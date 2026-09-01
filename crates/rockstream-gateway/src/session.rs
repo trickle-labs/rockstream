@@ -73,7 +73,7 @@ impl FreshnessToken {
 /// Maximum number of cursors open simultaneously per connection.
 /// Fill-level metric: `cursors.len()`.
 /// Backpressure: `RS-2052` / SQLSTATE 42P03.
-pub const MAX_CURSORS_PER_CONNECTION: usize = 100;
+pub const MAX_CURSORS_PER_CONNECTION: usize = rockstream_types::limits::MAX_CURSORS_PER_CONN;
 
 /// Transaction status byte — mirrors the Postgres ReadyForQuery status byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

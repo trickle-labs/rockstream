@@ -35,7 +35,7 @@ fn test_generated_manifest_matches_docs_json() {
 
     // Verify metadata invariants
     assert_eq!(manifest.manifest_metadata.schema_version, "1.0.0");
-    assert_eq!(manifest.manifest_metadata.engine_version, "0.59.13");
+    assert_eq!(manifest.manifest_metadata.engine_version, "0.59.19");
     assert_eq!(manifest.manifest_metadata.generator_version, "1.0.0");
     assert!(!manifest
         .manifest_metadata

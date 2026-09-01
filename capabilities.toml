@@ -1,29 +1,29 @@
 [contract]
-version = "v0.59.7"
+version = "v0.59.18"
 
 roadmap = "NEW_ROADMAP.md"
 promise = "RockStream ingests changing data, continuously maintains a documented SQL subset as durable materialized views, and serves globally committed results to PostgreSQL-compatible clients while surviving ordinary distributed-system failures without losing or silently corrupting committed state."
 
 [[contract.tier_decision]]
-capability = "language.aggregates"
+capability = "language.aggregates.float"
 old_tier = "Core"
 new_tier = "Experimental"
-reason = "The exact aggregate type matrix exposes unsupported floating-point and text-key combinations, so the broad aggregate claim is demoted rather than documented aspirationally."
+reason = "The exact aggregate type matrix exposes unsupported floating-point combinations, so approximate float aggregation is demoted rather than documented aspirationally."
 evidence = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_text_f64_sum"
 
 [[contract.tier_decision]]
-capability = "language.relational-operators"
+capability = "language.joins.float"
 old_tier = "Core"
 new_tier = "Experimental"
-reason = "The join matrix proves integer and text keys but rejects floating-point keys and text semi/anti joins with RS-1019, so the broad relational claim is demoted."
+reason = "The join matrix proves integer and text keys but rejects floating-point keys with RS-1019, so floating-point joins are demoted."
 evidence = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_inner_f64"
 
 [[contract.tier_decision]]
-capability = "language.analytics-time"
+capability = "language.joins.cross"
 old_tier = "Core"
 new_tier = "Experimental"
-reason = "The window matrix proves supported rank and navigation paths but the timestamp-key cells remain unsupported, so the broad analytics-time claim is demoted."
-evidence = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_row_number_timestamp"
+reason = "Unconstrained cross product joins without keys are demoted to experimental."
+evidence = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_cross"
 
 [[dispatch]]
 id = "query_async_entry"
@@ -124,47 +124,139 @@ behavior = [
 ]
 
 [[capability]]
-id = "language.aggregates"
+id = "language.aggregates.exact"
 kind = "language"
-name = "Aggregation and algebraic maintenance"
-tier = "Experimental"
+name = "Exact integer and decimal aggregation"
+tier = "Core"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
-proof = "crates/rockstream-gateway/tests/serving_path_aggregate_matrix_tests.rs::test_basic_int_sum_group_by"
-documentation = "docs/language-features.md#implemented-today"
-
-[[capability]]
-id = "language.relational-operators"
-kind = "language"
-name = "Relational operators"
-tier = "Experimental"
-reachability = "SQL over pgwire"
-dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
-proof = "crates/rockstream-sql/tests/tpch_plans.rs::tpch_q3_two_join_aggregate"
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_exact_int_sum"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
-  { behavior = "incremental", statement = "Join deltas update the relational result without changing unaffected rows.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_incremental_equals_batch_matrix" },
-  { behavior = "backfill", statement = "Join backfill builds the complete snapshot result before later input deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_backfill_matrix" },
-  { behavior = "checkpoint_recovery", statement = "A reopened join shard restores the committed relational transcript in both local and object-store backends.", proof = "crates/rockstream-gateway/tests/live_exec_join_durability_lfs_tests.rs::compiled_join_state_persists_across_restart_lfs", paired_proof = "crates/rockstream-gateway/tests/core_operator_durability_minio_tests.rs::compiled_join_state_persists_across_restart_minio" },
-  { behavior = "state_growth", statement = "Join arrangements use the configured state budget and expose fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_state_growth", bound = "configured arrangement state budget", metric = "arrangement_state_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
-  { behavior = "failure", statement = "Invalid join input returns an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_failure" },
+  { behavior = "incremental", statement = "Exact aggregation deltas update the grouped sum and count transcripts incrementally.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_exact_incremental" },
+  { behavior = "backfill", statement = "Aggregate backfill evaluates the complete snapshot over exact numeric groups before deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_exact_backfill" },
+  { behavior = "checkpoint_recovery", statement = "A reopened aggregate shard restores the committed exact grouped results.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_exact_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "Exact aggregate arrangements use the configured state budget and expose fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_exact_state_growth", bound = "configured aggregate state budget", metric = "aggregate_state_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "Invalid aggregate expressions fail closed with an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_exact_failure" },
 ]
 
 [[capability]]
-id = "language.analytics-time"
+id = "language.aggregates.text"
 kind = "language"
-name = "Analytics and time"
+name = "Text aggregation (MIN, MAX)"
+tier = "Maintain"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_text_min_max"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.aggregates.float"
+kind = "language"
+name = "Approximate floating-point aggregation"
 tier = "Experimental"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
-proof = "crates/rockstream-sql/tests/sql_engine_e2e.rs::sql_engine_window_row_number_over_view"
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_float_sum"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.joins.equi-integer"
+kind = "language"
+name = "Exact integer key equi-joins"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_equi_integer"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
-  { behavior = "incremental", statement = "Window deltas update only the affected partition and preserve the exact ordered transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_incremental_equals_batch_matrix" },
-  { behavior = "backfill", statement = "Window backfill orders the complete snapshot before applying later changes.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_backfill_matrix" },
-  { behavior = "checkpoint_recovery", statement = "A reopened window shard restores the committed ordered transcript in both local and object-store backends.", proof = "crates/rockstream-gateway/tests/live_exec_tumble_window_durability_lfs_tests.rs::compiled_tumble_window_state_persists_across_restart_lfs", paired_proof = "crates/rockstream-gateway/tests/core_operator_durability_minio_tests.rs::compiled_tumble_window_state_persists_across_restart_minio" },
-  { behavior = "state_growth", statement = "Window state is bounded by the configured partition budget and exposes fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_state_growth", bound = "configured window partition budget", metric = "window_state_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
-  { behavior = "failure", statement = "Unsupported window input returns an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_failure" },
+  { behavior = "incremental", statement = "Integer equi-join deltas update the relational result without changing unaffected rows.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_equi_integer_incremental" },
+  { behavior = "backfill", statement = "Join backfill builds the complete snapshot result before later input deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_equi_integer_backfill" },
+  { behavior = "checkpoint_recovery", statement = "A reopened join shard restores the committed relational transcript in both local and object-store backends.", proof = "crates/rockstream-gateway/tests/live_exec_join_durability_lfs_tests.rs::compiled_join_state_persists_across_restart_lfs", paired_proof = "crates/rockstream-gateway/tests/core_operator_durability_minio_tests.rs::compiled_join_state_persists_across_restart_minio" },
+  { behavior = "state_growth", statement = "Join arrangements use the configured state budget and expose fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_equi_integer_state_growth", bound = "configured arrangement state budget", metric = "arrangement_state_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "Invalid join input returns an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_equi_integer_failure" },
+]
+
+[[capability]]
+id = "language.joins.equi-text"
+kind = "language"
+name = "Binary UTF-8 text key equi-joins"
+tier = "Maintain"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_equi_text"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.joins.cross"
+kind = "language"
+name = "Cartesian cross-joins"
+tier = "Experimental"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_cross"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.joins.float"
+kind = "language"
+name = "Floating-point key joins"
+tier = "Experimental"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering"]
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_inner_f64"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.window.ranking"
+kind = "language"
+name = "Ranking functions (ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD)"
+tier = "Maintain"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_ranking"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.window.tumble"
+kind = "language"
+name = "Fixed tumbling time windows"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/live_exec_tumble_window_durability_lfs_tests.rs::compiled_tumble_window_state_persists_across_restart_lfs"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
+documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "Tumbling window deltas assign rows into non-overlapping epoch buckets deterministically.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_tumble_incremental" },
+  { behavior = "backfill", statement = "Tumble window backfill processes the complete snapshot before subsequent stream deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_tumble_backfill" },
+  { behavior = "checkpoint_recovery", statement = "A reopened tumble window shard restores the committed window transcript in both local and object-store backends.", proof = "crates/rockstream-gateway/tests/live_exec_tumble_window_durability_lfs_tests.rs::compiled_tumble_window_state_persists_across_restart_lfs", paired_proof = "crates/rockstream-gateway/tests/core_operator_durability_minio_tests.rs::compiled_tumble_window_state_persists_across_restart_minio" },
+  { behavior = "state_growth", statement = "Tumble window state is bounded by the active watermark retention window and reports fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_tumble_state_growth", bound = "configured tumble window partition budget", metric = "window_state_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "Invalid window parameters fail closed with an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_tumble_failure" },
+]
+
+[[capability]]
+id = "language.window.slide"
+kind = "language"
+name = "Sliding hopping time windows"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_sliding"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
+documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "Sliding window deltas recompute overlapping slice bounds and preserve exact ordered outputs.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_slide_incremental" },
+  { behavior = "backfill", statement = "Sliding window backfill evaluates all historical slice intervals across the snapshot.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_slide_backfill" },
+  { behavior = "checkpoint_recovery", statement = "A reopened sliding window shard restores committed slice state.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_slide_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "Sliding window buffers retain only unexpired active slices and report fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_slide_state_growth", bound = "configured slide window slice budget", metric = "window_state_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "Unsupported sliding window specifications fail closed with an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_slide_failure" },
 ]
 
 [[capability]]

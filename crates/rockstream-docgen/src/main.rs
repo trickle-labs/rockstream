@@ -156,9 +156,17 @@ fn main() {
                 process::exit(1);
             }
             for (name, markdown) in render_reference_docs(&manifest) {
-                if let Err(err) = fs::write(output_dir.join(&name), markdown) {
+                if let Err(err) = fs::write(output_dir.join(&name), &markdown) {
                     eprintln!("Error writing {}/{}: {err}", output_dir.display(), name);
                     process::exit(1);
+                }
+                if let Some(parent) = output_dir.parent() {
+                    if name == "limits.md"
+                        || name == "sql-semantics.md"
+                        || name == "sql-type-matrix.md"
+                    {
+                        let _ = fs::write(parent.join(&name), &markdown);
+                    }
                 }
             }
             println!(

@@ -4,7 +4,8 @@
 //! with actionable next_steps text.
 
 use rockstream_types::error_code::{
-    ErrorCode, RS_0001, RS_0003, RS_1002, RS_1011, RS_1012, RS_1013, RS_1016, RS_1731, RS_2016,
+    ErrorCode, RS_0001, RS_0003, RS_1002, RS_1011, RS_1012, RS_1013, RS_1016, RS_1019, RS_1731,
+    RS_2016,
 };
 use thiserror::Error;
 
@@ -34,6 +35,18 @@ pub enum SqlError {
     /// RS-1013: simplify the query or consult docs/language-features.md.
     #[error("[RS-1013] Unsupported plan node in incremental lowering: {node_type}")]
     UnsupportedPlanNode { node_type: String },
+
+    /// Requested collation is unsupported.
+    ///
+    /// RS-1013: only versioned 'rockstream_binary_v1' collation is supported.
+    #[error("[RS-1013] Unsupported collation '{collation}': only 'rockstream_binary_v1' deterministic UTF-8 binary collation is supported")]
+    UnsupportedCollation { collation: String },
+
+    /// Floating-point equality joins are unsupported.
+    ///
+    /// RS-1019: floating-point equi-joins are rejected in v1 due to lack of total ordering.
+    #[error("[RS-1019] Floating-point equi-join is unsupported: join keys must have total ordering (found floating-point key)")]
+    FloatJoinRejected,
 
     /// Unsupported window function in SQL lowering (v0.11).
     ///
@@ -98,6 +111,8 @@ impl SqlError {
             Self::CycleDetected { .. } => RS_1011,
             Self::ParseError { .. } => RS_1012,
             Self::UnsupportedPlanNode { .. } => RS_1013,
+            Self::UnsupportedCollation { .. } => RS_1013,
+            Self::FloatJoinRejected => RS_1019,
             Self::UnsupportedWindowFunction { .. } => RS_1016,
             Self::IncompatibleSchemaChange { .. } => RS_1002,
             Self::Storage(_) => RS_0003,

@@ -68,6 +68,25 @@ def check_sql_matrix_toml(matrix_path: Path, errors: list[str]) -> tuple[dict, s
                         rejection_codes.add(code)
                     except ValueError as e:
                         errors.append(str(e))
+
+    for section_name, key in [
+        ("collation", "rejection_code"),
+        ("numeric_bounds", "overflow_code"),
+        ("numeric_bounds", "invalid_precision_code"),
+        ("temporal_policy", "invalid_format_code"),
+        ("identifier_folding", "length_exceeded_code"),
+        ("parameter_arrays", "invalid_array_code"),
+    ]:
+        sec = data.get(section_name)
+        if isinstance(sec, dict):
+            code = sec.get(key)
+            if code:
+                try:
+                    parse_code_number(code)
+                    rejection_codes.add(code)
+                except ValueError as e:
+                    errors.append(str(e))
+
     return data, rejection_codes
 
 

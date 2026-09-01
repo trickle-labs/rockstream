@@ -247,9 +247,100 @@ pub struct ErrorSurfaceEntry {
     pub doc_anchor: String,
 }
 
+/// PostgreSQL reference database contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceDatabaseContract {
+    pub engine: String,
+    pub version: String,
+    pub canonical_image: String,
+    pub amd64_digest: String,
+    pub arm64_digest: String,
+}
+
+/// Deterministic collation contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollationContract {
+    pub name: String,
+    pub description: String,
+    pub rejection_code: String,
+}
+
+/// Admitted numeric / decimal bounds contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NumericBoundsContract {
+    pub max_precision: usize,
+    pub min_precision: usize,
+    pub min_scale: usize,
+    pub overflow_code: String,
+    pub invalid_precision_code: String,
+}
+
+/// Temporal precision and time-zone policy contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporalPolicyContract {
+    pub precision: usize,
+    pub resolution: String,
+    pub timezone_storage: String,
+    pub invalid_format_code: String,
+}
+
+/// Deterministic identifier folding contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentifierFoldingContract {
+    pub unquoted_folding: String,
+    pub quoted_preservation: bool,
+    pub max_byte_length: usize,
+    pub length_exceeded_code: String,
+}
+
+/// ANSI three-valued logic and NULL handling contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NullLogicContract {
+    pub logic: String,
+    pub distinct_from: String,
+}
+
+/// Prepared statement array parameter binding contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterArraysContract {
+    pub dimensions: usize,
+    pub any_element_matching: bool,
+    pub invalid_array_code: String,
+}
+
+/// System limits contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitsContract {
+    pub max_result_rows: usize,
+    pub max_conn_memory_bytes: usize,
+    pub max_connections: usize,
+    pub max_prepared_stmts: usize,
+    pub max_portals: usize,
+    pub max_cursors: usize,
+    pub max_identifier_len: usize,
+    pub max_decimal_precision: usize,
+    pub max_view_dag_depth: usize,
+}
+
 /// SQL contract compatibility surface descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SqlContractSurface {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_database: Option<ReferenceDatabaseContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<CollationContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numeric_bounds: Option<NumericBoundsContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_policy: Option<TemporalPolicyContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_folding: Option<IdentifierFoldingContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub null_logic: Option<NullLogicContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_arrays: Option<ParameterArraysContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<LimitsContract>,
     pub types: Vec<SqlTypeContract>,
 }
 

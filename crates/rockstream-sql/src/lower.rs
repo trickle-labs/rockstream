@@ -23,6 +23,7 @@
 //! plan's* output schema, so the lowered PlanNode is independent of column
 //! names.
 
+use arrow::datatypes::DataType;
 use datafusion::common::DFSchema;
 #[allow(unused_imports)]
 use datafusion::logical_expr::expr::AggregateFunctionParams;
@@ -1093,6 +1094,18 @@ fn extract_equi_join_keys(
                     })
                 }
             };
+
+        let left_type = left_schema.field(left_idx).data_type();
+        let right_type = right_schema.field(right_idx).data_type();
+        if matches!(
+            left_type,
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        ) || matches!(
+            right_type,
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        ) {
+            return Err(SqlError::FloatJoinRejected);
+        }
 
         left_keys.push(left_idx);
         right_keys.push(right_idx);

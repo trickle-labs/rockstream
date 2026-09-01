@@ -1,8 +1,8 @@
 {
   "manifest_metadata": {
     "schema_version": "1.0.0",
-    "engine_version": "0.59.13",
-    "candidate_identity_digest": "cc7f995138ad4c0a8d57f3321658e915975f4583edddcbce8465aa0bff9ca984",
+    "engine_version": "0.59.19",
+    "candidate_identity_digest": "ab1f0643daaeab105066e2aaecd0bef208d0284e44fd23d45c79d09126f3616f",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -6335,6 +6335,57 @@
     ]
   },
   "sql_contract_surface": {
+    "reference_database": {
+      "engine": "postgresql",
+      "version": "18.0",
+      "canonical_image": "postgres:18.0@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+      "amd64_digest": "sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+      "arm64_digest": "sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c"
+    },
+    "collation": {
+      "name": "rockstream_binary_v1",
+      "description": "Raw UTF-8 byte-wise lexicographical ordering independent of OS/libc locale",
+      "rejection_code": "RS-1013"
+    },
+    "numeric_bounds": {
+      "max_precision": 38,
+      "min_precision": 1,
+      "min_scale": 0,
+      "overflow_code": "RS-1016",
+      "invalid_precision_code": "RS-1012"
+    },
+    "temporal_policy": {
+      "precision": 6,
+      "resolution": "microsecond",
+      "timezone_storage": "UTC",
+      "invalid_format_code": "RS-1012"
+    },
+    "identifier_folding": {
+      "unquoted_folding": "lowercase",
+      "quoted_preservation": true,
+      "max_byte_length": 63,
+      "length_exceeded_code": "RS-1012"
+    },
+    "null_logic": {
+      "logic": "ANSI 3VL",
+      "distinct_from": "NULL-safe"
+    },
+    "parameter_arrays": {
+      "dimensions": 1,
+      "any_element_matching": true,
+      "invalid_array_code": "RS-1012"
+    },
+    "limits": {
+      "max_result_rows": 10000,
+      "max_conn_memory_bytes": 67108864,
+      "max_connections": 100,
+      "max_prepared_stmts": 100,
+      "max_portals": 50,
+      "max_cursors": 64,
+      "max_identifier_len": 63,
+      "max_decimal_precision": 38,
+      "max_view_dag_depth": 16
+    },
     "types": [
       {
         "name": "ARRAY",

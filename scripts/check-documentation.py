@@ -24,6 +24,12 @@ REQUIRED = (
     "docs/reference/catalog.md",
     "docs/reference/metrics.md",
     "docs/reference/errors.md",
+    "docs/reference/limits.md",
+    "docs/reference/sql-semantics.md",
+    "docs/reference/sql-type-matrix.md",
+    "docs/limits.md",
+    "docs/sql-semantics.md",
+    "docs/sql-type-matrix.md",
     "docs/cli.md",
     "docs/configuration.md",
     "docs/error-codes.md",
@@ -44,6 +50,9 @@ NAVIGATION = (
     "docs/configuration.md",
     "docs/error-codes.md",
     "docs/language-features.md",
+    "docs/limits.md",
+    "docs/sql-semantics.md",
+    "docs/sql-type-matrix.md",
     "examples/reference-app/README.md",
 )
 GENERATED_HEADINGS = {
@@ -51,9 +60,15 @@ GENERATED_HEADINGS = {
     "docs/reference/configuration.md": "# Configuration reference",
     "docs/reference/functions.md": "# Functions reference",
     "docs/reference/sql-support.md": "# SQL support reference",
+    "docs/reference/sql-type-matrix.md": "# SQL type and operation compatibility matrix",
+    "docs/reference/sql-semantics.md": "# SQL semantics and PostgreSQL compatibility",
+    "docs/reference/limits.md": "# System limits reference",
     "docs/reference/catalog.md": "# Catalog reference",
     "docs/reference/metrics.md": "# Metrics reference",
     "docs/reference/errors.md": "# Errors reference",
+    "docs/limits.md": "# System limits reference",
+    "docs/sql-semantics.md": "# SQL semantics and PostgreSQL compatibility",
+    "docs/sql-type-matrix.md": "# SQL type and operation compatibility matrix",
 }
 OBSOLETE_TERMS = {"pipeline": "view"}
 

@@ -15,6 +15,15 @@ pub fn render_reference_docs(manifest: &ProductSurfaceManifest) -> BTreeMap<Stri
             "sql-support.md",
             render_sql_support(&manifest.sql_contract_surface),
         ),
+        (
+            "sql-type-matrix.md",
+            render_sql_type_matrix(&manifest.sql_contract_surface),
+        ),
+        (
+            "sql-semantics.md",
+            render_sql_semantics(&manifest.sql_contract_surface),
+        ),
+        ("limits.md", render_limits(&manifest.sql_contract_surface)),
         ("catalog.md", render_catalog(&manifest.catalog_surface)),
         ("metrics.md", render_metrics(&manifest.metric_surface)),
         ("errors.md", render_errors(&manifest.error_surface)),
@@ -294,5 +303,138 @@ fn render_errors(surface: &ErrorSurface) -> String {
             ]
         }),
     ));
+    out
+}
+
+fn render_limits(_surface: &SqlContractSurface) -> String {
+    let mut out = String::from("# System limits reference\n\n");
+    out.push_str("Authoritative operational, architectural, protocol, and parser limits enforced across RockStream.\n\n");
+    let limits = rockstream_types::limits::SystemLimitsCatalog::all();
+    out.push_str(&table(
+        &[
+            "Limit Identifier",
+            "Name",
+            "Canonical Value",
+            "Unit",
+            "Enforcement Level",
+            "Metric Name",
+            "Error Code",
+            "Description",
+        ],
+        limits.iter().map(|l| {
+            vec![
+                format!("`{}`", l.id),
+                cell(&l.name),
+                format!("{}", l.canonical_value),
+                cell(&l.unit),
+                cell(&l.enforcement_level),
+                format!("`{}`", l.metric_name),
+                format!("`{}`", l.error_code),
+                cell(&l.description),
+            ]
+        }),
+    ));
+    out
+}
+
+fn render_sql_semantics(surface: &SqlContractSurface) -> String {
+    let mut out = String::from("# SQL semantics and PostgreSQL compatibility\n\n");
+    out.push_str("Authoritative v1 SQL semantics, PostgreSQL 18.0 differential compatibility, and system boundaries.\n\n");
+
+    if let Some(ref_db) = &surface.reference_database {
+        out.push_str("## Reference database\n\n");
+        out.push_str(&format!(
+            "- **Engine:** {}\n- **Version:** {}\n- **Canonical image:** `{}`\n- **AMD64 digest:** `{}`\n- **ARM64 digest:** `{}`\n\n",
+            ref_db.engine, ref_db.version, ref_db.canonical_image, ref_db.amd64_digest, ref_db.arm64_digest
+        ));
+    }
+
+    if let Some(col) = &surface.collation {
+        out.push_str("## Collation and string ordering\n\n");
+        out.push_str(&format!(
+            "- **Active collation:** `{}`\n- **Semantics:** {}\n- **Unsupported collations:** Rejected fail-closed with `{}`.\n\n",
+            col.name, col.description, col.rejection_code
+        ));
+    }
+
+    if let Some(num) = &surface.numeric_bounds {
+        out.push_str("## Numeric precision and decimal bounds\n\n");
+        out.push_str(&format!(
+            "- **Admitted precision:** `DECIMAL(p, s)` where {} <= p <= {}, {} <= s <= p.\n- **Arithmetic overflow:** Fails closed with `{}`.\n- **Invalid precision/scale:** Fails closed with `{}`.\n\n",
+            num.min_precision, num.max_precision, num.min_scale, num.overflow_code, num.invalid_precision_code
+        ));
+    }
+
+    if let Some(temp) = &surface.temporal_policy {
+        out.push_str("## Temporal policy and time zones\n\n");
+        out.push_str(&format!(
+            "- **Fractional precision:** {} digits (resolution: {}).\n- **Internal storage:** {}.\n- **Invalid format:** Fails closed with `{}`.\n\n",
+            temp.precision, temp.resolution, temp.timezone_storage, temp.invalid_format_code
+        ));
+    }
+
+    if let Some(ident) = &surface.identifier_folding {
+        out.push_str("## Identifier case folding\n\n");
+        out.push_str(&format!(
+            "- **Unquoted identifiers:** Folded to {}.\n- **Quoted identifiers:** Preserved verbatim (case-sensitive).\n- **Maximum byte length:** {} bytes (exceeding rejected with `{}`).\n\n",
+            ident.unquoted_folding, ident.max_byte_length, ident.length_exceeded_code
+        ));
+    }
+
+    if let Some(nulls) = &surface.null_logic {
+        out.push_str("## Three-valued logic and NULL semantics\n\n");
+        out.push_str(&format!(
+            "- **Evaluation logic:** {} (`TRUE`, `FALSE`, `UNKNOWN`).\n- **Equality:** `NULL = NULL` evaluates to `UNKNOWN`.\n- **Distinctness:** `IS NOT DISTINCT FROM` is {}.\n\n",
+            nulls.logic, nulls.distinct_from
+        ));
+    }
+
+    if let Some(arr) = &surface.parameter_arrays {
+        out.push_str("## Prepared statement array parameters\n\n");
+        out.push_str(&format!(
+            "- **Supported array dimensions:** {}.\n- **Array membership:** `col = ANY($1)` / `col IN (SELECT UNNEST($1))` supported.\n- **Invalid array parameter:** Fails closed with `{}`.\n\n",
+            arr.dimensions, arr.invalid_array_code
+        ));
+    }
+
+    out.push_str("## Multiset bag semantics and IVM retractions\n\n");
+    out.push_str("RockStream preserves exact bag/multiset duplicate counts under incremental view maintenance. Retraction underflow fails closed with `RS-1017`.\n\n");
+
+    out.push_str("## Unmatched DML\n\n");
+    out.push_str("`UPDATE` or `DELETE` statements matching zero rows succeed without error and return command tags `UPDATE 0` and `DELETE 0`.\n\n");
+
+    out.push_str("## Floating-point join restrictions\n\n");
+    out.push_str("Floating-point equality joins (`FLOAT4`/`FLOAT8`) are explicitly rejected fail-closed with `RS-1019` due to non-total IEEE-754 ordering.\n\n");
+
+    out
+}
+
+fn render_sql_type_matrix(surface: &SqlContractSurface) -> String {
+    let mut out = String::from("# SQL type and operation compatibility matrix\n\n");
+    out.push_str("Authoritative matrix of admitted SQL types, operations, support tiers, and rejection error codes.\n\n");
+    for ty in &surface.types {
+        out.push_str(&format!(
+            "## `{}`\n\n**Family:** {}  \n**Aliases:** {}\n\n{}\n\n",
+            ty.name,
+            ty.family,
+            if ty.aliases.is_empty() {
+                "—".into()
+            } else {
+                ty.aliases.join(", ")
+            },
+            ty.description
+        ));
+        out.push_str(&table(
+            &["Operation", "Status", "Rejection code", "Notes"],
+            ty.operations.iter().map(|o| {
+                vec![
+                    cell(&o.operation),
+                    cell(&o.status),
+                    o.rejection_code.as_deref().unwrap_or("—").into(),
+                    o.notes.as_deref().map(cell).unwrap_or_else(|| "—".into()),
+                ]
+            }),
+        ));
+    }
     out
 }

@@ -6,9 +6,60 @@ use rockstream_docgen::sql_matrix::SqlMatrixDocument;
 fn test_sql_matrix_toml_parsing_and_validity() {
     let doc =
         SqlMatrixDocument::load_canonical().expect("contracts/sql-type-matrix.toml must parse");
-    assert_eq!(doc.contract.version, "0.59.13");
+    assert_eq!(doc.contract.version, "0.59.19");
     assert_eq!(doc.contract.roadmap, "DOC-001");
     assert!(!doc.types.is_empty(), "Must contain SQL types");
+}
+
+#[test]
+fn test_contract_pinned_pg18_digest() {
+    let doc =
+        SqlMatrixDocument::load_canonical().expect("contracts/sql-type-matrix.toml must parse");
+    let ref_db = doc
+        .reference_database
+        .as_ref()
+        .expect("Reference database contract must be present");
+    assert_eq!(ref_db.engine, "postgresql");
+    assert_eq!(ref_db.version, "18.0");
+    assert_eq!(
+        ref_db.canonical_image,
+        "postgres:18.0@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c"
+    );
+    assert!(!ref_db.amd64_digest.is_empty());
+    assert!(!ref_db.arm64_digest.is_empty());
+}
+
+#[test]
+fn test_contract_collation_and_limits() {
+    let doc =
+        SqlMatrixDocument::load_canonical().expect("contracts/sql-type-matrix.toml must parse");
+    let collation = doc
+        .collation
+        .as_ref()
+        .expect("Collation contract must be present");
+    assert_eq!(collation.name, "rockstream_binary_v1");
+    assert_eq!(collation.rejection_code, "RS-1013");
+
+    let num_bounds = doc
+        .numeric_bounds
+        .as_ref()
+        .expect("Numeric bounds contract must be present");
+    assert_eq!(num_bounds.max_precision, 38);
+    assert_eq!(num_bounds.overflow_code, "RS-1016");
+
+    let limits = doc
+        .limits
+        .as_ref()
+        .expect("Limits contract must be present");
+    assert_eq!(limits.max_result_rows, 10000);
+    assert_eq!(limits.max_conn_memory_bytes, 64 * 1024 * 1024);
+    assert_eq!(limits.max_connections, 100);
+    assert_eq!(limits.max_prepared_stmts, 100);
+    assert_eq!(limits.max_portals, 50);
+    assert_eq!(limits.max_cursors, 64);
+    assert_eq!(limits.max_identifier_len, 63);
+    assert_eq!(limits.max_decimal_precision, 38);
+    assert_eq!(limits.max_view_dag_depth, 16);
 }
 
 #[test]

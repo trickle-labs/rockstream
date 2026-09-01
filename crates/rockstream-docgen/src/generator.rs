@@ -21,7 +21,7 @@ pub fn generate_manifest() -> Result<ProductSurfaceManifest, Box<dyn Error + Sen
 
     // Compute deterministic candidate digest based on contracts
     let mut hasher = Sha256::new();
-    hasher.update(b"rockstream-0.59.13-product-surface");
+    hasher.update(b"rockstream-0.59.19-product-surface");
     for err in &error_surface.errors {
         hasher.update(err.code.as_bytes());
         hasher.update(err.key.as_bytes());
@@ -37,7 +37,7 @@ pub fn generate_manifest() -> Result<ProductSurfaceManifest, Box<dyn Error + Sen
 
     let manifest_metadata = ManifestMetadata {
         schema_version: "1.0.0".to_string(),
-        engine_version: "0.59.13".to_string(),
+        engine_version: "0.59.19".to_string(),
         candidate_identity_digest,
         generator_version: "1.0.0".to_string(),
         generated_at: "2026-08-24T00:00:00Z".to_string(),

@@ -170,6 +170,25 @@ impl CollationId {
     pub fn utf8_default() -> Self {
         Self("utf8_default".to_string())
     }
+
+    pub fn rockstream_binary_v1() -> Self {
+        Self("rockstream_binary_v1".to_string())
+    }
+
+    /// Check if this collation identifier represents a supported binary/UTF-8 byte-wise collation.
+    pub fn is_binary_supported(&self) -> bool {
+        let s = self.0.trim().to_ascii_lowercase();
+        matches!(
+            s.as_str(),
+            "rockstream_binary_v1"
+                | "binary"
+                | "c"
+                | "posix"
+                | "utf8_default"
+                | "default"
+                | "ucs_basic"
+        )
+    }
 }
 
 impl fmt::Display for CollationId {

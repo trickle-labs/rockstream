@@ -29,8 +29,11 @@ fn each_manifest_surface_has_one_reference_section() {
             "configuration.md",
             "errors.md",
             "functions.md",
+            "limits.md",
             "metrics.md",
-            "sql-support.md"
+            "sql-semantics.md",
+            "sql-support.md",
+            "sql-type-matrix.md",
         ]
     );
     for markdown in generated.values() {

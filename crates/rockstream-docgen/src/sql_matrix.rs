@@ -4,7 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::manifest::{SqlContractSurface, SqlTypeContract};
+use crate::manifest::{
+    CollationContract, IdentifierFoldingContract, LimitsContract, NullLogicContract,
+    NumericBoundsContract, ParameterArraysContract, ReferenceDatabaseContract, SqlContractSurface,
+    SqlTypeContract, TemporalPolicyContract,
+};
 
 /// Errors encountered when parsing or validating `contracts/sql-type-matrix.toml`.
 #[derive(Debug, Error)]
@@ -31,6 +35,22 @@ pub struct SqlMatrixContractHeader {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqlMatrixDocument {
     pub contract: SqlMatrixContractHeader,
+    #[serde(default)]
+    pub reference_database: Option<ReferenceDatabaseContract>,
+    #[serde(default)]
+    pub collation: Option<CollationContract>,
+    #[serde(default)]
+    pub numeric_bounds: Option<NumericBoundsContract>,
+    #[serde(default)]
+    pub temporal_policy: Option<TemporalPolicyContract>,
+    #[serde(default)]
+    pub identifier_folding: Option<IdentifierFoldingContract>,
+    #[serde(default)]
+    pub null_logic: Option<NullLogicContract>,
+    #[serde(default)]
+    pub parameter_arrays: Option<ParameterArraysContract>,
+    #[serde(default)]
+    pub limits: Option<LimitsContract>,
     #[serde(rename = "type", default)]
     pub types: Vec<SqlTypeContract>,
 }
@@ -97,34 +117,70 @@ impl SqlMatrixDocument {
                         ))
                     })?;
 
-                    if !code.starts_with("RS-") {
-                        return Err(SqlMatrixError::Validation(format!(
-                            "SQL type '{}' operation '{}' rejection_code '{}' does not match RS-XXXX format",
-                            ty.name, op.operation, code
-                        )));
-                    }
-
-                    // Verify error code exists in ErrorCatalog
-                    if !rockstream_types::error_code::ErrorCatalog::current()
-                        .errors()
-                        .iter()
-                        .any(|e| e.code.to_string() == *code)
-                    {
-                        return Err(SqlMatrixError::UnknownErrorCode(format!(
-                            "SQL type '{}' operation '{}' references unknown error code '{}'",
-                            ty.name, op.operation, code
-                        )));
-                    }
+                    Self::validate_error_code(
+                        code,
+                        &format!("SQL type '{}' operation '{}'", ty.name, op.operation),
+                    )?;
                 }
             }
         }
 
+        if let Some(col) = &self.collation {
+            Self::validate_error_code(&col.rejection_code, "Collation contract")?;
+        }
+        if let Some(num) = &self.numeric_bounds {
+            Self::validate_error_code(&num.overflow_code, "Numeric bounds overflow")?;
+            Self::validate_error_code(
+                &num.invalid_precision_code,
+                "Numeric bounds invalid precision",
+            )?;
+        }
+        if let Some(temp) = &self.temporal_policy {
+            Self::validate_error_code(&temp.invalid_format_code, "Temporal policy invalid format")?;
+        }
+        if let Some(ident) = &self.identifier_folding {
+            Self::validate_error_code(
+                &ident.length_exceeded_code,
+                "Identifier folding length exceeded",
+            )?;
+        }
+        if let Some(arr) = &self.parameter_arrays {
+            Self::validate_error_code(&arr.invalid_array_code, "Parameter arrays invalid format")?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_error_code(code: &str, context: &str) -> Result<(), SqlMatrixError> {
+        if !code.starts_with("RS-") {
+            return Err(SqlMatrixError::Validation(format!(
+                "{context} rejection_code '{code}' does not match RS-XXXX format"
+            )));
+        }
+
+        if !rockstream_types::error_code::ErrorCatalog::current()
+            .errors()
+            .iter()
+            .any(|e| e.code.to_string() == code)
+        {
+            return Err(SqlMatrixError::UnknownErrorCode(format!(
+                "{context} references unknown error code '{code}'"
+            )));
+        }
         Ok(())
     }
 
     /// Convert to normalized `SqlContractSurface`.
     pub fn to_surface(&self) -> SqlContractSurface {
         let mut surface = SqlContractSurface {
+            reference_database: self.reference_database.clone(),
+            collation: self.collation.clone(),
+            numeric_bounds: self.numeric_bounds.clone(),
+            temporal_policy: self.temporal_policy.clone(),
+            identifier_folding: self.identifier_folding.clone(),
+            null_logic: self.null_logic.clone(),
+            parameter_arrays: self.parameter_arrays.clone(),
+            limits: self.limits.clone(),
             types: self.types.clone(),
         };
         surface.types.sort_by(|a, b| a.name.cmp(&b.name));

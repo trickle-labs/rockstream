@@ -250,10 +250,48 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
     if let Ok(statements) = sqlparser::parser::Parser::parse_sql(&dialect, sql) {
         for stmt in &statements {
             struct AstVisitor<'a> {
+                catalog: &'a CatalogStubs,
                 casts: &'a mut std::collections::HashMap<usize, Type>,
-                in_any: bool,
+                current_any_type: Option<Type>,
             }
             impl<'a> AstVisitor<'a> {
+                fn array_type_for_col(&self, col_name: &str) -> Type {
+                    let lower = col_name.to_ascii_lowercase();
+                    for table in self.catalog.list_tables() {
+                        for col in &table.columns {
+                            if col.name.eq_ignore_ascii_case(&lower) {
+                                return match col.data_type.to_ascii_lowercase().as_str() {
+                                    "int64" | "bigint" | "int8" => Type::INT8_ARRAY,
+                                    "int32" | "integer" | "int4" | "int" => Type::INT4_ARRAY,
+                                    "int16" | "smallint" | "int2" => Type::INT2_ARRAY,
+                                    "float64" | "double" | "float8" => Type::FLOAT8_ARRAY,
+                                    "float32" | "real" | "float4" => Type::FLOAT4_ARRAY,
+                                    "bool" | "boolean" => Type::BOOL_ARRAY,
+                                    "uuid" => Type::UUID_ARRAY,
+                                    _ => Type::TEXT_ARRAY,
+                                };
+                            }
+                        }
+                    }
+                    for view in self.catalog.list_views() {
+                        for col in &view.columns {
+                            if col.name.eq_ignore_ascii_case(&lower) {
+                                return match col.data_type.to_ascii_lowercase().as_str() {
+                                    "int64" | "bigint" | "int8" => Type::INT8_ARRAY,
+                                    "int32" | "integer" | "int4" | "int" => Type::INT4_ARRAY,
+                                    "int16" | "smallint" | "int2" => Type::INT2_ARRAY,
+                                    "float64" | "double" | "float8" => Type::FLOAT8_ARRAY,
+                                    "float32" | "real" | "float4" => Type::FLOAT4_ARRAY,
+                                    "bool" | "boolean" => Type::BOOL_ARRAY,
+                                    "uuid" => Type::UUID_ARRAY,
+                                    _ => Type::TEXT_ARRAY,
+                                };
+                            }
+                        }
+                    }
+                    Type::TEXT_ARRAY
+                }
+
                 fn visit_expr(&mut self, expr: &sqlparser::ast::Expr) {
                     use sqlparser::ast::{Expr, Value};
                     match expr {
@@ -279,8 +317,8 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                             if let Value::Placeholder(name) = &v.value {
                                 if let Some(rest) = name.strip_prefix('$') {
                                     if let Ok(idx) = rest.parse::<usize>() {
-                                        if self.in_any {
-                                            self.casts.insert(idx, Type::TEXT_ARRAY);
+                                        if let Some(any_ty) = &self.current_any_type {
+                                            self.casts.insert(idx, any_ty.clone());
                                         }
                                     }
                                 }
@@ -288,17 +326,39 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                         }
                         Expr::AnyOp { left, right, .. } => {
                             self.visit_expr(left);
-                            let old_any = self.in_any;
-                            self.in_any = true;
+                            let target_arr_ty = match &**left {
+                                Expr::Identifier(ident) => self.array_type_for_col(&ident.value),
+                                Expr::CompoundIdentifier(idents) => {
+                                    if let Some(last) = idents.last() {
+                                        self.array_type_for_col(&last.value)
+                                    } else {
+                                        Type::TEXT_ARRAY
+                                    }
+                                }
+                                _ => Type::TEXT_ARRAY,
+                            };
+                            let old_any = self.current_any_type.take();
+                            self.current_any_type = Some(target_arr_ty);
                             self.visit_expr(right);
-                            self.in_any = old_any;
+                            self.current_any_type = old_any;
                         }
                         Expr::AllOp { left, right, .. } => {
                             self.visit_expr(left);
-                            let old_any = self.in_any;
-                            self.in_any = true;
+                            let target_arr_ty = match &**left {
+                                Expr::Identifier(ident) => self.array_type_for_col(&ident.value),
+                                Expr::CompoundIdentifier(idents) => {
+                                    if let Some(last) = idents.last() {
+                                        self.array_type_for_col(&last.value)
+                                    } else {
+                                        Type::TEXT_ARRAY
+                                    }
+                                }
+                                _ => Type::TEXT_ARRAY,
+                            };
+                            let old_any = self.current_any_type.take();
+                            self.current_any_type = Some(target_arr_ty);
                             self.visit_expr(right);
-                            self.in_any = old_any;
+                            self.current_any_type = old_any;
                         }
                         Expr::Nested(inner) => {
                             self.visit_expr(inner);
@@ -370,8 +430,9 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
             }
 
             let mut visitor = AstVisitor {
+                catalog,
                 casts: &mut explicit_casts,
-                in_any: false,
+                current_any_type: None,
             };
             if let sqlparser::ast::Statement::Query(q) = stmt {
                 if let sqlparser::ast::SetExpr::Select(select) = &*q.body {
@@ -804,8 +865,9 @@ pub static PORTALS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// v0.51.6 Slice 1: bound on prepared statements/portals per connection.
 /// Exceeding this bound no longer errors (`RS-2600`/`RS-2601`) — the
 /// least-recently-used entry is evicted instead.
-pub const MAX_PREPARED_STATEMENTS_PER_CONN: usize = 1000;
-pub const MAX_PORTALS_PER_CONN: usize = 1000;
+pub const MAX_PREPARED_STATEMENTS_PER_CONN: usize =
+    rockstream_types::limits::MAX_PREPARED_STATEMENTS_PER_CONN;
+pub const MAX_PORTALS_PER_CONN: usize = rockstream_types::limits::MAX_PORTALS_PER_CONN;
 
 /// Cumulative count of prepared statements evicted via LRU (v0.51.6 Slice 1).
 pub static PREPARED_STATEMENTS_EVICTED_COUNT: std::sync::atomic::AtomicU64 =
@@ -16939,7 +17001,64 @@ fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
         let replacement = match param {
             None => "NULL".to_string(),
             Some(bytes) => {
-                if bytes
+                if bytes.len() >= 12 && bytes[..4] == [0, 0, 0, 1] {
+                    // 1D PostgreSQL binary array decoding
+                    let elem_type = i32::from_be_bytes(bytes[8..12].try_into().unwrap_or_default());
+                    let dim = i32::from_be_bytes(bytes[12..16].try_into().unwrap_or_default());
+                    let mut offset = 20;
+                    let mut elems = Vec::new();
+                    for _ in 0..dim.max(0) {
+                        if offset + 4 > bytes.len() {
+                            break;
+                        }
+                        let len = i32::from_be_bytes(
+                            bytes[offset..offset + 4].try_into().unwrap_or_default(),
+                        );
+                        offset += 4;
+                        if len < 0 {
+                            elems.push("NULL".to_string());
+                        } else if offset + len as usize <= bytes.len() {
+                            let elem_bytes = &bytes[offset..offset + len as usize];
+                            offset += len as usize;
+                            let formatted = match elem_type {
+                                20 => i64::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                    .to_string(),
+                                23 => i32::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                    .to_string(),
+                                21 => i16::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                    .to_string(),
+                                16 => {
+                                    if !elem_bytes.is_empty() && elem_bytes[0] != 0 {
+                                        "true".to_string()
+                                    } else {
+                                        "false".to_string()
+                                    }
+                                }
+                                700 => {
+                                    f32::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                        .to_string()
+                                }
+                                701 => {
+                                    f64::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                        .to_string()
+                                }
+                                _ => {
+                                    if let Ok(s) = std::str::from_utf8(elem_bytes) {
+                                        if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                                            s.to_string()
+                                        } else {
+                                            format!("'{}'", s.replace('\'', "''"))
+                                        }
+                                    } else {
+                                        "NULL".to_string()
+                                    }
+                                }
+                            };
+                            elems.push(formatted);
+                        }
+                    }
+                    format!("ARRAY[{}]", elems.join(", "))
+                } else if bytes
                     .iter()
                     .any(|&b| b < 32 && b != b'\t' && b != b'\n' && b != b'\r')
                 {
@@ -16965,7 +17084,29 @@ fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
                         "NULL".to_string()
                     }
                 } else if let Ok(s) = std::str::from_utf8(bytes) {
-                    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                    if s.starts_with('{') && s.ends_with('}') {
+                        // Text array parsing e.g. {1,2,3} or {"a","b"}
+                        let inner = &s[1..s.len() - 1].trim();
+                        if inner.is_empty() {
+                            "ARRAY[]".to_string()
+                        } else {
+                            let mut elems = Vec::new();
+                            for item in inner.split(',') {
+                                let item = item.trim();
+                                let unquoted = item.trim_matches('"');
+                                if unquoted.eq_ignore_ascii_case("null") {
+                                    elems.push("NULL".to_string());
+                                } else if unquoted.parse::<i64>().is_ok()
+                                    || unquoted.parse::<f64>().is_ok()
+                                {
+                                    elems.push(unquoted.to_string());
+                                } else {
+                                    elems.push(format!("'{}'", unquoted.replace('\'', "''")));
+                                }
+                            }
+                            format!("ARRAY[{}]", elems.join(", "))
+                        }
+                    } else if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
                         s.to_string()
                     } else {
                         format!("'{}'", s.replace('\'', "''"))
@@ -16997,6 +17138,25 @@ fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
         // Now replace bare `$N` placeholders.
         result = result.replace(&placeholder, &replacement);
     }
+
+    // Normalize `= ANY(ARRAY[...])` expressions to `IN (...)`
+    while let Some(pos) = result.find("= ANY(ARRAY[") {
+        if let Some(end_bracket) = result[pos..].find(']') {
+            let close_paren = pos + end_bracket + 1;
+            if close_paren < result.len() && result.as_bytes()[close_paren] == b')' {
+                let inner = &result[pos + "= ANY(ARRAY[".len()..pos + end_bracket];
+                let in_expr = if inner.trim().is_empty() {
+                    "IN (NULL)".to_string()
+                } else {
+                    format!("IN ({})", inner)
+                };
+                result.replace_range(pos..close_paren + 1, &in_expr);
+                continue;
+            }
+        }
+        break;
+    }
+
     result
 }
 

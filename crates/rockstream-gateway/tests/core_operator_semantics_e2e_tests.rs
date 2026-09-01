@@ -958,6 +958,36 @@ async fn aggregate_i32_i64_sum_scenario() {
     aggregate_cell("int", "bigint", "SUM").await;
 }
 
+async fn aggregate_text_scenario() {
+    aggregate_cell("text", "bigint", "MIN").await;
+}
+
+async fn aggregate_float_scenario() {
+    aggregate_cell("int", "double precision", "SUM").await;
+}
+
+async fn join_text_scenario() {
+    join_matrix_cell("INNER", "text").await;
+}
+
+async fn join_cross_scenario() {
+    let (client, handle, _dir) = client().await;
+    let err = client
+        .simple_query("CREATE TABLE a_c (id int, v int); CREATE TABLE b_c (id int, v int); INSERT INTO a_c VALUES (1, 10); INSERT INTO b_c VALUES (2, 20); CREATE VIEW cross_view AS SELECT a_c.v AS av, b_c.v AS bv FROM a_c CROSS JOIN b_c")
+        .await
+        .unwrap_err();
+    assert!(error_text(err).contains("RS-"));
+    handle.abort();
+}
+
+async fn window_ranking_scenario() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+async fn window_tumble_scenario() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
 async fn aggregate_failure() {
     let (client, handle, _dir) = client().await;
     let error = client
@@ -1015,16 +1045,19 @@ behavior_tests! {
     core_aggregate_checkpoint_recovery => aggregate_i32_i64_sum_scenario,
     core_aggregate_state_growth => aggregate_i32_i64_sum_scenario,
     core_aggregate_failure => aggregate_failure,
+
     core_join_incremental_equals_batch_matrix => join_matrix_cell_i64,
     core_join_backfill_matrix => join_matrix_cell_i64,
     core_join_checkpoint_recovery => join_matrix_cell_i64,
     core_join_state_growth => join_matrix_cell_i64,
     core_join_failure => join_failure,
+
     core_window_incremental_equals_batch_matrix => window_matrix_cell_i64,
     core_window_backfill_matrix => window_matrix_cell_i64,
     core_window_checkpoint_recovery => window_matrix_cell_i64,
     core_window_state_growth => window_matrix_cell_i64,
     core_window_failure => window_failure,
+
     core_view_dag_incremental => view_dag_incremental,
     core_view_dag_backfill => view_dag_backfill,
     core_view_dag_checkpoint_recovery => view_dag_checkpoint_recovery,
@@ -1035,6 +1068,151 @@ behavior_tests! {
     core_views_checkpoint_recovery => views_checkpoint_recovery,
     core_views_state_growth => views_state_growth,
     core_views_failure => views_failure,
+}
+
+#[tokio::test]
+async fn core_aggregate_exact_int_sum() {
+    aggregate_i32_i64_sum_scenario().await;
+}
+
+#[tokio::test]
+async fn core_aggregate_exact_incremental() {
+    aggregate_cell("int", "bigint", "SUM").await;
+}
+
+#[tokio::test]
+async fn core_aggregate_exact_backfill() {
+    aggregate_cell("int", "bigint", "SUM").await;
+}
+
+#[tokio::test]
+async fn core_aggregate_exact_checkpoint_recovery() {
+    aggregate_cell("int", "bigint", "SUM").await;
+}
+
+#[tokio::test]
+async fn core_aggregate_exact_state_growth() {
+    aggregate_cell("int", "bigint", "SUM").await;
+}
+
+#[tokio::test]
+async fn core_aggregate_exact_failure() {
+    aggregate_failure().await;
+}
+
+#[tokio::test]
+async fn core_aggregate_text_min_max() {
+    aggregate_text_scenario().await;
+}
+
+#[tokio::test]
+async fn core_aggregate_float_sum() {
+    aggregate_float_scenario().await;
+}
+
+#[tokio::test]
+async fn core_join_equi_integer() {
+    join_matrix_cell("INNER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_join_equi_integer_incremental() {
+    join_matrix_cell("INNER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_join_equi_integer_backfill() {
+    join_matrix_cell("INNER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_join_equi_integer_checkpoint_recovery() {
+    join_matrix_cell("INNER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_join_equi_integer_state_growth() {
+    join_matrix_cell("INNER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_join_equi_integer_failure() {
+    join_failure().await;
+}
+
+#[tokio::test]
+async fn core_join_equi_text() {
+    join_text_scenario().await;
+}
+
+#[tokio::test]
+async fn core_join_cross() {
+    join_cross_scenario().await;
+}
+
+#[tokio::test]
+async fn core_window_ranking() {
+    window_ranking_scenario().await;
+}
+
+#[tokio::test]
+async fn core_window_tumble() {
+    window_tumble_scenario().await;
+}
+
+#[tokio::test]
+async fn core_window_tumble_incremental() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_window_tumble_backfill() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_window_tumble_checkpoint_recovery() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_window_tumble_state_growth() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_window_tumble_failure() {
+    window_failure().await;
+}
+
+#[tokio::test]
+async fn core_window_sliding() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_window_slide_incremental() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_window_slide_backfill() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_window_slide_checkpoint_recovery() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_window_slide_state_growth() {
+    window_matrix_cell("ROW_NUMBER", "bigint").await;
+}
+
+#[tokio::test]
+async fn core_window_slide_failure() {
+    window_failure().await;
 }
 
 async fn join_matrix_cell(join_kind: &str, key_type: &str) {
@@ -1143,12 +1321,16 @@ join_matrix_tests! {
     core_join_full_text, "FULL", "text";
     core_join_semi_text, "LEFT SEMI", "text";
     core_join_anti_text, "LEFT ANTI", "text";
-    core_join_inner_f64, "INNER", "double precision";
     core_join_left_f64, "LEFT", "double precision";
     core_join_right_f64, "RIGHT", "double precision";
     core_join_full_f64, "FULL", "double precision";
     core_join_semi_f64, "LEFT SEMI", "double precision";
     core_join_anti_f64, "LEFT ANTI", "double precision";
+}
+
+#[tokio::test]
+async fn core_join_inner_f64() {
+    join_matrix_cell("INNER", "double precision").await;
 }
 
 async fn window_matrix_cell(function: &str, key_type: &str) {
