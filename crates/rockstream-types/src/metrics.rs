@@ -1512,10 +1512,8 @@ pub fn read_stage_timestamps(view_name: &str) -> Vec<StageTimestamps> {
     })
 }
 
-pub fn set_barrier_injected_at(checkpoint_id: u64, injected_at_ms: u64) {
+pub fn set_barrier_injected_at(_checkpoint_id: u64, injected_at_ms: u64) {
     with_registry(|reg| {
-        reg.barrier_flight_last_checkpoint_id
-            .store(checkpoint_id, Ordering::Relaxed);
         reg.barrier_flight_injected_at_ms
             .store(injected_at_ms, Ordering::Relaxed);
     });
@@ -3364,6 +3362,37 @@ mod tests {
         assert!(metrics.contains("view_freshness_lag_end_to_end_ms{view_name=\"active_users\"} 40"));
         assert!(metrics.contains("checkpoint_barrier_flight_time_ms 25"));
         assert!(metrics.contains("checkpoint_completion_time_ms 80"));
+    }
+
+    #[test]
+    fn barrier_flight_last_checkpoint_id_advances_only_on_completion() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        set_barrier_injected_at(41, 4_000);
+        record_checkpoint_completed(41, 4_100);
+        assert_eq!(
+            read_barrier_flight_stats(),
+            BarrierFlightStats {
+                barrier_injected_at_ms: 4_000,
+                barrier_flight_time_ms: 0,
+                checkpoint_completion_time_ms: 100,
+                last_checkpoint_id: 41,
+                samples_count: 1,
+            }
+        );
+
+        set_barrier_injected_at(42, 5_000);
+        assert_eq!(
+            read_barrier_flight_stats(),
+            BarrierFlightStats {
+                barrier_injected_at_ms: 5_000,
+                barrier_flight_time_ms: 0,
+                checkpoint_completion_time_ms: 100,
+                last_checkpoint_id: 41,
+                samples_count: 1,
+            }
+        );
     }
 
     #[test]
