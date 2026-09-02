@@ -41,6 +41,19 @@ min_epoch_msec = 10
 }
 
 #[test]
+fn test_cluster_shutdown_timeout_secs_is_known_key() {
+    let toml_str = r#"
+[cluster]
+shutdown_timeout_secs = 45
+"#;
+    let report = validate_config_str(toml_str, false);
+    assert_eq!(
+        report,
+        rockstream_types::config_validation::ConfigValidationReport::success()
+    );
+}
+
+#[test]
 fn test_deprecated_tiering_keys() {
     let toml_str = r#"
 [storage.tiering]

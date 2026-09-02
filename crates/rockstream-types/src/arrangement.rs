@@ -503,7 +503,7 @@ impl CanonicalKeyCodec {
     /// Decode a single literal from slice, returning (literal, remaining_slice).
     pub fn decode_literal(data: &[u8]) -> Result<(CanonicalLiteral, &[u8]), String> {
         if data.is_empty() {
-            return Err("Unexpected EOF while decoding CanonicalLiteral".to_string());
+            return Err("RS-1021: Unexpected EOF while decoding CanonicalLiteral".to_string());
         }
         let tag = data[0];
         let rest = &data[1..];
@@ -511,13 +511,13 @@ impl CanonicalKeyCodec {
             0x00 => Ok((CanonicalLiteral::Null, rest)),
             0x01 => {
                 if rest.is_empty() {
-                    return Err("Unexpected EOF decoding Bool".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Bool".to_string());
                 }
                 Ok((CanonicalLiteral::Bool(rest[0] != 0), &rest[1..]))
             }
             0x02 => {
                 if rest.len() < 2 {
-                    return Err("Unexpected EOF decoding Int16".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Int16".to_string());
                 }
                 let raw = u16::from_be_bytes(rest[..2].try_into().unwrap());
                 let val = (raw ^ (1 << 15)) as i16;
@@ -525,7 +525,7 @@ impl CanonicalKeyCodec {
             }
             0x03 => {
                 if rest.len() < 4 {
-                    return Err("Unexpected EOF decoding Int32".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Int32".to_string());
                 }
                 let raw = u32::from_be_bytes(rest[..4].try_into().unwrap());
                 let val = (raw ^ (1 << 31)) as i32;
@@ -533,7 +533,7 @@ impl CanonicalKeyCodec {
             }
             0x04 => {
                 if rest.len() < 8 {
-                    return Err("Unexpected EOF decoding Int64".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Int64".to_string());
                 }
                 let raw = u64::from_be_bytes(rest[..8].try_into().unwrap());
                 let val = (raw ^ (1 << 63)) as i64;
@@ -541,21 +541,21 @@ impl CanonicalKeyCodec {
             }
             0x05 => {
                 if rest.len() < 4 {
-                    return Err("Unexpected EOF decoding Float32".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Float32".to_string());
                 }
                 let raw = u32::from_be_bytes(rest[..4].try_into().unwrap());
                 Ok((CanonicalLiteral::Float32(raw), &rest[4..]))
             }
             0x06 => {
                 if rest.len() < 8 {
-                    return Err("Unexpected EOF decoding Float64".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Float64".to_string());
                 }
                 let raw = u64::from_be_bytes(rest[..8].try_into().unwrap());
                 Ok((CanonicalLiteral::Float64(raw), &rest[8..]))
             }
             0x07 => {
                 if rest.len() < 18 {
-                    return Err("Unexpected EOF decoding Decimal".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Decimal".to_string());
                 }
                 let raw = u128::from_be_bytes(rest[..16].try_into().unwrap());
                 let precision = rest[16];
@@ -576,7 +576,9 @@ impl CanonicalKeyCodec {
                 while i < rest.len() {
                     if rest[i] == 0 {
                         if i + 1 >= rest.len() {
-                            return Err("Truncated null-escape sequence in Utf8".to_string());
+                            return Err(
+                                "RS-1021: Truncated null-escape sequence in Utf8".to_string()
+                            );
                         }
                         if rest[i + 1] == 0 {
                             let s = std::str::from_utf8(&bytes)
@@ -587,14 +589,14 @@ impl CanonicalKeyCodec {
                             bytes.push(0);
                             i += 2;
                         } else {
-                            return Err("Invalid escape byte in Utf8".to_string());
+                            return Err("RS-1021: Invalid escape byte in Utf8".to_string());
                         }
                     } else {
                         bytes.push(rest[i]);
                         i += 1;
                     }
                 }
-                Err("Unterminated Utf8 string in CanonicalLiteral".to_string())
+                Err("RS-1021: Unterminated Utf8 string in CanonicalLiteral".to_string())
             }
             0x09 => {
                 let mut bytes = Vec::new();
@@ -602,7 +604,9 @@ impl CanonicalKeyCodec {
                 while i < rest.len() {
                     if rest[i] == 0 {
                         if i + 1 >= rest.len() {
-                            return Err("Truncated null-escape sequence in Bytes".to_string());
+                            return Err(
+                                "RS-1021: Truncated null-escape sequence in Bytes".to_string()
+                            );
                         }
                         if rest[i + 1] == 0 {
                             return Ok((CanonicalLiteral::Bytes(bytes), &rest[i + 2..]));
@@ -610,18 +614,18 @@ impl CanonicalKeyCodec {
                             bytes.push(0);
                             i += 2;
                         } else {
-                            return Err("Invalid escape byte in Bytes".to_string());
+                            return Err("RS-1021: Invalid escape byte in Bytes".to_string());
                         }
                     } else {
                         bytes.push(rest[i]);
                         i += 1;
                     }
                 }
-                Err("Unterminated Bytes in CanonicalLiteral".to_string())
+                Err("RS-1021: Unterminated Bytes in CanonicalLiteral".to_string())
             }
             0x0A => {
                 if rest.len() < 4 {
-                    return Err("Unexpected EOF decoding Date".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Date".to_string());
                 }
                 let raw = u32::from_be_bytes(rest[..4].try_into().unwrap());
                 let val = (raw ^ (1 << 31)) as i32;
@@ -629,7 +633,7 @@ impl CanonicalKeyCodec {
             }
             0x0B => {
                 if rest.len() < 8 {
-                    return Err("Unexpected EOF decoding Timestamp".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Timestamp".to_string());
                 }
                 let raw = u64::from_be_bytes(rest[..8].try_into().unwrap());
                 let val = (raw ^ (1 << 63)) as i64;
@@ -637,7 +641,7 @@ impl CanonicalKeyCodec {
             }
             0x0C => {
                 if rest.len() < 8 {
-                    return Err("Unexpected EOF decoding TimestampTz".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding TimestampTz".to_string());
                 }
                 let raw = u64::from_be_bytes(rest[..8].try_into().unwrap());
                 let val = (raw ^ (1 << 63)) as i64;
@@ -645,7 +649,7 @@ impl CanonicalKeyCodec {
             }
             0x0D => {
                 if rest.len() < 16 {
-                    return Err("Unexpected EOF decoding Interval".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Interval".to_string());
                 }
                 let m_raw = u32::from_be_bytes(rest[..4].try_into().unwrap());
                 let d_raw = u32::from_be_bytes(rest[4..8].try_into().unwrap());
@@ -664,7 +668,7 @@ impl CanonicalKeyCodec {
             }
             0x0E => {
                 if rest.len() < 16 {
-                    return Err("Unexpected EOF decoding Uuid".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Uuid".to_string());
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&rest[..16]);
@@ -672,7 +676,7 @@ impl CanonicalKeyCodec {
             }
             0x0F => {
                 if rest.len() < 4 {
-                    return Err("Unexpected EOF decoding Array count".to_string());
+                    return Err("RS-1021: Unexpected EOF decoding Array count".to_string());
                 }
                 let count = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
                 let mut cur = &rest[4..];
@@ -684,7 +688,10 @@ impl CanonicalKeyCodec {
                 }
                 Ok((CanonicalLiteral::Array(elems), cur))
             }
-            other => Err(format!("Unknown CanonicalLiteral tag: 0x{:02X}", other)),
+            other => Err(format!(
+                "RS-1021: Unknown CanonicalLiteral tag: 0x{:02X}",
+                other
+            )),
         }
     }
 

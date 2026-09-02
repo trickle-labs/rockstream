@@ -147,6 +147,7 @@ const KNOWN_CLUSTER_KEYS: &[&str] = &[
     "state_budget_gb",
     "index_prefer_selectivity_threshold",
     "index_max_lag_ms",
+    "shutdown_timeout_secs",
     "autotuner",
     "skew_split",
     "scatter_pruning",
