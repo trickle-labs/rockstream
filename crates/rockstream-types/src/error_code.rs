@@ -536,6 +536,10 @@ pub const RS_3029: ErrorCode = ErrorCode::new(3029);
 pub const RS_3030: ErrorCode = ErrorCode::new(3030);
 /// Invalid EXPLAIN INCREMENTAL ESTIMATE query or options.
 pub const RS_3031: ErrorCode = ErrorCode::new(3031);
+/// Release candidate qualification gate rejected candidate evidence.
+pub const RS_3032: ErrorCode = ErrorCode::new(3032);
+/// Anti-cheat harness mutation or invalid execution detected.
+pub const RS_3033: ErrorCode = ErrorCode::new(3033);
 /// Merge-law accumulator wire bytes have the wrong size.
 pub const RS_3501: ErrorCode = ErrorCode::new(3501);
 /// Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded.
@@ -964,6 +968,32 @@ mod tests {
                 2426,
                 "secret.in_use_by_source_or_sink",
                 Severity::Error,
+            ),
+        ];
+
+        for (code, val, expected_slug, expected_sev) in codes {
+            assert_eq!(code.value(), val);
+            assert_eq!(slug(code), expected_slug);
+            assert_eq!(severity(code), expected_sev);
+            assert!(!description(code).is_empty());
+            assert!(!next_steps(code).is_empty());
+        }
+    }
+
+    #[test]
+    fn qualification_error_codes_registered() {
+        let codes = [
+            (
+                RS_3032,
+                3032,
+                "qualification.release_gate_rejection",
+                Severity::Error,
+            ),
+            (
+                RS_3033,
+                3033,
+                "qualification.harness_invalidation",
+                Severity::Fatal,
             ),
         ];
 

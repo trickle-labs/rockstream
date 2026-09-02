@@ -39,6 +39,7 @@ pub mod metrics;
 pub mod migration;
 pub mod mutation_policy;
 pub mod platform;
+pub mod qualification;
 pub mod raft;
 pub mod rendezvous;
 pub mod schema_evolution;
@@ -81,6 +82,12 @@ pub use lifecycle::{
 };
 pub use limits::{SystemLimit, SystemLimitsCatalog};
 pub use platform::{ClassificationTier, PlatformClassification, PlatformClassifier};
+pub use qualification::{
+    QualificationAggregateMetrics, QualificationError, QualificationEvidenceManifest,
+    QualificationGateDecision, QualificationGateRejection, QualificationProfile,
+    QualificationReleaseGate, QualificationRun, QualificationRunStatus, QualificationWorkload,
+    TopologySpec, WorkloadRunResult,
+};
 pub use shared_window::{SharedWindowSpec, SharedWindowSpecError};
 pub use state_mutation::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 

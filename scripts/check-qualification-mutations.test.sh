@@ -30,15 +30,39 @@ OBSERVATIONS=(
   "test_observe_first_post_recovery_query_correctness"
 )
 
-mkdir -p "$TMP_DIR/scripts" "$TMP_DIR/crates/rockstream-sim/tests"
+mkdir -p "$TMP_DIR/scripts" "$TMP_DIR/crates/rockstream-sim/tests" "$TMP_DIR/crates/rockstream-types/tests"
 cp "$ROOT/scripts/check-qualification-mutations.sh" "$TMP_DIR/scripts/"
+cp "$ROOT/crates/rockstream-types/tests/qualification_harness_mutation_tests.rs" "$TMP_DIR/crates/rockstream-types/tests/"
 
 for obs in "${OBSERVATIONS[@]}"; do
   # Create mutated file with one observation removed
   grep -v "$obs" "$TEST_FILE" > "$TMP_DIR/crates/rockstream-sim/tests/qualification_recovery_tests.rs"
-  if bash "$TMP_DIR/scripts/check-qualification-mutations.sh" >/dev/null 2>&1; then
+  if (cd "$TMP_DIR" && bash "$TMP_DIR/scripts/check-qualification-mutations.sh" >/dev/null 2>&1); then
     fail "Mutation removing '$obs' was erroneously accepted"
   fi
 done
+cp "$TEST_FILE" "$TMP_DIR/crates/rockstream-sim/tests/"
 
-echo "OK: All 8 recovery observation mutation checks passed (falsifiability proven)."
+MUTATIONS=(
+  "single_process_simulation_rejected"
+  "duplicate_worker_id_rejected"
+  "idle_worker_rejected"
+  "unowned_shard_rejected"
+  "generator_saturation_rejected"
+  "sink_consumer_lag_rejected"
+  "stale_oracle_result_rejected"
+  "duplicate_or_lost_sink_output_rejected"
+  "constant_timestamp_rejected"
+  "skipped_workload_rejected"
+  "environment_shift_rejected"
+)
+
+MUTATION_SRC="$ROOT/crates/rockstream-types/tests/qualification_harness_mutation_tests.rs"
+for mut in "${MUTATIONS[@]}"; do
+  grep -v "$mut" "$MUTATION_SRC" > "$TMP_DIR/crates/rockstream-types/tests/qualification_harness_mutation_tests.rs"
+  if (cd "$TMP_DIR" && bash "$TMP_DIR/scripts/check-qualification-mutations.sh" >/dev/null 2>&1); then
+    fail "Mutation removing '$mut' was erroneously accepted"
+  fi
+done
+
+echo "OK: All 8 recovery observation and 11 anti-cheat mutation checks passed (falsifiability proven)."

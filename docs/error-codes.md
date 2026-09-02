@@ -989,6 +989,8 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-3029`](#rs-3029) | `connector.incompatible_version` | Incompatible external database or broker version | `Error` | `0A000` | `NonRetryable` |
 | [`RS-3030`](#rs-3030) | `capacity.sample_batch_flush_failure` | Capacity sample batch flush failure | `Error` | `58000` | `NonRetryable` |
 | [`RS-3031`](#rs-3031) | `capacity.invalid_estimate_request` | Invalid EXPLAIN INCREMENTAL ESTIMATE query or options | `Error` | `42601` | `NonRetryable` |
+| [`RS-3032`](#rs-3032) | `qualification.release_gate_rejection` | Release candidate qualification gate rejected candidate evidence | `Error` | `58000` | `NonRetryable` |
+| [`RS-3033`](#rs-3033) | `qualification.harness_invalidation` | Anti-cheat harness mutation or invalid execution detected | `Fatal` | `58000` | `NonRetryable` |
 | [`RS-3501`](#rs-3501) | `merge_law.accumulator_decode_error` | Merge-law accumulator wire bytes have the wrong size | `Error` | `22000` | `NonRetryable` |
 | [`RS-3601`](#rs-3601) | `checkpoint.alignment_buffer_overflow` | Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded | `Error` | `53200` | `ExponentialBackoff` |
 | [`RS-3602`](#rs-3602) | `cluster.checkpoint_recovery_in_progress` | Cluster checkpoint recovery in progress | `Warning` | `55000` | `AfterClusterRecovery` |
@@ -1218,6 +1220,22 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `42601`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Check the SQL query syntax, target view name, and cardinality hints supplied to EXPLAIN INCREMENTAL ESTIMATE.
+
+### <a id="rs-3032"></a> `RS-3032` — Release candidate qualification gate rejected candidate evidence
+
+- **Key**: `qualification.release_gate_rejection`
+- **Severity**: `Error`
+- **SQLSTATE**: `58000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Inspect qualification run failures, verify scaling floors, error ranges, and candidate identity invariants.
+
+### <a id="rs-3033"></a> `RS-3033` — Anti-cheat harness mutation or invalid execution detected
+
+- **Key**: `qualification.harness_invalidation`
+- **Severity**: `Fatal`
+- **SQLSTATE**: `58000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Verify multi-process worker isolation, distinct WorkerIds, active shard leases, and untampered timestamps.
 
 ### <a id="rs-3501"></a> `RS-3501` — Merge-law accumulator wire bytes have the wrong size
 

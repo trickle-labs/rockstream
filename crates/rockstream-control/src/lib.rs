@@ -29,6 +29,7 @@ pub mod kek;
 pub mod migration;
 pub mod namespace;
 pub mod placement;
+pub mod qualification_store;
 pub mod raft;
 pub mod scheduler;
 pub mod secret_store;
@@ -65,6 +66,7 @@ pub use migration::{
 };
 pub use namespace::NamespaceCatalog;
 pub use placement::PlacementAlgorithm;
+pub use qualification_store::QualificationEvidenceStore;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use secret_store::{SecretListing, SecretStore, SecretStoreError};
 pub use service::{ControlService, ControlServiceHandle};

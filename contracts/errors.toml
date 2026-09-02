@@ -1253,6 +1253,26 @@ retry_class = "NonRetryable"
 default_next_steps = "Check the SQL query syntax, target view name, and cardinality hints supplied to EXPLAIN INCREMENTAL ESTIMATE."
 doc_anchor = "rs-3031"
 
+[[error]]
+code = "RS-3032"
+key = "qualification.release_gate_rejection"
+title = "Release candidate qualification gate rejected candidate evidence"
+severity = "Error"
+sqlstate = "58000"
+retry_class = "NonRetryable"
+default_next_steps = "Inspect qualification run failures, verify scaling floors, error ranges, and candidate identity invariants."
+doc_anchor = "rs-3032"
+
+[[error]]
+code = "RS-3033"
+key = "qualification.harness_invalidation"
+title = "Anti-cheat harness mutation or invalid execution detected"
+severity = "Fatal"
+sqlstate = "58000"
+retry_class = "NonRetryable"
+default_next_steps = "Verify multi-process worker isolation, distinct WorkerIds, active shard leases, and untampered timestamps."
+doc_anchor = "rs-3033"
+
 
 [[error]]
 code = "RS-3501"

@@ -1,24 +1,24 @@
-//! Capacity threshold manifest and raw chunk durable storage (v0.59.23 Slice 5 / Phase 3b).
+//! Qualification evidence manifest and raw chunk durable storage (v0.59.24 Slice 7 / Phase 3b).
 
 use std::sync::Arc;
 
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::ObjectStore;
-use rockstream_types::capacity::CapacityThresholdManifest;
+use rockstream_types::qualification::QualificationEvidenceManifest;
 
-/// Durable store for capacity threshold manifest and raw measurement chunks.
+/// Durable store for qualification evidence manifest and raw measurement chunks.
 #[derive(Debug, Clone)]
-pub struct CapacityThresholdStore {
+pub struct QualificationEvidenceStore {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
 }
 
-impl CapacityThresholdStore {
+impl QualificationEvidenceStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self {
             store,
-            prefix: Path::from("control/capacity"),
+            prefix: Path::from("control/qualification"),
         }
     }
 
@@ -30,89 +30,92 @@ impl CapacityThresholdStore {
     }
 
     fn manifest_path(&self) -> Path {
-        self.prefix.child("capacity-manifest.json")
+        self.prefix.child("qualification-manifest.json")
     }
 
     fn chunk_path(&self, chunk_id: &str) -> Path {
         self.prefix.child("chunks").child(chunk_id)
     }
 
-    /// Persist the sealed threshold manifest with create-only semantics.
+    /// Persist the sealed qualification evidence manifest with create-only semantics.
     ///
     /// Fails with an error if the manifest already exists (mutations prohibited).
-    pub async fn save_manifest(&self, manifest: &CapacityThresholdManifest) -> Result<(), String> {
+    pub async fn save_manifest(
+        &self,
+        manifest: &QualificationEvidenceManifest,
+    ) -> Result<(), String> {
         let manifest_path = self.manifest_path();
 
         // Enforce create-only storage: verify it does not already exist
         if self.store.head(&manifest_path).await.is_ok() {
             return Err(format!(
-                "RS-3030: Capacity threshold manifest already exists at '{}'; mutation prohibited",
+                "RS-3032: Qualification evidence manifest already exists at '{}'; mutation prohibited",
                 manifest_path
             ));
         }
 
         let payload = serde_json::to_vec_pretty(manifest)
-            .map_err(|e| format!("RS-3030: serialize manifest: {e}"))?;
+            .map_err(|e| format!("RS-3032: serialize qualification manifest: {e}"))?;
 
         self.store
             .put(&manifest_path, payload.into())
             .await
             .map(|_| ())
-            .map_err(|e| format!("RS-3030: persist capacity manifest: {e}"))
+            .map_err(|e| format!("RS-3032: persist qualification manifest: {e}"))
     }
 
-    /// Load the sealed threshold manifest if present.
-    pub async fn load_manifest(&self) -> Result<Option<CapacityThresholdManifest>, String> {
+    /// Load the sealed qualification evidence manifest if present.
+    pub async fn load_manifest(&self) -> Result<Option<QualificationEvidenceManifest>, String> {
         let manifest_path = self.manifest_path();
         let get_result = match self.store.get(&manifest_path).await {
             Ok(res) => res,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(format!("RS-3030: get capacity manifest: {e}")),
+            Err(e) => return Err(format!("RS-3032: get qualification manifest: {e}")),
         };
 
         let bytes = get_result
             .bytes()
             .await
-            .map_err(|e| format!("RS-3030: read capacity manifest bytes: {e}"))?;
+            .map_err(|e| format!("RS-3032: read qualification manifest bytes: {e}"))?;
 
-        let manifest: CapacityThresholdManifest = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("RS-3030: deserialize capacity manifest: {e}"))?;
+        let manifest: QualificationEvidenceManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("RS-3032: deserialize qualification manifest: {e}"))?;
 
         // Verify cryptographic seal integrity upon load
         manifest
             .verify_seal()
-            .map_err(|e| format!("RS-3030: manifest integrity verification failed: {e}"))?;
+            .map_err(|e| format!("RS-3032: manifest integrity verification failed: {e}"))?;
 
         Ok(Some(manifest))
     }
 
-    /// Save an immutable raw capacity record chunk.
+    /// Save an immutable raw qualification record chunk.
     pub async fn save_raw_chunk(&self, chunk_id: &str, chunk_bytes: &[u8]) -> Result<(), String> {
         let path = self.chunk_path(chunk_id);
         self.store
             .put(&path, chunk_bytes.to_vec().into())
             .await
             .map(|_| ())
-            .map_err(|e| format!("RS-3030: persist raw chunk '{chunk_id}': {e}"))
+            .map_err(|e| format!("RS-3032: persist raw chunk '{chunk_id}': {e}"))
     }
 
-    /// Load all raw capacity chunks under `chunks/`.
+    /// Load all raw qualification chunks under `chunks/`.
     pub async fn load_raw_chunks(&self) -> Result<Vec<Vec<u8>>, String> {
         let chunks_prefix = self.prefix.child("chunks");
         let mut list_stream = self.store.list(Some(&chunks_prefix));
         let mut chunks = Vec::new();
 
         while let Some(meta_res) = list_stream.next().await {
-            let meta = meta_res.map_err(|e| format!("RS-3030: list raw chunks: {e}"))?;
+            let meta = meta_res.map_err(|e| format!("RS-3032: list raw chunks: {e}"))?;
             let get_res = self
                 .store
                 .get(&meta.location)
                 .await
-                .map_err(|e| format!("RS-3030: get raw chunk '{}': {e}", meta.location))?;
+                .map_err(|e| format!("RS-3032: get raw chunk '{}': {e}", meta.location))?;
             let bytes = get_res
                 .bytes()
                 .await
-                .map_err(|e| format!("RS-3030: read raw chunk bytes: {e}"))?;
+                .map_err(|e| format!("RS-3032: read raw chunk bytes: {e}"))?;
             chunks.push(bytes.to_vec());
         }
 
@@ -132,11 +135,11 @@ impl CapacityThresholdStore {
         let mut deleted_count = 0;
 
         while let Some(meta_res) = list_stream.next().await {
-            let meta = meta_res.map_err(|e| format!("RS-3030: scan objects for cleanup: {e}"))?;
+            let meta = meta_res.map_err(|e| format!("RS-3032: scan objects for cleanup: {e}"))?;
             self.store
                 .delete(&meta.location)
                 .await
-                .map_err(|e| format!("RS-3030: delete object '{}': {e}", meta.location))?;
+                .map_err(|e| format!("RS-3032: delete object '{}': {e}", meta.location))?;
             deleted_count += 1;
         }
 

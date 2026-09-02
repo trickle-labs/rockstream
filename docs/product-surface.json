@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "f3963ed37052091d27a07ccbb189586f7866599ed70e1a9270ac173f0ca6deed",
+    "candidate_identity_digest": "8ac497fc7f89345b3ba0ae1163cc91c7a26c4e696d04a36a420604bf25e3cf48",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -5758,6 +5758,26 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Check the SQL query syntax, target view name, and cardinality hints supplied to EXPLAIN INCREMENTAL ESTIMATE.",
         "doc_anchor": "rs-3031"
+      },
+      {
+        "code": "RS-3032",
+        "key": "qualification.release_gate_rejection",
+        "title": "Release candidate qualification gate rejected candidate evidence",
+        "severity": "ERROR",
+        "sqlstate": "58000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Inspect qualification run failures, verify scaling floors, error ranges, and candidate identity invariants.",
+        "doc_anchor": "rs-3032"
+      },
+      {
+        "code": "RS-3033",
+        "key": "qualification.harness_invalidation",
+        "title": "Anti-cheat harness mutation or invalid execution detected",
+        "severity": "FATAL",
+        "sqlstate": "58000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Verify multi-process worker isolation, distinct WorkerIds, active shard leases, and untampered timestamps.",
+        "doc_anchor": "rs-3033"
       },
       {
         "code": "RS-3501",
