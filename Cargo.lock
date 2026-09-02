@@ -2827,15 +2827,6 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hmac"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
-dependencies = [
- "digest 0.10.7",
-]
-
-[[package]]
-name = "hmac"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
@@ -4213,7 +4204,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "fallible-iterator",
- "hmac 0.13.0",
+ "hmac",
  "md-5 0.11.0",
  "memchr",
  "rand 0.10.1",
@@ -4982,7 +4973,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
- "hmac 0.12.1",
+ "hmac",
  "object_store 0.12.5",
  "proptest",
  "rand 0.8.6",
@@ -5015,7 +5006,7 @@ dependencies = [
  "criterion",
  "futures",
  "hex",
- "hmac 0.12.1",
+ "hmac",
  "object_store 0.12.5",
  "parking_lot",
  "proptest",
@@ -5109,7 +5100,7 @@ dependencies = [
  "datafusion",
  "futures",
  "hex",
- "hmac 0.12.1",
+ "hmac",
  "lru",
  "md5",
  "object_store 0.12.5",
@@ -5164,7 +5155,7 @@ dependencies = [
  "criterion",
  "datafusion",
  "hex",
- "hmac 0.12.1",
+ "hmac",
  "object_store 0.12.5",
  "proptest",
  "rand 0.8.6",
@@ -5197,7 +5188,7 @@ dependencies = [
  "bytes",
  "datafusion",
  "hex",
- "hmac 0.12.1",
+ "hmac",
  "object_store 0.12.5",
  "parking_lot",
  "proptest",
@@ -5246,7 +5237,7 @@ dependencies = [
  "criterion",
  "futures",
  "hex",
- "hmac 0.12.1",
+ "hmac",
  "lz4_flex 0.14.0",
  "object_store 0.12.5",
  "parking_lot",
@@ -5292,7 +5283,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
- "hmac 0.12.1",
+ "hmac",
  "object_store 0.12.5",
  "parking_lot",
  "rand 0.8.6",
@@ -5330,7 +5321,7 @@ dependencies = [
  "bytes",
  "datafusion",
  "hex",
- "hmac 0.12.1",
+ "hmac",
  "object_store 0.12.5",
  "parking_lot",
  "reqwest",
@@ -5363,7 +5354,7 @@ dependencies = [
  "criterion",
  "futures",
  "hex",
- "hmac 0.12.1",
+ "hmac",
  "libc",
  "moka",
  "object_store 0.12.5",
