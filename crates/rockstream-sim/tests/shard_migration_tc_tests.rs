@@ -46,6 +46,12 @@ impl TcCluster {
     async fn boot(test_id: &str) -> Self {
         let network = format!("rs-m46-net-{test_id}");
         let shared_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(shared_dir.path(), std::fs::Permissions::from_mode(0o777));
+        }
         let control_name = format!("rs-m46-control-{test_id}");
         let donor_name = format!("rs-m46-donor-{test_id}");
         let recipient_name = format!("rs-m46-recipient-{test_id}");

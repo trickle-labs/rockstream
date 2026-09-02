@@ -227,6 +227,11 @@ async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
     let kafka_name = format!("{network}-kafka");
     let minio_name = format!("{network}-minio");
     let shared_dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(shared_dir.path(), std::fs::Permissions::from_mode(0o777));
+    }
 
     let control = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
         .with_wait_for(WaitFor::message_on_stdout("control service listening"))

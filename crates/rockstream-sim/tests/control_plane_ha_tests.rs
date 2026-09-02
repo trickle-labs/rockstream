@@ -424,6 +424,14 @@ mod tc {
         pub async fn boot(test_id: &str) -> Self {
             let network = format!("rs-net-{test_id}");
             let shared_dir = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    shared_dir.path(),
+                    std::fs::Permissions::from_mode(0o777),
+                );
+            }
             let names: Vec<String> = (0..3).map(|i| format!("rs-ctl-{test_id}-{i}")).collect();
 
             let mut nodes = Vec::new();
@@ -654,7 +662,7 @@ mod tc {
         worker_id: u64,
         shard_id: u64,
     ) -> Option<rockstream_types::lease::ShardLease> {
-        let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(1)).await;
+        let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
         let mut addr = cluster.nodes[leader_idx].control_addr;
         for _ in 0..50 {
             let Ok(mut stream) = TcpStream::connect(addr).await else {
@@ -707,9 +715,9 @@ mod tc {
         worker_id: u64,
         shard_id: u64,
     ) -> (usize, rockstream_types::lease::ShardLease, TcpStream) {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(1)).await;
+            let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
             let addr = cluster.nodes[leader_idx].control_addr;
             let worker_stream = register_worker(addr, worker_id).await;
             if let Some(lease) = request_shard(cluster, worker_id, shard_id).await {

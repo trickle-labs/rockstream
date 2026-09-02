@@ -45,6 +45,12 @@ impl TcCluster {
     async fn boot(test_id: &str) -> Self {
         let network = format!("rs-m46-drain-net-{test_id}");
         let shared_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(shared_dir.path(), std::fs::Permissions::from_mode(0o777));
+        }
         let control_name = format!("rs-m46-drain-control-{test_id}");
         let control = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
             .with_wait_for(WaitFor::message_on_stdout("control service listening"))
