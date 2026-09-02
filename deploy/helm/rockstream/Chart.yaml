@@ -1,0 +1,15 @@
+apiVersion: v2
+name: rockstream
+description: A Helm chart for deploying RockStream streaming IVM engine on Kubernetes
+type: application
+version: 0.59.22
+appVersion: "0.59.22"
+keywords:
+  - rockstream
+  - streaming
+  - ivm
+  - database
+  - sql
+maintainers:
+  - name: Trickle Labs
+    url: https://github.com/trickle-labs/rockstream

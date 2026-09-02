@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rockstream-sa
+  labels:
+    app.kubernetes.io/name: rockstream
+    app.kubernetes.io/version: "0.59.22"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rockstream-role
+  labels:
+    app.kubernetes.io/name: rockstream
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints", "services", "pods", "configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rockstream-rolebinding
+  labels:
+    app.kubernetes.io/name: rockstream
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rockstream-role
+subjects:
+  - kind: ServiceAccount
+    name: rockstream-sa

@@ -535,6 +535,14 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let started_ms = now_ms();
     validate_role(&opts.role)?;
 
+    if let Err(e) = rockstream_types::platform::PlatformClassifier::validate_startup() {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_3028,
+            e,
+            "Run RockStream on a supported 64-bit architecture (x86_64/aarch64) on Linux or macOS.",
+        ));
+    }
+
     if opts.config.storage.tiering.shard_meta_backend.is_some()
         || opts.config.storage.tiering.cold_sst_backend.is_some()
         || opts.config.storage.tiering.cold_sst_age_threshold.is_some()

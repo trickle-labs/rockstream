@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-gateway
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Chart.Name }}
+        app.kubernetes.io/component: gateway
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - "rockstream"
+            - "start"
+            - "--role=gateway"
+            - "--control=http://{{ .Release.Name }}-control:{{ .Values.control.port }}"
+            - "--listen=0.0.0.0:{{ .Values.gateway.port }}"
+            - "--metrics-addr=0.0.0.0:{{ .Values.gateway.managementPort }}"
+            - "--storage=/data"
+          ports:
+            - name: pgwire
+              containerPort: {{ .Values.gateway.port }}
+              protocol: TCP
+            - name: management
+              containerPort: {{ .Values.gateway.managementPort }}
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /data
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: {{ .Values.gateway.managementPort }}
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: {{ .Values.gateway.managementPort }}
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: {{ .Values.gateway.managementPort }}
+            periodSeconds: 5
+            timeoutSeconds: 3
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: data
+          emptyDir: {}

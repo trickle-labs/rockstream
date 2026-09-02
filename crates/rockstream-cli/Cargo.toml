@@ -37,6 +37,7 @@ rustls = { workspace = true }
 tokio-postgres = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 rockstream-test-support = { workspace = true }

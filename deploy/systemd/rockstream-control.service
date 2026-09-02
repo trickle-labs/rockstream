@@ -1,0 +1,44 @@
+[Unit]
+Description=RockStream Raft Control Plane Node
+Documentation=https://github.com/trickle-labs/rockstream
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rockstream
+Group=rockstream
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/rockstream start --role=control --raft-bind=0.0.0.0:9200 --metrics-addr=0.0.0.0:9090 --storage=/var/lib/rockstream-control
+Restart=on-failure
+RestartSec=5s
+
+# Security Hardening & Sandboxing Directives
+StateDirectory=rockstream-control
+LogsDirectory=rockstream-control
+RuntimeDirectory=rockstream-control
+WorkingDirectory=/var/lib/rockstream-control
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Resource Limits
+LimitNOFILE=65536
+LimitNPROC=32768
+
+# Healthcheck & Watchdog
+WatchdogSec=30
+TimeoutStopSec=35s
+
+[Install]
+WantedBy=multi-user.target

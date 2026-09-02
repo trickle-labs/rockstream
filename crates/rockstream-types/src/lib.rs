@@ -37,6 +37,7 @@ pub mod merge_law;
 pub mod metrics;
 pub mod migration;
 pub mod mutation_policy;
+pub mod platform;
 pub mod raft;
 pub mod rendezvous;
 pub mod schema_evolution;
@@ -71,6 +72,7 @@ pub use lifecycle::{
     LifecycleTracker, LiveResponse, ReadyResponse,
 };
 pub use limits::{SystemLimit, SystemLimitsCatalog};
+pub use platform::{ClassificationTier, PlatformClassification, PlatformClassifier};
 pub use shared_window::{SharedWindowSpec, SharedWindowSpecError};
 pub use state_mutation::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 

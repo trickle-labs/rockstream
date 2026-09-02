@@ -1,0 +1,36 @@
+# RockStream Standalone Docker Compose Profile (v0.59.22)
+# Production-ready single-node deployment with non-root security and healthcheck probes.
+
+services:
+  rockstream:
+    image: ghcr.io/trickle-labs/rockstream:0.59.22
+    container_name: rockstream-standalone
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "5432:5432"  # PGWire SQL
+      - "9090:9090"  # Management / Health / Metrics
+    volumes:
+      - rs_data:/data:rw
+    environment:
+      - RUST_LOG=info
+      - ROCKSTREAM_CONTAINER=1
+    command:
+      - "start"
+      - "--role=all"
+      - "--listen=0.0.0.0:5432"
+      - "--metrics-addr=0.0.0.0:9090"
+      - "--storage=/data"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  rs_data:
+    driver: local

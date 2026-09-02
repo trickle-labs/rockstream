@@ -1184,6 +1184,56 @@ default_next_steps = "Reduce exchange batch size/rechunking or raise worker.max_
 doc_anchor = "rs-3024"
 
 [[error]]
+code = "RS-3025"
+key = "platform.unverified_environment_warning"
+title = "Unverified platform or compatible backend environment warning"
+severity = "Warning"
+sqlstate = "00000"
+retry_class = "NonRetryable"
+default_next_steps = "Review the platform or backend compatibility matrix in docs/platforms.md; unverified environments are protocol-compatible but not qualified in release gates."
+doc_anchor = "rs-3025"
+
+[[error]]
+code = "RS-3026"
+key = "platform.insecure_container_execution"
+title = "Insecure container execution (root user or writable rootfs)"
+severity = "Warning"
+sqlstate = "00000"
+retry_class = "NonRetryable"
+default_next_steps = "Run the container as unprivileged non-root user (UID 10001) with --read-only root filesystem and persistent /data volume mount."
+doc_anchor = "rs-3026"
+
+[[error]]
+code = "RS-3027"
+key = "platform.port_conflict"
+title = "Platform port conflict on required listener port"
+severity = "Error"
+sqlstate = "58000"
+retry_class = "NonRetryable"
+default_next_steps = "Check for another process binding the requested port (5432, 9090, 9100, 9200) or specify an alternative address via CLI flags."
+doc_anchor = "rs-3027"
+
+[[error]]
+code = "RS-3028"
+key = "platform.unsupported_environment"
+title = "Unsupported host platform, architecture, OS, or filesystem"
+severity = "Fatal"
+sqlstate = "58000"
+retry_class = "NonRetryable"
+default_next_steps = "Run RockStream on a supported 64-bit architecture (x86_64, aarch64) with modern Linux (glibc >= 2.31, kernel >= 5.4) or macOS, and ensure /data is on a local POSIX filesystem or supported S3 object store."
+doc_anchor = "rs-3028"
+
+[[error]]
+code = "RS-3029"
+key = "connector.incompatible_version"
+title = "Incompatible external database or broker version"
+severity = "Error"
+sqlstate = "0A000"
+retry_class = "NonRetryable"
+default_next_steps = "Upgrade external PostgreSQL to version 12+ (14+ recommended) or Kafka broker to version 2.8+ (3.x recommended)."
+doc_anchor = "rs-3029"
+
+[[error]]
 code = "RS-3501"
 key = "merge_law.accumulator_decode_error"
 title = "Merge-law accumulator wire bytes have the wrong size"

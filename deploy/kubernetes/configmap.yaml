@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rockstream-config
+  labels:
+    app.kubernetes.io/name: rockstream
+    app.kubernetes.io/version: "0.59.22"
+    app.kubernetes.io/part-of: rockstream
+data:
+  rockstream.toml: |
+    # RockStream Cluster Configuration (v0.59.22)
+    [cluster]
+    cluster_id = "k8s-prod-cluster"
+    heartbeat_interval_ms = 1000
+    heartbeat_timeout_ms = 5000
+    shutdown_timeout_secs = 30
+
+    [storage]
+    backend = "s3"
+    s3_endpoint = "http://rockstream-minio:9000"
+    s3_bucket = "rockstream-data"
+    lfs_path = "/data"
+
+    [gateway]
+    listen_addr = "0.0.0.0:5432"
+    max_connections = 1024
+
+    [worker]
+    listen_addr = "0.0.0.0:9100"
+    max_rows_per_quantum = 100000
+
+    [control]
+    raft_bind = "0.0.0.0:9200"

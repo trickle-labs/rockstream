@@ -522,6 +522,16 @@ pub const RS_3022: ErrorCode = ErrorCode::new(3022);
 pub const RS_3023: ErrorCode = ErrorCode::new(3023);
 /// Shuffle frame row budget exceeded worker.max_rows_per_quantum.
 pub const RS_3024: ErrorCode = ErrorCode::new(3024);
+/// Unverified platform or compatible backend environment warning.
+pub const RS_3025: ErrorCode = ErrorCode::new(3025);
+/// Insecure container execution (root user or writable rootfs).
+pub const RS_3026: ErrorCode = ErrorCode::new(3026);
+/// Platform port conflict on required listener port.
+pub const RS_3027: ErrorCode = ErrorCode::new(3027);
+/// Unsupported host platform, architecture, OS, or filesystem.
+pub const RS_3028: ErrorCode = ErrorCode::new(3028);
+/// Incompatible external database or broker version.
+pub const RS_3029: ErrorCode = ErrorCode::new(3029);
 /// Merge-law accumulator wire bytes have the wrong size.
 pub const RS_3501: ErrorCode = ErrorCode::new(3501);
 /// Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded.

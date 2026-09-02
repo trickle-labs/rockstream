@@ -1,0 +1,40 @@
+[Unit]
+Description=RockStream Query Gateway (Stateless)
+Documentation=https://github.com/trickle-labs/rockstream
+After=network-online.target rockstream-control.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rockstream
+Group=rockstream
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/rockstream start --role=gateway --control=http://127.0.0.1:9200 --listen=0.0.0.0:5432 --metrics-addr=0.0.0.0:9090
+Restart=on-failure
+RestartSec=5s
+
+# Security Hardening & Sandboxing Directives
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Resource Limits
+LimitNOFILE=65536
+LimitNPROC=32768
+
+# Healthcheck & Watchdog
+WatchdogSec=30
+TimeoutStopSec=35s
+
+[Install]
+WantedBy=multi-user.target

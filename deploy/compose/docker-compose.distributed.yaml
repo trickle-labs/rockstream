@@ -1,0 +1,153 @@
+# RockStream Distributed Cluster Docker Compose Profile (v0.59.22)
+# Multi-container topology: 1 Control Plane, 2 Workers, 1 Gateway, MinIO object store, and Redpanda Kafka.
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-01-18T22-51-28Z
+    container_name: rockstream-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  control:
+    image: ghcr.io/trickle-labs/rockstream:0.59.22
+    container_name: rockstream-control
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "9200:9200"
+      - "9092:9090"
+    volumes:
+      - control_data:/data:rw
+    environment:
+      - RUST_LOG=info
+      - ROCKSTREAM_CONTAINER=1
+    command:
+      - "start"
+      - "--role=control"
+      - "--raft-bind=0.0.0.0:9200"
+      - "--metrics-addr=0.0.0.0:9090"
+      - "--storage=/data"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  worker-1:
+    image: ghcr.io/trickle-labs/rockstream:0.59.22
+    container_name: rockstream-worker-1
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "9101:9100"
+      - "9093:9090"
+    volumes:
+      - worker1_data:/data:rw
+    environment:
+      - RUST_LOG=info
+      - ROCKSTREAM_CONTAINER=1
+    depends_on:
+      control:
+        condition: service_healthy
+    command:
+      - "start"
+      - "--role=worker"
+      - "--control=http://control:9200"
+      - "--listen=0.0.0.0:9100"
+      - "--metrics-addr=0.0.0.0:9090"
+      - "--storage=/data"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  worker-2:
+    image: ghcr.io/trickle-labs/rockstream:0.59.22
+    container_name: rockstream-worker-2
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "9102:9100"
+      - "9094:9090"
+    volumes:
+      - worker2_data:/data:rw
+    environment:
+      - RUST_LOG=info
+      - ROCKSTREAM_CONTAINER=1
+    depends_on:
+      control:
+        condition: service_healthy
+    command:
+      - "start"
+      - "--role=worker"
+      - "--control=http://control:9200"
+      - "--listen=0.0.0.0:9100"
+      - "--metrics-addr=0.0.0.0:9090"
+      - "--storage=/data"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    image: ghcr.io/trickle-labs/rockstream:0.59.22
+    container_name: rockstream-gateway
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "5432:5432"
+      - "9090:9090"
+    volumes:
+      - gateway_data:/data:rw
+    environment:
+      - RUST_LOG=info
+      - ROCKSTREAM_CONTAINER=1
+    depends_on:
+      control:
+        condition: service_healthy
+    command:
+      - "start"
+      - "--role=gateway"
+      - "--control=http://control:9200"
+      - "--listen=0.0.0.0:5432"
+      - "--metrics-addr=0.0.0.0:9090"
+      - "--storage=/data"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  minio_data:
+  control_data:
+  worker1_data:
+  worker2_data:
+  gateway_data:

@@ -1,0 +1,64 @@
+# RockStream PostgreSQL CDC Source Compose Profile (v0.59.22)
+# Configures PostgreSQL with wal_level=logical for CDC ingestion with RockStream.
+
+services:
+  postgres:
+    image: postgres:18.0-bookworm
+    container_name: rockstream-pg-cdc
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_DB=rockstream_source
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rockstream_source"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  rockstream:
+    image: ghcr.io/trickle-labs/rockstream:0.59.22
+    container_name: rockstream-cdc-engine
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "5432:5432"
+      - "9090:9090"
+    volumes:
+      - rs_cdc_data:/data:rw
+    environment:
+      - RUST_LOG=info
+      - ROCKSTREAM_CONTAINER=1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - "start"
+      - "--role=all"
+      - "--listen=0.0.0.0:5432"
+      - "--metrics-addr=0.0.0.0:9090"
+      - "--storage=/data"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pg_data:
+  rs_cdc_data:

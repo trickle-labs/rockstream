@@ -1,0 +1,238 @@
+# RockStream Platform, OS, Libc & Deployment Matrix Contract
+# Version: 0.59.22
+# Defines authoritative classification tiers: Supported, CompatibleUnverified, Unsupported
+
+[contract]
+name = "platform-matrix"
+version = "0.59.22"
+description = "RockStream Platform & Deployment Classification Matrix"
+
+[[architecture]]
+name = "x86_64"
+tier = "Supported"
+description = "x86-64-v2 / x86-64-v3 (AMD64)"
+is_64bit = true
+
+[[architecture]]
+name = "aarch64"
+tier = "Supported"
+description = "ARM64 / AArch64 (ARMv8.2-A+)"
+is_64bit = true
+
+[[architecture]]
+name = "riscv64"
+tier = "CompatibleUnverified"
+description = "RISC-V 64-bit"
+is_64bit = true
+
+[[architecture]]
+name = "ppc64le"
+tier = "CompatibleUnverified"
+description = "POWER 64-bit Little Endian"
+is_64bit = true
+
+[[architecture]]
+name = "s390x"
+tier = "CompatibleUnverified"
+description = "IBM System/390x 64-bit"
+is_64bit = true
+
+[[architecture]]
+name = "x86"
+tier = "Unsupported"
+description = "32-bit x86 (i386 / i686)"
+is_64bit = false
+rejection_code = "RS-3028"
+
+[[architecture]]
+name = "arm"
+tier = "Unsupported"
+description = "32-bit ARM (ARMv7 / armhf)"
+is_64bit = false
+rejection_code = "RS-3028"
+
+[[operating_system]]
+name = "linux"
+tier = "Supported"
+min_kernel = "5.4"
+min_glibc = "2.31"
+min_musl = "1.2.3"
+description = "Linux 64-bit with glibc >= 2.31 or musl >= 1.2.3"
+
+[[operating_system]]
+name = "macos"
+tier = "Supported"
+min_version = "13.0"
+description = "Apple macOS 13+ (Ventura, Sonoma, Sequoia) on x86_64 / aarch64"
+
+[[operating_system]]
+name = "wsl2"
+tier = "CompatibleUnverified"
+description = "Windows Subsystem for Linux 2 (Linux kernel on Windows)"
+
+[[operating_system]]
+name = "windows"
+tier = "Unsupported"
+description = "Native Windows (MSVC / MinGW) lacking POSIX / io_uring async semantics"
+rejection_code = "RS-3028"
+
+[[distribution]]
+name = "debian"
+tier = "Supported"
+version = "12 (Bookworm)"
+libc = "glibc 2.36"
+
+[[distribution]]
+name = "ubuntu"
+tier = "Supported"
+version = "22.04 / 24.04 LTS"
+libc = "glibc 2.35 / 2.39"
+
+[[distribution]]
+name = "rhel"
+tier = "Supported"
+version = "9 / Rocky 9 / AlmaLinux 9"
+libc = "glibc 2.34"
+
+[[distribution]]
+name = "alpine"
+tier = "Supported"
+version = "3.19+"
+libc = "musl 1.2.4+"
+
+[[distribution]]
+name = "amazonlinux"
+tier = "Supported"
+version = "2023 (AL2023)"
+libc = "glibc 2.34"
+
+[[distribution]]
+name = "other_linux"
+tier = "CompatibleUnverified"
+version = "Linux Kernel >= 5.4"
+libc = "glibc >= 2.31 or musl"
+
+[[distribution]]
+name = "legacy_linux"
+tier = "Unsupported"
+version = "Linux Kernel < 5.4 or glibc < 2.31"
+libc = "glibc < 2.31"
+rejection_code = "RS-3028"
+
+[[storage_backend]]
+name = "lfs"
+tier = "Supported"
+kind = "filesystem"
+description = "Local NVMe/SSD filesystem (ext4, xfs, btrfs, apfs, tmpfs) with POSIX O_DIRECT & locking"
+
+[[storage_backend]]
+name = "s3_aws"
+tier = "Supported"
+kind = "object_store"
+description = "AWS S3 (Standard, Express One Zone)"
+
+[[storage_backend]]
+name = "s3_minio"
+tier = "Supported"
+kind = "object_store"
+description = "MinIO (RELEASE.2023+)"
+
+[[storage_backend]]
+name = "s3_cloudflare_r2"
+tier = "CompatibleUnverified"
+kind = "object_store"
+description = "Cloudflare R2 (S3 API compatible)"
+
+[[storage_backend]]
+name = "s3_gcs"
+tier = "CompatibleUnverified"
+kind = "object_store"
+description = "Google Cloud Storage (S3 interoperability API)"
+
+[[storage_backend]]
+name = "s3_azure"
+tier = "CompatibleUnverified"
+kind = "object_store"
+description = "Azure Blob Storage (S3 API Proxy)"
+
+[[storage_backend]]
+name = "s3_ceph"
+tier = "CompatibleUnverified"
+kind = "object_store"
+description = "Ceph RADOS Object Gateway (S3 API)"
+
+[[storage_backend]]
+name = "nfs_smb"
+tier = "Unsupported"
+kind = "filesystem"
+description = "Network File System (NFS / SMB) without POSIX flock / O_DIRECT guarantees"
+rejection_code = "RS-3028"
+
+[[database_backend]]
+name = "postgres_18"
+tier = "Supported"
+version_range = "18.x"
+description = "PostgreSQL 18.0 (Pinned differential reference test container)"
+
+[[database_backend]]
+name = "postgres_14_17"
+tier = "Supported"
+version_range = "14.x - 17.x"
+description = "PostgreSQL 14, 15, 16, 17 with standard pgoutput logical replication"
+
+[[database_backend]]
+name = "postgres_12_13"
+tier = "CompatibleUnverified"
+version_range = "12.x - 13.x"
+description = "PostgreSQL 12, 13 with pgoutput logical replication"
+
+[[database_backend]]
+name = "postgres_cloud"
+tier = "CompatibleUnverified"
+version_range = "Compatible"
+description = "Neon, Supabase, AWS Aurora PostgreSQL"
+
+[[database_backend]]
+name = "postgres_legacy"
+tier = "Unsupported"
+version_range = "< 12"
+description = "PostgreSQL < 12 lacking required CDC streaming features"
+rejection_code = "RS-3029"
+
+[[broker_backend]]
+name = "kafka_3"
+tier = "Supported"
+version_range = "3.4 - 3.9"
+description = "Apache Kafka 3.x (KRaft & ZooKeeper modes)"
+
+[[broker_backend]]
+name = "redpanda"
+tier = "Supported"
+version_range = "23.x / 24.x"
+description = "Redpanda Kafka API"
+
+[[broker_backend]]
+name = "kafka_28"
+tier = "CompatibleUnverified"
+version_range = "2.8 - 3.3"
+description = "Apache Kafka 2.8+ early KRaft / ZooKeeper"
+
+[[broker_backend]]
+name = "kafka_legacy"
+tier = "Unsupported"
+version_range = "< 2.8"
+description = "Apache Kafka < 2.8 / legacy brokers"
+rejection_code = "RS-3029"
+
+[deployment_defaults]
+service_user = "rockstream"
+uid = 10001
+gid = 10001
+data_directory = "/data"
+read_only_rootfs = true
+ports = [
+    { name = "pgwire", port = 5432, protocol = "tcp", description = "PostgreSQL wire protocol SQL listener" },
+    { name = "management", port = 9090, protocol = "tcp", description = "HTTP Management, Probes (/live, /ready, /health) & Metrics (/metrics)" },
+    { name = "worker_rpc", port = 9100, protocol = "tcp", description = "Worker DataPlane & Exchange gRPC / Flight RPC" },
+    { name = "control_rpc", port = 9200, protocol = "tcp", description = "Control Plane Raft consensus & RPC listener" },
+]

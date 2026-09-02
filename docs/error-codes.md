@@ -17,7 +17,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (37 codes)
 - [24xx: Authentication, mTLS & Secrets](#24xx-authentication-mtls--secrets) (18 codes)
 - [25xx-26xx: Extended Query, Cursors & Transactions](#25xx-26xx-extended-query-cursors--transactions) (9 codes)
-- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (40 codes)
+- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (45 codes)
 - [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (23 codes)
 - [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (16 codes)
 - [6xxx: Connector Schema Evolution](#6xxx-connector-schema-evolution) (1 codes)
@@ -982,6 +982,11 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-3022`](#rs-3022) | `cluster.checkpoint_manifest_codec_error` | Cluster checkpoint manifest codec decode error | `Error` | `XX000` | `NonRetryable` |
 | [`RS-3023`](#rs-3023) | `exchange.fast_path_frontier_read_failed` | Fast-path shuffle frontier read failed during replay dedup | `Warning` | `53100` | `Immediate` |
 | [`RS-3024`](#rs-3024) | `exchange.row_budget_exceeded` | Shuffle frame row budget exceeded worker.max_rows_per_quantum | `Error` | `54000` | `ExponentialBackoff` |
+| [`RS-3025`](#rs-3025) | `platform.unverified_environment_warning` | Unverified platform or compatible backend environment warning | `Warning` | `00000` | `NonRetryable` |
+| [`RS-3026`](#rs-3026) | `platform.insecure_container_execution` | Insecure container execution (root user or writable rootfs) | `Warning` | `00000` | `NonRetryable` |
+| [`RS-3027`](#rs-3027) | `platform.port_conflict` | Platform port conflict on required listener port | `Error` | `58000` | `NonRetryable` |
+| [`RS-3028`](#rs-3028) | `platform.unsupported_environment` | Unsupported host platform, architecture, OS, or filesystem | `Fatal` | `58000` | `NonRetryable` |
+| [`RS-3029`](#rs-3029) | `connector.incompatible_version` | Incompatible external database or broker version | `Error` | `0A000` | `NonRetryable` |
 | [`RS-3501`](#rs-3501) | `merge_law.accumulator_decode_error` | Merge-law accumulator wire bytes have the wrong size | `Error` | `22000` | `NonRetryable` |
 | [`RS-3601`](#rs-3601) | `checkpoint.alignment_buffer_overflow` | Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded | `Error` | `53200` | `ExponentialBackoff` |
 | [`RS-3602`](#rs-3602) | `cluster.checkpoint_recovery_in_progress` | Cluster checkpoint recovery in progress | `Warning` | `55000` | `AfterClusterRecovery` |
@@ -1155,6 +1160,46 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `54000`
 - **Retry Class**: `ExponentialBackoff`
 - **Default Next Steps**: Reduce exchange batch size/rechunking or raise worker.max_rows_per_quantum only if the worker can safely absorb a larger in-flight row budget.
+
+### <a id="rs-3025"></a> `RS-3025` — Unverified platform or compatible backend environment warning
+
+- **Key**: `platform.unverified_environment_warning`
+- **Severity**: `Warning`
+- **SQLSTATE**: `00000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Review the platform or backend compatibility matrix in docs/platforms.md; unverified environments are protocol-compatible but not qualified in release gates.
+
+### <a id="rs-3026"></a> `RS-3026` — Insecure container execution (root user or writable rootfs)
+
+- **Key**: `platform.insecure_container_execution`
+- **Severity**: `Warning`
+- **SQLSTATE**: `00000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Run the container as unprivileged non-root user (UID 10001) with --read-only root filesystem and persistent /data volume mount.
+
+### <a id="rs-3027"></a> `RS-3027` — Platform port conflict on required listener port
+
+- **Key**: `platform.port_conflict`
+- **Severity**: `Error`
+- **SQLSTATE**: `58000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Check for another process binding the requested port (5432, 9090, 9100, 9200) or specify an alternative address via CLI flags.
+
+### <a id="rs-3028"></a> `RS-3028` — Unsupported host platform, architecture, OS, or filesystem
+
+- **Key**: `platform.unsupported_environment`
+- **Severity**: `Fatal`
+- **SQLSTATE**: `58000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Run RockStream on a supported 64-bit architecture (x86_64, aarch64) with modern Linux (glibc >= 2.31, kernel >= 5.4) or macOS, and ensure /data is on a local POSIX filesystem or supported S3 object store.
+
+### <a id="rs-3029"></a> `RS-3029` — Incompatible external database or broker version
+
+- **Key**: `connector.incompatible_version`
+- **Severity**: `Error`
+- **SQLSTATE**: `0A000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Upgrade external PostgreSQL to version 12+ (14+ recommended) or Kafka broker to version 2.8+ (3.x recommended).
 
 ### <a id="rs-3501"></a> `RS-3501` — Merge-law accumulator wire bytes have the wrong size
 

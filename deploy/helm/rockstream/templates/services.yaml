@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-gateway
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/component: gateway
+spec:
+  type: ClusterIP
+  ports:
+    - name: pgwire
+      port: {{ .Values.gateway.port }}
+      targetPort: 5432
+      protocol: TCP
+    - name: management
+      port: {{ .Values.gateway.managementPort }}
+      targetPort: 9090
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/component: gateway
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-control
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/component: control
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: raft-rpc
+      port: {{ .Values.control.port }}
+      targetPort: 9200
+      protocol: TCP
+    - name: management
+      port: {{ .Values.control.managementPort }}
+      targetPort: 9090
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/component: control
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/component: worker
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: dataplane-rpc
+      port: {{ .Values.worker.port }}
+      targetPort: 9100
+      protocol: TCP
+    - name: management
+      port: {{ .Values.worker.managementPort }}
+      targetPort: 9090
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/component: worker

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  rockstream.toml: |
+    [cluster]
+    cluster_id = "{{ .Values.cluster.id }}"
+    shutdown_timeout_secs = {{ .Values.cluster.shutdownTimeoutSecs }}

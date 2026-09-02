@@ -9,7 +9,8 @@ use crate::CliError;
 use rockstream_types::candidate_identity::CandidateIdentity;
 use rockstream_types::config_resolver::{CliConfigOverrides, ConfigResolver};
 use rockstream_types::config_validation::validate_config_str;
-use rockstream_types::error_code::RS_0003;
+use rockstream_types::error_code::{RS_0003, RS_3025, RS_3026, RS_3027, RS_3028};
+use rockstream_types::platform::{ClassificationTier, PlatformClassifier};
 
 /// Upper bound on the number of diagnostic checks executed in a single run.
 pub const MAX_DOCTOR_CHECKS: usize = 64;
@@ -455,14 +456,219 @@ pub async fn run_doctor_checks(opts: &DoctorOptions) -> DoctorReport {
             "system",
             check_timeout,
             || async {
+                let classification = PlatformClassifier::evaluate_host();
                 let os = std::env::consts::OS;
                 let arch = std::env::consts::ARCH;
-                let os_supported = os == "linux" || os == "macos";
-                let arch_supported = arch == "x86_64" || arch == "aarch64";
-                if os_supported && arch_supported {
-                    (
+                match classification.overall_tier {
+                    ClassificationTier::Supported => (
                         DiagnosticStatus::Pass,
                         format!("Platform {} / {} is fully supported", os, arch),
+                        None,
+                        None,
+                        None,
+                    ),
+                    ClassificationTier::CompatibleUnverified => (
+                        DiagnosticStatus::Warn,
+                        format!("Platform {} / {} is compatible but unverified", os, arch),
+                        None,
+                        Some(format!("{RS_3025}")),
+                        Some(
+                            "Review docs/platforms.md for qualified deployment targets."
+                                .to_string(),
+                        ),
+                    ),
+                    ClassificationTier::Unsupported => (
+                        DiagnosticStatus::Fail,
+                        format!("Platform {} / {} is unsupported", os, arch),
+                        None,
+                        Some(format!("{RS_3028}")),
+                        Some(
+                            "RockStream requires 64-bit Linux (x86_64/aarch64) or macOS."
+                                .to_string(),
+                        ),
+                    ),
+                }
+            },
+        )
+        .await,
+    );
+
+    // 7b. Platform Classification Details
+    checks.push(
+        run_bounded_check(
+            "platform.classification",
+            "platform",
+            check_timeout,
+            || async {
+                let classification = PlatformClassifier::evaluate_host();
+                let os = std::env::consts::OS;
+                let arch = std::env::consts::ARCH;
+                match classification.overall_tier {
+                    ClassificationTier::Supported => (
+                        DiagnosticStatus::Pass,
+                        format!("Host environment [{}/{}] tier: Supported", os, arch),
+                        Some(format!(
+                            "Arch: {} (tier: {}), OS: {} (tier: {}), Libc: {} (tier: {})",
+                            classification.architecture.name,
+                            classification.architecture.tier,
+                            classification.operating_system.name,
+                            classification.operating_system.tier,
+                            classification.libc_runtime.name,
+                            classification.libc_runtime.tier
+                        )),
+                        None,
+                        None,
+                    ),
+                    ClassificationTier::CompatibleUnverified => (
+                        DiagnosticStatus::Warn,
+                        format!(
+                            "Host environment [{}/{}] tier: Compatible, unverified",
+                            os, arch
+                        ),
+                        Some(classification.warnings.join("; ")),
+                        Some(format!("{RS_3025}")),
+                        Some(
+                            "Check contracts/platform-matrix.toml for qualified release profiles."
+                                .to_string(),
+                        ),
+                    ),
+                    ClassificationTier::Unsupported => (
+                        DiagnosticStatus::Fail,
+                        format!("Host environment [{}/{}] tier: Unsupported", os, arch),
+                        Some(
+                            "Host fails minimum platform prerequisites for 64-bit execution"
+                                .to_string(),
+                        ),
+                        Some(format!("{RS_3028}")),
+                        Some("Migrate to a supported Linux/macOS 64-bit environment.".to_string()),
+                    ),
+                }
+            },
+        )
+        .await,
+    );
+
+    // 7c. Platform Libc Compatibility Check
+    checks.push(
+        run_bounded_check(
+            "platform.libc_compatibility",
+            "platform",
+            check_timeout,
+            || async {
+                let libc_eval = PlatformClassifier::evaluate_libc();
+                match libc_eval.tier {
+                    ClassificationTier::Supported => (
+                        DiagnosticStatus::Pass,
+                        format!(
+                            "C library runtime {} is supported ({})",
+                            libc_eval.name,
+                            libc_eval.version.as_deref().unwrap_or("standard")
+                        ),
+                        None,
+                        None,
+                        None,
+                    ),
+                    ClassificationTier::CompatibleUnverified => (
+                        DiagnosticStatus::Warn,
+                        format!("C library runtime {} is unverified", libc_eval.name),
+                        libc_eval.reason,
+                        Some(format!("{RS_3025}")),
+                        Some("Verify glibc >= 2.31 or musl >= 1.2.3 compatibility.".to_string()),
+                    ),
+                    ClassificationTier::Unsupported => (
+                        DiagnosticStatus::Fail,
+                        format!("C library runtime {} is unsupported", libc_eval.name),
+                        libc_eval.reason,
+                        Some(format!("{RS_3028}")),
+                        Some("Upgrade host C library or deploy via Debian 12 / Ubuntu 24.04 container.".to_string()),
+                    ),
+                }
+            },
+        )
+        .await,
+    );
+
+    // 7d. Platform Container Security Profile Check
+    checks.push(
+        run_bounded_check(
+            "platform.container_security",
+            "platform",
+            check_timeout,
+            || async {
+                let is_container = Path::new("/.dockerenv").exists()
+                    || Path::new("/run/.containerenv").exists()
+                    || std::env::var("ROCKSTREAM_CONTAINER").is_ok()
+                    || std::env::var("container").is_ok();
+
+                if !is_container {
+                    (
+                        DiagnosticStatus::Pass,
+                        "Non-container native host execution".to_string(),
+                        None,
+                        None,
+                        None,
+                    )
+                } else {
+                    #[cfg(unix)]
+                    let uid = unsafe { libc::getuid() };
+                    #[cfg(not(unix))]
+                    let uid = 10001;
+
+                    if uid == 0 {
+                        (
+                            DiagnosticStatus::Warn,
+                            "Container is executing as root (UID 0)".to_string(),
+                            Some("Production containers must run unprivileged as user rockstream (UID 10001)".to_string()),
+                            Some(format!("{RS_3026}")),
+                            Some("Set 'USER rockstream:rockstream' or 'runAsUser: 10001' in container securityContext.".to_string()),
+                        )
+                    } else {
+                        (
+                            DiagnosticStatus::Pass,
+                            format!("Container executing securely as non-root user (UID {uid})"),
+                            Some("Complies with Kubernetes restricted Pod Security Standard".to_string()),
+                            None,
+                            None,
+                        )
+                    }
+                }
+            },
+        )
+        .await,
+    );
+
+    // 7e. Platform Port Availability Check
+    checks.push(
+        run_bounded_check(
+            "platform.port_availability",
+            "platform",
+            check_timeout,
+            || async {
+                let standard_ports = [
+                    (5432, "PGWire SQL"),
+                    (9090, "Management / Metrics"),
+                    (9100, "Worker DataPlane RPC"),
+                    (9200, "Control Raft RPC"),
+                ];
+                let mut conflicts = Vec::new();
+                for (port, name) in &standard_ports {
+                    // Try to bind ephemeral test listener
+                    match std::net::TcpListener::bind(("127.0.0.1", *port)) {
+                        Ok(listener) => {
+                            drop(listener);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                            conflicts.push(format!("Port {port} ({name}) is in use"));
+                        }
+                        Err(_) => {
+                            // Permission or other transient network restriction; ignore
+                        }
+                    }
+                }
+                if conflicts.is_empty() {
+                    (
+                        DiagnosticStatus::Pass,
+                        "Standard listener ports (5432, 9090, 9100, 9200) are available".to_string(),
                         None,
                         None,
                         None,
@@ -470,12 +676,10 @@ pub async fn run_doctor_checks(opts: &DoctorOptions) -> DoctorReport {
                 } else {
                     (
                         DiagnosticStatus::Warn,
-                        format!("Platform {} / {} is not tier-1 supported", os, arch),
-                        None,
-                        Some("RS-0002".to_string()),
-                        Some(
-                            "RockStream is validated on Linux/macOS on x86_64/aarch64.".to_string(),
-                        ),
+                        format!("Port binding notice: {}", conflicts.join(", ")),
+                        Some("Another process is currently listening on one or more standard ports".to_string()),
+                        Some(format!("{RS_3027}")),
+                        Some("Specify alternate listen ports via CLI options (--listen, --metrics-addr, etc.) if running alongside existing services.".to_string()),
                     )
                 }
             },
@@ -652,6 +856,62 @@ pub async fn run_doctor_checks(opts: &DoctorOptions) -> DoctorReport {
                 }
             }).await);
         }
+
+        // platform.storage_filesystem
+        checks.push(
+            run_bounded_check(
+                "platform.storage_filesystem",
+                "platform",
+                check_timeout,
+                || async {
+                    let eval = PlatformClassifier::evaluate_storage_backend(storage_str);
+                    match eval.tier {
+                        ClassificationTier::Supported => (
+                            DiagnosticStatus::Pass,
+                            format!("Storage backend {} is supported ({})", eval.name, eval.version.as_deref().unwrap_or("standard")),
+                            eval.reason,
+                            None,
+                            None,
+                        ),
+                        ClassificationTier::CompatibleUnverified => (
+                            DiagnosticStatus::Warn,
+                            format!("Storage backend {} is compatible but unverified", eval.name),
+                            eval.reason,
+                            Some(format!("{RS_3025}")),
+                            Some("Review contracts/platform-matrix.toml for qualified storage backends.".to_string()),
+                        ),
+                        ClassificationTier::Unsupported => (
+                            DiagnosticStatus::Fail,
+                            format!("Storage backend {} is unsupported", eval.name),
+                            eval.reason,
+                            Some(format!("{RS_3028}")),
+                            Some("Use local NVMe/SSD filesystem (LFS) or AWS S3 / MinIO object store.".to_string()),
+                        ),
+                    }
+                },
+            )
+            .await,
+        );
+
+        // platform.backend_compatibility
+        checks.push(
+            run_bounded_check(
+                "platform.backend_compatibility",
+                "platform",
+                check_timeout,
+                || async {
+                    let eval = PlatformClassifier::evaluate_storage_backend(storage_str);
+                    (
+                        DiagnosticStatus::Pass,
+                        format!("External backend tier: {} [{}]", eval.tier, eval.name),
+                        eval.reason,
+                        None,
+                        None,
+                    )
+                },
+            )
+            .await,
+        );
     }
 
     // 9. Control Reachability Check (if configured)
