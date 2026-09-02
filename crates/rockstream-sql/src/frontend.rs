@@ -33,7 +33,10 @@ use crate::{
     catalog::{ColumnDef, IndexEntry, IndexState, SchemaCatalog, ViewEntry},
     distribution::apply_distribution,
     error::SqlError,
-    estimate::{explain_incremental_estimate, format_estimate, EstimateRow},
+    estimate::{
+        explain_incremental_estimate, explain_incremental_estimate_capacity,
+        format_capacity_estimate_report, CapacityEstimateContext, EstimateRow,
+    },
     explain_incremental::{
         explain_incremental, explain_incremental_analyze, explain_incremental_verbose,
     },
@@ -302,6 +305,22 @@ impl SqlFrontend {
         ))
     }
 
+    /// Produce an `EXPLAIN INCREMENTAL ESTIMATE` calibrated capacity estimate for the given SQL.
+    pub async fn explain_incremental_estimate_capacity_for_sql(
+        &self,
+        sql: &str,
+        context: &CapacityEstimateContext,
+    ) -> Result<
+        (
+            rockstream_types::capacity::CapacityEstimate,
+            Vec<EstimateRow>,
+        ),
+        SqlError,
+    > {
+        let plan = self.sql_to_unoptimized_plan_node(sql).await?;
+        Ok(explain_incremental_estimate_capacity(&plan, context))
+    }
+
     /// Produce an `EXPLAIN INCREMENTAL ESTIMATE` formatted string.
     pub async fn explain_incremental_estimate_text(
         &self,
@@ -309,10 +328,25 @@ impl SqlFrontend {
         cardinality_hint: u64,
         batch_rows: u64,
     ) -> Result<String, SqlError> {
-        let rows = self
-            .explain_incremental_estimate_for_sql(sql, cardinality_hint, batch_rows)
+        let ctx = CapacityEstimateContext {
+            cardinality_hint,
+            batch_rows,
+            ..Default::default()
+        };
+        self.explain_incremental_estimate_capacity_text(sql, &ctx)
+            .await
+    }
+
+    /// Produce an `EXPLAIN INCREMENTAL ESTIMATE` calibrated capacity report formatted string.
+    pub async fn explain_incremental_estimate_capacity_text(
+        &self,
+        sql: &str,
+        context: &CapacityEstimateContext,
+    ) -> Result<String, SqlError> {
+        let (est, rows) = self
+            .explain_incremental_estimate_capacity_for_sql(sql, context)
             .await?;
-        Ok(format_estimate(&rows))
+        Ok(format_capacity_estimate_report(&est, &rows))
     }
 
     /// Load a view from the catalog and return its `PlanNode`.

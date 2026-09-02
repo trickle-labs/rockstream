@@ -1234,6 +1234,27 @@ default_next_steps = "Upgrade external PostgreSQL to version 12+ (14+ recommende
 doc_anchor = "rs-3029"
 
 [[error]]
+code = "RS-3030"
+key = "capacity.sample_batch_flush_failure"
+title = "Capacity sample batch flush failure"
+severity = "Error"
+sqlstate = "58000"
+retry_class = "NonRetryable"
+default_next_steps = "Check storage permissions and disk space for capacity measurement chunks, or reduce profiling sample rate."
+doc_anchor = "rs-3030"
+
+[[error]]
+code = "RS-3031"
+key = "capacity.invalid_estimate_request"
+title = "Invalid EXPLAIN INCREMENTAL ESTIMATE query or options"
+severity = "Error"
+sqlstate = "42601"
+retry_class = "NonRetryable"
+default_next_steps = "Check the SQL query syntax, target view name, and cardinality hints supplied to EXPLAIN INCREMENTAL ESTIMATE."
+doc_anchor = "rs-3031"
+
+
+[[error]]
 code = "RS-3501"
 key = "merge_law.accumulator_decode_error"
 title = "Merge-law accumulator wire bytes have the wrong size"

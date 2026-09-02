@@ -5618,28 +5618,64 @@ impl GatewayHandler {
             let explain_args = q["explain incremental ".len()..]
                 .trim()
                 .trim_end_matches(';');
-            let (level, target_sql) = if let Some(rest) = explain_args.strip_prefix("VERBOSE ") {
-                (ExplainLevel::Verbose, rest.trim())
-            } else if let Some(rest) = explain_args.strip_prefix("ANALYZE ") {
-                (ExplainLevel::Analyze, rest.trim())
-            } else if let Some(rest) = explain_args.strip_prefix("ESTIMATE ") {
-                (ExplainLevel::Default, rest.trim())
+            let explain_args_lower = explain_args.to_ascii_lowercase();
+            let (level, is_estimate, target_sql) = if explain_args_lower.starts_with("verbose ") {
+                (
+                    ExplainLevel::Verbose,
+                    false,
+                    explain_args["verbose ".len()..].trim(),
+                )
+            } else if explain_args_lower.starts_with("analyze ") {
+                (
+                    ExplainLevel::Analyze,
+                    false,
+                    explain_args["analyze ".len()..].trim(),
+                )
+            } else if explain_args_lower.starts_with("estimate ") {
+                (
+                    ExplainLevel::Default,
+                    true,
+                    explain_args["estimate ".len()..].trim(),
+                )
             } else {
-                (ExplainLevel::Default, explain_args)
+                (ExplainLevel::Default, false, explain_args)
             };
 
             let normalized_sql = if target_sql.to_ascii_lowercase().starts_with("select ")
                 || target_sql.to_ascii_lowercase().starts_with("with ")
             {
                 target_sql.to_string()
+            } else if let Some(view) = self.catalog.get_view(target_sql.trim()) {
+                view.sql
             } else {
                 format!("SELECT * FROM {}", target_sql.trim())
             };
 
             let frontend = self.build_explain_frontend()?;
-            let explain_text = if explain_args.starts_with("ESTIMATE ") {
+            let explain_text = if is_estimate {
+                let mut canonical_arrs = Vec::new();
+                for (view_name, info) in self.catalog.list_view_arrangements() {
+                    let arr_id_str = info
+                        .arrangement_id
+                        .map(|id| format!("{id:?}"))
+                        .unwrap_or_else(|| format!("arr_{view_name}"));
+                    let consumers = (0..info.consumer_count)
+                        .map(|i| format!("{view_name}_{i}"))
+                        .collect();
+                    canonical_arrs.push(rockstream_sql::estimate::CanonicalArrangementEntry {
+                        arrangement_id: arr_id_str,
+                        state_bytes: info.shared_state_bytes,
+                        consumers,
+                    });
+                }
+                let context = rockstream_sql::estimate::CapacityEstimateContext {
+                    cardinality_hint: 1_000,
+                    batch_rows: 10_000,
+                    canonical_arrangements: canonical_arrs,
+                    ..Default::default()
+                };
                 frontend
-                    .explain_incremental_estimate_text(&normalized_sql, 1_000, 10_000)
+                    .explain_incremental_estimate_capacity_text(&normalized_sql, &context)
                     .await
                     .map_err(|e| PgWireError::ApiError(Box::new(e)))?
             } else {

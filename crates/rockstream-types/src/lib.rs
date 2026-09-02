@@ -11,6 +11,7 @@ pub mod audit;
 pub mod batch;
 pub mod candidate_identity;
 pub mod capability;
+pub mod capacity;
 pub mod checkpoint;
 pub mod compatibility;
 pub mod config;
@@ -58,6 +59,13 @@ pub use arrangement::{
 };
 pub use candidate_identity::CandidateIdentity;
 pub use capability::{CapabilityDocument, CapabilityEntry, CapabilityRegistry};
+pub use capacity::{
+    CapacityBatchCollector, CapacityChunkSink, CapacityErrorRange, CapacityEstimate,
+    CapacityObservation, CapacityProfile, CapacityRecordingError, CapacityReducer, CapacitySummary,
+    HardwareIdentity, MemoryChunkSink, MetricError, PhysicalStrategy, RawCapacityRecord,
+    SourceStatisticProvenance, WorkloadDigest, CAPACITY_SAMPLE_BATCH_BYTES_MAX,
+    CAPACITY_SAMPLE_BATCH_MAX, METRIC_CAPACITY_SAMPLE_BATCH_FILL_RATIO,
+};
 pub use compatibility::{
     ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
 };

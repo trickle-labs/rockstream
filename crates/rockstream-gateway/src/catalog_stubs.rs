@@ -587,6 +587,25 @@ impl CatalogStubs {
             .insert(view_name.to_string(), info);
     }
 
+    /// Retrieve arrangement sharing metadata for a view.
+    pub fn get_view_arrangement_sharing(&self, view_name: &str) -> Option<ArrangementSharingInfo> {
+        self.view_arrangements
+            .read()
+            .unwrap()
+            .get(view_name)
+            .cloned()
+    }
+
+    /// List all view arrangement sharing entries.
+    pub fn list_view_arrangements(&self) -> Vec<(String, ArrangementSharingInfo)> {
+        self.view_arrangements
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Set raw engine facts for a view (OBS-03).
     pub fn set_view_engine_facts(
         &self,

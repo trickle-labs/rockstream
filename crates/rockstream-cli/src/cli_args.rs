@@ -256,7 +256,7 @@ pub enum Command {
     Explain {
         /// View name to explain.
         view: String,
-        /// Show static cost and state memory estimates without deploying.
+        /// Show calibrated capacity, state memory, and throughput estimates without deploying.
         #[arg(long)]
         estimate: bool,
         /// Show operator IDs and addressability details for intermediate state.

@@ -987,6 +987,8 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-3027`](#rs-3027) | `platform.port_conflict` | Platform port conflict on required listener port | `Error` | `58000` | `NonRetryable` |
 | [`RS-3028`](#rs-3028) | `platform.unsupported_environment` | Unsupported host platform, architecture, OS, or filesystem | `Fatal` | `58000` | `NonRetryable` |
 | [`RS-3029`](#rs-3029) | `connector.incompatible_version` | Incompatible external database or broker version | `Error` | `0A000` | `NonRetryable` |
+| [`RS-3030`](#rs-3030) | `capacity.sample_batch_flush_failure` | Capacity sample batch flush failure | `Error` | `58000` | `NonRetryable` |
+| [`RS-3031`](#rs-3031) | `capacity.invalid_estimate_request` | Invalid EXPLAIN INCREMENTAL ESTIMATE query or options | `Error` | `42601` | `NonRetryable` |
 | [`RS-3501`](#rs-3501) | `merge_law.accumulator_decode_error` | Merge-law accumulator wire bytes have the wrong size | `Error` | `22000` | `NonRetryable` |
 | [`RS-3601`](#rs-3601) | `checkpoint.alignment_buffer_overflow` | Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded | `Error` | `53200` | `ExponentialBackoff` |
 | [`RS-3602`](#rs-3602) | `cluster.checkpoint_recovery_in_progress` | Cluster checkpoint recovery in progress | `Warning` | `55000` | `AfterClusterRecovery` |
@@ -1200,6 +1202,22 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `0A000`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Upgrade external PostgreSQL to version 12+ (14+ recommended) or Kafka broker to version 2.8+ (3.x recommended).
+
+### <a id="rs-3030"></a> `RS-3030` — Capacity sample batch flush failure
+
+- **Key**: `capacity.sample_batch_flush_failure`
+- **Severity**: `Error`
+- **SQLSTATE**: `58000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Check storage permissions and disk space for capacity measurement chunks, or reduce profiling sample rate.
+
+### <a id="rs-3031"></a> `RS-3031` — Invalid EXPLAIN INCREMENTAL ESTIMATE query or options
+
+- **Key**: `capacity.invalid_estimate_request`
+- **Severity**: `Error`
+- **SQLSTATE**: `42601`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Check the SQL query syntax, target view name, and cardinality hints supplied to EXPLAIN INCREMENTAL ESTIMATE.
 
 ### <a id="rs-3501"></a> `RS-3501` — Merge-law accumulator wire bytes have the wrong size
 

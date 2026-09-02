@@ -18,6 +18,7 @@
 pub mod acl;
 pub mod arrangement;
 pub mod audit;
+pub mod capacity_store;
 pub mod checkpoint;
 pub mod checkpoint_export;
 pub mod checkpoint_store;
@@ -40,6 +41,7 @@ pub mod topology;
 
 // Re-export commonly used top-level types.
 pub use acl::{AclError, AclStore};
+pub use capacity_store::CapacityThresholdStore;
 pub use checkpoint::{
     ChangelogCheckpointContribution, CheckpointCoordinator, CoordinatorError,
     DEFAULT_ALIGNMENT_MAX_CREDITS,

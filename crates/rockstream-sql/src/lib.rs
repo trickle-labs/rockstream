@@ -31,7 +31,11 @@ pub use canonicalize::ExpressionNormalizer;
 pub use catalog::{ColumnDef, SchemaCatalog, ViewEntry};
 pub use distribution::apply_distribution;
 pub use error::SqlError;
-pub use estimate::{explain_incremental_estimate, format_estimate, EstimateRow};
+pub use estimate::{
+    explain_incremental_estimate, explain_incremental_estimate_capacity,
+    format_capacity_estimate_report, format_estimate, CanonicalArrangementEntry,
+    CapacityEstimateContext, EstimateRow,
+};
 pub use explain_incremental::{
     explain_incremental, explain_incremental_analyze, explain_incremental_verbose,
     explain_incremental_with_arrangements, explain_incremental_with_engine_facts,

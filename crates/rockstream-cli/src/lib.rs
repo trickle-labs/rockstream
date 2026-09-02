@@ -1829,8 +1829,13 @@ pub fn run_explain_view(
 
         rt.block_on(async {
             if estimate {
-                let rows = frontend
-                    .explain_incremental_estimate_for_sql(&view.query, 1000, 10000)
+                let context = rockstream_sql::CapacityEstimateContext {
+                    cardinality_hint: 1000,
+                    batch_rows: 10000,
+                    ..Default::default()
+                };
+                let (cap_est, rows) = frontend
+                    .explain_incremental_estimate_capacity_for_sql(&view.query, &context)
                     .await
                     .map_err(|e| {
                         CliError::new(
@@ -1839,7 +1844,7 @@ pub fn run_explain_view(
                             "Verify view query syntax and catalog schema dependencies.",
                         )
                     })?;
-                let formatted_text = rockstream_sql::format_estimate(&rows);
+                let formatted_text = rockstream_sql::format_capacity_estimate_report(&cap_est, &rows);
                 let estimate_infos: Vec<output::EstimateRowInfo> = rows
                     .into_iter()
                     .map(|r| output::EstimateRowInfo {
@@ -1851,6 +1856,7 @@ pub fn run_explain_view(
                 let info = output::ExplainEstimateInfo {
                     view_name: view.name,
                     query: view.query,
+                    capacity_estimate: Some(cap_est),
                     estimates: estimate_infos,
                     formatted_text,
                 };

@@ -978,6 +978,8 @@ pub struct EstimateRowInfo {
 pub struct ExplainEstimateInfo {
     pub view_name: String,
     pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity_estimate: Option<rockstream_types::capacity::CapacityEstimate>,
     pub estimates: Vec<EstimateRowInfo>,
     pub formatted_text: String,
 }

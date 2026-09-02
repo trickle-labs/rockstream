@@ -44,5 +44,6 @@ rockstream-test-support = { workspace = true }
 rockstream-docgen = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
+async-trait = { workspace = true }
 
 

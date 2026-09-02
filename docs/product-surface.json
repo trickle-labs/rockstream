@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "5855874d692abba990e77737a453060c27054a85a3d24fb05b0a4b0fed63f500",
+    "candidate_identity_digest": "f3963ed37052091d27a07ccbb189586f7866599ed70e1a9270ac173f0ca6deed",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -1054,7 +1054,7 @@
           {
             "name": "estimate",
             "long": "estimate",
-            "help": "Show static cost and state memory estimates without deploying",
+            "help": "Show calibrated capacity, state memory, and throughput estimates without deploying",
             "required": false,
             "value_name": "ESTIMATE",
             "possible_values": [
@@ -5738,6 +5738,26 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Upgrade external PostgreSQL to version 12+ (14+ recommended) or Kafka broker to version 2.8+ (3.x recommended).",
         "doc_anchor": "rs-3029"
+      },
+      {
+        "code": "RS-3030",
+        "key": "capacity.sample_batch_flush_failure",
+        "title": "Capacity sample batch flush failure",
+        "severity": "ERROR",
+        "sqlstate": "58000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Check storage permissions and disk space for capacity measurement chunks, or reduce profiling sample rate.",
+        "doc_anchor": "rs-3030"
+      },
+      {
+        "code": "RS-3031",
+        "key": "capacity.invalid_estimate_request",
+        "title": "Invalid EXPLAIN INCREMENTAL ESTIMATE query or options",
+        "severity": "ERROR",
+        "sqlstate": "42601",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Check the SQL query syntax, target view name, and cardinality hints supplied to EXPLAIN INCREMENTAL ESTIMATE.",
+        "doc_anchor": "rs-3031"
       },
       {
         "code": "RS-3501",

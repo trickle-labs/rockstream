@@ -532,6 +532,10 @@ pub const RS_3027: ErrorCode = ErrorCode::new(3027);
 pub const RS_3028: ErrorCode = ErrorCode::new(3028);
 /// Incompatible external database or broker version.
 pub const RS_3029: ErrorCode = ErrorCode::new(3029);
+/// Capacity sample batch flush failure.
+pub const RS_3030: ErrorCode = ErrorCode::new(3030);
+/// Invalid EXPLAIN INCREMENTAL ESTIMATE query or options.
+pub const RS_3031: ErrorCode = ErrorCode::new(3031);
 /// Merge-law accumulator wire bytes have the wrong size.
 pub const RS_3501: ErrorCode = ErrorCode::new(3501);
 /// Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded.
