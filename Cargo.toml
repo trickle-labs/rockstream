@@ -62,7 +62,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 md5 = "0.7"
 antichain = { version = "0.3.1", features = ["serde"] }
-slatedb = "0.13"
+slatedb = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
