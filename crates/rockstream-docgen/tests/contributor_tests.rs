@@ -101,8 +101,8 @@ fn test_error_contributor_extraction() {
     let error_surface = ErrorContributor::extract();
     assert_eq!(
         error_surface.errors.len(),
-        183,
-        "ErrorContributor must extract all 183 error descriptors from contracts/errors.toml"
+        192,
+        "ErrorContributor must extract all 192 error descriptors from contracts/errors.toml"
     );
 }
 

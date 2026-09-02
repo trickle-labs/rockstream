@@ -440,7 +440,7 @@ Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| estimate | — | --estimate | ESTIMATE | no | — | true, false | Show static cost and state memory estimates without deploying |
+| estimate | — | --estimate | ESTIMATE | no | — | true, false | Show calibrated capacity, state memory, and throughput estimates without deploying |
 | op_ids | — | --op-ids | OP_IDS | no | — | true, false | Show operator IDs and addressability details for intermediate state |
 | view | — | — | VIEW | yes | — | — | View name to explain |
 
