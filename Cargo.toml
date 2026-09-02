@@ -37,7 +37,7 @@ arrow = "58"
 arrow-flight = "58"
 async-trait = "0.1"
 bytes = "1"
-prost = "0.13"
+prost = "0.14"
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
