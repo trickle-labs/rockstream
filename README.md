@@ -188,7 +188,7 @@ record what has shipped and how each milestone was verified.
 | [Architecture](ARCHITECTURE.md) | A short map of runtime components and dependencies |
 | [Design](DESIGN.md) | Storage layout, coordination, fault tolerance, and deployment details |
 | [IVM internals](IVM.md) | Differentiation, operators, circuits, and the correctness oracle |
-| [Roadmap](NEW_ROADMAP.md) | Version history, remaining qualification work, and proof obligations |
+| [Roadmap](ROADMAP.md) | Active usability, durability, and technical maturity roadmap (v0.60–v0.75; supersedes [NEW_ROADMAP.md](NEW_ROADMAP.md)) |
 | [Project focus](ROCKSTREAM_PROJECT_FOCUS.md) | Core scope, maintained features, and admission rules for new work |
 | [Release governance](docs/release-governance.md) | Candidate identity, evidence, and release gates |
 

@@ -1,4 +1,8 @@
-# RockStream Focused Roadmap
+# RockStream Focused Roadmap (v0.1 – v0.59.24)
+
+> [!NOTE]
+> **Status: Superseded by [ROADMAP.md](ROADMAP.md)** as of v0.59.24.
+> This document remains the authoritative historical record of the v0.1 through v0.59.24 build sequence and sign-offs. For the active post-v0.59 roadmap (v0.60 through v0.75), see [ROADMAP.md](ROADMAP.md).
 
 This roadmap turns [NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md)
 into an ordered, evidence-producing build sequence. It complements:
