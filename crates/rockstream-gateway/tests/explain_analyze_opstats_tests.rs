@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use tokio_postgres::NoTls;
 
-use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView};
+use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable, CatalogView};
 use rockstream_gateway::server::GatewayServer;
 use rockstream_gateway::view_reader::ViewReadStrategy;
 use rockstream_gateway::GatewayError;
@@ -75,6 +75,19 @@ async fn test_explain_analyze_opstats_aggregate() {
     );
 
     let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "base".to_string(),
+        columns: vec![
+            CatalogColumn {
+                name: "k".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            CatalogColumn {
+                name: "v".to_string(),
+                data_type: "Int64".to_string(),
+            },
+        ],
+    });
     catalog.add_view(CatalogView {
         name: "agg_view".to_string(),
         sql: "SELECT k, SUM(v) FROM base GROUP BY k".to_string(),
@@ -136,6 +149,26 @@ async fn test_explain_analyze_opstats_join() {
     );
 
     let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "t1".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    });
+    catalog.add_table(CatalogTable {
+        name: "t2".to_string(),
+        columns: vec![
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            CatalogColumn {
+                name: "val".to_string(),
+                data_type: "Text".to_string(),
+            },
+        ],
+    });
     catalog.add_view(CatalogView {
         name: "join_view".to_string(),
         sql: "SELECT a.id, b.val FROM t1 a JOIN t2 b ON a.id = b.id".to_string(),
@@ -192,6 +225,13 @@ async fn test_explain_analyze_opstats_distinct_minmax() {
     );
 
     let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "base".to_string(),
+        columns: vec![CatalogColumn {
+            name: "k".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    });
     catalog.add_view(CatalogView {
         name: "distinct_view".to_string(),
         sql: "SELECT DISTINCT k FROM base".to_string(),
