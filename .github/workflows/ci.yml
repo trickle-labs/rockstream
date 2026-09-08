@@ -113,6 +113,10 @@ jobs:
         run: bash scripts/check-no-mock-connectors.sh
       - name: no-mock-connectors checker self-test
         run: bash scripts/check-no-mock-connectors.test.sh
+      - name: Check production CLI fixture isolation
+        run: bash scripts/check-no-fixture-dispatch.sh
+      - name: Test production CLI fixture isolation gate
+        run: bash scripts/check-no-fixture-dispatch.test.sh
       - name: connector-admission gate
         run: bash scripts/check-connector-admission.sh
       - name: connector-admission checker self-test

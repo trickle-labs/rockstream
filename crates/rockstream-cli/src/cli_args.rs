@@ -6,6 +6,58 @@ use std::path::PathBuf;
 
 use crate::output::OutputFormat;
 
+/// Node role selected by `rockstream start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    All,
+    Gateway,
+    Worker,
+    Control,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::All => "all",
+                Self::Gateway => "gateway",
+                Self::Worker => "worker",
+                Self::Control => "control",
+            }
+        )
+    }
+}
+
+/// Authentication mode selected by `rockstream start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    Off,
+    Scram,
+    Md5,
+    Oidc,
+    Mtls,
+}
+
+impl std::fmt::Display for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Off => "off",
+                Self::Scram => "scram",
+                Self::Md5 => "md5",
+                Self::Oidc => "oidc",
+                Self::Mtls => "mtls",
+            }
+        )
+    }
+}
+
 /// Target shell for completion generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -17,7 +69,7 @@ pub enum ShellType {
 
 /// RockStream — a cloud-native incremental view maintenance engine with a
 /// PostgreSQL wire access layer.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "rockstream", version, about, long_about = None)]
 pub struct Cli {
     /// Format output as text or JSON.
@@ -83,9 +135,33 @@ impl Cli {
     }
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
+    /// Print cluster topology and health status.
+    Status,
+    /// Execute an incremental query against a view or stream.
+    Query {
+        /// SQL query to execute.
+        query: String,
+    },
+    /// Launch interactive SQL/admin REPL shell.
+    Shell,
+    /// Administrative operations (drain, migrate, raft, checkpoint).
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+    /// Developer and offline development tooling.
+    Dev {
+        #[command(subcommand)]
+        command: DevCommand,
+    },
+    /// Project scaffolding and workspace management.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
     /// Migrate shard storage formats offline.
     Migrate {
         /// Existing storage format version.
@@ -105,16 +181,16 @@ pub enum Command {
         storage: PathBuf,
 
         /// Node role.
-        #[arg(long, default_value = "all")]
-        role: String,
+        #[arg(long, value_enum, default_value_t = Role::All)]
+        role: Role,
 
         /// Control service URL (required for the worker and frontier roles).
         #[arg(long)]
         control: Option<String>,
 
         /// Authentication mode.
-        #[arg(long, default_value = "off", value_parser = clap::builder::PossibleValuesParser::new(["off", "oidc", "mtls"]))]
-        auth: String,
+        #[arg(long, value_enum, default_value_t = AuthMode::Off)]
+        auth: AuthMode,
 
         /// Stable same-host identity advertised during worker registration.
         #[arg(long)]
@@ -369,7 +445,7 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ConfigCommand {
     /// Validate RockStream configuration files for syntax, unknown keys, and semantic bounds.
     Validate {
@@ -417,7 +493,7 @@ pub enum ConfigCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ManifestCommand {
     /// Validate an evidence-manifest.json file.
     Validate {
@@ -429,7 +505,7 @@ pub enum ManifestCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum DebugCommand {
     /// Inspect intermediate arrangement Z-set state for an operator.
     Arrangement {
@@ -445,7 +521,7 @@ pub enum DebugCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ViewCommand {
     /// List all views.
     List,
@@ -493,7 +569,7 @@ pub enum ViewCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum SourceCommand {
     /// List all sources.
     List,
@@ -522,7 +598,7 @@ pub enum SourceCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum SchemaCommand {
     /// List all tables and views in the schema.
     List,
@@ -549,7 +625,7 @@ pub enum SchemaCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum WorkloadCommand {
     /// List all workloads.
     List,
@@ -602,7 +678,7 @@ pub enum WorkloadCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ShardCommand {
     /// List all shards and their lease assignments.
     List,
@@ -619,7 +695,7 @@ pub enum ShardCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum CheckpointCommand {
     /// List cluster checkpoints.
     List,
@@ -648,7 +724,7 @@ pub enum CheckpointCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum SupportCommand {
     /// Generate on-demand diagnostic support bundle.
     Bundle {
@@ -676,7 +752,7 @@ pub enum SupportCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ResourceCommand {
     /// Show per-view and per-workload resource usage.
     Usage {
@@ -688,7 +764,7 @@ pub enum ResourceCommand {
     Cluster,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum SchemaEvolutionCommand {
     /// Show schema evolution status.
     Status,
@@ -696,7 +772,7 @@ pub enum SchemaEvolutionCommand {
     History,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum AuditCommand {
     /// Tail recent audit log events.
     Tail {
@@ -715,7 +791,7 @@ pub enum AuditCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ClusterCommand {
     /// Show cluster status and leadership.
     Status,
@@ -728,7 +804,7 @@ pub enum ClusterCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum WorkerCommand {
     /// List all registered workers.
     List,
@@ -747,5 +823,125 @@ pub enum WorkerCommand {
         /// Confirm destructive action without interactive prompt.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum AdminCommand {
+    /// Gracefully drain workloads from a worker node.
+    Drain {
+        /// Worker ID to drain.
+        #[arg(long)]
+        worker_id: u64,
+        /// Control service URL.
+        #[arg(long)]
+        control: Option<String>,
+        /// Automatically confirm execution without interactive prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Migrate a shard to a target worker node.
+    Migrate {
+        /// Shard ID to migrate.
+        #[arg(long)]
+        shard_id: u64,
+        /// Target worker ID.
+        #[arg(long)]
+        target_worker: u64,
+        /// Control service URL.
+        #[arg(long)]
+        control: Option<String>,
+    },
+    /// Raft consensus administrative inspection and operations.
+    Raft {
+        #[command(subcommand)]
+        command: RaftAdminCommand,
+    },
+    /// Checkpoint administration and manual triggering.
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum RaftAdminCommand {
+    /// Inspect Raft consensus cluster membership and leadership.
+    Status,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DevCommand {
+    /// Evidence manifest verification and inspection.
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommand,
+    },
+    /// Run release qualification suite or check prerequisites.
+    Qualify {
+        /// Check execution environment prerequisites fail-closed.
+        #[arg(long)]
+        check_prerequisites: bool,
+        /// Qualification test suite to execute.
+        #[arg(long)]
+        suite: Option<String>,
+        /// Output file path for raw metrics and summary.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Low-level debugging and arrangement state inspection.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+    /// Parse, lower, and explain a SQL query without deploying.
+    Sql {
+        /// SQL query to parse and lower.
+        query: String,
+    },
+    /// Run offline dataflow simulation.
+    Sim {
+        /// Path to simulation scenario definition.
+        #[arg(long)]
+        scenario: Option<PathBuf>,
+    },
+    /// Generate shell completion scripts for Bash, Zsh, or Fish.
+    Completions {
+        /// Target shell to generate completions for.
+        #[arg(value_enum)]
+        shell: ShellType,
+    },
+    /// Explain the incremental execution plan for a view.
+    Explain {
+        /// View name to explain.
+        view: String,
+        /// Show calibrated capacity, state memory, and throughput estimates without deploying.
+        #[arg(long)]
+        estimate: bool,
+        /// Show operator IDs and addressability details for intermediate state.
+        #[arg(long)]
+        op_ids: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ProjectCommand {
+    /// Initialize a new RockStream project from a template.
+    Init {
+        /// Project name (defaults to "my_project").
+        #[arg(default_value = "my_project")]
+        name: String,
+
+        /// Project template: "local", "kafka", or "postgres-cdc".
+        #[arg(long, default_value = "local")]
+        template: String,
+
+        /// Target directory to scaffold the project into (defaults to ./<name>).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Overwrite existing files in non-empty directory.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }

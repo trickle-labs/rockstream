@@ -9,12 +9,13 @@
 //! - Durability across SlateDB storage profiles (0 range deletions)
 //! - Coordination under simulated network stalls and worker transitions
 
+mod common;
+
 use std::sync::Arc;
 
 use object_store::memory::InMemory;
 use rockstream_cli::output::{OutputFormat, ViewStatusInfo};
 use rockstream_cli::run_view_status;
-use rockstream_cli::transport::CatalogClient;
 use rockstream_control::checkpoint::CheckpointCoordinator;
 use rockstream_ops::pipeline::StageTimestampTracker;
 use rockstream_storage::ShardDb;
@@ -340,7 +341,7 @@ fn test_metrics_prometheus_stage_lag_and_barrier_flight_units_monotonic() {
 fn test_cli_view_status_text_with_lag_breakdown() {
     let _lock = METRICS_TEST_LOCK.lock().unwrap();
     reset_all();
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     let lag = StageLagBreakdown {
         source_lag_ms: 10,
@@ -364,7 +365,7 @@ fn test_cli_view_status_text_with_lag_breakdown() {
 fn test_cli_view_status_json_with_lag_breakdown() {
     let _lock = METRICS_TEST_LOCK.lock().unwrap();
     reset_all();
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     let lag = StageLagBreakdown {
         source_lag_ms: 10,

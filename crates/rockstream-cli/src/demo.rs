@@ -28,9 +28,25 @@ pub struct DemoStep {
     pub duration_ms: u64,
 }
 
+fn default_demo_mode() -> String {
+    "demo".to_string()
+}
+fn default_ephemeral_durability() -> String {
+    "ephemeral".to_string()
+}
+fn default_simulated_topology() -> String {
+    "simulated".to_string()
+}
+
 /// Overall structured outcome of `rockstream demo`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DemoOutcome {
+    #[serde(default = "default_demo_mode")]
+    pub mode: String,
+    #[serde(default = "default_ephemeral_durability")]
+    pub durability: String,
+    #[serde(default = "default_simulated_topology")]
+    pub topology: String,
     pub scenario: String,
     pub status: String,
     pub steps: Vec<DemoStep>,
@@ -46,6 +62,9 @@ impl Formattable for DemoOutcome {
             "RockStream Demo: scenario='{}' status={} in {}ms",
             self.scenario, self.status, self.total_duration_ms
         ));
+        lines.push(format!("Mode: {}", self.mode));
+        lines.push(format!("Durability: {}", self.durability));
+        lines.push(format!("Topology: {}", self.topology));
         lines.push(format!(
             "Storage: {} (retained: {})",
             self.storage_path, self.retained
@@ -343,6 +362,9 @@ pub async fn run_demo_async(format: OutputFormat, opts: &DemoOptions) -> Result<
 
     let total_duration_ms = start_all.elapsed().as_millis() as u64;
     let outcome = DemoOutcome {
+        mode: "demo".to_string(),
+        durability: "ephemeral".to_string(),
+        topology: "simulated".to_string(),
         scenario: opts.scenario.clone(),
         status: if failure.is_none() {
             "passed".to_string()

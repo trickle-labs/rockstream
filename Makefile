@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt documentation check e2e e2e-lfs e2e-nextest qualify approve clean error-codes exit-criteria failure-matrix coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
+.PHONY: build test clippy fmt documentation check e2e e2e-lfs e2e-nextest qualify approve clean error-codes exit-criteria failure-matrix fixture-dispatch coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
 
 # Build the workspace
 build:
@@ -22,7 +22,7 @@ documentation:
 	bash scripts/check-documentation.test.sh
 
 # Run all checks (what CI does)
-check: fmt clippy test documentation error-codes exit-criteria verify path-coupling failure-matrix
+check: fmt clippy test documentation error-codes exit-criteria verify path-coupling failure-matrix fixture-dispatch
 
 # Run formal verification specs
 verify:
@@ -62,6 +62,11 @@ exit-criteria:
 failure-matrix:
 	bash scripts/check-failure-matrix.sh
 	bash scripts/check-failure-matrix.test.sh
+
+# Keep test fixtures out of production CLI dispatch.
+fixture-dispatch:
+	bash scripts/check-no-fixture-dispatch.sh
+	bash scripts/check-no-fixture-dispatch.test.sh
 
 # Generate an lcov coverage report for the workspace (requires cargo-llvm-cov).
 coverage:

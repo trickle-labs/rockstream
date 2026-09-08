@@ -22,7 +22,7 @@ async fn test_cli_continuous_polling_under_simulated_faults() {
 
     let client_identity = ClientIdentity::default();
     let cli_control = ControlClient::new(Some(control_url), client_identity);
-    let cli_catalog = CatalogClient::with_defaults();
+    let cli_catalog = CatalogClient::new(ClientIdentity::default());
 
     // Loop with buggify fault injection at control service query dispatch and status collection
     for _ in 0..50 {
@@ -33,10 +33,15 @@ async fn test_cli_continuous_polling_under_simulated_faults() {
 
         // Poll CLI inspection routines
         let status = run_cluster_status(OutputFormat::Json, &cli_control);
-        assert!(
-            status.is_ok(),
-            "cluster status query must succeed: {status:?}"
-        );
+        if let Err(error) = &status {
+            assert!(
+                matches!(
+                    error.code,
+                    rockstream_types::error_code::RS_0003 | rockstream_types::error_code::RS_0004
+                ),
+                "control-plane faults must fail closed with a coded error: {status:?}"
+            );
+        }
 
         let view_status = run_view_status(OutputFormat::Json, &cli_catalog, None);
         assert!(
@@ -51,9 +56,10 @@ async fn test_cli_continuous_polling_under_simulated_faults() {
         );
 
         let shard_list = run_shard_list(OutputFormat::Json, &cli_control);
-        assert!(
-            shard_list.is_ok(),
-            "shard list query must succeed: {shard_list:?}"
+        assert_eq!(
+            shard_list.unwrap_err().code,
+            rockstream_types::error_code::RS_0004,
+            "unsupported topology data must fail closed"
         );
     }
 

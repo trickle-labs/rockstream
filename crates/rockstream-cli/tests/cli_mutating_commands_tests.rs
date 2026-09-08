@@ -8,8 +8,10 @@
 //! - Support bundle secret redaction and size cap.
 //! - Exhaustive dynamic dispatch table refusal and audit verification for unauthorized identities.
 
+mod common;
+
 use rockstream_cli::output::OutputFormat;
-use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
+use rockstream_cli::transport::{CatalogClient, ClientIdentity, StorageClient};
 use rockstream_cli::{
     run_checkpoint_export, run_checkpoint_restore, run_cluster_workers_drain, run_schema_create,
     run_schema_drop, run_shard_migrate, run_source_drop, run_source_pause, run_source_resume,
@@ -37,9 +39,10 @@ fn test_cli_mutating_subcommands_e2e_live_cluster() {
     let storage_path = tmp.path().to_path_buf();
 
     let admin_identity = ClientIdentity::new("admin_op").with_role(Role::Admin);
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(&storage_path);
+    let mut catalog = common::catalog_with_defaults().with_storage_path(&storage_path);
     catalog.identity = admin_identity.clone();
-    let control = ControlClient::new(None, admin_identity.clone()).with_storage_path(&storage_path);
+    let control =
+        common::MockControlClient::new(admin_identity.clone()).with_storage_path(&storage_path);
     let storage = StorageClient::with_identity(admin_identity);
     let dr_source = storage_path.join("dr-source");
     let checkpoint_bytes = seed_checkpoint(&dr_source, 100);
@@ -173,9 +176,10 @@ fn test_cli_mutating_commands_emit_exact_audit_event() {
     let storage_path = tmp.path().to_path_buf();
     let admin_identity = ClientIdentity::new("audit_admin").with_role(Role::Admin);
 
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(&storage_path);
+    let mut catalog = common::catalog_with_defaults().with_storage_path(&storage_path);
     catalog.identity = admin_identity.clone();
-    let control = ControlClient::new(None, admin_identity.clone()).with_storage_path(&storage_path);
+    let control =
+        common::MockControlClient::new(admin_identity.clone()).with_storage_path(&storage_path);
     let storage = StorageClient::with_identity(admin_identity);
     seed_checkpoint(&storage_path, 200);
     let export_path = storage_path.join("export");
@@ -218,9 +222,9 @@ fn test_cli_mutating_commands_emit_exact_audit_event() {
 fn test_cli_mutating_commands_idempotency_and_refusal() {
     let tmp = tempfile::tempdir().unwrap();
     let admin_identity = ClientIdentity::new("admin").with_role(Role::Admin);
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog.identity = admin_identity.clone();
-    let control = ControlClient::new(None, admin_identity).with_storage_path(tmp.path());
+    let control = common::MockControlClient::new(admin_identity).with_storage_path(tmp.path());
 
     // 1. Pausing already paused view -> RS-1007
     catalog.pause_view("active_users").unwrap();
@@ -259,8 +263,9 @@ fn test_cli_mutating_commands_idempotency_and_refusal() {
 #[test]
 fn test_cli_drain_and_migrate_resumable_after_interruption() {
     let tmp = tempfile::tempdir().unwrap();
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin))
-        .with_storage_path(tmp.path());
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin))
+            .with_storage_path(tmp.path());
 
     // Simulate initiating a drain, then re-issuing (idempotent progress status)
     let res1 = control.drain_worker(1).unwrap();
@@ -306,7 +311,7 @@ fn test_cli_unauthorized_identity_refused_and_audited_exhaustive() {
 
     let mut catalog = CatalogClient::new(viewer_identity.clone()).with_storage_path(&storage_path);
     let control =
-        ControlClient::new(None, viewer_identity.clone()).with_storage_path(&storage_path);
+        common::MockControlClient::new(viewer_identity.clone()).with_storage_path(&storage_path);
     let storage = StorageClient::with_identity(viewer_identity);
 
     let resource_for = |operation: &str| match operation {

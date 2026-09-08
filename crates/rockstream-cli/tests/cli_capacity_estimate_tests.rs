@@ -1,11 +1,12 @@
 //! CLI and PGWire capacity estimate equivalence tests (v0.59.23 Slice 3).
 
+mod common;
+
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 
 use rockstream_cli::output::{ExplainEstimateInfo, OutputFormat};
 use rockstream_cli::run_explain_view;
-use rockstream_cli::transport::CatalogClient;
 use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView};
 use rockstream_gateway::server::GatewayServer;
 use rockstream_gateway::view_reader::ViewReadStrategy;
@@ -110,7 +111,7 @@ async fn cli_and_pgwire_reports_match_exactly() {
         .join("\n");
 
     // 3. CLI report via run_explain_view
-    let cli_catalog = CatalogClient::with_defaults();
+    let cli_catalog = common::catalog_with_defaults();
     let cli_text_report =
         run_explain_view(OutputFormat::Text, &cli_catalog, view_name, true, false)
             .expect("CLI run_explain_view text failed");

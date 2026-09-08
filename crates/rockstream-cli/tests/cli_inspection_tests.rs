@@ -11,6 +11,7 @@ use rockstream_cli::output::{
     WorkloadDetail, AUDIT_TAIL_MAX_EVENTS,
 };
 use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
+mod common;
 use rockstream_cli::{
     run_audit_query, run_audit_tail, run_checkpoint_list, run_checkpoint_show, run_cluster_quotas,
     run_cluster_status, run_cluster_workers_list, run_cluster_workers_status,
@@ -62,7 +63,7 @@ fn test_cli_transport_substrate_and_schema_validation() {
 
 #[test]
 fn test_cli_catalog_commands_text_and_json_golden() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     // 1. View List
     let view_list_text = run_view_list(OutputFormat::Text, &catalog).unwrap();
@@ -142,7 +143,7 @@ fn test_cli_catalog_commands_text_and_json_golden() {
 
 #[test]
 fn test_cli_view_show_not_found_rs1001() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let err = run_view_show(OutputFormat::Text, &catalog, "nonexistent_view").unwrap_err();
     assert_eq!(err.code, RS_1001);
     assert!(err.message.contains("nonexistent_view"));
@@ -151,7 +152,7 @@ fn test_cli_view_show_not_found_rs1001() {
 
 #[test]
 fn test_cli_source_show_not_found_rs4009() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let err = run_source_show(OutputFormat::Text, &catalog, "nonexistent_source").unwrap_err();
     assert_eq!(err.code, RS_4009);
     assert!(err.message.contains("nonexistent_source"));
@@ -160,7 +161,7 @@ fn test_cli_source_show_not_found_rs4009() {
 
 #[test]
 fn test_cli_schema_show_not_found_rs1001() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let err = run_schema_show(OutputFormat::Text, &catalog, "nonexistent_schema").unwrap_err();
     assert_eq!(err.code, RS_1001);
     assert!(err.message.contains("nonexistent_schema"));
@@ -168,7 +169,7 @@ fn test_cli_schema_show_not_found_rs1001() {
 
 #[test]
 fn test_cli_workload_show_not_found_rs1005() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let err = run_workload_show(OutputFormat::Text, &catalog, "nonexistent_workload").unwrap_err();
     assert_eq!(err.code, RS_1005);
     assert!(err.message.contains("nonexistent_workload"));
@@ -196,7 +197,7 @@ fn test_cli_catalog_empty_lists() {
 
 #[test]
 fn test_cli_cluster_inspection_commands_golden() {
-    let control = ControlClient::new(None, ClientIdentity::default());
+    let control = common::MockControlClient::new(ClientIdentity::default());
 
     // 1. Cluster Status
     let status_text = run_cluster_status(OutputFormat::Text, &control).unwrap();
@@ -240,7 +241,7 @@ fn test_cli_cluster_inspection_commands_golden() {
 
 #[test]
 fn test_cli_shard_and_checkpoint_list_golden() {
-    let control = ControlClient::new(None, ClientIdentity::default());
+    let control = common::MockControlClient::new(ClientIdentity::default());
 
     // Shard List
     let shard_text = run_shard_list(OutputFormat::Text, &control).unwrap();
@@ -339,12 +340,14 @@ fn test_cli_cluster_status_unreachable_rs0004() {
     let err = run_cluster_status(OutputFormat::Text, &unreachable_control).unwrap_err();
     assert_eq!(err.code, RS_0004);
     assert!(err.message.contains("failed to reach control plane"));
-    assert!(err.next_steps.contains("Verify the control service URL"));
+    assert!(err
+        .next_steps
+        .contains("verify the configured control endpoint"));
 }
 
 #[test]
 fn test_cli_cluster_workers_status_not_found() {
-    let control = ControlClient::new(None, ClientIdentity::default());
+    let control = common::MockControlClient::new(ClientIdentity::default());
     let err = run_cluster_workers_status(OutputFormat::Text, &control, Some(999)).unwrap_err();
     assert_eq!(err.code, RS_1001);
     assert!(err.message.contains("Worker ID 999 not found"));
@@ -354,7 +357,7 @@ fn test_cli_cluster_workers_status_not_found() {
 
 #[test]
 fn test_cli_resource_evolution_audit_commands_golden() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     // 1. Resource Usage
     let res_text = run_resource_usage(OutputFormat::Text, &catalog, None).unwrap();
@@ -487,7 +490,7 @@ fn test_cli_audit_query_filter_no_match() {
 
 #[test]
 fn test_cli_resource_usage_workload_not_found() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let err = run_resource_usage(OutputFormat::Text, &catalog, Some("nonexistent_wl")).unwrap_err();
     assert_eq!(err.code, RS_1005);
     assert!(err.message.contains("nonexistent_wl"));
@@ -497,7 +500,7 @@ fn test_cli_resource_usage_workload_not_found() {
 
 #[test]
 fn test_cli_explain_and_sql_offline_compilation_golden() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     // 1. Explain view text
     let explain_text =
@@ -545,7 +548,7 @@ fn test_cli_explain_and_sql_offline_compilation_golden() {
 
 #[test]
 fn test_cli_explain_view_not_found_rs1001() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let err = run_explain_view(
         OutputFormat::Text,
         &catalog,
@@ -561,7 +564,7 @@ fn test_cli_explain_view_not_found_rs1001() {
 
 #[test]
 fn test_cli_explain_view_estimate_not_found() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let err = run_explain_view(
         OutputFormat::Text,
         &catalog,
@@ -576,7 +579,7 @@ fn test_cli_explain_view_estimate_not_found() {
 
 #[test]
 fn test_cli_explain_view_op_ids_text_and_json() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     // 1. Text format
     let text = run_explain_view(OutputFormat::Text, &catalog, "active_users", false, true).unwrap();
@@ -594,7 +597,7 @@ fn test_cli_explain_view_op_ids_text_and_json() {
 
 #[test]
 fn test_cli_debug_arrangement_command_e2e() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     // Get an op_id from explain --op-ids
     let json = run_explain_view(OutputFormat::Json, &catalog, "active_users", false, true).unwrap();
@@ -688,7 +691,7 @@ fn test_cli_sql_compile_syntax_error_rs1012() {
 fn test_cli_view_status_text_with_lag_breakdown() {
     let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
     rockstream_types::metrics::reset_all();
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     let lag = rockstream_types::metrics::StageLagBreakdown {
         source_lag_ms: 10,
@@ -712,7 +715,7 @@ fn test_cli_view_status_text_with_lag_breakdown() {
 fn test_cli_view_status_json_with_lag_breakdown() {
     let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
     rockstream_types::metrics::reset_all();
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     let lag = rockstream_types::metrics::StageLagBreakdown {
         source_lag_ms: 10,
@@ -737,7 +740,7 @@ fn test_cli_view_status_json_with_lag_breakdown() {
 fn test_cli_view_status_explainability_text_exact() {
     let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
     rockstream_types::metrics::reset_all();
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     let lag = rockstream_types::metrics::StageLagBreakdown {
         source_lag_ms: 10,
@@ -793,7 +796,7 @@ fn test_cli_view_status_explainability_text_exact() {
 fn test_cli_view_status_explainability_json_exact() {
     let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
     rockstream_types::metrics::reset_all();
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     let lag = rockstream_types::metrics::StageLagBreakdown {
         source_lag_ms: 10,

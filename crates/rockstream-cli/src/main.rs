@@ -8,7 +8,10 @@ use std::process::ExitCode;
 use clap::Parser;
 use rockstream_cli::cli_args::*;
 use rockstream_cli::output::OutputFormat;
-use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
+use rockstream_cli::transport::{
+    ClientIdentity, RemoteCatalogClient, RemoteOperationClient, RemoteStorageAdminClient,
+    RemoteTopologyClient, StorageClient,
+};
 use rockstream_cli::{
     run_audit_query, run_audit_tail, run_checkpoint_export, run_checkpoint_list,
     run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
@@ -23,7 +26,7 @@ use rockstream_cli::{
     run_view_subscribe, run_workload_alter, run_workload_create, run_workload_drop,
     run_workload_list, run_workload_show, DemoOptions, DoctorOptions, InitOptions, StartOptions,
 };
-use rockstream_types::acl::Role;
+use rockstream_types::acl::Role as AclRole;
 use rockstream_types::config_resolver::CliConfigOverrides;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 
@@ -39,7 +42,143 @@ fn main() -> ExitCode {
     let identity = cli_identity(&cli);
     let format = cli.effective_output_format();
 
-    match cli.command {
+    match cli.command.clone() {
+        Command::Status => {
+            let control = make_control_client(&cli, None);
+            handle_result(run_cluster_status(format, &control), format)
+        }
+        Command::Query { query } => {
+            let catalog = make_catalog_client(&cli, identity.clone());
+            handle_result(run_view_query(format, &catalog, &query, None), format)
+        }
+        Command::Shell => {
+            let control = make_control_client(&cli, None);
+            handle_result(run_cluster_status(format, &control), format)
+        }
+        Command::Admin { ref command } => match command {
+            AdminCommand::Drain {
+                worker_id,
+                control: ref ctrl_addr,
+                yes,
+            } => {
+                let control_client = make_operation_client(&cli, ctrl_addr.clone());
+                handle_result(
+                    run_cluster_workers_drain(format, &control_client, *worker_id, *yes),
+                    format,
+                )
+            }
+            AdminCommand::Migrate {
+                shard_id,
+                target_worker,
+                control: ref ctrl_addr,
+            } => {
+                let control = make_operation_client(&cli, ctrl_addr.clone());
+                handle_result(
+                    run_shard_migrate(format, &control, *shard_id, *target_worker, true),
+                    format,
+                )
+            }
+            AdminCommand::Raft {
+                command: RaftAdminCommand::Status,
+            } => {
+                let control = make_control_client(&cli, None);
+                handle_result(run_cluster_status(format, &control), format)
+            }
+            AdminCommand::Checkpoint { ref command } => {
+                let storage = RemoteStorageAdminClient::with_identity(identity.clone());
+                let storage_path = cli
+                    .storage_dir
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let res = match command {
+                    CheckpointCommand::List => run_checkpoint_list(format, &storage, &storage_path),
+                    CheckpointCommand::Show { checkpoint_id } => {
+                        run_checkpoint_show(format, &storage, *checkpoint_id, &storage_path)
+                    }
+                    CheckpointCommand::Export { destination } => {
+                        run_checkpoint_export(format, &storage, &storage_path, destination)
+                    }
+                    CheckpointCommand::Restore {
+                        source,
+                        storage: target,
+                        yes,
+                    } => run_checkpoint_restore(
+                        format,
+                        &storage,
+                        &storage_path,
+                        source,
+                        target,
+                        *yes,
+                    ),
+                };
+                handle_result(res, format)
+            }
+        },
+        Command::Dev { ref command } => match command {
+            DevCommand::Manifest { ref command } => match command {
+                ManifestCommand::Validate { path, base_dir } => handle_result(
+                    run_manifest_validate(format, path, base_dir.as_deref()),
+                    format,
+                ),
+            },
+            DevCommand::Qualify {
+                check_prerequisites,
+                suite,
+                output,
+            } => handle_result(
+                run_qualify(
+                    format,
+                    *check_prerequisites,
+                    suite.as_deref(),
+                    output.as_deref(),
+                ),
+                format,
+            ),
+            DevCommand::Debug { ref command } => {
+                let catalog = make_catalog_client(&cli, identity.clone());
+                let res = match command {
+                    DebugCommand::Arrangement {
+                        view,
+                        op_id,
+                        key,
+                        epoch,
+                    } => run_debug_arrangement(format, &catalog, view, op_id, key, *epoch),
+                };
+                handle_result(res, format)
+            }
+            DevCommand::Sql { query } => handle_result(run_sql_compile(format, query), format),
+            DevCommand::Sim { scenario: _ } => {
+                let control = make_control_client(&cli, None);
+                handle_result(run_cluster_status(format, &control), format)
+            }
+            DevCommand::Completions { shell } => handle_result(run_completions(*shell), format),
+            DevCommand::Explain {
+                view,
+                estimate,
+                op_ids,
+            } => {
+                let catalog = make_catalog_client(&cli, identity.clone());
+                handle_result(
+                    run_explain_view(format, &catalog, view, *estimate, *op_ids),
+                    format,
+                )
+            }
+        },
+        Command::Project { ref command } => match command {
+            ProjectCommand::Init {
+                name,
+                template,
+                dir,
+                force,
+            } => {
+                let opts = InitOptions {
+                    name: name.clone(),
+                    template: template.clone(),
+                    dir: dir.clone(),
+                    force: *force,
+                };
+                handle_result(run_init(format, &opts), format)
+            }
+        },
         Command::Migrate { from, to, storage } => {
             handle_result(run_format_migrate(format, from, to, &storage), format)
         }
@@ -115,9 +254,9 @@ fn main() -> ExitCode {
 
             let opts = StartOptions {
                 storage,
-                role,
+                role: role.to_string(),
                 control,
-                auth_mode: auth,
+                auth_mode: auth.to_string(),
                 worker_location: WorkerLocation::new(
                     host_id
                         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -163,7 +302,7 @@ fn main() -> ExitCode {
         }
         Command::View { command } => {
             let identity = identity.clone();
-            let mut catalog = CatalogClient::new(identity);
+            let mut catalog = make_catalog_client(&cli, identity);
             let res = match command {
                 ViewCommand::List => run_view_list(format, &catalog),
                 ViewCommand::Show { name } => run_view_show(format, &catalog, &name),
@@ -185,7 +324,7 @@ fn main() -> ExitCode {
         }
         Command::Source { command } => {
             let identity = identity.clone();
-            let mut catalog = CatalogClient::new(identity);
+            let mut catalog = make_catalog_client(&cli, identity);
             let res = match command {
                 SourceCommand::List => run_source_list(format, &catalog),
                 SourceCommand::Show { name } => run_source_show(format, &catalog, &name),
@@ -199,7 +338,7 @@ fn main() -> ExitCode {
         }
         Command::Schema { command } => {
             let identity = identity.clone();
-            let mut catalog = CatalogClient::new(identity);
+            let mut catalog = make_catalog_client(&cli, identity);
             let res = match command {
                 SchemaCommand::List => run_schema_list(format, &catalog),
                 SchemaCommand::Show { name } => run_schema_show(format, &catalog, &name),
@@ -214,7 +353,7 @@ fn main() -> ExitCode {
         }
         Command::Workload { command } => {
             let identity = identity.clone();
-            let mut catalog = CatalogClient::new(identity);
+            let mut catalog = make_catalog_client(&cli, identity);
             let res = match command {
                 WorkloadCommand::List => run_workload_list(format, &catalog),
                 WorkloadCommand::Show { name } => run_workload_show(format, &catalog, &name),
@@ -281,9 +420,9 @@ fn main() -> ExitCode {
                         },
                 } => {
                     let control_client = if let Some(addr) = ctrl_addr {
-                        make_control_client(&cli, Some(addr.clone()))
+                        make_operation_client(&cli, Some(addr.clone()))
                     } else {
-                        control
+                        make_operation_client(&cli, None)
                     };
                     handle_result(
                         run_cluster_workers_drain(format, &control_client, *worker_id, *yes),
@@ -297,7 +436,8 @@ fn main() -> ExitCode {
             let res = match command {
                 ShardCommand::List => run_shard_list(format, &control),
                 ShardCommand::Migrate { shard_id, to, yes } => {
-                    run_shard_migrate(format, &control, *shard_id, *to, *yes)
+                    let operation = make_operation_client(&cli, None);
+                    run_shard_migrate(format, &operation, *shard_id, *to, *yes)
                 }
             };
             handle_result(res, format)
@@ -354,7 +494,7 @@ fn main() -> ExitCode {
         }
         Command::Resource { command } => {
             let identity = identity.clone();
-            let catalog = CatalogClient::new(identity);
+            let catalog = make_catalog_client(&cli, identity);
             let res = match command {
                 ResourceCommand::Usage { workload } => {
                     run_resource_usage(format, &catalog, workload.as_deref())
@@ -365,7 +505,7 @@ fn main() -> ExitCode {
         }
         Command::SchemaEvolution { command } => {
             let identity = identity.clone();
-            let catalog = CatalogClient::new(identity);
+            let catalog = make_catalog_client(&cli, identity);
             let res = match command {
                 SchemaEvolutionCommand::Status => run_schema_evolution_status(format, &catalog),
                 SchemaEvolutionCommand::History => run_schema_evolution_history(format, &catalog),
@@ -390,7 +530,7 @@ fn main() -> ExitCode {
             estimate,
             op_ids,
         } => {
-            let catalog = CatalogClient::with_defaults();
+            let catalog = make_catalog_client(&cli, identity.clone());
             handle_result(
                 run_explain_view(format, &catalog, &view, estimate, op_ids),
                 format,
@@ -398,7 +538,7 @@ fn main() -> ExitCode {
         }
         Command::Sql { query } => handle_result(run_sql_compile(format, &query), format),
         Command::Debug { command } => {
-            let catalog = CatalogClient::with_defaults();
+            let catalog = make_catalog_client(&cli, identity.clone());
             let res = match command {
                 DebugCommand::Arrangement {
                     view,
@@ -555,48 +695,68 @@ fn main() -> ExitCode {
     }
 }
 
-fn make_control_client(cli: &Cli, override_addr: Option<String>) -> ControlClient {
+fn make_control_client(cli: &Cli, override_addr: Option<String>) -> RemoteTopologyClient {
     let mut identity = cli_identity(cli);
     if let Some(ref p) = cli.tls_cert_path {
         identity = identity.with_cert(p.clone());
     }
-    let control_addr = override_addr.or_else(|| cli.control.clone());
-    let mut client = ControlClient::new(control_addr, identity);
-    if cli.tls_cert_path.is_some()
-        || cli.tls_key_path.is_some()
-        || cli.tls_ca_cert_path.is_some()
-        || cli.internal_tls_cert_path.is_some()
-        || cli.internal_tls_key_path.is_some()
-        || cli.internal_tls_ca_cert_path.is_some()
-    {
-        let cert_path = cli
-            .internal_tls_cert_path
-            .clone()
-            .or_else(|| cli.tls_cert_path.clone());
-        let key_path = cli
-            .internal_tls_key_path
-            .clone()
-            .or_else(|| cli.tls_key_path.clone());
-        let ca_cert_path = cli
-            .internal_tls_ca_cert_path
-            .clone()
-            .or_else(|| cli.tls_ca_cert_path.clone());
-        client = client.with_internal_tls(rockstream_types::identity::InternalTlsConfig {
-            cert_path,
-            key_path,
-            ca_cert_path,
-            client_auth_required: true,
-            reload_enabled: false,
-        });
+    let mut client =
+        RemoteTopologyClient::new(override_addr.or_else(|| cli.control.clone()), identity);
+    if let Some(config) = tls_config(cli) {
+        client = client.with_internal_tls(config);
     }
     client
 }
 
+fn make_operation_client(cli: &Cli, override_addr: Option<String>) -> RemoteOperationClient {
+    let mut client = RemoteOperationClient::new(
+        override_addr.or_else(|| cli.control.clone()),
+        cli_identity(cli),
+    );
+    if let Some(config) = tls_config(cli) {
+        client = client.with_internal_tls(config);
+    }
+    client
+}
+
+fn make_catalog_client(cli: &Cli, identity: ClientIdentity) -> RemoteCatalogClient {
+    let mut client = RemoteCatalogClient::new(cli.control.clone(), identity);
+    if let Some(config) = tls_config(cli) {
+        client = client.with_internal_tls(config);
+    }
+    client
+}
+
+fn tls_config(cli: &Cli) -> Option<rockstream_types::identity::InternalTlsConfig> {
+    let enabled = cli.tls_cert_path.is_some()
+        || cli.tls_key_path.is_some()
+        || cli.tls_ca_cert_path.is_some()
+        || cli.internal_tls_cert_path.is_some()
+        || cli.internal_tls_key_path.is_some()
+        || cli.internal_tls_ca_cert_path.is_some();
+    enabled.then(|| rockstream_types::identity::InternalTlsConfig {
+        cert_path: cli
+            .internal_tls_cert_path
+            .clone()
+            .or_else(|| cli.tls_cert_path.clone()),
+        key_path: cli
+            .internal_tls_key_path
+            .clone()
+            .or_else(|| cli.tls_key_path.clone()),
+        ca_cert_path: cli
+            .internal_tls_ca_cert_path
+            .clone()
+            .or_else(|| cli.tls_ca_cert_path.clone()),
+        client_auth_required: true,
+        reload_enabled: false,
+    })
+}
+
 fn cli_identity(cli: &Cli) -> ClientIdentity {
     let role = match cli.identity_role.as_str() {
-        "admin" => Role::Admin,
-        "pipeline-owner" => Role::PipelineOwner,
-        _ => Role::Viewer,
+        "admin" => AclRole::Admin,
+        "pipeline-owner" => AclRole::PipelineOwner,
+        _ => AclRole::Viewer,
     };
     let mut identity = ClientIdentity::new(cli.identity_user.clone()).with_role(role);
     if let Some(cert_path) = &cli.tls_cert_path {

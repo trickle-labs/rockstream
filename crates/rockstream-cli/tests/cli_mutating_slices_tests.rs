@@ -10,8 +10,10 @@
 //! - Slice 7: Checkpoint restore and storage inspection.
 //! - Slice 8: Diagnostic support bundle generation.
 
+mod common;
+
 use rockstream_cli::output::OutputFormat;
-use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
+use rockstream_cli::transport::{CatalogClient, ClientIdentity, StorageClient};
 use rockstream_cli::{
     prompt_confirmation, run_checkpoint_restore, run_cluster_workers_drain, run_schema_create,
     run_schema_drop, run_shard_migrate, run_source_drop, run_source_pause, run_source_resume,
@@ -87,7 +89,7 @@ fn test_cli_mutating_auth_rbac_and_audit_logging() {
 
     // 2. Authorized principal (PipelineOwner role) performing mutation
     let owner_identity = ClientIdentity::new("owner_user").with_role(Role::PipelineOwner);
-    let mut owner_catalog = CatalogClient::with_defaults();
+    let mut owner_catalog = common::catalog_with_defaults();
     owner_catalog.identity = owner_identity;
     owner_catalog.storage_path = Some(storage_path.clone());
 
@@ -113,7 +115,7 @@ fn test_cli_view_mutating_lifecycle_query_and_subscribe() {
     let tmp = tempfile::tempdir().unwrap();
     let storage_path = tmp.path().to_path_buf();
 
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(&storage_path);
+    let mut catalog = common::catalog_with_defaults().with_storage_path(&storage_path);
 
     // 1. Pause view with --yes
     let pause_out = run_view_pause(OutputFormat::Text, &mut catalog, "active_users", true).unwrap();
@@ -164,7 +166,7 @@ fn test_cli_view_mutating_lifecycle_query_and_subscribe() {
 fn test_cli_source_and_schema_mutating_commands() {
     let tmp = tempfile::tempdir().unwrap();
     let storage_path = tmp.path().to_path_buf();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(&storage_path);
+    let mut catalog = common::catalog_with_defaults().with_storage_path(&storage_path);
 
     // Source lifecycle: pause, resume, drop
     let pause_out = run_source_pause(OutputFormat::Text, &mut catalog, "users_source").unwrap();
@@ -212,7 +214,7 @@ fn test_cli_source_and_schema_mutating_commands() {
 fn test_cli_workload_mutating_lifecycle_and_constraints() {
     let tmp = tempfile::tempdir().unwrap();
     let storage_path = tmp.path().to_path_buf();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(&storage_path);
+    let mut catalog = common::catalog_with_defaults().with_storage_path(&storage_path);
 
     // 1. Create workload
     let create_out = run_workload_create(
@@ -281,7 +283,7 @@ fn test_cli_workload_mutating_lifecycle_and_constraints() {
 
 #[test]
 fn test_cli_view_pause_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     let res = catalog.pause_view("active_users");
     assert_eq!(res.unwrap_err().code, RS_2401);
@@ -289,21 +291,21 @@ fn test_cli_view_pause_viewer_denied_rs2401() {
 
 #[test]
 fn test_cli_view_pause_owner_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("owner").with_role(Role::PipelineOwner);
     assert!(catalog.pause_view("active_users").is_ok());
 }
 
 #[test]
 fn test_cli_view_pause_unconfirmed_refusal() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     let res = run_view_pause(OutputFormat::Text, &mut catalog, "active_users", false);
     assert_eq!(res.unwrap_err().code, RS_0005);
 }
 
 #[test]
 fn test_cli_view_pause_idempotent() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.pause_view("active_users").unwrap();
     let res = catalog.pause_view("active_users");
     assert_eq!(res.unwrap_err().code, RS_1007);
@@ -312,7 +314,7 @@ fn test_cli_view_pause_idempotent() {
 #[test]
 fn test_cli_view_pause_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog.pause_view("active_users").unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
     assert!(events
@@ -322,7 +324,7 @@ fn test_cli_view_pause_audit_event_logged() {
 
 #[test]
 fn test_cli_view_resume_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.views.get_mut("active_users").unwrap().state = "PAUSED".to_string();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     let res = catalog.resume_view("active_users");
@@ -331,7 +333,7 @@ fn test_cli_view_resume_viewer_denied_rs2401() {
 
 #[test]
 fn test_cli_view_resume_owner_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.views.get_mut("active_users").unwrap().state = "PAUSED".to_string();
     catalog.identity = ClientIdentity::new("owner").with_role(Role::PipelineOwner);
     assert!(catalog.resume_view("active_users").is_ok());
@@ -339,7 +341,7 @@ fn test_cli_view_resume_owner_authorized() {
 
 #[test]
 fn test_cli_view_resume_idempotent() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     // active_users is already RUNNING
     let res = catalog.resume_view("active_users");
     assert_eq!(res.unwrap_err().code, RS_1008);
@@ -348,7 +350,7 @@ fn test_cli_view_resume_idempotent() {
 #[test]
 fn test_cli_view_resume_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog.views.get_mut("active_users").unwrap().state = "PAUSED".to_string();
     catalog.resume_view("active_users").unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
@@ -359,7 +361,7 @@ fn test_cli_view_resume_audit_event_logged() {
 
 #[test]
 fn test_cli_view_query_viewer_authorized() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let query_viewer = CatalogClient {
         identity: ClientIdentity::new("viewer").with_role(Role::Viewer),
         ..catalog
@@ -369,13 +371,13 @@ fn test_cli_view_query_viewer_authorized() {
 
 #[test]
 fn test_cli_view_query_admin_authorized() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     assert!(catalog.query_view("active_users", None).is_ok());
 }
 
 #[test]
 fn test_cli_view_query_reissue_identical() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let res1 = catalog.query_view("active_users", Some(5)).unwrap();
     let res2 = catalog.query_view("active_users", Some(5)).unwrap();
     assert_eq!(res1, res2);
@@ -384,7 +386,7 @@ fn test_cli_view_query_reissue_identical() {
 #[test]
 fn test_cli_view_query_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog.query_view("active_users", None).unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
     assert!(events.iter().any(|e| e.action == "view.query"));
@@ -392,7 +394,7 @@ fn test_cli_view_query_audit_event_logged() {
 
 #[test]
 fn test_cli_view_subscribe_viewer_authorized() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let sub_viewer = CatalogClient {
         identity: ClientIdentity::new("viewer").with_role(Role::Viewer),
         ..catalog
@@ -404,7 +406,7 @@ fn test_cli_view_subscribe_viewer_authorized() {
 
 #[test]
 fn test_cli_view_subscribe_admin_authorized() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     assert!(catalog
         .subscribe_view("active_users", Some(15), true)
         .is_ok());
@@ -412,7 +414,7 @@ fn test_cli_view_subscribe_admin_authorized() {
 
 #[test]
 fn test_cli_view_subscribe_rs2006_retention() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let res = catalog.subscribe_view("active_users", Some(2), false);
     assert_eq!(res.unwrap_err().code, RS_2006);
 }
@@ -420,7 +422,7 @@ fn test_cli_view_subscribe_rs2006_retention() {
 #[test]
 fn test_cli_view_subscribe_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog
         .subscribe_view("active_users", Some(15), true)
         .unwrap();
@@ -430,7 +432,7 @@ fn test_cli_view_subscribe_audit_event_logged() {
 
 #[test]
 fn test_cli_source_pause_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     assert_eq!(
         catalog.pause_source("users_source").unwrap_err().code,
@@ -440,14 +442,14 @@ fn test_cli_source_pause_viewer_denied_rs2401() {
 
 #[test]
 fn test_cli_source_pause_owner_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("owner").with_role(Role::PipelineOwner);
     assert!(catalog.pause_source("users_source").is_ok());
 }
 
 #[test]
 fn test_cli_source_pause_idempotent() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.pause_source("users_source").unwrap();
     assert!(catalog.pause_source("users_source").is_ok());
 }
@@ -455,7 +457,7 @@ fn test_cli_source_pause_idempotent() {
 #[test]
 fn test_cli_source_pause_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog.pause_source("users_source").unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
     assert!(events.iter().any(|e| e.action == "source.pause"));
@@ -463,7 +465,7 @@ fn test_cli_source_pause_audit_event_logged() {
 
 #[test]
 fn test_cli_source_resume_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     assert_eq!(
         catalog.resume_source("users_source").unwrap_err().code,
@@ -473,14 +475,14 @@ fn test_cli_source_resume_viewer_denied_rs2401() {
 
 #[test]
 fn test_cli_source_resume_owner_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("owner").with_role(Role::PipelineOwner);
     assert!(catalog.resume_source("users_source").is_ok());
 }
 
 #[test]
 fn test_cli_source_resume_idempotent() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.resume_source("users_source").unwrap();
     assert!(catalog.resume_source("users_source").is_ok());
 }
@@ -488,7 +490,7 @@ fn test_cli_source_resume_idempotent() {
 #[test]
 fn test_cli_source_resume_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog.resume_source("users_source").unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
     assert!(events.iter().any(|e| e.action == "source.resume"));
@@ -496,7 +498,7 @@ fn test_cli_source_resume_audit_event_logged() {
 
 #[test]
 fn test_cli_source_drop_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     assert_eq!(
         catalog.drop_source("users_source").unwrap_err().code,
@@ -506,20 +508,20 @@ fn test_cli_source_drop_viewer_denied_rs2401() {
 
 #[test]
 fn test_cli_source_drop_admin_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     assert!(catalog.drop_source("users_source").is_ok());
 }
 
 #[test]
 fn test_cli_source_drop_unconfirmed_refusal() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     let res = run_source_drop(OutputFormat::Text, &mut catalog, "users_source", false);
     assert_eq!(res.unwrap_err().code, RS_0005);
 }
 
 #[test]
 fn test_cli_source_drop_not_found_rs4009() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.drop_source("users_source").unwrap();
     assert_eq!(
         catalog.drop_source("users_source").unwrap_err().code,
@@ -530,7 +532,7 @@ fn test_cli_source_drop_not_found_rs4009() {
 #[test]
 fn test_cli_source_drop_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog.drop_source("users_source").unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
     assert!(events.iter().any(|e| e.action == "source.drop"));
@@ -538,7 +540,7 @@ fn test_cli_source_drop_audit_event_logged() {
 
 #[test]
 fn test_cli_schema_create_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     assert_eq!(
         catalog.create_schema("tbl", None).unwrap_err().code,
@@ -548,14 +550,14 @@ fn test_cli_schema_create_viewer_denied_rs2401() {
 
 #[test]
 fn test_cli_schema_create_owner_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("owner").with_role(Role::PipelineOwner);
     assert!(catalog.create_schema("tbl", None).is_ok());
 }
 
 #[test]
 fn test_cli_schema_create_already_exists_rs1004() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     assert_eq!(
         catalog.create_schema("users", None).unwrap_err().code,
         RS_1004
@@ -565,7 +567,7 @@ fn test_cli_schema_create_already_exists_rs1004() {
 #[test]
 fn test_cli_schema_create_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog.create_schema("new_tbl", None).unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
     assert!(events.iter().any(|e| e.action == "schema.create"));
@@ -573,27 +575,27 @@ fn test_cli_schema_create_audit_event_logged() {
 
 #[test]
 fn test_cli_schema_drop_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     assert_eq!(catalog.drop_schema("users").unwrap_err().code, RS_2401);
 }
 
 #[test]
 fn test_cli_schema_drop_admin_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     assert!(catalog.drop_schema("users").is_ok());
 }
 
 #[test]
 fn test_cli_schema_drop_unconfirmed_refusal() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     let res = run_schema_drop(OutputFormat::Text, &mut catalog, "users", false);
     assert_eq!(res.unwrap_err().code, RS_0005);
 }
 
 #[test]
 fn test_cli_schema_drop_not_found_rs1001() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.drop_schema("users").unwrap();
     assert_eq!(catalog.drop_schema("users").unwrap_err().code, RS_1001);
 }
@@ -601,7 +603,7 @@ fn test_cli_schema_drop_not_found_rs1001() {
 #[test]
 fn test_cli_schema_drop_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog.drop_schema("users").unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
     assert!(events.iter().any(|e| e.action == "schema.drop"));
@@ -609,7 +611,7 @@ fn test_cli_schema_drop_audit_event_logged() {
 
 #[test]
 fn test_cli_workload_create_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     assert_eq!(
         catalog
@@ -622,7 +624,7 @@ fn test_cli_workload_create_viewer_denied_rs2401() {
 
 #[test]
 fn test_cli_workload_create_admin_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     assert!(catalog
         .create_workload("new_wl", None, None, None, None)
         .is_ok());
@@ -630,7 +632,7 @@ fn test_cli_workload_create_admin_authorized() {
 
 #[test]
 fn test_cli_workload_create_already_exists_rs1006() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     assert_eq!(
         catalog
             .create_workload("analytics", None, None, None, None)
@@ -643,7 +645,7 @@ fn test_cli_workload_create_already_exists_rs1006() {
 #[test]
 fn test_cli_workload_create_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog
         .create_workload("new_wl", None, None, None, None)
         .unwrap();
@@ -653,7 +655,7 @@ fn test_cli_workload_create_audit_event_logged() {
 
 #[test]
 fn test_cli_workload_alter_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     assert_eq!(
         catalog
@@ -666,7 +668,7 @@ fn test_cli_workload_alter_viewer_denied_rs2401() {
 
 #[test]
 fn test_cli_workload_alter_admin_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     assert!(catalog
         .alter_workload("analytics", Some(50), None, None, None)
         .is_ok());
@@ -674,7 +676,7 @@ fn test_cli_workload_alter_admin_authorized() {
 
 #[test]
 fn test_cli_workload_alter_idempotent() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog
         .alter_workload("analytics", Some(50), None, None, None)
         .unwrap();
@@ -686,7 +688,7 @@ fn test_cli_workload_alter_idempotent() {
 #[test]
 fn test_cli_workload_alter_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog
         .alter_workload("analytics", Some(50), None, None, None)
         .unwrap();
@@ -696,7 +698,7 @@ fn test_cli_workload_alter_audit_event_logged() {
 
 #[test]
 fn test_cli_workload_drop_viewer_denied_rs2401() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog.identity = ClientIdentity::new("viewer").with_role(Role::Viewer);
     assert_eq!(
         catalog.drop_workload("analytics").unwrap_err().code,
@@ -706,7 +708,7 @@ fn test_cli_workload_drop_viewer_denied_rs2401() {
 
 #[test]
 fn test_cli_workload_drop_admin_authorized() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog
         .create_workload("empty_wl", None, None, None, None)
         .unwrap();
@@ -715,7 +717,7 @@ fn test_cli_workload_drop_admin_authorized() {
 
 #[test]
 fn test_cli_workload_drop_unconfirmed_refusal() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     catalog
         .create_workload("empty_wl", None, None, None, None)
         .unwrap();
@@ -725,7 +727,7 @@ fn test_cli_workload_drop_unconfirmed_refusal() {
 
 #[test]
 fn test_cli_workload_drop_has_views_rs1014() {
-    let mut catalog = CatalogClient::with_defaults();
+    let mut catalog = common::catalog_with_defaults();
     assert_eq!(
         catalog.drop_workload("analytics").unwrap_err().code,
         RS_1014
@@ -735,7 +737,7 @@ fn test_cli_workload_drop_has_views_rs1014() {
 #[test]
 fn test_cli_workload_drop_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = CatalogClient::with_defaults().with_storage_path(tmp.path());
+    let mut catalog = common::catalog_with_defaults().with_storage_path(tmp.path());
     catalog
         .create_workload("empty_wl", None, None, None, None)
         .unwrap();
@@ -749,8 +751,9 @@ fn test_cli_workload_drop_audit_event_logged() {
 #[test]
 fn test_cli_cluster_workers_drain_and_shard_migrate_resumability() {
     let tmp = tempfile::tempdir().unwrap();
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin))
-        .with_storage_path(tmp.path());
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin))
+            .with_storage_path(tmp.path());
 
     // 1. Worker drain with confirmation
     let drain_out = run_cluster_workers_drain(OutputFormat::Text, &control, 1, true).unwrap();
@@ -778,26 +781,30 @@ fn test_cli_cluster_workers_drain_and_shard_migrate_resumability() {
 
 #[test]
 fn test_cli_drain_viewer_denied_rs2401() {
-    let control = ControlClient::new(None, ClientIdentity::new("viewer").with_role(Role::Viewer));
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("viewer").with_role(Role::Viewer));
     assert_eq!(control.drain_worker(1).unwrap_err().code, RS_2401);
 }
 
 #[test]
 fn test_cli_drain_admin_authorized() {
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin));
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin));
     assert!(control.drain_worker(1).is_ok());
 }
 
 #[test]
 fn test_cli_drain_unconfirmed_refusal() {
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin));
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin));
     let res = run_cluster_workers_drain(OutputFormat::Text, &control, 1, false);
     assert_eq!(res.unwrap_err().code, RS_0005);
 }
 
 #[test]
 fn test_cli_drain_reissue_idempotent_status() {
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin));
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin));
     let res1 = control.drain_worker(1).unwrap();
     let res2 = control.drain_worker(1).unwrap();
     assert_eq!(res1.status, res2.status);
@@ -806,8 +813,9 @@ fn test_cli_drain_reissue_idempotent_status() {
 #[test]
 fn test_cli_drain_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin))
-        .with_storage_path(tmp.path());
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin))
+            .with_storage_path(tmp.path());
     control.drain_worker(1).unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
     assert!(events
@@ -817,34 +825,39 @@ fn test_cli_drain_audit_event_logged() {
 
 #[test]
 fn test_cli_migrate_viewer_denied_rs2401() {
-    let control = ControlClient::new(None, ClientIdentity::new("viewer").with_role(Role::Viewer));
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("viewer").with_role(Role::Viewer));
     assert_eq!(control.migrate_shard(1, 2).unwrap_err().code, RS_2401);
 }
 
 #[test]
 fn test_cli_migrate_admin_authorized() {
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin));
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin));
     assert!(control.migrate_shard(1, 2).is_ok());
 }
 
 #[test]
 fn test_cli_migrate_unconfirmed_refusal() {
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin));
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin));
     let res = run_shard_migrate(OutputFormat::Text, &control, 1, 2, false);
     assert_eq!(res.unwrap_err().code, RS_0005);
 }
 
 #[test]
 fn test_cli_migrate_in_flight_refusal_rs5030() {
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin));
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin));
     assert_eq!(control.migrate_shard(999, 2).unwrap_err().code, RS_5030);
 }
 
 #[test]
 fn test_cli_migrate_audit_event_logged() {
     let tmp = tempfile::tempdir().unwrap();
-    let control = ControlClient::new(None, ClientIdentity::new("admin").with_role(Role::Admin))
-        .with_storage_path(tmp.path());
+    let control =
+        common::MockControlClient::new(ClientIdentity::new("admin").with_role(Role::Admin))
+            .with_storage_path(tmp.path());
     control.migrate_shard(1, 2).unwrap();
     let events = StorageClient::new().audit_tail(tmp.path(), 10).unwrap();
     assert!(events

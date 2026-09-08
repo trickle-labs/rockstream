@@ -1143,7 +1143,7 @@ pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), CliErro
 
 pub fn run_view_list(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let views = catalog.list_views()?;
     Ok(output::render_output(&views, format))
@@ -1151,7 +1151,7 @@ pub fn run_view_list(
 
 pub fn run_view_show(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let view = catalog.get_view(name)?;
@@ -1160,7 +1160,7 @@ pub fn run_view_show(
 
 pub fn run_view_status(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: Option<&str>,
 ) -> Result<String, CliError> {
     let statuses = catalog.view_status(name)?;
@@ -1169,7 +1169,7 @@ pub fn run_view_status(
 
 pub fn run_source_list(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let sources = catalog.list_sources()?;
     Ok(output::render_output(&sources, format))
@@ -1177,7 +1177,7 @@ pub fn run_source_list(
 
 pub fn run_source_show(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let source = catalog.get_source(name)?;
@@ -1186,7 +1186,7 @@ pub fn run_source_show(
 
 pub fn run_schema_list(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let schemas = catalog.list_schemas()?;
     Ok(output::render_output(&schemas, format))
@@ -1194,7 +1194,7 @@ pub fn run_schema_list(
 
 pub fn run_schema_show(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let schema = catalog.get_schema(name)?;
@@ -1203,7 +1203,7 @@ pub fn run_schema_show(
 
 pub fn run_workload_list(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let workloads = catalog.list_workloads()?;
     Ok(output::render_output(&workloads, format))
@@ -1211,7 +1211,7 @@ pub fn run_workload_list(
 
 pub fn run_workload_show(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let workload = catalog.get_workload(name)?;
@@ -1220,7 +1220,7 @@ pub fn run_workload_show(
 
 pub fn run_cluster_status(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
 ) -> Result<String, CliError> {
     let status = control.cluster_status()?;
     Ok(output::render_output(&status, format))
@@ -1228,7 +1228,7 @@ pub fn run_cluster_status(
 
 pub fn run_cluster_quotas(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
 ) -> Result<String, CliError> {
     let quotas = control.cluster_quotas()?;
     Ok(output::render_output(&quotas, format))
@@ -1236,7 +1236,7 @@ pub fn run_cluster_quotas(
 
 pub fn run_cluster_workers_list(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
 ) -> Result<String, CliError> {
     let workers = control.list_workers()?;
     Ok(output::render_output(&workers, format))
@@ -1244,7 +1244,7 @@ pub fn run_cluster_workers_list(
 
 pub fn run_cluster_workers_status(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
     worker_id: Option<u64>,
 ) -> Result<String, CliError> {
     let statuses = control.worker_status(worker_id)?;
@@ -1257,7 +1257,7 @@ pub fn run_cluster_workers_status(
 
 pub fn run_shard_list(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
 ) -> Result<String, CliError> {
     let shards = control.list_shards()?;
     Ok(output::render_output(&shards, format))
@@ -1265,7 +1265,7 @@ pub fn run_shard_list(
 
 pub fn run_checkpoint_list(
     format: output::OutputFormat,
-    storage: &transport::StorageClient,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
     storage_path: &Path,
 ) -> Result<String, CliError> {
     let checkpoints = storage.list_checkpoints(storage_path)?;
@@ -1274,7 +1274,7 @@ pub fn run_checkpoint_list(
 
 pub fn run_checkpoint_show(
     format: output::OutputFormat,
-    storage: &transport::StorageClient,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
     checkpoint_id: u64,
     storage_path: &Path,
 ) -> Result<String, CliError> {
@@ -1284,7 +1284,7 @@ pub fn run_checkpoint_show(
 
 pub fn run_resource_usage(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     workload: Option<&str>,
 ) -> Result<String, CliError> {
     let usage = catalog.resource_usage(workload)?;
@@ -1293,7 +1293,7 @@ pub fn run_resource_usage(
 
 pub fn run_resource_cluster(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let cluster = catalog.resource_cluster()?;
     Ok(output::render_output(&cluster, format))
@@ -1301,7 +1301,7 @@ pub fn run_resource_cluster(
 
 pub fn run_schema_evolution_status(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let status = catalog.schema_evolution_status()?;
     Ok(output::render_output(&status, format))
@@ -1309,7 +1309,7 @@ pub fn run_schema_evolution_status(
 
 pub fn run_schema_evolution_history(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let history = catalog.schema_evolution_history()?;
     Ok(output::render_output(&history, format))
@@ -1372,7 +1372,7 @@ pub fn prompt_confirmation(prompt: &str, yes_flag: bool) -> Result<(), CliError>
 
 pub fn run_view_pause(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1386,7 +1386,7 @@ pub fn run_view_pause(
 
 pub fn run_view_resume(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let outcome = catalog.resume_view(name)?;
@@ -1395,7 +1395,7 @@ pub fn run_view_resume(
 
 pub fn run_view_query(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
     limit: Option<usize>,
 ) -> Result<String, CliError> {
@@ -1405,7 +1405,7 @@ pub fn run_view_query(
 
 pub fn run_view_subscribe(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
     from_epoch: Option<u64>,
     snapshot: bool,
@@ -1416,7 +1416,7 @@ pub fn run_view_subscribe(
 
 pub fn run_source_pause(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let outcome = catalog.pause_source(name)?;
@@ -1425,7 +1425,7 @@ pub fn run_source_pause(
 
 pub fn run_source_resume(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let outcome = catalog.resume_source(name)?;
@@ -1434,7 +1434,7 @@ pub fn run_source_resume(
 
 pub fn run_source_drop(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1448,7 +1448,7 @@ pub fn run_source_drop(
 
 pub fn run_schema_create(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     columns: Option<&str>,
 ) -> Result<String, CliError> {
@@ -1458,7 +1458,7 @@ pub fn run_schema_create(
 
 pub fn run_schema_drop(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1472,7 +1472,7 @@ pub fn run_schema_drop(
 
 pub fn run_workload_create(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     priority: Option<u32>,
     freshness_slo_ms: Option<u64>,
@@ -1491,7 +1491,7 @@ pub fn run_workload_create(
 
 pub fn run_workload_alter(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     priority: Option<u32>,
     freshness_slo_ms: Option<u64>,
@@ -1510,7 +1510,7 @@ pub fn run_workload_alter(
 
 pub fn run_workload_drop(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1524,7 +1524,7 @@ pub fn run_workload_drop(
 
 pub fn run_cluster_workers_drain(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::OperationApi + ?Sized),
     worker_id: u64,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1538,7 +1538,7 @@ pub fn run_cluster_workers_drain(
 
 pub fn run_shard_migrate(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::OperationApi + ?Sized),
     shard_id: u64,
     to_worker: u64,
     yes: bool,
@@ -1617,7 +1617,7 @@ pub fn run_format_migrate(
 
 pub fn run_checkpoint_restore(
     format: output::OutputFormat,
-    storage: &transport::StorageClient,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
     audit_path: &Path,
     source: &str,
     target: &str,
@@ -1633,7 +1633,7 @@ pub fn run_checkpoint_restore(
 
 pub fn run_checkpoint_export(
     format: output::OutputFormat,
-    storage: &transport::StorageClient,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
     storage_path: &Path,
     destination: &str,
 ) -> Result<String, CliError> {
@@ -1759,10 +1759,12 @@ fn map_column_type(data_type: &str) -> arrow::datatypes::DataType {
 }
 
 pub fn build_sql_frontend_from_catalog(
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<rockstream_sql::SqlFrontend, CliError> {
     let frontend = rockstream_sql::SqlFrontend::new();
-    for schema in catalog.schemas.values() {
+    let schemas = catalog.list_schemas()?;
+    for schema_summary in &schemas {
+        let schema = catalog.get_schema(&schema_summary.name)?;
         let fields: Vec<arrow::datatypes::Field> = schema
             .columns
             .iter()
@@ -1781,8 +1783,8 @@ pub fn build_sql_frontend_from_catalog(
                 )
             })?;
     }
-    for source in catalog.sources.values() {
-        if !catalog.schemas.contains_key(&source.table) {
+    for source in catalog.list_sources()? {
+        if !schemas.iter().any(|schema| schema.name == source.table) {
             let default_schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
                 arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Float64, false),
@@ -1799,20 +1801,12 @@ pub fn build_sql_frontend_from_catalog(
             let _ = frontend.register_table(&source.table, default_schema);
         }
     }
-    if !catalog.schemas.contains_key("orders") {
-        let default_orders_schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new("hour", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Float64, false),
-        ]));
-        let _ = frontend.register_table("orders", default_orders_schema);
-    }
     Ok(frontend)
 }
 
 pub fn run_explain_view(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     view_name: &str,
     estimate: bool,
     op_ids: bool,
@@ -1933,7 +1927,7 @@ pub fn run_explain_view(
 
 pub fn run_debug_arrangement(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     view_name: &str,
     op_id_str: &str,
     key_str: &str,
@@ -2056,8 +2050,28 @@ pub fn run_debug_arrangement(
 }
 
 pub fn run_sql_compile(format: output::OutputFormat, query: &str) -> Result<String, CliError> {
-    let catalog = transport::CatalogClient::with_defaults();
-    let frontend = build_sql_frontend_from_catalog(&catalog)?;
+    let frontend = rockstream_sql::SqlFrontend::new();
+    let users_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, true),
+        arrow::datatypes::Field::new(
+            "created_at",
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let _ = frontend.register_table("users", users_schema);
+    let orders_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Float64, false),
+        arrow::datatypes::Field::new("hour", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new(
+            "created_at",
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let _ = frontend.register_table("orders", orders_schema);
     let query_str = query.to_string();
 
     std::thread::spawn(move || {

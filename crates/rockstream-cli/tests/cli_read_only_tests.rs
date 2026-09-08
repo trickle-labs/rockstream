@@ -1,6 +1,8 @@
 //! Read-only inspection tests, non-perturbing polling verification,
 //! golden text and JSON validation, and durability tests (v0.53 Slice 7).
 
+mod common;
+
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,7 +12,7 @@ use rockstream_cli::output::{
     CheckpointSummary, ClusterQuotasInfo, OutputFormat, ResourceUsageInfo, ShardInfo,
     ViewStatusInfo, AUDIT_TAIL_MAX_EVENTS,
 };
-use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
+use rockstream_cli::transport::{ClientIdentity, StorageClient};
 use rockstream_cli::{
     run_audit_query, run_audit_tail, run_checkpoint_list, run_cluster_quotas, run_cluster_status,
     run_cluster_workers_list, run_cluster_workers_status, run_explain_view, run_resource_cluster,
@@ -22,8 +24,8 @@ use rockstream_types::audit::AuditEvent;
 
 #[test]
 fn test_cli_read_only_answers_stale_worker_shards_and_workload() {
-    let catalog = CatalogClient::with_defaults();
-    let control = ControlClient::new(None, ClientIdentity::default());
+    let catalog = common::catalog_with_defaults();
+    let control = common::MockControlClient::new(ClientIdentity::default());
 
     // 1. Which views are stale/running?
     let view_status = run_view_status(OutputFormat::Json, &catalog, None).unwrap();
@@ -49,8 +51,8 @@ fn test_cli_read_only_answers_stale_worker_shards_and_workload() {
 
 #[test]
 fn test_cli_all_subcommands_golden_text_and_json_schema() {
-    let catalog = CatalogClient::with_defaults();
-    let control = ControlClient::new(None, ClientIdentity::default());
+    let catalog = common::catalog_with_defaults();
+    let control = common::MockControlClient::new(ClientIdentity::default());
     let storage = StorageClient::new();
     let temp_dir = tempfile::tempdir().unwrap();
     let storage_path = temp_dir.path();
@@ -265,8 +267,8 @@ fn test_cli_all_subcommands_golden_text_and_json_schema() {
 #[test]
 fn test_cli_read_only_polling_non_perturbing_tc() {
     // Simulate active pipeline running concurrently while CLI continuously polls read-only endpoints.
-    let catalog = Arc::new(CatalogClient::with_defaults());
-    let control = Arc::new(ControlClient::new(None, ClientIdentity::default()));
+    let catalog = Arc::new(common::catalog_with_defaults());
+    let control = Arc::new(common::MockControlClient::new(ClientIdentity::default()));
 
     let stop = Arc::new(AtomicBool::new(false));
     let pipeline_ticks = Arc::new(AtomicU64::new(0));
@@ -283,10 +285,10 @@ fn test_cli_read_only_polling_non_perturbing_tc() {
 
     // Simulated CLI continuous polling loop (100 iterations of status inspections)
     for _ in 0..100 {
-        let _ = run_view_status(OutputFormat::Json, &catalog, None);
-        let _ = run_resource_usage(OutputFormat::Json, &catalog, None);
-        let _ = run_shard_list(OutputFormat::Json, &control);
-        let _ = run_cluster_status(OutputFormat::Json, &control);
+        let _ = run_view_status(OutputFormat::Json, catalog.as_ref(), None);
+        let _ = run_resource_usage(OutputFormat::Json, catalog.as_ref(), None);
+        let _ = run_shard_list(OutputFormat::Json, control.as_ref());
+        let _ = run_cluster_status(OutputFormat::Json, control.as_ref());
         std::thread::sleep(Duration::from_millis(1));
     }
 
@@ -441,7 +443,7 @@ fn test_cli_shard_inspection_lfs() {
             key_range: "[8000..ffff]".to_string(),
         },
     ];
-    let control = ControlClient::new(None, ClientIdentity::default()).with_mock_data(
+    let control = common::MockTopologyClient::new().with_mock_data(
         vec![],
         shards,
         ClusterQuotasInfo {
@@ -469,7 +471,7 @@ fn test_cli_shard_inspection_minio() {
         status: "active".to_string(),
         key_range: "[00..ff]".to_string(),
     }];
-    let control = ControlClient::new(None, ClientIdentity::default()).with_mock_data(
+    let control = common::MockTopologyClient::new().with_mock_data(
         vec![],
         shards,
         ClusterQuotasInfo {

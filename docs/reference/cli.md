@@ -1,5 +1,181 @@
 # CLI reference
 
+## `rockstream admin`
+
+Administrative operations (drain, migrate, raft, checkpoint)
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream admin checkpoint`
+
+Checkpoint administration and manual triggering
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream admin checkpoint export`
+
+Export latest committed checkpoint
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| destination | — | --destination | DESTINATION | yes | — | — | Destination object-store URL |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream admin checkpoint list`
+
+List cluster checkpoints
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream admin checkpoint restore`
+
+Restore committed export
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| source | — | --source | SOURCE | yes | — | — | Export object-store URL |
+| storage | — | --storage | STORAGE | yes | — | — | Fresh target object-store URL |
+| yes | — | --yes | YES | no | — | true, false | Confirm destructive action without interactive prompt |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream admin checkpoint show`
+
+Show per-shard checkpoint alignment state
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| checkpoint_id | — | — | CHECKPOINT_ID | yes | — | — | Checkpoint ID |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream admin drain`
+
+Gracefully drain workloads from a worker node
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| control | — | --control | CONTROL | no | — | — | Control service URL |
+| worker_id | — | --worker-id | WORKER_ID | yes | — | — | Worker ID to drain |
+| yes | -y | --yes | YES | no | — | true, false | Automatically confirm execution without interactive prompt |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream admin migrate`
+
+Migrate a shard to a target worker node
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| control | — | --control | CONTROL | no | — | — | Control service URL |
+| shard_id | — | --shard-id | SHARD_ID | yes | — | — | Shard ID to migrate |
+| target_worker | — | --target-worker | TARGET_WORKER | yes | — | — | Target worker ID |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream admin raft`
+
+Raft consensus administrative inspection and operations
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream admin raft status`
+
+Inspect Raft consensus cluster membership and leadership
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
 ## `rockstream audit`
 
 Audit log inspection commands
@@ -406,6 +582,196 @@ Exit codes
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
+## `rockstream dev`
+
+Developer and offline development tooling
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream dev completions`
+
+Generate shell completion scripts for Bash, Zsh, or Fish
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| shell | — | — | SHELL | yes | — | bash, zsh, fish | Target shell to generate completions for |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream dev debug`
+
+Low-level debugging and arrangement state inspection
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream dev debug arrangement`
+
+Inspect intermediate arrangement Z-set state for an operator
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| epoch | — | --epoch | EPOCH | no | — | — | Historical epoch to inspect |
+| key | — | — | KEY | yes | — | — | Key expression to inspect |
+| op_id | — | — | OP_ID | yes | — | — | Operator ID to inspect |
+| view | — | — | VIEW | yes | — | — | View name to inspect |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream dev explain`
+
+Explain the incremental execution plan for a view
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| estimate | — | --estimate | ESTIMATE | no | — | true, false | Show calibrated capacity, state memory, and throughput estimates without deploying |
+| op_ids | — | --op-ids | OP_IDS | no | — | true, false | Show operator IDs and addressability details for intermediate state |
+| view | — | — | VIEW | yes | — | — | View name to explain |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream dev manifest`
+
+Evidence manifest verification and inspection
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream dev manifest validate`
+
+Validate an evidence-manifest.json file
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| base_dir | — | --base-dir | BASE_DIR | no | — | — | Optional base directory containing referenced artifact files |
+| path | — | — | PATH | yes | — | — | Path to the evidence-manifest.json file |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream dev qualify`
+
+Run release qualification suite or check prerequisites
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| check_prerequisites | — | --check-prerequisites | CHECK_PREREQUISITES | no | — | true, false | Check execution environment prerequisites fail-closed |
+| output | — | --output | OUTPUT | no | — | — | Output file path for raw metrics and summary |
+| suite | — | --suite | SUITE | no | — | — | Qualification test suite to execute |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream dev sim`
+
+Run offline dataflow simulation
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| scenario | — | --scenario | SCENARIO | no | — | — | Path to simulation scenario definition |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream dev sql`
+
+Parse, lower, and explain a SQL query without deploying
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| query | — | — | QUERY | yes | — | — | SQL query to parse and lower |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
 ## `rockstream doctor`
 
 Run non-destructive diagnostic checks on binary, config, system, storage, and network reachability
@@ -534,6 +900,43 @@ Exit codes
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
+## `rockstream project`
+
+Project scaffolding and workspace management
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream project init`
+
+Initialize a new RockStream project from a template
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| dir | — | --dir | DIR | no | — | — | Target directory to scaffold the project into (defaults to ./<name>) |
+| force | — | --force | FORCE | no | false | true, false | Overwrite existing files in non-empty directory |
+| name | — | — | NAME | no | my_project | — | Project name (defaults to "my_project") |
+| template | — | --template | TEMPLATE | no | local | — | Project template: "local", "kafka", or "postgres-cdc" |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
 ## `rockstream qualify`
 
 Run release qualification suite or check prerequisites
@@ -545,6 +948,26 @@ Options
 | check_prerequisites | — | --check-prerequisites | CHECK_PREREQUISITES | no | — | true, false | Check execution environment prerequisites fail-closed |
 | output | — | --output | OUTPUT | no | — | — | Output file path for raw metrics and summary |
 | suite | — | --suite | SUITE | no | — | — | Qualification test suite to execute |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+## `rockstream query`
+
+Execute an incremental query against a view or stream
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| query | — | — | QUERY | yes | — | — | SQL query to execute |
 
 Exit codes
 
@@ -786,6 +1209,20 @@ Exit codes
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
+## `rockstream shell`
+
+Launch interactive SQL/admin REPL shell
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
 ## `rockstream source`
 
 Source inspection commands
@@ -923,7 +1360,7 @@ Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| auth | — | --auth | AUTH | no | off | off, oidc, mtls | Authentication mode |
+| auth | — | --auth | AUTH | no | off | off, scram, md5, oidc, mtls | Authentication mode |
 | availability_zone | — | --availability-zone | AVAILABILITY_ZONE | no | — | — | Availability zone advertised during worker registration |
 | checkpoint_retention_count | — | --checkpoint-retention-count | CHECKPOINT_RETENTION_COUNT | no | — | — |  |
 | control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker and frontier roles) |
@@ -944,7 +1381,7 @@ Options
 | raft_bootstrap | — | --raft-bootstrap | RAFT_BOOTSTRAP | no | false | true, false | Start an election immediately on boot |
 | raft_node_id | — | --raft-node-id | RAFT_NODE_ID | no | — | — | This node's ID within its Raft group |
 | raft_peers | — | --raft-peers | RAFT_PEERS | no | — | — | Comma-separated list of other control nodes in Raft group |
-| role | — | --role | ROLE | no | all | — | Node role |
+| role | — | --role | ROLE | no | all | all, gateway, worker, control | Node role |
 | same_host_shm_segment_bytes | — | --same-host-shm-segment-bytes | SAME_HOST_SHM_SEGMENT_BYTES | no | — | — |  |
 | same_host_shm_segments_per_peer | — | --same-host-shm-segments-per-peer | SAME_HOST_SHM_SEGMENTS_PER_PEER | no | — | — |  |
 | shutdown_timeout_secs | — | --shutdown-timeout-secs | SHUTDOWN_TIMEOUT_SECS | no | — | — | Configurable shutdown timeout deadline in seconds (default: 30) |
@@ -952,6 +1389,20 @@ Options
 | storage | — | --storage | STORAGE | yes | — | — | Local storage directory for node state and artifacts |
 | webhook_listen | — | --webhook-listen | WEBHOOK_LISTEN | no | — | — | Independent HTTP listener for `POST /webhook/<source>` ingestion |
 | worker_id | — | --worker-id | WORKER_ID | no | — | — | Explicit worker ID advertised during worker registration |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+## `rockstream status`
+
+Print cluster topology and health status
 
 Exit codes
 

@@ -7,6 +7,9 @@ Run the deterministic demo:
 ```console
 $ rockstream demo
 RockStream Demo: scenario='orders' status=passed in <duration>ms
+Mode: demo
+Durability: ephemeral
+Topology: simulated
 Storage: <temporary storage> (retained: false)
 --------------------------------------------------------------------------------
 [Step 1] create_table_orders (<duration>ms) [ok]
@@ -51,6 +54,9 @@ The JSON form is stable apart from duration and temporary-storage fields:
 ```console
 $ rockstream demo --output json
 {
+  "mode": "demo",
+  "durability": "ephemeral",
+  "topology": "simulated",
   "scenario": "orders",
   "status": "passed",
   "steps": [

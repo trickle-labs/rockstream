@@ -4,11 +4,12 @@
 //! against batch oracle expectations, surrogate key roundtrips, historical epoch retention bounds,
 //! and non-perturbing concurrent polling.
 
+mod common;
+
 use std::sync::Arc;
 
 use object_store::memory::InMemory;
 use rockstream_cli::output::{ArrangementDebugInfo, ExplainOpIdInfo, OutputFormat};
-use rockstream_cli::transport::CatalogClient;
 use rockstream_cli::{run_debug_arrangement, run_explain_view};
 use rockstream_ops::debugger::{decode_user_key, inspect_arrangement_db};
 use rockstream_ops::live_exec::{GroupKeyPacker, Utf8KeyPacker};
@@ -21,7 +22,7 @@ use rockstream_types::ids::OperatorId;
 
 #[test]
 fn test_debug_arrangement_all_stateful_operators_batch_oracle() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     // 1. Aggregate view: active_users
     let json_explain =
@@ -113,7 +114,7 @@ fn test_debug_arrangement_composite_and_utf8_key_roundtrip() {
 
 #[test]
 fn test_debug_arrangement_unsupported_family_refuses_by_name() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let json_explain =
         run_explain_view(OutputFormat::Json, &catalog, "active_users", false, true).unwrap();
     let explain: ExplainOpIdInfo = serde_json::from_str(&json_explain).unwrap();
@@ -148,7 +149,7 @@ fn test_debug_arrangement_unsupported_family_refuses_by_name() {
 
 #[test]
 fn test_debug_arrangement_historical_epoch_and_retention_bounds() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let json_explain =
         run_explain_view(OutputFormat::Json, &catalog, "active_users", false, true).unwrap();
     let explain: ExplainOpIdInfo = serde_json::from_str(&json_explain).unwrap();
@@ -187,7 +188,7 @@ fn test_debug_arrangement_historical_epoch_and_retention_bounds() {
 
 #[test]
 fn test_debug_arrangement_continuous_polling_non_perturbing() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
     let json_explain =
         run_explain_view(OutputFormat::Json, &catalog, "active_users", false, true).unwrap();
     let explain: ExplainOpIdInfo = serde_json::from_str(&json_explain).unwrap();
@@ -273,7 +274,7 @@ async fn test_debug_arrangement_durability_lfs_and_minio() {
 
 #[test]
 fn test_debug_arrangement_sim_faults() {
-    let catalog = CatalogClient::with_defaults();
+    let catalog = common::catalog_with_defaults();
 
     // Fault 1: Non-existent view
     let err_view = run_debug_arrangement(
