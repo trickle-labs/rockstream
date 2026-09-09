@@ -98,6 +98,7 @@ async fn start_role(
         .with_cmd(vec![
             "start".to_string(),
             "--storage=/data".to_string(),
+            "--daemon".to_string(),
             format!("--role={role}"),
             format!("--control={control_addr}"),
         ])
