@@ -2844,6 +2844,13 @@ async fn explain_incremental_matches_frontend_byte_for_byte() {
     use rockstream_types::explain::ExplainLevel;
 
     let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "base".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    });
     catalog.add_view(CatalogView {
         name: "inc_mv".to_string(),
         sql: "SELECT id FROM base".to_string(),
@@ -2875,12 +2882,12 @@ async fn explain_incremental_matches_frontend_byte_for_byte() {
     let frontend = SqlFrontend::new();
     frontend
         .register_table(
-            "inc_mv",
+            "base",
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
         )
         .unwrap();
     let direct = frontend
-        .explain_incremental_for_sql("SELECT * FROM inc_mv", ExplainLevel::Default, &[])
+        .explain_incremental_for_sql("SELECT id FROM base", ExplainLevel::Default, &[])
         .await
         .unwrap();
 
@@ -2922,6 +2929,13 @@ async fn explain_incremental_analyze_reflects_live_view_traffic() {
 
     rockstream_types::metrics::reset_all();
     let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "base".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    });
     catalog.add_view(CatalogView {
         name: "analyze_mv".to_string(),
         sql: "SELECT id FROM base".to_string(),
