@@ -10,8 +10,8 @@ description: "Phase 0–1: Validate input and orient — confirm version exists,
 - Prefix every shell command with `rtk` (e.g. `rtk cargo test`, `rtk git status`).
 - One binary, one CLI, one config: every role is a flag on the same `rockstream`
   binary. `main` must remain runnable through it at the end of this version.
-- Strict ordering: do **not** start this version until the previous version's
-  `sign-offs/v*.md` is complete. If it is not, stop and report.
+- Follow the prerequisites in the active roadmap and version plan. Check their
+  sign-offs before dependent work; sibling patches and connector branches can overlap.
 - No code path may depend on SlateDB range deletion. Cleanup is scan-and-delete
   or snapshot-safe compaction filters, and a test must assert this.
 - Unbounded in-memory accumulation is never acceptable. Every new queue, buffer,
@@ -33,18 +33,23 @@ description: "Phase 0–1: Validate input and orient — confirm version exists,
 
 ## Phase 0: Validate Input
 
-1. Confirm `${input:version}` exists in [NEW_ROADMAP.md](../../NEW_ROADMAP.md)
-   (read just that row).
-2. Check that the **previous version's** `sign-offs/v*.md` is **complete**
-   (all boxes checked).
-3. Report the version's **Focus, Scope, Proof, and Backends** from the roadmap row.
-4. Stop if the previous version is incomplete. Otherwise, proceed to Phase 1.
+1. For v0.60 onward, locate `${input:version}` in [ROADMAP.md](../../ROADMAP.md).
+   Read its section and, for v0.61 through v0.74, its committed plan from the
+   [implementation plan index](../../docs/implementation-plans/README.md).
+   Read the index's shared rules too. A `.0` suffix selects the minor-version plan.
+   Use [NEW_ROADMAP.md](../../NEW_ROADMAP.md) only for historical versions through v0.59.
+2. Check the sign-offs for the plan's required predecessor work. A checked box
+   needs linked evidence, not only a completion claim.
+3. Report the version's scope, implementation steps, documentation obligations,
+   exit criterion IDs, and required test backends. Include the common definition of done.
+4. Stop dependent work if its prerequisites are incomplete. Otherwise, proceed to Phase 1.
 
 ---
 
 ## Phase 1: Orient
 
-1. **Read only the `${input:version}` row** from NEW_ROADMAP.md.
+1. Read the selected version's roadmap section and committed plan. Preserve
+   every exit criterion ID when restating its obligations.
 2. **Extended Deferred-Item Audit** (three-pass scan):
    - **Pass A**: Read every prior sign-off for items marked: "deferred", "TODO", 
      "stub", "placeholder", "out-of-scope". List any that overlap this version's Scope.
@@ -62,7 +67,7 @@ description: "Phase 0–1: Validate input and orient — confirm version exists,
      For each, state explicitly whether it overlaps this version's Scope — this
      determines whether Phase 2 must fix it now (see Exit below).
 3. **Restate**, in your own words, the **exact proof obligations** for this
-   version. List every concrete claim in the Proof column as a checkable
+   version. List every plan exit criterion and roadmap proof claim as a checkable
    assertion. This list is your contract — nothing is "done" until every item
    is independently verifiable.
 4. **Confirm** the extended deferred-item audit is complete and all categories reported.

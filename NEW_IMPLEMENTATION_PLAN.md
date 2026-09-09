@@ -1,5 +1,9 @@
 # RockStream Focused Implementation Plan
 
+> Historical plan. [ROADMAP.md](ROADMAP.md) governs current work.
+> Use the [v0.61 through v0.74 implementation plans](docs/implementation-plans/README.md)
+> for those milestones and their performance patches.
+
 A deliberately narrow, test-first roadmap from an empty repository to a
 production-grade system built around **two core pillars** and nothing else:
 

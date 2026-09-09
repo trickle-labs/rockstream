@@ -10,6 +10,12 @@ slices implemented and tests passing.
 Start by reading `.claude/${input:version}-plan.md` to reload the proof-claim →
 test mapping before running any proofs.
 
+For v0.61 through v0.74, also read the committed version plan and
+[shared evidence rules](../../docs/implementation-plans/README.md).
+Compare every plan ID and implementation step with the evidence. Require full
+expected outputs and public release-binary proof; internal tests alone cannot
+qualify product claims. Record missing or unavailable proof as incomplete.
+
 ## ⚡ Ground Rules (non-negotiable)
 
 - Prefix every shell command with `rtk` (e.g. `rtk cargo test`, `rtk git status`).
@@ -59,8 +65,9 @@ Satisfy every rung the version's **Backends** and **Proof** require:
   is checked in as a permanent regression seed.**
 - **Crash/chaos**: Where the Proof calls for it, inject the fault and prove
   bit-identical recovery against a non-faulty reference.
-- **Benchmark**: Any performance claim gets a `criterion` benchmark or recorded
-  measurement note; establish/refresh baseline.
+- **Benchmark**: Follow the version plan's measured gates and frozen profiles.
+  Public-path performance claims require external measurements and complete
+  result checks. Keep frozen baselines; write new evidence for the candidate.
 - **Soak (if gated)**: Run the required long soak to completion and capture clean
   results. A soak is a gate, not a loophole.
 

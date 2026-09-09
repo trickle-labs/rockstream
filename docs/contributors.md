@@ -8,6 +8,7 @@ open a pull request.
 
 Useful source and contract references:
 
+- [Active roadmap](../ROADMAP.md) and [v0.61 through v0.74 implementation plans](implementation-plans/README.md)
 - [CLI reference](reference/cli.md)
 - [Configuration reference](reference/configuration.md)
 - [Language features](language-features.md)

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # check-exit-criteria.sh — enforce that every version marked ✅ Done in
-# NEW_ROADMAP.md has a complete sign-off file in sign-offs/.
+# ROADMAP.md or historical NEW_ROADMAP.md has a complete sign-off in sign-offs/.
 #
 # Called by CI on every push and PR. Also callable locally: ./scripts/check-exit-criteria.sh
 #
 # A sign-off file is considered complete when it has no unchecked checklist
-# items (i.e. no '- [ ]' lines remain).
+# items and includes checked evidence for every committed implementation-plan ID.
 set -euo pipefail
 
 ROOT="${1:-$(git rev-parse --show-toplevel)}"
@@ -69,11 +69,17 @@ done < <(grep -E '^\| v[0-9]+\.[0-9]+(\.[0-9]+)? \|' "$ROADMAP" || true)
 # which is exactly the bug found by the <=v0.42.3 implementation review
 # (2026-07-10): v0.42.1/v0.42.2/v0.42.3 were marked Done with no sign-off
 # file and this check never noticed.
-done_versions=$(grep -E '^\| v[0-9]+\.[0-9]+(\.[0-9]+)? \|.*✅ Done' "$ROADMAP" \
-  | sed 's/^| \(v[0-9]*\.[0-9]*\(\.[0-9]*\)*\) |.*/\1/' || true)
+roadmaps=("$ROADMAP")
+if [ -f "$ROOT/ROADMAP.md" ]; then
+  roadmaps+=("$ROOT/ROADMAP.md")
+fi
+done_versions=$(sed 's/\*\*//g' "${roadmaps[@]}" \
+  | grep -E '^\| v[0-9]+\.[0-9]+(\.[0-9]+)? \|.*✅ Done' \
+  | sed -E 's/^\| (v[0-9]+\.[0-9]+(\.[0-9]+)?) \|.*/\1/; s/\.0$//' \
+  | sort -u || true)
 
-if [ -z "$done_versions" ]; then
-  echo "No versions marked Done in NEW_ROADMAP.md."
+if [ -z "$done_versions" ] && [ "$ERRORS" -eq 0 ]; then
+  echo "No versions marked Done in the roadmaps."
   exit 0
 fi
 
@@ -81,7 +87,7 @@ for version in $done_versions; do
   signoff="$SIGNOFFS_DIR/${version}.md"
 
   if [ ! -f "$signoff" ]; then
-    echo "MISSING: $version is marked Done in NEW_ROADMAP.md but sign-offs/${version}.md does not exist."
+    echo "MISSING: $version is marked Done but sign-offs/${version}.md does not exist."
     echo "  Run: make approve VERSION=${version#v}"
     ERRORS=$((ERRORS + 1))
     continue
@@ -96,6 +102,28 @@ for version in $done_versions; do
     continue
   fi
 
+  plan="$ROOT/docs/implementation-plans/${version}.md"
+  if [[ "$version" =~ ^v0\.(6[1-9]|7[0-4])(\.[0-9]+)?$ ]] && [ ! -f "$plan" ]; then
+    echo "MISSING: $version has no committed implementation plan."
+    ERRORS=$((ERRORS + 1))
+    continue
+  fi
+  if [ -f "$plan" ]; then
+    criteria=$(sed -nE 's/^\| (V[0-9]+-[0-9]+) \|.*/\1/p' "$plan")
+    if [ -z "$criteria" ]; then
+      echo "INCOMPLETE: $version implementation plan has no exit criterion IDs."
+      ERRORS=$((ERRORS + 1))
+      continue
+    fi
+    previous_errors=$ERRORS
+    for criterion in $criteria; do
+      if ! grep -qE "^- \[[xX]\] ${criterion}: [^[:space:]]" "$signoff"; then
+        echo "INCOMPLETE: sign-offs/${version}.md lacks checked evidence for ${criterion}."
+        ERRORS=$((ERRORS + 1))
+      fi
+    done
+    [ "$ERRORS" -eq "$previous_errors" ] || continue
+  fi
   echo "OK: $version"
 done
 

@@ -10,6 +10,11 @@ claims passing and evidence collected.
 Start by reading `.claude/${input:version}-evidence.md` to reload the evidence
 table before writing the sign-off.
 
+For v0.61 through v0.74, compare that table with the committed version plan and
+[shared sign-off rules](../../docs/implementation-plans/README.md).
+Every exit criterion ID needs implementation, documentation, test, and result
+links. An absent ID or an unproven implementation step blocks completion.
+
 ## ⚡ Ground Rules (non-negotiable)
 
 - Prefix every shell command with `rtk` (e.g. `rtk cargo test`, `rtk git status`).
@@ -37,14 +42,16 @@ table before writing the sign-off.
 
 1. Create the sign-off template: `rtk make approve VERSION=<X.Y>` (pass the
    number without the `v`).
-2. Edit `sign-offs/v<X.Y>.md` so it enumerates **every** Proof claim from the
-   roadmap row, each with the concrete evidence that proves it, and check off
-   every box. The exit-criteria CI gate (`scripts/check-exit-criteria.sh`) fails
-   if any `- [ ]` remains.
-3. Update the version's status in the roadmap to `✅ Done` only after the
-   sign-off is complete.
+2. Edit `sign-offs/v<X.Y>.md` to cover every roadmap proof claim, common
+   definition-of-done item, and committed plan ID. Use `- [x] V061-01:` followed
+   by concrete evidence links for each proven ID, substituting the actual ID.
+   Leave incomplete criteria unchecked. The exit-criteria gate rejects missing
+   plan IDs and unchecked items; reviewers must assess the linked proof.
+3. Update the plan status and the version's overview row in ROADMAP.md to
+   `✅ Done` only after sign-off is complete. Historical versions through v0.59
+   update NEW_ROADMAP.md instead.
 4. Bump Cargo.toml
-5. Run `rtk ./scripts/check-exit-criteria.sh` and `rtk make e2e` (or `rtk make e2e-nextest`) and confirm
+5. Run `rtk proxy bash scripts/check-exit-criteria.sh` and `rtk make e2e` (or `rtk make e2e-nextest`) and confirm
    both pass.
 
 ---

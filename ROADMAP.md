@@ -8,6 +8,10 @@
 **Roadmap range:** v0.60 through v0.75  
 **Primary objective:** Turn RockStream from a technically ambitious IVM engine with uneven product surfaces into a coherent, trustworthy, durable, operable database system.
 
+**Implementation plans:** [v0.61 through v0.74, including performance patches](docs/implementation-plans/README.md).
+These plans define implementation steps, documentation changes, and numbered exit criteria.
+Carry every criterion into implementation and sign-off before marking a milestone Done.
+
 ---
 
 ## 1. Purpose
@@ -539,6 +543,8 @@ A repository search gate should fail CI if known fixture constructors become rea
 
 ---
 
+<a id="v0-61"></a>
+
 # 7. v0.61 — Golden Path and Project Tooling
 
 ## Focus
@@ -712,6 +718,8 @@ The generated README commands must themselves be executed by CI.
 - Cloud deployment automation.
 
 ---
+
+<a id="v0-62"></a>
 
 # 8. v0.62 — Unified Configuration and Node Lifecycle
 
@@ -908,6 +916,8 @@ The test suite must prove that:
 
 ---
 
+<a id="v0-63"></a>
+
 # 9. v0.63 — Durable Catalog
 
 ## Focus
@@ -1088,6 +1098,8 @@ Repeat with:
 
 ---
 
+<a id="v0-64"></a>
+
 # 10. v0.64 — SQL Execution Integrity
 
 ## Focus
@@ -1244,6 +1256,8 @@ restart after DML
 
 ---
 
+<a id="v0-65"></a>
+
 # 11. v0.65 — Complete Standalone Recovery, Backup, and Restore
 
 ## Focus
@@ -1377,6 +1391,8 @@ verify exact view multiset
 The restored instance must have no dependency on files outside the backup.
 
 ---
+
+<a id="v0-66"></a>
 
 # 12. v0.66 — Real Management Plane
 
@@ -1522,6 +1538,8 @@ Run the CLI against:
 For every status field shown by the CLI, tests must mutate the actual underlying state and verify the field changes.
 
 ---
+
+<a id="v0-67"></a>
 
 # 13. v0.67 — Direct Distributed Data Plane
 
@@ -1697,6 +1715,8 @@ All must have deterministic outcomes.
 
 ---
 
+<a id="v0-68"></a>
+
 # 14. v0.68 — Durable Distributed Lifecycle
 
 ## Focus
@@ -1854,6 +1874,8 @@ Distributed lifecycle protocols remain subject to simulation/formal verification
 
 ---
 
+<a id="v0-69"></a>
+
 # 15. v0.69 — PostgreSQL CDC Golden Connector
 
 ## Focus
@@ -2008,6 +2030,8 @@ The resulting template becomes Supported only after this complete test passes.
 
 ---
 
+<a id="v0-70"></a>
+
 # 16. v0.70 — Kafka Golden Connector
 
 ## Focus
@@ -2124,6 +2148,8 @@ view correctness after restart
 The Kafka template becomes Supported only after these tests pass.
 
 ---
+
+<a id="v0-71"></a>
 
 # 17. v0.71 — Operational Observability and Diagnostics
 
@@ -2291,6 +2317,8 @@ storage unavailable
 
 ---
 
+<a id="v0-72"></a>
+
 # 18. v0.72 — Resource Control and Capacity Behavior
 
 ## Focus
@@ -2427,6 +2455,8 @@ Performance claims must be reproducible from repository commands.
 
 ---
 
+<a id="v0-73"></a>
+
 # 19. v0.73 — Security Coherence
 
 ## Focus
@@ -2554,6 +2584,8 @@ secret rotation during operation
 No secret values may appear in ordinary diagnostics or support bundles.
 
 ---
+
+<a id="v0-74"></a>
 
 # 20. v0.74 — Upgrade and Compatibility
 

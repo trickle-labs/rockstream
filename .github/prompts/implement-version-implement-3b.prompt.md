@@ -11,6 +11,11 @@ to see which slices have been completed. Continue with the remaining slices.
 
 ## ⚡ Ground Rules (non-negotiable)
 
+- For v0.61 through v0.74, read the committed version plan and
+  [shared implementation rules](../../docs/implementation-plans/README.md).
+  Preserve every exit criterion ID in the working plan. Implement its behavior,
+  documentation, and tests together; keep unproven IDs incomplete.
+
 - Prefix every shell command with `rtk` (e.g. `rtk cargo test`, `rtk git status`).
 - One binary, one CLI, one config: every role is a flag on the same `rockstream`
   binary. `main` must remain runnable through it at the end of this version.

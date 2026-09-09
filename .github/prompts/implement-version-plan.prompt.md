@@ -6,8 +6,10 @@ description: "Phase 2: Plan — deferred-item audit, vertical slices, test commi
 # Implement `${input:version}` — Phase 2: Plan
 
 Prerequisite: Phases 0–1 (`implement-version-orient`) must be complete and proof
-obligations agreed. Start by reading the `${input:version}` row from
-[NEW_ROADMAP.md](../../NEW_ROADMAP.md) to re-establish context.
+obligations agreed. Read the selected version's section in
+[ROADMAP.md](../../ROADMAP.md), its committed plan, and the
+[shared implementation and evidence rules](../../docs/implementation-plans/README.md).
+Use NEW_ROADMAP.md only for historical versions through v0.59.
 
 ## ⚡ Ground Rules (non-negotiable)
 
@@ -63,6 +65,10 @@ obligations agreed. Start by reading the `${input:version}` row from
    annotations.
 8. **Proof Mapping**: Map each Proof claim to the specific test(s) that will
    prove it. If a claim has no test mapped to it, the plan is not finished.
+   Preserve every committed exit criterion ID. Map each implementation step
+   and documentation obligation to an ID, implementation files, tests, and an
+   evidence artifact. Resolve required contract choices before dependent work.
+   Compare the complete ID set with the committed plan before leaving this phase.
 
 **For DESIGN.md and IVM.md, always search first — never read entire files or sections:**
 ```
@@ -82,6 +88,8 @@ Once every Proof claim is mapped to a test, dispatch wiring is audited (with mis
    - Dispatch-wiring audit (file/line for each path, flagging any MISSING)
    - Coverage matrices with test commitments for each cell
    - Proof-claim → test mapping
+   - Committed plan path and all exit criterion IDs, including their code,
+     documentation, test, and evidence mapping
    This file survives the upcoming compaction.
 2. Output **exactly** this message and nothing else:
    > "Phase 2 done. Plan saved to `.claude/${input:version}-plan.md` (including dispatch-wiring audit and coverage matrices). Run `/compact` now, then run `/implement-version-implement-3a` with version `${input:version}`."

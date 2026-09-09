@@ -29,6 +29,12 @@ conversation.
 
 ## Procedure
 
+For v0.60 onward, use [ROADMAP.md](../../../ROADMAP.md). For v0.61 through
+v0.74, also use the [committed implementation plans](../../../docs/implementation-plans/README.md).
+Pass the selected plan path and its complete exit criterion ID set through
+every phase. Follow the plan's dependencies, including parallel connector
+branches and performance patches, instead of requiring numeric adjacency.
+
 1. **Resolve the version.** If `${input:version}` wasn't given, ask for it
    before doing anything else.
 
@@ -36,11 +42,11 @@ conversation.
    `medium`) with a prompt telling it to: read
    `.github/prompts/implement-version-orient.prompt.md` and carry out Phases 0
    and 1 for `version=<X.Y>` exactly as written there (check the roadmap row
-   exists, check the previous version's sign-off is fully checked off, restate
+   exists, check required predecessor sign-offs and their evidence, restate
    the Proof obligations as a checkable list, and audit prior sign-offs for
    overlapping deferred items). Ask it to return only: pass/blocked, the
    restated proof-obligation list, and any overlapping deferred items found.
-   - If it reports **blocked** (prior version incomplete, or version missing
+   - If it reports **blocked** (required predecessor incomplete, or version missing
      from the roadmap): stop immediately and report that to the user. Do not
      continue.
 
@@ -120,7 +126,7 @@ reasoning, no full test logs).
 
 ## Stopping conditions (always halt and report, never guess past these)
 
-- Orient reports the previous version's sign-off is incomplete, or the version
+- Orient reports a required predecessor's sign-off is incomplete, or the version
   isn't on the roadmap.
 - Implement reports a test failure it couldn't root-cause within the phase.
 - Prove reports a Proof claim that cannot be satisfied.
