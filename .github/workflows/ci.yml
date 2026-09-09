@@ -43,6 +43,10 @@ jobs:
           toolchain: "1.88"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
       - name: Require Docker
         run: docker info
       - name: Build unified-binary test image
@@ -237,6 +241,10 @@ jobs:
           toolchain: "1.88"
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
       - name: Require Docker
         run: docker info
       - name: Build unified-binary test image
