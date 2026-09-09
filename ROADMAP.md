@@ -237,12 +237,17 @@ Changes to persistent formats or public protocols require:
 |---|---|---|
 | v0.60.0 | Product Truth | Production CLI stops fabricating system state ✅ Done |
 | **v0.61** | Golden Path | A generated local project actually works end-to-end |
+| v0.61.1 | External performance baseline | Complete measured workloads gate performance changes |
+| v0.61.2 | Aggregate delta reduction | Epoch-visible aggregates emit only net group changes |
 | **v0.62** | Configuration & Lifecycle | One authoritative configuration and runtime lifecycle |
+| v0.62.1 | Worker memory budgets | Shards share bounded caches and propagate backpressure |
 | **v0.63** | Durable Catalog | DDL and metadata survive process destruction |
 | **v0.64** | SQL Execution Integrity | Standard PostgreSQL DML replaces ad-hoc command parsing |
 | **v0.65** | Standalone Recovery | Complete standalone crash recovery, backup, and restore |
+| v0.65.1 | Concurrent maintenance and group commit | Independent work overlaps without weakening durable visibility |
 | **v0.66** | Management Plane | Real typed management API and truthful operational CLI |
 | **v0.67** | Distributed Data Plane | Row traffic leaves the control plane |
+| v0.67.1 | State beyond RAM | Maintained state and recovery operate within worker budgets |
 | **v0.68** | Distributed Lifecycle | Migration, drain, and failover become durable sagas |
 | **v0.69** | PostgreSQL CDC | First complete external ingestion golden path |
 | **v0.70** | Kafka | Second complete external ingestion golden path |
@@ -251,6 +256,63 @@ Changes to persistent formats or public protocols require:
 | **v0.73** | Security | Authentication and identity become production-coherent |
 | **v0.74** | Upgrade Compatibility | Rolling/versioned upgrades and durable format migration |
 | **v0.75** | Stable Technical Preview | Long-lived 0.x compatibility and qualification contract |
+
+### 5.1 Performance work starts with v0.61
+
+Start the external baseline alongside the golden path. Pull worker memory limits and performance measurements forward from v0.72 into the patch milestones above. These are planned milestones, not completed capabilities. Follow the split rules in section 3 if a milestone needs several reviews.
+
+Reuse the existing exchange, storage, arrangement, spill, and benchmark implementations. Integrate them into the public execution path before adding alternatives. Performance changes must preserve exact results, replay behavior, and durable visibility.
+
+### 5.2 v0.61.1: External performance baseline
+
+Extend [the R1 runner](scripts/run-r1-local.sh) and [its workload contract](benchmarks/r1-local/README.md). Version new profiles without overwriting frozen evidence. Use release binaries through public ingestion and query interfaces. Treat `sample_reference_run` as a qualification-logic fixture only.
+
+Measure read latency, durable commit latency, and event-to-committed-result freshness separately. Set explicit p99 targets, offered load, and regression tolerances before comparing candidates. Timestamp events at scheduled generation and include generator delay, backpressure, errors, and timeouts. Keep the offered-load schedule independent of completion so overload remains visible.
+
+Require these experiments, adding their gates as the corresponding production path becomes available:
+
+| Experiment | Required evidence |
+|---|---|
+| One-key updates with 1K, 100K, and 10M groups | State writes per change remain approximately constant; report lookup cost separately |
+| One and twenty compatible views | Shared execution reduces duplicated state, writes, and computation |
+| 1, 2, 4, and 8 actual workers | More sustainable committed throughput at the same freshness target; identify host resource limits |
+| Concurrent ingestion and queries | Read p99 and freshness remain within their separate targets |
+| State larger than RAM through compaction and restart | Bounded RSS and storage backlog, with complete recovered results |
+| Overload, worker loss, and migration | Explicit backpressure, exact results, and bounded recovery |
+
+Compare complete result multisets with an independent oracle. Measure freshness using the correct result at the relevant committed epoch. A visibility probe alone is insufficient. Reject missing required matrix cells, inactive worker processes, and synthetic measurements. Record unavailable cases as blocked, with an owning milestone. v0.61.1 requires a measured standalone baseline; distributed and large-state claims require their later measured gates.
+
+Publish commands, revision, hardware, storage backend, raw samples, and repeated-run variation. Keep payload size, view count, state size, durability, and latency targets fixed. Report state writes, intermediate rows, network bytes, and object-store requests per committed input change, plus RSS, queue age, control-node load, and physical flushes per logical epoch.
+
+Report cost per million changes as `total hourly infrastructure cost * 1_000_000 / (sustainable committed changes per second * 3600)`. Include gateways, control nodes, workers, storage requests, retained storage, network transfer, and compaction. Local runs establish local performance only; cloud cost claims require a measured deployment with dated prices.
+
+### 5.3 v0.61.2: Aggregate delta reduction
+
+Keep the existing dirty-key persistence. For epoch-visible `SUM` and `COUNT`, consolidate each group's inputs and emit its old and final values once. Emit nothing when the result is unchanged. Preserve checked arithmetic, NULL behavior, signed multiplicities, group deletion, and atomic failure behavior. Do not coalesce across observable epoch boundaries.
+
+Prove exact output deltas and recovered results for repeated-key updates, cancellations, deletions, NULLs, and overflow. Measure intermediate rows as well as dirty-key writes. This is a bounded optimization of supported aggregates, not a new aggregate framework.
+
+### 5.4 v0.62.1: Worker memory budgets
+
+Wire the existing `WorkerStorageContext` into production shard creation. Pass worker-owned block and metadata caches into every `ShardDbBuilder`; account for their shared allocations once. Include SlateDB write buffers, operator state, source and exchange buffers, queries, checkpoints, and migrations in the worker budget.
+
+Enforce byte limits and admission control before allocation. Propagate pressure to sources, and bound retries and waiters. Reserve capacity for foreground maintenance and reads while limiting compaction, backfill, and migration concurrency. Prove bounded RSS and queue age under sustained overload with many shards, including shard creation and removal.
+
+Use a bounded local disk cache for object-store data through the pinned SlateDB version's supported API. Validate cache identity and lifecycle across shards. Shared block caches primarily share a resource budget; cross-instance download reuse belongs in the object-store cache. See [SlateDB caching](https://slatedb.io/docs/design/caching/).
+
+### 5.5 v0.65.1: Concurrent maintenance and group commit
+
+After the v0.65 recovery contract is proven, schedule independent branches of the view dependency graph concurrently. Keep one ordered execution owner per shard and bound concurrency. Reduce the gateway commit lock's scope only after preserving dependent-view ordering and consistent reads.
+
+Feed multiple complete logical epochs into the existing physical commit group. Flush at a byte limit or a bounded delay for the oldest pending epoch, including idle traffic. Reserve time for persistence within the freshness budget. Bound pending bytes and acknowledgment waiters. Advance frontiers and acknowledge durability only after all required writes and durable flushes succeed; never expose partial dependencies or later epochs across a failed commit.
+
+Compare one and twenty views under light and sustained load. Require exact results through crash, retry, stale-owner, and write-failure cases. Publish lock wait, flushes per epoch, throughput, and read, commit, and freshness p99. Batching must demonstrate a benefit without violating the selected latency targets.
+
+### 5.6 v0.67.1: State beyond RAM
+
+Reuse existing spillable arrangements. Make ordinary aggregate state demand-loaded or spillable, and audit every supported stateful operator and recovery path for full-state materialization. Page restoration to completion; a truncated bounded scan must never count as successful recovery. The complete-recovery requirement already applies at v0.65.
+
+Prove exact output after eviction, restart, and compaction with state larger than the configured worker memory budget. Bound spill I/O, disk occupancy, checkpoint buffers, and storage backlog. Unsupported operators must reject the workload explicitly. Extend this proof to large-state migration at v0.68, before expanding the connector workload envelope in v0.69.
 
 ---
 
@@ -1523,6 +1585,8 @@ message ExchangeFrame {
 
 Replace TSV row representation on the distributed hot path with Arrow record batches.
 
+Reuse the existing Arrow serialization and pooled gRPC exchange clients. Route gateway batches directly to current shard owners using control-plane placement and lease metadata. Serve reads from durable, indexed worker view state with the requested committed frontier. Exercise both ingestion and reads through the public gateway.
+
 Avoid:
 
 ```text
@@ -1602,11 +1666,19 @@ The control plane should record compact execution metadata rather than complete 
 
 Authoritative query results belong in durable shard state.
 
+### 13.8 Shared work on the public path
+
+Wire compatible views to one source index and reuse existing arrangements with correct ownership, retention, and recovery. Verify shared plan selection through public SQL. Gate this work on the one-versus-twenty-view benchmark in section 5.2.
+
+Evaluate pre-aggregation and measure existing factorized join-to-aggregate paths against ordinary execution where the algebra permits them. Require exact weighted results for updates, deletions, and NULLs. Admit further optimizer work only when these measurements identify duplicated work worth removing.
+
 ---
 
 ## Required Proof
 
 Measurements must show that increased row throughput does not produce proportional control-node row-processing CPU.
+
+Control-node memory and row-traffic bytes must also remain independent of output history. Require the measured 1, 2, 4, and 8-worker gate from section 5.2, with the same freshness target and evidence that each worker executes workload data.
 
 Fault scenarios:
 
@@ -1749,6 +1821,12 @@ return to a safe repair phase
 record exact failure
 preserve authoritative data
 ```
+
+### 14.8 Rebalance from partition pressure
+
+Use stable logical partitions that can move independently of worker count. Feed measured partition processing time, state size, queue age, and input rate into the existing pressure and skew controls. Scale out only when queued work can use additional parallelism. Add cooldowns to prevent repeated moves under fluctuating load.
+
+Prewarm state within the recipient's budget before fenced cutover. Prove bounded recovery and foreground freshness during hot-partition movement. For mergeable aggregates, qualify partial aggregation followed by a combining stage. Qualify joins separately; adding workers cannot divide an indivisible hot key by itself.
 
 ---
 
@@ -2219,6 +2297,8 @@ storage unavailable
 
 Make resource limits meaningful and predictable.
 
+This milestone completes cross-workload fairness and capacity qualification. Initial memory bounds, backpressure, and performance evidence ship through section 5's earlier milestones; they must not wait for v0.72.
+
 ## User outcome
 
 A workload cannot silently consume unbounded memory or overwhelm another workload.
@@ -2294,6 +2374,8 @@ Always enforce configured lower and upper bounds.
 ---
 
 ### 18.5 Capacity benchmark suite
+
+Extend the external suite from v0.61.1 and require all applicable matrix cells from section 5.2. Keep separate read, durability, and freshness targets, and report cost per million committed changes.
 
 Canonical workloads:
 
@@ -2907,6 +2989,8 @@ v0.69 PostgreSQL CDC   v0.70 Kafka
 
 Some implementation streams may overlap, but sign-off should preserve the logical dependencies.
 
+Section 5's performance patches attach to their named parent milestones. Baseline collection and aggregate delta reduction can start alongside v0.61. Worker budgeting follows `NodeConfig`; concurrent commits follow recovery proof. Direct transport and shared execution remain v0.67 gates, and state beyond RAM follows at v0.67.1. Pressure-driven movement requires v0.68's durable migration protocol. Later observability and resource-control releases complete this work rather than delaying its start.
+
 ---
 
 # 23. What Happens to the Previously Deferred Feature Programs?
@@ -2948,6 +3032,8 @@ Admission requires answering:
 9. Is improving an existing capability more valuable?
 
 A feature that cannot answer these questions stays in research.
+
+A faster durability tier or replicated WAL also stays here unless measured object-store persistence cannot meet an explicit durable-visibility target. Shorter flush intervals trade fewer waiting milliseconds for more PUT requests; they do not establish a strict sub-10-ms durable p99. See [SlateDB tuning](https://slatedb.io/docs/operations/tuning/).
 
 ---
 
@@ -3159,26 +3245,23 @@ what the operator should do
 
 # 28. Recommended Immediate Execution Order
 
-The next engineering work should start with v0.60 rather than attempting to implement several future versions concurrently.
+v0.60.0 is complete. Start the v0.61 golden path and the performance baseline together.
 
 The first concrete sequence is:
 
 ```text
-1. Inventory every production CLI command.
-2. Mark each backing client as live, durable-local, mock, or synthetic.
-3. Move mock implementations into rockstream-test-support.
-4. Make unimplemented remote commands fail closed.
-5. Define the reduced top-level CLI hierarchy.
-6. Add black-box CLI tests.
-7. Sign off v0.60.
-8. Begin the executable local project workflow in v0.61.
+1. Make the local project workflow executable in v0.61.
+2. Extend the existing external runner and capture the v0.61.1 baseline.
+3. Reduce aggregate output transitions in v0.61.2 and measure the change.
+4. Ship NodeConfig and worker-wide memory budgets in v0.62 and v0.62.1.
+5. Complete catalog, SQL integrity, and standalone recovery through v0.65.
+6. Prove concurrent maintenance and deadline-based group commit in v0.65.1.
+7. Ship the management API and direct Arrow path through v0.67.
+8. Prove shared execution and bounded state beyond RAM by v0.67.1.
+9. Qualify pressure-driven movement with durable lifecycle work in v0.68.
 ```
 
-This work is intentionally mundane compared with factorized joins, Raft, CDC, or incremental window maintenance.
-
-It is also the highest-leverage work in the project.
-
-Once RockStream's public surfaces become trustworthy, every later technical improvement becomes easier to evaluate.
+Each performance change carries its before-and-after external evidence. Complete these gates before connector expansion in v0.69 and v0.70; do not postpone measurement until v0.72.
 
 ---
 
