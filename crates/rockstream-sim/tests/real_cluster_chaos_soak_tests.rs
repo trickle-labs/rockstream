@@ -32,6 +32,18 @@ fn docker(args: &[&str]) {
         .args(args)
         .status()
         .unwrap_or_else(|error| panic!("Docker is required for real-cluster chaos proof: {error}"));
+    if !status.success() && args.first() == Some(&"kill") {
+        if let Some(name) = args.get(1) {
+            let state = std::process::Command::new("docker")
+                .args(["inspect", "--format", "{{.State.Running}}", name])
+                .output();
+            if state.is_ok_and(|output| {
+                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "false"
+            }) {
+                return;
+            }
+        }
+    }
     assert!(status.success(), "docker {} failed", args.join(" "));
 }
 
