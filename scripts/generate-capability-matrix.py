@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the v0.57.1 capability matrix from capabilities.toml."""
+"""Generate the capability matrix from capabilities.toml."""
 
 from __future__ import annotations
 
@@ -40,8 +40,8 @@ def validate(
     if not isinstance(contract, dict):
         fail("capabilities.toml must define [contract]")
     version = contract.get("version")
-    if version not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24"}:
-        fail("capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, or v0.59.24")
+    if version not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0"}:
+        fail("capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, or v0.60.0")
 
     roadmap = contract.get("roadmap")
     if not isinstance(roadmap, str):
@@ -52,10 +52,10 @@ def validate(
         for row in re.findall(
             rf"^\| {re.escape(str(version))} \|.*$", roadmap_text, re.MULTILINE
         )
-        if len(row.split("|")) >= 6 and "✅ Done" in row
+        if len(row.split("|")) >= 5 and "✅ Done" in row
     ]
     if len(roadmap_rows) != 1:
-        fail(f"NEW_ROADMAP.md has no {version} version row")
+        fail(f"{roadmap} has no {version} version row")
 
     roadmap_fingerprint = hashlib.sha256(
         roadmap_rows[0].encode("utf-8")

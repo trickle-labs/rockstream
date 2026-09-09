@@ -17,6 +17,7 @@ fail() {
 
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/"
 cp "$ROOT/NEW_ROADMAP.md" "$TMP_ROOT/"
+cp "$ROOT/ROADMAP.md" "$TMP_ROOT/"
 cp "$ROOT/README.md" "$ROOT/DESIGN.md" "$ROOT/NEW_IMPLEMENTATION_PLAN.md" "$TMP_ROOT/"
 cp -R "$ROOT/crates" "$TMP_ROOT/"
 cp -R "$ROOT/docs" "$TMP_ROOT/"
@@ -76,9 +77,9 @@ printf '\nmutation\n' >> "$TMP_ROOT/docs/capability-matrix.md"
 run_bad "generated matrix drift"
 cp "$ROOT/docs/capability-matrix.md" "$TMP_ROOT/docs/capability-matrix.md"
 
-python3 -c 'from pathlib import Path; import re; root=Path("'"$TMP_ROOT"'"); version=re.search(r"^version = \"([^\"]+)\"$", (root/"capabilities.toml").read_text(), re.M).group(1); p=root/"NEW_ROADMAP.md"; s=p.read_text(); mutated=re.sub(rf"^\| {re.escape(version)} \|(?=.*✅ Done)", "| v0.590 |", s, count=1, flags=re.M); assert mutated != s; p.write_text(mutated)'
+python3 -c 'from pathlib import Path; import re; root=Path("'"$TMP_ROOT"'"); version=re.search(r"^version = \"([^\"]+)\"$", (root/"capabilities.toml").read_text(), re.M).group(1); p=root/"ROADMAP.md"; s=p.read_text(); mutated=re.sub(rf"^\| {re.escape(version)} \|(?=.*✅ Done)", "| v0.590 |", s, count=1, flags=re.M); assert mutated != s; p.write_text(mutated)'
 run_bad "roadmap drift"
-cp "$ROOT/NEW_ROADMAP.md" "$TMP_ROOT/NEW_ROADMAP.md"
+cp "$ROOT/ROADMAP.md" "$TMP_ROOT/ROADMAP.md"
 
 
 python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/README.md"); s=p.read_text(); p.write_text(s.replace("RockStream ingests changing data", "RockStream mutates changing data", 1))'

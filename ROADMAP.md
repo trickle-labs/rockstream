@@ -14,7 +14,7 @@
 
 RockStream has reached the point where adding more isolated capabilities is less valuable than making the existing system work coherently from the perspective of an ordinary user and operator.
 
-This roadmap supersedes [NEW_ROADMAP.md](NEW_ROADMAP.md) (which governed v0.1 through the v0.59.24 qualification program). The current v0.59 program deliberately freezes its scope and directs subsequent work to v0.60+. The workspace is currently versioned at `0.59.24`. The existing roadmap also explicitly states that promotion to v1.0 is unscheduled.  
+This roadmap supersedes [NEW_ROADMAP.md](NEW_ROADMAP.md) (which governed v0.1 through the v0.59.24 qualification program). The current v0.59 program deliberately freezes its scope and directs subsequent work to v0.60+. The workspace is currently versioned at `0.60.0`. The existing roadmap also explicitly states that promotion to v1.0 is unscheduled.
 
 This roadmap therefore does **not** treat v1.0 as the target.
 
@@ -235,7 +235,7 @@ Changes to persistent formats or public protocols require:
 
 | Version | Theme | Primary Outcome |
 |---|---|---|
-| **v0.60** | Product Truth | Production CLI stops fabricating system state |
+| v0.60.0 | Product Truth | Production CLI stops fabricating system state ✅ Done |
 | **v0.61** | Golden Path | A generated local project actually works end-to-end |
 | **v0.62** | Configuration & Lifecycle | One authoritative configuration and runtime lifecycle |
 | **v0.63** | Durable Catalog | DDL and metadata survive process destruction |
