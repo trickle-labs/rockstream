@@ -46,7 +46,7 @@ jobs:
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          docker system prune -af
+          docker builder prune -af
       - name: Require Docker
         run: docker info
       - name: Build unified-binary test image
@@ -79,6 +79,8 @@ jobs:
           rm -f target/pgwire-test-results.json
           ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
           cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
+      - name: Remove Docker test image
+        run: docker image rm rockstream-tc-test:latest || true
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
       - name: install cargo-deny
@@ -244,7 +246,7 @@ jobs:
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          docker system prune -af
+          docker builder prune -af
       - name: Require Docker
         run: docker info
       - name: Build unified-binary test image
