@@ -13,7 +13,7 @@ fn test_capability_registry_loads_embedded_toml() {
         !registry.dispatches().is_empty(),
         "dispatches must not be empty"
     );
-    assert_eq!(registry.contract().roadmap, "NEW_ROADMAP.md");
+    assert_eq!(registry.contract().roadmap, "ROADMAP.md");
 
     // Check language.query-read
     let query_read = registry
