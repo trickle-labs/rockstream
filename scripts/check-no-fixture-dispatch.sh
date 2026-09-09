@@ -13,9 +13,9 @@ for dispatch in "${DISPATCH_FILES[@]}"; do
   fi
 done
 
-if matches=$(rg -n -e 'with_defaults' -e 'with_mock_data' \
+if matches=$(grep -R -n -E -e 'with_defaults' -e 'with_mock_data' \
   -e 'MockCatalogClient' -e 'MockTopologyClient' -e 'MockOperationClient' \
-  "$SOURCE_ROOT" -g '*.rs'); then
+  --include='*.rs' "$SOURCE_ROOT"); then
   echo "$matches" >&2
   echo "FAIL: fixture or mock client is reachable from production CLI dispatch." >&2
   exit 1
