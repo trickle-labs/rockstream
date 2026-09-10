@@ -241,7 +241,7 @@ Changes to persistent formats or public protocols require:
 |---|---|---|
 | v0.60.0 | Product Truth | Production CLI stops fabricating system state ✅ Done |
 | v0.61.0 | Golden Path | A generated local project actually works end-to-end ✅ Done |
-| v0.61.1 | External performance baseline | Complete measured workloads gate performance changes |
+| v0.61.1 | External performance baseline | Complete measured workloads gate performance changes ✅ Done |
 | v0.61.2 | Aggregate delta reduction | Epoch-visible aggregates emit only net group changes |
 | **v0.62** | Configuration & Lifecycle | One authoritative configuration and runtime lifecycle |
 | v0.62.1 | Worker memory budgets | Shards share bounded caches and propagate backpressure |

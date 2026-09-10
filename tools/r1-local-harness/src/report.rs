@@ -31,6 +31,33 @@ pub struct Decision {
     pub cells: Vec<SummaryCell>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostBreakdown {
+    pub hourly_gateways_cost: f64,
+    pub hourly_control_nodes_cost: f64,
+    pub hourly_workers_cost: f64,
+    pub hourly_storage_requests_cost: f64,
+    pub hourly_retained_storage_cost: f64,
+    pub hourly_network_transfer_cost: f64,
+    pub hourly_compaction_cost: f64,
+    pub total_hourly_cost: f64,
+    pub sustainable_changes_per_sec: f64,
+    pub cost_per_million_changes: f64,
+    pub pricing_scope: String,
+    pub pricing_date: Option<String>,
+}
+
+pub fn calculate_cost_per_million(
+    hourly_cost: f64,
+    sustainable_changes_per_sec: f64,
+) -> Result<f64> {
+    if sustainable_changes_per_sec <= 0.0 {
+        bail!("sustainable_changes_per_sec must be positive");
+    }
+    Ok((hourly_cost * 1_000_000.0) / (sustainable_changes_per_sec * 3600.0))
+}
+
 pub fn evaluate(evidence_dir: &Path) -> Result<Decision> {
     let samples = read_samples(&evidence_dir.join("raw-samples.jsonl"))?;
     let structural = read_structural(&evidence_dir.join("structural-results.json"))?;
@@ -76,13 +103,12 @@ pub fn evaluate(evidence_dir: &Path) -> Result<Decision> {
     if cells.is_empty() {
         bail!("raw evidence has no timing cells");
     }
-    let verdict = if structural.results.len() == 3
-        && cells.iter().all(|cell| cell.verdict == "GREEN")
-    {
-        "GREEN"
-    } else {
-        "INCOMPLETE"
-    };
+    let verdict =
+        if structural.results.len() == 3 && cells.iter().all(|cell| cell.verdict == "GREEN") {
+            "GREEN"
+        } else {
+            "INCOMPLETE"
+        };
     Ok(Decision {
         schema_version: 1,
         verdict: verdict.to_string(),

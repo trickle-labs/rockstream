@@ -2,6 +2,187 @@ use crate::corpus::{Change, Corpus};
 use anyhow::{bail, Context, Result};
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OracleError {
+    WrongColumnValue {
+        row_index: usize,
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+    DuplicateRow {
+        row: Vec<String>,
+        expected_count: usize,
+        actual_count: usize,
+    },
+    MissingRow {
+        row: Vec<String>,
+        expected_count: usize,
+        actual_count: usize,
+    },
+    StaleEpoch {
+        expected_epoch: u64,
+        actual_epoch: u64,
+        message: String,
+    },
+    CardinalityMismatch {
+        expected_total: usize,
+        actual_total: usize,
+    },
+}
+
+impl std::fmt::Display for OracleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongColumnValue {
+                row_index,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "RS-3032: Multiset value mismatch at row {row_index}: expected {expected:?}, got {actual:?}. Next steps: verify IVM operator delta logic."
+                )
+            }
+            Self::DuplicateRow {
+                row,
+                expected_count,
+                actual_count,
+            } => {
+                write!(
+                    f,
+                    "RS-3032: Multiset duplicate row: {row:?} appears {actual_count} times, expected {expected_count}. Next steps: check duplicate retraction handling."
+                )
+            }
+            Self::MissingRow {
+                row,
+                expected_count,
+                actual_count,
+            } => {
+                write!(
+                    f,
+                    "RS-3032: Multiset missing row: {row:?} appears {actual_count} times, expected {expected_count}. Next steps: verify aggregation and join frontiers."
+                )
+            }
+            Self::StaleEpoch {
+                expected_epoch,
+                actual_epoch,
+                message,
+            } => {
+                write!(
+                    f,
+                    "RS-3032: Multiset stale epoch: expected {expected_epoch}, got {actual_epoch} ({message}). Next steps: ensure view drain reaches source frontier."
+                )
+            }
+            Self::CardinalityMismatch {
+                expected_total,
+                actual_total,
+            } => {
+                write!(
+                    f,
+                    "RS-3032: Multiset cardinality mismatch: expected {expected_total} rows, got {actual_total} rows. Next steps: inspect operator output count."
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for OracleError {}
+
+pub fn compare_multisets(
+    actual: &[Vec<String>],
+    expected: &[Vec<String>],
+) -> Result<(), OracleError> {
+    let mut actual_sorted = actual.to_vec();
+    let mut expected_sorted = expected.to_vec();
+    actual_sorted.sort();
+    expected_sorted.sort();
+
+    let mut actual_counts: BTreeMap<Vec<String>, usize> = BTreeMap::new();
+    for row in actual {
+        *actual_counts.entry(row.clone()).or_insert(0) += 1;
+    }
+    let mut expected_counts: BTreeMap<Vec<String>, usize> = BTreeMap::new();
+    for row in expected {
+        *expected_counts.entry(row.clone()).or_insert(0) += 1;
+    }
+
+    // Check for duplicate row surplus
+    for (row, &act_count) in &actual_counts {
+        let exp_count = expected_counts.get(row).copied().unwrap_or(0);
+        if act_count > exp_count && exp_count > 0 {
+            return Err(OracleError::DuplicateRow {
+                row: row.clone(),
+                expected_count: exp_count,
+                actual_count: act_count,
+            });
+        }
+    }
+
+    if actual.len() > expected.len() {
+        for (row, &act_count) in &actual_counts {
+            let exp_count = expected_counts.get(row).copied().unwrap_or(0);
+            if act_count > exp_count {
+                return Err(OracleError::DuplicateRow {
+                    row: row.clone(),
+                    expected_count: exp_count,
+                    actual_count: act_count,
+                });
+            }
+        }
+        return Err(OracleError::CardinalityMismatch {
+            expected_total: expected.len(),
+            actual_total: actual.len(),
+        });
+    }
+
+    if actual.len() < expected.len() {
+        for (row, &exp_count) in &expected_counts {
+            let act_count = actual_counts.get(row).copied().unwrap_or(0);
+            if act_count < exp_count {
+                return Err(OracleError::MissingRow {
+                    row: row.clone(),
+                    expected_count: exp_count,
+                    actual_count: act_count,
+                });
+            }
+        }
+        return Err(OracleError::CardinalityMismatch {
+            expected_total: expected.len(),
+            actual_total: actual.len(),
+        });
+    }
+
+    // actual.len() == expected.len()
+    for (i, (act, exp)) in actual_sorted.iter().zip(expected_sorted.iter()).enumerate() {
+        if act != exp {
+            return Err(OracleError::WrongColumnValue {
+                row_index: i,
+                expected: exp.clone(),
+                actual: act.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+pub fn compare_multisets_at_epoch(
+    actual: &[Vec<String>],
+    expected: &[Vec<String>],
+    actual_epoch: u64,
+    expected_epoch: u64,
+) -> Result<(), OracleError> {
+    if actual_epoch != expected_epoch {
+        return Err(OracleError::StaleEpoch {
+            expected_epoch,
+            actual_epoch,
+            message: format!("observed epoch {actual_epoch} != committed epoch {expected_epoch}"),
+        });
+    }
+    compare_multisets(actual, expected)
+}
 
 pub fn admitted_query(workload_sql: &str) -> Result<(String, String)> {
     let statement = workload_sql

@@ -50,6 +50,19 @@ fn sample() -> RawSample {
         rockstream_output_sha256: "0".repeat(64),
         sqlite_oracle_output_sha256: "0".repeat(64),
         outputs_equal: true,
+        state_writes_per_change: None,
+        intermediate_rows_per_change: None,
+        network_bytes_per_change: None,
+        object_store_requests_per_change: None,
+        read_p99_ms: None,
+        commit_p99_ms: None,
+        freshness_p99_ms: None,
+        generator_delay_p99_ms: None,
+        generator_queue_drops: None,
+        timeouts_and_errors: None,
+        queue_age_ms: None,
+        control_node_load: None,
+        physical_flushes_per_epoch: None,
     }
 }
 

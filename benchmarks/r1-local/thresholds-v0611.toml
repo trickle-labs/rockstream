@@ -1,0 +1,56 @@
+contract_version = 2
+
+[sampling]
+repetitions = 5
+max_sample_cv = 0.15
+
+[workload_contract]
+payload_bytes = 128
+durability_mode = "Durable"
+warm_up_seconds = 10
+measurement_seconds = 60
+view_counts = [1, 20]
+
+[latency_targets]
+read_p99_ms = 10.0
+commit_p99_ms = 25.0
+freshness_p99_ms = 100.0
+max_generator_delay_ms = 5.0
+max_queue_depth = 10000
+
+[write_amplification]
+max_write_amplification_ratio = 1.10
+max_logical_byte_ratio = 1.10
+max_full_state_entries_visited = 0
+require_identical_mutation_counts = true
+live_groups = [1000, 100000, 10000000]
+
+[one_key_persistence]
+live_groups = [1000, 100000, 10000000]
+max_logical_byte_ratio = 1.10
+max_full_state_entries_visited = 0
+require_identical_mutation_counts = true
+
+[shared_state]
+max_shared_20_to_shared_1_ratio = 1.50
+max_shared_20_to_private_20_ratio = 0.20
+
+[shared_source_index]
+max_key_build_ratio = 1.50
+max_trace_rows_written_ratio = 1.50
+max_cpu_per_accepted_change_ratio = 1.75
+
+[factorized]
+min_classic_to_factorized_intermediate_ratio = 10.0
+min_throughput_ratio = 1.50
+max_cpu_per_visible_change_ratio = 0.67
+max_exchange_bytes_per_visible_change_ratio = 0.67
+
+[ordinary_regression]
+min_throughput_ratio = 0.85
+max_p99_freshness_ratio = 1.15
+
+[worker_scaling]
+min_four_to_one_throughput_ratio = 2.00
+yellow_min_four_to_one_throughput_ratio = 1.50
+require_nonzero_work_per_worker = true

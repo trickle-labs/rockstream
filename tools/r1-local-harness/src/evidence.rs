@@ -22,7 +22,7 @@ pub struct ProcessUsage {
     pub rss_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSample {
     pub schema_version: u32,
@@ -54,12 +54,46 @@ pub struct RawSample {
     pub rockstream_output_sha256: String,
     pub sqlite_oracle_output_sha256: String,
     pub outputs_equal: bool,
+    #[serde(default)]
+    pub state_writes_per_change: Option<f64>,
+    #[serde(default)]
+    pub intermediate_rows_per_change: Option<f64>,
+    #[serde(default)]
+    pub network_bytes_per_change: Option<f64>,
+    #[serde(default)]
+    pub object_store_requests_per_change: Option<f64>,
+    #[serde(default)]
+    pub read_p99_ms: Option<f64>,
+    #[serde(default)]
+    pub commit_p99_ms: Option<f64>,
+    #[serde(default)]
+    pub freshness_p99_ms: Option<f64>,
+    #[serde(default)]
+    pub generator_delay_p99_ms: Option<f64>,
+    #[serde(default)]
+    pub generator_queue_drops: Option<u64>,
+    #[serde(default)]
+    pub timeouts_and_errors: Option<u64>,
+    #[serde(default)]
+    pub queue_age_ms: Option<f64>,
+    #[serde(default)]
+    pub control_node_load: Option<f64>,
+    #[serde(default)]
+    pub physical_flushes_per_epoch: Option<f64>,
 }
 
 impl RawSample {
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != 1 {
             bail!("raw sample {} schema_version must be 1", self.run_id);
+        }
+        if self.candidate_id == "sample_reference_run"
+            || self.run_id.contains("sample_reference_run")
+        {
+            bail!(
+                "raw sample {} uses synthetic sample_reference_run: synthetic sample disallowed in release baseline",
+                self.run_id
+            );
         }
         for (name, digest) in [
             ("binary", &self.binary_sha256),

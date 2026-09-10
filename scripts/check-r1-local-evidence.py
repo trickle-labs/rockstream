@@ -246,6 +246,34 @@ def validate(root: Path) -> str | None:
     ):
         return "profile.toml has unexpected profile identity or revision"
 
+    v0611_profile_path = base / "profile-v0611.toml"
+    v0611_thresholds_path = base / "thresholds-v0611.toml"
+    if v0611_profile_path.is_file():
+        try:
+            v0611_profile = load_toml(v0611_profile_path)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            return f"invalid profile-v0611.toml: {error}"
+        if (
+            v0611_profile.get("contract_version") != 2
+            or v0611_profile.get("profile_id") != "MBP-M5Pro-48GB-v2"
+            or v0611_profile.get("state") != "frozen"
+        ):
+            return "profile-v0611.toml has unexpected profile identity or state"
+    if v0611_thresholds_path.is_file():
+        try:
+            v0611_thresholds = load_toml(v0611_thresholds_path)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            return f"invalid thresholds-v0611.toml: {error}"
+        if v0611_thresholds.get("contract_version") != 2:
+            return "thresholds-v0611.toml has unexpected contract_version"
+        latencies = v0611_thresholds.get("latency_targets", {})
+        if (
+            latencies.get("read_p99_ms") != 10.0
+            or latencies.get("commit_p99_ms") != 25.0
+            or latencies.get("freshness_p99_ms") != 100.0
+        ):
+            return "thresholds-v0611.toml has unexpected latency targets"
+
     load = corpus.get("load", {})
     changes = corpus.get("changes", {})
     repetitions = corpus.get("repetitions", {})
