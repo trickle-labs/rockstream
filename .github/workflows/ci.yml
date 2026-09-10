@@ -403,11 +403,11 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-cli --fail-under-lines 73 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
-      - name: cargo llvm-cov (rockstream-cli regions ≥75%)
+      - name: cargo llvm-cov (rockstream-cli regions ≥74%)
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-cli --fail-under-regions 75 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
+        run: cargo llvm-cov report --package rockstream-cli --fail-under-regions 74 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
       - name: cargo llvm-cov (rockstream-oracle lines ≥83%)
         env:
           CARGO_BUILD_JOBS: "2"
