@@ -872,8 +872,6 @@ async fn leader_kill_recovers_within_budget_tc() {
          §11.5-derived detection+reassignment budget of {:?}",
         FAILURE_DETECTION_BUDGET + SHARD_RECOVERY_BUDGET
     );
-    let new_leader_addr = cluster.nodes[new_leader_idx].control_addr;
-
     // (b): shard leasing resumes against the new leader — a *different*
     // worker requesting the SAME already-leased shard 7 must be denied
     // (no split-brain: the new leader adopted worker 10's persisted lease
@@ -887,10 +885,9 @@ async fn leader_kill_recovers_within_budget_tc() {
          worker 10's pre-kill lease (persisted to the shared control-plane \
          store) is still live: {conflicting:?}"
     );
-    let _worker_20_stream = tc::register_worker(new_leader_addr, 20).await;
-    let fresh_lease = tc::request_shard(&cluster, 20, 8)
-        .await
-        .expect("shard leasing must resume against the new leader for an unleased shard");
+    let (fresh_leader_idx, fresh_lease, _worker_20_stream) =
+        tc::register_and_request_shard(&cluster, 20, 8).await;
+    let fresh_leader_addr = cluster.nodes[fresh_leader_idx].control_addr;
     assert_eq!(fresh_lease.worker_id, WorkerId(20));
     let shard_recovery_elapsed = shard_recovery_start.elapsed();
     assert!(
@@ -903,7 +900,7 @@ async fn leader_kill_recovers_within_budget_tc() {
     // pipeline-freshness-recovery budget.
     let freshness_start = Instant::now();
     assert!(
-        tc::report_shard_frontier(new_leader_addr, 7, 101).await,
+        tc::report_shard_frontier(fresh_leader_addr, 7, 101).await,
         "frontier publication must resume against the new leader"
     );
     let freshness_elapsed = freshness_start.elapsed();
