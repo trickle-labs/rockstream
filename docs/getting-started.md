@@ -168,17 +168,17 @@ Target Directory: my-project
 Status: created
 Generated Files:
   - rockstream.toml
+  - project.toml
   - schema.sql
-  - queries.sql
   - data/seed.csv
+  - queries/verify.sql
   - README.md
-  - scripts/verify.sh
-  - scripts/cleanup.sh
 
 Next steps:
   1. cd my-project
-  2. rockstream start --storage ./storage
-  3. bash scripts/verify.sh
+  2. rockstream start --storage ./storage --listen 127.0.0.1:5432
+  3. rockstream project apply
+  4. rockstream project verify
 ```
 
 ```console
@@ -191,32 +191,34 @@ The generated local project has this layout:
 my-project/
 ├── README.md
 ├── data/seed.csv
-├── queries.sql
+├── project.toml
+├── queries/verify.sql
 ├── rockstream.toml
-├── schema.sql
-└── scripts/
-    ├── cleanup.sh
-    └── verify.sh
+└── schema.sql
 ```
 
-Run the generated verifier without PostgreSQL installed:
+Apply the declarative schema and seed data over pgwire:
 
 ```console
-$ bash scripts/verify.sh
-==> Verifying RockStream local standalone deployment on 127.0.0.1:5432...
-Notice: psql not found in PATH, skipping psql query checks.
+$ rockstream project apply
+Project 'my-project' applied successfully:
+  - schema 'schema.sql' (applied)
+  - seed table 'orders' from 'data/seed.csv' (ingested)
+
+Next step:
+  rockstream project verify
 ```
 
-Remove the local storage after the check:
+Verify maintained views without external psql:
 
 ```console
-$ bash scripts/cleanup.sh
-==> Cleaning up local RockStream project state...
-==> Cleanup complete.
+$ rockstream project verify
+PASSED verification 'sales_by_store' (2 rows)
 ```
 
 Read the generated `README.md`, then use its verification command before
-connecting a client. The available templates are `local`, `kafka`, and
-`postgres-cdc`.
+connecting a client. The supported template in v0.61 is `local`. Kafka and
+PostgreSQL CDC templates are available under `examples/experimental/`.
 
 For the full command surface, see the [CLI reference](reference/cli.md).
+

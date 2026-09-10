@@ -3,6 +3,7 @@
 //! Every node role is a flag on this one binary. At v0.1 it runs an embedded
 //! no-op node; see [`rockstream_cli`] for the command implementations.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -17,7 +18,8 @@ use rockstream_cli::{
     run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
     run_cluster_workers_drain, run_cluster_workers_list, run_cluster_workers_status,
     run_completions, run_config_print_effective, run_config_validate, run_debug_arrangement,
-    run_demo, run_doctor, run_explain_view, run_format_migrate, run_init, run_manifest_validate,
+    run_demo, run_doctor, run_embedded_query, run_explain_view, run_format_migrate, run_init,
+    run_interactive_shell, run_manifest_validate, run_project_apply, run_project_verify,
     run_qualify, run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
     run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
     run_shard_list, run_shard_migrate, run_source_drop, run_source_list, run_source_pause,
@@ -47,14 +49,24 @@ fn main() -> ExitCode {
             let control = make_control_client(&cli, None);
             handle_result(run_cluster_status(format, &control), format)
         }
-        Command::Query { query } => {
-            let catalog = make_catalog_client(&cli, identity.clone());
-            handle_result(run_view_query(format, &catalog, &query, None), format)
+        Command::Query {
+            query,
+            file,
+            format: query_format,
+            timing,
+            endpoint,
+        } => {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let result = rt.block_on(run_embedded_query(
+                &query,
+                file.as_deref(),
+                &query_format,
+                timing,
+                &endpoint,
+            ));
+            handle_result(result, format)
         }
-        Command::Shell => {
-            let control = make_control_client(&cli, None);
-            handle_result(run_cluster_status(format, &control), format)
-        }
+        Command::Shell { endpoint } => handle_result(run_interactive_shell(&endpoint), format),
         Command::Admin { ref command } => match command {
             AdminCommand::Drain {
                 worker_id,
@@ -177,6 +189,39 @@ fn main() -> ExitCode {
                     force: *force,
                 };
                 handle_result(run_init(format, &opts), format)
+            }
+            ProjectCommand::New {
+                name,
+                template,
+                dir,
+                force,
+            } => {
+                let target_dir = dir.clone().unwrap_or_else(|| PathBuf::from(name));
+                let opts = InitOptions {
+                    name: name.clone(),
+                    template: template.clone(),
+                    dir: Some(target_dir),
+                    force: *force,
+                };
+                handle_result(run_init(format, &opts), format)
+            }
+            ProjectCommand::Apply {
+                dir,
+                endpoint,
+                timeout,
+            } => {
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                let result = rt.block_on(run_project_apply(dir, endpoint, *timeout));
+                handle_result(result, format)
+            }
+            ProjectCommand::Verify {
+                dir,
+                endpoint,
+                timeout,
+            } => {
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                let result = rt.block_on(run_project_verify(dir, endpoint, *timeout));
+                handle_result(result, format)
             }
         },
         Command::Migrate { from, to, storage } => {

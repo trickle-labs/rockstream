@@ -32,21 +32,30 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub mod cli_args;
+pub mod client;
 pub mod demo;
 pub mod doctor;
 pub mod init;
 pub mod metrics_server;
 pub mod output;
+pub mod project;
+pub mod shell;
 pub mod shutdown;
 pub mod transport;
 
 pub use cli_args::{Cli, Command, ConfigCommand, ShellType};
+pub use client::{connect_client, execute_query, run_embedded_query, QueryResult};
 pub use demo::{run_demo, DemoOptions, DemoOutcome, DemoStep};
 pub use doctor::{
     run_doctor, run_doctor_checks, DiagnosticCheckResult, DiagnosticStatus, DoctorOptions,
     DoctorReport,
 };
 pub use init::{run_init, scaffold_project, InitOptions, InitOutcome};
+pub use project::{
+    load_manifest, run_project_apply, run_project_verify, AppliedState, AppliedStepRecord,
+    ApplyStep, ProjectManifest, SeedStep, VerifyStep,
+};
+pub use shell::{run_interactive_shell, run_shell_with_io};
 pub use shutdown::{ShutdownCoordinator, SUPPRESS_PROCESS_EXIT};
 
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
@@ -319,6 +328,14 @@ fn validate_role(role: &str) -> Result<(), CliError> {
 pub async fn start_gateway(
     opts: &StartOptions,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    start_gateway_with_catalog(opts, catalog).await
+}
+
+pub async fn start_gateway_with_catalog(
+    opts: &StartOptions,
+    catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let gateway_shard_dir = opts.storage.join("gateway-shard");
     std::fs::create_dir_all(&gateway_shard_dir).map_err(|e| {
         CliError::new(
@@ -349,7 +366,7 @@ pub async fn start_gateway(
         })?;
     let shard_db = Arc::new(shard_db);
 
-    start_gateway_with_shard(opts, shard_db, store, "gateway").await
+    start_gateway_with_shard_and_catalog(opts, shard_db, store, "gateway", catalog).await
 }
 
 /// Start the PostgreSQL wire gateway against an **already-open** shard
@@ -368,6 +385,17 @@ pub async fn start_gateway_with_shard(
     shard_db: Arc<rockstream_storage::ShardDb>,
     store: Arc<dyn object_store::ObjectStore>,
     shard_path: &str,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    start_gateway_with_shard_and_catalog(opts, shard_db, store, shard_path, catalog).await
+}
+
+pub async fn start_gateway_with_shard_and_catalog(
+    opts: &StartOptions,
+    shard_db: Arc<rockstream_storage::ShardDb>,
+    store: Arc<dyn object_store::ObjectStore>,
+    shard_path: &str,
+    catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     // Flush to create the initial manifest so ShardReader can open on a fresh node.
     shard_db.flush().await.map_err(|e| {
@@ -393,8 +421,6 @@ pub async fn start_gateway_with_shard(
             shard_reader: Arc::new(reader),
             frontier_epoch: None,
         });
-
-    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
 
     let mut topology_readers = vec![rockstream_gateway::QueryTimeShardReaderSpec::new(
         shard_path, store,

@@ -24,7 +24,7 @@ overflow-checks = true
 strip = "symbols"
 
 [workspace.package]
-version = "0.60.0"
+version = "0.61.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"

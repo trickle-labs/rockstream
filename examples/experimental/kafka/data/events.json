@@ -1,0 +1,5 @@
+[
+  {"user_id": 1, "duration_ms": 150},
+  {"user_id": 1, "duration_ms": 250},
+  {"user_id": 2, "duration_ms": 100}
+]

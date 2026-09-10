@@ -112,3 +112,46 @@ fn history_and_adr_indexes_resolve() {
         );
     }
 }
+
+#[test]
+fn generated_readme_commands_are_executable() {
+    use clap::Parser;
+    use rockstream_cli::cli_args::Cli;
+    use rockstream_cli::init::{scaffold_project, InitOptions};
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().expect("tempdir");
+    let proj_dir = temp_dir.path().join("readme_check");
+    let opts = InitOptions {
+        name: "readme_check".to_string(),
+        template: "local".to_string(),
+        dir: Some(proj_dir.clone()),
+        force: false,
+    };
+    scaffold_project(&opts).expect("scaffold");
+
+    let readme = fs::read_to_string(proj_dir.join("README.md")).expect("read README.md");
+    let mut in_code_block = false;
+    let mut commands = Vec::new();
+
+    for line in readme.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block && trimmed.starts_with("rockstream ") {
+            commands.push(trimmed.to_string());
+        }
+    }
+
+    assert!(!commands.is_empty(), "README must contain commands");
+    for cmd in commands {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(
+            Cli::try_parse_from(&parts).is_ok(),
+            "command '{}' from generated README must parse cleanly as valid CLI invocation",
+            cmd
+        );
+    }
+}

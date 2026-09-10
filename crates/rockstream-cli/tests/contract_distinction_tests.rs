@@ -106,30 +106,41 @@ fn test_configuration_distinction() {
 fn test_service_topology_distinction() {
     let temp_dir = TempDir::new().expect("tempdir");
 
-    // Init produces multi-service Compose profiles for kafka and postgres-cdc
+    // In v0.61, non-local templates are rejected by init with guidance to examples/experimental/
     let kafka_dir = temp_dir.path().join("kafka_topo");
     let kafka_opts = InitOptions {
         name: "kafka_topo".to_string(),
         template: "kafka".to_string(),
-        dir: Some(kafka_dir.clone()),
+        dir: Some(kafka_dir),
         force: false,
     };
-    run_init(OutputFormat::Json, &kafka_opts).expect("init kafka");
-    let kafka_compose =
-        fs::read_to_string(kafka_dir.join("docker-compose.yaml")).expect("kafka compose");
+    let err = run_init(OutputFormat::Json, &kafka_opts).unwrap_err();
+    assert!(err.message.contains("only 'local' is supported"));
+
+    // Multi-service Compose profiles reside in examples/experimental/
+    let kafka_compose_path =
+        std::path::Path::new("examples/experimental/kafka/docker-compose.yaml");
+    let actual_kafka_path = if kafka_compose_path.exists() {
+        kafka_compose_path.to_path_buf()
+    } else {
+        std::path::Path::new("../../examples/experimental/kafka/docker-compose.yaml").to_path_buf()
+    };
+    assert!(actual_kafka_path.exists());
+    let kafka_compose = fs::read_to_string(actual_kafka_path).expect("kafka compose");
     assert!(kafka_compose.contains("redpanda:"));
     assert!(kafka_compose.contains("rockstream:"));
     assert!(kafka_compose.contains("verifier:"));
 
-    let cdc_dir = temp_dir.path().join("cdc_topo");
-    let cdc_opts = InitOptions {
-        name: "cdc_topo".to_string(),
-        template: "postgres-cdc".to_string(),
-        dir: Some(cdc_dir.clone()),
-        force: false,
+    let cdc_compose_path =
+        std::path::Path::new("examples/experimental/postgres-cdc/docker-compose.yaml");
+    let actual_cdc_path = if cdc_compose_path.exists() {
+        cdc_compose_path.to_path_buf()
+    } else {
+        std::path::Path::new("../../examples/experimental/postgres-cdc/docker-compose.yaml")
+            .to_path_buf()
     };
-    run_init(OutputFormat::Json, &cdc_opts).expect("init cdc");
-    let cdc_compose = fs::read_to_string(cdc_dir.join("docker-compose.yaml")).expect("cdc compose");
+    assert!(actual_cdc_path.exists());
+    let cdc_compose = fs::read_to_string(actual_cdc_path).expect("cdc compose");
     assert!(cdc_compose.contains("postgres:"));
     assert!(cdc_compose.contains("rockstream:"));
 }
@@ -146,12 +157,16 @@ fn test_rerunnability_distinction() {
     };
     run_init(OutputFormat::Json, &init_opts).expect("init run");
 
-    let verify_script = target_dir.join("scripts/verify.sh");
-    let cleanup_script = target_dir.join("scripts/cleanup.sh");
-    assert!(verify_script.exists());
-    assert!(cleanup_script.exists());
+    // In v0.61, local projects emit the six-file contract
+    assert!(target_dir.join("rockstream.toml").exists());
+    assert!(target_dir.join("project.toml").exists());
+    assert!(target_dir.join("schema.sql").exists());
+    assert!(target_dir.join("data/seed.csv").exists());
+    assert!(target_dir.join("queries/verify.sql").exists());
+    assert!(target_dir.join("README.md").exists());
 
-    // Both scripts are executable and idempotent
-    let cleanup_content = fs::read_to_string(&cleanup_script).expect("read cleanup.sh");
-    assert!(cleanup_content.contains("rm -rf ./storage"));
+    // Destination safety: repeat init without force must be safely rejected
+    let repeat_err =
+        run_init(OutputFormat::Json, &init_opts).expect_err("repeat init without force must fail");
+    assert_eq!(repeat_err.code, rockstream_types::error_code::RS_0004);
 }

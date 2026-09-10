@@ -1,0 +1,17 @@
+# RockStream Configuration — Kafka Streaming Deployment
+[gateway]
+listen = "0.0.0.0:5432"
+
+[storage]
+backend = "lfs"
+path = "./storage"
+
+[connectors.kafka]
+brokers = ["redpanda:9092"]
+
+[metrics]
+listen = "0.0.0.0:9090"
+enabled = true
+
+[logging]
+level = "info"

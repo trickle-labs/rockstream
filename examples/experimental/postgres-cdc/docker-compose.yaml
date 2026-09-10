@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=source_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./pg-init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: ["postgres", "-c", "wal_level=logical"]
+
+  rockstream:
+    image: rockstream/rockstream:latest
+    container_name: rockstream
+    depends_on:
+      - postgres
+    ports:
+      - "5432:5432"
+      - "9090:9090"
+    volumes:
+      - ./rockstream.toml:/etc/rockstream/rockstream.toml
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    environment:
+      - ROCKSTREAM_CONFIG=/etc/rockstream/rockstream.toml

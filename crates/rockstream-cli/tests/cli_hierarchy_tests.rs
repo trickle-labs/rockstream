@@ -15,7 +15,7 @@ fn test_query_command_top_level() {
     let cli = Cli::try_parse_from(["rockstream", "query", "SELECT * FROM orders"])
         .expect("failed to parse rockstream query");
     match cli.command {
-        Command::Query { query } => assert_eq!(query, "SELECT * FROM orders"),
+        Command::Query { query, .. } => assert_eq!(query, "SELECT * FROM orders"),
         other => panic!("expected Command::Query, got {other:?}"),
     }
 }
@@ -24,7 +24,7 @@ fn test_query_command_top_level() {
 fn test_shell_command_top_level() {
     let cli =
         Cli::try_parse_from(["rockstream", "shell"]).expect("failed to parse rockstream shell");
-    assert!(matches!(cli.command, Command::Shell));
+    assert!(matches!(cli.command, Command::Shell { .. }));
 }
 
 #[test]

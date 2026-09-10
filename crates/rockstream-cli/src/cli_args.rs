@@ -140,13 +140,34 @@ impl Cli {
 pub enum Command {
     /// Print cluster topology and health status.
     Status,
-    /// Execute an incremental query against a view or stream.
+    /// Execute an incremental query against a view or stream via embedded pgwire client.
     Query {
         /// SQL query to execute.
+        #[arg(default_value = "")]
         query: String,
+
+        /// Path to SQL file to execute.
+        #[arg(long)]
+        file: Option<PathBuf>,
+
+        /// Output format: table, json, or csv.
+        #[arg(long, default_value = "table")]
+        format: String,
+
+        /// Measure and display query execution timing.
+        #[arg(long, default_value_t = false)]
+        timing: bool,
+
+        /// Gateway address to connect to.
+        #[arg(long, default_value = "127.0.0.1:5432")]
+        endpoint: String,
     },
-    /// Launch interactive SQL/admin REPL shell.
-    Shell,
+    /// Launch interactive SQL/admin REPL shell over live pgwire connection.
+    Shell {
+        /// Gateway address to connect to.
+        #[arg(long, default_value = "127.0.0.1:5432")]
+        endpoint: String,
+    },
     /// Administrative operations (drain, migrate, raft, checkpoint).
     Admin {
         #[command(subcommand)]
@@ -932,7 +953,7 @@ pub enum ProjectCommand {
         #[arg(default_value = "my_project")]
         name: String,
 
-        /// Project template: "local", "kafka", or "postgres-cdc".
+        /// Project template: "local" (experimental templates are in examples/experimental/).
         #[arg(long, default_value = "local")]
         template: String,
 
@@ -943,5 +964,50 @@ pub enum ProjectCommand {
         /// Overwrite existing files in non-empty directory.
         #[arg(long, default_value_t = false)]
         force: bool,
+    },
+    /// Scaffold a new RockStream project into a new directory.
+    New {
+        /// Project name.
+        name: String,
+
+        /// Project template: "local".
+        #[arg(long, default_value = "local")]
+        template: String,
+
+        /// Target directory to scaffold the project into (defaults to ./<name>).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Overwrite existing files in non-empty directory.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Apply project schema and seed data over live pgwire connection.
+    Apply {
+        /// Project directory containing project.toml (defaults to current dir).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+
+        /// Gateway address to connect to (defaults to 127.0.0.1:5432).
+        #[arg(long, default_value = "127.0.0.1:5432")]
+        endpoint: String,
+
+        /// Connection / statement timeout in seconds.
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
+    /// Verify project materialized views against expected query results.
+    Verify {
+        /// Project directory containing project.toml (defaults to current dir).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+
+        /// Gateway address to connect to (defaults to 127.0.0.1:5432).
+        #[arg(long, default_value = "127.0.0.1:5432")]
+        endpoint: String,
+
+        /// Connection / statement timeout in seconds.
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
     },
 }

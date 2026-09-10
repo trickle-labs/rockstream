@@ -2094,6 +2094,60 @@
         "about": "Project scaffolding and workspace management",
         "subcommands": [
           {
+            "name": "apply",
+            "about": "Apply project schema and seed data over live pgwire connection",
+            "options": [
+              {
+                "name": "dir",
+                "long": "dir",
+                "help": "Project directory containing project.toml (defaults to current dir)",
+                "required": false,
+                "value_name": "DIR",
+                "default_value": "."
+              },
+              {
+                "name": "endpoint",
+                "long": "endpoint",
+                "help": "Gateway address to connect to (defaults to 127.0.0.1:5432)",
+                "required": false,
+                "value_name": "ENDPOINT",
+                "default_value": "127.0.0.1:5432"
+              },
+              {
+                "name": "timeout",
+                "long": "timeout",
+                "help": "Connection / statement timeout in seconds",
+                "required": false,
+                "value_name": "TIMEOUT",
+                "default_value": "30"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
             "name": "init",
             "about": "Initialize a new RockStream project from a template",
             "options": [
@@ -2126,10 +2180,127 @@
               {
                 "name": "template",
                 "long": "template",
-                "help": "Project template: \"local\", \"kafka\", or \"postgres-cdc\"",
+                "help": "Project template: \"local\" (experimental templates are in examples/experimental/)",
                 "required": false,
                 "value_name": "TEMPLATE",
                 "default_value": "local"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "new",
+            "about": "Scaffold a new RockStream project into a new directory",
+            "options": [
+              {
+                "name": "dir",
+                "long": "dir",
+                "help": "Target directory to scaffold the project into (defaults to ./<name>)",
+                "required": false,
+                "value_name": "DIR"
+              },
+              {
+                "name": "force",
+                "long": "force",
+                "help": "Overwrite existing files in non-empty directory",
+                "required": false,
+                "value_name": "FORCE",
+                "default_value": "false",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "name": "name",
+                "help": "Project name",
+                "required": true,
+                "value_name": "NAME"
+              },
+              {
+                "name": "template",
+                "long": "template",
+                "help": "Project template: \"local\"",
+                "required": false,
+                "value_name": "TEMPLATE",
+                "default_value": "local"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "verify",
+            "about": "Verify project materialized views against expected query results",
+            "options": [
+              {
+                "name": "dir",
+                "long": "dir",
+                "help": "Project directory containing project.toml (defaults to current dir)",
+                "required": false,
+                "value_name": "DIR",
+                "default_value": "."
+              },
+              {
+                "name": "endpoint",
+                "long": "endpoint",
+                "help": "Gateway address to connect to (defaults to 127.0.0.1:5432)",
+                "required": false,
+                "value_name": "ENDPOINT",
+                "default_value": "127.0.0.1:5432"
+              },
+              {
+                "name": "timeout",
+                "long": "timeout",
+                "help": "Connection / statement timeout in seconds",
+                "required": false,
+                "value_name": "TIMEOUT",
+                "default_value": "30"
               }
             ],
             "exit_codes": [
@@ -2240,13 +2411,49 @@
       },
       {
         "name": "query",
-        "about": "Execute an incremental query against a view or stream",
+        "about": "Execute an incremental query against a view or stream via embedded pgwire client",
         "options": [
+          {
+            "name": "endpoint",
+            "long": "endpoint",
+            "help": "Gateway address to connect to",
+            "required": false,
+            "value_name": "ENDPOINT",
+            "default_value": "127.0.0.1:5432"
+          },
+          {
+            "name": "file",
+            "long": "file",
+            "help": "Path to SQL file to execute",
+            "required": false,
+            "value_name": "FILE"
+          },
+          {
+            "name": "format",
+            "long": "format",
+            "help": "Output format: table, json, or csv",
+            "required": false,
+            "value_name": "FORMAT",
+            "default_value": "table"
+          },
           {
             "name": "query",
             "help": "SQL query to execute",
-            "required": true,
-            "value_name": "QUERY"
+            "required": false,
+            "value_name": "QUERY",
+            "default_value": ""
+          },
+          {
+            "name": "timing",
+            "long": "timing",
+            "help": "Measure and display query execution timing",
+            "required": false,
+            "value_name": "TIMING",
+            "default_value": "false",
+            "possible_values": [
+              "true",
+              "false"
+            ]
           }
         ],
         "exit_codes": [
@@ -2753,7 +2960,17 @@
       },
       {
         "name": "shell",
-        "about": "Launch interactive SQL/admin REPL shell",
+        "about": "Launch interactive SQL/admin REPL shell over live pgwire connection",
+        "options": [
+          {
+            "name": "endpoint",
+            "long": "endpoint",
+            "help": "Gateway address to connect to",
+            "required": false,
+            "value_name": "ENDPOINT",
+            "default_value": "127.0.0.1:5432"
+          }
+        ],
         "exit_codes": [
           {
             "code": 0,

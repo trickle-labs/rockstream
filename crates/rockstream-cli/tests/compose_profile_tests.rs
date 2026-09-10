@@ -19,17 +19,25 @@ fn test_compose_profile_local() {
 
     run_init(OutputFormat::Json, &opts).expect("init local");
 
-    // Verify local verification and cleanup scripts
-    let verify_script = target_dir.join("scripts/verify.sh");
-    assert!(verify_script.exists());
-    let verify_content = fs::read_to_string(&verify_script).expect("read verify.sh");
-    assert!(verify_content.contains("GATEWAY_PORT"));
-    assert!(verify_content.contains("sales_by_store"));
+    // In v0.61, local template emits the six-file contract
+    let rockstream_toml = target_dir.join("rockstream.toml");
+    assert!(rockstream_toml.exists());
+    let rt_content = fs::read_to_string(&rockstream_toml).expect("read rockstream.toml");
+    assert!(rt_content.contains("5432"));
 
-    let cleanup_script = target_dir.join("scripts/cleanup.sh");
-    assert!(cleanup_script.exists());
-    let cleanup_content = fs::read_to_string(&cleanup_script).expect("read cleanup.sh");
-    assert!(cleanup_content.contains("rm -rf ./storage"));
+    let schema_sql = target_dir.join("schema.sql");
+    assert!(schema_sql.exists());
+    let schema_content = fs::read_to_string(&schema_sql).expect("read schema.sql");
+    assert!(schema_content.contains("sales_by_store"));
+
+    let project_toml = target_dir.join("project.toml");
+    assert!(project_toml.exists());
+    let seed_csv = target_dir.join("data/seed.csv");
+    assert!(seed_csv.exists());
+    let verify_sql = target_dir.join("queries/verify.sql");
+    assert!(verify_sql.exists());
+    let readme = target_dir.join("README.md");
+    assert!(readme.exists());
 }
 
 #[test]
@@ -44,11 +52,22 @@ fn test_compose_profile_kafka() {
         force: false,
     };
 
-    run_init(OutputFormat::Json, &opts).expect("init kafka");
+    // In v0.61, init rejects non-local templates
+    let err = run_init(OutputFormat::Json, &opts).unwrap_err();
+    assert!(err.message.contains("only 'local' is supported"));
 
-    let compose_file = target_dir.join("docker-compose.yaml");
-    assert!(compose_file.exists());
-    let compose_content = fs::read_to_string(&compose_file).expect("read docker-compose.yaml");
+    // Verify relocated experimental kafka compose profile
+    let exp_compose = std::path::Path::new("../../examples/experimental/kafka/docker-compose.yaml");
+    let compose_path = if exp_compose.exists() {
+        exp_compose.to_path_buf()
+    } else {
+        std::path::Path::new("examples/experimental/kafka/docker-compose.yaml").to_path_buf()
+    };
+    assert!(
+        compose_path.exists(),
+        "experimental kafka compose file must exist"
+    );
+    let compose_content = fs::read_to_string(&compose_path).expect("read docker-compose.yaml");
 
     // Check service orchestrations
     assert!(compose_content.contains("redpanda:"));
@@ -57,11 +76,6 @@ fn test_compose_profile_kafka() {
     assert!(compose_content.contains("9092:9092"));
     assert!(compose_content.contains("5432:5432"));
     assert!(compose_content.contains("depends_on:"));
-
-    let cleanup_script = target_dir.join("scripts/cleanup.sh");
-    assert!(cleanup_script.exists());
-    let cleanup_content = fs::read_to_string(&cleanup_script).expect("read cleanup.sh");
-    assert!(cleanup_content.contains("docker compose down -v"));
 }
 
 #[test]
@@ -76,11 +90,23 @@ fn test_compose_profile_postgres() {
         force: false,
     };
 
-    run_init(OutputFormat::Json, &opts).expect("init postgres-cdc");
+    // In v0.61, init rejects non-local templates
+    let err = run_init(OutputFormat::Json, &opts).unwrap_err();
+    assert!(err.message.contains("only 'local' is supported"));
 
-    let compose_file = target_dir.join("docker-compose.yaml");
-    assert!(compose_file.exists());
-    let compose_content = fs::read_to_string(&compose_file).expect("read docker-compose.yaml");
+    // Verify relocated experimental postgres compose profile
+    let exp_compose =
+        std::path::Path::new("../../examples/experimental/postgres-cdc/docker-compose.yaml");
+    let compose_path = if exp_compose.exists() {
+        exp_compose.to_path_buf()
+    } else {
+        std::path::Path::new("examples/experimental/postgres-cdc/docker-compose.yaml").to_path_buf()
+    };
+    assert!(
+        compose_path.exists(),
+        "experimental postgres compose file must exist"
+    );
+    let compose_content = fs::read_to_string(&compose_path).expect("read docker-compose.yaml");
 
     // Check service orchestrations
     assert!(compose_content.contains("postgres:"));
@@ -89,15 +115,15 @@ fn test_compose_profile_postgres() {
     assert!(compose_content.contains("5433:5432"));
     assert!(compose_content.contains("5432:5432"));
 
-    let pg_init = target_dir.join("pg-init.sql");
-    assert!(pg_init.exists());
-    let pg_init_content = fs::read_to_string(&pg_init).expect("read pg-init.sql");
+    let exp_pg_init = std::path::Path::new("../../examples/experimental/postgres-cdc/pg-init.sql");
+    let pg_init_path = if exp_pg_init.exists() {
+        exp_pg_init.to_path_buf()
+    } else {
+        std::path::Path::new("examples/experimental/postgres-cdc/pg-init.sql").to_path_buf()
+    };
+    assert!(pg_init_path.exists(), "pg-init.sql must exist");
+    let pg_init_content = fs::read_to_string(&pg_init_path).expect("read pg-init.sql");
     assert!(pg_init_content.contains("CREATE PUBLICATION rockstream_pub"));
-
-    let cleanup_script = target_dir.join("scripts/cleanup.sh");
-    assert!(cleanup_script.exists());
-    let cleanup_content = fs::read_to_string(&cleanup_script).expect("read cleanup.sh");
-    assert!(cleanup_content.contains("docker compose down -v"));
 }
 
 #[test]
@@ -105,22 +131,37 @@ fn test_compose_profile_all() {
     let temp_dir = TempDir::new().expect("tempdir");
     let target_dir = temp_dir.path().join("all_profiles");
 
-    // Verify all templates can be generated in separate project paths side-by-side
-    for tmpl in ["local", "kafka", "postgres-cdc"] {
+    // Verify local succeeds and generates six files
+    let local_path = target_dir.join("local");
+    let opts = InitOptions {
+        name: "local".to_string(),
+        template: "local".to_string(),
+        dir: Some(local_path.clone()),
+        force: false,
+    };
+    let res = run_init(OutputFormat::Json, &opts).expect("init template");
+    let outcome: rockstream_cli::init::InitOutcome =
+        serde_json::from_str(&res).expect("valid json");
+    assert_eq!(outcome.template, "local");
+    assert_eq!(outcome.generated_files.len(), 6);
+    assert!(local_path.join("rockstream.toml").exists());
+    assert!(local_path.join("project.toml").exists());
+    assert!(local_path.join("schema.sql").exists());
+    assert!(local_path.join("data/seed.csv").exists());
+    assert!(local_path.join("queries/verify.sql").exists());
+    assert!(local_path.join("README.md").exists());
+
+    // Verify non-local templates are rejected
+    for tmpl in ["kafka", "postgres-cdc"] {
         let p = target_dir.join(tmpl);
         let opts = InitOptions {
             name: tmpl.to_string(),
             template: tmpl.to_string(),
-            dir: Some(p.clone()),
+            dir: Some(p),
             force: false,
         };
-        let res = run_init(OutputFormat::Json, &opts).expect("init template");
-        let outcome: rockstream_cli::init::InitOutcome =
-            serde_json::from_str(&res).expect("valid json");
-        assert_eq!(outcome.template, tmpl);
-        assert!(p.join("rockstream.toml").exists());
-        assert!(p.join("scripts/verify.sh").exists());
-        assert!(p.join("scripts/cleanup.sh").exists());
+        let err = run_init(OutputFormat::Json, &opts).unwrap_err();
+        assert!(err.message.contains("only 'local' is supported"));
     }
 }
 
@@ -142,10 +183,6 @@ fn test_cleanup_service_idempotency() {
     fs::create_dir_all(&storage_dir).expect("create storage dir");
     fs::write(storage_dir.join("mock_sst.db"), "data").expect("write mock db file");
     assert!(storage_dir.exists());
-
-    // Execute cleanup simulation: deleting storage directory
-    let cleanup_script = target_dir.join("scripts/cleanup.sh");
-    assert!(cleanup_script.exists());
 
     // 1st Cleanup
     if storage_dir.exists() {
