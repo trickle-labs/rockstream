@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::RockstreamConfig;
+use crate::config::{NodeConfig, RockstreamConfig, StorageUrl};
 use crate::config_validation::{validate_config_str, ConfigDiagnostic};
 
 /// Source origin of a configuration value.
@@ -37,6 +37,29 @@ impl std::fmt::Display for ConfigOrigin {
 /// CLI override flags matching start and config print-effective commands.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CliConfigOverrides {
+    pub role: Option<String>,
+    pub host_id: Option<String>,
+    pub availability_zone: Option<String>,
+    pub listen_addr: Option<String>,
+    pub gateway_max_connections: Option<usize>,
+    pub gateway_query_timeout_secs: Option<u64>,
+    pub control_bind: Option<String>,
+    pub control_url: Option<String>,
+    pub control_shared_storage: Option<String>,
+    pub worker_id: Option<u64>,
+    pub worker_threads: Option<usize>,
+    pub worker_cache_bytes: Option<usize>,
+    pub worker_quantum: Option<usize>,
+    pub storage_url: Option<String>,
+    pub storage_temp_dir: Option<PathBuf>,
+    pub storage_spill_dir: Option<PathBuf>,
+    pub metrics_addr: Option<String>,
+    pub metrics_enabled: Option<bool>,
+    pub auth_mode: Option<String>,
+    pub auth_secret_path: Option<PathBuf>,
+    pub log_level: Option<String>,
+    pub log_format: Option<String>,
+
     pub min_epoch_ms: Option<u64>,
     pub checkpoint_retention_count: Option<u32>,
     pub state_budget_gb: Option<u64>,
@@ -61,6 +84,8 @@ pub struct CliConfigOverrides {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedConfig {
     pub config: RockstreamConfig,
+    #[serde(default)]
+    pub node_config: NodeConfig,
     pub origins: BTreeMap<String, ConfigOrigin>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub diagnostics: Vec<ConfigDiagnostic>,
@@ -69,7 +94,14 @@ pub struct ResolvedConfig {
 impl ResolvedConfig {
     /// Format the resolved configuration as TOML, with optional source origin comments.
     pub fn to_toml_text(&self, show_origins: bool) -> String {
-        let toml_str = toml::to_string_pretty(&self.config).unwrap_or_default();
+        let redacted = self.redacted_node_config();
+        let mut toml_str = toml::to_string_pretty(&redacted).unwrap_or_default();
+        if self.config.exchange != crate::config::ExchangeConfig::default() {
+            if let Ok(ex_str) = toml::to_string_pretty(&self.config.exchange) {
+                toml_str.push_str("\n[exchange]\n");
+                toml_str.push_str(&ex_str);
+            }
+        }
         if !show_origins {
             return toml_str;
         }
@@ -122,6 +154,21 @@ impl ResolvedConfig {
         }
         cfg
     }
+
+    /// Return a copy of `node_config` with sensitive values redacted.
+    pub fn redacted_node_config(&self) -> NodeConfig {
+        let mut node = self.node_config.clone();
+        if let Some(ref mut key_path) = node.gateway.tls.key_path {
+            let path_str = key_path.to_string_lossy();
+            if path_str.contains("secret") || path_str.contains("private") {
+                *key_path = PathBuf::from("[REDACTED]");
+            }
+        }
+        if let Some(ref mut secret_path) = node.auth.secret_path {
+            *secret_path = PathBuf::from("[REDACTED]");
+        }
+        node
+    }
 }
 
 /// The authoritative configuration resolver.
@@ -135,6 +182,7 @@ impl ConfigResolver {
         cli_overrides: &CliConfigOverrides,
     ) -> Result<ResolvedConfig, String> {
         let mut config = RockstreamConfig::default();
+        let mut node_config = NodeConfig::default();
         let mut origins = BTreeMap::new();
         let mut diagnostics = Vec::new();
 
@@ -170,30 +218,43 @@ impl ConfigResolver {
                 let report = validate_config_str(&contents, false);
                 diagnostics.extend(report.diagnostics);
 
-                let parsed_config = RockstreamConfig::load_from_str(&contents).map_err(|e| {
-                    format!("Failed to parse config file {}: {e}", file_path.display())
-                })?;
+                if let Ok(mut parsed_node) = NodeConfig::load_from_str(&contents) {
+                    if let Some(parent) = file_path.parent() {
+                        parsed_node.storage.url = parsed_node.storage.url.resolve(parent);
+                    }
+                    config = RockstreamConfig::from(&parsed_node);
+                    node_config = parsed_node;
+                } else if let Ok(parsed_legacy) = RockstreamConfig::load_from_str(&contents) {
+                    node_config = NodeConfig::from(&parsed_legacy);
+                    config = parsed_legacy;
+                }
 
                 // Merge file values into config and update origins
                 if let Ok(toml_val) = toml::from_str::<toml::Value>(&contents) {
                     merge_toml_table_origins(&toml_val, "", &file_path, &mut origins);
+                    sync_canonical_and_legacy_origins(&mut origins);
                 }
-                config = parsed_config;
             }
         }
 
         // 3. Environment Variables (ROCKSTREAM__<SECTION>__<KEY>)
-        apply_env_vars(&mut config, &mut origins);
+        apply_env_vars(&mut config, &mut node_config, &mut origins);
 
         // 4. CLI Overrides
-        apply_cli_overrides(&mut config, cli_overrides, &mut origins);
+        apply_cli_overrides(&mut config, &mut node_config, cli_overrides, &mut origins);
 
         // Validate final semantic bounds
+        crate::config_validation::validate_node_config_semantic_bounds(
+            &node_config,
+            false,
+            &mut diagnostics,
+        );
         crate::config_validation::validate_semantic_bounds(&config, false, &mut diagnostics);
         diagnostics.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.message.cmp(&b.message)));
 
         Ok(ResolvedConfig {
             config,
+            node_config,
             origins,
             diagnostics,
         })
@@ -314,6 +375,37 @@ fn init_default_origins(origins: &mut BTreeMap<String, ConfigOrigin>) {
         "exchange.frame_channel_capacity".to_string(),
         ConfigOrigin::Default,
     );
+
+    // Canonical NodeConfig defaults
+    origins.insert("node.role".to_string(), ConfigOrigin::Default);
+    origins.insert("node.host_id".to_string(), ConfigOrigin::Default);
+    origins.insert("node.availability_zone".to_string(), ConfigOrigin::Default);
+    origins.insert("gateway.listen_addr".to_string(), ConfigOrigin::Default);
+    origins.insert("gateway.max_connections".to_string(), ConfigOrigin::Default);
+    origins.insert(
+        "gateway.query_timeout_secs".to_string(),
+        ConfigOrigin::Default,
+    );
+    origins.insert("control.listen_addr".to_string(), ConfigOrigin::Default);
+    origins.insert("control.url".to_string(), ConfigOrigin::Default);
+    origins.insert("control.shared_storage".to_string(), ConfigOrigin::Default);
+    origins.insert("worker.worker_id".to_string(), ConfigOrigin::Default);
+    origins.insert("storage.url".to_string(), ConfigOrigin::Default);
+    origins.insert("metrics.listen_addr".to_string(), ConfigOrigin::Default);
+    origins.insert("metrics.enabled".to_string(), ConfigOrigin::Default);
+    origins.insert("auth.mode".to_string(), ConfigOrigin::Default);
+    origins.insert("logging.level".to_string(), ConfigOrigin::Default);
+    origins.insert("logging.format".to_string(), ConfigOrigin::Default);
+    origins.insert(
+        "runtime.shutdown_timeout_secs".to_string(),
+        ConfigOrigin::Default,
+    );
+    origins.insert("runtime.min_epoch_ms".to_string(), ConfigOrigin::Default);
+    origins.insert(
+        "runtime.checkpoint_retention_count".to_string(),
+        ConfigOrigin::Default,
+    );
+    origins.insert("runtime.state_budget_gb".to_string(), ConfigOrigin::Default);
 }
 
 fn merge_toml_table_origins(
@@ -338,10 +430,44 @@ fn merge_toml_table_origins(
     }
 }
 
-fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, ConfigOrigin>) {
+fn sync_canonical_and_legacy_origins(origins: &mut BTreeMap<String, ConfigOrigin>) {
+    let mappings = [
+        ("cluster.min_epoch_ms", "runtime.min_epoch_ms"),
+        (
+            "cluster.shutdown_timeout_secs",
+            "runtime.shutdown_timeout_secs",
+        ),
+        (
+            "cluster.checkpoint_retention_count",
+            "runtime.checkpoint_retention_count",
+        ),
+        ("cluster.state_budget_gb", "runtime.state_budget_gb"),
+        ("gateway.listen", "gateway.listen_addr"),
+        ("metrics.listen", "metrics.listen_addr"),
+    ];
+    for (legacy, canonical) in mappings {
+        if let Some(orig) = origins.get(legacy).cloned() {
+            if orig != ConfigOrigin::Default {
+                origins.insert(canonical.to_string(), orig);
+            }
+        }
+        if let Some(orig) = origins.get(canonical).cloned() {
+            if orig != ConfigOrigin::Default {
+                origins.insert(legacy.to_string(), orig);
+            }
+        }
+    }
+}
+
+fn apply_env_vars(
+    config: &mut RockstreamConfig,
+    node_config: &mut NodeConfig,
+    origins: &mut BTreeMap<String, ConfigOrigin>,
+) {
     if let Ok(value) = std::env::var("ROCKSTREAM_WORKER_EXECUTION_THREADS") {
         if let Ok(value) = value.parse::<usize>() {
             config.worker.execution_threads = value;
+            node_config.worker.execution_threads = value;
             origins.insert(
                 "worker.execution_threads".to_string(),
                 ConfigOrigin::Environment("ROCKSTREAM_WORKER_EXECUTION_THREADS".to_string()),
@@ -356,11 +482,136 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
         let parts: Vec<&str> = stripped.split("__").collect();
 
         match parts.as_slice() {
+            ["NODE", "ROLE"] => {
+                node_config.node.role = v.clone();
+                origins.insert("node.role".to_string(), ConfigOrigin::Environment(k));
+            }
+            ["NODE", "HOST_ID"] => {
+                node_config.node.host_id = Some(v.clone());
+                origins.insert("node.host_id".to_string(), ConfigOrigin::Environment(k));
+            }
+            ["NODE", "AVAILABILITY_ZONE"] => {
+                node_config.node.availability_zone = Some(v.clone());
+                origins.insert(
+                    "node.availability_zone".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
+            }
+            ["GATEWAY", "LISTEN_ADDR"] => {
+                node_config.gateway.listen_addr = v.clone();
+                origins.insert(
+                    "gateway.listen_addr".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
+            }
+            ["CONTROL", "LISTEN_ADDR"] => {
+                node_config.control.listen_addr = Some(v.clone());
+                origins.insert(
+                    "control.listen_addr".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
+            }
+            ["CONTROL", "URL"] => {
+                node_config.control.url = Some(v.clone());
+                origins.insert("control.url".to_string(), ConfigOrigin::Environment(k));
+            }
+            ["WORKER", "WORKER_ID"] => {
+                if let Ok(id) = v.parse::<u64>() {
+                    node_config.worker.worker_id = Some(id);
+                    origins.insert("worker.worker_id".to_string(), ConfigOrigin::Environment(k));
+                }
+            }
+            ["STORAGE", "URL"] => {
+                if let Ok(u) = StorageUrl::parse(&v) {
+                    node_config.storage.url = u;
+                    origins.insert("storage.url".to_string(), ConfigOrigin::Environment(k));
+                }
+            }
+            ["METRICS", "LISTEN_ADDR"] => {
+                node_config.metrics.listen_addr = v.clone();
+                origins.insert(
+                    "metrics.listen_addr".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
+            }
+            ["AUTH", "MODE"] => {
+                node_config.auth.mode = v.clone();
+                origins.insert("auth.mode".to_string(), ConfigOrigin::Environment(k));
+            }
+            ["LOGGING", "LEVEL"] => {
+                node_config.logging.level = v.clone();
+                origins.insert("logging.level".to_string(), ConfigOrigin::Environment(k));
+            }
+            ["LOGGING", "FORMAT"] => {
+                node_config.logging.format = v.clone();
+                origins.insert("logging.format".to_string(), ConfigOrigin::Environment(k));
+            }
+            ["RUNTIME", "SHUTDOWN_TIMEOUT_SECS"] => {
+                if let Ok(val) = v.parse::<u64>() {
+                    node_config.runtime.shutdown_timeout_secs = val;
+                    config.cluster.shutdown_timeout_secs = val;
+                    origins.insert(
+                        "runtime.shutdown_timeout_secs".to_string(),
+                        ConfigOrigin::Environment(k.clone()),
+                    );
+                    origins.insert(
+                        "cluster.shutdown_timeout_secs".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["RUNTIME", "MIN_EPOCH_MS"] => {
+                if let Ok(val) = v.parse::<u64>() {
+                    node_config.runtime.min_epoch_ms = val;
+                    config.cluster.min_epoch_ms = val;
+                    origins.insert(
+                        "runtime.min_epoch_ms".to_string(),
+                        ConfigOrigin::Environment(k.clone()),
+                    );
+                    origins.insert(
+                        "cluster.min_epoch_ms".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["RUNTIME", "CHECKPOINT_RETENTION_COUNT"] => {
+                if let Ok(val) = v.parse::<u32>() {
+                    node_config.runtime.checkpoint_retention_count = val;
+                    config.cluster.checkpoint_retention_count = val;
+                    origins.insert(
+                        "runtime.checkpoint_retention_count".to_string(),
+                        ConfigOrigin::Environment(k.clone()),
+                    );
+                    origins.insert(
+                        "cluster.checkpoint_retention_count".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["RUNTIME", "STATE_BUDGET_GB"] => {
+                if let Ok(val) = v.parse::<u64>() {
+                    node_config.runtime.state_budget_gb = val;
+                    config.cluster.state_budget_gb = val;
+                    origins.insert(
+                        "runtime.state_budget_gb".to_string(),
+                        ConfigOrigin::Environment(k.clone()),
+                    );
+                    origins.insert(
+                        "cluster.state_budget_gb".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
             ["CLUSTER", "MIN_EPOCH_MS"] => {
                 if let Ok(val) = v.parse::<u64>() {
                     config.cluster.min_epoch_ms = val;
+                    node_config.runtime.min_epoch_ms = val;
                     origins.insert(
                         "cluster.min_epoch_ms".to_string(),
+                        ConfigOrigin::Environment(k.clone()),
+                    );
+                    origins.insert(
+                        "runtime.min_epoch_ms".to_string(),
                         ConfigOrigin::Environment(k),
                     );
                 }
@@ -368,8 +619,13 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
             ["CLUSTER", "CHECKPOINT_RETENTION_COUNT"] => {
                 if let Ok(val) = v.parse::<u32>() {
                     config.cluster.checkpoint_retention_count = val;
+                    node_config.runtime.checkpoint_retention_count = val;
                     origins.insert(
                         "cluster.checkpoint_retention_count".to_string(),
+                        ConfigOrigin::Environment(k.clone()),
+                    );
+                    origins.insert(
+                        "runtime.checkpoint_retention_count".to_string(),
                         ConfigOrigin::Environment(k),
                     );
                 }
@@ -377,8 +633,13 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
             ["CLUSTER", "STATE_BUDGET_GB"] => {
                 if let Ok(val) = v.parse::<u64>() {
                     config.cluster.state_budget_gb = val;
+                    node_config.runtime.state_budget_gb = val;
                     origins.insert(
                         "cluster.state_budget_gb".to_string(),
+                        ConfigOrigin::Environment(k.clone()),
+                    );
+                    origins.insert(
+                        "runtime.state_budget_gb".to_string(),
                         ConfigOrigin::Environment(k),
                     );
                 }
@@ -386,8 +647,13 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
             ["CLUSTER", "SHUTDOWN_TIMEOUT_SECS"] => {
                 if let Ok(val) = v.parse::<u64>() {
                     config.cluster.shutdown_timeout_secs = val;
+                    node_config.runtime.shutdown_timeout_secs = val;
                     origins.insert(
                         "cluster.shutdown_timeout_secs".to_string(),
+                        ConfigOrigin::Environment(k.clone()),
+                    );
+                    origins.insert(
+                        "runtime.shutdown_timeout_secs".to_string(),
                         ConfigOrigin::Environment(k),
                     );
                 }
@@ -422,6 +688,7 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
             ["WORKER", "SEGMENT_CACHE_BYTES"] => {
                 if let Ok(val) = v.parse::<usize>() {
                     config.worker.segment_cache_bytes = val;
+                    node_config.worker.segment_cache_bytes = val;
                     origins.insert(
                         "worker.segment_cache_bytes".to_string(),
                         ConfigOrigin::Environment(k),
@@ -431,6 +698,7 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
             ["WORKER", "MAX_ROWS_PER_QUANTUM"] => {
                 if let Ok(val) = v.parse::<usize>() {
                     config.worker.max_rows_per_quantum = val;
+                    node_config.worker.max_rows_per_quantum = val;
                     origins.insert(
                         "worker.max_rows_per_quantum".to_string(),
                         ConfigOrigin::Environment(k),
@@ -440,6 +708,7 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
             ["WORKER", "EXECUTION_THREADS"] => {
                 if let Ok(val) = v.parse::<usize>() {
                     config.worker.execution_threads = val;
+                    node_config.worker.execution_threads = val;
                     origins.insert(
                         "worker.execution_threads".to_string(),
                         ConfigOrigin::Environment(k),
@@ -472,27 +741,202 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
 
 fn apply_cli_overrides(
     config: &mut RockstreamConfig,
+    node_config: &mut NodeConfig,
     cli: &CliConfigOverrides,
     origins: &mut BTreeMap<String, ConfigOrigin>,
 ) {
+    if let Some(ref val) = cli.role {
+        node_config.node.role = val.clone();
+        origins.insert(
+            "node.role".to_string(),
+            ConfigOrigin::Cli("--role".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.host_id {
+        node_config.node.host_id = Some(val.clone());
+        origins.insert(
+            "node.host_id".to_string(),
+            ConfigOrigin::Cli("--host-id".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.availability_zone {
+        node_config.node.availability_zone = Some(val.clone());
+        origins.insert(
+            "node.availability_zone".to_string(),
+            ConfigOrigin::Cli("--availability-zone".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.listen_addr {
+        node_config.gateway.listen_addr = val.clone();
+        origins.insert(
+            "gateway.listen_addr".to_string(),
+            ConfigOrigin::Cli("--listen".to_string()),
+        );
+    }
+    if let Some(val) = cli.gateway_max_connections {
+        node_config.gateway.max_connections = val;
+        origins.insert(
+            "gateway.max_connections".to_string(),
+            ConfigOrigin::Cli("--gateway-max-connections".to_string()),
+        );
+    }
+    if let Some(val) = cli.gateway_query_timeout_secs {
+        node_config.gateway.query_timeout_secs = val;
+        origins.insert(
+            "gateway.query_timeout_secs".to_string(),
+            ConfigOrigin::Cli("--gateway-query-timeout-secs".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.control_bind {
+        node_config.control.listen_addr = Some(val.clone());
+        origins.insert(
+            "control.listen_addr".to_string(),
+            ConfigOrigin::Cli("--control-bind".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.control_url {
+        node_config.control.url = Some(val.clone());
+        origins.insert(
+            "control.url".to_string(),
+            ConfigOrigin::Cli("--control".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.control_shared_storage {
+        node_config.control.shared_storage = Some(val.clone());
+        origins.insert(
+            "control.shared_storage".to_string(),
+            ConfigOrigin::Cli("--control-shared-storage".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_id {
+        node_config.worker.worker_id = Some(val);
+        origins.insert(
+            "worker.worker_id".to_string(),
+            ConfigOrigin::Cli("--worker-id".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_threads {
+        node_config.worker.execution_threads = val;
+        config.worker.execution_threads = val;
+        origins.insert(
+            "worker.execution_threads".to_string(),
+            ConfigOrigin::Cli("--worker-threads".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_cache_bytes {
+        node_config.worker.segment_cache_bytes = val;
+        config.worker.segment_cache_bytes = val;
+        origins.insert(
+            "worker.segment_cache_bytes".to_string(),
+            ConfigOrigin::Cli("--worker-cache-bytes".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_quantum {
+        node_config.worker.max_rows_per_quantum = val;
+        config.worker.max_rows_per_quantum = val;
+        origins.insert(
+            "worker.max_rows_per_quantum".to_string(),
+            ConfigOrigin::Cli("--worker-quantum".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.storage_url {
+        if let Ok(u) = StorageUrl::parse(val) {
+            node_config.storage.url = u;
+            origins.insert(
+                "storage.url".to_string(),
+                ConfigOrigin::Cli("--storage".to_string()),
+            );
+        }
+    }
+    if let Some(ref val) = cli.storage_temp_dir {
+        node_config.storage.temp_dir = Some(val.clone());
+        origins.insert(
+            "storage.temp_dir".to_string(),
+            ConfigOrigin::Cli("--storage-temp-dir".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.storage_spill_dir {
+        node_config.storage.spill_dir = Some(val.clone());
+        origins.insert(
+            "storage.spill_dir".to_string(),
+            ConfigOrigin::Cli("--storage-spill-dir".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.metrics_addr {
+        node_config.metrics.listen_addr = val.clone();
+        origins.insert(
+            "metrics.listen_addr".to_string(),
+            ConfigOrigin::Cli("--metrics-addr".to_string()),
+        );
+    }
+    if let Some(val) = cli.metrics_enabled {
+        node_config.metrics.enabled = val;
+        origins.insert(
+            "metrics.enabled".to_string(),
+            ConfigOrigin::Cli("--metrics-enabled".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.auth_mode {
+        node_config.auth.mode = val.clone();
+        origins.insert(
+            "auth.mode".to_string(),
+            ConfigOrigin::Cli("--auth".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.auth_secret_path {
+        node_config.auth.secret_path = Some(val.clone());
+        origins.insert(
+            "auth.secret_path".to_string(),
+            ConfigOrigin::Cli("--auth-secret-path".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.log_level {
+        node_config.logging.level = val.clone();
+        origins.insert(
+            "logging.level".to_string(),
+            ConfigOrigin::Cli("--log-level".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.log_format {
+        node_config.logging.format = val.clone();
+        origins.insert(
+            "logging.format".to_string(),
+            ConfigOrigin::Cli("--log-format".to_string()),
+        );
+    }
     if let Some(val) = cli.min_epoch_ms {
         config.cluster.min_epoch_ms = val;
+        node_config.runtime.min_epoch_ms = val;
         origins.insert(
             "cluster.min_epoch_ms".to_string(),
+            ConfigOrigin::Cli("--min-epoch-ms".to_string()),
+        );
+        origins.insert(
+            "runtime.min_epoch_ms".to_string(),
             ConfigOrigin::Cli("--min-epoch-ms".to_string()),
         );
     }
     if let Some(val) = cli.checkpoint_retention_count {
         config.cluster.checkpoint_retention_count = val;
+        node_config.runtime.checkpoint_retention_count = val;
         origins.insert(
             "cluster.checkpoint_retention_count".to_string(),
+            ConfigOrigin::Cli("--checkpoint-retention-count".to_string()),
+        );
+        origins.insert(
+            "runtime.checkpoint_retention_count".to_string(),
             ConfigOrigin::Cli("--checkpoint-retention-count".to_string()),
         );
     }
     if let Some(val) = cli.state_budget_gb {
         config.cluster.state_budget_gb = val;
+        node_config.runtime.state_budget_gb = val;
         origins.insert(
             "cluster.state_budget_gb".to_string(),
+            ConfigOrigin::Cli("--state-budget-gb".to_string()),
+        );
+        origins.insert(
+            "runtime.state_budget_gb".to_string(),
             ConfigOrigin::Cli("--state-budget-gb".to_string()),
         );
     }
@@ -549,6 +993,7 @@ fn apply_cli_overrides(
     }
     if let Some(ref val) = cli.webhook_listen_addr {
         config.gateway.webhook_listen_addr = Some(val.clone());
+        node_config.gateway.webhook_listen_addr = Some(val.clone());
         origins.insert(
             "gateway.webhook_listen_addr".to_string(),
             ConfigOrigin::Cli("--webhook-listen".to_string()),
@@ -556,22 +1001,37 @@ fn apply_cli_overrides(
     }
     if let Some(ref val) = cli.tls_cert_path {
         config.gateway.tls_cert_path = Some(val.clone());
+        node_config.gateway.tls.cert_path = Some(val.clone());
         origins.insert(
             "gateway.tls_cert_path".to_string(),
+            ConfigOrigin::Cli("--tls-cert-path".to_string()),
+        );
+        origins.insert(
+            "gateway.tls.cert_path".to_string(),
             ConfigOrigin::Cli("--tls-cert-path".to_string()),
         );
     }
     if let Some(ref val) = cli.tls_key_path {
         config.gateway.tls_key_path = Some(val.clone());
+        node_config.gateway.tls.key_path = Some(val.clone());
         origins.insert(
             "gateway.tls_key_path".to_string(),
+            ConfigOrigin::Cli("--tls-key-path".to_string()),
+        );
+        origins.insert(
+            "gateway.tls.key_path".to_string(),
             ConfigOrigin::Cli("--tls-key-path".to_string()),
         );
     }
     if let Some(ref val) = cli.tls_ca_cert_path {
         config.gateway.tls_ca_cert_path = Some(val.clone());
+        node_config.gateway.tls.ca_cert_path = Some(val.clone());
         origins.insert(
             "gateway.tls_ca_cert_path".to_string(),
+            ConfigOrigin::Cli("--tls-ca-cert-path".to_string()),
+        );
+        origins.insert(
+            "gateway.tls.ca_cert_path".to_string(),
             ConfigOrigin::Cli("--tls-ca-cert-path".to_string()),
         );
     }
@@ -598,8 +1058,13 @@ fn apply_cli_overrides(
     }
     if let Some(val) = cli.shutdown_timeout_secs {
         config.cluster.shutdown_timeout_secs = val;
+        node_config.runtime.shutdown_timeout_secs = val;
         origins.insert(
             "cluster.shutdown_timeout_secs".to_string(),
+            ConfigOrigin::Cli("--shutdown-timeout-secs".to_string()),
+        );
+        origins.insert(
+            "runtime.shutdown_timeout_secs".to_string(),
             ConfigOrigin::Cli("--shutdown-timeout-secs".to_string()),
         );
     }

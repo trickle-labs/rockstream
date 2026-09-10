@@ -115,8 +115,12 @@ fn find_closest_match<'a>(target: &str, candidates: &'a [&'a str]) -> Option<&'a
     let mut best_dist = usize::MAX;
     for &cand in candidates {
         let dist = levenshtein(target, cand);
-        if dist < best_dist && dist <= 3 {
-            best_dist = dist;
+        let base_cand = cand.split('_').next().unwrap_or(cand);
+        let base_dist = levenshtein(target, base_cand);
+        let effective_dist = dist.min(base_dist + 1);
+
+        if effective_dist < best_dist && effective_dist <= 3 {
+            best_dist = effective_dist;
             best = Some(cand);
         }
     }
@@ -230,10 +234,54 @@ const DEPRECATED_TIERING_KEYS: &[&str] = &[
     "cold_sst_age_threshold",
 ];
 
+const KNOWN_NODE_CONFIG_ROOT_KEYS: &[&str] = &[
+    "version", "node", "gateway", "control", "worker", "storage", "metrics", "auth", "logging",
+    "runtime",
+];
+
+const KNOWN_NODE_SECTION_KEYS: &[&str] = &["role", "host_id", "availability_zone"];
+const KNOWN_GATEWAY_SECTION_KEYS: &[&str] = &[
+    "listen_addr",
+    "max_connections",
+    "query_timeout_secs",
+    "tls",
+    "webhook_listen_addr",
+];
+const KNOWN_GATEWAY_TLS_KEYS: &[&str] = &["cert_path", "key_path", "ca_cert_path"];
+const KNOWN_CONTROL_SECTION_KEYS: &[&str] = &["listen_addr", "url", "shared_storage", "raft"];
+const KNOWN_CONTROL_RAFT_KEYS: &[&str] = &["peers", "node_id", "bind", "bootstrap"];
+const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
+    "worker_id",
+    "execution_threads",
+    "segment_cache_bytes",
+    "max_rows_per_quantum",
+    "capabilities",
+];
+const KNOWN_STORAGE_SECTION_KEYS: &[&str] = &["url", "temp_dir", "spill_dir", "tiering"];
+const KNOWN_METRICS_SECTION_KEYS: &[&str] = &["listen_addr", "enabled", "scrape_interval_secs"];
+const KNOWN_AUTH_SECTION_KEYS: &[&str] = &["mode", "secret_path", "admin_user"];
+const KNOWN_LOGGING_SECTION_KEYS: &[&str] = &["level", "format"];
+const KNOWN_RUNTIME_SECTION_KEYS: &[&str] = &[
+    "shutdown_timeout_secs",
+    "min_epoch_ms",
+    "checkpoint_retention_count",
+    "state_budget_gb",
+];
+
+fn find_line_col_for_key(toml_str: &str, key: &str) -> (Option<usize>, Option<usize>) {
+    for (line_idx, line) in toml_str.lines().enumerate() {
+        if let Some(col_idx) = line.find(key) {
+            return (Some(line_idx + 1), Some(col_idx + 1));
+        }
+    }
+    (None, None)
+}
+
 fn validate_keys_in_table(
     table: &toml::Table,
     section_path: &str,
     known_keys: &[&str],
+    toml_str: &str,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
     for (k, v) in table {
@@ -246,6 +294,7 @@ fn validate_keys_in_table(
         if !known_keys.contains(&k.as_str()) {
             let suggestion =
                 find_closest_match(k, known_keys).map(|c| format!("Did you mean `{c}`?"));
+            let (line, column) = find_line_col_for_key(toml_str, k);
             diagnostics.push(ConfigDiagnostic {
                 path: full_path.clone(),
                 severity: ConfigDiagnosticSeverity::Error,
@@ -259,51 +308,95 @@ fn validate_keys_in_table(
                     }
                 ),
                 suggestion,
-                line: None,
-                column: None,
+                line,
+                column,
             });
         } else if let toml::Value::Table(sub) = v {
             match full_path.as_str() {
-                "cluster" => {
-                    validate_keys_in_table(sub, "cluster", KNOWN_CLUSTER_KEYS, diagnostics)
+                "cluster" => validate_keys_in_table(
+                    sub,
+                    "cluster",
+                    KNOWN_CLUSTER_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "cluster.autotuner" | "autotuner" => validate_keys_in_table(
+                    sub,
+                    &full_path,
+                    KNOWN_AUTOTUNER_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "cluster.skew_split" | "skew_split" => validate_keys_in_table(
+                    sub,
+                    &full_path,
+                    KNOWN_SKEW_SPLIT_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "cluster.scatter_pruning" | "scatter_pruning" => validate_keys_in_table(
+                    sub,
+                    &full_path,
+                    KNOWN_SCATTER_PRUNING_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "worker" => {
+                    validate_keys_in_table(sub, "worker", KNOWN_WORKER_KEYS, toml_str, diagnostics)
                 }
-                "cluster.autotuner" | "autotuner" => {
-                    validate_keys_in_table(sub, &full_path, KNOWN_AUTOTUNER_KEYS, diagnostics)
-                }
-                "cluster.skew_split" | "skew_split" => {
-                    validate_keys_in_table(sub, &full_path, KNOWN_SKEW_SPLIT_KEYS, diagnostics)
-                }
-                "cluster.scatter_pruning" | "scatter_pruning" => {
-                    validate_keys_in_table(sub, &full_path, KNOWN_SCATTER_PRUNING_KEYS, diagnostics)
-                }
-                "worker" => validate_keys_in_table(sub, "worker", KNOWN_WORKER_KEYS, diagnostics),
-                "connector" => {
-                    validate_keys_in_table(sub, "connector", KNOWN_CONNECTOR_KEYS, diagnostics)
-                }
-                "exchange" => {
-                    validate_keys_in_table(sub, "exchange", KNOWN_EXCHANGE_KEYS, diagnostics)
-                }
-                "pricing" => {
-                    validate_keys_in_table(sub, "pricing", KNOWN_PRICING_KEYS, diagnostics)
-                }
-                "gateway" => {
-                    validate_keys_in_table(sub, "gateway", KNOWN_GATEWAY_KEYS, diagnostics)
-                }
+                "connector" => validate_keys_in_table(
+                    sub,
+                    "connector",
+                    KNOWN_CONNECTOR_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "exchange" => validate_keys_in_table(
+                    sub,
+                    "exchange",
+                    KNOWN_EXCHANGE_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "pricing" => validate_keys_in_table(
+                    sub,
+                    "pricing",
+                    KNOWN_PRICING_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "gateway" => validate_keys_in_table(
+                    sub,
+                    "gateway",
+                    KNOWN_GATEWAY_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
                 "internal_tls" => validate_keys_in_table(
                     sub,
                     "internal_tls",
                     KNOWN_INTERNAL_TLS_KEYS,
+                    toml_str,
                     diagnostics,
                 ),
-                "storage" => {
-                    validate_keys_in_table(sub, "storage", KNOWN_STORAGE_KEYS, diagnostics)
-                }
-                "execution" => {
-                    validate_keys_in_table(sub, "execution", KNOWN_EXECUTION_KEYS, diagnostics)
-                }
+                "storage" => validate_keys_in_table(
+                    sub,
+                    "storage",
+                    KNOWN_STORAGE_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "execution" => validate_keys_in_table(
+                    sub,
+                    "execution",
+                    KNOWN_EXECUTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
                 "storage.tiering" => {
                     for (tk, _) in sub {
                         let t_path = format!("storage.tiering.{tk}");
+                        let (line, column) = find_line_col_for_key(toml_str, tk);
                         if DEPRECATED_TIERING_KEYS.contains(&tk.as_str()) {
                             diagnostics.push(ConfigDiagnostic {
                                 path: t_path,
@@ -312,8 +405,8 @@ fn validate_keys_in_table(
                                 message: "Storage tiering is removed. Refer to migration docs."
                                     .to_string(),
                                 suggestion: None,
-                                line: None,
-                                column: None,
+                                line,
+                                column,
                             });
                         } else {
                             diagnostics.push(ConfigDiagnostic {
@@ -322,12 +415,131 @@ fn validate_keys_in_table(
                                 code: "RS-0002".to_string(),
                                 message: format!("Unknown key `{tk}` in storage.tiering"),
                                 suggestion: None,
-                                line: None,
-                                column: None,
+                                line,
+                                column,
                             });
                         }
                     }
                 }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn validate_node_config_keys(
+    table: &toml::Table,
+    section_path: &str,
+    known_keys: &[&str],
+    toml_str: &str,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    for (k, v) in table {
+        let full_path = if section_path.is_empty() {
+            k.clone()
+        } else {
+            format!("{section_path}.{k}")
+        };
+
+        if !known_keys.contains(&k.as_str()) {
+            let suggestion =
+                find_closest_match(k, known_keys).map(|c| format!("Did you mean `{c}`?"));
+            let (line, column) = find_line_col_for_key(toml_str, k);
+            diagnostics.push(ConfigDiagnostic {
+                path: full_path.clone(),
+                severity: ConfigDiagnosticSeverity::Error,
+                code: "RS-0002".to_string(),
+                message: format!(
+                    "Unknown key `{k}` in section `{}`",
+                    if section_path.is_empty() {
+                        "root"
+                    } else {
+                        section_path
+                    }
+                ),
+                suggestion,
+                line,
+                column,
+            });
+        } else if let toml::Value::Table(sub) = v {
+            match full_path.as_str() {
+                "node" => validate_node_config_keys(
+                    sub,
+                    "node",
+                    KNOWN_NODE_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "gateway" => validate_node_config_keys(
+                    sub,
+                    "gateway",
+                    KNOWN_GATEWAY_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "gateway.tls" => validate_node_config_keys(
+                    sub,
+                    "gateway.tls",
+                    KNOWN_GATEWAY_TLS_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "control" => validate_node_config_keys(
+                    sub,
+                    "control",
+                    KNOWN_CONTROL_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "control.raft" => validate_node_config_keys(
+                    sub,
+                    "control.raft",
+                    KNOWN_CONTROL_RAFT_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "worker" => validate_node_config_keys(
+                    sub,
+                    "worker",
+                    KNOWN_WORKER_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "storage" => validate_node_config_keys(
+                    sub,
+                    "storage",
+                    KNOWN_STORAGE_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "metrics" => validate_node_config_keys(
+                    sub,
+                    "metrics",
+                    KNOWN_METRICS_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "auth" => validate_node_config_keys(
+                    sub,
+                    "auth",
+                    KNOWN_AUTH_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "logging" => validate_node_config_keys(
+                    sub,
+                    "logging",
+                    KNOWN_LOGGING_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "runtime" => validate_node_config_keys(
+                    sub,
+                    "runtime",
+                    KNOWN_RUNTIME_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
                 _ => {}
             }
         }
@@ -377,30 +589,112 @@ pub fn validate_config_str(toml_str: &str, check_files: bool) -> ConfigValidatio
         }
     };
 
-    // Layer 2: Unknown and Deprecated Keys
-    if let toml::Value::Table(ref root_table) = parsed_val {
+    let root_table = match parsed_val {
+        toml::Value::Table(tbl) => tbl,
+        _ => {
+            diagnostics.push(ConfigDiagnostic {
+                path: "root".to_string(),
+                severity: ConfigDiagnosticSeverity::Error,
+                code: "RS-0002".to_string(),
+                message: "Configuration root must be a table".to_string(),
+                suggestion: None,
+                line: None,
+                column: None,
+            });
+            return ConfigValidationReport {
+                valid: false,
+                diagnostics,
+            };
+        }
+    };
+
+    let has_version = root_table.contains_key("version");
+    let has_node_sections = root_table.contains_key("node")
+        || root_table.contains_key("control")
+        || root_table.contains_key("runtime")
+        || (root_table.contains_key("storage")
+            && root_table
+                .get("storage")
+                .and_then(|v| v.as_table())
+                .map(|t| t.contains_key("url"))
+                .unwrap_or(false));
+
+    let is_node_config = has_version || has_node_sections;
+
+    if is_node_config {
+        // Layer 2: Version validation
+        if let Some(v) = root_table.get("version") {
+            let ver_val = match v {
+                toml::Value::Integer(i) => *i,
+                _ => -1,
+            };
+            if ver_val != 1 {
+                let (line, column) = find_line_col_for_key(toml_str, "version");
+                diagnostics.push(ConfigDiagnostic {
+                    path: "version".to_string(),
+                    severity: ConfigDiagnosticSeverity::Error,
+                    code: "RS-0002".to_string(),
+                    message: format!(
+                        "unsupported configuration version {ver_val} (expected version = 1)"
+                    ),
+                    suggestion: Some("Set `version = 1`".to_string()),
+                    line,
+                    column,
+                });
+            }
+        }
+
+        // Layer 2: Unknown keys in NodeConfig
+        validate_node_config_keys(
+            &root_table,
+            "",
+            KNOWN_NODE_CONFIG_ROOT_KEYS,
+            toml_str,
+            &mut diagnostics,
+        );
+
+        // Layer 3: Semantic Bounds Validation
+        match crate::config::NodeConfig::load_from_str(toml_str) {
+            Ok(node_cfg) => {
+                validate_node_config_semantic_bounds(&node_cfg, check_files, &mut diagnostics);
+            }
+            Err(e) => {
+                if diagnostics.is_empty() {
+                    diagnostics.push(ConfigDiagnostic {
+                        path: "config".to_string(),
+                        severity: ConfigDiagnosticSeverity::Error,
+                        code: "RS-0002".to_string(),
+                        message: format!("Failed to parse config into NodeConfig: {e}"),
+                        suggestion: None,
+                        line: None,
+                        column: None,
+                    });
+                }
+            }
+        }
+    } else {
+        // Legacy RockstreamConfig validation
         let mut top_known = Vec::new();
         top_known.extend_from_slice(KNOWN_TOP_LEVEL_TABLES);
         top_known.extend_from_slice(KNOWN_TOP_LEVEL_SCALARS);
-        validate_keys_in_table(root_table, "", &top_known, &mut diagnostics);
-    }
+        validate_keys_in_table(&root_table, "", &top_known, toml_str, &mut diagnostics);
 
-    // Layer 3: Semantic Bounds Validation
-    match toml::from_str::<RockstreamConfig>(toml_str) {
-        Ok(config) => {
-            validate_semantic_bounds(&config, check_files, &mut diagnostics);
-        }
-        Err(e) => {
-            if diagnostics.is_empty() {
-                diagnostics.push(ConfigDiagnostic {
-                    path: "config".to_string(),
-                    severity: ConfigDiagnosticSeverity::Error,
-                    code: "RS-0002".to_string(),
-                    message: format!("Failed to parse config into RockstreamConfig: {e}"),
-                    suggestion: None,
-                    line: None,
-                    column: None,
-                });
+        match toml::from_str::<RockstreamConfig>(toml_str) {
+            Ok(config) => {
+                validate_semantic_bounds(&config, check_files, &mut diagnostics);
+            }
+            Err(e) => {
+                if diagnostics.is_empty() {
+                    diagnostics.push(ConfigDiagnostic {
+                        path: "config".to_string(),
+                        severity: ConfigDiagnosticSeverity::Error,
+                        code: "RS-0002".to_string(),
+                        message: format!("Failed to parse config into RockstreamConfig: {e}"),
+                        suggestion: None,
+                        line: None,
+                        column: None,
+                    });
+                }
             }
         }
     }
@@ -654,6 +948,255 @@ pub fn validate_semantic_bounds(
             &config.internal_tls.ca_cert_path,
             "internal_tls.ca_cert_path",
         );
+    }
+}
+
+/// Validate semantic bounds on a `NodeConfig`.
+pub fn validate_node_config_semantic_bounds(
+    node_cfg: &crate::config::NodeConfig,
+    check_files: bool,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    if node_cfg.version != 1 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "version".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: format!(
+                "unsupported configuration version {} (expected version = 1)",
+                node_cfg.version
+            ),
+            suggestion: Some("Set `version = 1`".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    let role_norm = node_cfg.node.role.trim().to_lowercase();
+    let valid_roles = ["all", "control", "worker", "gateway", "metrics", "frontier"];
+    if !valid_roles.contains(&role_norm.as_str()) {
+        diagnostics.push(ConfigDiagnostic {
+            path: "node.role".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: format!(
+                "unknown role `{}`; supported: all, control, worker, gateway, metrics",
+                node_cfg.node.role
+            ),
+            suggestion: Some("Set `role = \"all\"` or one of the supported roles".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if (role_norm == "worker" || role_norm == "frontier") && node_cfg.control.url.is_none() {
+        diagnostics.push(ConfigDiagnostic {
+            path: "node.role".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: format!("role `{}` requires `control.url`", node_cfg.node.role),
+            suggestion: Some(
+                "Set `control.url` in [control] section or pass --control=<url>".to_string(),
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    // gateway listen_addr
+    if node_cfg
+        .gateway
+        .listen_addr
+        .parse::<std::net::SocketAddr>()
+        .is_err()
+    {
+        diagnostics.push(ConfigDiagnostic {
+            path: "gateway.listen_addr".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: format!("invalid socket address `{}`", node_cfg.gateway.listen_addr),
+            suggestion: Some("Specify a valid IP:port like `127.0.0.1:5432`".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    // control listen_addr
+    if let Some(ref addr) = node_cfg.control.listen_addr {
+        if addr.parse::<std::net::SocketAddr>().is_err() {
+            diagnostics.push(ConfigDiagnostic {
+                path: "control.listen_addr".to_string(),
+                severity: ConfigDiagnosticSeverity::Error,
+                code: "RS-0002".to_string(),
+                message: format!("invalid socket address `{}`", addr),
+                suggestion: Some("Specify a valid IP:port like `127.0.0.1:9200`".to_string()),
+                line: None,
+                column: None,
+            });
+        }
+    }
+
+    // metrics listen_addr
+    if node_cfg
+        .metrics
+        .listen_addr
+        .parse::<std::net::SocketAddr>()
+        .is_err()
+    {
+        diagnostics.push(ConfigDiagnostic {
+            path: "metrics.listen_addr".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: format!("invalid socket address `{}`", node_cfg.metrics.listen_addr),
+            suggestion: Some("Specify a valid IP:port like `127.0.0.1:9090`".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    // auth mode
+    let auth_mode_norm = node_cfg.auth.mode.trim().to_lowercase();
+    let valid_auth = ["off", "scram", "md5", "oidc", "mtls"];
+    if !valid_auth.contains(&auth_mode_norm.as_str()) {
+        diagnostics.push(ConfigDiagnostic {
+            path: "auth.mode".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: format!(
+                "unknown auth mode `{}`; supported: off, scram, md5, oidc, mtls",
+                node_cfg.auth.mode
+            ),
+            suggestion: Some("Set auth mode to off, scram, md5, oidc, or mtls".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    // storage bounds
+    if check_files {
+        if let Err(e) = node_cfg.storage.url.verify_accessible() {
+            diagnostics.push(ConfigDiagnostic {
+                path: "storage.url".to_string(),
+                severity: ConfigDiagnosticSeverity::Error,
+                code: "RS-0003".to_string(),
+                message: e,
+                suggestion: Some("Ensure storage directory exists and is writable".to_string()),
+                line: None,
+                column: None,
+            });
+        }
+    }
+
+    // worker bounds
+    if node_cfg.worker.execution_threads == 0 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "worker.execution_threads".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "worker.execution_threads must be greater than 0".to_string(),
+            suggestion: Some("Set execution_threads >= 1".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if node_cfg.worker.segment_cache_bytes == 0 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "worker.segment_cache_bytes".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "worker.segment_cache_bytes must be greater than 0".to_string(),
+            suggestion: Some("Set segment_cache_bytes > 0".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if node_cfg.worker.max_rows_per_quantum == 0 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "worker.max_rows_per_quantum".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "worker.max_rows_per_quantum must be greater than 0".to_string(),
+            suggestion: Some("Set max_rows_per_quantum > 0".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    // runtime bounds
+    if node_cfg.runtime.shutdown_timeout_secs == 0 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "runtime.shutdown_timeout_secs".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "runtime.shutdown_timeout_secs must be greater than 0".to_string(),
+            suggestion: Some("Set shutdown_timeout_secs >= 1".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if node_cfg.runtime.min_epoch_ms == 0 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "runtime.min_epoch_ms".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "runtime.min_epoch_ms must be greater than 0".to_string(),
+            suggestion: Some("Set min_epoch_ms >= 1 (default 10)".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if node_cfg.runtime.checkpoint_retention_count == 0 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "runtime.checkpoint_retention_count".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "runtime.checkpoint_retention_count must be greater than 0".to_string(),
+            suggestion: Some("Set checkpoint_retention_count >= 1 (default 128)".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if node_cfg.runtime.state_budget_gb == 0 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "runtime.state_budget_gb".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "runtime.state_budget_gb must be greater than 0".to_string(),
+            suggestion: Some("Set state_budget_gb >= 1".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if check_files {
+        let mut check_file = |opt: &Option<std::path::PathBuf>, path: &str| {
+            if let Some(ref p) = opt {
+                if !p.exists() {
+                    diagnostics.push(ConfigDiagnostic {
+                        path: path.to_string(),
+                        severity: ConfigDiagnosticSeverity::Error,
+                        code: "RS-0002".to_string(),
+                        message: format!("Referenced file does not exist: {}", p.display()),
+                        suggestion: Some("Check file path and existence".to_string()),
+                        line: None,
+                        column: None,
+                    });
+                }
+            }
+        };
+
+        check_file(&node_cfg.gateway.tls.cert_path, "gateway.tls.cert_path");
+        check_file(&node_cfg.gateway.tls.key_path, "gateway.tls.key_path");
+        check_file(
+            &node_cfg.gateway.tls.ca_cert_path,
+            "gateway.tls.ca_cert_path",
+        );
+        check_file(&node_cfg.auth.secret_path, "auth.secret_path");
     }
 }
 

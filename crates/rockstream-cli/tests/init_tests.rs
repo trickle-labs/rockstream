@@ -49,7 +49,8 @@ fn test_init_local_template() {
     // Verify file contents exist and are non-empty
     let config_content =
         fs::read_to_string(target_dir.join("rockstream.toml")).expect("rockstream.toml");
-    assert!(config_content.contains("backend = \"lfs\""));
+    assert!(config_content.contains("url = \"file://./data\""));
+    assert!(config_content.contains("version = 1"));
 
     let manifest_content =
         fs::read_to_string(target_dir.join("project.toml")).expect("project.toml");
@@ -344,4 +345,39 @@ fn test_readme_commands_match_cli_options() {
     assert!(readme.contains("rockstream start --storage ./storage --listen 127.0.0.1:5432"));
     assert!(readme.contains("rockstream project apply"));
     assert!(readme.contains("rockstream project verify"));
+}
+
+#[test]
+fn test_scaffolded_rockstream_toml_validates_as_node_config() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let proj_dir = temp_dir.path().join("test_proj");
+
+    let opts = InitOptions {
+        name: "test_proj".to_string(),
+        template: "local".to_string(),
+        dir: Some(proj_dir.clone()),
+        force: false,
+    };
+
+    rockstream_cli::init::scaffold_project(&opts).expect("scaffold");
+    let config_path = proj_dir.join("rockstream.toml");
+    let config_content = fs::read_to_string(&config_path).expect("read rockstream.toml");
+
+    // Validate using rockstream_types config validator
+    let report = rockstream_types::config_validation::validate_config_str(&config_content, false);
+    assert!(
+        report.valid,
+        "Scaffolded rockstream.toml must validate as valid NodeConfig: {:?}",
+        report.diagnostics
+    );
+
+    // Also verify deserialization into NodeConfig succeeds
+    let node_config: rockstream_types::config::NodeConfig = toml::from_str(&config_content)
+        .expect("scaffolded config must deserialize into NodeConfig");
+    assert_eq!(node_config.version, 1);
+    assert_eq!(node_config.node.role, "all");
+    assert_eq!(node_config.gateway.listen_addr, "127.0.0.1:5432");
+    assert_eq!(node_config.storage.url.to_string(), "file://./data");
+    assert_eq!(node_config.metrics.listen_addr, "127.0.0.1:9090");
+    assert_eq!(node_config.logging.level, "info");
 }

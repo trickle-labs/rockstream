@@ -13,7 +13,9 @@ async fn test_shutdown_coordinator_signal_and_deadline_watchdog() {
     let tracker = Arc::new(LifecycleTracker::new("worker"));
     let coordinator = ShutdownCoordinator::new(tracker.clone(), Duration::from_millis(100));
 
-    // 1. Initial state is Starting
+    // 1. Initial state is Created, transition to Starting
+    assert_eq!(tracker.state(), LifecycleState::Created);
+    tracker.set_state(LifecycleState::Starting);
     assert_eq!(tracker.state(), LifecycleState::Starting);
     assert!(!coordinator.is_shutting_down());
 
@@ -45,5 +47,5 @@ async fn test_shutdown_coordinator_signal_and_deadline_watchdog() {
     coordinator2.mark_completed();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let _ = watchdog2.await;
-    assert_eq!(tracker2.state(), LifecycleState::Terminated);
+    assert_eq!(tracker2.state(), LifecycleState::Stopped);
 }

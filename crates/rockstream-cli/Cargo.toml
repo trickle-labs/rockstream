@@ -39,6 +39,7 @@ tokio-postgres = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 libc = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 rockstream-test-support = { workspace = true }

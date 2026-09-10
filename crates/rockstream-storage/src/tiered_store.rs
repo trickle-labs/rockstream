@@ -476,6 +476,53 @@ pub fn build_migration_object_store(storage_url: &str) -> Result<Arc<dyn ObjectS
     })
 }
 
+/// Build an ObjectStore backend from a validated `StorageUrl`.
+pub fn build_storage_backend_from_url(
+    storage_url: &rockstream_types::config::StorageUrl,
+) -> Result<Arc<dyn ObjectStore>, String> {
+    match storage_url {
+        rockstream_types::config::StorageUrl::File(path) => {
+            std::fs::create_dir_all(path)
+                .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+            let store = object_store::local::LocalFileSystem::new_with_prefix(path)
+                .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+            Ok(Arc::new(store))
+        }
+        rockstream_types::config::StorageUrl::S3 { bucket, prefix } => {
+            let endpoint = std::env::var("ROCKSTREAM_OBJECT_STORE_ENDPOINT").map_err(|_| {
+                "RS-0002: ROCKSTREAM_OBJECT_STORE_ENDPOINT is required for s3 storage".to_string()
+            })?;
+            let access_key = std::env::var("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY").map_err(|_| {
+                "RS-0002: ROCKSTREAM_OBJECT_STORE_ACCESS_KEY is required for s3 storage".to_string()
+            })?;
+            let secret_key = std::env::var("ROCKSTREAM_OBJECT_STORE_SECRET_KEY").map_err(|_| {
+                "RS-0002: ROCKSTREAM_OBJECT_STORE_SECRET_KEY is required for s3 storage".to_string()
+            })?;
+            let region = std::env::var("ROCKSTREAM_OBJECT_STORE_REGION")
+                .unwrap_or_else(|_| "us-east-1".to_string());
+            let store = AmazonS3Builder::new()
+                .with_endpoint(endpoint.clone())
+                .with_bucket_name(bucket.clone())
+                .with_region(region)
+                .with_access_key_id(access_key)
+                .with_secret_access_key(secret_key)
+                .with_allow_http(endpoint.starts_with("http://"))
+                .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+                .build()
+                .map_err(|error| format!("RS-0002: failed to build S3 object store: {error}"))?;
+            let store: Arc<dyn ObjectStore> = Arc::new(store);
+            if prefix.is_empty() {
+                Ok(store)
+            } else {
+                Ok(Arc::new(object_store::prefix::PrefixStore::new(
+                    store,
+                    prefix.trim_matches('/'),
+                )))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

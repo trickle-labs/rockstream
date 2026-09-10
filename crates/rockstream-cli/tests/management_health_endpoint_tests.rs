@@ -32,9 +32,11 @@ async fn send_get(addr: SocketAddr, path: &str) -> (u16, String) {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn test_live_ready_health_endpoints_and_transitions() {
     let _lock = METRICS_SERVER_TEST_LOCK.lock().await;
     let tracker = Arc::new(LifecycleTracker::new("worker"));
+    tracker.set_state(LifecycleState::Starting);
     let handle = start_management_server("127.0.0.1:0", tracker.clone())
         .await
         .unwrap();
