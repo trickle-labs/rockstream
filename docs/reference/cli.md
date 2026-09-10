@@ -914,6 +914,28 @@ Exit codes
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
+### `rockstream project apply`
+
+Apply project schema and seed data over live pgwire connection
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| dir | — | --dir | DIR | no | . | — | Project directory containing project.toml (defaults to current dir) |
+| endpoint | — | --endpoint | ENDPOINT | no | 127.0.0.1:5432 | — | Gateway address to connect to (defaults to 127.0.0.1:5432) |
+| timeout | — | --timeout | TIMEOUT | no | 30 | — | Connection / statement timeout in seconds |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
 ### `rockstream project init`
 
 Initialize a new RockStream project from a template
@@ -925,7 +947,52 @@ Options
 | dir | — | --dir | DIR | no | — | — | Target directory to scaffold the project into (defaults to ./<name>) |
 | force | — | --force | FORCE | no | false | true, false | Overwrite existing files in non-empty directory |
 | name | — | — | NAME | no | my_project | — | Project name (defaults to "my_project") |
-| template | — | --template | TEMPLATE | no | local | — | Project template: "local", "kafka", or "postgres-cdc" |
+| template | — | --template | TEMPLATE | no | local | — | Project template: "local" (experimental templates are in examples/experimental/) |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream project new`
+
+Scaffold a new RockStream project into a new directory
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| dir | — | --dir | DIR | no | — | — | Target directory to scaffold the project into (defaults to ./<name>) |
+| force | — | --force | FORCE | no | false | true, false | Overwrite existing files in non-empty directory |
+| name | — | — | NAME | yes | — | — | Project name |
+| template | — | --template | TEMPLATE | no | local | — | Project template: "local" |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream project verify`
+
+Verify project materialized views against expected query results
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| dir | — | --dir | DIR | no | . | — | Project directory containing project.toml (defaults to current dir) |
+| endpoint | — | --endpoint | ENDPOINT | no | 127.0.0.1:5432 | — | Gateway address to connect to (defaults to 127.0.0.1:5432) |
+| timeout | — | --timeout | TIMEOUT | no | 30 | — | Connection / statement timeout in seconds |
 
 Exit codes
 
@@ -961,13 +1028,17 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream query`
 
-Execute an incremental query against a view or stream
+Execute an incremental query against a view or stream via embedded pgwire client
 
 Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| query | — | — | QUERY | yes | — | — | SQL query to execute |
+| endpoint | — | --endpoint | ENDPOINT | no | 127.0.0.1:5432 | — | Gateway address to connect to |
+| file | — | --file | FILE | no | — | — | Path to SQL file to execute |
+| format | — | --format | FORMAT | no | table | — | Output format: table, json, or csv |
+| query | — | — | QUERY | no |  | — | SQL query to execute |
+| timing | — | --timing | TIMING | no | false | true, false | Measure and display query execution timing |
 
 Exit codes
 
@@ -1211,7 +1282,13 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream shell`
 
-Launch interactive SQL/admin REPL shell
+Launch interactive SQL/admin REPL shell over live pgwire connection
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| endpoint | — | --endpoint | ENDPOINT | no | 127.0.0.1:5432 | — | Gateway address to connect to |
 
 Exit codes
 
