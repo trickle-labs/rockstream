@@ -1,11 +1,11 @@
 {
-  "aggregate_performance/aggregate_in_memory/10000": 952096.671,
-  "delta_propagation_cost/aggregate_update/0.1pct": 24769.778,
-  "delta_propagation_cost/aggregate_update/10pct": 1915712.672,
-  "delta_propagation_cost/aggregate_update/1pct": 196729.422,
-  "filter_delta_cost/filter_update/0.1pct": 3434.909,
-  "filter_delta_cost/filter_update/10pct": 167384.030,
-  "filter_delta_cost/filter_update/1pct": 18033.058,
-  "filter_performance/filter_in_memory/10000": 74926.126,
-  "join_performance/join_in_memory/10000": 575126795.560
+  "aggregate_performance/aggregate_in_memory/10000": 1096619.097,
+  "delta_propagation_cost/aggregate_update/0.1pct": 26257.514,
+  "delta_propagation_cost/aggregate_update/10pct": 2190130.280,
+  "delta_propagation_cost/aggregate_update/1pct": 220665.554,
+  "filter_delta_cost/filter_update/0.1pct": 4170.599,
+  "filter_delta_cost/filter_update/10pct": 201208.007,
+  "filter_delta_cost/filter_update/1pct": 21571.640,
+  "filter_performance/filter_in_memory/10000": 85617.882,
+  "join_performance/join_in_memory/10000": 507958984.360
 }
