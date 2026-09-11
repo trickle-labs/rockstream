@@ -162,7 +162,10 @@ mod tests {
     #[tokio::test]
     #[allow(deprecated)]
     async fn live_ready_health_endpoints_work() {
-        let tracker = Arc::new(LifecycleTracker::new("worker"));
+        let tracker = Arc::new(LifecycleTracker::new_with_state(
+            "worker",
+            LifecycleState::Starting,
+        ));
         let handle = start_management_server("127.0.0.1:0", tracker.clone())
             .await
             .unwrap();
