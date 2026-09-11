@@ -847,14 +847,23 @@ impl Image for MinIO2024 {
     }
 }
 
-async fn start_minio() -> (testcontainers::ContainerAsync<MinIO2024>, u16) {
-    let container = MinIO2024::default()
-        .start()
-        .await
-        .expect("failed to start MinIO container; is Docker running?");
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
+async fn start_minio() -> Option<(testcontainers::ContainerAsync<MinIO2024>, u16)> {
+    let container = match MinIO2024::default().start().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP start_minio: cannot start MinIO container ({e:?})");
+            return None;
+        }
+    };
+    let port = match container.get_host_port_ipv4(9000).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("SKIP start_minio: cannot get MinIO port ({e:?})");
+            return None;
+        }
+    };
     create_minio_bucket(port, MINIO_BUCKET).await;
-    (container, port)
+    Some((container, port))
 }
 
 fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
@@ -883,7 +892,13 @@ async fn run_minio_retraction_test(
         eprintln!("SKIP {shard_name}: Docker not available");
         return;
     }
-    let (_container, port) = start_minio().await;
+    let (_container, port) = match start_minio().await {
+        Some(res) => res,
+        None => {
+            eprintln!("SKIP {shard_name}: MinIO container unavailable");
+            return;
+        }
+    };
     let store = minio_object_store(port);
     run_retraction_test_with_store(shard_name, views, view_ddls, oracle_queries, seed, store).await;
 }
