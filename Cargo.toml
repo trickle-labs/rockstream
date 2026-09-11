@@ -24,7 +24,7 @@ overflow-checks = true
 strip = "symbols"
 
 [workspace.package]
-version = "0.62.1"
+version = "0.63.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -68,6 +68,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
+crc32fast = "1.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

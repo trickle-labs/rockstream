@@ -13,6 +13,7 @@
 //! scan-and-delete or compaction-filter patterns.
 
 pub mod arrangement_catalog;
+pub mod catalog;
 pub mod concurrency_governor;
 pub mod error;
 pub mod format_migration;

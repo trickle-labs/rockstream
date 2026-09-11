@@ -6,7 +6,10 @@
 
 pub mod dag;
 pub mod explain;
+pub mod identity;
 pub mod virtual_bucket;
+
+pub use identity::{CompiledPlanRecord, CURRENT_COMPILER_VERSION, CURRENT_STATE_LAYOUT_VERSION};
 
 use rockstream_types::ids::OperatorId;
 use rockstream_types::merge_law::MergeLawId;

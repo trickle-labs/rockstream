@@ -205,3 +205,34 @@ async fn test_removed_connector_error_dispatch() {
     let desc = ErrorDescriptor::lookup(RS_4017).expect("RS_4017 must exist");
     assert_eq!(desc.sqlstate, "0A000");
 }
+
+#[tokio::test]
+async fn test_unsupported_ddl_error_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, _handle, _shard_db) = start_gateway("unsupported-ddl-test", store, catalog).await;
+    let client = connect_port(port).await;
+
+    let unsupported_queries = [
+        "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE PROCEDURE p()",
+        "CREATE PROCEDURE p() LANGUAGE SQL AS $$ SELECT 1 $$",
+        "CREATE FOREIGN TABLE ft (id int) SERVER srv",
+        "CREATE DOMAIN us_postal_code AS TEXT",
+        "CREATE SEQUENCE seq_1",
+    ];
+
+    for q in unsupported_queries {
+        let res = client.simple_query(q).await;
+        assert!(res.is_err(), "unsupported DDL '{q}' must fail");
+        let err = res.unwrap_err();
+        let db_err = err.as_db_error().expect("must be DB error");
+        assert_eq!(db_err.code().code(), "0A000");
+        assert!(
+            db_err.message().contains("RS-1001"),
+            "Error message must contain RS-1001, got: {}",
+            db_err.message()
+        );
+    }
+}

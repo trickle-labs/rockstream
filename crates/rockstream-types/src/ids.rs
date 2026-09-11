@@ -91,6 +91,36 @@ define_id!(
     ArrangementId, u64, "arr"
 );
 
+define_id!(
+    /// Identifies a table in the catalog.
+    TableId, u64, "table"
+);
+
+define_id!(
+    /// Identifies a secondary index in the catalog.
+    IndexId, u64, "idx"
+);
+
+define_id!(
+    /// Identifies a database in the catalog.
+    DatabaseId, u64, "db"
+);
+
+define_id!(
+    /// Identifies a sink instance.
+    SinkId, u64, "sink"
+);
+
+define_id!(
+    /// Identifies a compiled plan in the catalog.
+    CompiledPlanId, u64, "plan"
+);
+
+define_id!(
+    /// Identifies a principal/role in the catalog.
+    PrincipalId, u64, "principal"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +141,15 @@ mod tests {
         let _s: ShardId = ShardId(1);
         let _o: OperatorId = OperatorId(1);
         // These are different types despite same inner value.
+    }
+
+    #[test]
+    fn domain_id_types_and_display() {
+        assert_eq!(TableId(1).to_string(), "table-1");
+        assert_eq!(IndexId(2).to_string(), "idx-2");
+        assert_eq!(DatabaseId(3).to_string(), "db-3");
+        assert_eq!(SinkId(4).to_string(), "sink-4");
+        assert_eq!(CompiledPlanId(5).to_string(), "plan-5");
+        assert_eq!(PrincipalId(6).to_string(), "principal-6");
     }
 }

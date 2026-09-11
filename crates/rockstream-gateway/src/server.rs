@@ -4942,6 +4942,14 @@ impl GatewayHandler {
             return Some(Ok(vec![connector_removed_error_response()]));
         }
 
+        if let Err(e) = rockstream_storage::catalog::validate_unsupported_ddl(q) {
+            return Some(Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "0A000".to_owned(),
+                e.to_string(),
+            )))]));
+        }
+
         // SERIALIZABLE → RS-2003
         if ql.contains("serializable") && ql.contains("isolation") {
             return Some(Ok(vec![diagnostic_error_response(

@@ -417,6 +417,9 @@ pub struct CatalogStubs {
     /// automatic backfill (Slice 5, v0.51.2). Not derived from any real
     /// runtime-DAG `IndexArrangeOp` — see v0.51.2 plan §2 scoping decision.
     next_index_op_id: std::sync::atomic::AtomicU64,
+    durable_store: RwLock<Option<Arc<rockstream_storage::catalog::DurableCatalogStore>>>,
+    catalog_revision: std::sync::atomic::AtomicU64,
+    projection_cache: RwLock<HashMap<(String, Vec<String>), CatalogResponse>>,
 }
 
 const V0522_CONNECTOR_CATALOG_KEY: &[u8] = b"rockstream/catalog/connectors/v0522";
@@ -488,6 +491,9 @@ impl CatalogStubs {
             view_arrangements: RwLock::new(HashMap::new()),
             view_engine_facts: RwLock::new(HashMap::new()),
             next_index_op_id: std::sync::atomic::AtomicU64::new(1),
+            durable_store: RwLock::new(None),
+            catalog_revision: std::sync::atomic::AtomicU64::new(0),
+            projection_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -504,12 +510,228 @@ impl CatalogStubs {
             view_arrangements: RwLock::new(HashMap::new()),
             view_engine_facts: RwLock::new(HashMap::new()),
             next_index_op_id: std::sync::atomic::AtomicU64::new(1),
+            durable_store: RwLock::new(None),
+            catalog_revision: std::sync::atomic::AtomicU64::new(0),
+            projection_cache: RwLock::new(HashMap::new()),
         };
         let workloads = workload_catalog.load_all_workloads().await?;
         let mut inner = catalog.inner.write().unwrap();
         inner.workloads = workloads;
         drop(inner);
         Ok(catalog)
+    }
+
+    /// Return the current catalog revision.
+    pub fn get_revision(&self) -> u64 {
+        self.catalog_revision
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Set the catalog revision and invalidate projection caches.
+    pub fn set_revision(&self, rev: u64) {
+        self.catalog_revision
+            .store(rev, std::sync::atomic::Ordering::SeqCst);
+        self.projection_cache.write().unwrap().clear();
+    }
+
+    /// Invalidate all system catalog projection caches and advance revision.
+    pub fn invalidate_projection_caches(&self) {
+        self.catalog_revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.projection_cache.write().unwrap().clear();
+    }
+
+    /// Attach a durable catalog store.
+    pub fn set_durable_store(&self, store: Arc<rockstream_storage::catalog::DurableCatalogStore>) {
+        *self.durable_store.write().unwrap() = Some(store);
+    }
+
+    /// Retrieve the attached durable catalog store.
+    pub fn get_durable_store(
+        &self,
+    ) -> Option<Arc<rockstream_storage::catalog::DurableCatalogStore>> {
+        self.durable_store.read().unwrap().clone()
+    }
+
+    /// Reconstruct gateway catalog state from the attached durable catalog store.
+    pub async fn sync_from_durable_store(&self) -> Result<(), String> {
+        let Some(store) = self.get_durable_store() else {
+            return Ok(());
+        };
+        use rockstream_storage::catalog::CatalogStore;
+        let rev = store.get_revision().await;
+        self.catalog_revision
+            .store(rev, std::sync::atomic::Ordering::SeqCst);
+
+        let tables = store.list_tables().await.map_err(|e| e.to_string())?;
+        let views = store.list_views().await.map_err(|e| e.to_string())?;
+        let indexes = store.list_indexes().await.map_err(|e| e.to_string())?;
+        let workloads = store.list_workloads().await.map_err(|e| e.to_string())?;
+        let sources = store.list_sources().await.map_err(|e| e.to_string())?;
+        let sinks = store.list_sinks().await.map_err(|e| e.to_string())?;
+
+        let mut inner = self.inner.write().unwrap();
+        inner.tables.clear();
+        let mut table_id_to_name = std::collections::HashMap::new();
+        for t in tables {
+            table_id_to_name.insert(t.id, t.name.clone());
+            let cols = t
+                .columns
+                .into_iter()
+                .map(|c| CatalogColumn {
+                    name: c.name,
+                    data_type: c.data_type,
+                })
+                .collect();
+            inner.tables.insert(
+                t.name.clone(),
+                CatalogTable {
+                    name: t.name,
+                    columns: cols,
+                },
+            );
+        }
+        inner.views.clear();
+        for v in views {
+            let cols = v
+                .columns
+                .into_iter()
+                .map(|c| CatalogColumn {
+                    name: c.name,
+                    data_type: c.data_type,
+                })
+                .collect();
+            inner.views.insert(
+                v.name.clone(),
+                CatalogView {
+                    name: v.name,
+                    sql: v.sql,
+                    columns: cols,
+                    namespace: "public".to_string(),
+                    op_id: v.op_id,
+                },
+            );
+        }
+        inner.indexes.clear();
+        for idx in indexes {
+            let state = match idx.state {
+                rockstream_storage::catalog::CatalogIndexState::Building => {
+                    CatalogIndexState::Building
+                }
+                rockstream_storage::catalog::CatalogIndexState::Ready => CatalogIndexState::Ready,
+            };
+            let table_name = table_id_to_name
+                .get(&idx.table_id)
+                .cloned()
+                .unwrap_or_else(|| format!("table_{}", idx.table_id));
+            inner.indexes.insert(
+                idx.name.clone(),
+                CatalogIndexEntry {
+                    name: idx.name,
+                    table: table_name,
+                    index_cols: idx.index_cols,
+                    state,
+                    op_id: idx.op_id,
+                },
+            );
+        }
+        inner.workloads.clear();
+        for w in workloads {
+            inner.workloads.insert(w.name.clone(), w);
+        }
+        inner.sources.clear();
+        inner.source_runtime.clear();
+        for s in sources {
+            inner.sources.insert(
+                s.name.clone(),
+                CatalogSourceEntry {
+                    name: s.name.clone(),
+                    table_name: s.table_name,
+                    source_type: s.connector_type,
+                    options: s.options,
+                    format: "json".to_string(),
+                    status: "RUNNING".to_string(),
+                    live_offset: "0".to_string(),
+                    live_lag: 0,
+                },
+            );
+            inner.source_runtime.insert(
+                s.name,
+                CatalogSourceRuntimeEntry {
+                    status: "RUNNING".to_string(),
+                    live_offset: "0".to_string(),
+                    live_lag: 0,
+                    owner: Some("gateway:pending".to_string()),
+                    committed_checkpoint: 0,
+                    buffer_fill: 0,
+                    blocked_reason: None,
+                    source_identity_hash: None,
+                    active_xid: None,
+                    envelope_bytes: 0,
+                    in_memory_bytes: 0,
+                    spill_bytes: 0,
+                    attached_view_count: 0,
+                    affected_view_count: 0,
+                    relation_schema_version: 0,
+                },
+            );
+        }
+        inner.sinks.clear();
+        for s in sinks {
+            inner.sinks.insert(
+                s.name.clone(),
+                CatalogSinkEntry {
+                    name: s.name.clone(),
+                    view: s.target.clone(),
+                    format: "parquet".to_string(),
+                    path: s.target,
+                    snapshot_interval_epochs: None,
+                    snapshot_interval_ms: None,
+                    parquet_row_group_bytes: None,
+                    format_version: None,
+                    partition_by: vec![],
+                    catalog: "memory".to_string(),
+                    last_snapshot_epoch: None,
+                    state: "OK".to_string(),
+                },
+            );
+        }
+        drop(inner);
+        self.projection_cache.write().unwrap().clear();
+        Ok(())
+    }
+
+    /// Persist mutations to the durable catalog store if attached.
+    pub fn persist_mutations(&self, mutations: Vec<rockstream_storage::catalog::CatalogMutation>) {
+        if let Some(store) = self.get_durable_store() {
+            let rev = self
+                .catalog_revision
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if let Ok(txn) = rockstream_storage::catalog::CatalogTxn::new(rev, rev, mutations) {
+                use rockstream_storage::catalog::CatalogStore;
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    match handle.runtime_flavor() {
+                        tokio::runtime::RuntimeFlavor::MultiThread => {
+                            tokio::task::block_in_place(|| {
+                                handle.block_on(async {
+                                    let _ = store.commit_txn(txn).await;
+                                })
+                            });
+                        }
+                        _ => {
+                            let store_clone = store.clone();
+                            handle.spawn(async move {
+                                let _ = store_clone.commit_txn(txn).await;
+                            });
+                        }
+                    }
+                } else {
+                    futures::executor::block_on(async {
+                        let _ = store.commit_txn(txn).await;
+                    });
+                }
+            }
+        }
     }
 
     /// Mints a fresh monotonic `op_id` for a gateway-local index arrangement
@@ -521,13 +743,7 @@ impl CatalogStubs {
 
     /// Register a view in the catalog without dependency tracking.
     pub fn add_view(&self, view: CatalogView) {
-        let mut inner = self.inner.write().unwrap();
-        self.view_states
-            .write()
-            .unwrap()
-            .entry(view.name.clone())
-            .or_insert(ViewState::Running);
-        inner.views.insert(view.name.clone(), view);
+        self.add_view_with_deps(view, vec![]);
     }
 
     /// Register a view with an explicit dependency list.
@@ -541,19 +757,62 @@ impl CatalogStubs {
             .unwrap()
             .entry(view.name.clone())
             .or_insert(ViewState::Running);
-        inner.deps.insert(view.name.clone(), deps);
-        inner.views.insert(view.name.clone(), view);
+        inner.deps.insert(view.name.clone(), deps.clone());
+        inner.views.insert(view.name.clone(), view.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+
+        let cols = view
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| rockstream_storage::catalog::CatalogColumn {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: true,
+                ordinal: (i + 1) as u32,
+            })
+            .collect();
+        let vid = rockstream_types::ids::ViewId(rockstream_storage::catalog::stable_name_id(
+            "view", &view.name,
+        ));
+        let cat_view = rockstream_storage::catalog::CatalogView {
+            id: vid,
+            name: view.name.clone(),
+            namespace_id: rockstream_types::ids::NamespaceId(1),
+            sql: view.sql.clone(),
+            compiled_plan_id: None,
+            op_id: view.op_id,
+            columns: cols,
+        };
+        let mut mutations = vec![rockstream_storage::catalog::CatalogMutation::PutView(
+            cat_view,
+        )];
+        for dep in &deps {
+            let child_id = self
+                .get_table(dep)
+                .map(|t| rockstream_storage::catalog::stable_name_id("table", &t.name))
+                .or_else(|| {
+                    self.get_view(dep)
+                        .map(|v| rockstream_storage::catalog::stable_name_id("view", &v.name))
+                })
+                .unwrap_or(0);
+            mutations.push(
+                rockstream_storage::catalog::CatalogMutation::PutViewDependency(
+                    rockstream_storage::catalog::ViewDependency {
+                        parent_id: vid.0,
+                        child_id,
+                        dependency_kind: rockstream_storage::catalog::DependencyKind::Table,
+                    },
+                ),
+            );
+        }
+        self.persist_mutations(mutations);
     }
 
     /// Register a view that already has its namespace set.
     pub fn add_view_in_namespace(&self, view: CatalogView) {
-        let mut inner = self.inner.write().unwrap();
-        self.view_states
-            .write()
-            .unwrap()
-            .entry(view.name.clone())
-            .or_insert(ViewState::Running);
-        inner.views.insert(view.name.clone(), view);
+        self.add_view_with_deps(view, vec![]);
     }
 
     /// List all registered views.
@@ -576,7 +835,18 @@ impl CatalogStubs {
         self.view_states.write().unwrap().remove(name);
         self.view_arrangements.write().unwrap().remove(name);
         self.view_engine_facts.write().unwrap().remove(name);
-        inner.views.remove(name).is_some()
+        let removed = inner.views.remove(name).is_some();
+        drop(inner);
+        if removed {
+            self.invalidate_projection_caches();
+            let vid = rockstream_types::ids::ViewId(rockstream_storage::catalog::stable_name_id(
+                "view", name,
+            ));
+            self.persist_mutations(vec![
+                rockstream_storage::catalog::CatalogMutation::DeleteView(vid),
+            ]);
+        }
+        removed
     }
 
     /// Set arrangement sharing metadata for a view.
@@ -677,7 +947,14 @@ impl CatalogStubs {
         if inner.workloads.contains_key(&workload.name) {
             return false;
         }
-        inner.workloads.insert(workload.name.clone(), workload);
+        inner
+            .workloads
+            .insert(workload.name.clone(), workload.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutWorkload(workload),
+        ]);
         true
     }
 
@@ -693,6 +970,11 @@ impl CatalogStubs {
             .write()
             .unwrap()
             .remove(&workload.name);
+        drop(inner);
+        self.invalidate_projection_caches();
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutWorkload(workload),
+        ]);
         true
     }
 
@@ -705,6 +987,14 @@ impl CatalogStubs {
             return false;
         }
         self.workload_budgets.write().unwrap().remove(workload_name);
+        self.invalidate_projection_caches();
+        let wid = rockstream_types::ids::WorkloadId(rockstream_storage::catalog::stable_name_id(
+            "workload",
+            workload_name,
+        ));
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::DeleteWorkload(wid),
+        ]);
         true
     }
 
@@ -776,7 +1066,35 @@ impl CatalogStubs {
         if inner.tables.contains_key(&table.name) {
             return false;
         }
-        inner.tables.insert(table.name.clone(), table);
+        inner.tables.insert(table.name.clone(), table.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+
+        let cols = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| rockstream_storage::catalog::CatalogColumn {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: true,
+                ordinal: (i + 1) as u32,
+            })
+            .collect();
+        let tid = rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
+            "table",
+            &table.name,
+        ));
+        let cat_table = rockstream_storage::catalog::CatalogTable {
+            id: tid,
+            name: table.name.clone(),
+            namespace_id: rockstream_types::ids::NamespaceId(1),
+            columns: cols,
+            pk_cols: vec![],
+        };
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutTable(cat_table),
+        ]);
         true
     }
 
@@ -786,6 +1104,8 @@ impl CatalogStubs {
         if let Some(v) = inner.views.get_mut(view_name) {
             v.columns = columns;
         }
+        drop(inner);
+        self.invalidate_projection_caches();
     }
 
     pub fn update_table_columns(&self, table_name: &str, columns: Vec<CatalogColumn>) {
@@ -793,6 +1113,8 @@ impl CatalogStubs {
         if let Some(table) = inner.tables.get_mut(table_name) {
             table.columns = columns;
         }
+        drop(inner);
+        self.invalidate_projection_caches();
     }
 
     /// Set the `OperatorId` (as u64) of the compiled `ViewSinkOp` backing a
@@ -830,7 +1152,18 @@ impl CatalogStubs {
     /// Remove a table from the catalog (DROP TABLE).
     pub fn remove_table(&self, name: &str) -> bool {
         let mut inner = self.inner.write().unwrap();
-        inner.tables.remove(name).is_some()
+        let removed = inner.tables.remove(name).is_some();
+        drop(inner);
+        if removed {
+            self.invalidate_projection_caches();
+            let tid = rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
+                "table", name,
+            ));
+            self.persist_mutations(vec![
+                rockstream_storage::catalog::CatalogMutation::DeleteTable(tid),
+            ]);
+        }
+        removed
     }
 
     /// Add a schema to the catalog (CREATE SCHEMA).
@@ -921,7 +1254,35 @@ impl CatalogStubs {
                 return false;
             }
         }
-        inner.indexes.insert(entry.name.clone(), entry);
+        inner.indexes.insert(entry.name.clone(), entry.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+
+        let iid = rockstream_types::ids::IndexId(rockstream_storage::catalog::stable_name_id(
+            "index",
+            &entry.name,
+        ));
+        let tid = rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
+            "table",
+            &entry.table,
+        ));
+        let cat_idx = rockstream_storage::catalog::CatalogIndexEntry {
+            id: iid,
+            name: entry.name.clone(),
+            table_id: tid,
+            index_cols: entry.index_cols.clone(),
+            pk_cols: vec![],
+            state: match entry.state {
+                CatalogIndexState::Building => {
+                    rockstream_storage::catalog::CatalogIndexState::Building
+                }
+                CatalogIndexState::Ready => rockstream_storage::catalog::CatalogIndexState::Ready,
+            },
+            op_id: entry.op_id,
+        };
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutIndex(cat_idx),
+        ]);
         true
     }
 
@@ -935,6 +1296,14 @@ impl CatalogStubs {
     pub fn remove_index(&self, name: &str) {
         let mut inner = self.inner.write().unwrap();
         inner.indexes.remove(name);
+        drop(inner);
+        self.invalidate_projection_caches();
+        let iid = rockstream_types::ids::IndexId(rockstream_storage::catalog::stable_name_id(
+            "index", name,
+        ));
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::DeleteIndex(iid),
+        ]);
     }
 
     /// Transition an existing index back to Building state (REBUILD INDEX).
@@ -1051,7 +1420,24 @@ impl CatalogStubs {
                 relation_schema_version: 0,
             },
         );
-        inner.sources.insert(entry.name.clone(), entry);
+        inner.sources.insert(entry.name.clone(), entry.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+
+        let sid = rockstream_types::ids::SourceId(rockstream_storage::catalog::stable_name_id(
+            "source",
+            &entry.name,
+        ));
+        let cat_source = rockstream_storage::catalog::CatalogSourceEntry {
+            id: sid,
+            name: entry.name.clone(),
+            connector_type: entry.source_type.clone(),
+            table_name: entry.table_name.clone(),
+            options: entry.options.clone(),
+        };
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutSource(cat_source),
+        ]);
         true
     }
 
@@ -1162,6 +1548,16 @@ impl CatalogStubs {
             removed, runtime_removed,
             "EDGE-SOURCE-RUNTIME: catalog and runtime source removal must be atomic"
         );
+        drop(inner);
+        if removed {
+            self.invalidate_projection_caches();
+            let sid = rockstream_types::ids::SourceId(rockstream_storage::catalog::stable_name_id(
+                "source", name,
+            ));
+            self.persist_mutations(vec![
+                rockstream_storage::catalog::CatalogMutation::DeleteSource(sid),
+            ]);
+        }
         removed
     }
 
@@ -2443,7 +2839,11 @@ impl CatalogStubs {
     // ── pg_catalog.pg_tables ──────────────────────────────────────────────────
 
     fn pg_tables(&self, requested_cols: &[String]) -> CatalogResponse {
-        let cols = if requested_cols.is_empty() {
+        let key = ("pg_tables".to_string(), requested_cols.to_vec());
+        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
             vec![
                 "schemaname".to_string(),
                 "tablename".to_string(),
@@ -2474,13 +2874,22 @@ impl CatalogStubs {
             }
             rows.push(row);
         }
-        CatalogResponse::rows(cols, rows)
+        let resp = CatalogResponse::rows(cols, rows);
+        self.projection_cache
+            .write()
+            .unwrap()
+            .insert(key, resp.clone());
+        resp
     }
 
     // ── pg_catalog.pg_views ───────────────────────────────────────────────────
 
     fn pg_views(&self, requested_cols: &[String]) -> CatalogResponse {
-        let cols = if requested_cols.is_empty() {
+        let key = ("pg_views".to_string(), requested_cols.to_vec());
+        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
             vec![
                 "schemaname".to_string(),
                 "viewname".to_string(),
@@ -2505,13 +2914,22 @@ impl CatalogStubs {
             }
             rows.push(row);
         }
-        CatalogResponse::rows(cols, rows)
+        let resp = CatalogResponse::rows(cols, rows);
+        self.projection_cache
+            .write()
+            .unwrap()
+            .insert(key, resp.clone());
+        resp
     }
 
     // ── pg_catalog.pg_class ───────────────────────────────────────────────────
 
     fn pg_class(&self, requested_cols: &[String]) -> CatalogResponse {
-        let cols = if requested_cols.is_empty() {
+        let key = ("pg_class".to_string(), requested_cols.to_vec());
+        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
             vec![
                 "oid".to_string(),
                 "relname".to_string(),
@@ -2563,7 +2981,12 @@ impl CatalogStubs {
             }
             rows.push(row);
         }
-        CatalogResponse::rows(cols, rows)
+        let resp = CatalogResponse::rows(cols, rows);
+        self.projection_cache
+            .write()
+            .unwrap()
+            .insert(key, resp.clone());
+        resp
     }
 
     // ── pg_catalog.pg_attribute ──────────────────────────────────────────────
@@ -2753,7 +3176,14 @@ impl CatalogStubs {
     // ── information_schema.tables ────────────────────────────────────────────
 
     fn information_schema_tables(&self, requested_cols: &[String]) -> CatalogResponse {
-        let cols = if requested_cols.is_empty() {
+        let key = (
+            "information_schema_tables".to_string(),
+            requested_cols.to_vec(),
+        );
+        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
             vec![
                 "table_catalog".to_string(),
                 "table_schema".to_string(),
@@ -2785,13 +3215,25 @@ impl CatalogStubs {
             }
             rows.push(row);
         }
-        CatalogResponse::rows(cols, rows)
+        let resp = CatalogResponse::rows(cols, rows);
+        self.projection_cache
+            .write()
+            .unwrap()
+            .insert(key, resp.clone());
+        resp
     }
 
     // ── information_schema.columns ───────────────────────────────────────────
 
     fn information_schema_columns(&self, requested_cols: &[String]) -> CatalogResponse {
-        let cols = if requested_cols.is_empty() {
+        let key = (
+            "information_schema_columns".to_string(),
+            requested_cols.to_vec(),
+        );
+        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
             vec![
                 "table_catalog".to_string(),
                 "table_schema".to_string(),
@@ -2841,7 +3283,12 @@ impl CatalogStubs {
             }
             rows.push(row);
         }
-        CatalogResponse::rows(cols, rows)
+        let resp = CatalogResponse::rows(cols, rows);
+        self.projection_cache
+            .write()
+            .unwrap()
+            .insert(key, resp.clone());
+        resp
     }
 
     // ── pg_catalog.pg_proc ────────────────────────────────────────────────────
@@ -4182,7 +4629,7 @@ pub(crate) fn project_workload_resource_usage(
 }
 
 /// A response from the catalog stub handler.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogResponse {
     /// A result set with column names and rows.
     Rows {

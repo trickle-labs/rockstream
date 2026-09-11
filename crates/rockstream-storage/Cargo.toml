@@ -19,6 +19,7 @@ slatedb-common = "0.13.1"
 moka = { version = "0.12.15", features = ["future"] }
 object_store = { workspace = true }
 thiserror = { workspace = true }
+crc32fast = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
