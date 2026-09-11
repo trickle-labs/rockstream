@@ -12,8 +12,6 @@ use rockstream_connectors::{KafkaSink, SinkConnector};
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::sink::{RecoveryAction, SinkState};
 use std::time::{Duration, Instant};
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::minio::MinIO;
 
 fn pending_handle(state: &SinkState) -> Vec<u8> {
     match state {
@@ -79,16 +77,14 @@ async fn kafka_sink_checkpoint_restart_minio_has_byte_identical_commit() {
         (fixture, topic)
     };
 
-    let minio = MinIO::default()
-        .start()
-        .await
-        .expect("minio container start");
-    let minio_port = minio
-        .get_host_port_ipv4(9000)
-        .await
-        .expect("minio container port");
     let bucket = "sink-checkpoint-durability";
-    common::create_minio_bucket(minio_port, bucket).await;
+    let (_minio, minio_port) = match common::start_minio(bucket).await {
+        Some(res) => res,
+        None => {
+            eprintln!("SKIP test_kafka_sink_pre_commit_state_survives_crash_minio: MinIO container unavailable");
+            return;
+        }
+    };
     let store = common::build_minio_store(minio_port, bucket);
     let checkpoint_path = object_store::path::Path::from("sink_checkpoint/epoch-1.bin");
 

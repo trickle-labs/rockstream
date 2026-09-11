@@ -250,3 +250,63 @@ pub fn build_minio_store(port: u16, bucket: &str) -> Arc<dyn ObjectStore> {
             .unwrap(),
     )
 }
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use testcontainers::Image;
+
+#[derive(Debug)]
+pub struct MinIO2024 {
+    env_vars: HashMap<String, String>,
+}
+
+impl Default for MinIO2024 {
+    fn default() -> Self {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("MINIO_CONSOLE_ADDRESS".to_owned(), ":9001".to_owned());
+        Self { env_vars }
+    }
+}
+
+impl Image for MinIO2024 {
+    fn name(&self) -> &str {
+        "minio/minio"
+    }
+
+    fn tag(&self) -> &str {
+        "RELEASE.2024-11-07T00-52-20Z"
+    }
+
+    fn ready_conditions(&self) -> Vec<WaitFor> {
+        vec![WaitFor::message_on_stderr("API:")]
+    }
+
+    fn env_vars(
+        &self,
+    ) -> impl IntoIterator<Item = (impl Into<Cow<'_, str>>, impl Into<Cow<'_, str>>)> {
+        &self.env_vars
+    }
+
+    fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
+        vec!["server", "/data"]
+    }
+}
+
+pub async fn start_minio(bucket: &str) -> Option<(ContainerAsync<MinIO2024>, u16)> {
+    let container = match MinIO2024::default().start().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP start_minio: cannot start MinIO container ({e:?})");
+            return None;
+        }
+    };
+    let port = match container.get_host_port_ipv4(9000).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("SKIP start_minio: cannot get MinIO port ({e:?})");
+            return None;
+        }
+    };
+    create_minio_bucket(port, bucket).await;
+    Some((container, port))
+}

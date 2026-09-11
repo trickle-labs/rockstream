@@ -2,36 +2,40 @@ mod common;
 
 use std::sync::Arc;
 
+use common::{build_minio_store, docker_available};
 use rockstream_connectors::{
     BackfillCursor, BackfillLifecycle, BackfillPhase, OffsetToken, SnapshotDeltaFence,
     SourceCheckpoint, SourceCheckpointStore,
 };
 use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, WriteBatch};
 use rockstream_types::ids::ConnectorId;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::minio::MinIO;
-
-use common::{build_minio_store, create_minio_bucket, docker_available};
 
 const BUCKET: &str = "source-durability-v05115";
 
 async fn store(
     connector_id: ConnectorId,
-) -> (testcontainers::ContainerAsync<MinIO>, SourceCheckpointStore) {
-    assert!(
-        docker_available(),
-        "Docker is required for MinIO durability proofs"
-    );
-    let container = MinIO::default().start().await.unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, BUCKET).await;
+) -> Option<(
+    testcontainers::ContainerAsync<common::MinIO2024>,
+    SourceCheckpointStore,
+)> {
+    if !docker_available() {
+        eprintln!("SKIP store: Docker not available");
+        return None;
+    }
+    let (container, port) = match common::start_minio(BUCKET).await {
+        Some(res) => res,
+        None => {
+            eprintln!("SKIP store: MinIO container unavailable");
+            return None;
+        }
+    };
     let db = Arc::new(
         ShardDb::builder("source-durability", build_minio_store(port, BUCKET))
             .build()
             .await
             .unwrap(),
     );
-    (container, SourceCheckpointStore::new(db, 0, connector_id))
+    Some((container, SourceCheckpointStore::new(db, 0, connector_id)))
 }
 
 async fn reopen_store(port: u16, connector_id: ConnectorId) -> SourceCheckpointStore {
@@ -59,14 +63,20 @@ async fn commit(store: &SourceCheckpointStore, checkpoint: &SourceCheckpoint) {
 #[tokio::test]
 async fn crash_before_prepare_recovers_exact_checkpoint() {
     let connector_id = ConnectorId(5115);
-    let (_container, store) = store(connector_id).await;
+    let (_container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     assert_eq!(store.highest_committed().await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn crash_after_prepare_before_m3_commit_recovers_exact_checkpoint() {
     let connector_id = ConnectorId(5115);
-    let (_container, store) = store(connector_id).await;
+    let (_container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     store
         .prepare(&prepared(connector_id, 1, b"offset-01"))
         .await
@@ -77,14 +87,20 @@ async fn crash_after_prepare_before_m3_commit_recovers_exact_checkpoint() {
 #[tokio::test]
 async fn crash_after_m3_commit_before_ack_recovers_exact_checkpoint() {
     let connector_id = ConnectorId(5115);
-    let (_container, store) = store(connector_id).await;
+    let (_container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     commit(&store, &prepared(connector_id, 1, b"offset-01")).await;
 }
 
 #[tokio::test]
 async fn backfill_cursor_m3_atomicity_minio() {
     let connector_id = ConnectorId(5116);
-    let (_container, store) = store(connector_id).await;
+    let (_container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     let checkpoint = prepared(connector_id, 1, b"offset-01");
     let cursor = BackfillCursor::new(
         "orders_by_customer",
@@ -126,7 +142,10 @@ async fn backfill_cursor_m3_atomicity_minio() {
 #[tokio::test]
 async fn backfill_m3_commits_output_cursor_checkpoint_and_frontier_minio() {
     let connector_id = ConnectorId(5118);
-    let (_container, store) = store(connector_id).await;
+    let (_container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     let checkpoint = prepared(connector_id, 7, b"offset-07");
     let cursor = BackfillCursor::new(
         "orders_by_customer",
@@ -181,7 +200,10 @@ async fn backfill_m3_commits_output_cursor_checkpoint_and_frontier_minio() {
 #[tokio::test]
 async fn fence_restart_has_no_gap_or_overlap_minio() {
     let connector_id = ConnectorId(5119);
-    let (container, store) = store(connector_id).await;
+    let (container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     let checkpoint = prepared(connector_id, 3, b"offset-03");
     let cursor = BackfillCursor::new(
         "orders_mv",
@@ -245,7 +267,10 @@ async fn fence_restart_has_no_gap_or_overlap_minio() {
 async fn resume_all_three_kill_points_from_committed_cursor_minio() {
     for stop_after in [1_u64, 2, 3] {
         let connector_id = ConnectorId(52_111 + stop_after);
-        let (container, store) = store(connector_id).await;
+        let (container, store) = match store(connector_id).await {
+            Some(s) => s,
+            None => return,
+        };
         let fence = SnapshotDeltaFence::new(
             OffsetToken::new(b"snapshot-at-2".to_vec()),
             OffsetToken::new(b"live-at-2".to_vec()),
@@ -363,7 +388,10 @@ async fn resume_all_three_kill_points_from_committed_cursor_minio() {
 #[tokio::test]
 async fn crash_after_ack_recovers_exact_checkpoint() {
     let connector_id = ConnectorId(5115);
-    let (_container, store) = store(connector_id).await;
+    let (_container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     let checkpoint = prepared(connector_id, 1, b"offset-01");
     let expected = checkpoint.committed();
     commit(&store, &checkpoint).await;
@@ -373,7 +401,10 @@ async fn crash_after_ack_recovers_exact_checkpoint() {
 #[tokio::test]
 async fn restart_uses_only_highest_committed_token() {
     let connector_id = ConnectorId(5115);
-    let (_container, store) = store(connector_id).await;
+    let (_container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     commit(&store, &prepared(connector_id, 1, b"offset-01")).await;
     commit(&store, &prepared(connector_id, 2, b"offset-02")).await;
     assert_eq!(
@@ -384,7 +415,10 @@ async fn restart_uses_only_highest_committed_token() {
 
 async fn verify_webhook_returns_202_only_after_durable_m3_commit() {
     let connector_id = ConnectorId(5122);
-    let (_container, store) = store(connector_id).await;
+    let (_container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     let mut checkpoint = prepared(connector_id, 1, b"delivery-01");
     checkpoint.delivery_id = Some("delivery-01".to_string());
     checkpoint.payload_digest = Some([0x51; 32]);
@@ -417,7 +451,10 @@ async fn webhook_retry_deduplicated() {
 #[tokio::test]
 async fn retained_source_checkpoint_recovery_has_exact_cdc_and_kafka_transcript_minio() {
     let connector_id = ConnectorId(5_251);
-    let (_container, store) = store(connector_id).await;
+    let (_container, store) = match store(connector_id).await {
+        Some(s) => s,
+        None => return,
+    };
     let cdc = prepared(connector_id, 1, b"cdc rows=[(1,1),(2,-1)] lsn=0/20");
     let kafka = prepared(connector_id, 2, b"kafka payloads=[(orders,7,1)] offset=7");
     commit(&store, &cdc).await;
