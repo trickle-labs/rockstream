@@ -1027,18 +1027,23 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         } else {
             // ── Background role execution (control / worker / metrics) ──
             tracker.set_state(rockstream_types::lifecycle::LifecycleState::Ready);
+            let daemon_mode = opts.daemon || opts.role == "worker";
             let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok());
-            if let Some(sleep_ms) = e2e_sleep {
-                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            if daemon_mode {
+                if let Some(sleep_ms) = e2e_sleep {
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                } else {
+                    tracing::info!(
+                        role = %opts.role,
+                        "node running in daemon mode — blocking until shutdown signal"
+                    );
+                    coordinator.wait_for_signal_or_trigger().await;
+                    tracing::info!("shutdown signal received — stopping daemon");
+                }
             } else {
-                tracing::info!(
-                    role = %opts.role,
-                    "node running in server mode — blocking until shutdown signal"
-                );
-                coordinator.wait_for_signal_or_trigger().await;
-                tracing::info!("shutdown signal received — stopping server");
+                tokio::time::sleep(Duration::from_millis(e2e_sleep.unwrap_or(50))).await;
             }
             let _watchdog = coordinator.spawn_watchdog();
             tracker.set_state(rockstream_types::lifecycle::LifecycleState::Draining);
