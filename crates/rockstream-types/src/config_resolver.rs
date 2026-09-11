@@ -231,8 +231,8 @@ impl ConfigResolver {
                     }
                     config = RockstreamConfig::from(&parsed_node);
                     node_config = parsed_node;
-                } else if let Ok(parsed_legacy) = RockstreamConfig::load_from_str(&contents) {
-                    node_config = NodeConfig::from(&parsed_legacy);
+                }
+                if let Ok(parsed_legacy) = RockstreamConfig::load_from_str(&contents) {
                     config = parsed_legacy;
                 }
 

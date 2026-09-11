@@ -36,6 +36,31 @@ impl ViewReader for NoopViewReader {
     }
 }
 
+async fn connect_postgres_upstream(
+    host: &str,
+    port: u16,
+) -> (
+    tokio_postgres::Client,
+    tokio_postgres::Connection<tokio_postgres::Socket, tokio_postgres::tls::NoTlsStream>,
+) {
+    let mut last_err = None;
+    for _ in 0..50 {
+        match tokio_postgres::connect(
+            &format!("host={host} port={port} user=postgres dbname=postgres"),
+            NoTls,
+        )
+        .await
+        {
+            Ok(res) => return res,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("Failed to connect to postgres: {last_err:?}");
+}
+
 async fn result_string_rows(client: &tokio_postgres::Client) -> Vec<Vec<String>> {
     let mut rows = client
         .simple_query("SELECT * FROM result")
@@ -164,12 +189,7 @@ async fn pgoutput_aggregate_rows(
         .unwrap();
     let host = postgres.get_host().await.unwrap();
     let port = postgres.get_host_port_ipv4(5432).await.unwrap();
-    let (upstream, upstream_connection) = tokio_postgres::connect(
-        &format!("host={host} port={port} user=postgres dbname=postgres"),
-        NoTls,
-    )
-    .await
-    .unwrap();
+    let (upstream, upstream_connection) = connect_postgres_upstream(&format!("{host}"), port).await;
     tokio::spawn(async move {
         let _ = upstream_connection.await;
     });
@@ -564,12 +584,7 @@ async fn pgoutput_join_rows(
         .unwrap();
     let host = postgres.get_host().await.unwrap();
     let port = postgres.get_host_port_ipv4(5432).await.unwrap();
-    let (upstream, upstream_connection) = tokio_postgres::connect(
-        &format!("host={host} port={port} user=postgres dbname=postgres"),
-        NoTls,
-    )
-    .await
-    .unwrap();
+    let (upstream, upstream_connection) = connect_postgres_upstream(&format!("{host}"), port).await;
     tokio::spawn(async move {
         let _ = upstream_connection.await;
     });
@@ -868,12 +883,7 @@ async fn pgoutput_window_rows(
         .unwrap();
     let host = postgres.get_host().await.unwrap();
     let port = postgres.get_host_port_ipv4(5432).await.unwrap();
-    let (upstream, upstream_connection) = tokio_postgres::connect(
-        &format!("host={host} port={port} user=postgres dbname=postgres"),
-        NoTls,
-    )
-    .await
-    .unwrap();
+    let (upstream, upstream_connection) = connect_postgres_upstream(&format!("{host}"), port).await;
     tokio::spawn(async move {
         let _ = upstream_connection.await;
     });

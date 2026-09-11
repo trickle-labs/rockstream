@@ -77,13 +77,20 @@ pub async fn connector_fixture(label: &str) -> ConnectorFixture {
         "127.0.0.1:{}",
         kafka.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
     );
-    let health: BaseConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &kafka_bootstrap)
-        .create()
-        .unwrap();
-    health
-        .fetch_metadata(None, Duration::from_secs(10))
-        .unwrap();
+    let mut metadata_res = Err(rdkafka::error::KafkaError::ClientCreation("initial".into()));
+    for _ in 0..30 {
+        if let Ok(health) = ClientConfig::new()
+            .set("bootstrap.servers", &kafka_bootstrap)
+            .create::<BaseConsumer>()
+        {
+            if health.fetch_metadata(None, Duration::from_secs(2)).is_ok() {
+                metadata_res = Ok(());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    metadata_res.expect("kafka broker must become reachable");
 
     ConnectorFixture {
         _postgres: postgres,

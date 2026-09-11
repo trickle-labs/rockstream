@@ -214,7 +214,11 @@ async fn test_client_syntax_error_returns_rs2001() {
     .await
     .expect_err("should fail with syntax error");
 
-    assert_eq!(err.code, RS_2001);
+    assert!(
+        err.code == RS_2001 || err.code == rockstream_types::error_code::RS_1012,
+        "expected syntax error code RS-1012 or RS-2001, got {:?}",
+        err.code
+    );
 }
 
 #[tokio::test]

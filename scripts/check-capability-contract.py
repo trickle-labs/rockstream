@@ -264,8 +264,8 @@ def generated_block(text: str) -> str | None:
 def check_full_semantics(
     root: Path, contract: dict, capabilities: list[dict], errors: list[str]
 ) -> None:
-    if contract.get("version") not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0"}:
-        fail(errors, "capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, or v0.61.0")
+    if contract.get("version") not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0"}:
+        fail(errors, "capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, or v0.64.0")
 
 
     for capability in capabilities:
@@ -343,8 +343,8 @@ def main() -> int:
     errors: list[str] = []
     contract, capabilities = load_source(root, errors)
     if contract:
-        if contract.get("version") not in {"v0.57", "v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0"}:
-            fail(errors, "capabilities.toml contract.version must be v0.57, v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, or v0.61.0")
+        if contract.get("version") not in {"v0.57", "v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0"}:
+            fail(errors, "capabilities.toml contract.version must be v0.57, v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, or v0.64.0")
 
         check_promises(root, contract.get("promise"), errors)
         check_roadmap(root, contract, errors)
