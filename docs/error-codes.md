@@ -14,7 +14,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - [0xxx: Internal & General System](#0xxx-internal--general-system) (5 codes)
 - [1xxx: Pipeline, Plan & Optimization](#1xxx-pipeline-plan--optimization) (26 codes)
 - [17xx: Lease Management & Raft Leadership](#17xx-lease-management--raft-leadership) (4 codes)
-- [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (37 codes)
+- [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (38 codes)
 - [24xx: Authentication, mTLS & Secrets](#24xx-authentication-mtls--secrets) (18 codes)
 - [25xx-26xx: Extended Query, Cursors & Transactions](#25xx-26xx-extended-query-cursors--transactions) (9 codes)
 - [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (49 codes)
@@ -237,10 +237,6 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Reduce value magnitudes or switch to a wider numeric type.
 
-Aggregate epoch updates are staged before state or dirty-key mutations are
-applied. Overflow, invalid multiplicity, malformed input, and consolidation
-capacity errors therefore reject the whole epoch without a partial state write.
-
 ### <a id="rs-1017"></a> `RS-1017` — MIN/MAX multiset retraction underflow: value has no positive weight
 
 - **Key**: `aggregate.retraction_underflow`
@@ -406,6 +402,7 @@ capacity errors therefore reject the whole epoch without a partial state write.
 | [`RS-2054`](#rs-2054) | `query.statement_timeout` | Query exceeded the configured statement timeout | `Error` | `57014` | `ExponentialBackoff` |
 | [`RS-2055`](#rs-2055) | `limit.connection_limit_exceeded` | Server-wide connection limit reached | `Error` | `53300` | `ExponentialBackoff` |
 | [`RS-2056`](#rs-2056) | `write.malformed_values_list` | Malformed INSERT VALUES list or schema mismatch | `Error` | `42601` | `NonRetryable` |
+| [`RS-2057`](#rs-2057) | `write.duplicate_key` | Duplicate key value violates primary key constraint | `Error` | `23505` | `NonRetryable` |
 | [`RS-2060`](#rs-2060) | `write.epoch_exhausted` | Commit epoch reached u64::MAX | `Fatal` | `54000` | `NonRetryable` |
 
 ### <a id="rs-2000"></a> `RS-2000` — Malformed table DDL statement
@@ -695,6 +692,14 @@ capacity errors therefore reject the whole epoch without a partial state write.
 - **SQLSTATE**: `42601`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Ensure every VALUES row has matching parenthesis and correct column count.
+
+### <a id="rs-2057"></a> `RS-2057` — Duplicate key value violates primary key constraint
+
+- **Key**: `write.duplicate_key`
+- **Severity**: `Error`
+- **SQLSTATE**: `23505`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Ensure inserted or updated primary key values are unique.
 
 ### <a id="rs-2060"></a> `RS-2060` — Commit epoch reached u64::MAX
 
