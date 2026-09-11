@@ -110,6 +110,7 @@ async fn test_invalid_source_worker_returns_error_not_panic() {
             name: "id".to_string(),
             data_type: "Int64".to_string(),
         }],
+        pk_cols: vec![],
     });
 
     gw.catalog.add_source(CatalogSourceEntry {

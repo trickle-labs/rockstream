@@ -714,6 +714,16 @@ default_next_steps = "Ensure every VALUES row has matching parenthesis and corre
 doc_anchor = "rs-2056"
 
 [[error]]
+code = "RS-2057"
+key = "write.duplicate_key"
+title = "Duplicate key value violates primary key constraint"
+severity = "Error"
+sqlstate = "23505"
+retry_class = "NonRetryable"
+default_next_steps = "Ensure inserted or updated primary key values are unique."
+doc_anchor = "rs-2057"
+
+[[error]]
 code = "RS-2060"
 key = "write.epoch_exhausted"
 title = "Commit epoch reached u64::MAX"

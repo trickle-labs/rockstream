@@ -19,6 +19,7 @@
 pub mod canonicalize;
 pub mod catalog;
 pub mod distribution;
+pub mod dml;
 pub mod error;
 pub mod estimate;
 pub mod explain_incremental;

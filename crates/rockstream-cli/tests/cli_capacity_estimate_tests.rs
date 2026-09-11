@@ -73,6 +73,7 @@ async fn cli_and_pgwire_reports_match_exactly() {
             name: "id".to_string(),
             data_type: "Int64".to_string(),
         }],
+        pk_cols: Vec::new(),
     });
     gw_catalog.add_view(CatalogView {
         name: view_name.to_string(),

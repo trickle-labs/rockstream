@@ -77,6 +77,7 @@ async fn mixed_case_estimate_returns_exact_report() {
                 data_type: "Float64".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     catalog.add_view(CatalogView {
         name: "orders_view".to_string(),

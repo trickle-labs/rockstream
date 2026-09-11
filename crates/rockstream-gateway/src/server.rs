@@ -508,6 +508,88 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         }
     }
 
+    if let Ok(dml) = rockstream_sql::dml::parse_dml_statement(sql) {
+        match dml {
+            rockstream_sql::dml::DmlStatement::Insert(ins) => {
+                if let Some(catalog_table) = catalog.get_table(&ins.table) {
+                    let insert_cols = if ins.columns.is_empty() {
+                        catalog_table
+                            .columns
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect()
+                    } else {
+                        ins.columns.clone()
+                    };
+                    for row in &ins.values {
+                        for (col_idx, expr) in row.iter().enumerate() {
+                            if let Some(col_name) = insert_cols.get(col_idx) {
+                                if let Some(col) = catalog_table
+                                    .columns
+                                    .iter()
+                                    .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                                {
+                                    let oid = arrow_type_to_pg_oid(&col.data_type);
+                                    let pg_type = pg_type_from_oid(oid);
+                                    find_placeholders_in_expr(expr, &mut |idx| {
+                                        if idx > 0
+                                            && idx <= max_idx
+                                            && !explicit_casts.contains_key(&idx)
+                                        {
+                                            inferred_types[idx - 1] = pg_type.clone();
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            rockstream_sql::dml::DmlStatement::Update(upd) => {
+                if let Some(catalog_table) = catalog.get_table(&upd.table) {
+                    for assign in &upd.assignments {
+                        if let Some(col) = catalog_table
+                            .columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(&assign.column))
+                        {
+                            let oid = arrow_type_to_pg_oid(&col.data_type);
+                            let pg_type = pg_type_from_oid(oid);
+                            find_placeholders_in_expr(&assign.expr, &mut |idx| {
+                                if idx > 0 && idx <= max_idx && !explicit_casts.contains_key(&idx) {
+                                    inferred_types[idx - 1] = pg_type.clone();
+                                }
+                            });
+                        }
+                    }
+                    if let Some(sel) = &upd.selection {
+                        infer_placeholders_from_predicate(
+                            sel,
+                            &catalog_table,
+                            max_idx,
+                            &explicit_casts,
+                            &mut inferred_types,
+                        );
+                    }
+                }
+            }
+            rockstream_sql::dml::DmlStatement::Delete(del) => {
+                if let Some(catalog_table) = catalog.get_table(&del.table) {
+                    if let Some(sel) = &del.selection {
+                        infer_placeholders_from_predicate(
+                            sel,
+                            &catalog_table,
+                            max_idx,
+                            &explicit_casts,
+                            &mut inferred_types,
+                        );
+                    }
+                }
+            }
+        }
+        return inferred_types;
+    }
+
     let mut df_inferred = std::collections::HashMap::new();
     match ctx.sql(sql).await {
         Ok(df) => {
@@ -536,56 +618,153 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         }
     }
 
-    let ql = sql.to_lowercase();
-    if ql.starts_with("update ") {
-        if let Ok((table_name, _, _, _)) = parse_update(sql) {
-            if let Some(catalog_table) = catalog.get_table(&table_name) {
-                for col in &catalog_table.columns {
-                    let oid = arrow_type_to_pg_oid(&col.data_type);
-                    let pg_type = pg_type_from_oid(oid);
-                    for idx in 1..=max_idx {
-                        let patterns = [
-                            format!("{} = ${}", col.name.to_lowercase(), idx),
-                            format!("{} =${}", col.name.to_lowercase(), idx),
-                            format!("{}= ${}", col.name.to_lowercase(), idx),
-                            format!("{}=${}", col.name.to_lowercase(), idx),
-                        ];
-                        if patterns.iter().any(|p| ql.contains(p))
-                            && idx <= max_idx
-                            && !explicit_casts.contains_key(&idx)
-                        {
-                            inferred_types[idx - 1] = pg_type.clone();
-                        }
+    inferred_types
+}
+
+fn find_placeholders_in_expr(expr: &sqlparser::ast::Expr, cb: &mut impl FnMut(usize)) {
+    match expr {
+        sqlparser::ast::Expr::Value(v) => {
+            if let sqlparser::ast::Value::Placeholder(s) = &v.value {
+                if let Some(rest) = s.strip_prefix('$') {
+                    if let Ok(idx) = rest.parse::<usize>() {
+                        cb(idx);
                     }
                 }
             }
         }
-    } else if ql.starts_with("delete from ") {
-        if let Ok((table_name, _, _)) = parse_delete(sql) {
-            if let Some(catalog_table) = catalog.get_table(&table_name) {
-                for col in &catalog_table.columns {
+        sqlparser::ast::Expr::BinaryOp { left, right, .. } => {
+            find_placeholders_in_expr(left, cb);
+            find_placeholders_in_expr(right, cb);
+        }
+        sqlparser::ast::Expr::UnaryOp { expr, .. } => {
+            find_placeholders_in_expr(expr, cb);
+        }
+        sqlparser::ast::Expr::Nested(inner) => {
+            find_placeholders_in_expr(inner, cb);
+        }
+        _ => {}
+    }
+}
+
+fn infer_placeholders_from_predicate(
+    expr: &sqlparser::ast::Expr,
+    catalog_table: &CatalogTable,
+    max_idx: usize,
+    explicit_casts: &std::collections::HashMap<usize, Type>,
+    inferred_types: &mut [Type],
+) {
+    match expr {
+        sqlparser::ast::Expr::BinaryOp { left, right, .. } => {
+            let left_col = match &**left {
+                sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.as_str()),
+                sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+                    parts.last().map(|p| p.value.as_str())
+                }
+                _ => None,
+            };
+            let right_col = match &**right {
+                sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.as_str()),
+                sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+                    parts.last().map(|p| p.value.as_str())
+                }
+                _ => None,
+            };
+
+            if let Some(col_name) = left_col {
+                if let Some(col) = catalog_table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                {
                     let oid = arrow_type_to_pg_oid(&col.data_type);
                     let pg_type = pg_type_from_oid(oid);
-                    for idx in 1..=max_idx {
-                        let patterns = [
-                            format!("{} = ${}", col.name.to_lowercase(), idx),
-                            format!("{} =${}", col.name.to_lowercase(), idx),
-                            format!("{}= ${}", col.name.to_lowercase(), idx),
-                            format!("{}=${}", col.name.to_lowercase(), idx),
-                        ];
-                        if patterns.iter().any(|p| ql.contains(p))
-                            && idx <= max_idx
-                            && !explicit_casts.contains_key(&idx)
-                        {
+                    find_placeholders_in_expr(right, &mut |idx| {
+                        if idx > 0 && idx <= max_idx && !explicit_casts.contains_key(&idx) {
                             inferred_types[idx - 1] = pg_type.clone();
                         }
-                    }
+                    });
                 }
+            } else if let Some(col_name) = right_col {
+                if let Some(col) = catalog_table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                {
+                    let oid = arrow_type_to_pg_oid(&col.data_type);
+                    let pg_type = pg_type_from_oid(oid);
+                    find_placeholders_in_expr(left, &mut |idx| {
+                        if idx > 0 && idx <= max_idx && !explicit_casts.contains_key(&idx) {
+                            inferred_types[idx - 1] = pg_type.clone();
+                        }
+                    });
+                }
+            } else {
+                infer_placeholders_from_predicate(
+                    left,
+                    catalog_table,
+                    max_idx,
+                    explicit_casts,
+                    inferred_types,
+                );
+                infer_placeholders_from_predicate(
+                    right,
+                    catalog_table,
+                    max_idx,
+                    explicit_casts,
+                    inferred_types,
+                );
             }
+        }
+        sqlparser::ast::Expr::UnaryOp { expr, .. } => {
+            infer_placeholders_from_predicate(
+                expr,
+                catalog_table,
+                max_idx,
+                explicit_casts,
+                inferred_types,
+            );
+        }
+        sqlparser::ast::Expr::Nested(inner) => {
+            infer_placeholders_from_predicate(
+                inner,
+                catalog_table,
+                max_idx,
+                explicit_casts,
+                inferred_types,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_dml(q: &str) -> Option<&'static str> {
+    let mut s = q.trim();
+    while s.starts_with("/*") {
+        if let Some(end) = s.find("*/") {
+            s = s[end + 2..].trim();
+        } else {
+            break;
         }
     }
-
-    inferred_types
+    while s.starts_with("--") {
+        if let Some(end) = s.find('\n') {
+            s = s[end + 1..].trim();
+        } else {
+            break;
+        }
+    }
+    let sl = s.to_lowercase();
+    if sl.starts_with("insert ") || sl.starts_with("insert\t") || sl.starts_with("insert\n") {
+        Some("insert")
+    } else if sl.starts_with("update ") || sl.starts_with("update\t") || sl.starts_with("update\n")
+    {
+        Some("update")
+    } else if sl.starts_with("delete ") || sl.starts_with("delete\t") || sl.starts_with("delete\n")
+    {
+        Some("delete")
+    } else {
+        None
+    }
 }
 
 fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType {
@@ -1101,7 +1280,9 @@ fn pg_type_from_oid(oid: i32) -> Type {
 fn parse_pg_timestamp(s: &str) -> Option<chrono::NaiveDateTime> {
     let s = s.trim();
     chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
         .ok()
 }
 
@@ -6489,9 +6670,19 @@ impl GatewayHandler {
         }
         // ─────────────────────────────────────────────────────────────────────
 
-        // INSERT — accumulate in write buffer.
-        if ql.starts_with("insert into ") {
-            let result = self.handle_insert(q, conn_id).await;
+        // DML dispatch — AST-driven statement recognition (v0.64)
+        if let Ok(dml) = rockstream_sql::dml::parse_dml_statement(q) {
+            let result = match dml {
+                rockstream_sql::dml::DmlStatement::Insert(_) => {
+                    self.handle_insert(q, conn_id).await
+                }
+                rockstream_sql::dml::DmlStatement::Update(_) => {
+                    self.handle_update(q, conn_id).await
+                }
+                rockstream_sql::dml::DmlStatement::Delete(_) => {
+                    self.handle_delete(q, conn_id).await
+                }
+            };
             if result.is_err() {
                 if let Some(id) = conn_id {
                     if let Some(mut session) = self.sessions.get_mut(id) {
@@ -6500,24 +6691,12 @@ impl GatewayHandler {
                 }
             }
             return result;
-        }
-
-        // UPDATE — accumulate in write buffer.
-        if ql.starts_with("update ") {
-            let result = self.handle_update(q, conn_id).await;
-            if result.is_err() {
-                if let Some(id) = conn_id {
-                    if let Some(mut session) = self.sessions.get_mut(id) {
-                        session.fail_transaction();
-                    }
-                }
-            }
-            return result;
-        }
-
-        // DELETE — accumulate in write buffer.
-        if ql.starts_with("delete from ") {
-            let result = self.handle_delete(q, conn_id).await;
+        } else if let Some(dml_kind) = looks_like_dml(q) {
+            let result = match dml_kind {
+                "insert" => self.handle_insert(q, conn_id).await,
+                "update" => self.handle_update(q, conn_id).await,
+                _ => self.handle_delete(q, conn_id).await,
+            };
             if result.is_err() {
                 if let Some(id) = conn_id {
                     if let Some(mut session) = self.sessions.get_mut(id) {
@@ -8090,6 +8269,7 @@ impl GatewayHandler {
         self.catalog.add_table(CatalogTable {
             name: table_name.clone(),
             columns: parsed.columns,
+            pk_cols: parsed.pk_cols,
         });
         if !parsed.generated_columns.is_empty() {
             let identity_sequences = parsed
@@ -10255,6 +10435,7 @@ impl GatewayHandler {
                         data_type: "Utf8".to_string(),
                     })
                     .collect(),
+                pk_cols: vec![],
             });
         }
         let metadata = self
@@ -10262,8 +10443,17 @@ impl GatewayHandler {
             .get(&table)
             .map(|entry| entry.value().clone());
 
+        let pk_cols = self
+            .catalog
+            .get_table(&table)
+            .map(|ct| ct.pk_cols)
+            .unwrap_or_default();
+
         let mut returning_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
         let mut row_keys = Vec::with_capacity(rows.len());
+        let mut candidate_ops = Vec::with_capacity(rows.len());
+        let mut seen_keys = HashSet::new();
+
         for values in &rows {
             let mut value_map: HashMap<String, String> = insert_cols
                 .iter()
@@ -10295,9 +10485,44 @@ impl GatewayHandler {
             };
             let stored_values: Vec<String> = stored_cols
                 .iter()
-                .map(|col| value_map.get(col).cloned().unwrap_or_default())
+                .map(|col| {
+                    value_map
+                        .get(col)
+                        .cloned()
+                        .unwrap_or_else(|| r"\N".to_string())
+                })
                 .collect();
-            let row_key = build_row_key(&stored_cols, &stored_values);
+            let row_key = build_table_row_key(&pk_cols, &stored_cols, &stored_values);
+
+            if !pk_cols.is_empty() {
+                if !seen_keys.insert(row_key.clone()) {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "23505".to_owned(),
+                            format!("[RS-2057] duplicate key value violates unique constraint \"{table}\""),
+                        ),
+                    )))]);
+                }
+                let exists = match self.check_pk_exists(&table, &row_key, conn_id).await {
+                    Ok(ex) => ex,
+                    Err(e) => {
+                        return Ok(vec![promote_response(Response::Error(Box::new(
+                            ErrorInfo::new("ERROR".to_owned(), "58000".to_owned(), e.to_string()),
+                        )))]);
+                    }
+                };
+                if exists {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "23505".to_owned(),
+                            format!("[RS-2057] duplicate key value violates unique constraint \"{table}\""),
+                        ),
+                    )))]);
+                }
+            }
+
             let values_tsv = stored_values.join("\t");
 
             let op = DmlOp::Insert {
@@ -10307,16 +10532,20 @@ impl GatewayHandler {
                 row_key: row_key.clone(),
             };
 
-            if let Some(id) = conn_id {
-                let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+            candidate_ops.push(op);
+            row_keys.push(row_key);
+            returning_rows.push(stored_values);
+        }
+
+        if let Some(id) = conn_id {
+            let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+            for op in candidate_ops {
                 if let Err(e) = entry.push(op) {
                     return Ok(vec![promote_response(Response::Error(Box::new(
                         ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
                     )))]);
                 }
             }
-            row_keys.push(row_key);
-            returning_rows.push(stored_values);
         }
 
         // Standard-PostgreSQL autocommit: any statement outside an explicit
@@ -10497,12 +10726,64 @@ impl GatewayHandler {
         promote_response(Response::Query(QueryResponse::new(schema, stream)))
     }
 
-    /// Scan and overlay write buffers to find all live rows matching the WHERE predicates.
-    async fn find_matching_rows_for_table(
+    async fn check_pk_exists(
+        &self,
+        table: &str,
+        row_key: &str,
+        conn_id: Option<&str>,
+    ) -> Result<bool, GatewayError> {
+        if let Some(id) = conn_id {
+            if let Some(buffer) = self.write_buffers.get(id) {
+                for op in buffer.ops().iter().rev() {
+                    match op {
+                        DmlOp::Insert {
+                            table: t,
+                            row_key: rk,
+                            ..
+                        } if t.eq_ignore_ascii_case(table) => {
+                            if rk == row_key {
+                                return Ok(true);
+                            }
+                        }
+                        DmlOp::Update {
+                            table: t,
+                            new_row_key,
+                            old_row_key,
+                            ..
+                        } if t.eq_ignore_ascii_case(table) => {
+                            if new_row_key == row_key {
+                                return Ok(true);
+                            }
+                            if old_row_key == row_key {
+                                return Ok(false);
+                            }
+                        }
+                        DmlOp::Delete {
+                            table: t,
+                            row_key: rk,
+                            ..
+                        } if t.eq_ignore_ascii_case(table) && rk == row_key => {
+                            return Ok(false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(shard_db) = &self.shard_db {
+            let key = format!("view_output/{table}/{row_key}");
+            let exists = shard_db.get(key.as_bytes()).await?.is_some();
+            return Ok(exists);
+        }
+        Ok(false)
+    }
+
+    /// Scan and overlay write buffers to find all live rows matching the predicate using 3-valued logic.
+    async fn find_matching_rows_predicate(
         &self,
         table: &str,
         table_columns: &[String],
-        where_pairs: &[(String, String)],
+        predicate: Option<&rockstream_sql::dml::DmlPredicate>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<(String, Vec<String>)>> {
         let mut live_rows: std::collections::BTreeMap<String, String> =
@@ -10565,36 +10846,40 @@ impl GatewayHandler {
                 fields.resize(table_columns.len(), String::new());
             }
 
-            let mut all_match = true;
-            for (where_col, where_val) in where_pairs {
-                let col_pos = table_columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(where_col));
-                let expected = where_val.trim_matches('\'');
-                if let Some(pos) = col_pos {
-                    let actual = fields.get(pos).map(|s| s.as_str()).unwrap_or("");
-                    if actual != expected {
-                        all_match = false;
-                        break;
-                    }
-                } else {
-                    let key_pairs = parse_kv_list(&row_key);
-                    if let Some((_, actual)) = key_pairs
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(where_col))
-                    {
-                        if actual != expected {
-                            all_match = false;
-                            break;
+            if let Some(pred) = predicate {
+                let mut row_map: HashMap<String, Option<String>> = HashMap::new();
+                for (i, col) in table_columns.iter().enumerate() {
+                    let val = fields.get(i).cloned();
+                    let val_opt = match val {
+                        Some(ref s) if s == r"\N" => None,
+                        other => other,
+                    };
+                    row_map.insert(col.clone(), val_opt);
+                }
+
+                match pred.evaluate(&row_map) {
+                    Ok(tri) => {
+                        if tri.is_true() {
+                            matched.push((row_key, fields));
                         }
-                    } else {
-                        all_match = false;
-                        break;
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let sqlstate = if err_str.contains("RS-1013") {
+                            "0A000"
+                        } else if err_str.contains("RS-1016") {
+                            "22012"
+                        } else {
+                            "42804"
+                        };
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            sqlstate.to_owned(),
+                            err_str,
+                        ))));
                     }
                 }
-            }
-
-            if all_match {
+            } else {
                 matched.push((row_key, fields));
             }
         }
@@ -10602,43 +10887,132 @@ impl GatewayHandler {
         Ok(matched)
     }
 
-    /// UPDATE handler: hardened multi-row read-modify-write (v0.59.11 SQL-01).
+    /// UPDATE handler: hardened multi-row read-modify-write (v0.64).
     async fn handle_update(
         &self,
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        let (table, set_pairs, where_pairs, returning_cols) = match parse_update(q) {
-            Ok(v) => v,
+        if q.len() > rockstream_sql::dml::MAX_SQL_STATEMENT_BYTES {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    "[RS-1012] Statement exceeds maximum allowed size".to_owned(),
+                ),
+            )))]);
+        }
+
+        let parsed_dml = match rockstream_sql::dml::parse_dml_statement(q) {
+            Ok(stmt) => stmt,
             Err(e) => {
+                if let Some(norm_q) = try_normalize_where_commas(q) {
+                    match rockstream_sql::dml::parse_dml_statement(&norm_q) {
+                        Ok(stmt) => stmt,
+                        Err(_) => {
+                            return Ok(vec![promote_response(Response::Error(Box::new(
+                                ErrorInfo::new(
+                                    "ERROR".to_owned(),
+                                    "42601".to_owned(),
+                                    e.to_string(),
+                                ),
+                            )))]);
+                        }
+                    }
+                } else {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e.to_string()),
+                    )))]);
+                }
+            }
+        };
+
+        let update_stmt = match parsed_dml {
+            rockstream_sql::dml::DmlStatement::Update(stmt) => stmt,
+            _ => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e),
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "not an UPDATE statement".to_owned(),
+                    ),
                 )))]);
             }
         };
 
-        let (old_cols, _old_vals): (Vec<_>, Vec<_>) = where_pairs
-            .iter()
-            .map(|(c, v)| (c.clone(), v.clone()))
-            .unzip();
+        let table = update_stmt.table;
+        let returning_cols = update_stmt.returning;
 
-        let table_columns: Vec<String> = self
-            .catalog
-            .get_table(&table)
-            .map(|ct| ct.columns.into_iter().map(|c| c.name).collect())
-            .unwrap_or_else(|| {
-                let mut cols = old_cols.clone();
-                for (c, _) in &set_pairs {
-                    if !cols.contains(c) {
-                        cols.push(c.clone());
-                    }
+        let mut assignments = Vec::new();
+        for assign in &update_stmt.assignments {
+            let scalar = match rockstream_sql::dml::lower_scalar_expr(&assign.expr) {
+                Ok(s) => s,
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let sqlstate = if err_str.contains("RS-1013") {
+                        "0A000"
+                    } else {
+                        "42601"
+                    };
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                    )))]);
                 }
-                cols
-            });
+            };
+            assignments.push((assign.column.to_lowercase(), scalar));
+        }
 
-        let matched_rows = self
-            .find_matching_rows_for_table(&table, &table_columns, &where_pairs, conn_id)
-            .await?;
+        let predicate = match update_stmt
+            .selection
+            .as_ref()
+            .map(rockstream_sql::dml::lower_predicate)
+            .transpose()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let err_str = e.to_string();
+                let sqlstate = if err_str.contains("RS-1013") {
+                    "0A000"
+                } else {
+                    "42601"
+                };
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                )))]);
+            }
+        };
+
+        let table_entry = self.catalog.get_table(&table);
+        let table_columns: Vec<String> = table_entry
+            .as_ref()
+            .map(|ct| ct.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_else(|| assignments.iter().map(|(c, _)| c.clone()).collect());
+        let pk_cols = table_entry.map(|ct| ct.pk_cols).unwrap_or_default();
+
+        let matched_rows = match self
+            .find_matching_rows_predicate(&table, &table_columns, predicate.as_ref(), conn_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(PgWireError::UserError(err)) => {
+                return Ok(vec![promote_response(Response::Error(err))]);
+            }
+            Err(e) => return Err(e),
+        };
+
+        if matched_rows.len() > rockstream_sql::dml::MAX_DML_MUTATIONS_PER_STATEMENT {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "57014".to_owned(),
+                    format!(
+                        "[RS-2002] DML mutation count {} exceeds limit {}",
+                        matched_rows.len(),
+                        rockstream_sql::dml::MAX_DML_MUTATIONS_PER_STATEMENT
+                    ),
+                ),
+            )))]);
+        }
 
         if matched_rows.is_empty() {
             if let Some(returning_cols) = &returning_cols {
@@ -10654,44 +11028,107 @@ impl GatewayHandler {
             ))]);
         }
 
+        let mut candidate_ops = Vec::with_capacity(matched_rows.len());
         let mut result_rows = Vec::with_capacity(matched_rows.len());
+        let mut new_keys_in_batch = HashSet::new();
 
-        for (old_row_key, existing_fields) in matched_rows {
-            let old_tsv = existing_fields.join("\t");
-            let mut value_map: HashMap<String, String> = HashMap::new();
+        for (old_row_key, existing_fields) in &matched_rows {
+            let mut row_map: HashMap<String, Option<String>> = HashMap::new();
             for (i, col) in table_columns.iter().enumerate() {
-                value_map.insert(
-                    col.clone(),
-                    existing_fields.get(i).cloned().unwrap_or_default(),
-                );
+                let val = existing_fields.get(i).cloned();
+                let val_opt = match val {
+                    Some(ref s) if s == r"\N" => None,
+                    other => other,
+                };
+                row_map.insert(col.clone(), val_opt);
             }
-            for (c, v) in &set_pairs {
-                value_map.insert(c.clone(), v.trim_matches('\'').to_string());
+
+            for (col_name, scalar_expr) in &assignments {
+                let new_val = match scalar_expr.evaluate(&row_map) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let sqlstate = if err_str.contains("RS-1016") {
+                            "22012"
+                        } else if err_str.contains("RS-1013") {
+                            "0A000"
+                        } else {
+                            "42601"
+                        };
+                        return Ok(vec![promote_response(Response::Error(Box::new(
+                            ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                        )))]);
+                    }
+                };
+                row_map.insert(col_name.clone(), new_val);
             }
+
             let new_vals: Vec<String> = table_columns
                 .iter()
-                .map(|c| value_map.get(c).cloned().unwrap_or_default())
+                .map(|c| {
+                    row_map
+                        .get(c)
+                        .and_then(|o| o.clone())
+                        .unwrap_or_else(|| r"\N".to_string())
+                })
                 .collect();
-            let new_row_key = build_row_key(&table_columns, &new_vals);
-            let new_tsv = new_vals.join("\t");
 
-            let op = DmlOp::Update {
+            let new_row_key = if !pk_cols.is_empty() {
+                build_pk_row_key(&pk_cols, &table_columns, &new_vals)
+            } else {
+                old_row_key.clone()
+            };
+
+            if !pk_cols.is_empty() && new_row_key != *old_row_key {
+                if !new_keys_in_batch.insert(new_row_key.clone()) {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "23505".to_owned(),
+                            format!("[RS-2057] duplicate key value violates unique constraint \"{table}\""),
+                        ),
+                    )))]);
+                }
+                let exists = match self.check_pk_exists(&table, &new_row_key, conn_id).await {
+                    Ok(ex) => ex,
+                    Err(e) => {
+                        return Ok(vec![promote_response(Response::Error(Box::new(
+                            ErrorInfo::new("ERROR".to_owned(), "58000".to_owned(), e.to_string()),
+                        )))]);
+                    }
+                };
+                if exists {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "23505".to_owned(),
+                            format!("[RS-2057] duplicate key value violates unique constraint \"{table}\""),
+                        ),
+                    )))]);
+                }
+            }
+
+            let old_tsv = existing_fields.join("\t");
+            let new_tsv = new_vals.join("\t");
+            candidate_ops.push(DmlOp::Update {
                 table: table.clone(),
-                old_row_key,
+                old_row_key: old_row_key.clone(),
                 old_tsv,
                 new_row_key,
                 new_tsv,
-            };
+            });
+            result_rows.push(new_vals);
+        }
 
-            if let Some(id) = conn_id {
-                let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+        if let Some(id) = conn_id {
+            let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+            for op in candidate_ops {
                 if let Err(e) = entry.push(op) {
                     return Ok(vec![promote_response(Response::Error(Box::new(
                         ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
                     )))]);
                 }
             }
-            result_rows.push(new_vals);
         }
 
         let in_explicit_block = conn_id
@@ -10724,35 +11161,111 @@ impl GatewayHandler {
         ))])
     }
 
-    /// DELETE handler: pre-image capture for RETURNING (v0.59.11 SQL-02).
+    /// DELETE handler: pre-image capture for RETURNING (v0.64).
     async fn handle_delete(
         &self,
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        let (table, where_pairs, returning_cols) = match parse_delete(q) {
-            Ok(v) => v,
+        if q.len() > rockstream_sql::dml::MAX_SQL_STATEMENT_BYTES {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    "[RS-1012] Statement exceeds maximum allowed size".to_owned(),
+                ),
+            )))]);
+        }
+
+        let parsed_dml = match rockstream_sql::dml::parse_dml_statement(q) {
+            Ok(stmt) => stmt,
             Err(e) => {
+                if let Some(norm_q) = try_normalize_where_commas(q) {
+                    match rockstream_sql::dml::parse_dml_statement(&norm_q) {
+                        Ok(stmt) => stmt,
+                        Err(_) => {
+                            return Ok(vec![promote_response(Response::Error(Box::new(
+                                ErrorInfo::new(
+                                    "ERROR".to_owned(),
+                                    "42601".to_owned(),
+                                    e.to_string(),
+                                ),
+                            )))]);
+                        }
+                    }
+                } else {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e.to_string()),
+                    )))]);
+                }
+            }
+        };
+
+        let delete_stmt = match parsed_dml {
+            rockstream_sql::dml::DmlStatement::Delete(stmt) => stmt,
+            _ => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e),
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "not a DELETE statement".to_owned(),
+                    ),
                 )))]);
             }
         };
 
-        let (cols, _vals): (Vec<_>, Vec<_>) = where_pairs
-            .iter()
-            .map(|(c, v)| (c.clone(), v.clone()))
-            .unzip();
+        let table = delete_stmt.table;
+        let returning_cols = delete_stmt.returning;
 
-        let table_columns: Vec<String> = self
-            .catalog
-            .get_table(&table)
-            .map(|ct| ct.columns.into_iter().map(|c| c.name).collect())
-            .unwrap_or_else(|| cols.clone());
+        let predicate = match delete_stmt
+            .selection
+            .as_ref()
+            .map(rockstream_sql::dml::lower_predicate)
+            .transpose()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let err_str = e.to_string();
+                let sqlstate = if err_str.contains("RS-1013") {
+                    "0A000"
+                } else {
+                    "42601"
+                };
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                )))]);
+            }
+        };
 
-        let matched_rows = self
-            .find_matching_rows_for_table(&table, &table_columns, &where_pairs, conn_id)
-            .await?;
+        let table_entry = self.catalog.get_table(&table);
+        let table_columns: Vec<String> = table_entry
+            .map(|ct| ct.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+
+        let matched_rows = match self
+            .find_matching_rows_predicate(&table, &table_columns, predicate.as_ref(), conn_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(PgWireError::UserError(err)) => {
+                return Ok(vec![promote_response(Response::Error(err))]);
+            }
+            Err(e) => return Err(e),
+        };
+
+        if matched_rows.len() > rockstream_sql::dml::MAX_DML_MUTATIONS_PER_STATEMENT {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "57014".to_owned(),
+                    format!(
+                        "[RS-2002] DML mutation count {} exceeds limit {}",
+                        matched_rows.len(),
+                        rockstream_sql::dml::MAX_DML_MUTATIONS_PER_STATEMENT
+                    ),
+                ),
+            )))]);
+        }
 
         if matched_rows.is_empty() {
             if let Some(returning_cols) = &returning_cols {
@@ -10769,24 +11282,27 @@ impl GatewayHandler {
         }
 
         let mut captured_rows = Vec::with_capacity(matched_rows.len());
+        let mut candidate_ops = Vec::with_capacity(matched_rows.len());
 
         for (row_key, existing_fields) in matched_rows {
             let returning_tsv = Some(existing_fields.join("\t"));
-            let op = DmlOp::Delete {
+            candidate_ops.push(DmlOp::Delete {
                 table: table.clone(),
                 row_key,
                 returning_tsv,
-            };
+            });
+            captured_rows.push(existing_fields);
+        }
 
-            if let Some(id) = conn_id {
-                let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+        if let Some(id) = conn_id {
+            let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+            for op in candidate_ops {
                 if let Err(e) = entry.push(op) {
                     return Ok(vec![promote_response(Response::Error(Box::new(
                         ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
                     )))]);
                 }
             }
-            captured_rows.push(existing_fields);
         }
 
         let in_explicit_block = conn_id
@@ -12100,7 +12616,11 @@ impl ExtendedQueryHandler for GatewayHandler {
         // (and any other execution path) can evaluate the literals directly.
         let effective_query: String;
         let dispatch_query: &str = if !portal.parameters.is_empty() && query.contains('$') {
-            effective_query = substitute_params(query, &portal.parameters);
+            effective_query = substitute_params_typed(
+                query,
+                &portal.parameters,
+                &portal.statement.parameter_types,
+            );
             &effective_query
         } else {
             query
@@ -14081,7 +14601,7 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                         let date = epoch + chrono::Duration::days(days as i64);
                         date.format("%Y-%m-%d").to_string()
                     }),
-                    ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => col
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => col
                         .as_any()
                         .downcast_ref::<TimestampMicrosecondArray>()
                         .map(|a| {
@@ -14096,7 +14616,11 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                                     )
                                     .unwrap_or_default()
                                 });
-                            dt.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string()
+                            if tz.is_some() {
+                                dt.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string()
+                            } else {
+                                dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+                            }
                         }),
                     ArrowDataType::FixedSizeBinary(16) => col
                         .as_any()
@@ -17240,139 +17764,20 @@ fn extract_sql_refs(sql: &str) -> Vec<String> {
     deps
 }
 
-/// Substitute `$1`, `$2`, … placeholders in `sql` with their bound values.
-///
-/// - `None` parameter → `NULL`
-/// - `Some(bytes)` that parses as a number → inserted as-is (no quotes)
-/// - `Some(bytes)` that is valid UTF-8 text → wrapped in single-quoted string
-///   with internal single-quotes escaped as `''`
-/// - `Some(bytes)` that is not valid UTF-8 → `NULL`
-///
-/// The function also strips PostgreSQL-style type casts (e.g. `$1::int`) from
-/// the placeholders before substitution so DataFusion can evaluate the literal.
-fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
+fn substitute_params_typed(
+    sql: &str,
+    params: &[Option<bytes::Bytes>],
+    param_types: &[Type],
+) -> String {
     let mut result = sql.to_string();
     // Work from the highest index downward so that replacing `$10` before `$1`
     // doesn't corrupt earlier replacements.
     for (i, param) in params.iter().enumerate().rev() {
         let placeholder = format!("${}", i + 1);
+        let param_type = param_types.get(i);
         let replacement = match param {
             None => "NULL".to_string(),
-            Some(bytes) => {
-                if bytes.len() >= 12 && bytes[..4] == [0, 0, 0, 1] {
-                    // 1D PostgreSQL binary array decoding
-                    let elem_type = i32::from_be_bytes(bytes[8..12].try_into().unwrap_or_default());
-                    let dim = i32::from_be_bytes(bytes[12..16].try_into().unwrap_or_default());
-                    let mut offset = 20;
-                    let mut elems = Vec::new();
-                    for _ in 0..dim.max(0) {
-                        if offset + 4 > bytes.len() {
-                            break;
-                        }
-                        let len = i32::from_be_bytes(
-                            bytes[offset..offset + 4].try_into().unwrap_or_default(),
-                        );
-                        offset += 4;
-                        if len < 0 {
-                            elems.push("NULL".to_string());
-                        } else if offset + len as usize <= bytes.len() {
-                            let elem_bytes = &bytes[offset..offset + len as usize];
-                            offset += len as usize;
-                            let formatted = match elem_type {
-                                20 => i64::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
-                                    .to_string(),
-                                23 => i32::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
-                                    .to_string(),
-                                21 => i16::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
-                                    .to_string(),
-                                16 => {
-                                    if !elem_bytes.is_empty() && elem_bytes[0] != 0 {
-                                        "true".to_string()
-                                    } else {
-                                        "false".to_string()
-                                    }
-                                }
-                                700 => {
-                                    f32::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
-                                        .to_string()
-                                }
-                                701 => {
-                                    f64::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
-                                        .to_string()
-                                }
-                                _ => {
-                                    if let Ok(s) = std::str::from_utf8(elem_bytes) {
-                                        if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-                                            s.to_string()
-                                        } else {
-                                            format!("'{}'", s.replace('\'', "''"))
-                                        }
-                                    } else {
-                                        "NULL".to_string()
-                                    }
-                                }
-                            };
-                            elems.push(formatted);
-                        }
-                    }
-                    format!("ARRAY[{}]", elems.join(", "))
-                } else if bytes
-                    .iter()
-                    .any(|&b| b < 32 && b != b'\t' && b != b'\n' && b != b'\r')
-                {
-                    // Binary parameter decoding (e.g. from tokio-postgres prepared statements)
-                    if bytes.len() == 8 {
-                        let num = bytes[..8].try_into().map(i64::from_be_bytes).unwrap_or(0);
-                        num.to_string()
-                    } else if bytes.len() == 4 {
-                        let num = bytes[..4].try_into().map(i32::from_be_bytes).unwrap_or(0);
-                        num.to_string()
-                    } else if bytes.len() == 2 {
-                        let num = bytes[..2].try_into().map(i16::from_be_bytes).unwrap_or(0);
-                        num.to_string()
-                    } else if bytes.len() == 1 {
-                        if bytes[0] == 0 {
-                            "false".to_string()
-                        } else if bytes[0] == 1 {
-                            "true".to_string()
-                        } else {
-                            bytes[0].to_string()
-                        }
-                    } else {
-                        "NULL".to_string()
-                    }
-                } else if let Ok(s) = std::str::from_utf8(bytes) {
-                    if s.starts_with('{') && s.ends_with('}') {
-                        // Text array parsing e.g. {1,2,3} or {"a","b"}
-                        let inner = &s[1..s.len() - 1].trim();
-                        if inner.is_empty() {
-                            "ARRAY[]".to_string()
-                        } else {
-                            let mut elems = Vec::new();
-                            for item in inner.split(',') {
-                                let item = item.trim();
-                                let unquoted = item.trim_matches('"');
-                                if unquoted.eq_ignore_ascii_case("null") {
-                                    elems.push("NULL".to_string());
-                                } else if unquoted.parse::<i64>().is_ok()
-                                    || unquoted.parse::<f64>().is_ok()
-                                {
-                                    elems.push(unquoted.to_string());
-                                } else {
-                                    elems.push(format!("'{}'", unquoted.replace('\'', "''")));
-                                }
-                            }
-                            format!("ARRAY[{}]", elems.join(", "))
-                        }
-                    } else if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-                        s.to_string()
-                    } else {
-                        format!("'{}'", s.replace('\'', "''"))
-                    }
-                } else {
-                    "NULL".to_string()
-                }
-            }
+            Some(bytes) => decode_param_bytes(bytes, param_type),
         };
         // Replace `$N::cast_type` as well as bare `$N`.
         // We do a simple regex-free replacement: find `$N` and strip any
@@ -17418,11 +17823,198 @@ fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
     result
 }
 
+fn decode_param_bytes(bytes: &[u8], param_type: Option<&Type>) -> String {
+    if bytes.len() >= 12 && bytes[..4] == [0, 0, 0, 1] {
+        // 1D PostgreSQL binary array decoding
+        let elem_type = i32::from_be_bytes(bytes[8..12].try_into().unwrap_or_default());
+        let dim = i32::from_be_bytes(bytes[12..16].try_into().unwrap_or_default());
+        let mut offset = 20;
+        let mut elems = Vec::new();
+        for _ in 0..dim.max(0) {
+            if offset + 4 > bytes.len() {
+                break;
+            }
+            let len = i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap_or_default());
+            offset += 4;
+            if len < 0 {
+                elems.push("NULL".to_string());
+            } else if offset + len as usize <= bytes.len() {
+                let elem_bytes = &bytes[offset..offset + len as usize];
+                offset += len as usize;
+                let formatted = match elem_type {
+                    20 => i64::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
+                    23 => i32::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
+                    21 => i16::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
+                    16 => {
+                        if !elem_bytes.is_empty() && elem_bytes[0] != 0 {
+                            "true".to_string()
+                        } else {
+                            "false".to_string()
+                        }
+                    }
+                    700 => {
+                        f32::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string()
+                    }
+                    701 => {
+                        f64::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string()
+                    }
+                    _ => {
+                        if let Ok(s) = std::str::from_utf8(elem_bytes) {
+                            if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                                s.to_string()
+                            } else {
+                                format!("'{}'", s.replace('\'', "''"))
+                            }
+                        } else {
+                            "NULL".to_string()
+                        }
+                    }
+                };
+                elems.push(formatted);
+            }
+        }
+        return format!("ARRAY[{}]", elems.join(", "));
+    }
+
+    if let Some(ty) = param_type {
+        match *ty {
+            Type::INT8 => {
+                if bytes.len() == 8 {
+                    return i64::from_be_bytes(bytes[..8].try_into().unwrap_or_default())
+                        .to_string();
+                }
+            }
+            Type::INT4 => {
+                if bytes.len() == 4 {
+                    return i32::from_be_bytes(bytes[..4].try_into().unwrap_or_default())
+                        .to_string();
+                }
+            }
+            Type::INT2 => {
+                if bytes.len() == 2 {
+                    return i16::from_be_bytes(bytes[..2].try_into().unwrap_or_default())
+                        .to_string();
+                }
+            }
+            Type::FLOAT8 => {
+                if bytes.len() == 8 {
+                    return f64::from_be_bytes(bytes[..8].try_into().unwrap_or_default())
+                        .to_string();
+                }
+            }
+            Type::FLOAT4 => {
+                if bytes.len() == 4 {
+                    return f32::from_be_bytes(bytes[..4].try_into().unwrap_or_default())
+                        .to_string();
+                }
+            }
+            Type::BOOL => {
+                if bytes.len() == 1 {
+                    return if bytes[0] != 0 { "true" } else { "false" }.to_string();
+                }
+            }
+            Type::UUID => {
+                if bytes.len() == 16 {
+                    return format!(
+                        "'{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}'",
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                        bytes[4], bytes[5],
+                        bytes[6], bytes[7],
+                        bytes[8], bytes[9],
+                        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+                    );
+                }
+            }
+            Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+                if bytes.len() == 8 {
+                    let pg_micros = i64::from_be_bytes(bytes[..8].try_into().unwrap_or_default());
+                    let unix_micros = pg_micros + 946_684_800_000_000i64;
+                    let secs = unix_micros.div_euclid(1_000_000);
+                    let nsecs = (unix_micros.rem_euclid(1_000_000) * 1_000) as u32;
+                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
+                        return format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f"));
+                    }
+                }
+            }
+            Type::VARCHAR | Type::TEXT => {
+                if let Ok(s) = std::str::from_utf8(bytes) {
+                    return format!("'{}'", s.replace('\'', "''"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Fallback heuristic decoding
+    if bytes
+        .iter()
+        .any(|&b| b < 32 && b != b'\t' && b != b'\n' && b != b'\r')
+    {
+        if bytes.len() == 8 {
+            let num = bytes[..8].try_into().map(i64::from_be_bytes).unwrap_or(0);
+            num.to_string()
+        } else if bytes.len() == 4 {
+            let num = bytes[..4].try_into().map(i32::from_be_bytes).unwrap_or(0);
+            num.to_string()
+        } else if bytes.len() == 2 {
+            let num = bytes[..2].try_into().map(i16::from_be_bytes).unwrap_or(0);
+            num.to_string()
+        } else if bytes.len() == 1 {
+            if bytes[0] == 0 {
+                "false".to_string()
+            } else if bytes[0] == 1 {
+                "true".to_string()
+            } else {
+                bytes[0].to_string()
+            }
+        } else if bytes.len() == 16 {
+            format!(
+                "'{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}'",
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5],
+                bytes[6], bytes[7],
+                bytes[8], bytes[9],
+                bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+            )
+        } else {
+            "NULL".to_string()
+        }
+    } else if let Ok(s) = std::str::from_utf8(bytes) {
+        if s.starts_with('{') && s.ends_with('}') {
+            let inner = &s[1..s.len() - 1].trim();
+            if inner.is_empty() {
+                "ARRAY[]".to_string()
+            } else {
+                let mut elems = Vec::new();
+                for item in inner.split(',') {
+                    let item = item.trim();
+                    let unquoted = item.trim_matches('"');
+                    if unquoted.eq_ignore_ascii_case("null") {
+                        elems.push("NULL".to_string());
+                    } else if unquoted.parse::<i64>().is_ok() || unquoted.parse::<f64>().is_ok() {
+                        elems.push(unquoted.to_string());
+                    } else {
+                        elems.push(format!("'{}'", unquoted.replace('\'', "''")));
+                    }
+                }
+                format!("ARRAY[{}]", elems.join(", "))
+            }
+        } else if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+            s.to_string()
+        } else {
+            format!("'{}'", s.replace('\'', "''"))
+        }
+    } else {
+        "NULL".to_string()
+    }
+}
+
 // ── DML parsers ───────────────────────────────────────────────────────────────
 
 struct ParsedCreateTableColumns {
     columns: Vec<CatalogColumn>,
     generated_columns: HashMap<String, GeneratedColumnKind>,
+    pk_cols: Vec<String>,
 }
 
 /// Parse `CREATE TABLE <name> (col type, ...)` column list.
@@ -17433,6 +18025,7 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
             return ParsedCreateTableColumns {
                 columns: vec![],
                 generated_columns: HashMap::new(),
+                pk_cols: vec![],
             }
         }
     };
@@ -17442,19 +18035,40 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
             return ParsedCreateTableColumns {
                 columns: vec![],
                 generated_columns: HashMap::new(),
+                pk_cols: vec![],
             }
         }
     };
     let cols_str = &after_table_name[start..end];
     let mut columns = Vec::new();
     let mut generated_columns = HashMap::new();
+    let mut pk_cols = Vec::new();
     for part in split_top_level_comma_list(cols_str).unwrap_or_else(|_| vec![cols_str.to_string()])
     {
         let part = part.trim();
+        let part_upper = part.to_uppercase();
+
+        // Check for table-level PRIMARY KEY constraint:
+        // e.g. PRIMARY KEY (col1, col2) or CONSTRAINT name PRIMARY KEY (col1, col2)
+        if part_upper.starts_with("PRIMARY KEY")
+            || (part_upper.starts_with("CONSTRAINT") && part_upper.contains("PRIMARY KEY"))
+        {
+            if let (Some(s), Some(e)) = (part.find('('), part.rfind(')')) {
+                let pk_sub = &part[s + 1..e];
+                for pk_col in pk_sub.split(',') {
+                    let col = pk_col.trim().trim_matches('"').to_lowercase();
+                    if !col.is_empty() && !pk_cols.contains(&col) {
+                        pk_cols.push(col);
+                    }
+                }
+            }
+            continue;
+        }
+
         if let Some((column, generated_kind)) = (|| {
             let part = part.trim();
             let mut tokens = part.split_whitespace();
-            let col_name = tokens.next()?.to_lowercase();
+            let col_name = tokens.next()?.trim_matches('"').to_lowercase();
             let mut pg_type = tokens.next()?.to_uppercase();
             // If pg_type starts with '(' but doesn't end with ')', consume tokens until ')'
             if (pg_type.starts_with("DECIMAL(")
@@ -17497,6 +18111,9 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
             } else {
                 None
             };
+            if part_upper.contains("PRIMARY KEY") && !pk_cols.contains(&col_name) {
+                pk_cols.push(col_name.clone());
+            }
             Some((
                 CatalogColumn {
                     name: col_name,
@@ -17514,6 +18131,7 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
     ParsedCreateTableColumns {
         columns,
         generated_columns,
+        pk_cols,
     }
 }
 
@@ -17545,6 +18163,84 @@ fn pg_type_to_arrow(pg_type: &str) -> &'static str {
         "UUID[]" => "_uuid",
         _ => "Utf8",
     }
+}
+
+static NEXT_HEAP_ROW_ID: AtomicU64 = AtomicU64::new(1);
+
+fn build_pk_row_key(pk_cols: &[String], cols: &[String], vals: &[String]) -> String {
+    pk_cols
+        .iter()
+        .map(|pk| {
+            let pos = cols.iter().position(|c| c.eq_ignore_ascii_case(pk));
+            let val = pos
+                .and_then(|p| vals.get(p))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            format!("{pk}={val}")
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn build_table_row_key(pk_cols: &[String], cols: &[String], vals: &[String]) -> String {
+    if !pk_cols.is_empty() {
+        build_pk_row_key(pk_cols, cols, vals)
+    } else {
+        let id = NEXT_HEAP_ROW_ID.fetch_add(1, Ordering::Relaxed);
+        format!("__heap_{id}")
+    }
+}
+
+fn try_normalize_where_commas(q: &str) -> Option<String> {
+    let ql = q.to_lowercase();
+    let where_pos = ql.find(" where ")?;
+    let prefix = &q[..where_pos + 7];
+    let rest = &q[where_pos + 7..];
+
+    let (where_part, returning_part) =
+        if let Some(ret_pos) = rest.to_lowercase().find(" returning ") {
+            (&rest[..ret_pos], &rest[ret_pos..])
+        } else {
+            (rest, "")
+        };
+
+    if !where_part.contains(',') {
+        return None;
+    }
+
+    let mut normalized_where = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut paren_depth = 0;
+
+    for c in where_part.chars() {
+        match c {
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                normalized_where.push(c);
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                normalized_where.push(c);
+            }
+            '(' if !in_single_quote && !in_double_quote => {
+                paren_depth += 1;
+                normalized_where.push(c);
+            }
+            ')' if !in_single_quote && !in_double_quote => {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                }
+                normalized_where.push(c);
+            }
+            ',' if !in_single_quote && !in_double_quote && paren_depth == 0 => {
+                normalized_where.push_str(" AND ");
+            }
+            _ => normalized_where.push(c),
+        }
+    }
+
+    Some(format!("{prefix}{normalized_where}{returning_part}"))
 }
 
 /// Build a deterministic row key from column names and values.
@@ -17923,7 +18619,7 @@ fn parse_value_list(s: &str) -> Vec<String> {
     let push_value = |values: &mut Vec<String>, current: &str, was_quoted: bool| {
         let trimmed = current.trim();
         if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
-            values.push(String::new());
+            values.push(r"\N".to_string());
         } else {
             values.push(trimmed.to_string());
         }

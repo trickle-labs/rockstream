@@ -123,6 +123,7 @@ async fn query_budget_error(sql: &str) -> String {
                 data_type: "Int64".to_owned(),
             },
         ],
+        pk_cols: vec![],
     }));
     let server = GatewayServer::with_shard_db_and_query_time_shard_topology(
         "127.0.0.1:0".parse().unwrap(),
@@ -611,11 +612,11 @@ async fn dml() {
         .await
         .unwrap();
     client
-        .simple_query("UPDATE source SET value = 15 WHERE id = 1, value = 10")
+        .simple_query("UPDATE source SET value = 15 WHERE id = 1 AND value = 10")
         .await
         .unwrap();
     client
-        .simple_query("DELETE FROM source WHERE id = 2, value = 20")
+        .simple_query("DELETE FROM source WHERE id = 2 AND value = 20")
         .await
         .unwrap();
     let expected: Vec<Vec<String>> = vec![vec!["1".to_owned(), "15".to_owned()]];

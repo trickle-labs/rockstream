@@ -47,6 +47,7 @@ fn table(name: &str, columns: &[(&str, &str)]) -> CatalogTable {
                 data_type: (*data_type).to_string(),
             })
             .collect(),
+        pk_cols: vec![],
     }
 }
 

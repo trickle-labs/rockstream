@@ -57,6 +57,7 @@ async fn spawn_smoke_gateway() -> (u16, String, tokio::task::JoinHandle<()>) {
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
 
     let role_catalog = Arc::new(RoleCatalog::new());

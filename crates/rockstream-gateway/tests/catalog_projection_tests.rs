@@ -312,6 +312,7 @@ async fn test_projection_cache_invalidation_on_revision_change() {
             name: "id".to_string(),
             data_type: "Int32".to_string(),
         }],
+        pk_cols: vec![],
     });
     let rev1 = gw.get_revision();
     assert!(rev1 > initial_rev, "add_table must advance revision");
@@ -332,6 +333,7 @@ async fn test_projection_cache_invalidation_on_revision_change() {
             name: "id".to_string(),
             data_type: "Int32".to_string(),
         }],
+        pk_cols: vec![],
     });
     let rev2 = gw.get_revision();
     assert!(rev2 > rev1, "second add_table must advance revision");

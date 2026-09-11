@@ -428,6 +428,8 @@ pub const RS_2054: ErrorCode = ErrorCode::new(2054);
 pub const RS_2055: ErrorCode = ErrorCode::new(2055);
 /// Malformed INSERT VALUES list or schema mismatch.
 pub const RS_2056: ErrorCode = ErrorCode::new(2056);
+/// Duplicate key value violates primary key constraint.
+pub const RS_2057: ErrorCode = ErrorCode::new(2057);
 /// Commit epoch reached u64::MAX.
 pub const RS_2060: ErrorCode = ErrorCode::new(2060);
 /// Unauthenticated: request missing or carrying invalid credentials.

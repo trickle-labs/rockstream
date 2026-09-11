@@ -50,12 +50,6 @@ Authoritative v1 SQL semantics, PostgreSQL 18.0 differential compatibility, and 
 
 RockStream preserves exact bag/multiset duplicate counts under incremental view maintenance. Retraction underflow fails closed with `RS-1017`.
 
-For `SUM`, `COUNT`, and `AVG`, repeated changes to one group within a logical
-epoch are consolidated before the result delta is emitted. The final SQL result
-and signed multiset weights are unchanged; only intermediate rows are
-suppressed. Group deletion emits the prior row's retraction and removes its
-aggregate state, while a later insertion recreates the group.
-
 ## Unmatched DML
 
 `UPDATE` or `DELETE` statements matching zero rows succeed without error and return command tags `UPDATE 0` and `DELETE 0`.
@@ -63,3 +57,4 @@ aggregate state, while a later insertion recreates the group.
 ## Floating-point join restrictions
 
 Floating-point equality joins (`FLOAT4`/`FLOAT8`) are explicitly rejected fail-closed with `RS-1019` due to non-total IEEE-754 ordering.
+

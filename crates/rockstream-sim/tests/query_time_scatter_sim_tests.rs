@@ -47,6 +47,7 @@ async fn start_gateway(
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     }));
     let topology = QueryTimeShardTopology::new(readers, 17);
     assert_eq!(topology.pinned_frontier(), 17);

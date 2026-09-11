@@ -176,6 +176,57 @@ impl SqlFrontend {
         lower_with_views(&logical, &Default::default(), &snapshot_sources)
     }
 
+    /// Parse a DML statement (INSERT, UPDATE, DELETE) into typed AST IR.
+    pub fn parse_dml(&self, sql: &str) -> Result<crate::dml::DmlStatement, SqlError> {
+        crate::dml::parse_dml_statement(sql)
+    }
+
+    /// Validate a parsed DML statement against registered table schemas.
+    pub async fn validate_dml(&self, dml: &crate::dml::DmlStatement) -> Result<(), SqlError> {
+        let table_name = dml.table_name();
+        let provider = match self.ctx.table_provider(table_name).await {
+            Ok(p) => p,
+            Err(_) => {
+                return Err(SqlError::ParseError {
+                    message: format!("[RS-1012] Target relation '{table_name}' does not exist"),
+                });
+            }
+        };
+
+        let schema = provider.schema();
+        let col_names: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_lowercase())
+            .collect();
+
+        match dml {
+            crate::dml::DmlStatement::Insert(ins) => {
+                for col in &ins.columns {
+                    if !col_names.contains(&col.to_lowercase()) {
+                        return Err(SqlError::ParseError {
+                            message: format!("[RS-1012] Column '{col}' does not exist in relation '{table_name}'"),
+                        });
+                    }
+                }
+            }
+            crate::dml::DmlStatement::Update(upd) => {
+                for asgn in &upd.assignments {
+                    if !col_names.contains(&asgn.column.to_lowercase()) {
+                        return Err(SqlError::ParseError {
+                            message: format!(
+                                "[RS-1012] Column '{}' does not exist in relation '{table_name}'",
+                                asgn.column
+                            ),
+                        });
+                    }
+                }
+            }
+            crate::dml::DmlStatement::Delete(_) => {}
+        }
+        Ok(())
+    }
+
     /// Parse SQL and return the **unoptimized** `PlanNode`.
     ///
     /// The unoptimized plan is more predictable than the optimized plan because

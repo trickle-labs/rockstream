@@ -65,6 +65,7 @@ async fn create_view_registers_op_id_and_no_longer_uses_datafusion_materializer(
                 data_type: "Int64".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
 
     let dir = TempDir::new().unwrap();

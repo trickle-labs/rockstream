@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "8ac497fc7f89345b3ba0ae1163cc91c7a26c4e696d04a36a420604bf25e3cf48",
+    "candidate_identity_digest": "d7393eeacca6fedfd980bb657ef237a120e97390a90c2ba76456914ce019a288",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -6425,6 +6425,16 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Ensure every VALUES row has matching parenthesis and correct column count.",
         "doc_anchor": "rs-2056"
+      },
+      {
+        "code": "RS-2057",
+        "key": "write.duplicate_key",
+        "title": "Duplicate key value violates primary key constraint",
+        "severity": "ERROR",
+        "sqlstate": "23505",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Ensure inserted or updated primary key values are unique.",
+        "doc_anchor": "rs-2057"
       },
       {
         "code": "RS-2060",

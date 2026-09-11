@@ -1464,6 +1464,7 @@ async fn insert_returning_returns_written_rows() {
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
@@ -1471,27 +1472,34 @@ async fn insert_returning_returns_written_rows() {
     let client = connect_port(local_addr.port()).await;
 
     let rows = client
-        .simple_query("INSERT INTO products (id, name) VALUES (1, 'Widget') RETURNING *")
+        .simple_query("INSERT INTO products (id, name) VALUES (42, 'Widget') RETURNING *")
         .await
-        .expect("INSERT RETURNING failed");
+        .expect("INSERT … RETURNING failed");
 
-    let data_rows: Vec<_> = rows
-        .iter()
-        .filter_map(|m| {
-            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
-                Some(r)
-            } else {
-                None
-            }
-        })
+    let data_messages: Vec<_> = rows
+        .into_iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
         .collect();
 
     assert_eq!(
-        data_rows.len(),
+        data_messages.len(),
         1,
-        "expected 1 row from RETURNING, got {}",
-        data_rows.len()
+        "expected exactly 1 row from INSERT RETURNING"
     );
+    if let tokio_postgres::SimpleQueryMessage::Row(row) = &data_messages[0] {
+        assert_eq!(
+            row.get("id"),
+            Some("42"),
+            "id column must match inserted value"
+        );
+        assert_eq!(
+            row.get("name"),
+            Some("Widget"),
+            "name column must match inserted value"
+        );
+    } else {
+        panic!("expected Row message");
+    }
 }
 
 // ── S7: insert_select_returning_multi_row ────────────────────────────────────
@@ -1513,6 +1521,7 @@ async fn insert_select_returning_multi_row() {
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
@@ -1610,6 +1619,7 @@ async fn multi_row_insert_values_returning_returns_all_rows() {
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
@@ -2850,6 +2860,7 @@ async fn explain_incremental_matches_frontend_byte_for_byte() {
             name: "id".to_string(),
             data_type: "Int64".to_string(),
         }],
+        pk_cols: vec![],
     });
     catalog.add_view(CatalogView {
         name: "inc_mv".to_string(),
@@ -2935,6 +2946,7 @@ async fn explain_incremental_analyze_reflects_live_view_traffic() {
             name: "id".to_string(),
             data_type: "Int64".to_string(),
         }],
+        pk_cols: vec![],
     });
     catalog.add_view(CatalogView {
         name: "analyze_mv".to_string(),
@@ -3301,6 +3313,7 @@ async fn copy_in_auth_enforced_lfs() {
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
 
     // ── RS-2400: JwtVerifier rejects missing/empty token ─────────────────────
@@ -4688,6 +4701,7 @@ async fn proof_index_scan_point_lookup_via_wire() {
                 data_type: "Int64".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     let view_reader = Arc::new(NoopViewReader);
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -6422,6 +6436,7 @@ async fn explain_reports_pruned_shard_count() {
             name: "region".to_string(),
             data_type: "Utf8".to_string(),
         }],
+        pk_cols: vec![],
     });
     catalog.set_shard_stats(
         "orders",

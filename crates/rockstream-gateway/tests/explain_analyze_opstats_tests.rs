@@ -87,6 +87,7 @@ async fn test_explain_analyze_opstats_aggregate() {
                 data_type: "Int64".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     catalog.add_view(CatalogView {
         name: "agg_view".to_string(),
@@ -155,6 +156,7 @@ async fn test_explain_analyze_opstats_join() {
             name: "id".to_string(),
             data_type: "Int64".to_string(),
         }],
+        pk_cols: vec![],
     });
     catalog.add_table(CatalogTable {
         name: "t2".to_string(),
@@ -168,6 +170,7 @@ async fn test_explain_analyze_opstats_join() {
                 data_type: "Text".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     catalog.add_view(CatalogView {
         name: "join_view".to_string(),
@@ -231,6 +234,7 @@ async fn test_explain_analyze_opstats_distinct_minmax() {
             name: "k".to_string(),
             data_type: "Int64".to_string(),
         }],
+        pk_cols: vec![],
     });
     catalog.add_view(CatalogView {
         name: "distinct_view".to_string(),

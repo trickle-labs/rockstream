@@ -89,6 +89,7 @@ async fn start_gateway(total_rows: usize, payload: &str, budget: QueryTimeScatte
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     }));
     let server = GatewayServer::with_shard_db_and_query_time_shard_topology(
         "127.0.0.1:0".parse().unwrap(),

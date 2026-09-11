@@ -73,6 +73,7 @@
 | RS-2054 | query.statement_timeout | Query exceeded the configured statement timeout | ERROR | 57014 | ExponentialBackoff | Increase statement_timeout or optimize the query. | rs-2054 |
 | RS-2055 | limit.connection_limit_exceeded | Server-wide connection limit reached | ERROR | 53300 | ExponentialBackoff | Close idle connections or increase max_connections. | rs-2055 |
 | RS-2056 | write.malformed_values_list | Malformed INSERT VALUES list or schema mismatch | ERROR | 42601 | NonRetryable | Ensure every VALUES row has matching parenthesis and correct column count. | rs-2056 |
+| RS-2057 | write.duplicate_key | Duplicate key value violates primary key constraint | ERROR | 23505 | NonRetryable | Ensure inserted or updated primary key values are unique. | rs-2057 |
 | RS-2060 | write.epoch_exhausted | Commit epoch reached u64::MAX | FATAL | 54000 | NonRetryable | Create a new shard before retrying. | rs-2060 |
 | RS-2400 | auth.unauthenticated | Unauthenticated: request missing or carrying invalid credentials | ERROR | 28000 | NonRetryable | Provide valid credentials (Bearer token or mTLS certificate) | rs-2400 |
 | RS-2401 | auth.permission_denied | Permission denied: authenticated principal lacks required RBAC role | ERROR | 28000 | NonRetryable | Request elevated RBAC role from an admin or contact the namespace owner | rs-2401 |

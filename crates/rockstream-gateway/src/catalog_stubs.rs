@@ -193,10 +193,33 @@ impl BackfillProgress {
 }
 
 /// A table entry registered by `CREATE TABLE` commands.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogTable {
     pub name: String,
     pub columns: Vec<CatalogColumn>,
+    pub pk_cols: Vec<String>,
+}
+
+impl CatalogTable {
+    pub fn new(name: impl Into<String>, columns: Vec<CatalogColumn>) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            pk_cols: Vec::new(),
+        }
+    }
+
+    pub fn with_pk(
+        name: impl Into<String>,
+        columns: Vec<CatalogColumn>,
+        pk_cols: Vec<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            pk_cols,
+        }
+    }
 }
 
 /// A column in a catalog view entry.
@@ -588,6 +611,7 @@ impl CatalogStubs {
                 CatalogTable {
                     name: t.name,
                     columns: cols,
+                    pk_cols: t.pk_cols,
                 },
             );
         }
@@ -1090,7 +1114,7 @@ impl CatalogStubs {
             name: table.name.clone(),
             namespace_id: rockstream_types::ids::NamespaceId(1),
             columns: cols,
-            pk_cols: vec![],
+            pk_cols: table.pk_cols.clone(),
         };
         self.persist_mutations(vec![
             rockstream_storage::catalog::CatalogMutation::PutTable(cat_table),

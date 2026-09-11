@@ -96,6 +96,7 @@ async fn spawn_ref_gateway() -> (u16, String) {
                     data_type: t.to_string(),
                 })
                 .collect(),
+            pk_cols: vec![],
         });
     }
 
