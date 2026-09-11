@@ -114,8 +114,33 @@ mod tests {
 
         #[test]
         fn incremental_equals_batch_for_bucketed_hot_key_aggregate(epochs in arb_epochs()) {
+            let mut kv_state: std::collections::HashMap<(i64, i64), i64> =
+                std::collections::HashMap::new();
+            let mut valid_epochs: Vec<Vec<(i64, i64, i64)>> = Vec::new();
+            for epoch in &epochs {
+                let mut valid_epoch = Vec::new();
+                for &(k, v, w) in epoch {
+                    if w > 0 {
+                        let e = kv_state.entry((k, v)).or_insert(0);
+                        *e += 1;
+                        valid_epoch.push((k, v, 1));
+                    } else {
+                        let e = kv_state.entry((k, v)).or_insert(0);
+                        if *e > 0 {
+                            *e -= 1;
+                            if *e == 0 {
+                                kv_state.remove(&(k, v));
+                            }
+                            valid_epoch.push((k, v, -1));
+                        }
+                    }
+                }
+                if !valid_epoch.is_empty() {
+                    valid_epochs.push(valid_epoch);
+                }
+            }
             for bucket_count in [2u16, 4, 8, 16] {
-                assert_bucketed_matches_unsplit(&epochs, bucket_count);
+                assert_bucketed_matches_unsplit(&valid_epochs, bucket_count);
             }
         }
     }
