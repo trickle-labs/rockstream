@@ -23,6 +23,24 @@ ignored by Git; their SHA-256 values remain in the compact candidate record.
 Changing the profile, corpus, thresholds, workload, or SQL after a scored run
 requires a new profile revision and invalidates every earlier sample.
 
+## v0.61.2 aggregate delta reduction
+
+The v0.61.2 aggregate path measures work per committed epoch. It consolidates
+repeated group-key inputs before computing the final `SUM`, `COUNT`, or `AVG`.
+A changed group emits one old row with weight `-1` and one final row with
+weight `+1`. An unchanged group emits no row and creates no dirty-key write.
+
+Run the focused proof suites to verify exact rows, signed weights, state
+mutations, and execution counters:
+
+```console
+rtk cargo test -p rockstream-ops --test delta_native_aggregate_tests --test constant_write_amplification_scale_tests --test r1_execution_counter_tests
+```
+
+The suites also verify that dirty-key writes stay proportional to changed
+groups and that staging stops at `MAX_EPOCH_CONSOLIDATION_GROUPS` or
+`MAX_EPOCH_CONSOLIDATION_BYTES` without partial state changes.
+
 ---
 
 ## v0.61.1 External Performance Baseline Contract

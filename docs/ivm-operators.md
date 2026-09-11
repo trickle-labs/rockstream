@@ -130,6 +130,11 @@ weight passthrough.
 row contributes `(sum_contribution × weight, count_contribution × weight)` via
 `SumCount/v1::merge`. The output is a `(group_key → avg/sum/count)` delta.
 
+Within one logical epoch, repeated inputs for a group are consolidated before
+the transition is emitted. A changed group produces at most one old-state
+retraction and one final-state insertion. An unchanged group produces no delta
+and no dirty-key persistence write.
+
 Groups whose accumulator reaches `(0, 0)` are tombstoned via `TombstoneGc`.
 
 **Arrangement layout**:

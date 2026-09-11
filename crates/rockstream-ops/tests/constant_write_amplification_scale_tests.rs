@@ -189,3 +189,75 @@ fn test_constant_write_amplification_across_scales() {
         );
     }
 }
+
+#[test]
+fn test_v0612_repeated_keys_intermediate_rows_reduction() {
+    let operator_id = OperatorId(61_200);
+    let op = AggregateOp::new(operator_id);
+    op.process_delta_with_result(make_kv_batch(&[(1, 10, 1)]))
+        .unwrap();
+    metrics::reset_all();
+
+    let result = op
+        .process_delta_with_result(make_kv_batch(&[
+            (1, 10, -1),
+            (1, 20, 1),
+            (1, 20, -1),
+            (1, 40, 1),
+        ]))
+        .unwrap();
+
+    assert_result(
+        &result,
+        &[vec![1, 1], vec![10, 40], vec![1, 1]],
+        &[10.0, 40.0],
+        &[-1, 1],
+        vec![put(operator_id, 1, 40, 1)],
+        OperatorEpochMetrics {
+            input_records: 4,
+            output_records: 2,
+            dirty_keys: 1,
+            state_mutations: 1,
+            logical_mutation_bytes: 33,
+            full_state_entries_visited: 0,
+            state_bytes: 24,
+        },
+    );
+}
+
+#[test]
+fn test_v0612_dirty_keys_proportional_to_distinct_keys() {
+    let operator_id = OperatorId(61_201);
+    let op = AggregateOp::new(operator_id);
+    let initial: Vec<_> = (0..100).map(|key| (key, key, 1)).collect();
+    op.process_delta_with_result(make_kv_batch(&initial))
+        .unwrap();
+    metrics::reset_all();
+
+    let result = op
+        .process_delta_with_result(make_kv_batch(&[
+            (2, 2, -1),
+            (2, 22, 1),
+            (97, 97, -1),
+            (97, 197, 1),
+        ]))
+        .unwrap();
+
+    assert_result(
+        &result,
+        &[vec![2, 2, 97, 97], vec![2, 22, 97, 197], vec![1, 1, 1, 1]],
+        &[2.0, 22.0, 97.0, 197.0],
+        &[-1, 1, -1, 1],
+        vec![put(operator_id, 2, 22, 1), put(operator_id, 97, 197, 1)],
+        OperatorEpochMetrics {
+            input_records: 4,
+            output_records: 4,
+            dirty_keys: 2,
+            state_mutations: 2,
+            logical_mutation_bytes: 66,
+            full_state_entries_visited: 0,
+            state_bytes: 2_400,
+        },
+    );
+    assert_eq!(op.live_groups(), 100);
+}

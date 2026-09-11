@@ -248,6 +248,10 @@ impl ViewSinkOp {
             let value = Self::encode_row(batch, row);
             wb.put(&key, &value);
         }
+        wb.put(
+            &view_output_epoch_key(self.op_id),
+            &epoch.saturating_add(1).to_be_bytes(),
+        );
 
         debug!(
             op_id = op_id_raw,
@@ -269,7 +273,50 @@ impl ViewSinkOp {
 
     /// Convenience: write batch at the next auto-incremented epoch.
     pub async fn write_next_epoch(&self, batch: &ArrowZSet) -> Result<Epoch, OpError> {
-        let epoch = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let persisted_next = match self
+            .db
+            .get(&view_output_epoch_key(self.op_id))
+            .await
+            .map_err(OpError::storage)?
+        {
+            Some(bytes) if bytes.len() == 8 => u64::from_be_bytes(bytes[..].try_into().unwrap()),
+            Some(_) => return Err(OpError::internal("invalid persisted view output epoch")),
+            None => {
+                let (entries, truncated) = self
+                    .db
+                    .scan_prefix_bounded(
+                        &view_output_prefix(self.op_id),
+                        VIEW_OUTPUT_READ_MAX_BYTES,
+                    )
+                    .await
+                    .map_err(OpError::storage)?;
+                if truncated {
+                    return Err(OpError::internal(format!(
+                        "view output exceeds {VIEW_OUTPUT_READ_MAX_BYTES} byte epoch scan limit"
+                    )));
+                }
+                entries
+                    .iter()
+                    .filter_map(|(key, _)| key.get(9..17))
+                    .filter_map(|bytes| bytes.try_into().ok().map(u64::from_be_bytes))
+                    .max()
+                    .map_or(0, |epoch| epoch.saturating_add(1))
+            }
+        };
+        let mut current = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let epoch = loop {
+            let epoch = current.max(persisted_next);
+            let next = epoch.saturating_add(1);
+            match self.epoch.compare_exchange(
+                current,
+                next,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => break epoch,
+                Err(actual) => current = actual,
+            }
+        };
         self.write_epoch(batch, epoch).await?;
         Ok(epoch)
     }
@@ -368,6 +415,12 @@ fn view_output_prefix(op_id: OperatorId) -> Vec<u8> {
     p.push(ShardPrefix::ViewOutput.as_byte());
     p.extend_from_slice(&op_id.0.to_be_bytes());
     p
+}
+
+fn view_output_epoch_key(op_id: OperatorId) -> Vec<u8> {
+    let mut key = view_output_prefix(op_id);
+    key.extend_from_slice(b"epoch");
+    key
 }
 
 fn decode_view_output_entries(

@@ -12,8 +12,20 @@ use rockstream_types::metrics::{
     self, R1ExecutionContext, R1ExecutionCounters, R1ExecutionKey, R1ExecutionStrategy,
     R1WorkerActivity,
 };
+use std::sync::{LazyLock, Mutex};
+
+static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn batch(rows: &[(i64, i64)]) -> ArrowZSet {
+    weighted_batch(
+        &rows
+            .iter()
+            .map(|&(key, value)| (key, value, 1))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn weighted_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
     ArrowZSet::new(
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -30,12 +42,13 @@ fn batch(rows: &[(i64, i64)]) -> ArrowZSet {
             ],
         )
         .unwrap(),
-        vec![1; rows.len()],
+        rows.iter().map(|row| row.2).collect(),
     )
 }
 
 #[test]
 fn classic_and_factorized_work_counters_are_exact() {
+    let _guard = METRICS_TEST_LOCK.lock().unwrap();
     metrics::reset_all();
     let context = R1ExecutionContext {
         worker_id: WorkerId(1),
@@ -182,6 +195,101 @@ fn classic_and_factorized_work_counters_are_exact() {
             WorkerId(1),
             R1WorkerActivity {
                 state_writes: 7,
+                ..Default::default()
+            },
+        )]
+    );
+}
+
+#[test]
+fn test_v0612_execution_counters_reflect_reduced_deltas() {
+    let _guard = METRICS_TEST_LOCK.lock().unwrap();
+    metrics::reset_all();
+    let operator_id = OperatorId(61_202);
+    let op = AggregateOp::new(operator_id);
+    let context = R1ExecutionContext {
+        worker_id: WorkerId(1),
+        workload_id: WorkloadId(7),
+        shard_id: ShardId(9),
+    };
+
+    let (initial, update) = metrics::with_r1_execution_context(context, || {
+        let initial = op
+            .process_delta_with_result(weighted_batch(&[(1, 10, 1)]))
+            .unwrap();
+        let update = op
+            .process_delta_with_result(weighted_batch(&[
+                (1, 10, -1),
+                (1, 20, 1),
+                (1, 20, -1),
+                (1, 40, 1),
+            ]))
+            .unwrap();
+        (initial, update)
+    });
+
+    let rows = |result: &rockstream_ops::op::OperatorEpochResult| {
+        let keys = result
+            .output_delta
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let sums = result
+            .output_delta
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let counts = result
+            .output_delta
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let avgs = result
+            .output_delta
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        (0..result.output_delta.num_rows())
+            .map(|row| {
+                (
+                    keys.value(row),
+                    sums.value(row),
+                    counts.value(row),
+                    avgs.value(row),
+                    result.output_delta.weights[row],
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(rows(&initial), vec![(1, 10, 1, 10.0, 1)]);
+    assert_eq!(
+        rows(&update),
+        vec![(1, 10, 1, 10.0, -1), (1, 40, 1, 40.0, 1)]
+    );
+    assert_eq!(
+        metrics::r1_execution_snapshot(),
+        vec![(
+            R1ExecutionKey {
+                worker_id: WorkerId(1),
+                workload_id: WorkloadId(7),
+                shard_id: ShardId(9),
+                operator_id,
+                strategy: R1ExecutionStrategy::Classic,
+            },
+            R1ExecutionCounters {
+                input_deltas: 5,
+                arrangement_probes: 2,
+                output_deltas: 3,
+                changed_state_writes: 2,
                 ..Default::default()
             },
         )]

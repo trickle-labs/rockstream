@@ -13,4 +13,6 @@ Authoritative operational, architectural, protocol, and parser limits enforced a
 | `MAX_IDENTIFIER_LEN` | Identifier Length Limit | 63 | bytes | SQL parser / lexer | `sql_parse_errors_total` | `RS-1012` | Maximum byte length of SQL identifiers |
 | `MAX_DECIMAL_PRECISION` | Decimal Precision Limit | 38 | digits | SQL type checker | `sql_type_errors_total` | `RS-1016` | Maximum digits of precision for DECIMAL/NUMERIC types |
 | `MAX_VIEW_DAG_DEPTH` | View Dependency DAG Depth | 16 | levels | View compiler DAG validator | `view_compilation_errors_total` | `RS-1011` | Maximum depth of materialized view-on-view dependency hierarchy |
-
+| `MAX_EPOCH_CONSOLIDATION_GROUPS` | Epoch Consolidation Group Limit | 1000000 | groups | Aggregate epoch staging | `AggregateOp::consolidation_groups()` | `RS-1015` | Maximum distinct aggregate groups staged in one logical epoch |
+| `MAX_EPOCH_CONSOLIDATION_BYTES` | Epoch Consolidation Memory Limit | 67108864 | bytes | Aggregate epoch staging | `AggregateOp::consolidation_bytes()` | `RS-1015` | Maximum estimated aggregate staging memory in one logical epoch |
+| `MAX_AGGREGATE_RESTORE_BYTES` | Aggregate Restore Scan Limit | 67108864 | bytes | Aggregate arrangement restore | `load_from_storage` / `restore_in_place` | `RS-0001` | Maximum aggregate arrangement bytes read during one restore scan |

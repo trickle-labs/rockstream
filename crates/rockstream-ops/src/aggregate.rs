@@ -33,6 +33,7 @@
 //! to restore state.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -220,6 +221,31 @@ impl AggState {
         (self.entries.len() * 24) as u64
     }
 
+    /// Lookup state for a group key.
+    pub fn get(&self, k: &i64) -> Option<(i64, i64)> {
+        self.entries.get(k).copied()
+    }
+
+    /// Insert or update state for a group key.
+    pub fn insert(&mut self, k: i64, val: (i64, i64)) {
+        self.entries.insert(k, val);
+    }
+
+    /// Remove a group key from state.
+    pub fn remove(&mut self, k: &i64) -> Option<(i64, i64)> {
+        self.entries.remove(k)
+    }
+
+    /// Check if state contains a group key.
+    pub fn contains_key(&self, k: &i64) -> bool {
+        self.entries.contains_key(k)
+    }
+
+    /// Immutable reference to the underlying entries map.
+    pub fn entries(&self) -> &HashMap<i64, (i64, i64)> {
+        &self.entries
+    }
+
     /// Apply one delta `(key, value_delta * weight)` to the arrangement.
     ///
     /// Returns `(old_state, new_state)` where each is `Option<(sum, count)>`.
@@ -246,7 +272,12 @@ impl AggState {
                     .ok_or_else(|| OpError::aggregate_overflow(k))?,
             )
             .ok_or_else(|| OpError::aggregate_overflow(k))?;
-        let new_count = old_count + w;
+        let new_count = old_count
+            .checked_add(w)
+            .ok_or_else(|| OpError::aggregate_overflow(k))?;
+        if new_count < 0 {
+            return Err(OpError::invalid_multiplicity(k, new_count));
+        }
 
         let new_state = if new_count != 0 {
             self.entries.insert(k, (new_sum, new_count));
@@ -342,6 +373,118 @@ impl AggState {
     }
 }
 
+// ─── StagedEpochAggregator ──────────────────────────────────────────────────
+
+/// Named upper bound for epoch consolidation distinct group keys.
+pub const MAX_EPOCH_CONSOLIDATION_GROUPS: usize = 1_000_000;
+/// Named upper bound for epoch consolidation staging memory (64 MiB).
+pub const MAX_EPOCH_CONSOLIDATION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AGGREGATE_RESTORE_BYTES: usize = 64 * 1024 * 1024;
+
+/// In-memory staged accumulator for epoch group input consolidation.
+/// Consolidates inputs per group key `k`, computes net sum/count in i128/i64,
+/// and enforces checked arithmetic and strict resource bounds.
+#[derive(Debug, Clone)]
+pub struct StagedEpochAggregator {
+    /// Group key -> (net_delta_sum in i128, net_delta_count in i64).
+    pub entries: HashMap<i64, (i128, i64)>,
+    /// Insertion order of group keys for deterministic output ordering.
+    pub order: Vec<i64>,
+    max_groups: usize,
+    max_bytes: usize,
+    estimated_bytes: usize,
+}
+
+impl StagedEpochAggregator {
+    pub fn new() -> Self {
+        Self::with_limits(
+            MAX_EPOCH_CONSOLIDATION_GROUPS,
+            MAX_EPOCH_CONSOLIDATION_BYTES,
+        )
+    }
+
+    pub fn with_limits(max_groups: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: Vec::new(),
+            max_groups,
+            max_bytes,
+            estimated_bytes: 0,
+        }
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        self.estimated_bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Ingest a single (key, value, weight) delta.
+    ///
+    /// Checks:
+    /// 1. Weight != 0 (weight == 0 is a no-op).
+    /// 2. Per-row multiplication overflow: `v.checked_mul(w)`.
+    /// 3. Resource bounds: group count limit and byte memory limit.
+    /// 4. Net group delta accumulation in i128 (sum) and i64 (count).
+    pub fn ingest_delta(&mut self, k: i64, v: i64, w: i64) -> Result<(), OpError> {
+        if w == 0 {
+            return Ok(());
+        }
+
+        // Per-row multiplication checked strictly upon ingestion
+        let prod = v
+            .checked_mul(w)
+            .ok_or_else(|| OpError::aggregate_overflow(k))?;
+
+        if let Some((sum, count)) = self.entries.get_mut(&k) {
+            *sum = sum
+                .checked_add(prod as i128)
+                .ok_or_else(|| OpError::aggregate_overflow(k))?;
+            *count = count
+                .checked_add(w)
+                .ok_or_else(|| OpError::aggregate_overflow(k))?;
+        } else {
+            if self.entries.len() >= self.max_groups {
+                return Err(OpError::capacity_exceeded(
+                    "epoch consolidation groups",
+                    self.entries.len() + 1,
+                    self.max_groups,
+                    "reduce epoch distinct groups or increase MAX_EPOCH_CONSOLIDATION_GROUPS",
+                ));
+            }
+
+            // Approximate memory: 8 bytes key + 24 bytes (i128, i64) + 8 bytes order + 24 bytes map overhead = 64 bytes
+            const ENTRY_ESTIMATED_BYTES: usize = 64;
+            if self.estimated_bytes + ENTRY_ESTIMATED_BYTES > self.max_bytes {
+                return Err(OpError::capacity_exceeded(
+                    "epoch consolidation bytes",
+                    self.estimated_bytes + ENTRY_ESTIMATED_BYTES,
+                    self.max_bytes,
+                    "reduce epoch batch size or increase MAX_EPOCH_CONSOLIDATION_BYTES",
+                ));
+            }
+
+            self.entries.insert(k, (prod as i128, w));
+            self.order.push(k);
+            self.estimated_bytes += ENTRY_ESTIMATED_BYTES;
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for StagedEpochAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─── AggregateOp ─────────────────────────────────────────────────────────────
 
 /// Stateful incremental aggregate operator.
@@ -354,16 +497,20 @@ pub struct AggregateOp {
     state: Mutex<AggState>,
     dirty_keys: Mutex<std::collections::HashSet<i64>>,
     pub op_id: OperatorId,
+    max_groups: AtomicUsize,
+    max_bytes: AtomicUsize,
+    last_consolidation_groups: AtomicUsize,
+    last_consolidation_bytes: AtomicUsize,
 }
 
 impl AggregateOp {
-    /// Create a new aggregate operator with empty state.
+    /// Create a new aggregate operator with default consolidation limits and empty state.
     pub fn new(op_id: OperatorId) -> Self {
-        AggregateOp {
-            state: Mutex::new(AggState::new()),
-            dirty_keys: Mutex::new(std::collections::HashSet::new()),
+        Self::with_limits(
             op_id,
-        }
+            MAX_EPOCH_CONSOLIDATION_GROUPS,
+            MAX_EPOCH_CONSOLIDATION_BYTES,
+        )
     }
 
     /// Create from pre-loaded state (used after loading from storage).
@@ -372,7 +519,48 @@ impl AggregateOp {
             state: Mutex::new(state),
             dirty_keys: Mutex::new(std::collections::HashSet::new()),
             op_id,
+            max_groups: AtomicUsize::new(MAX_EPOCH_CONSOLIDATION_GROUPS),
+            max_bytes: AtomicUsize::new(MAX_EPOCH_CONSOLIDATION_BYTES),
+            last_consolidation_groups: AtomicUsize::new(0),
+            last_consolidation_bytes: AtomicUsize::new(0),
         }
+    }
+
+    /// Create with custom consolidation limits.
+    pub fn with_limits(op_id: OperatorId, max_groups: usize, max_bytes: usize) -> Self {
+        AggregateOp {
+            state: Mutex::new(AggState::new()),
+            dirty_keys: Mutex::new(std::collections::HashSet::new()),
+            op_id,
+            max_groups: AtomicUsize::new(max_groups),
+            max_bytes: AtomicUsize::new(max_bytes),
+            last_consolidation_groups: AtomicUsize::new(0),
+            last_consolidation_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    /// Set consolidation limits dynamically.
+    pub fn set_limits(&self, max_groups: usize, max_bytes: usize) {
+        self.max_groups.store(max_groups, Ordering::Relaxed);
+        self.max_bytes.store(max_bytes, Ordering::Relaxed);
+    }
+
+    /// Observable occupancy: distinct groups touched in the last epoch consolidation.
+    pub fn consolidation_groups(&self) -> usize {
+        self.last_consolidation_groups.load(Ordering::Relaxed)
+    }
+
+    /// Observable occupancy: estimated byte memory used in the last epoch consolidation.
+    pub fn consolidation_bytes(&self) -> usize {
+        self.last_consolidation_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Mark the current dirty-key set durable after its caller's batch commits.
+    pub fn clear_dirty_keys(&self) {
+        self.dirty_keys
+            .lock()
+            .expect("AggregateOp dirty-key mutex poisoned")
+            .clear();
     }
 
     /// Number of live groups (fill-level metric).
@@ -397,10 +585,15 @@ impl AggregateOp {
     /// Restore an `AggregateOp` from a `ShardDb` (called at shard startup).
     pub async fn load_from_storage(db: &ShardDb, op_id: OperatorId) -> Result<Self, OpError> {
         let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
-        let (entries, _truncated) = db
-            .scan_prefix_bounded(&prefix, 64 * 1024 * 1024) // 64 MB cap
+        let (entries, truncated) = db
+            .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
             .await
             .map_err(OpError::storage)?;
+        if truncated {
+            return Err(OpError::internal(format!(
+                "aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
+            )));
+        }
         let state = AggState::decode_from_entries(&entries, op_id);
         Ok(Self::with_state(op_id, state))
     }
@@ -413,10 +606,15 @@ impl AggregateOp {
     /// to rebuild the pipeline around a freshly-returned instance).
     pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
         let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, self.op_id.0);
-        let (entries, _truncated) = db
-            .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
+        let (entries, truncated) = db
+            .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
             .await
             .map_err(OpError::storage)?;
+        if truncated {
+            return Err(OpError::internal(format!(
+                "aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
+            )));
+        }
         let state = AggState::decode_from_entries(&entries, self.op_id);
         *self.state.lock().expect("AggregateOp mutex poisoned") = state;
         Ok(())
@@ -441,17 +639,28 @@ impl AggregateOp {
             ));
         }
 
-        // Validate input schema: need at least 2 Int64 columns (k, v).
+        // Validate input schema: need at least 2 columns (k, v).
         if delta.data.num_columns() < 2 {
             return Err(OpError::column_out_of_bounds(1, delta.data.num_columns()));
         }
 
-        let k_col = delta
-            .data
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
+        let k_raw = delta.data.column(0);
+        let k_col_owned = if let Some(arr) = k_raw.as_any().downcast_ref::<Int64Array>() {
+            arr.clone()
+        } else if let Ok(cast_arr) = arrow::compute::cast(k_raw.as_ref(), &DataType::Int64) {
+            cast_arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .cloned()
+                .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?
+        } else {
+            return Err(OpError::column_type_mismatch(
+                "Int64",
+                format!("{:?}", k_raw.data_type()),
+            ));
+        };
+        let k_col = &k_col_owned;
+
         let v_raw = delta.data.column(1);
         let v_col_owned = if let Some(arr) = v_raw.as_any().downcast_ref::<Int64Array>() {
             arr.clone()
@@ -459,9 +668,16 @@ impl AggregateOp {
             Int64Array::from(
                 (0..arr.len())
                     .map(|row| {
-                        i64::try_from(arr.value(row)).map_err(|_| {
-                            OpError::column_type_mismatch("Decimal128 fitting Int64", "Decimal128")
-                        })
+                        if arr.is_null(row) {
+                            Ok(0)
+                        } else {
+                            i64::try_from(arr.value(row)).map_err(|_| {
+                                OpError::column_type_mismatch(
+                                    "Decimal128 fitting Int64",
+                                    "Decimal128",
+                                )
+                            })
+                        }
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             )
@@ -476,7 +692,15 @@ impl AggregateOp {
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
                 .unwrap();
-            let ints: Vec<i64> = (0..f_arr.len()).map(|r| f_arr.value(r) as i64).collect();
+            let ints: Vec<i64> = (0..f_arr.len())
+                .map(|r| {
+                    if f_arr.is_null(r) {
+                        0
+                    } else {
+                        f_arr.value(r) as i64
+                    }
+                })
+                .collect();
             Int64Array::from(ints)
         } else {
             return Err(OpError::column_type_mismatch(
@@ -488,58 +712,121 @@ impl AggregateOp {
 
         let n = delta.num_rows();
 
-        let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
-            std::collections::HashMap::new();
-        let mut order: Vec<(i64, i64)> = Vec::new();
+        let max_groups = self.max_groups.load(Ordering::Relaxed);
+        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
+        let mut staged = StagedEpochAggregator::with_limits(max_groups, max_bytes);
+
         for row in 0..n {
+            if k_col.is_null(row) || v_col.is_null(row) || v_raw.is_null(row) {
+                continue;
+            }
             let k = k_col.value(row);
             let v = v_col.value(row);
             let w = delta.weights[row];
-            let entry = consolidated.entry((k, v)).or_insert_with(|| {
-                order.push((k, v));
-                0
-            });
-            *entry += w;
-        }
-
-        let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_avg: Vec<f64> = Vec::with_capacity(order.len() * 2);
-        let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
-
-        let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
-        let mut dirty_keys = std::collections::HashSet::new();
-
-        for (k, v) in &order {
-            let k = *k;
-            let v = *v;
-            let w = consolidated[&(k, v)];
             if w == 0 {
                 continue;
             }
+            staged.ingest_delta(k, v, w)?;
+        }
 
-            let (old_state, new_state) = state.apply_delta(k, v, w)?;
-            dirty_keys.insert(k);
+        self.last_consolidation_groups
+            .store(staged.group_count(), Ordering::Relaxed);
+        self.last_consolidation_bytes
+            .store(staged.estimated_bytes(), Ordering::Relaxed);
 
-            // Retract old aggregate row.
-            if let Some((old_sum, old_count)) = old_state {
+        struct GroupTransition {
+            key: i64,
+            old_state: Option<(i64, i64)>,
+            new_state: Option<(i64, i64)>,
+            changed: bool,
+        }
+
+        let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
+        let mut transitions = Vec::with_capacity(staged.order.len());
+
+        for &k in &staged.order {
+            let (delta_sum, delta_count) = staged.entries[&k];
+            let old = state.entries.get(&k).copied();
+            let (old_sum, old_count) = old.unwrap_or((0, 0));
+            let old_state = if old_count > 0 {
+                Some((old_sum, old_count))
+            } else {
+                None
+            };
+
+            if delta_sum == 0 && delta_count == 0 {
+                transitions.push(GroupTransition {
+                    key: k,
+                    old_state,
+                    new_state: old_state,
+                    changed: false,
+                });
+                continue;
+            }
+
+            let new_count = old_count
+                .checked_add(delta_count)
+                .ok_or_else(|| OpError::aggregate_overflow(k))?;
+            if new_count < 0 {
+                return Err(OpError::invalid_multiplicity(k, new_count));
+            }
+
+            let new_state = if new_count > 0 {
+                let old_sum_128 = old_sum as i128;
+                let total_sum_128 = old_sum_128
+                    .checked_add(delta_sum)
+                    .ok_or_else(|| OpError::aggregate_overflow(k))?;
+                let new_sum =
+                    i64::try_from(total_sum_128).map_err(|_| OpError::aggregate_overflow(k))?;
+                Some((new_sum, new_count))
+            } else {
+                None
+            };
+
+            let changed = old_state != new_state;
+            transitions.push(GroupTransition {
+                key: k,
+                old_state,
+                new_state,
+                changed,
+            });
+        }
+
+        let mut out_k: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
+        let mut out_sum: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
+        let mut out_count: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
+        let mut out_avg: Vec<f64> = Vec::with_capacity(transitions.len() * 2);
+        let mut out_weights: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
+        let mut dirty_keys = std::collections::HashSet::new();
+
+        for t in transitions {
+            if !t.changed {
+                continue;
+            }
+
+            dirty_keys.insert(t.key);
+
+            // Retract old aggregate row
+            if let Some((old_sum, old_count)) = t.old_state {
                 let old_avg = avg_from_sum_count(old_sum, old_count).unwrap_or(0.0);
-                out_k.push(k);
+                out_k.push(t.key);
                 out_sum.push(old_sum);
                 out_count.push(old_count);
                 out_avg.push(old_avg);
                 out_weights.push(-1);
             }
 
-            // Insert new aggregate row.
-            if let Some((new_sum, new_count)) = new_state {
+            // Insert new aggregate row
+            if let Some((new_sum, new_count)) = t.new_state {
+                state.entries.insert(t.key, (new_sum, new_count));
                 let new_avg = avg_from_sum_count(new_sum, new_count).unwrap_or(0.0);
-                out_k.push(k);
+                out_k.push(t.key);
                 out_sum.push(new_sum);
                 out_count.push(new_count);
                 out_avg.push(new_avg);
                 out_weights.push(1);
+            } else {
+                state.entries.remove(&t.key);
             }
         }
 
@@ -929,16 +1216,11 @@ pub async fn load_frontier(db: &ShardDb) -> Result<Option<u64>, OpError> {
     }
 }
 
-/// Persist the full aggregate state to `ShardDb`, cleaning up stale entries.
+/// Append the aggregate's dirty-key mutations to a caller-owned write batch.
 ///
-/// This is the canonical state-persistence call for `AggregateOp`.  It:
-/// 1. Scans all existing `op_state` entries for `op_id`.
-/// 2. Deletes entries whose group keys are no longer in the live state.
-/// 3. Writes all current live entries.
-///
-/// This scan-and-delete pattern satisfies the "no range deletion" constraint.
-///
-/// Call this after each epoch commit to ensure storage reflects current state.
+/// The caller commits the batch atomically with the epoch's other writes.
+/// This path touches only keys changed since the previous append and uses
+/// point deletes for removed groups.
 pub async fn append_agg_state(
     _db: &ShardDb,
     op: &AggregateOp,
@@ -965,10 +1247,6 @@ pub async fn append_agg_state(
             }
         }
     }
-    op.dirty_keys
-        .lock()
-        .expect("AggregateOp dirty-key mutex poisoned")
-        .clear();
     Ok(())
 }
 
@@ -979,6 +1257,7 @@ pub async fn persist_agg_state(db: &ShardDb, op: &AggregateOp) -> Result<(), OpE
     if !batch.is_empty() {
         db.write_batch(batch).await.map_err(OpError::storage)?;
     }
+    op.clear_dirty_keys();
     Ok(())
 }
 
@@ -1172,21 +1451,11 @@ mod tests {
         };
         assert_eq!(
             rows(&sum),
-            vec![
-                (1, "10.25".to_string(), 1),
-                (1, "10.25".to_string(), -1),
-                (1, "15.75".to_string(), 1),
-                (2, "3.75".to_string(), 1),
-            ]
+            vec![(1, "15.75".to_string(), 1), (2, "3.75".to_string(), 1),]
         );
         assert_eq!(
             rows(&avg),
-            vec![
-                (1, "10.25".to_string(), 1),
-                (1, "10.25".to_string(), -1),
-                (1, "7.875".to_string(), 1),
-                (2, "3.75".to_string(), 1),
-            ]
+            vec![(1, "7.875".to_string(), 1), (2, "3.75".to_string(), 1),]
         );
     }
 
@@ -1238,20 +1507,14 @@ mod tests {
         let delta = make_batch(&[(1, 5, 1), (2, 20, 1), (1, 3, 1)]);
         let out = op.process_delta(delta).unwrap();
         let rows = extract_rows(&out);
-        // Process k=1,v=5: no old → insert (k=1, sum=5, count=1, avg=5).
-        // Process k=2,v=20: no old → insert (k=2, sum=20, count=1, avg=20).
-        // Process k=1,v=3: old=(5,1) → retract (k=1,5,1,5,-1), insert (k=1,8,2,4,+1).
+        // Consolidated in epoch:
+        // k=1: 5 + 3 = 8, count = 2 -> insert (k=1, sum=8, count=2, avg=4)
+        // k=2: 20, count = 1 -> insert (k=2, sum=20, count=1, avg=20)
+        // Zero intermediate retractions or insertions emitted.
+        assert_eq!(rows, vec![(1, 8, 2, 4.0, 1), (2, 20, 1, 20.0, 1)]);
         assert!(
             rows.contains(&(2, 20, 1, 20.0, 1)),
             "k=2 insert missing: {rows:?}"
-        );
-        assert!(
-            rows.contains(&(1, 5, 1, 5.0, -1)),
-            "k=1 first retract missing: {rows:?}"
-        );
-        assert!(
-            rows.contains(&(1, 8, 2, 4.0, 1)),
-            "k=1 final insert missing: {rows:?}"
         );
         assert_eq!(op.live_groups(), 2);
     }

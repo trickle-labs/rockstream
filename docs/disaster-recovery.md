@@ -27,6 +27,11 @@ materialized view with complete sorted-row comparisons and confirm the restored
 checkpoint epoch, catalog, topology, leases, connector offsets, and source
 resume positions.
 
+Aggregate arrangements are restored from their dirty-key mutations. A crash
+before the epoch commit must leave no acknowledged partial epoch; retrying the
+same input must produce the same final multiset without duplicate deltas,
+stale values, or resurrected groups.
+
 Never reuse a target containing another active generation. `RS-5035` means the
 export is incomplete, malformed, truncated, or inconsistent; leave the target
 offline, correct object-store access or replace the export, and retry into fresh

@@ -3420,6 +3420,11 @@ impl GatewayHandler {
             .commit_attachment(&lease, &lifecycle, m3)
             .await
             .map_err(source_backfill_error)?;
+        if let Some(join) = &compiled.join {
+            join.pipeline.ack_persisted_state();
+        } else {
+            compiled.pipeline.ack_persisted_state();
+        }
         coordinator.attach_alias(source.name.clone());
         if let Some(output) = output {
             self.catalog.update_backfill_progress(
@@ -4381,6 +4386,15 @@ impl GatewayHandler {
             .commit_replayable_epoch(&lease, epoch, offset, &lifecycles, m3)
             .await
             .map_err(source_backfill_error)?;
+        for view_name in &affected {
+            if let Some(compiled) = self.compiled_views.get(view_name) {
+                if let Some(join) = &compiled.join {
+                    join.pipeline.ack_persisted_state();
+                } else {
+                    compiled.pipeline.ack_persisted_state();
+                }
+            }
+        }
         coordinator.cleanup_committed(shard_db).await?;
         for route in &envelope.route_updates {
             let existing_columns = self
@@ -4663,6 +4677,11 @@ impl GatewayHandler {
             .commit_backfill_epoch(lease, epoch, offset, lifecycle, m3)
             .await
             .map_err(source_backfill_error)?;
+        if let Some(join) = &compiled.join {
+            join.pipeline.ack_persisted_state();
+        } else {
+            compiled.pipeline.ack_persisted_state();
+        }
         self.catalog.update_backfill_progress(
             view_name,
             epoch.to_string(),

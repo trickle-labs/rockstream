@@ -1867,13 +1867,22 @@ mod tests {
         let compiled = compile_plan(&plan, db, &table_schemas).unwrap();
         let batch = ArrowZSet::from_ab_rows(&[(1, 10), (1, 20), (2, 5)], 1);
         let out = compiled.pipeline.process(batch).unwrap();
-        // k=1 has two distinct (k,v) pairs in this single batch, each
-        // processed sequentially by AggregateOp's per-(k,v) consolidation:
-        // the first (1,10) emits 1 insert row; the second (1,20) emits a
-        // retract-old + insert-new pair (2 rows) since group k=1 already
-        // existed after the first. k=2 (new group) emits 1 insert row.
-        // Total: 1 + 2 + 1 = 4.
-        assert_eq!(out.num_rows(), 4);
+        let keys = out
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let sums = out
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let rows = (0..out.num_rows())
+            .map(|row| (keys.value(row), sums.value(row), out.weights[row]))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![(1, 30, 1), (2, 5, 1)]);
     }
 
     #[tokio::test]

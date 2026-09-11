@@ -93,7 +93,7 @@ coverage-gate:
 	cargo llvm-cov report --package rockstream-diff --fail-under-lines 76
 	cargo llvm-cov report --package rockstream-diff --fail-under-regions 71
 	cargo llvm-cov report --package rockstream-ops --fail-under-lines 81
-cargo llvm-cov report --package rockstream-ops --fail-under-regions 81
+	cargo llvm-cov report --package rockstream-ops --fail-under-regions 81
 	cargo llvm-cov report --package rockstream-storage --fail-under-lines 75
 	cargo llvm-cov report --package rockstream-storage --fail-under-regions 75
 	cargo llvm-cov report --package rockstream-runtime --fail-under-lines 76

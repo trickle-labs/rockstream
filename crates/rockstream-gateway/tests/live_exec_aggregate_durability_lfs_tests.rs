@@ -142,3 +142,72 @@ async fn compiled_aggregate_state_persists_across_restart_lfs() {
         "post-restart commit should accumulate on top of the persisted pre-restart state"
     );
 }
+
+#[tokio::test]
+async fn test_v0612_aggregate_persists_across_restart_lfs() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let shard_path = "v0612-aggregate-durability-lfs";
+
+    let (port, handle, shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE bid (id BIGINT, category BIGINT, price BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW cat_sum AS SELECT category, SUM(price) FROM bid GROUP BY category",
+        )
+        .await
+        .unwrap();
+
+    // Epoch 1: Initial groups 10, 20, 30
+    client
+        .simple_query(
+            "INSERT INTO bid (id, category, price) VALUES (1, 10, 100), (2, 20, 50), (3, 30, 25)",
+        )
+        .await
+        .unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+
+    // Epoch 2: Repeated updates to group 10, net unchanged update to 20
+    client
+        .simple_query(
+            "INSERT INTO bid (id, category, price) VALUES (4, 10, 50), (5, 20, 10), (6, 20, -10)",
+        )
+        .await
+        .unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+
+    shard_db.flush().await.unwrap();
+    handle.abort();
+
+    // Restart: reopen the same on-disk shard
+    let (port2, _handle2, shard_db2) = start_gateway(shard_path, store, catalog).await;
+    let client2 = connect_port(port2).await;
+    shard_db2.flush().await.unwrap();
+
+    let restored = read_view_state(&client2, "cat_sum").await;
+    assert_eq!(
+        restored,
+        HashMap::from([(10, 150), (20, 50), (30, 25)]),
+        "restored state must match exact pre-restart multiset"
+    );
+
+    // Post-restart commit accumulates properly on top of restored state
+    client2
+        .simple_query("INSERT INTO bid (id, category, price) VALUES (7, 10, 200)")
+        .await
+        .unwrap();
+    client2.simple_query("COMMIT").await.unwrap();
+
+    let after = read_view_state(&client2, "cat_sum").await;
+    assert_eq!(
+        after,
+        HashMap::from([(10, 350), (20, 50), (30, 25)]),
+        "post-restart updates accumulate onto restored state"
+    );
+}

@@ -237,6 +237,10 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Reduce value magnitudes or switch to a wider numeric type.
 
+Aggregate epoch updates are staged before state or dirty-key mutations are
+applied. Overflow, invalid multiplicity, malformed input, and consolidation
+capacity errors therefore reject the whole epoch without a partial state write.
+
 ### <a id="rs-1017"></a> `RS-1017` — MIN/MAX multiset retraction underflow: value has no positive weight
 
 - **Key**: `aggregate.retraction_underflow`

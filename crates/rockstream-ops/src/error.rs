@@ -101,6 +101,28 @@ pub enum OpError {
     )]
     TopKBufferOverflow { limit: usize, code: ErrorCode },
 
+    /// Epoch consolidation capacity exceeded (groups or bytes limit reached).
+    #[error(
+        "[{code}] Consolidation capacity exceeded for {resource} ({current}/{limit}); next_steps: {next_steps}"
+    )]
+    CapacityExceeded {
+        resource: &'static str,
+        current: usize,
+        limit: usize,
+        next_steps: &'static str,
+        code: ErrorCode,
+    },
+
+    /// Invalid multiplicity: count dropped below zero in aggregate consolidation.
+    #[error(
+        "[{code}] Invalid multiplicity for group key {group_key}: count dropped below zero to {count}; next_steps: ensure every retraction is matched by a prior insertion"
+    )]
+    InvalidMultiplicity {
+        group_key: i64,
+        count: i64,
+        code: ErrorCode,
+    },
+
     /// Hop-window state exceeded its configured overlap-aware bound.
     #[error(
         "[{code}] Hop window state bound exceeded ({current}/{limit} rows); next_steps: reduce hop overlap, increase HOP_WINDOW_STATE_LIMIT, or shard the windowed stream more finely"
@@ -322,6 +344,31 @@ impl OpError {
         Self::TopKBufferOverflow {
             limit,
             code: RS_1018,
+        }
+    }
+
+    pub fn capacity_exceeded(
+        resource: &'static str,
+        current: usize,
+        limit: usize,
+        next_steps: &'static str,
+    ) -> Self {
+        use rockstream_types::error_code::RS_1015;
+        Self::CapacityExceeded {
+            resource,
+            current,
+            limit,
+            next_steps,
+            code: RS_1015,
+        }
+    }
+
+    pub fn invalid_multiplicity(group_key: i64, count: i64) -> Self {
+        use rockstream_types::error_code::RS_1017;
+        Self::InvalidMultiplicity {
+            group_key,
+            count,
+            code: RS_1017,
         }
     }
 

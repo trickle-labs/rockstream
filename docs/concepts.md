@@ -141,6 +141,11 @@ committed together. This is important: either everything from epoch 42
 landed safely, or none of it did. There is no "halfway through epoch 42"
 state visible to anyone.
 
+Aggregate maintenance applies the same epoch boundary. Repeated changes to one
+group are consolidated before the old and final aggregate rows are emitted.
+When the final value equals the value at the start of the epoch, no output
+delta or dirty-key write is produced.
+
 Once the batch commits, the operator publishes a small piece of metadata
 called a **frontier**: a promise that says "I have finished epoch 42 and
 I will not send you any older updates." Downstream consumers — other

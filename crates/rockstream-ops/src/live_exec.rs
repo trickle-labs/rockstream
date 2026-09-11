@@ -371,6 +371,14 @@ impl Stage {
         }
     }
 
+    fn ack_persisted_state(&self) {
+        match self {
+            Stage::Aggregate(op) => op.clear_dirty_keys(),
+            Stage::MultiAggregate(op) => op.ack_persisted_state(),
+            _ => {}
+        }
+    }
+
     /// Load each stateful stage's persisted arrangement from `db` into the
     /// stage's already-constructed op instance, in place (used by
     /// `GatewayHandler::recover_compiled_views` after a process restart —
@@ -1135,11 +1143,18 @@ impl StatefulPipeline {
 
     /// Append state without committing it. Source backfill combines this with
     /// output, checkpoint, cursor, lifecycle, and frontier in one M3 batch.
+    /// Call `ack_persisted_state` only after that enclosing batch commits.
     pub async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
         for stage in &self.stages {
             stage.append_state(db, target).await?;
         }
         Ok(())
+    }
+
+    pub fn ack_persisted_state(&self) {
+        for stage in &self.stages {
+            stage.ack_persisted_state();
+        }
     }
 
     /// Load every stateful stage's persisted arrangement from `db` into
@@ -1342,6 +1357,12 @@ impl MultiAggregatePipeline {
             join.append_state(target)?;
         }
         Ok(())
+    }
+
+    pub fn ack_persisted_state(&self) {
+        for lane in &self.lanes {
+            lane.ack_persisted_state();
+        }
     }
 
     pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
@@ -1595,6 +1616,17 @@ impl JoinPipeline {
             stage.append_state(db, target).await?;
         }
         Ok(())
+    }
+
+    pub fn ack_persisted_state(&self) {
+        for stage in self
+            .left_pre
+            .iter()
+            .chain(&self.right_pre)
+            .chain(&self.post)
+        {
+            stage.ack_persisted_state();
+        }
     }
 
     /// Load the join's persisted arrangement(s), and any stateful pre/post
