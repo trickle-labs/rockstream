@@ -18187,7 +18187,8 @@ fn build_table_row_key(pk_cols: &[String], cols: &[String], vals: &[String]) -> 
         build_pk_row_key(pk_cols, cols, vals)
     } else {
         let id = NEXT_HEAP_ROW_ID.fetch_add(1, Ordering::Relaxed);
-        format!("__heap_{id}")
+        let uuid = generate_uuid_v4_string();
+        format!("__heap_{uuid}_{id}")
     }
 }
 
