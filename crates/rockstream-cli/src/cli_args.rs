@@ -487,7 +487,7 @@ pub enum ConfigCommand {
         #[arg(long)]
         file: Option<PathBuf>,
         /// Include source origin annotations in the printed configuration.
-        #[arg(long)]
+        #[arg(long, visible_alias = "origins")]
         show_origins: bool,
         #[arg(long)]
         min_epoch_ms: Option<u64>,

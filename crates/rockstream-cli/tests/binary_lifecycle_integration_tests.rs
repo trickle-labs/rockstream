@@ -242,3 +242,291 @@ async fn test_binary_lifecycle_gateway_worker_control_roles() {
 
     control_handle.shutdown();
 }
+
+#[tokio::test]
+async fn test_invalid_config_fails_before_port_bind() {
+    let dir = TempDir::new().unwrap();
+    let uncreated_storage = dir.path().join("never-created-storage");
+
+    let test_port = get_free_port();
+    let test_addr = format!("127.0.0.1:{test_port}");
+
+    // 1. Invalid listen address fails with RS-0002 before creating storage directory
+    let invalid_listen_opts = StartOptions {
+        storage: uncreated_storage.clone(),
+        role: "all".to_string(),
+        control: None,
+        auth_mode: "off".to_string(),
+        worker_location: WorkerLocation::default(),
+        worker_capabilities: WorkerCapabilities::default(),
+        config: RockstreamConfig::default(),
+        metrics_addr: None,
+        listen_addr: Some("999.999.999.999:5432".to_string()),
+        raft_peers: None,
+        raft_node_id: None,
+        raft_bind: None,
+        raft_bootstrap: false,
+        daemon: false,
+        worker_id: None,
+        control_bind: None,
+        control_shared_storage: None,
+        query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: Some(5),
+    };
+
+    let err = run_start(&invalid_listen_opts).unwrap_err();
+    assert_eq!(err.code, rockstream_types::error_code::RS_0002);
+    assert!(
+        !uncreated_storage.exists(),
+        "Storage directory must not be created on validation failure"
+    );
+
+    // 2. Invalid metrics address fails with RS-0002 before creating storage directory
+    let invalid_metrics_opts = StartOptions {
+        storage: uncreated_storage.clone(),
+        role: "all".to_string(),
+        control: None,
+        auth_mode: "off".to_string(),
+        worker_location: WorkerLocation::default(),
+        worker_capabilities: WorkerCapabilities::default(),
+        config: RockstreamConfig::default(),
+        metrics_addr: Some("999.999.999.999:9090".to_string()),
+        listen_addr: Some(test_addr.clone()),
+        raft_peers: None,
+        raft_node_id: None,
+        raft_bind: None,
+        raft_bootstrap: false,
+        daemon: false,
+        worker_id: None,
+        control_bind: None,
+        control_shared_storage: None,
+        query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: Some(5),
+    };
+
+    let err = run_start(&invalid_metrics_opts).unwrap_err();
+    assert_eq!(err.code, rockstream_types::error_code::RS_0002);
+    assert!(
+        !uncreated_storage.exists(),
+        "Storage directory must not be created on validation failure"
+    );
+
+    // Verify the test port is still unbound and can be bound immediately
+    let listener =
+        std::net::TcpListener::bind(&test_addr).expect("port must remain completely unbound");
+    drop(listener);
+
+    // 3. Worker role without control URL fails before binding
+    let missing_control_opts = StartOptions {
+        storage: uncreated_storage.clone(),
+        role: "worker".to_string(),
+        control: None,
+        auth_mode: "off".to_string(),
+        worker_location: WorkerLocation::default(),
+        worker_capabilities: WorkerCapabilities::default(),
+        config: RockstreamConfig::default(),
+        metrics_addr: Some(test_addr.clone()),
+        listen_addr: None,
+        raft_peers: None,
+        raft_node_id: None,
+        raft_bind: None,
+        raft_bootstrap: false,
+        daemon: false,
+        worker_id: None,
+        control_bind: None,
+        control_shared_storage: None,
+        query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: Some(5),
+    };
+
+    let err = run_start(&missing_control_opts).unwrap_err();
+    assert_eq!(err.code, rockstream_types::error_code::RS_0002);
+    assert!(
+        !uncreated_storage.exists(),
+        "Storage directory must not be created on validation failure"
+    );
+
+    // 4. Unknown auth mode fails before binding
+    let invalid_auth_opts = StartOptions {
+        storage: uncreated_storage.clone(),
+        role: "all".to_string(),
+        control: None,
+        auth_mode: "magic".to_string(),
+        worker_location: WorkerLocation::default(),
+        worker_capabilities: WorkerCapabilities::default(),
+        config: RockstreamConfig::default(),
+        metrics_addr: Some(test_addr.clone()),
+        listen_addr: None,
+        raft_peers: None,
+        raft_node_id: None,
+        raft_bind: None,
+        raft_bootstrap: false,
+        daemon: false,
+        worker_id: None,
+        control_bind: None,
+        control_shared_storage: None,
+        query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: Some(5),
+    };
+
+    let err = run_start(&invalid_auth_opts).unwrap_err();
+    assert_eq!(err.code, rockstream_types::error_code::RS_0002);
+    assert!(
+        !uncreated_storage.exists(),
+        "Storage directory must not be created on validation failure"
+    );
+}
+
+#[tokio::test]
+async fn test_all_roles_startup_and_lifecycle_traces() {
+    // Verify that every supported role can be initialized and produces valid lifecycle traces
+    for role in &["all", "control", "worker", "gateway", "metrics"] {
+        let mut config = rockstream_types::config::NodeConfig::default();
+        config.node.role = role.to_string();
+        let runtime = rockstream_cli::component::NodeRuntime::new(config);
+        assert!(
+            runtime.is_ok(),
+            "NodeRuntime for role {role} must initialize cleanly"
+        );
+        let mut rt = runtime.unwrap();
+        assert_eq!(
+            rt.tracker().state(),
+            rockstream_types::lifecycle::LifecycleState::Created
+        );
+        let start_res = rt.start().await;
+        assert!(start_res.is_ok(), "Start for role {role} must succeed");
+        assert_eq!(
+            rt.tracker().state(),
+            rockstream_types::lifecycle::LifecycleState::Ready
+        );
+        let shutdown_res = rt.shutdown().await;
+        assert!(
+            shutdown_res.is_ok(),
+            "Shutdown for role {role} must succeed"
+        );
+        assert_eq!(
+            rt.tracker().state(),
+            rockstream_types::lifecycle::LifecycleState::Stopped
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_server_roles_remain_alive_until_explicit_signal() {
+    let dir = TempDir::new().unwrap();
+    let storage_dir = dir.path().join("server-alive-storage");
+    std::fs::create_dir_all(&storage_dir).unwrap();
+
+    let metrics_port = get_free_port();
+    let pg_port = get_free_port();
+    let metrics_addr = format!("127.0.0.1:{metrics_port}");
+    let listen_addr = format!("127.0.0.1:{pg_port}");
+
+    let opts = StartOptions {
+        storage: storage_dir.clone(),
+        role: "all".to_string(),
+        control: None,
+        auth_mode: "off".to_string(),
+        worker_location: WorkerLocation::default(),
+        worker_capabilities: WorkerCapabilities::default(),
+        config: RockstreamConfig::default(),
+        metrics_addr: Some(metrics_addr.clone()),
+        listen_addr: Some(listen_addr.clone()),
+        raft_peers: None,
+        raft_node_id: None,
+        raft_bind: None,
+        raft_bootstrap: false,
+        daemon: false,
+        worker_id: None,
+        control_bind: None,
+        control_shared_storage: None,
+        query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: Some(5),
+    };
+
+    // Set a controlled test duration via ROCKSTREAM_E2E_SLEEP_MS to prove server remains alive beyond old 50ms default
+    std::env::set_var("ROCKSTREAM_E2E_SLEEP_MS", "400");
+
+    let server_thread = std::thread::spawn(move || run_start(&opts));
+
+    let m_addr: SocketAddr = metrics_addr.parse().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut reached_ready = false;
+    while std::time::Instant::now() < deadline {
+        if let Some((code, _)) = send_http_get(m_addr, "/ready").await {
+            if code == 200 {
+                reached_ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(reached_ready, "Server must reach Ready (HTTP 200)");
+
+    // At 150ms (well past the old 50ms premature exit), verify server is STILL alive
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (live_status, _) = send_http_get(m_addr, "/live").await.expect("still alive");
+    assert_eq!(live_status, 200, "Server must remain alive beyond 50ms");
+
+    // Wait for the server thread to finish clean shutdown
+    let res = server_thread.join().expect("server thread join");
+    assert!(res.is_ok(), "Server must exit cleanly: {:?}", res);
+}
+
+#[tokio::test]
+async fn test_graceful_shutdown_drains_work_within_deadline() {
+    let mut config = rockstream_types::config::NodeConfig::default();
+    config.node.role = "all".to_string();
+    config.runtime.shutdown_timeout_secs = 5;
+
+    let mut runtime = rockstream_cli::component::NodeRuntime::new(config).expect("runtime");
+    runtime.start().await.expect("start");
+    assert_eq!(
+        runtime.tracker().state(),
+        rockstream_types::lifecycle::LifecycleState::Ready
+    );
+
+    let shutdown_start = std::time::Instant::now();
+    runtime.shutdown().await.expect("clean shutdown");
+    let elapsed = shutdown_start.elapsed();
+
+    assert_eq!(
+        runtime.tracker().state(),
+        rockstream_types::lifecycle::LifecycleState::Stopped
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "Shutdown must complete within configured deadline"
+    );
+}
+
+#[tokio::test]
+async fn test_watchdog_enforces_shutdown_timeout() {
+    use rockstream_types::lifecycle::LifecycleTracker;
+    use std::sync::atomic::Ordering;
+    rockstream_cli::shutdown::SUPPRESS_PROCESS_EXIT.store(true, Ordering::SeqCst);
+
+    let tracker = Arc::new(LifecycleTracker::new("worker"));
+    let coordinator = rockstream_cli::shutdown::ShutdownCoordinator::new(
+        tracker.clone(),
+        Duration::from_millis(60),
+    );
+
+    tracker.set_state(rockstream_types::lifecycle::LifecycleState::Ready);
+    coordinator.trigger_shutdown();
+    assert_eq!(
+        tracker.state(),
+        rockstream_types::lifecycle::LifecycleState::Draining
+    );
+
+    let watchdog = coordinator.spawn_watchdog();
+    // Intentionally do not call mark_completed()
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let _ = watchdog.await;
+
+    assert_eq!(
+        tracker.state(),
+        rockstream_types::lifecycle::LifecycleState::Fatal,
+        "Watchdog must transition tracker to Fatal when deadline is exceeded"
+    );
+}

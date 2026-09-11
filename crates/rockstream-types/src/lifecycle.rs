@@ -12,83 +12,122 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleState {
+    Created,
     Starting,
+    Recovering,
     Ready,
-    Degraded,
-    DependencyLoss,
     Draining,
-    ShuttingDown,
-    Terminated,
+    Stopping,
+    Stopped,
     Fatal,
+
+    #[deprecated(note = "Legacy state; use Ready with HealthReason")]
+    Degraded,
+    #[deprecated(note = "Legacy state; use Fatal")]
+    DependencyLoss,
+    #[deprecated(note = "Legacy state; use Stopping")]
+    ShuttingDown,
+    #[deprecated(note = "Legacy state; use Stopped")]
+    Terminated,
 }
 
 impl LifecycleState {
-    const CODE_STARTING: u8 = 0;
-    const CODE_READY: u8 = 1;
-    const CODE_DEGRADED: u8 = 2;
-    const CODE_DEPENDENCY_LOSS: u8 = 3;
+    const CODE_CREATED: u8 = 0;
+    const CODE_STARTING: u8 = 1;
+    const CODE_RECOVERING: u8 = 2;
+    const CODE_READY: u8 = 3;
     const CODE_DRAINING: u8 = 4;
-    const CODE_SHUTTING_DOWN: u8 = 5;
-    const CODE_TERMINATED: u8 = 6;
+    const CODE_STOPPING: u8 = 5;
+    const CODE_STOPPED: u8 = 6;
     const CODE_FATAL: u8 = 7;
+    const CODE_DEGRADED: u8 = 8;
+    const CODE_DEPENDENCY_LOSS: u8 = 9;
+    const CODE_SHUTTING_DOWN: u8 = 10;
+    const CODE_TERMINATED: u8 = 11;
 
+    #[allow(deprecated)]
     pub fn to_u8(self) -> u8 {
         match self {
+            Self::Created => Self::CODE_CREATED,
             Self::Starting => Self::CODE_STARTING,
+            Self::Recovering => Self::CODE_RECOVERING,
             Self::Ready => Self::CODE_READY,
+            Self::Draining => Self::CODE_DRAINING,
+            Self::Stopping => Self::CODE_STOPPING,
+            Self::Stopped => Self::CODE_STOPPED,
+            Self::Fatal => Self::CODE_FATAL,
             Self::Degraded => Self::CODE_DEGRADED,
             Self::DependencyLoss => Self::CODE_DEPENDENCY_LOSS,
-            Self::Draining => Self::CODE_DRAINING,
             Self::ShuttingDown => Self::CODE_SHUTTING_DOWN,
             Self::Terminated => Self::CODE_TERMINATED,
-            Self::Fatal => Self::CODE_FATAL,
         }
     }
 
+    #[allow(deprecated)]
     pub fn from_u8(code: u8) -> Self {
         match code {
+            Self::CODE_CREATED => Self::Created,
             Self::CODE_STARTING => Self::Starting,
+            Self::CODE_RECOVERING => Self::Recovering,
             Self::CODE_READY => Self::Ready,
+            Self::CODE_DRAINING => Self::Draining,
+            Self::CODE_STOPPING => Self::Stopping,
+            Self::CODE_STOPPED => Self::Stopped,
+            Self::CODE_FATAL => Self::Fatal,
             Self::CODE_DEGRADED => Self::Degraded,
             Self::CODE_DEPENDENCY_LOSS => Self::DependencyLoss,
-            Self::CODE_DRAINING => Self::Draining,
             Self::CODE_SHUTTING_DOWN => Self::ShuttingDown,
             Self::CODE_TERMINATED => Self::Terminated,
             _ => Self::Fatal,
         }
     }
 
+    #[allow(deprecated)]
     pub fn is_alive(&self) -> bool {
-        !matches!(self, LifecycleState::Terminated)
+        !matches!(
+            self,
+            LifecycleState::Stopped | LifecycleState::Fatal | LifecycleState::Terminated
+        )
     }
 
+    #[allow(deprecated)]
     pub fn is_ready(&self) -> bool {
         matches!(self, LifecycleState::Ready | LifecycleState::Degraded)
     }
 
+    #[allow(deprecated)]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Created => "created",
             Self::Starting => "starting",
+            Self::Recovering => "recovering",
             Self::Ready => "ready",
-            Self::Degraded => "degraded",
-            Self::DependencyLoss => "unhealthy",
             Self::Draining => "draining",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Fatal => "fatal",
+            Self::Degraded => "degraded",
+            Self::DependencyLoss => "dependency_loss",
             Self::ShuttingDown => "shutting_down",
             Self::Terminated => "terminated",
-            Self::Fatal => "fatal",
         }
     }
 
+    #[allow(deprecated)]
     pub fn health_status_str(&self) -> &'static str {
         match self {
+            Self::Created => "created",
             Self::Starting => "starting",
+            Self::Recovering => "recovering",
             Self::Ready => "healthy",
+            Self::Draining => "draining",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Fatal => "fatal",
             Self::Degraded => "degraded",
             Self::DependencyLoss => "unhealthy",
-            Self::Draining => "draining",
             Self::ShuttingDown => "shutting_down",
             Self::Terminated => "terminated",
-            Self::Fatal => "fatal",
         }
     }
 
@@ -100,10 +139,58 @@ impl LifecycleState {
         }
     }
 
+    #[allow(deprecated)]
+    pub fn live_http_code(&self) -> u16 {
+        match self {
+            Self::Fatal => 500,
+            Self::Stopped | Self::Terminated => 503,
+            _ => 200,
+        }
+    }
+
+    #[allow(deprecated)]
     pub fn health_http_code(&self) -> u16 {
         match self {
             Self::Ready | Self::Degraded => 200,
+            Self::Fatal => 500,
             _ => 503,
+        }
+    }
+
+    #[allow(deprecated)]
+    pub fn can_transition_to(&self, next: LifecycleState) -> bool {
+        match (*self, next) {
+            (s, LifecycleState::Fatal)
+                if s != LifecycleState::Fatal
+                    && s != LifecycleState::Stopped
+                    && s != LifecycleState::Terminated =>
+            {
+                true
+            }
+            (LifecycleState::Created, LifecycleState::Starting) => true,
+            (LifecycleState::Starting, LifecycleState::Recovering) => true,
+            (LifecycleState::Recovering, LifecycleState::Ready) => true,
+            (LifecycleState::Ready, LifecycleState::Draining) => true,
+            (LifecycleState::Draining, LifecycleState::Stopping) => true,
+            (LifecycleState::Stopping, LifecycleState::Stopped) => true,
+            // Legacy transitions
+            (LifecycleState::Ready, LifecycleState::Degraded) => true,
+            (LifecycleState::Degraded, LifecycleState::Ready) => true,
+            (LifecycleState::Ready, LifecycleState::DependencyLoss) => true,
+            (LifecycleState::Draining, LifecycleState::ShuttingDown) => true,
+            (LifecycleState::ShuttingDown, LifecycleState::Terminated) => true,
+            _ => false,
+        }
+    }
+
+    pub fn transition_to(&self, next: LifecycleState) -> Result<(), String> {
+        if self.can_transition_to(next) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Illegal lifecycle transition from {:?} to {:?}",
+                self, next
+            ))
         }
     }
 }
@@ -201,11 +288,16 @@ pub struct LifecycleTracker {
 }
 
 impl LifecycleTracker {
-    /// Create a new tracker starting in `LifecycleState::Starting`.
+    /// Create a new tracker starting in `LifecycleState::Created`.
     pub fn new(role: impl Into<String>) -> Self {
+        Self::new_with_state(role, LifecycleState::Created)
+    }
+
+    /// Create a new tracker starting in an explicit state.
+    pub fn new_with_state(role: impl Into<String>, state: LifecycleState) -> Self {
         Self {
             role: role.into(),
-            state: AtomicU8::new(LifecycleState::Starting.to_u8()),
+            state: AtomicU8::new(state.to_u8()),
             active_shards: AtomicUsize::new(0),
             start_time: Instant::now(),
             identity: CandidateIdentity::current(),
@@ -224,6 +316,19 @@ impl LifecycleTracker {
 
     pub fn set_state(&self, state: LifecycleState) {
         self.state.store(state.to_u8(), Ordering::SeqCst);
+    }
+
+    pub fn transition_to(&self, next: LifecycleState) -> Result<(), String> {
+        let current = self.state();
+        if current.can_transition_to(next) {
+            self.set_state(next);
+            Ok(())
+        } else {
+            Err(format!(
+                "Illegal lifecycle transition from {:?} to {:?}",
+                current, next
+            ))
+        }
     }
 
     pub fn is_alive(&self) -> bool {
@@ -277,21 +382,13 @@ impl LifecycleTracker {
 
     pub fn generate_live_response(&self) -> (u16, LiveResponse) {
         let state = self.state();
-        if state.is_alive() {
-            (
-                200,
-                LiveResponse {
-                    status: "alive".to_string(),
-                },
-            )
+        let code = state.live_http_code();
+        let status = if code == 200 {
+            "alive".to_string()
         } else {
-            (
-                503,
-                LiveResponse {
-                    status: "terminated".to_string(),
-                },
-            )
-        }
+            state.as_str().to_string()
+        };
+        (code, LiveResponse { status })
     }
 
     pub fn generate_ready_response(&self) -> (u16, ReadyResponse) {
@@ -305,20 +402,11 @@ impl LifecycleTracker {
                 },
             )
         } else {
-            let reason = match state {
-                LifecycleState::Starting => "starting",
-                LifecycleState::DependencyLoss => "dependency_loss",
-                LifecycleState::Draining => "draining",
-                LifecycleState::ShuttingDown => "shutting_down",
-                LifecycleState::Terminated => "terminated",
-                LifecycleState::Fatal => "fatal",
-                _ => "not_ready",
-            };
             (
                 503,
                 ReadyResponse {
                     status: "not_ready".to_string(),
-                    reason: Some(reason.to_string()),
+                    reason: Some(state.as_str().to_string()),
                 },
             )
         }

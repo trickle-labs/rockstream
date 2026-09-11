@@ -155,3 +155,45 @@ fn generated_readme_commands_are_executable() {
         );
     }
 }
+
+#[test]
+fn test_published_configuration_examples_run_in_release() {
+    use rockstream_cli::init::{scaffold_project, InitOptions};
+    use rockstream_types::config_resolver::{CliConfigOverrides, ConfigResolver};
+    use rockstream_types::config_validation::validate_config_str;
+    use tempfile::TempDir;
+
+    let root = repo_root();
+
+    // 1. Scaffold project template rockstream.toml and validate it cleanly
+    let temp_dir = TempDir::new().expect("tempdir");
+    let proj_dir = temp_dir.path().join("template_check");
+    let opts = InitOptions {
+        name: "template_check".to_string(),
+        template: "local".to_string(),
+        dir: Some(proj_dir.clone()),
+        force: false,
+    };
+    scaffold_project(&opts).expect("scaffold");
+
+    let template_toml =
+        fs::read_to_string(proj_dir.join("rockstream.toml")).expect("read template toml");
+    let report = validate_config_str(&template_toml, false);
+    assert!(
+        report.diagnostics.is_empty(),
+        "scaffolded project rockstream.toml must validate with zero diagnostics, got: {:?}",
+        report.diagnostics
+    );
+
+    // 2. Reference app configuration compatibility
+    let ref_app_cfg = root.join("examples/reference-app/rockstream.toml");
+    if ref_app_cfg.exists() {
+        let empty_overrides = CliConfigOverrides::default();
+        let resolved = ConfigResolver::resolve(Some(&ref_app_cfg), &empty_overrides);
+        assert!(
+            resolved.is_ok(),
+            "reference app configuration must resolve successfully: {:?}",
+            resolved.err()
+        );
+    }
+}

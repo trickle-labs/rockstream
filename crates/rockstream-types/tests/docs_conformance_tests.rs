@@ -106,3 +106,27 @@ fn test_configuration_doc_matches_rockstream_config_defaults() {
          key as a documented default, but ClusterConfig has no corresponding field"
     );
 }
+
+#[test]
+fn test_configuration_doc_matches_node_config_defaults() {
+    let node_cfg = rockstream_types::config::NodeConfig::default();
+    assert_eq!(node_cfg.version, 1);
+    assert_eq!(node_cfg.node.role, "all");
+    assert_eq!(node_cfg.gateway.listen_addr, "127.0.0.1:5432");
+    assert_eq!(
+        node_cfg.control.listen_addr,
+        Some("127.0.0.1:9200".to_string())
+    );
+    assert_eq!(node_cfg.worker.execution_threads, 1);
+    assert_eq!(node_cfg.worker.segment_cache_bytes, 536870912);
+    assert_eq!(node_cfg.worker.max_rows_per_quantum, 1000);
+    assert_eq!(node_cfg.storage.url.to_string(), "file://./data");
+    assert_eq!(node_cfg.metrics.listen_addr, "127.0.0.1:9090");
+    assert!(node_cfg.metrics.enabled);
+    assert_eq!(node_cfg.auth.mode, "off");
+    assert_eq!(node_cfg.logging.level, "info");
+    assert_eq!(node_cfg.runtime.shutdown_timeout_secs, 30);
+    assert_eq!(node_cfg.runtime.min_epoch_ms, 10);
+    assert_eq!(node_cfg.runtime.checkpoint_retention_count, 128);
+    assert_eq!(node_cfg.runtime.state_budget_gb, 10);
+}

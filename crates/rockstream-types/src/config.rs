@@ -347,6 +347,602 @@ impl Default for RockstreamConfig {
     }
 }
 
+// ============================================================================
+// v0.62: StorageUrl & NodeConfig (Unified Configuration Architecture)
+// ============================================================================
+
+/// Explicit storage URL representation supporting `file://` and `s3://` schemes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StorageUrl {
+    File(std::path::PathBuf),
+    S3 { bucket: String, prefix: String },
+}
+
+impl StorageUrl {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let trimmed = s.trim();
+        if let Some(rest) = trimmed.strip_prefix("file://") {
+            let path_str = if rest.is_empty() { "." } else { rest };
+            Ok(Self::File(std::path::PathBuf::from(path_str)))
+        } else if let Some(rest) = trimmed.strip_prefix("s3://") {
+            let (bucket, prefix) = match rest.split_once('/') {
+                Some((b, p)) => (b, p),
+                None => (rest, ""),
+            };
+            if bucket.is_empty() {
+                return Err("RS-0002: S3 storage URL missing bucket name".to_string());
+            }
+            Ok(Self::S3 {
+                bucket: bucket.to_string(),
+                prefix: prefix.trim_matches('/').to_string(),
+            })
+        } else if let Some((scheme, _)) = trimmed.split_once("://") {
+            Err(format!(
+                "RS-0002: unsupported storage scheme `{scheme}`; supported schemes are file:// and s3://"
+            ))
+        } else {
+            Ok(Self::File(std::path::PathBuf::from(trimmed)))
+        }
+    }
+
+    pub fn scheme(&self) -> &str {
+        match self {
+            Self::File(_) => "file",
+            Self::S3 { .. } => "s3",
+        }
+    }
+
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File(_))
+    }
+
+    pub fn is_s3(&self) -> bool {
+        matches!(self, Self::S3 { .. })
+    }
+
+    pub fn as_file_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::File(p) => Some(p.as_path()),
+            Self::S3 { .. } => None,
+        }
+    }
+
+    pub fn s3_bucket(&self) -> Option<&str> {
+        match self {
+            Self::S3 { bucket, .. } => Some(bucket.as_str()),
+            Self::File(_) => None,
+        }
+    }
+
+    pub fn s3_prefix(&self) -> Option<&str> {
+        match self {
+            Self::S3 { prefix, .. } => Some(prefix.as_str()),
+            Self::File(_) => None,
+        }
+    }
+
+    pub fn resolve(&self, base_dir: &std::path::Path) -> Self {
+        match self {
+            Self::File(p) => {
+                if p.is_relative() {
+                    Self::File(base_dir.join(p))
+                } else {
+                    self.clone()
+                }
+            }
+            Self::S3 { .. } => self.clone(),
+        }
+    }
+
+    pub fn resolve_relative(&self, base_dir: &std::path::Path) -> Self {
+        self.resolve(base_dir)
+    }
+
+    pub fn verify_accessible(&self) -> Result<(), String> {
+        match self {
+            Self::File(p) => {
+                std::fs::create_dir_all(p).map_err(|e| {
+                    format!(
+                        "RS-0003: storage directory inaccessible `{}`: {e}",
+                        p.display()
+                    )
+                })?;
+                Ok(())
+            }
+            Self::S3 { bucket, .. } => {
+                if bucket.is_empty() {
+                    return Err("RS-0003: S3 storage bucket cannot be empty".to_string());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for StorageUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(p) => {
+                let p_str = p.to_string_lossy();
+                if p_str.starts_with('/') || p_str.starts_with('.') {
+                    write!(f, "file://{p_str}")
+                } else {
+                    write!(f, "file://./{p_str}")
+                }
+            }
+            Self::S3 { bucket, prefix } => {
+                if prefix.is_empty() {
+                    write!(f, "s3://{bucket}")
+                } else {
+                    write!(f, "s3://{bucket}/{prefix}")
+                }
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for StorageUrl {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl Default for StorageUrl {
+    fn default() -> Self {
+        Self::File(std::path::PathBuf::from("./data"))
+    }
+}
+
+impl Serialize for StorageUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageUrl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeSection {
+    #[serde(default = "default_node_role")]
+    pub role: String,
+    #[serde(default)]
+    pub host_id: Option<String>,
+    #[serde(default)]
+    pub availability_zone: Option<String>,
+}
+
+fn default_node_role() -> String {
+    "all".to_string()
+}
+
+impl Default for NodeSection {
+    fn default() -> Self {
+        Self {
+            role: default_node_role(),
+            host_id: None,
+            availability_zone: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GatewayTlsConfig {
+    #[serde(default)]
+    pub cert_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub ca_cert_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewaySection {
+    #[serde(default = "default_gateway_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default = "default_gateway_max_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_gateway_query_timeout_secs")]
+    pub query_timeout_secs: u64,
+    #[serde(default)]
+    pub tls: GatewayTlsConfig,
+    #[serde(default)]
+    pub webhook_listen_addr: Option<String>,
+}
+
+fn default_gateway_listen_addr() -> String {
+    "127.0.0.1:5432".to_string()
+}
+
+fn default_gateway_max_connections() -> usize {
+    1024
+}
+
+fn default_gateway_query_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for GatewaySection {
+    fn default() -> Self {
+        Self {
+            listen_addr: default_gateway_listen_addr(),
+            max_connections: default_gateway_max_connections(),
+            query_timeout_secs: default_gateway_query_timeout_secs(),
+            tls: GatewayTlsConfig::default(),
+            webhook_listen_addr: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RaftSection {
+    #[serde(default)]
+    pub peers: Vec<String>,
+    #[serde(default)]
+    pub node_id: Option<u64>,
+    #[serde(default)]
+    pub bind: Option<String>,
+    #[serde(default)]
+    pub bootstrap: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlSection {
+    #[serde(default = "default_control_listen_addr")]
+    pub listen_addr: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub shared_storage: Option<String>,
+    #[serde(default)]
+    pub raft: Option<RaftSection>,
+}
+
+fn default_control_listen_addr() -> Option<String> {
+    Some("127.0.0.1:9200".to_string())
+}
+
+impl Default for ControlSection {
+    fn default() -> Self {
+        Self {
+            listen_addr: default_control_listen_addr(),
+            url: None,
+            shared_storage: None,
+            raft: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerSection {
+    #[serde(default)]
+    pub worker_id: Option<u64>,
+    #[serde(default = "default_worker_execution_threads")]
+    pub execution_threads: usize,
+    #[serde(default = "default_worker_segment_cache_bytes")]
+    pub segment_cache_bytes: usize,
+    #[serde(default = "default_worker_max_rows_per_quantum")]
+    pub max_rows_per_quantum: usize,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+fn default_worker_execution_threads() -> usize {
+    1
+}
+
+fn default_worker_segment_cache_bytes() -> usize {
+    536870912
+}
+
+fn default_worker_max_rows_per_quantum() -> usize {
+    1000
+}
+
+impl Default for WorkerSection {
+    fn default() -> Self {
+        Self {
+            worker_id: None,
+            execution_threads: default_worker_execution_threads(),
+            segment_cache_bytes: default_worker_segment_cache_bytes(),
+            max_rows_per_quantum: default_worker_max_rows_per_quantum(),
+            capabilities: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StorageSection {
+    #[serde(default)]
+    pub url: StorageUrl,
+    #[serde(default)]
+    pub temp_dir: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub spill_dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricsSection {
+    #[serde(default = "default_metrics_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_scrape_interval_secs")]
+    pub scrape_interval_secs: u64,
+}
+
+fn default_metrics_listen_addr() -> String {
+    "127.0.0.1:9090".to_string()
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+fn default_metrics_scrape_interval_secs() -> u64 {
+    15
+}
+
+impl Default for MetricsSection {
+    fn default() -> Self {
+        Self {
+            listen_addr: default_metrics_listen_addr(),
+            enabled: default_metrics_enabled(),
+            scrape_interval_secs: default_metrics_scrape_interval_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthSection {
+    #[serde(default = "default_auth_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub secret_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub admin_user: Option<String>,
+}
+
+fn default_auth_mode() -> String {
+    "off".to_string()
+}
+
+impl Default for AuthSection {
+    fn default() -> Self {
+        Self {
+            mode: default_auth_mode(),
+            secret_path: None,
+            admin_user: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoggingSection {
+    #[serde(default = "default_logging_level")]
+    pub level: String,
+    #[serde(default = "default_logging_format")]
+    pub format: String,
+}
+
+fn default_logging_level() -> String {
+    "info".to_string()
+}
+
+fn default_logging_format() -> String {
+    "text".to_string()
+}
+
+impl Default for LoggingSection {
+    fn default() -> Self {
+        Self {
+            level: default_logging_level(),
+            format: default_logging_format(),
+        }
+    }
+}
+
+fn default_min_epoch_ms() -> u64 {
+    10
+}
+
+fn default_checkpoint_retention_count() -> u32 {
+    128
+}
+
+fn default_state_budget_gb() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSection {
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
+    #[serde(default = "default_min_epoch_ms")]
+    pub min_epoch_ms: u64,
+    #[serde(default = "default_checkpoint_retention_count")]
+    pub checkpoint_retention_count: u32,
+    #[serde(default = "default_state_budget_gb")]
+    pub state_budget_gb: u64,
+}
+
+impl Default for RuntimeSection {
+    fn default() -> Self {
+        Self {
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            min_epoch_ms: default_min_epoch_ms(),
+            checkpoint_retention_count: default_checkpoint_retention_count(),
+            state_budget_gb: default_state_budget_gb(),
+        }
+    }
+}
+
+/// The unified, authoritative RockStream node configuration (v0.62).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeConfig {
+    #[serde(default = "default_config_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub node: NodeSection,
+    #[serde(default)]
+    pub gateway: GatewaySection,
+    #[serde(default)]
+    pub control: ControlSection,
+    #[serde(default)]
+    pub worker: WorkerSection,
+    #[serde(default)]
+    pub storage: StorageSection,
+    #[serde(default)]
+    pub metrics: MetricsSection,
+    #[serde(default)]
+    pub auth: AuthSection,
+    #[serde(default)]
+    pub logging: LoggingSection,
+    #[serde(default)]
+    pub runtime: RuntimeSection,
+}
+
+fn default_config_version() -> u32 {
+    1
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            version: default_config_version(),
+            node: NodeSection::default(),
+            gateway: GatewaySection::default(),
+            control: ControlSection::default(),
+            worker: WorkerSection::default(),
+            storage: StorageSection::default(),
+            metrics: MetricsSection::default(),
+            auth: AuthSection::default(),
+            logging: LoggingSection::default(),
+            runtime: RuntimeSection::default(),
+        }
+    }
+}
+
+impl From<&RockstreamConfig> for NodeConfig {
+    fn from(cfg: &RockstreamConfig) -> Self {
+        Self {
+            version: 1,
+            node: NodeSection {
+                role: "all".to_string(),
+                host_id: None,
+                availability_zone: None,
+            },
+            gateway: GatewaySection {
+                listen_addr: "127.0.0.1:5432".to_string(),
+                max_connections: 1024,
+                query_timeout_secs: 60,
+                tls: GatewayTlsConfig {
+                    cert_path: cfg.gateway.tls_cert_path.clone(),
+                    key_path: cfg.gateway.tls_key_path.clone(),
+                    ca_cert_path: cfg.gateway.tls_ca_cert_path.clone(),
+                },
+                webhook_listen_addr: cfg.gateway.webhook_listen_addr.clone(),
+            },
+            control: ControlSection::default(),
+            worker: WorkerSection {
+                worker_id: None,
+                execution_threads: cfg.worker.execution_threads,
+                segment_cache_bytes: cfg.worker.segment_cache_bytes,
+                max_rows_per_quantum: cfg.worker.max_rows_per_quantum,
+                capabilities: Vec::new(),
+            },
+            storage: StorageSection::default(),
+            metrics: MetricsSection::default(),
+            auth: AuthSection::default(),
+            logging: LoggingSection::default(),
+            runtime: RuntimeSection {
+                shutdown_timeout_secs: cfg.cluster.shutdown_timeout_secs,
+                min_epoch_ms: cfg.cluster.min_epoch_ms,
+                checkpoint_retention_count: cfg.cluster.checkpoint_retention_count,
+                state_budget_gb: cfg.cluster.state_budget_gb,
+            },
+        }
+    }
+}
+
+impl From<RockstreamConfig> for NodeConfig {
+    fn from(cfg: RockstreamConfig) -> Self {
+        Self::from(&cfg)
+    }
+}
+
+impl From<&NodeConfig> for RockstreamConfig {
+    fn from(node: &NodeConfig) -> Self {
+        let mut cfg = RockstreamConfig::default();
+        cfg.cluster.shutdown_timeout_secs = node.runtime.shutdown_timeout_secs;
+        cfg.cluster.min_epoch_ms = node.runtime.min_epoch_ms;
+        cfg.cluster.checkpoint_retention_count = node.runtime.checkpoint_retention_count;
+        cfg.cluster.state_budget_gb = node.runtime.state_budget_gb;
+        cfg.worker.execution_threads = node.worker.execution_threads;
+        cfg.worker.segment_cache_bytes = node.worker.segment_cache_bytes;
+        cfg.worker.max_rows_per_quantum = node.worker.max_rows_per_quantum;
+        cfg.gateway.tls_cert_path = node.gateway.tls.cert_path.clone();
+        cfg.gateway.tls_key_path = node.gateway.tls.key_path.clone();
+        cfg.gateway.tls_ca_cert_path = node.gateway.tls.ca_cert_path.clone();
+        cfg.gateway.webhook_listen_addr = node.gateway.webhook_listen_addr.clone();
+        cfg
+    }
+}
+
+impl From<NodeConfig> for RockstreamConfig {
+    fn from(node: NodeConfig) -> Self {
+        Self::from(&node)
+    }
+}
+
+impl NodeConfig {
+    pub fn load_from_str(s: &str) -> Result<Self, String> {
+        if s.contains("version")
+            || s.contains("[node]")
+            || s.contains("[gateway]")
+            || s.contains("[control]")
+            || s.contains("[storage]")
+            || s.contains("[runtime]")
+        {
+            if let Ok(cfg) = toml::from_str::<NodeConfig>(s) {
+                return Ok(cfg);
+            }
+        }
+        match toml::from_str::<RockstreamConfig>(s) {
+            Ok(legacy) => Ok(NodeConfig::from(&legacy)),
+            Err(_) => toml::from_str::<NodeConfig>(s).map_err(|err| err.to_string()),
+        }
+    }
+
+    pub fn to_string(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
+    }
+
+    pub fn validate(&self, check_files: bool) -> crate::config_validation::ConfigValidationReport {
+        let mut diagnostics = Vec::new();
+        crate::config_validation::validate_node_config_semantic_bounds(
+            self,
+            check_files,
+            &mut diagnostics,
+        );
+        let valid = diagnostics
+            .iter()
+            .all(|d| d.severity != crate::config_validation::ConfigDiagnosticSeverity::Error);
+        crate::config_validation::ConfigValidationReport { valid, diagnostics }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -90,12 +90,12 @@ pub async fn start_management_server(
                                     resp_bytes.extend_from_slice(body);
                                     let _ = socket.write_all(&resp_bytes).await;
                                     let _ = socket.flush().await;
-                                } else if req.starts_with("GET /live") {
+                                } else if req.starts_with("GET /live") || req.starts_with("GET /healthz") {
                                     let (code, live) = tracker.generate_live_response();
                                     let resp_bytes = format_http_json_response(code, &live);
                                     let _ = socket.write_all(&resp_bytes).await;
                                     let _ = socket.flush().await;
-                                } else if req.starts_with("GET /ready") {
+                                } else if req.starts_with("GET /ready") || req.starts_with("GET /readyz") {
                                     let (code, ready) = tracker.generate_ready_response();
                                     let resp_bytes = format_http_json_response(code, &ready);
                                     let _ = socket.write_all(&resp_bytes).await;
@@ -160,6 +160,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn live_ready_health_endpoints_work() {
         let tracker = Arc::new(LifecycleTracker::new("worker"));
         let handle = start_management_server("127.0.0.1:0", tracker.clone())

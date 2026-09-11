@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 pub mod cli_args;
 pub mod client;
+pub mod component;
 pub mod demo;
 pub mod doctor;
 pub mod init;
@@ -45,6 +46,10 @@ pub mod transport;
 
 pub use cli_args::{Cli, Command, ConfigCommand, ShellType};
 pub use client::{connect_client, execute_query, run_embedded_query, QueryResult};
+pub use component::{
+    Component, ComponentState, ConnectorSupervisor, ControlComponent, GatewayComponent,
+    LifecycleEvent, MetricsComponent, NodeRuntime, WorkerComponent, LIFECYCLE_EVENT_QUEUE_CAPACITY,
+};
 pub use demo::{run_demo, DemoOptions, DemoOutcome, DemoStep};
 pub use doctor::{
     run_doctor, run_doctor_checks, DiagnosticCheckResult, DiagnosticStatus, DoctorOptions,
@@ -609,6 +614,26 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         ));
     }
 
+    // Pre-validate listen_addr and metrics_addr before creating directories or binding ports
+    if let Some(ref listen) = opts.listen_addr {
+        listen.parse::<std::net::SocketAddr>().map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("invalid --listen address `{listen}`: {e}"),
+                "Pass a valid socket address such as 127.0.0.1:5432.",
+            )
+        })?;
+    }
+    if let Some(ref metrics) = opts.metrics_addr {
+        metrics.parse::<std::net::SocketAddr>().map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("invalid --metrics-addr address `{metrics}`: {e}"),
+                "Pass a valid socket address such as 127.0.0.1:9090.",
+            )
+        })?;
+    }
+
     fs::create_dir_all(&opts.storage).map_err(|e| {
         CliError::new(
             RS_0003,
@@ -651,18 +676,6 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let serve_gateway =
         opts.listen_addr.is_some() && (opts.role == "gateway" || opts.role == "all");
 
-    // Pre-validate the listen address before starting the runtime.
-    if serve_gateway {
-        let listen = opts.listen_addr.as_deref().unwrap_or("127.0.0.1:5432");
-        listen.parse::<std::net::SocketAddr>().map_err(|e| {
-            CliError::new(
-                RS_0002,
-                format!("invalid --listen address `{listen}`: {e}"),
-                "Pass a valid socket address such as 127.0.0.1:5432.",
-            )
-        })?;
-    }
-
     // Start services in a tokio runtime
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
@@ -684,7 +697,13 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         if let Some(metrics_addr) = &opts.metrics_addr {
             let mh = metrics_server::start_management_server(metrics_addr, tracker.clone())
                 .await
-                .unwrap();
+                .map_err(|e| {
+                    CliError::new(
+                        RS_0003,
+                        format!("failed to bind metrics server on `{metrics_addr}`: {e}"),
+                        "Check if the port is already in use or choose a different port.",
+                    )
+                })?;
             tracing::info!(metrics_addr = %mh.local_addr, "metrics server started");
             metrics_handle = Some(mh);
         }
@@ -1006,30 +1025,20 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 }
             }
         } else {
-            // ── No-op / test mode ─────────────────────────────────────────
+            // ── Background role execution (control / worker / metrics) ──
             tracker.set_state(rockstream_types::lifecycle::LifecycleState::Ready);
-            let daemon_mode = opts.daemon || opts.role == "worker";
-            if daemon_mode {
-                let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok());
-                if let Some(sleep_ms) = e2e_sleep {
-                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-                } else {
-                    tracing::info!(
-                        role = %opts.role,
-                        "node running in daemon mode — blocking until shutdown signal"
-                    );
-                    coordinator.wait_for_signal_or_trigger().await;
-                    tracing::info!("shutdown signal received — stopping daemon");
-                }
-            } else {
-                // Allow live interactions to complete, then exit cleanly.
-                let sleep_ms = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(50);
+            let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+            if let Some(sleep_ms) = e2e_sleep {
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            } else {
+                tracing::info!(
+                    role = %opts.role,
+                    "node running in server mode — blocking until shutdown signal"
+                );
+                coordinator.wait_for_signal_or_trigger().await;
+                tracing::info!("shutdown signal received — stopping server");
             }
             let _watchdog = coordinator.spawn_watchdog();
             tracker.set_state(rockstream_types::lifecycle::LifecycleState::Draining);
@@ -1044,7 +1053,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         if let Some(rn) = raft_node_guard {
             rn.shutdown();
         }
-        tracker.set_state(rockstream_types::lifecycle::LifecycleState::ShuttingDown);
+        tracker.set_state(rockstream_types::lifecycle::LifecycleState::Stopping);
         if let Some(mh) = metrics_handle {
             mh.shutdown();
         }

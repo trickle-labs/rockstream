@@ -259,6 +259,19 @@ fn main() -> ExitCode {
             shutdown_timeout_secs,
         } => {
             let overrides = CliConfigOverrides {
+                role: Some(role.to_string()),
+                host_id: host_id.clone(),
+                availability_zone: availability_zone.clone(),
+                listen_addr: Some(listen.clone()),
+                control_bind: control_bind.clone(),
+                control_url: control.clone(),
+                control_shared_storage: control_shared_storage
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+                worker_id,
+                storage_url: Some(storage.to_string_lossy().to_string()),
+                metrics_addr: metrics_addr.clone(),
+                auth_mode: Some(auth.to_string()),
                 min_epoch_ms,
                 checkpoint_retention_count,
                 state_budget_gb,
@@ -273,7 +286,7 @@ fn main() -> ExitCode {
                 same_host_shm_segment_bytes,
                 same_host_shm_segments_per_peer,
                 max_exchange_compression_states,
-                webhook_listen_addr: webhook_listen,
+                webhook_listen_addr: webhook_listen.clone(),
                 tls_cert_path: cli.tls_cert_path.clone(),
                 tls_key_path: cli.tls_key_path.clone(),
                 tls_ca_cert_path: cli.tls_ca_cert_path.clone(),
@@ -281,6 +294,7 @@ fn main() -> ExitCode {
                 internal_tls_key_path: cli.internal_tls_key_path.clone(),
                 internal_tls_ca_cert_path: cli.internal_tls_ca_cert_path.clone(),
                 shutdown_timeout_secs,
+                ..Default::default()
             };
             let config = match rockstream_types::config_resolver::ConfigResolver::resolve(
                 None, &overrides,
@@ -669,6 +683,7 @@ fn main() -> ExitCode {
                     internal_tls_key_path: cli.internal_tls_key_path.clone(),
                     internal_tls_ca_cert_path: cli.internal_tls_ca_cert_path.clone(),
                     shutdown_timeout_secs: None,
+                    ..Default::default()
                 };
                 handle_result(
                     run_config_print_effective(format, file.as_deref(), show_origins, &overrides),

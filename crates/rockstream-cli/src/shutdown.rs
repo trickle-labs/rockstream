@@ -66,7 +66,7 @@ impl ShutdownCoordinator {
     /// Mark shutdown as successfully completed (cancels watchdog panic/exit).
     pub fn mark_completed(&self) {
         self.is_completed.store(true, Ordering::SeqCst);
-        self.tracker.set_state(LifecycleState::Terminated);
+        self.tracker.set_state(LifecycleState::Stopped);
     }
 
     /// Spawns an asynchronous watchdog timer. If shutdown takes longer than

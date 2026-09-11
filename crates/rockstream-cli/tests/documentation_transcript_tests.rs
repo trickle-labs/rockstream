@@ -176,15 +176,19 @@ fn local_init_transcript_and_layout_are_exact() {
         (
             "rockstream.toml",
             r#"# RockStream Configuration — Local Standalone Deployment
+version = 1
+
+[node]
+role = "all"
+
 [gateway]
-listen = "127.0.0.1:5432"
+listen_addr = "127.0.0.1:5432"
 
 [storage]
-backend = "lfs"
-path = "./storage"
+url = "file://./data"
 
 [metrics]
-listen = "127.0.0.1:9090"
+listen_addr = "127.0.0.1:9090"
 enabled = true
 
 [logging]

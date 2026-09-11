@@ -260,3 +260,122 @@ tls_key_path = "{}"
         .iter()
         .any(|d| d.path == "gateway.tls_key_path" && d.code == "RS-0002"));
 }
+
+#[test]
+fn test_unknown_section_and_key_typo_suggestions() {
+    // 1. Unknown section typo: [gateawy] -> suggestion: [gateway]
+    let toml_section_typo = r#"
+version = 1
+
+[gateawy]
+listen_addr = "127.0.0.1:5432"
+"#;
+    let report1 = validate_config_str(toml_section_typo, false);
+    assert!(!report1.valid);
+    let diag1 = report1
+        .diagnostics
+        .iter()
+        .find(|d| d.path == "gateawy")
+        .expect("diagnostic for unknown section gateawy");
+    assert_eq!(diag1.code, "RS-0002");
+    assert_eq!(diag1.suggestion.as_deref(), Some("Did you mean `gateway`?"));
+    assert!(diag1.line.is_some());
+    assert!(diag1.column.is_some());
+
+    // 2. Unknown key typo: lisetn -> suggestion: listen_addr
+    let toml_key_typo = r#"
+version = 1
+
+[gateway]
+lisetn = "127.0.0.1:5432"
+"#;
+    let report2 = validate_config_str(toml_key_typo, false);
+    assert!(!report2.valid);
+    let diag2 = report2
+        .diagnostics
+        .iter()
+        .find(|d| d.path == "gateway.lisetn")
+        .expect("diagnostic for unknown key lisetn");
+    assert_eq!(diag2.code, "RS-0002");
+    assert_eq!(
+        diag2.suggestion.as_deref(),
+        Some("Did you mean `listen_addr`?")
+    );
+    assert!(diag2.line.is_some());
+    assert!(diag2.column.is_some());
+}
+
+#[test]
+fn test_invalid_version_and_role_diagnostics() {
+    // 1. Unsupported version 2
+    let toml_v2 = r#"
+version = 2
+
+[node]
+role = "all"
+"#;
+    let report_v2 = validate_config_str(toml_v2, false);
+    assert!(!report_v2.valid);
+    let diag_v2 = report_v2
+        .diagnostics
+        .iter()
+        .find(|d| d.path == "version")
+        .expect("diagnostic for version");
+    assert_eq!(diag_v2.code, "RS-0002");
+    assert!(diag_v2
+        .message
+        .contains("unsupported configuration version 2"));
+
+    // 2. Worker role without control URL
+    let toml_worker = r#"
+version = 1
+
+[node]
+role = "worker"
+"#;
+    let report_worker = validate_config_str(toml_worker, false);
+    assert!(!report_worker.valid);
+    let diag_worker = report_worker
+        .diagnostics
+        .iter()
+        .find(|d| d.path == "node.role")
+        .expect("diagnostic for worker role without control");
+    assert_eq!(diag_worker.code, "RS-0002");
+    assert!(diag_worker
+        .message
+        .contains("role `worker` requires `control.url`"));
+
+    // 3. Invalid auth mode
+    let toml_auth = r#"
+version = 1
+
+[auth]
+mode = "magic"
+"#;
+    let report_auth = validate_config_str(toml_auth, false);
+    assert!(!report_auth.valid);
+    let diag_auth = report_auth
+        .diagnostics
+        .iter()
+        .find(|d| d.path == "auth.mode")
+        .expect("diagnostic for auth mode");
+    assert_eq!(diag_auth.code, "RS-0002");
+    assert!(diag_auth.message.contains("unknown auth mode `magic`"));
+
+    // 4. Invalid socket address
+    let toml_addr = r#"
+version = 1
+
+[gateway]
+listen_addr = "999.999.999.999:5432"
+"#;
+    let report_addr = validate_config_str(toml_addr, false);
+    assert!(!report_addr.valid);
+    let diag_addr = report_addr
+        .diagnostics
+        .iter()
+        .find(|d| d.path == "gateway.listen_addr")
+        .expect("diagnostic for invalid socket address");
+    assert_eq!(diag_addr.code, "RS-0002");
+    assert!(diag_addr.message.contains("invalid socket address"));
+}

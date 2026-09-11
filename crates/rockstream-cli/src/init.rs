@@ -203,15 +203,19 @@ fn local_template_files(project_name: &str) -> Vec<TemplateFile> {
         TemplateFile {
             rel_path: "rockstream.toml",
             content: r#"# RockStream Configuration — Local Standalone Deployment
+version = 1
+
+[node]
+role = "all"
+
 [gateway]
-listen = "127.0.0.1:5432"
+listen_addr = "127.0.0.1:5432"
 
 [storage]
-backend = "lfs"
-path = "./storage"
+url = "file://./data"
 
 [metrics]
-listen = "127.0.0.1:9090"
+listen_addr = "127.0.0.1:9090"
 enabled = true
 
 [logging]
