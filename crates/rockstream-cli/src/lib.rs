@@ -359,7 +359,10 @@ pub async fn start_gateway_with_catalog(
             )
         })?;
 
+    let storage_context =
+        Arc::new(rockstream_storage::storage_context::WorkerStorageContext::new(536_870_912));
     let shard_db = rockstream_storage::ShardDb::builder("gateway", store.clone())
+        .with_storage_context(storage_context)
         .build()
         .await
         .map_err(|e| {

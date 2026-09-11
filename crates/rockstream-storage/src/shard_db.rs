@@ -89,6 +89,10 @@ pub struct ShardDb {
     last_epoch: Arc<std::sync::atomic::AtomicU64>,
     format_version: u8,
     migration_pending: bool,
+    storage_context: Option<Arc<crate::storage_context::WorkerStorageContext>>,
+    concurrency_governor: Option<Arc<crate::concurrency_governor::ConcurrencyGovernor>>,
+    disk_cache_dir: Option<std::path::PathBuf>,
+    cleanup_on_drop: bool,
 }
 
 /// Builder for creating a `ShardDb`.
@@ -99,6 +103,10 @@ pub struct ShardDbBuilder {
     metrics_shard_id: Option<u16>,
     worker_id: Option<String>,
     supported_format_range: SupportedStorageFormatRange,
+    storage_context: Option<Arc<crate::storage_context::WorkerStorageContext>>,
+    concurrency_governor: Option<Arc<crate::concurrency_governor::ConcurrencyGovernor>>,
+    disk_cache_dir: Option<std::path::PathBuf>,
+    cleanup_on_drop: bool,
 }
 
 /// Specification for a partial aggregation query.
@@ -123,12 +131,22 @@ impl ShardDbBuilder {
             metrics_shard_id: None,
             worker_id: None,
             supported_format_range: SupportedStorageFormatRange::v1_through_v3(),
+            storage_context: None,
+            concurrency_governor: None,
+            disk_cache_dir: None,
+            cleanup_on_drop: false,
         }
     }
 
     /// Set custom database settings.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    /// Set whether the disk cache directory should be cleaned up automatically on ShardDb drop.
+    pub fn with_cleanup_on_drop(mut self, cleanup: bool) -> Self {
+        self.cleanup_on_drop = cleanup;
         self
     }
 
@@ -148,15 +166,72 @@ impl ShardDbBuilder {
         self
     }
 
+    /// Wire the worker-owned shared storage context into this shard database.
+    pub fn with_storage_context(
+        mut self,
+        ctx: Arc<crate::storage_context::WorkerStorageContext>,
+    ) -> Self {
+        self.storage_context = Some(ctx);
+        self
+    }
+
+    /// Access the shared storage context if configured.
+    pub fn storage_context(&self) -> Option<&Arc<crate::storage_context::WorkerStorageContext>> {
+        self.storage_context.as_ref()
+    }
+
+    /// Wire the concurrency governor to limit compaction, backfill, and migration concurrency.
+    pub fn with_concurrency_governor(
+        mut self,
+        gov: Arc<crate::concurrency_governor::ConcurrencyGovernor>,
+    ) -> Self {
+        self.concurrency_governor = Some(gov);
+        self
+    }
+
+    /// Access the concurrency governor if configured.
+    pub fn concurrency_governor(
+        &self,
+    ) -> Option<&Arc<crate::concurrency_governor::ConcurrencyGovernor>> {
+        self.concurrency_governor.as_ref()
+    }
+
+    /// Configure local object-store disk cache using pinned SlateDB Settings.object_store_cache_options.
+    pub fn with_disk_cache(mut self, dir: impl Into<std::path::PathBuf>, max_bytes: usize) -> Self {
+        let dir_path = dir.into();
+        self.settings.object_store_cache_options.root_folder = Some(dir_path.clone());
+        self.settings
+            .object_store_cache_options
+            .max_cache_size_bytes = Some(max_bytes);
+        self.settings.object_store_cache_options.part_size_bytes = 4 * 1024 * 1024;
+        self.settings.object_store_cache_options.scan_interval =
+            Some(std::time::Duration::from_secs(3600));
+        self.settings
+            .object_store_cache_options
+            .max_open_file_handles = 1000;
+        self.disk_cache_dir = Some(dir_path);
+        self
+    }
+
+    /// Access the SlateDB object store cache options.
+    pub fn object_store_cache_options(&self) -> &slatedb::config::ObjectStoreCacheOptions {
+        &self.settings.object_store_cache_options
+    }
+
     /// Build and open the shard database.
     pub async fn build(self) -> Result<ShardDb, StorageError> {
         let worker_id = self
             .worker_id
             .unwrap_or_else(|| "worker-unknown".to_string());
+        let db_cache = if let Some(ref ctx) = self.storage_context {
+            ctx.db_cache()
+        } else {
+            crate::slatedb_metrics::instrumented_db_cache(&worker_id)
+        };
         let mut builder = Db::builder(self.path.as_str(), self.object_store.clone())
             .with_settings(self.settings)
             .with_merge_operator(Arc::new(SumCountMergeOperator))
-            .with_db_cache(crate::slatedb_metrics::instrumented_db_cache(&worker_id));
+            .with_db_cache(db_cache);
         if let Some(shard_id) = self.metrics_shard_id {
             builder = builder.with_metrics_recorder(
                 crate::slatedb_metrics::instrumented_metrics_recorder(shard_id),
@@ -221,11 +296,50 @@ impl ShardDbBuilder {
             last_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
             format_version,
             migration_pending,
+            storage_context: self.storage_context,
+            concurrency_governor: self.concurrency_governor,
+            disk_cache_dir: self.disk_cache_dir,
+            cleanup_on_drop: self.cleanup_on_drop,
         })
     }
 }
 
+impl Drop for ShardDb {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = self.cleanup_disk_cache();
+        }
+    }
+}
+
 impl ShardDb {
+    /// Return the shared storage context if configured for this shard.
+    pub fn storage_context(&self) -> Option<&Arc<crate::storage_context::WorkerStorageContext>> {
+        self.storage_context.as_ref()
+    }
+
+    /// Return the concurrency governor if configured for this shard.
+    pub fn concurrency_governor(
+        &self,
+    ) -> Option<&Arc<crate::concurrency_governor::ConcurrencyGovernor>> {
+        self.concurrency_governor.as_ref()
+    }
+
+    /// Return the disk cache directory if configured.
+    pub fn disk_cache_dir(&self) -> Option<&std::path::Path> {
+        self.disk_cache_dir.as_deref()
+    }
+
+    /// Clean up the disk cache directory associated with this shard.
+    pub fn cleanup_disk_cache(&self) -> std::io::Result<()> {
+        if let Some(ref dir) = self.disk_cache_dir {
+            if dir.exists() {
+                std::fs::remove_dir_all(dir)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Return the SlateDB path used to open this shard.
     pub fn path(&self) -> &str {
         &self.path

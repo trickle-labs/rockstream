@@ -49,6 +49,9 @@ pub use recovery::{
 pub mod quota;
 pub use quota::WorkerQuotaManager;
 
+pub mod source_pressure;
+pub use source_pressure::{SourcePressureController, SourcePressureState};
+
 #[cfg(test)]
 mod tests {
     use super::*;

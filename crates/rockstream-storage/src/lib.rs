@@ -13,6 +13,7 @@
 //! scan-and-delete or compaction-filter patterns.
 
 pub mod arrangement_catalog;
+pub mod concurrency_governor;
 pub mod error;
 pub mod format_migration;
 pub mod keys;
@@ -26,6 +27,7 @@ pub mod wal;
 pub mod wal_cache;
 
 pub use arrangement_catalog::{ArrangementCatalog, ArrangementEntry};
+pub use concurrency_governor::{ConcurrencyGovernor, ConcurrencyLimitError};
 pub use error::StorageError;
 pub use keys::{
     minmax_sort_key, minmax_sort_key_decode, CatalogKeyEncoder, JoinSide, ShardKeyEncoder,

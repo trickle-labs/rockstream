@@ -634,6 +634,20 @@ pub struct WorkerSection {
     pub segment_cache_bytes: usize,
     #[serde(default = "default_worker_max_rows_per_quantum")]
     pub max_rows_per_quantum: usize,
+    #[serde(default = "default_worker_memory_budget_bytes")]
+    pub memory_budget_bytes: usize,
+    #[serde(default = "default_worker_foreground_reservation_bytes")]
+    pub foreground_reservation_bytes: usize,
+    #[serde(default = "default_worker_max_compaction_concurrency")]
+    pub max_compaction_concurrency: usize,
+    #[serde(default = "default_worker_max_backfill_concurrency")]
+    pub max_backfill_concurrency: usize,
+    #[serde(default = "default_worker_max_migration_concurrency")]
+    pub max_migration_concurrency: usize,
+    #[serde(default)]
+    pub disk_cache_dir: Option<std::path::PathBuf>,
+    #[serde(default = "default_worker_disk_cache_bytes")]
+    pub disk_cache_bytes: usize,
     #[serde(default)]
     pub capabilities: Vec<String>,
 }
@@ -650,6 +664,30 @@ fn default_worker_max_rows_per_quantum() -> usize {
     1000
 }
 
+fn default_worker_memory_budget_bytes() -> usize {
+    2_147_483_648
+}
+
+fn default_worker_foreground_reservation_bytes() -> usize {
+    429_496_729
+}
+
+fn default_worker_max_compaction_concurrency() -> usize {
+    2
+}
+
+fn default_worker_max_backfill_concurrency() -> usize {
+    1
+}
+
+fn default_worker_max_migration_concurrency() -> usize {
+    1
+}
+
+fn default_worker_disk_cache_bytes() -> usize {
+    17_179_869_184
+}
+
 impl Default for WorkerSection {
     fn default() -> Self {
         Self {
@@ -657,6 +695,13 @@ impl Default for WorkerSection {
             execution_threads: default_worker_execution_threads(),
             segment_cache_bytes: default_worker_segment_cache_bytes(),
             max_rows_per_quantum: default_worker_max_rows_per_quantum(),
+            memory_budget_bytes: default_worker_memory_budget_bytes(),
+            foreground_reservation_bytes: default_worker_foreground_reservation_bytes(),
+            max_compaction_concurrency: default_worker_max_compaction_concurrency(),
+            max_backfill_concurrency: default_worker_max_backfill_concurrency(),
+            max_migration_concurrency: default_worker_max_migration_concurrency(),
+            disk_cache_dir: None,
+            disk_cache_bytes: default_worker_disk_cache_bytes(),
             capabilities: Vec::new(),
         }
     }
@@ -861,6 +906,7 @@ impl From<&RockstreamConfig> for NodeConfig {
                 segment_cache_bytes: cfg.worker.segment_cache_bytes,
                 max_rows_per_quantum: cfg.worker.max_rows_per_quantum,
                 capabilities: Vec::new(),
+                ..WorkerSection::default()
             },
             storage: StorageSection::default(),
             metrics: MetricsSection::default(),

@@ -15,15 +15,27 @@ use slatedb::db_stats::L0_FLUSH_BYTES;
 use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
 
 pub(crate) fn instrumented_db_cache(worker_id: &str) -> Arc<dyn DbCache> {
+    instrumented_db_cache_with_capacities(
+        worker_id,
+        DEFAULT_BLOCK_CACHE_CAPACITY,
+        DEFAULT_META_CACHE_CAPACITY,
+    )
+}
+
+pub(crate) fn instrumented_db_cache_with_capacities(
+    worker_id: &str,
+    block_capacity: u64,
+    meta_capacity: u64,
+) -> Arc<dyn DbCache> {
     Arc::new(
         SplitCache::new()
             .with_block_cache(Some(Arc::new(InstrumentedMokaCache::new(
                 worker_id,
-                DEFAULT_BLOCK_CACHE_CAPACITY,
+                block_capacity,
             ))))
             .with_meta_cache(Some(Arc::new(InstrumentedMokaCache::new(
                 worker_id,
-                DEFAULT_META_CACHE_CAPACITY,
+                meta_capacity,
             ))))
             .build(),
     )

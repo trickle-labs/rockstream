@@ -50,6 +50,13 @@ pub struct CliConfigOverrides {
     pub worker_threads: Option<usize>,
     pub worker_cache_bytes: Option<usize>,
     pub worker_quantum: Option<usize>,
+    pub worker_memory_budget_bytes: Option<usize>,
+    pub worker_foreground_reservation_bytes: Option<usize>,
+    pub worker_max_compaction_concurrency: Option<usize>,
+    pub worker_max_backfill_concurrency: Option<usize>,
+    pub worker_max_migration_concurrency: Option<usize>,
+    pub worker_disk_cache_dir: Option<PathBuf>,
+    pub worker_disk_cache_bytes: Option<usize>,
     pub storage_url: Option<String>,
     pub storage_temp_dir: Option<PathBuf>,
     pub storage_spill_dir: Option<PathBuf>,
@@ -390,6 +397,27 @@ fn init_default_origins(origins: &mut BTreeMap<String, ConfigOrigin>) {
     origins.insert("control.url".to_string(), ConfigOrigin::Default);
     origins.insert("control.shared_storage".to_string(), ConfigOrigin::Default);
     origins.insert("worker.worker_id".to_string(), ConfigOrigin::Default);
+    origins.insert(
+        "worker.memory_budget_bytes".to_string(),
+        ConfigOrigin::Default,
+    );
+    origins.insert(
+        "worker.foreground_reservation_bytes".to_string(),
+        ConfigOrigin::Default,
+    );
+    origins.insert(
+        "worker.max_compaction_concurrency".to_string(),
+        ConfigOrigin::Default,
+    );
+    origins.insert(
+        "worker.max_backfill_concurrency".to_string(),
+        ConfigOrigin::Default,
+    );
+    origins.insert(
+        "worker.max_migration_concurrency".to_string(),
+        ConfigOrigin::Default,
+    );
+    origins.insert("worker.disk_cache_bytes".to_string(), ConfigOrigin::Default);
     origins.insert("storage.url".to_string(), ConfigOrigin::Default);
     origins.insert("metrics.listen_addr".to_string(), ConfigOrigin::Default);
     origins.insert("metrics.enabled".to_string(), ConfigOrigin::Default);
@@ -519,6 +547,67 @@ fn apply_env_vars(
                 if let Ok(id) = v.parse::<u64>() {
                     node_config.worker.worker_id = Some(id);
                     origins.insert("worker.worker_id".to_string(), ConfigOrigin::Environment(k));
+                }
+            }
+            ["WORKER", "MEMORY_BUDGET_BYTES"] => {
+                if let Ok(val) = v.parse::<usize>() {
+                    node_config.worker.memory_budget_bytes = val;
+                    origins.insert(
+                        "worker.memory_budget_bytes".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["WORKER", "FOREGROUND_RESERVATION_BYTES"] => {
+                if let Ok(val) = v.parse::<usize>() {
+                    node_config.worker.foreground_reservation_bytes = val;
+                    origins.insert(
+                        "worker.foreground_reservation_bytes".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["WORKER", "MAX_COMPACTION_CONCURRENCY"] => {
+                if let Ok(val) = v.parse::<usize>() {
+                    node_config.worker.max_compaction_concurrency = val;
+                    origins.insert(
+                        "worker.max_compaction_concurrency".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["WORKER", "MAX_BACKFILL_CONCURRENCY"] => {
+                if let Ok(val) = v.parse::<usize>() {
+                    node_config.worker.max_backfill_concurrency = val;
+                    origins.insert(
+                        "worker.max_backfill_concurrency".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["WORKER", "MAX_MIGRATION_CONCURRENCY"] => {
+                if let Ok(val) = v.parse::<usize>() {
+                    node_config.worker.max_migration_concurrency = val;
+                    origins.insert(
+                        "worker.max_migration_concurrency".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["WORKER", "DISK_CACHE_DIR"] => {
+                node_config.worker.disk_cache_dir = Some(PathBuf::from(&v));
+                origins.insert(
+                    "worker.disk_cache_dir".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
+            }
+            ["WORKER", "DISK_CACHE_BYTES"] => {
+                if let Ok(val) = v.parse::<usize>() {
+                    node_config.worker.disk_cache_bytes = val;
+                    origins.insert(
+                        "worker.disk_cache_bytes".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
                 }
             }
             ["STORAGE", "URL"] => {
@@ -837,6 +926,55 @@ fn apply_cli_overrides(
         origins.insert(
             "worker.max_rows_per_quantum".to_string(),
             ConfigOrigin::Cli("--worker-quantum".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_memory_budget_bytes {
+        node_config.worker.memory_budget_bytes = val;
+        origins.insert(
+            "worker.memory_budget_bytes".to_string(),
+            ConfigOrigin::Cli("--worker-memory-budget".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_foreground_reservation_bytes {
+        node_config.worker.foreground_reservation_bytes = val;
+        origins.insert(
+            "worker.foreground_reservation_bytes".to_string(),
+            ConfigOrigin::Cli("--worker-foreground-reservation".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_max_compaction_concurrency {
+        node_config.worker.max_compaction_concurrency = val;
+        origins.insert(
+            "worker.max_compaction_concurrency".to_string(),
+            ConfigOrigin::Cli("--worker-max-compaction-concurrency".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_max_backfill_concurrency {
+        node_config.worker.max_backfill_concurrency = val;
+        origins.insert(
+            "worker.max_backfill_concurrency".to_string(),
+            ConfigOrigin::Cli("--worker-max-backfill-concurrency".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_max_migration_concurrency {
+        node_config.worker.max_migration_concurrency = val;
+        origins.insert(
+            "worker.max_migration_concurrency".to_string(),
+            ConfigOrigin::Cli("--worker-max-migration-concurrency".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.worker_disk_cache_dir {
+        node_config.worker.disk_cache_dir = Some(val.clone());
+        origins.insert(
+            "worker.disk_cache_dir".to_string(),
+            ConfigOrigin::Cli("--worker-disk-cache-dir".to_string()),
+        );
+    }
+    if let Some(val) = cli.worker_disk_cache_bytes {
+        node_config.worker.disk_cache_bytes = val;
+        origins.insert(
+            "worker.disk_cache_bytes".to_string(),
+            ConfigOrigin::Cli("--worker-disk-cache-bytes".to_string()),
         );
     }
     if let Some(ref val) = cli.storage_url {

@@ -401,9 +401,17 @@ pub struct WorkerClientHandle {
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
     secret_manager: Arc<WorkerSecretManager>,
+    storage_context: Arc<rockstream_storage::storage_context::WorkerStorageContext>,
 }
 
 impl WorkerClientHandle {
+    /// Returns the worker storage context.
+    pub fn storage_context(
+        &self,
+    ) -> Arc<rockstream_storage::storage_context::WorkerStorageContext> {
+        self.storage_context.clone()
+    }
+
     /// Returns the worker ID assigned by the control plane.
     pub fn worker_id(&self) -> Option<WorkerId> {
         *self.worker_id.read()
@@ -636,6 +644,12 @@ where
     let secret_manager = Arc::new(WorkerSecretManager::new(format!(
         "worker-{proposed_worker_id}"
     )));
+    let storage_context = Arc::new(
+        rockstream_storage::storage_context::WorkerStorageContext::new_with_worker_id(
+            &format!("worker-{proposed_worker_id}"),
+            536_870_912,
+        ),
+    );
 
     let handle = WorkerClientHandle {
         worker_id: worker_id.clone(),
@@ -644,6 +658,7 @@ where
         msg_tx: msg_tx.clone(),
         fence_waiters: fence_waiters.clone(),
         secret_manager: secret_manager.clone(),
+        storage_context: storage_context.clone(),
     };
 
     let deployments = Arc::new(RwLock::new(HashMap::<
@@ -675,6 +690,7 @@ where
     let deployments_clone = deployments.clone();
     let actor_registry_clone = actor_registry.clone();
     let execute_clone = execute.clone();
+    let storage_context_clone = storage_context.clone();
 
     let join_handle = tokio::spawn(async move {
         // 1. Send Registration message.
@@ -805,6 +821,7 @@ where
                         .map_err(io::Error::other)?;
                         let db = Arc::new(
                             ShardDb::builder("db", store)
+                                .with_storage_context(storage_context_clone.clone())
                                 .build()
                                 .await
                                 .map_err(io::Error::other)?,
@@ -911,10 +928,12 @@ where
                     };
 
                     // Attempt to open the ShardDb
-                    let mut builder = ShardDb::builder("db", store).with_supported_format_range(
-                        rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(
-                        ),
-                    );
+                    let mut builder = ShardDb::builder("db", store)
+                        .with_supported_format_range(
+                            rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(
+                            ),
+                        )
+                        .with_storage_context(storage_context_clone.clone());
                     if let Ok(metric_shard_id) = u16::try_from(lease.shard_id.0) {
                         builder = builder
                             .with_metrics_identity(metric_shard_id, lease.worker_id.to_string());

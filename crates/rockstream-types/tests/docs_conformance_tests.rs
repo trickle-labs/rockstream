@@ -120,6 +120,13 @@ fn test_configuration_doc_matches_node_config_defaults() {
     assert_eq!(node_cfg.worker.execution_threads, 1);
     assert_eq!(node_cfg.worker.segment_cache_bytes, 536870912);
     assert_eq!(node_cfg.worker.max_rows_per_quantum, 1000);
+    assert_eq!(node_cfg.worker.memory_budget_bytes, 2_147_483_648);
+    assert_eq!(node_cfg.worker.foreground_reservation_bytes, 429_496_729);
+    assert_eq!(node_cfg.worker.max_compaction_concurrency, 2);
+    assert_eq!(node_cfg.worker.max_backfill_concurrency, 1);
+    assert_eq!(node_cfg.worker.max_migration_concurrency, 1);
+    assert_eq!(node_cfg.worker.disk_cache_dir, None);
+    assert_eq!(node_cfg.worker.disk_cache_bytes, 17_179_869_184);
     assert_eq!(node_cfg.storage.url.to_string(), "file://./data");
     assert_eq!(node_cfg.metrics.listen_addr, "127.0.0.1:9090");
     assert!(node_cfg.metrics.enabled);

@@ -126,8 +126,9 @@ impl LruStore {
     }
 }
 
+use std::sync::Arc;
+
 /// Worker-wide shared storage context managing unified block & index caches.
-#[derive(Debug)]
 pub struct WorkerStorageContext {
     budget_bytes: usize,
     blocks: Mutex<LruStore>,
@@ -135,6 +136,18 @@ pub struct WorkerStorageContext {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+    db_cache: Arc<dyn slatedb::db_cache::DbCache>,
+}
+
+impl std::fmt::Debug for WorkerStorageContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerStorageContext")
+            .field("budget_bytes", &self.budget_bytes)
+            .field("hits", &self.hits.load(Ordering::Relaxed))
+            .field("misses", &self.misses.load(Ordering::Relaxed))
+            .field("evictions", &self.evictions.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 pub type SharedStorageContext = WorkerStorageContext;
@@ -142,9 +155,20 @@ pub type SharedStorageContext = WorkerStorageContext;
 impl WorkerStorageContext {
     /// Create a new worker storage context with the specified memory budget in bytes.
     pub fn new(budget_bytes: usize) -> Self {
+        Self::new_with_worker_id("worker-default", budget_bytes)
+    }
+
+    /// Create a new worker storage context with explicit worker ID and memory budget in bytes.
+    pub fn new_with_worker_id(worker_id: &str, budget_bytes: usize) -> Self {
         // Allocate 70% budget for decoded blocks, 30% for indexes
         let block_budget = (budget_bytes * 7) / 10;
         let index_budget = budget_bytes.saturating_sub(block_budget);
+
+        let db_cache = crate::slatedb_metrics::instrumented_db_cache_with_capacities(
+            worker_id,
+            block_budget as u64,
+            index_budget as u64,
+        );
 
         Self {
             budget_bytes,
@@ -153,7 +177,18 @@ impl WorkerStorageContext {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            db_cache,
         }
+    }
+
+    /// Retrieve the shared SlateDB database cache.
+    pub fn db_cache(&self) -> Arc<dyn slatedb::db_cache::DbCache> {
+        self.db_cache.clone()
+    }
+
+    /// Retrieve the total configured budget in bytes.
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes
     }
 
     /// Retrieve a decoded block from cache.

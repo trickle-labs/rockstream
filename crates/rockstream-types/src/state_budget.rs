@@ -50,6 +50,20 @@ impl fmt::Display for StateBudgetError {
                 self.operator_name, self.current_bytes, self.requested_bytes
             );
         }
+        if self.operator_name == "allocation-waiters-queue" {
+            return write!(
+                f,
+                "RS-9001: quota limit exceeded: maximum allocation waiters ({}) exceeded; next_steps: retry after memory pressure subsides",
+                self.max_bytes
+            );
+        }
+        if self.operator_name.starts_with("waiter-timeout-") {
+            return write!(
+                f,
+                "RS-5003: state budget exceeded: waiter timed out waiting for {} bytes; current={}, limit={}; next_steps: reduce worker memory pressure or increase budget",
+                self.requested_bytes, self.current_bytes, self.max_bytes
+            );
+        }
         write!(
             f,
             "RS-5003: state budget exceeded for '{}': current={} bytes, \
@@ -727,6 +741,301 @@ impl QuotaGuard {
 impl Drop for QuotaGuard {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+// ─── Worker Memory Budget Ledger (v0.62.1) ───────────────────────────────────
+
+/// Canonical memory categories tracked by the worker memory budget ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum MemoryCategory {
+    SlateDbWriteBuffers,
+    BlockAndMetadataCaches,
+    OperatorState,
+    SourceBuffers,
+    ExchangeBuffers,
+    QueryWorkMemory,
+    CheckpointStaging,
+    MigrationBuffers,
+}
+
+impl MemoryCategory {
+    /// Return all 8 canonical memory categories.
+    pub fn all() -> &'static [MemoryCategory] {
+        &[
+            MemoryCategory::SlateDbWriteBuffers,
+            MemoryCategory::BlockAndMetadataCaches,
+            MemoryCategory::OperatorState,
+            MemoryCategory::SourceBuffers,
+            MemoryCategory::ExchangeBuffers,
+            MemoryCategory::QueryWorkMemory,
+            MemoryCategory::CheckpointStaging,
+            MemoryCategory::MigrationBuffers,
+        ]
+    }
+
+    /// Category name identifier.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::SlateDbWriteBuffers => "slatedb_write_buffers",
+            Self::BlockAndMetadataCaches => "block_and_metadata_caches",
+            Self::OperatorState => "operator_state",
+            Self::SourceBuffers => "source_buffers",
+            Self::ExchangeBuffers => "exchange_buffers",
+            Self::QueryWorkMemory => "query_work_memory",
+            Self::CheckpointStaging => "checkpoint_staging",
+            Self::MigrationBuffers => "migration_buffers",
+        }
+    }
+
+    /// Zero-based index into category storage array.
+    pub fn index(&self) -> usize {
+        match self {
+            Self::SlateDbWriteBuffers => 0,
+            Self::BlockAndMetadataCaches => 1,
+            Self::OperatorState => 2,
+            Self::SourceBuffers => 3,
+            Self::ExchangeBuffers => 4,
+            Self::QueryWorkMemory => 5,
+            Self::CheckpointStaging => 6,
+            Self::MigrationBuffers => 7,
+        }
+    }
+}
+
+/// Drop-safe byte permit for worker memory allocations.
+/// Automatically releases allocated bytes back to the specific category and ledger upon drop.
+#[derive(Debug)]
+pub struct MemoryPermit {
+    ledger: Arc<WorkerBudgetLedger>,
+    category: MemoryCategory,
+    bytes: u64,
+    active: bool,
+}
+
+impl MemoryPermit {
+    pub fn new(ledger: Arc<WorkerBudgetLedger>, category: MemoryCategory, bytes: u64) -> Self {
+        Self {
+            ledger,
+            category,
+            bytes,
+            active: true,
+        }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn category(&self) -> MemoryCategory {
+        self.category
+    }
+
+    /// Disarm permit so that dropping it does not release bytes back to ledger.
+    pub fn defuse(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for MemoryPermit {
+    fn drop(&mut self) {
+        if self.active && self.bytes > 0 {
+            self.ledger.release(self.category, self.bytes);
+        }
+    }
+}
+
+/// Unified Worker Budget Ledger managing memory across all 8 canonical categories
+/// with prospective admission, foreground capacity reservations, 10% allocator overhead margin,
+/// and bounded waiter queue tracking.
+#[derive(Debug)]
+pub struct WorkerBudgetLedger {
+    total_budget_bytes: u64,
+    foreground_reservation_bytes: u64,
+    allocator_overhead_pct: u64,
+    categories: [AtomicU64; 8],
+    waiter_count: AtomicU64,
+    max_waiters: u64,
+    shared_cache_charged: AtomicBool,
+}
+
+impl WorkerBudgetLedger {
+    pub const DEFAULT_ALLOCATOR_OVERHEAD_PCT: u64 = 10;
+    pub const DEFAULT_MAX_WAITERS: u64 = 1024;
+
+    /// Create a new `WorkerBudgetLedger` with default waiter bound (1024).
+    pub fn new(total_budget_bytes: usize, foreground_reservation_bytes: usize) -> Self {
+        Self::new_with_max_waiters(
+            total_budget_bytes,
+            foreground_reservation_bytes,
+            Self::DEFAULT_MAX_WAITERS as usize,
+        )
+    }
+
+    /// Create a new `WorkerBudgetLedger` with explicit maximum waiter count.
+    pub fn new_with_max_waiters(
+        total_budget_bytes: usize,
+        foreground_reservation_bytes: usize,
+        max_waiters: usize,
+    ) -> Self {
+        Self {
+            total_budget_bytes: total_budget_bytes as u64,
+            foreground_reservation_bytes: foreground_reservation_bytes as u64,
+            allocator_overhead_pct: Self::DEFAULT_ALLOCATOR_OVERHEAD_PCT,
+            categories: Default::default(),
+            waiter_count: AtomicU64::new(0),
+            max_waiters: max_waiters as u64,
+            shared_cache_charged: AtomicBool::new(false),
+        }
+    }
+
+    pub fn total_budget_bytes(&self) -> u64 {
+        self.total_budget_bytes
+    }
+
+    pub fn foreground_reservation_bytes(&self) -> u64 {
+        self.foreground_reservation_bytes
+    }
+
+    pub fn allocator_overhead_pct(&self) -> u64 {
+        self.allocator_overhead_pct
+    }
+
+    pub fn waiter_count(&self) -> u64 {
+        self.waiter_count.load(Ordering::Relaxed)
+    }
+
+    pub fn max_waiters(&self) -> u64 {
+        self.max_waiters
+    }
+
+    pub fn increment_waiters(&self) -> Result<(), StateBudgetError> {
+        loop {
+            let current = self.waiter_count.load(Ordering::Relaxed);
+            if current >= self.max_waiters {
+                return Err(StateBudgetError {
+                    operator_name: "allocation-waiters-queue".to_string(),
+                    max_bytes: self.max_waiters,
+                    current_bytes: current,
+                    requested_bytes: 1,
+                });
+            }
+            if self
+                .waiter_count
+                .compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn decrement_waiters(&self) {
+        self.waiter_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn category_bytes(&self, category: MemoryCategory) -> u64 {
+        self.categories[category.index()].load(Ordering::Relaxed)
+    }
+
+    pub fn total_allocated_bytes(&self) -> u64 {
+        self.categories
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    pub fn available_background_bytes(&self) -> u64 {
+        let max_bg = self
+            .total_budget_bytes
+            .saturating_sub(self.foreground_reservation_bytes);
+        let allocated = self.total_allocated_bytes();
+        let overhead = (allocated * self.allocator_overhead_pct) / 100;
+        let gross = allocated.saturating_add(overhead);
+        max_bg.saturating_sub(gross)
+    }
+
+    pub fn available_foreground_bytes(&self) -> u64 {
+        let allocated = self.total_allocated_bytes();
+        let overhead = (allocated * self.allocator_overhead_pct) / 100;
+        let gross = allocated.saturating_add(overhead);
+        self.total_budget_bytes.saturating_sub(gross)
+    }
+
+    pub fn charge_shared_cache_once(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<bool, StateBudgetError> {
+        if !self.shared_cache_charged.swap(true, Ordering::SeqCst) {
+            let permit = self.try_acquire(MemoryCategory::BlockAndMetadataCaches, bytes, false)?;
+            permit.defuse();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn try_acquire(
+        self: &Arc<Self>,
+        category: MemoryCategory,
+        bytes: u64,
+        is_foreground: bool,
+    ) -> Result<MemoryPermit, StateBudgetError> {
+        if bytes == 0 {
+            return Ok(MemoryPermit::new(self.clone(), category, 0));
+        }
+
+        let max_budget = if is_foreground {
+            self.total_budget_bytes
+        } else {
+            self.total_budget_bytes
+                .saturating_sub(self.foreground_reservation_bytes)
+        };
+
+        if max_budget > 0 && bytes > max_budget {
+            return Err(StateBudgetError {
+                operator_name: format!("oversized-{}", category.name()),
+                max_bytes: max_budget,
+                current_bytes: self.total_allocated_bytes(),
+                requested_bytes: bytes,
+            });
+        }
+
+        loop {
+            let current_allocated = self.total_allocated_bytes();
+            let proposed_allocated = current_allocated.saturating_add(bytes);
+            let overhead = (proposed_allocated * self.allocator_overhead_pct) / 100;
+            let gross = proposed_allocated.saturating_add(overhead);
+
+            if max_budget > 0 && gross > max_budget {
+                return Err(StateBudgetError {
+                    operator_name: format!("worker-budget-{}", category.name()),
+                    max_bytes: max_budget,
+                    current_bytes: current_allocated,
+                    requested_bytes: bytes,
+                });
+            }
+
+            let cat_idx = category.index();
+            let cur_cat = self.categories[cat_idx].load(Ordering::Relaxed);
+            if self.categories[cat_idx]
+                .compare_exchange_weak(
+                    cur_cat,
+                    cur_cat + bytes,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Ok(MemoryPermit::new(self.clone(), category, bytes));
+            }
+        }
+    }
+
+    pub fn release(&self, category: MemoryCategory, bytes: u64) {
+        if bytes > 0 {
+            self.categories[category.index()].fetch_sub(bytes, Ordering::SeqCst);
+        }
     }
 }
 

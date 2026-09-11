@@ -244,7 +244,7 @@ Changes to persistent formats or public protocols require:
 | v0.61.1 | External performance baseline | Complete measured workloads gate performance changes ✅ Done |
 | v0.61.2 | Aggregate delta reduction | Epoch-visible aggregates emit only net group changes ✅ Done |
 | **v0.62** | Configuration & Lifecycle | One authoritative configuration and runtime lifecycle ✅ Done |
-| v0.62.1 | Worker memory budgets | Shards share bounded caches and propagate backpressure |
+| v0.62.1 | Worker memory budgets | Shards share bounded caches and propagate backpressure ✅ Done |
 | **v0.63** | Durable Catalog | DDL and metadata survive process destruction |
 | **v0.64** | SQL Execution Integrity | Standard PostgreSQL DML replaces ad-hoc command parsing |
 | **v0.65** | Standalone Recovery | Complete standalone crash recovery, backup, and restore |

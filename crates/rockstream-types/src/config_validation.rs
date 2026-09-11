@@ -255,6 +255,13 @@ const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
     "execution_threads",
     "segment_cache_bytes",
     "max_rows_per_quantum",
+    "memory_budget_bytes",
+    "foreground_reservation_bytes",
+    "max_compaction_concurrency",
+    "max_backfill_concurrency",
+    "max_migration_concurrency",
+    "disk_cache_dir",
+    "disk_cache_bytes",
     "capabilities",
 ];
 const KNOWN_STORAGE_SECTION_KEYS: &[&str] = &["url", "temp_dir", "spill_dir", "tiering"];
@@ -951,6 +958,16 @@ pub fn validate_semantic_bounds(
     }
 }
 
+/// Validate a `NodeConfig` struct directly and return a `ConfigValidationReport`.
+pub fn validate_node_config(node_cfg: &crate::config::NodeConfig) -> ConfigValidationReport {
+    let mut diagnostics = Vec::new();
+    validate_node_config_semantic_bounds(node_cfg, false, &mut diagnostics);
+    let valid = !diagnostics
+        .iter()
+        .any(|d| matches!(d.severity, ConfigDiagnosticSeverity::Error));
+    ConfigValidationReport { valid, diagnostics }
+}
+
 /// Validate semantic bounds on a `NodeConfig`.
 pub fn validate_node_config_semantic_bounds(
     node_cfg: &crate::config::NodeConfig,
@@ -1119,6 +1136,45 @@ pub fn validate_node_config_semantic_bounds(
             code: "RS-0002".to_string(),
             message: "worker.max_rows_per_quantum must be greater than 0".to_string(),
             suggestion: Some("Set max_rows_per_quantum > 0".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if node_cfg.worker.memory_budget_bytes < 64 * 1024 * 1024 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "worker.memory_budget_bytes".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "worker.memory_budget_bytes must be at least 64 MiB (67108864 bytes)"
+                .to_string(),
+            suggestion: Some("Set memory_budget_bytes >= 67108864".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if node_cfg.worker.foreground_reservation_bytes >= node_cfg.worker.memory_budget_bytes {
+        diagnostics.push(ConfigDiagnostic {
+            path: "worker.foreground_reservation_bytes".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message:
+                "worker.foreground_reservation_bytes must be less than worker.memory_budget_bytes"
+                    .to_string(),
+            suggestion: Some("Set foreground_reservation_bytes < memory_budget_bytes".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if node_cfg.worker.max_compaction_concurrency == 0 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "worker.max_compaction_concurrency".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "worker.max_compaction_concurrency must be greater than 0".to_string(),
+            suggestion: Some("Set max_compaction_concurrency >= 1".to_string()),
             line: None,
             column: None,
         });

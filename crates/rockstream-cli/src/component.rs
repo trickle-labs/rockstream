@@ -134,15 +134,29 @@ pub struct WorkerComponent {
     state: LifecycleState,
     fail_on_start: bool,
     fail_on_recover: bool,
+    storage_context: Arc<rockstream_storage::storage_context::WorkerStorageContext>,
 }
 
 impl WorkerComponent {
     pub fn new() -> Self {
+        Self::with_cache_bytes(536_870_912)
+    }
+
+    pub fn with_cache_bytes(cache_bytes: usize) -> Self {
         Self {
             state: LifecycleState::Created,
             fail_on_start: false,
             fail_on_recover: false,
+            storage_context: Arc::new(
+                rockstream_storage::storage_context::WorkerStorageContext::new(cache_bytes),
+            ),
         }
+    }
+
+    pub fn storage_context(
+        &self,
+    ) -> Arc<rockstream_storage::storage_context::WorkerStorageContext> {
+        self.storage_context.clone()
     }
 
     pub fn with_start_failure(mut self, fail: bool) -> Self {
