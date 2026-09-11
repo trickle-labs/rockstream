@@ -123,8 +123,15 @@ async fn minio_project_state_persists_across_restart() {
         return;
     }
 
+    use testcontainers::core::WaitFor;
     use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
+    use testcontainers::{GenericImage, ImageExt};
+    let container = GenericImage::new("minio/minio", "RELEASE.2024-11-07T00-52-20Z")
+        .with_wait_for(WaitFor::message_on_stderr("API:"))
+        .with_exposed_port(testcontainers::core::ContainerPort::Tcp(9000))
+        .with_cmd(vec!["server".to_string(), "/data".to_string()])
+        .with_env_var("MINIO_ROOT_USER", "minioadmin")
+        .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
         .start()
         .await
         .unwrap();
