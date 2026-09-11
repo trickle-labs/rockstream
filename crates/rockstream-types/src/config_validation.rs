@@ -1220,8 +1220,8 @@ mod tests {
                     code: "RS-0002".to_string(),
                     message: "Unknown key `join_stratgey` in section `execution`".to_string(),
                     suggestion: Some("Did you mean `join_strategy`?".to_string()),
-                    line: None,
-                    column: None,
+                    line: Some(2),
+                    column: Some(1),
                 }],
             }
         );

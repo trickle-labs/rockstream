@@ -1,7 +1,7 @@
 //! Node lifecycle state machine and structured health definitions (v0.59.21).
 
 use crate::candidate_identity::CandidateIdentity;
-use crate::error_code::ErrorCode;
+use crate::error_code::{ErrorCode, RS_0001};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -188,8 +188,8 @@ impl LifecycleState {
             Ok(())
         } else {
             Err(format!(
-                "Illegal lifecycle transition from {:?} to {:?}",
-                self, next
+                "[{}] Illegal lifecycle transition from {:?} to {:?}",
+                RS_0001, self, next
             ))
         }
     }
@@ -325,8 +325,8 @@ impl LifecycleTracker {
             Ok(())
         } else {
             Err(format!(
-                "Illegal lifecycle transition from {:?} to {:?}",
-                current, next
+                "[{}] Illegal lifecycle transition from {:?} to {:?}",
+                RS_0001, current, next
             ))
         }
     }

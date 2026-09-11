@@ -599,8 +599,10 @@ impl NodeRuntime {
             if let Err(e) = comp.start().await {
                 error!(
                     component = comp.name(),
+                    code = %RS_0003,
                     error = %e.message,
-                    "Component startup failed — beginning reverse teardown"
+                    "[{}] Component startup failed — beginning reverse teardown",
+                    RS_0003
                 );
                 Self::send_event(&event_tx, comp.name(), c_prev, LifecycleState::Fatal);
                 self.tracker.set_state(LifecycleState::Fatal);
@@ -630,8 +632,10 @@ impl NodeRuntime {
             if let Err(e) = comp.recover().await {
                 error!(
                     component = comp.name(),
+                    code = %RS_0003,
                     error = %e.message,
-                    "Component mandatory recovery failed — transitioning to Fatal and tearing down"
+                    "[{}] Component mandatory recovery failed — transitioning to Fatal and tearing down",
+                    RS_0003
                 );
                 Self::send_event(&event_tx, comp.name(), c_prev, LifecycleState::Fatal);
                 self.tracker.set_state(LifecycleState::Fatal);
