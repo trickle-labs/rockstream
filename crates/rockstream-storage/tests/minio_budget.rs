@@ -50,11 +50,8 @@ fn docker_available() -> bool {
     rockstream_test_support::docker_available()
 }
 
-async fn start_minio() -> (Option<ContainerAsync<MinIO2024>>, u16) {
-    let (container, port) = rt_start_minio(MINIO_BUCKET)
-        .await
-        .expect("failed to start MinIO container");
-    (Some(container), port)
+async fn start_minio() -> Option<(ContainerAsync<MinIO2024>, u16)> {
+    rt_start_minio(MINIO_BUCKET).await
 }
 
 fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
@@ -86,7 +83,13 @@ async fn minio_wal_listing_cache_hit_ratio() {
         return;
     }
 
-    let (_container, port) = start_minio().await;
+    let (_container, port) = match start_minio().await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP minio_wal_listing_cache_hit_ratio: MinIO container unavailable");
+            return;
+        }
+    };
     let store = minio_object_store(port);
 
     // Open a ShardDb on MinIO and write 100 epochs of WAL-like data.
@@ -180,7 +183,13 @@ async fn minio_manifest_cadence_bounded() {
         return;
     }
 
-    let (_container, port) = start_minio().await;
+    let (_container, port) = match start_minio().await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP minio_manifest_cadence_bounded: MinIO container unavailable");
+            return;
+        }
+    };
     let store = minio_object_store(port);
 
     let db = Arc::new(
@@ -247,7 +256,13 @@ async fn minio_latency_p99_1gb() {
         return;
     }
 
-    let (_container, port) = start_minio().await;
+    let (_container, port) = match start_minio().await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP minio_latency_p99_1gb: MinIO container unavailable");
+            return;
+        }
+    };
     let store = minio_object_store(port);
 
     let db = Arc::new(
@@ -343,7 +358,13 @@ async fn minio_write_amplification() {
         return;
     }
 
-    let (_container, port) = start_minio().await;
+    let (_container, port) = match start_minio().await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP minio_write_amplification: MinIO container unavailable");
+            return;
+        }
+    };
     let store = minio_object_store(port);
 
     let db = Arc::new(

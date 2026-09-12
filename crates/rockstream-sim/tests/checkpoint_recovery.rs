@@ -286,14 +286,11 @@ async fn test_recovery_bit_identical_lfs() {
 
 const MINIO_BUCKET: &str = "rockstream-checkpoint-test";
 
-async fn start_minio() -> (
-    Option<testcontainers::ContainerAsync<rockstream_test_support::minio::MinIO2024>>,
+async fn start_minio() -> Option<(
+    testcontainers::ContainerAsync<rockstream_test_support::minio::MinIO2024>,
     u16,
-) {
-    let (container, port) = rockstream_test_support::minio::start_minio(MINIO_BUCKET)
-        .await
-        .expect("failed to start MinIO; is Docker running?");
-    (Some(container), port)
+)> {
+    rockstream_test_support::minio::start_minio(MINIO_BUCKET).await
 }
 
 fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
@@ -315,7 +312,13 @@ async fn test_recovery_bit_identical_minio() {
         return;
     }
 
-    let (_container, port) = start_minio().await;
+    let (_container, port) = match start_minio().await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP test_recovery_bit_identical_minio: MinIO container unavailable");
+            return;
+        }
+    };
     let store = minio_object_store(port);
 
     // Write pre-crash state.
@@ -383,7 +386,13 @@ async fn test_checkpoint_gc_bounded_minio() {
         return;
     }
 
-    let (_container, port) = start_minio().await;
+    let (_container, port) = match start_minio().await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP test_checkpoint_gc_bounded_minio: MinIO container unavailable");
+            return;
+        }
+    };
     let store = minio_object_store(port);
 
     const N_ROUNDS: usize = 10;
