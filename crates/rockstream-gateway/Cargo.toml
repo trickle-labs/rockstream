@@ -69,3 +69,6 @@ rcgen.workspace = true
 tokio-postgres-rustls.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 serde_yaml.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
