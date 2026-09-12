@@ -643,6 +643,10 @@ async fn read_u32_be(stream: &mut tokio::net::TcpStream) -> u32 {
 // ── S8: proof_psql_select_limit_10_under_10ms_p99 ─────────────────────────────
 
 /// P1: 100 back-to-back `SELECT * FROM my_view LIMIT 10` queries; p99 < 10 ms.
+#[cfg_attr(
+    coverage,
+    ignore = "latency SLO is not meaningful under coverage instrumentation"
+)]
 #[tokio::test]
 async fn proof_psql_select_limit_10_under_10ms_p99() {
     // 1. In-memory LFS shard with 100 rows.
