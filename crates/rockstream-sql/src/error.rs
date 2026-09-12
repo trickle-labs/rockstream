@@ -5,7 +5,7 @@
 
 use rockstream_types::error_code::{
     ErrorCode, RS_0001, RS_0003, RS_1002, RS_1011, RS_1012, RS_1013, RS_1016, RS_1019, RS_1731,
-    RS_2016,
+    RS_2016, RS_2022,
 };
 use thiserror::Error;
 
@@ -91,6 +91,15 @@ pub enum SqlError {
     #[error("[RS-1012] DDL parse error: {message}")]
     DdlParseError { message: String },
 
+    /// UPDATE/DELETE RETURNING clause is malformed.
+    ///
+    /// RS-2022: Check RETURNING syntax; it must be RETURNING * or RETURNING <col>[, <col>...] with no trailing content.
+    #[error(
+        "[RS-2022] write.malformed_returning_clause: RETURNING clause is malformed. \
+         next_steps: Use RETURNING * or RETURNING <col>[, <col>...] with no trailing content."
+    )]
+    MalformedReturningClause,
+
     /// A workload-catalog write (`CREATE WORKLOAD` / update / drop) was
     /// attempted on a control node that is not the current Raft-elected
     /// control leader (v0.45.2, M7-S2 leader-only write gating).
@@ -120,6 +129,7 @@ impl SqlError {
             Self::Serde(_) => RS_0001,
             Self::IndexNameConflict { .. } => RS_2016,
             Self::DdlParseError { .. } => RS_1012,
+            Self::MalformedReturningClause => RS_2022,
             Self::NotLeader => RS_1731,
         }
     }

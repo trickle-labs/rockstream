@@ -669,6 +669,56 @@ fn extract_returning(returning: &Option<Vec<SelectItem>>) -> Option<Vec<String>>
     })
 }
 
+fn check_malformed_returning(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let mut in_quote = false;
+    let mut returning_idx = None;
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote && lower[i..].starts_with("returning") {
+            let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')';
+            let after_idx = i + "returning".len();
+            let after_ok = after_idx == bytes.len()
+                || bytes[after_idx].is_ascii_whitespace()
+                || bytes[after_idx] == b';'
+                || bytes[after_idx] == b'(';
+            if before_ok && after_ok {
+                returning_idx = Some(after_idx);
+            }
+        }
+        i += 1;
+    }
+
+    if let Some(after_idx) = returning_idx {
+        let rest = sql[after_idx..].trim().trim_end_matches(';').trim();
+        if rest.is_empty() {
+            return true;
+        }
+        if rest == "*" {
+            return false;
+        }
+        if rest.ends_with(',') || rest.starts_with(',') || rest.contains(",,") {
+            return true;
+        }
+        let cols: Vec<&str> = rest.split(',').map(|c| c.trim()).collect();
+        if cols.iter().any(|c| {
+            c.is_empty()
+                || !c
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '*' || ch == '.')
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse a raw SQL query into a typed [`DmlStatement`], enforcing statement size and expression depth bounds.
 pub fn parse_dml_statement(sql: &str) -> Result<DmlStatement, SqlError> {
     // 1. Statement length bound check
@@ -705,11 +755,19 @@ pub fn parse_dml_statement(sql: &str) -> Result<DmlStatement, SqlError> {
         }
     }
 
-    // 2. Parse via sqlparser with PostgreSQL dialect
+    // 3. Parse via sqlparser with PostgreSQL dialect
     let dialect = PostgreSqlDialect {};
-    let mut statements = Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::ParseError {
-        message: e.to_string(),
-    })?;
+    let mut statements = match Parser::parse_sql(&dialect, sql) {
+        Ok(stmts) => stmts,
+        Err(e) => {
+            if check_malformed_returning(sql) {
+                return Err(SqlError::MalformedReturningClause);
+            }
+            return Err(SqlError::ParseError {
+                message: e.to_string(),
+            });
+        }
+    };
 
     if statements.is_empty() {
         return Err(SqlError::ParseError {
