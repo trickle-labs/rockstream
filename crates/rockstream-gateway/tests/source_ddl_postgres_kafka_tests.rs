@@ -263,7 +263,7 @@ async fn kafka_source_backfill_and_live_updates_reach_pgwire() {
         vec![vec![
             Some("order_rows".to_string()),
             Some("RUNNING".to_string()),
-            Some("2".to_string()),
+            Some("3".to_string()),
             Some("0".to_string()),
             Some("0".to_string()),
             Some("ADMITTED".to_string()),
