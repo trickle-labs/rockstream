@@ -99,10 +99,25 @@ fn test_metric_contributor_extraction() {
 #[test]
 fn test_error_contributor_extraction() {
     let error_surface = ErrorContributor::extract();
+    let catalog = rockstream_types::error_code::ErrorCatalog::current();
+    let mut expected: Vec<_> = catalog
+        .errors()
+        .iter()
+        .map(|e| rockstream_docgen::manifest::ErrorSurfaceEntry {
+            code: e.code.to_string(),
+            key: e.key.clone(),
+            title: e.title.clone(),
+            severity: e.severity.to_string(),
+            sqlstate: e.sqlstate.clone(),
+            retry_class: e.retry_class.to_string(),
+            default_next_steps: e.default_next_steps.clone(),
+            doc_anchor: e.doc_anchor.clone(),
+        })
+        .collect();
+    expected.sort_by(|a, b| a.code.cmp(&b.code));
     assert_eq!(
-        error_surface.errors.len(),
-        193,
-        "ErrorContributor must extract all 193 error descriptors from contracts/errors.toml"
+        error_surface.errors, expected,
+        "ErrorContributor must extract every descriptor from contracts/errors.toml exactly"
     );
 }
 
