@@ -7,9 +7,6 @@
 //! - **S7**: LFS durability — auto-tuner audit survives crash-replay
 //! - **S8**: MinIO TC integration test — stability under real S3
 
-use std::borrow::Cow;
-use std::collections::HashMap;
-
 use bytes::Bytes;
 use rockstream_sim::buggify::{buggify_disable, buggify_init};
 use rockstream_sim::{AutoTuner, OscillationDetector, SimObjectStoreHandle, SpikeScenario};
@@ -133,201 +130,25 @@ fn deserialize_events(raw: &Bytes) -> Vec<AuditEvent> {
 
 // ─── S8: MinIO TC integration test ───────────────────────────────────────────
 
-const MINIO_USER: &str = "minioadmin";
-const MINIO_PASS: &str = "minioadmin";
 const MINIO_BUCKET: &str = "rockstream-autotuner-test";
-
-fn docker_available() -> bool {
-    rockstream_test_support::docker_available()
-}
-
-#[derive(Debug, Clone)]
-struct MinIO2024 {
-    env_vars: HashMap<String, String>,
-}
-
-impl Default for MinIO2024 {
-    fn default() -> Self {
-        let mut env_vars = HashMap::new();
-        env_vars.insert("MINIO_CONSOLE_ADDRESS".to_owned(), ":9001".to_owned());
-        Self { env_vars }
-    }
-}
-
-impl testcontainers::Image for MinIO2024 {
-    fn name(&self) -> &str {
-        "minio/minio"
-    }
-
-    fn tag(&self) -> &str {
-        "RELEASE.2024-11-07T00-52-20Z"
-    }
-
-    fn ready_conditions(&self) -> Vec<testcontainers::core::WaitFor> {
-        vec![testcontainers::core::WaitFor::message_on_stderr("API:")]
-    }
-
-    fn env_vars(
-        &self,
-    ) -> impl IntoIterator<Item = (impl Into<Cow<'_, str>>, impl Into<Cow<'_, str>>)> {
-        &self.env_vars
-    }
-
-    fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
-        vec!["server", "/data"]
-    }
-}
-
-async fn start_minio() -> (testcontainers::ContainerAsync<MinIO2024>, u16) {
-    use testcontainers::runners::AsyncRunner;
-    let container = MinIO2024::default()
-        .start()
-        .await
-        .expect("failed to start MinIO container");
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_BUCKET).await;
-    (container, port)
-}
-
-fn minio_object_store(port: u16) -> std::sync::Arc<dyn object_store::ObjectStore> {
-    use object_store::aws::AmazonS3Builder;
-    std::sync::Arc::new(
-        AmazonS3Builder::new()
-            .with_endpoint(format!("http://127.0.0.1:{port}"))
-            .with_bucket_name(MINIO_BUCKET)
-            .with_access_key_id(MINIO_USER)
-            .with_secret_access_key(MINIO_PASS)
-            .with_region("us-east-1")
-            .with_allow_http(true)
-            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
-            .build()
-            .expect("failed to build MinIO object store"),
-    )
-}
-
-async fn create_minio_bucket(port: u16, bucket: &str) {
-    use hmac::{Hmac, Mac};
-    use sha2::{Digest, Sha256};
-    type HmacSha256 = Hmac<Sha256>;
-
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let (y, mo, d, hh, mm, ss) = epoch_to_ymd_hms(secs);
-    let date = format!("{y:04}{mo:02}{d:02}");
-    let datetime = format!("{y:04}{mo:02}{d:02}T{hh:02}{mm:02}{ss:02}Z");
-    let host = format!("127.0.0.1:{port}");
-    let region = "us-east-1";
-    let empty_hash = format!("{:x}", Sha256::digest(b""));
-    let canonical = format!(
-        "PUT\n/{bucket}\n\nhost:{host}\nx-amz-content-sha256:{empty_hash}\nx-amz-date:{datetime}\n\nhost;x-amz-content-sha256;x-amz-date\n{empty_hash}"
-    );
-    let canonical_hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
-    let scope = format!("{date}/{region}/s3/aws4_request");
-    let sts = format!("AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{canonical_hash}");
-    let k1 = {
-        let mut mac = HmacSha256::new_from_slice(format!("AWS4{MINIO_PASS}").as_bytes()).unwrap();
-        mac.update(date.as_bytes());
-        mac.finalize().into_bytes().to_vec()
-    };
-    let k2 = {
-        let mut mac = HmacSha256::new_from_slice(&k1).unwrap();
-        mac.update(region.as_bytes());
-        mac.finalize().into_bytes().to_vec()
-    };
-    let k3 = {
-        let mut mac = HmacSha256::new_from_slice(&k2).unwrap();
-        mac.update(b"s3");
-        mac.finalize().into_bytes().to_vec()
-    };
-    let signing_key = {
-        let mut mac = HmacSha256::new_from_slice(&k3).unwrap();
-        mac.update(b"aws4_request");
-        mac.finalize().into_bytes().to_vec()
-    };
-    let sig = {
-        let mut mac = HmacSha256::new_from_slice(&signing_key).unwrap();
-        mac.update(sts.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
-    };
-    let auth = format!(
-        "AWS4-HMAC-SHA256 Credential={MINIO_USER}/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={sig}"
-    );
-    let resp = reqwest::Client::new()
-        .put(format!("http://{host}/{bucket}"))
-        .header("Host", &host)
-        .header("X-Amz-Content-Sha256", &empty_hash)
-        .header("X-Amz-Date", &datetime)
-        .header("Authorization", &auth)
-        .header("Content-Length", "0")
-        .send()
-        .await
-        .expect("CreateBucket PUT failed");
-    let status = resp.status();
-    assert!(
-        status.is_success() || status.as_u16() == 409,
-        "CreateBucket failed: {status}"
-    );
-}
-
-fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let sod = secs % 86400;
-    let mut days = (secs / 86400) as u32;
-    let h = (sod / 3600) as u32;
-    let m = ((sod % 3600) / 60) as u32;
-    let s = (sod % 60) as u32;
-    let mut year = 1970u32;
-    loop {
-        let leap =
-            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let dy = if leap { 366 } else { 365 };
-        if days < dy {
-            break;
-        }
-        days -= dy;
-        year += 1;
-    }
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let dpm: [u32; 12] = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 0u32;
-    for &d in &dpm {
-        if days < d {
-            break;
-        }
-        days -= d;
-        month += 1;
-    }
-    let day = days + 1;
-    month += 1;
-    (year, month, day, h, m, s)
-}
 
 #[tokio::test]
 async fn proof_auto_tuner_stability_minio_tc() {
-    if !docker_available() {
-        eprintln!("SKIP proof_auto_tuner_stability_minio_tc: Docker not available");
-        return;
-    }
+    let (_container, port) = match rockstream_test_support::minio::start_minio(MINIO_BUCKET).await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP proof_auto_tuner_stability_minio_tc: Docker not available");
+            return;
+        }
+    };
 
     use object_store::path::Path;
     use object_store::PutPayload;
 
-    let (_container, port) = start_minio().await;
-    let store = minio_object_store(port);
+    let store = std::sync::Arc::new(rockstream_test_support::minio::minio_object_store(
+        port,
+        MINIO_BUCKET,
+    ));
 
     // Run scenario and collect audit events.
     let scenario = SpikeScenario::ten_x_spike(5, 10);

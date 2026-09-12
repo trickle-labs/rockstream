@@ -31,7 +31,6 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{
@@ -44,8 +43,7 @@ use rockstream_storage::{
     merge_registry::MergeOperatorRegistry,
     tier_aged_ssts, ShardDb, StorageError, TieredObjectStore, WriteBatch,
 };
-use sha2::{Digest, Sha256};
-use testcontainers::runners::AsyncRunner;
+use rockstream_test_support::minio::create_minio_bucket;
 
 // ─── constants ───────────────────────────────────────────────────────────────
 
@@ -60,176 +58,17 @@ fn docker_available() -> bool {
     rockstream_test_support::docker_available()
 }
 
-// ── SigV4 helpers for CreateBucket ───────────────────────────────────────────
-
-fn sha256_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key).unwrap();
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// Convert seconds-since-epoch to (year, month, day, hour, min, sec) UTC.
-fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let sod = secs % 86400;
-    let mut days = (secs / 86400) as u32;
-    let h = (sod / 3600) as u32;
-    let m = ((sod % 3600) / 60) as u32;
-    let s = (sod % 60) as u32;
-    let mut year = 1970u32;
-    loop {
-        let leap =
-            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let dy = if leap { 366 } else { 365 };
-        if days < dy {
-            break;
-        }
-        days -= dy;
-        year += 1;
-    }
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let dpm: [u32; 12] = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 0u32;
-    for &d in &dpm {
-        if days < d {
-            break;
-        }
-        days -= d;
-        month += 1;
-    }
-    let day = days + 1;
-    month += 1;
-    (year, month, day, h, m, s)
-}
-
-/// Create an S3 bucket on MinIO using the S3 API with AWS Signature V4.
-///
-/// Sends `PUT /<bucket>` (the standard S3 CreateBucket operation) with
-/// proper SigV4 authentication.  Both 200 OK and 409 Conflict (bucket
-/// already exists) are treated as success.
-async fn create_minio_bucket(port: u16, bucket: &str) {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let (y, mo, d, hh, mm, ss) = epoch_to_ymd_hms(secs);
-    let date = format!("{y:04}{mo:02}{d:02}");
-    let datetime = format!("{y:04}{mo:02}{d:02}T{hh:02}{mm:02}{ss:02}Z");
-    let host = format!("127.0.0.1:{port}");
-    let region = "us-east-1";
-    let empty_hash = sha256_hex(b"");
-    let canonical = format!(
-        "PUT\n/{bucket}\n\nhost:{host}\nx-amz-content-sha256:{empty_hash}\nx-amz-date:{datetime}\n\nhost;x-amz-content-sha256;x-amz-date\n{empty_hash}"
-    );
-    let canonical_hash = sha256_hex(canonical.as_bytes());
-    let scope = format!("{date}/{region}/s3/aws4_request");
-    let sts = format!("AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{canonical_hash}");
-    let k1 = hmac_sha256(format!("AWS4{MINIO_PASS}").as_bytes(), date.as_bytes());
-    let k2 = hmac_sha256(&k1, region.as_bytes());
-    let k3 = hmac_sha256(&k2, b"s3");
-    let signing_key = hmac_sha256(&k3, b"aws4_request");
-    let sig = hex::encode(hmac_sha256(&signing_key, sts.as_bytes()));
-    let auth = format!(
-        "AWS4-HMAC-SHA256 Credential={MINIO_USER}/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={sig}"
-    );
-    let resp = reqwest::Client::new()
-        .put(format!("http://{host}/{bucket}"))
-        .header("Host", &host)
-        .header("X-Amz-Content-Sha256", &empty_hash)
-        .header("X-Amz-Date", &datetime)
-        .header("Authorization", &auth)
-        .header("Content-Length", "0")
-        .send()
-        .await
-        .expect("CreateBucket PUT request failed");
-    let status = resp.status();
-    assert!(
-        status.is_success() || status.as_u16() == 409,
-        "CreateBucket failed: {status}"
-    );
-}
-
-use std::borrow::Cow;
-use std::collections::HashMap;
-use testcontainers::{core::WaitFor, Image};
-
-#[derive(Debug, Clone)]
-pub struct MinIO2024 {
-    env_vars: HashMap<String, String>,
-}
-
-impl Default for MinIO2024 {
-    fn default() -> Self {
-        let mut env_vars = HashMap::new();
-        env_vars.insert("MINIO_CONSOLE_ADDRESS".to_owned(), ":9001".to_owned());
-        Self { env_vars }
-    }
-}
-
-impl Image for MinIO2024 {
-    fn name(&self) -> &str {
-        "minio/minio"
-    }
-
-    fn tag(&self) -> &str {
-        "RELEASE.2024-11-07T00-52-20Z"
-    }
-
-    fn ready_conditions(&self) -> Vec<WaitFor> {
-        vec![WaitFor::message_on_stderr("API:")]
-    }
-
-    fn env_vars(
-        &self,
-    ) -> impl IntoIterator<Item = (impl Into<Cow<'_, str>>, impl Into<Cow<'_, str>>)> {
-        &self.env_vars
-    }
-
-    fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
-        vec!["server", "/data"]
-    }
-}
-
 static SHARED_MINIO: tokio::sync::OnceCell<
-    Option<(testcontainers::ContainerAsync<MinIO2024>, u16)>,
+    Option<(
+        testcontainers::ContainerAsync<rockstream_test_support::minio::MinIO2024>,
+        u16,
+    )>,
 > = tokio::sync::OnceCell::const_new();
 
 /// Return the port of a shared MinIO container instance.
 async fn get_shared_minio() -> Option<u16> {
-    if !docker_available() {
-        eprintln!("SKIP minio_backend: Docker not available locally");
-        return None;
-    }
     let res = SHARED_MINIO
-        .get_or_init(|| async {
-            let container = match MinIO2024::default().start().await {
-                Ok(c) => c,
-                Err(_) => return None,
-            };
-            let port = match container.get_host_port_ipv4(9000).await {
-                Ok(p) => p,
-                Err(_) => return None,
-            };
-            create_minio_bucket(port, MINIO_BUCKET).await;
-            Some((container, port))
-        })
+        .get_or_init(|| async { rockstream_test_support::minio::start_minio(MINIO_BUCKET).await })
         .await;
     res.as_ref().map(|(_, port)| *port)
 }
@@ -245,18 +84,10 @@ fn fast_settings() -> slatedb::config::Settings {
 /// Build an `object_store::ObjectStore` pointing at the MinIO container.
 #[allow(dead_code)]
 fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
-    Arc::new(
-        AmazonS3Builder::new()
-            .with_endpoint(format!("http://127.0.0.1:{port}"))
-            .with_bucket_name(MINIO_BUCKET)
-            .with_access_key_id(MINIO_USER)
-            .with_secret_access_key(MINIO_PASS)
-            .with_region("us-east-1")
-            .with_allow_http(true)
-            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
-            .build()
-            .expect("failed to build S3 object store for MinIO"),
-    )
+    Arc::new(rockstream_test_support::minio::minio_object_store(
+        port,
+        MINIO_BUCKET,
+    ))
 }
 
 fn minio_object_store_for_bucket(port: u16, bucket: &str) -> Arc<dyn ObjectStore> {
