@@ -8,8 +8,8 @@ use rockstream_control::{
 };
 use rockstream_types::ids::{ShardId, WorkerId};
 use rockstream_types::topology::{
-    CapacityHeadroom, ControlMessage, NodeRole, WorkerLifecycleState, WorkerMessage,
-    WorkerRegistration,
+    CapacityHeadroom, ControlMessage, NodeRole, WorkerCapabilities, WorkerLifecycleState,
+    WorkerMessage, WorkerRegistration,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -44,7 +44,11 @@ async fn register(addr: std::net::SocketAddr, worker_id: u64) -> TcpStream {
         NodeRole::Worker,
         format!("127.0.0.1:{}", 7000 + worker_id),
         CapacityHeadroom::FULL,
-    );
+    )
+    .with_capabilities(WorkerCapabilities {
+        shared_shard_store_id: Some([1; 32]),
+        ..Default::default()
+    });
     let line = serde_json::to_string(&WorkerMessage::Register(reg)).unwrap() + "\n";
     stream.write_all(line.as_bytes()).await.unwrap();
     let mut reader = BufReader::new(&mut stream);
@@ -60,9 +64,7 @@ async fn register(addr: std::net::SocketAddr, worker_id: u64) -> TcpStream {
     stream
 }
 
-async fn start_service(
-    auto_drain: bool,
-) -> (
+async fn start_service() -> (
     rockstream_control::ControlServiceHandle,
     TopologyCatalog,
     ShardManager,
@@ -73,29 +75,24 @@ async fn start_service(
     let service = ControlService::new(catalog.clone())
         .with_shard_manager(manager.clone())
         .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
-        .with_migration_store(Arc::new(MigrationPersistentStore::new(store)))
-        .with_auto_drain(auto_drain);
+        .with_migration_store(Arc::new(MigrationPersistentStore::new(store)));
     let handle = service.start("127.0.0.1:0").await.unwrap();
     (handle, catalog, manager)
 }
 
 #[tokio::test]
 async fn draining_worker_receives_no_new_shards() {
-    let (handle, catalog, _manager) = start_service(false).await;
+    let (handle, catalog, _manager) = start_service().await;
     let _worker_1 = register(handle.addr, 1).await;
     let _worker_2 = register(handle.addr, 2).await;
 
-    let replies = send(
+    let _ = send(
         handle.addr,
         &WorkerMessage::RequestDrain {
             worker_id: WorkerId(1),
         },
     )
     .await;
-    assert!(matches!(
-        replies.last(),
-        Some(ControlMessage::DrainStatus { .. })
-    ));
     assert!(matches!(
         catalog.get(WorkerId(1)).unwrap().lifecycle,
         WorkerLifecycleState::Draining {
@@ -121,24 +118,29 @@ async fn draining_worker_receives_no_new_shards() {
 
 #[tokio::test]
 async fn drain_completes_after_all_shards_migrate() {
-    let (handle, catalog, manager) = start_service(true).await;
-    let _worker_1 = register(handle.addr, 1).await;
+    let (handle, catalog, manager) = start_service().await;
+    let mut worker_1 = register(handle.addr, 1).await;
     let _worker_2 = register(handle.addr, 2).await;
     manager.acquire(ShardId(7), WorkerId(1)).unwrap();
     manager.acquire(ShardId(8), WorkerId(1)).unwrap();
 
-    let replies = send(
-        handle.addr,
+    send_on(
+        &mut worker_1,
         &WorkerMessage::RequestDrain {
             worker_id: WorkerId(1),
         },
     )
     .await;
-    assert!(matches!(
-        replies.last(),
-        Some(ControlMessage::DrainStatus { .. })
-    ));
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_begin_drain(&mut worker_1).await;
+    send_on(
+        &mut worker_1,
+        &WorkerMessage::DrainAck {
+            worker_id: WorkerId(1),
+            shards_remaining: 0,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert!(matches!(
         catalog.get(WorkerId(1)).unwrap().lifecycle,
@@ -151,15 +153,24 @@ async fn drain_completes_after_all_shards_migrate() {
 
 #[tokio::test]
 async fn decommissioned_worker_removed_from_topology_after_grace_period() {
-    let (handle, catalog, manager) = start_service(true).await;
-    let _worker_1 = register(handle.addr, 1).await;
+    let (handle, catalog, manager) = start_service().await;
+    let mut worker_1 = register(handle.addr, 1).await;
     let _worker_2 = register(handle.addr, 2).await;
     manager.acquire(ShardId(10), WorkerId(1)).unwrap();
 
-    let _ = send(
-        handle.addr,
+    send_on(
+        &mut worker_1,
         &WorkerMessage::RequestDrain {
             worker_id: WorkerId(1),
+        },
+    )
+    .await;
+    wait_for_begin_drain(&mut worker_1).await;
+    send_on(
+        &mut worker_1,
+        &WorkerMessage::DrainAck {
+            worker_id: WorkerId(1),
+            shards_remaining: 0,
         },
     )
     .await;
@@ -169,6 +180,30 @@ async fn decommissioned_worker_removed_from_topology_after_grace_period() {
 
     assert!(catalog.get(WorkerId(1)).is_none());
     handle.shutdown();
+}
+
+async fn receive(stream: &mut TcpStream) -> ControlMessage {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(line.trim()).unwrap()
+}
+
+async fn wait_for_begin_drain(stream: &mut TcpStream) {
+    for _ in 0..4 {
+        if matches!(receive(stream).await, ControlMessage::BeginDrain(_)) {
+            return;
+        }
+    }
+    panic!("worker did not receive BeginDrain");
+}
+
+async fn send_on(stream: &mut TcpStream, msg: &WorkerMessage) {
+    let line = serde_json::to_string(msg).unwrap() + "\n";
+    stream.write_all(line.as_bytes()).await.unwrap();
 }
 
 #[tokio::test]

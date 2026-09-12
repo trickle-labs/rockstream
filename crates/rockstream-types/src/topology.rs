@@ -122,6 +122,9 @@ pub struct WorkerCapabilities {
     /// Supports compressed checkpoint-manifest codec framing.
     #[serde(default)]
     pub checkpoint_manifest_codec_v1: bool,
+    /// Identifies the shared object store used for durable shard data.
+    #[serde(default)]
+    pub shared_shard_store_id: Option<[u8; 32]>,
 }
 
 /// Registration request sent by a worker to the control plane.
@@ -883,6 +886,7 @@ mod tests {
             same_host_arrow_shm_v1: true,
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: true,
+            shared_shard_store_id: None,
         });
         let json = serde_json::to_string(&reg).unwrap();
         let decoded: WorkerRegistration = serde_json::from_str(&json).unwrap();
@@ -961,6 +965,7 @@ mod tests {
             same_host_arrow_shm_v1: true,
             shuffle_codec_v1: false,
             checkpoint_manifest_codec_v1: true,
+            shared_shard_store_id: None,
         });
         let info = WorkerInfo::from_registration(&reg);
         assert_eq!(info.worker_id, WorkerId(5));

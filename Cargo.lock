@@ -4954,6 +4954,7 @@ dependencies = [
  "rockstream-control",
  "rockstream-docgen",
  "rockstream-gateway",
+ "rockstream-management-proto",
  "rockstream-ops",
  "rockstream-plan",
  "rockstream-runtime",
@@ -4973,6 +4974,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-rustls",
  "toml",
+ "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -5028,6 +5030,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rockstream-cli",
+ "rockstream-management-proto",
  "rockstream-ops",
  "rockstream-plan",
  "rockstream-runtime",
@@ -5048,6 +5051,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "tonic 0.12.3",
  "tracing",
  "uuid",
  "x509-parser",
@@ -5156,6 +5160,17 @@ dependencies = [
  "tracing",
  "uuid",
  "x509-parser",
+]
+
+[[package]]
+name = "rockstream-management-proto"
+version = "0.65.0"
+dependencies = [
+ "prost 0.13.5",
+ "protoc-bin-vendored",
+ "tokio",
+ "tonic 0.12.3",
+ "tonic-build",
 ]
 
 [[package]]

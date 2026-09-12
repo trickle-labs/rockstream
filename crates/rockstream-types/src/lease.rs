@@ -58,6 +58,8 @@ pub enum ShardRevokeReason {
     WorkerDead,
     /// The control plane preempted the lease for rebalancing.
     ControlPlanePreempt,
+    /// The worker flushed shared shard data before a graceful drain handoff.
+    WorkerDrain,
 }
 
 impl std::fmt::Display for ShardRevokeReason {
@@ -65,6 +67,7 @@ impl std::fmt::Display for ShardRevokeReason {
         match self {
             ShardRevokeReason::WorkerDead => write!(f, "worker_dead"),
             ShardRevokeReason::ControlPlanePreempt => write!(f, "control_plane_preempt"),
+            ShardRevokeReason::WorkerDrain => write!(f, "worker_drain"),
         }
     }
 }

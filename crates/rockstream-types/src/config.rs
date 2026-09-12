@@ -601,6 +601,8 @@ pub struct RaftSection {
 pub struct ControlSection {
     #[serde(default = "default_control_listen_addr")]
     pub listen_addr: Option<String>,
+    #[serde(default = "default_management_addr")]
+    pub management_addr: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
@@ -613,10 +615,15 @@ fn default_control_listen_addr() -> Option<String> {
     Some("127.0.0.1:9200".to_string())
 }
 
+fn default_management_addr() -> Option<String> {
+    Some("127.0.0.1:9201".to_string())
+}
+
 impl Default for ControlSection {
     fn default() -> Self {
         Self {
             listen_addr: default_control_listen_addr(),
+            management_addr: default_management_addr(),
             url: None,
             shared_storage: None,
             raft: None,
@@ -999,6 +1006,24 @@ mod tests {
         let serialized = default_cfg.to_string().unwrap();
         let deserialized = RockstreamConfig::load_from_str(&serialized).unwrap();
         assert_eq!(default_cfg, deserialized);
+    }
+
+    #[test]
+    fn control_management_addr_defaults_and_roundtrips() {
+        let old_config =
+            NodeConfig::load_from_str("[control]\nlisten_addr = '127.0.0.1:9200'\n").unwrap();
+        assert_eq!(
+            old_config.control.management_addr.as_deref(),
+            Some("127.0.0.1:9201")
+        );
+
+        let configured =
+            NodeConfig::load_from_str("[control]\nmanagement_addr = '0.0.0.0:9201'\n").unwrap();
+        let roundtrip = NodeConfig::load_from_str(&toml::to_string(&configured).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.control.management_addr.as_deref(),
+            Some("0.0.0.0:9201")
+        );
     }
 
     #[test]

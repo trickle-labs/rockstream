@@ -26,6 +26,8 @@ pub mod config_deriver;
 pub mod freshness;
 pub mod frontier;
 pub mod kek;
+pub mod management;
+pub mod management_store;
 pub mod manifest;
 pub mod migration;
 pub mod namespace;
@@ -60,6 +62,12 @@ pub use freshness::{
 };
 pub use frontier::{AggregatorError, FrontierAggregator};
 pub use kek::{AwsKmsKekProvider, EnvKekProvider, KekError, KekProvider};
+pub use management::{ManagementService, ManagementServiceHandle};
+pub use management_store::{
+    IdempotencyRecord, ManagementOperationStore, OperationKind, OperationLifecycleError,
+    OperationRecord, OperationStatus, OperationStoreError, OperationUpdate,
+    IDEMPOTENCY_KEY_RETENTION_MS, MANAGEMENT_OPERATION_RECORD_VERSION,
+};
 pub use manifest::{
     compute_file_sha256, validate_catalog_reference, verify_backup_payload_files,
     BackupConcurrencyGovernor, BackupFileEntry, BackupManifest, BackupPoint,

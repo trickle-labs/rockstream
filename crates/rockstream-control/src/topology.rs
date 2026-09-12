@@ -268,6 +268,7 @@ mod tests {
             same_host_arrow_shm_v1: true,
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: id.is_multiple_of(2),
+            shared_shard_store_id: None,
         })
     }
 
@@ -346,6 +347,7 @@ mod tests {
             same_host_arrow_shm_v1: false,
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: true,
+            shared_shard_store_id: None,
         });
         cat.register(&reg2);
         assert_eq!(cat.len(), 1);

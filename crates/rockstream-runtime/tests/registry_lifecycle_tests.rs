@@ -19,6 +19,7 @@ fn sample_worker_info(worker_id: u64, address: &str) -> WorkerInfo {
             same_host_arrow_shm_v1: true,
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: true,
+            shared_shard_store_id: None,
         },
         protocol_range: rockstream_types::compatibility::SupportedVersionRange::default(),
         storage_format_range: rockstream_types::compatibility::SupportedStorageFormatRange::default(

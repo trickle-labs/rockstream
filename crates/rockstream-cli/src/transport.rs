@@ -145,6 +145,150 @@ pub trait CliTransport: Send + Sync {
     fn identity(&self) -> &ClientIdentity;
 }
 
+pub struct ManagementClient {
+    client: rockstream_management_proto::v1::management_service_client::ManagementServiceClient<
+        tonic::transport::Channel,
+    >,
+}
+
+impl ManagementClient {
+    pub async fn connect(addr: impl AsRef<str>) -> Result<Self, tonic::transport::Error> {
+        let addr = addr.as_ref();
+        let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
+            addr.to_owned()
+        } else {
+            format!("http://{addr}")
+        };
+        Ok(Self {
+            client:
+                rockstream_management_proto::v1::management_service_client::ManagementServiceClient::connect(endpoint)
+                    .await?,
+        })
+    }
+
+    pub async fn get_cluster_status(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetClusterStatusRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::GetClusterStatusResponse>,
+        tonic::Status,
+    > {
+        self.client.get_cluster_status(request).await
+    }
+
+    pub async fn list_nodes(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::ListNodesRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::ListNodesResponse>, tonic::Status>
+    {
+        self.client.list_nodes(request).await
+    }
+
+    pub async fn get_node(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetNodeRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetNodeResponse>, tonic::Status>
+    {
+        self.client.get_node(request).await
+    }
+
+    pub async fn list_shards(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::ListShardsRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::ListShardsResponse>, tonic::Status>
+    {
+        self.client.list_shards(request).await
+    }
+
+    pub async fn get_shard(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetShardRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetShardResponse>, tonic::Status>
+    {
+        self.client.get_shard(request).await
+    }
+
+    pub async fn list_operations(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::ListOperationsRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::ListOperationsResponse>,
+        tonic::Status,
+    > {
+        self.client.list_operations(request).await
+    }
+
+    pub async fn get_operation(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetOperationRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetOperationResponse>, tonic::Status>
+    {
+        self.client.get_operation(request).await
+    }
+
+    pub async fn get_config_summary(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetConfigSummaryRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::GetConfigSummaryResponse>,
+        tonic::Status,
+    > {
+        self.client.get_config_summary(request).await
+    }
+
+    pub async fn get_capabilities(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetCapabilitiesRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::GetCapabilitiesResponse>,
+        tonic::Status,
+    > {
+        self.client.get_capabilities(request).await
+    }
+
+    pub async fn get_health(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetHealthRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetHealthResponse>, tonic::Status>
+    {
+        self.client.get_health(request).await
+    }
+
+    pub async fn drain_worker(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::DrainWorkerRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::DrainWorkerResponse>, tonic::Status>
+    {
+        self.client.drain_worker(request).await
+    }
+
+    pub async fn migrate_shard(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::MigrateShardRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::MigrateShardResponse>, tonic::Status>
+    {
+        self.client.migrate_shard(request).await
+    }
+
+    pub async fn create_backup(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::CreateBackupRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::CreateBackupResponse>, tonic::Status>
+    {
+        self.client.create_backup(request).await
+    }
+
+    pub async fn cancel_operation(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::CancelOperationRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::CancelOperationResponse>,
+        tonic::Status,
+    > {
+        self.client.cancel_operation(request).await
+    }
+}
+
 // ─── API Traits ──────────────────────────────────────────────────────────────
 
 pub trait TopologyApi: Send + Sync {

@@ -161,6 +161,7 @@ pub async fn run_demo_async(format: OutputFormat, opts: &DemoOptions) -> Result<
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: None,
         metrics_addr: None,
         listen_addr: Some(listen_addr),
         raft_peers: None,
