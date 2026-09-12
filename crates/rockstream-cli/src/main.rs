@@ -279,6 +279,7 @@ fn main() -> ExitCode {
             raft_bootstrap,
             daemon,
             control_bind,
+            management_addr,
             control_shared_storage,
             query_time_shard_dirs,
             min_epoch_ms,
@@ -299,6 +300,7 @@ fn main() -> ExitCode {
                 availability_zone: availability_zone.clone(),
                 listen_addr: Some(listen.clone()),
                 control_bind: control_bind.clone(),
+                management_addr: management_addr.clone(),
                 control_url: control.clone(),
                 control_shared_storage: control_shared_storage
                     .as_ref()
@@ -331,20 +333,19 @@ fn main() -> ExitCode {
                 shutdown_timeout_secs,
                 ..Default::default()
             };
-            let config = match rockstream_types::config_resolver::ConfigResolver::resolve(
-                None, &overrides,
-            ) {
-                Ok(r) => r.config,
-                Err(e) => {
-                    let err = rockstream_cli::CliError::new(
-                        rockstream_types::error_code::RS_0002,
-                        format!("configuration resolution failed: {e}"),
-                        "Check configuration files, environment variables, and CLI flags.",
-                    );
-                    eprintln!("{}", rockstream_cli::output::render_error(&err, format));
-                    return ExitCode::FAILURE;
-                }
-            };
+            let (config, node_config) =
+                match rockstream_types::config_resolver::ConfigResolver::resolve(None, &overrides) {
+                    Ok(r) => (r.config, r.node_config),
+                    Err(e) => {
+                        let err = rockstream_cli::CliError::new(
+                            rockstream_types::error_code::RS_0002,
+                            format!("configuration resolution failed: {e}"),
+                            "Check configuration files, environment variables, and CLI flags.",
+                        );
+                        eprintln!("{}", rockstream_cli::output::render_error(&err, format));
+                        return ExitCode::FAILURE;
+                    }
+                };
 
             let opts = StartOptions {
                 storage,
@@ -363,8 +364,10 @@ fn main() -> ExitCode {
                     same_host_arrow_shm_v1: true,
                     shuffle_codec_v1: true,
                     checkpoint_manifest_codec_v1: true,
+                    shared_shard_store_id: None,
                 },
                 config,
+                node_config: Some(node_config),
                 metrics_addr,
                 listen_addr: Some(listen),
                 raft_peers,

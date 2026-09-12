@@ -14,6 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use parking_lot::RwLock;
 use serde_json;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -636,6 +637,8 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut capabilities = capabilities;
+    capabilities.shared_shard_store_id = shared_shard_store_id();
     let worker_id = Arc::new(RwLock::new(None));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
@@ -786,6 +789,63 @@ where
             };
 
             match msg {
+                ControlMessage::BeginDrain(request) => {
+                    let Some(id) = *worker_id_clone.read() else {
+                        continue;
+                    };
+                    if request.worker_id != id {
+                        tracing::error!(worker = %id, requested = %request.worker_id, "worker rejected a drain request for another identity");
+                        continue;
+                    }
+                    let shard_ids = active_shards_clone
+                        .read()
+                        .keys()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let mut databases = Vec::new();
+                    for shard_id in &shard_ids {
+                        actor_registry_clone.revoke(*shard_id);
+                        deployments_clone.write().retain(|_, deployment| {
+                            if deployment.descriptor.shard.shard_id == *shard_id {
+                                databases.push(deployment.db.as_ref().clone());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        if let Some(state) = active_shards_clone.write().remove(shard_id) {
+                            if let Some(db) = state.db {
+                                databases.push(db);
+                            }
+                        }
+                    }
+                    let mut flushed = true;
+                    for db in databases {
+                        if let Err(error) = db.flush().await {
+                            tracing::error!(worker = %id, %error, "worker drain stopped because shard flush failed");
+                            flushed = false;
+                            break;
+                        }
+                        if let Err(error) = db.close().await {
+                            tracing::error!(worker = %id, %error, "worker drain stopped because shard close failed");
+                            flushed = false;
+                            break;
+                        }
+                    }
+                    if flushed {
+                        rockstream_types::metrics::set_r1_worker_shards_owned(id, 0);
+                        if msg_tx
+                            .send(WorkerMessage::DrainAck {
+                                worker_id: id,
+                                shards_remaining: 0,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(worker = %id, "worker drain acknowledgement could not be queued");
+                        }
+                    }
+                }
                 ControlMessage::Registered { worker_id: wid } => {
                     tracing::info!("Worker client registered successfully as {:?}", wid);
                     *worker_id_clone.write() = Some(wid);
@@ -1117,4 +1177,17 @@ where
     });
 
     Ok((handle, join_handle))
+}
+
+fn shared_shard_store_id() -> Option<[u8; 32]> {
+    let endpoint = std::env::var("ROCKSTREAM_OBJECT_STORE_ENDPOINT").ok()?;
+    let bucket = std::env::var("ROCKSTREAM_OBJECT_STORE_BUCKET").ok()?;
+    let region =
+        std::env::var("ROCKSTREAM_OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
+    let mut digest = Sha256::new();
+    for value in [endpoint, bucket, region] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    Some(digest.finalize().into())
 }

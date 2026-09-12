@@ -12,14 +12,13 @@ use rockstream_runtime::exchange::pool::ShuffleClientPool;
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::{ShardId, WorkerId};
 use rockstream_types::topology::{
-    CapacityHeadroom, ControlMessage, NodeRole, WorkerLifecycleState, WorkerMessage,
-    WorkerRegistration,
+    CapacityHeadroom, ControlMessage, NodeRole, WorkerCapabilities, WorkerLifecycleState,
+    WorkerMessage, WorkerRegistration,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-async fn send_worker_msg(addr: std::net::SocketAddr, msg: &WorkerMessage) -> Vec<ControlMessage> {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+async fn send_worker_msg(stream: &mut TcpStream, msg: &WorkerMessage) -> Vec<ControlMessage> {
     let line = serde_json::to_string(msg).unwrap() + "\n";
     stream.write_all(line.as_bytes()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -48,7 +47,11 @@ async fn register_worker(addr: std::net::SocketAddr, worker_id: u64) -> TcpStrea
         NodeRole::Worker,
         format!("127.0.0.1:{}", 8000 + worker_id),
         CapacityHeadroom::FULL,
-    );
+    )
+    .with_capabilities(WorkerCapabilities {
+        shared_shard_store_id: Some([1; 32]),
+        ..Default::default()
+    });
     let line = serde_json::to_string(&WorkerMessage::Register(reg)).unwrap() + "\n";
     stream.write_all(line.as_bytes()).await.unwrap();
     let mut reader = BufReader::new(&mut stream);
@@ -87,7 +90,7 @@ async fn test_worker_epoch_flush_lease_release_durability() {
     let service = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
     let handle = service.start("127.0.0.1:0").await.unwrap();
 
-    let _w1_conn = register_worker(handle.addr, 1).await;
+    let mut w1_conn = register_worker(handle.addr, 1).await;
     let _w2_conn = register_worker(handle.addr, 2).await;
 
     // Worker 1 acquires Shard 42
@@ -105,23 +108,22 @@ async fn test_worker_epoch_flush_lease_release_durability() {
     // 3. Initiate Graceful Drain on Worker 1
     // Request drain
     let drain_replies = send_worker_msg(
-        handle.addr,
+        &mut w1_conn,
         &WorkerMessage::RequestDrain {
             worker_id: WorkerId(1),
         },
     )
     .await;
-    assert!(matches!(
-        drain_replies.last(),
-        Some(ControlMessage::DrainStatus { .. })
-    ));
+    assert!(drain_replies
+        .iter()
+        .any(|message| matches!(message, ControlMessage::DrainStatus { .. })));
 
     // Worker 1 purges exchange connections and sends DrainAck with 0 shards remaining
     multiplexer.evict_worker(WorkerId(1));
     pool.evict_worker(WorkerId(1));
 
     let _ack_replies = send_worker_msg(
-        handle.addr,
+        &mut w1_conn,
         &WorkerMessage::DrainAck {
             worker_id: WorkerId(1),
             shards_remaining: 0,
@@ -135,10 +137,12 @@ async fn test_worker_epoch_flush_lease_release_durability() {
         w1.lifecycle,
         WorkerLifecycleState::Decommissioned { .. }
     ));
-    assert_eq!(manager.get(ShardId(42)).map(|l| l.worker_id), None);
+    assert_eq!(
+        manager.get(ShardId(42)).map(|l| l.worker_id),
+        Some(WorkerId(2))
+    );
 
     // 5. Worker 2 immediately acquires the released Shard 42 without timeout delay
-    manager.acquire(ShardId(42), WorkerId(2)).unwrap();
     assert_eq!(
         manager.get(ShardId(42)).map(|l| l.worker_id),
         Some(WorkerId(2))

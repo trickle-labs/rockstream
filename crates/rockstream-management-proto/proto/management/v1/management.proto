@@ -1,0 +1,168 @@
+syntax = "proto3";
+
+package rockstream.management.v1;
+
+service ManagementService {
+  rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+  rpc GetShard(GetShardRequest) returns (GetShardResponse);
+  rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+  rpc GetConfigSummary(GetConfigSummaryRequest) returns (GetConfigSummaryResponse);
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+  rpc GetHealth(GetHealthRequest) returns (GetHealthResponse);
+  rpc DrainWorker(DrainWorkerRequest) returns (DrainWorkerResponse);
+  rpc MigrateShard(MigrateShardRequest) returns (MigrateShardResponse);
+  rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse);
+  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
+}
+
+message GetClusterStatusRequest { uint32 protocol_version = 1; }
+message GetClusterStatusResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  string state = 4;
+  repeated Node nodes = 5;
+  uint32 active_operations = 6;
+  uint32 retained_operations = 7;
+  uint32 request_fill = 8;
+}
+
+message ListNodesRequest {
+  uint32 protocol_version = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+message ListNodesResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  repeated Node nodes = 4;
+  string next_page_token = 5;
+}
+message GetNodeRequest { uint32 protocol_version = 1; string node_id = 2; }
+message GetNodeResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  Node node = 4;
+}
+
+message Node {
+  string node_id = 1;
+  string address = 2;
+  string state = 3;
+  string source_version = 4;
+}
+
+message ListShardsRequest {
+  uint32 protocol_version = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+message ListShardsResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  repeated Shard shards = 4;
+  string next_page_token = 5;
+}
+message GetShardRequest { uint32 protocol_version = 1; string shard_id = 2; }
+message GetShardResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  Shard shard = 4;
+}
+message Shard {
+  string shard_id = 1;
+  string owner_node_id = 2;
+  string state = 3;
+  string source_version = 4;
+}
+
+message ListOperationsRequest {
+  uint32 protocol_version = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+message ListOperationsResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  repeated Operation operations = 4;
+  string next_page_token = 5;
+}
+message GetOperationRequest { uint32 protocol_version = 1; string operation_id = 2; }
+message GetOperationResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  Operation operation = 4;
+}
+message Operation {
+  string operation_id = 1;
+  string kind = 2;
+  string state = 3;
+  string started_at = 4;
+  string updated_at = 5;
+  string progress = 6;
+  string phase = 7;
+  string error_code = 8;
+  repeated string next_steps = 9;
+  string source_version = 10;
+}
+
+message GetConfigSummaryRequest { uint32 protocol_version = 1; }
+message GetConfigSummaryResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  repeated ConfigValue values = 4;
+}
+message ConfigValue { string key = 1; string value = 2; bool redacted = 3; }
+
+message GetCapabilitiesRequest { uint32 protocol_version = 1; }
+message GetCapabilitiesResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  repeated string capabilities = 4;
+}
+
+message GetHealthRequest { uint32 protocol_version = 1; }
+message GetHealthResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  string state = 4;
+  string reason = 5;
+}
+
+message DrainWorkerRequest {
+  uint32 protocol_version = 1;
+  string worker_id = 2;
+  string idempotency_key = 3;
+}
+message DrainWorkerResponse { uint32 protocol_version = 1; Operation operation = 2; }
+message MigrateShardRequest {
+  uint32 protocol_version = 1;
+  string shard_id = 2;
+  string target_node_id = 3;
+  string idempotency_key = 4;
+}
+message MigrateShardResponse { uint32 protocol_version = 1; Operation operation = 2; }
+message CreateBackupRequest {
+  uint32 protocol_version = 1;
+  string destination = 2;
+  string idempotency_key = 3;
+}
+message CreateBackupResponse { uint32 protocol_version = 1; Operation operation = 2; }
+message CancelOperationRequest {
+  uint32 protocol_version = 1;
+  string operation_id = 2;
+}
+message CancelOperationResponse { uint32 protocol_version = 1; Operation operation = 2; }

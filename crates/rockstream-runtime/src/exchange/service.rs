@@ -541,6 +541,7 @@ mod tests {
                 same_host_arrow_shm_v1: same_host_shm,
                 shuffle_codec_v1: shuffle_codec,
                 checkpoint_manifest_codec_v1: true,
+                shared_shard_store_id: None,
             },
             protocol_range: rockstream_types::compatibility::SupportedVersionRange::default(),
             storage_format_range:

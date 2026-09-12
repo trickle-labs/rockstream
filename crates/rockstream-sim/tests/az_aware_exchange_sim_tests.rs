@@ -41,13 +41,56 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 static SHM_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
-async fn send(addr: std::net::SocketAddr, msg: &WorkerMessage) {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let line = serde_json::to_string(msg).unwrap() + "\n";
-    stream.write_all(line.as_bytes()).await.unwrap();
-    let mut reader = BufReader::new(stream);
-    let mut buf = String::new();
-    let _ = tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut buf)).await;
+async fn register_worker(
+    addr: std::net::SocketAddr,
+    id: u64,
+    host_id: &str,
+    az: &str,
+) -> BufReader<TcpStream> {
+    let mut reader = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    let line = serde_json::to_string(&WorkerMessage::Register(registration_with_location(
+        id, host_id, az,
+    )))
+    .unwrap()
+        + "\n";
+    reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<rockstream_types::topology::ControlMessage>(response.trim())
+            .unwrap(),
+        rockstream_types::topology::ControlMessage::Registered { worker_id } if worker_id == WorkerId(id)
+    ));
+    reader
+}
+
+async fn drain_worker(reader: &mut BufReader<TcpStream>, worker_id: WorkerId) {
+    let line = serde_json::to_string(&WorkerMessage::RequestDrain { worker_id }).unwrap() + "\n";
+    reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+    let mut begin_seen = false;
+    let mut status_seen = false;
+    while !(begin_seen && status_seen) {
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<rockstream_types::topology::ControlMessage>(response.trim())
+            .unwrap()
+        {
+            rockstream_types::topology::ControlMessage::BeginDrain(_) => begin_seen = true,
+            rockstream_types::topology::ControlMessage::DrainStatus { .. } => status_seen = true,
+            _ => {}
+        }
+    }
+    let line = serde_json::to_string(&WorkerMessage::DrainAck {
+        worker_id,
+        shards_remaining: 0,
+    })
+    .unwrap()
+        + "\n";
+    reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 fn registration_with_location(id: u64, host_id: &str, az: &str) -> WorkerRegistration {
@@ -62,6 +105,7 @@ fn registration_with_location(id: u64, host_id: &str, az: &str) -> WorkerRegistr
         same_host_arrow_shm_v1: true,
         shuffle_codec_v1: true,
         checkpoint_manifest_codec_v1: true,
+        shared_shard_store_id: Some([1; 32]),
     })
 }
 
@@ -76,6 +120,7 @@ fn worker_info(worker_id: u64, address: String, host_id: &str, az: &str) -> Work
             same_host_arrow_shm_v1: true,
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: true,
+            shared_shard_store_id: Some([1; 32]),
         },
         protocol_range: rockstream_types::compatibility::SupportedVersionRange::default(),
         storage_format_range: rockstream_types::compatibility::SupportedStorageFormatRange::default(
@@ -451,25 +496,14 @@ async fn az_domain_rebuild_during_drain_preserves_delivery_sim() {
         .with_shard_manager(manager.clone())
         .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
         .with_migration_store(Arc::new(MigrationPersistentStore::new(store)))
-        .with_auto_drain(true)
         .start("127.0.0.1:0")
         .await
         .unwrap();
-    for reg in [
-        registration_with_location(1, "host-a", "az-1"),
-        registration_with_location(2, "host-b", "az-2"),
-        registration_with_location(3, "host-c", "az-1"),
-    ] {
-        catalog.register(&reg);
-    }
+    let mut worker_1 = register_worker(handle.addr, 1, "host-a", "az-1").await;
+    let _worker_2 = register_worker(handle.addr, 2, "host-b", "az-2").await;
+    let _worker_3 = register_worker(handle.addr, 3, "host-c", "az-1").await;
     manager.acquire(ShardId(77), WorkerId(1)).unwrap();
-    send(
-        handle.addr,
-        &WorkerMessage::RequestDrain {
-            worker_id: WorkerId(1),
-        },
-    )
-    .await;
+    drain_worker(&mut worker_1, WorkerId(1)).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(manager.get(ShardId(77)).unwrap().worker_id, WorkerId(3));
 
@@ -560,25 +594,14 @@ async fn exchange_domain_rebuild_releases_row_credits_during_drain_sim() {
         .with_shard_manager(manager.clone())
         .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
         .with_migration_store(Arc::new(MigrationPersistentStore::new(store)))
-        .with_auto_drain(true)
         .start("127.0.0.1:0")
         .await
         .unwrap();
-    for reg in [
-        registration_with_location(11, "host-a", "az-1"),
-        registration_with_location(12, "host-b", "az-2"),
-        registration_with_location(13, "host-c", "az-1"),
-    ] {
-        catalog.register(&reg);
-    }
+    let mut worker_11 = register_worker(handle.addr, 11, "host-a", "az-1").await;
+    let _worker_12 = register_worker(handle.addr, 12, "host-b", "az-2").await;
+    let _worker_13 = register_worker(handle.addr, 13, "host-c", "az-1").await;
     manager.acquire(ShardId(88), WorkerId(11)).unwrap();
-    send(
-        handle.addr,
-        &WorkerMessage::RequestDrain {
-            worker_id: WorkerId(11),
-        },
-    )
-    .await;
+    drain_worker(&mut worker_11, WorkerId(11)).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(manager.get(ShardId(88)).unwrap().worker_id, WorkerId(13));
 

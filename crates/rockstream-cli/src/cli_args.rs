@@ -84,6 +84,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub control: Option<String>,
 
+    /// Management API endpoint.
+    #[arg(long, global = true, default_value = "127.0.0.1:9201")]
+    pub management: String,
+
     /// Storage directory for local state and artifacts.
     #[arg(long, global = true)]
     pub storage_dir: Option<PathBuf>,
@@ -260,6 +264,10 @@ pub enum Command {
         /// Override address worker-facing ControlService binds to.
         #[arg(long)]
         control_bind: Option<String>,
+
+        /// Address the typed management RPC listener binds to.
+        #[arg(long)]
+        management_addr: Option<String>,
 
         /// Directory for state shared across control nodes in Raft group.
         #[arg(long)]

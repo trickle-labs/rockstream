@@ -88,6 +88,7 @@ fn worker_info(worker_id: u64, address: String, host_id: &str) -> WorkerInfo {
             same_host_arrow_shm_v1: false,
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: true,
+            shared_shard_store_id: None,
         },
         protocol_range: rockstream_types::compatibility::SupportedVersionRange::default(),
         storage_format_range: rockstream_types::compatibility::SupportedStorageFormatRange::default(
