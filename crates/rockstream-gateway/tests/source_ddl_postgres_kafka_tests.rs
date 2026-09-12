@@ -247,29 +247,37 @@ async fn kafka_source_backfill_and_live_updates_reach_pgwire() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(live, vec![("a".to_string(), "35".to_string())]);
-    let status = client
-        .query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW order_rows", &[])
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| {
-            (0..7)
-                .map(|index| row.get::<_, Option<String>>(index))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        status,
-        vec![vec![
-            Some("order_rows".to_string()),
-            Some("RUNNING".to_string()),
-            Some("3".to_string()),
-            Some("0".to_string()),
-            Some("0".to_string()),
-            Some("ADMITTED".to_string()),
-            None,
-        ]]
-    );
+    let expected_status = vec![vec![
+        Some("order_rows".to_string()),
+        Some("RUNNING".to_string()),
+        Some("3".to_string()),
+        Some("0".to_string()),
+        Some("0".to_string()),
+        Some("ADMITTED".to_string()),
+        None,
+    ]];
+    let status_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = client
+            .query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW order_rows", &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (0..7)
+                    .map(|index| row.get::<_, Option<String>>(index))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if status == expected_status {
+            break;
+        }
+        assert!(
+            Instant::now() < status_deadline,
+            "Kafka backfill status did not reach the final cursor"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let persisted_table = catalog.get_table("orders").unwrap();
     let persisted_source = catalog.get_source("orders").unwrap();
     let persisted_view = catalog.get_view("order_rows").unwrap();
