@@ -883,6 +883,41 @@ pub enum AdminCommand {
         #[command(subcommand)]
         command: CheckpointCommand,
     },
+    /// Point-in-time durable backup operations (create, inspect, verify).
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+    /// Restore a database backup into a clean or authorized destination.
+    Restore {
+        /// Source backup directory or object-store URI.
+        source: String,
+        /// Target destination directory.
+        #[arg(long, short = 't')]
+        target: Option<String>,
+        /// Force overwrite of existing non-empty destination.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum BackupCommand {
+    /// Create a full point-in-time backup.
+    Create {
+        /// Destination directory or URI.
+        destination: String,
+    },
+    /// Inspect a backup manifest and point-in-time consistency metadata.
+    Inspect {
+        /// Destination directory or URI.
+        destination: String,
+    },
+    /// Cryptographically verify backup integrity against manifest checksums.
+    Verify {
+        /// Destination directory or URI.
+        destination: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

@@ -568,6 +568,14 @@ pub const RS_3610: ErrorCode = ErrorCode::new(3610);
 pub const RS_3611: ErrorCode = ErrorCode::new(3611);
 /// Worker drain queue reached its configured bound; backpressure applied.
 pub const RS_3612: ErrorCode = ErrorCode::new(3612);
+/// Missing payload file or truncated/unfinalized manifest.
+pub const RS_3615: ErrorCode = ErrorCode::new(3615);
+/// Checksum mismatch on manifest or data file.
+pub const RS_3616: ErrorCode = ErrorCode::new(3616);
+/// Incompatible backup manifest format version or unsupported storage layout.
+pub const RS_3617: ErrorCode = ErrorCode::new(3617);
+/// Broken catalog reference or catalog revision inconsistency.
+pub const RS_3618: ErrorCode = ErrorCode::new(3618);
 /// View is waiting on source/frontier progress.
 pub const RS_3701: ErrorCode = ErrorCode::new(3701);
 /// View admission rejected by quota controls.
@@ -995,6 +1003,34 @@ mod tests {
                 RS_3033,
                 3033,
                 "qualification.harness_invalidation",
+                Severity::Fatal,
+            ),
+        ];
+
+        for (code, val, expected_slug, expected_sev) in codes {
+            assert_eq!(code.value(), val);
+            assert_eq!(slug(code), expected_slug);
+            assert_eq!(severity(code), expected_sev);
+            assert!(!description(code).is_empty());
+            assert!(!next_steps(code).is_empty());
+        }
+    }
+
+    #[test]
+    fn backup_recovery_error_codes_registered() {
+        let codes = [
+            (
+                RS_3615,
+                3615,
+                "backup.missing_file_or_manifest",
+                Severity::Fatal,
+            ),
+            (RS_3616, 3616, "backup.checksum_mismatch", Severity::Fatal),
+            (RS_3617, 3617, "backup.incompatible_format", Severity::Fatal),
+            (
+                RS_3618,
+                3618,
+                "backup.broken_catalog_reference",
                 Severity::Fatal,
             ),
         ];

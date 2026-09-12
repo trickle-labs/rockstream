@@ -1415,6 +1415,46 @@ default_next_steps = "Wait for in-flight shard drain tasks to complete before en
 doc_anchor = "rs-3612"
 
 [[error]]
+code = "RS-3615"
+key = "backup.missing_file_or_manifest"
+title = "Missing payload file or truncated/unfinalized manifest"
+severity = "Fatal"
+sqlstate = "58030"
+retry_class = "NonRetryable"
+default_next_steps = "Restore missing file from backup replica or retry backup creation; ensure backup completes cleanly."
+doc_anchor = "rs-3615"
+
+[[error]]
+code = "RS-3616"
+key = "backup.checksum_mismatch"
+title = "Checksum mismatch on manifest or data file"
+severity = "Fatal"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Replace corrupted file from verified backup replica; discard invalid backup."
+doc_anchor = "rs-3616"
+
+[[error]]
+code = "RS-3617"
+key = "backup.incompatible_format"
+title = "Incompatible backup manifest format version or unsupported storage layout"
+severity = "Fatal"
+sqlstate = "0A000"
+retry_class = "NonRetryable"
+default_next_steps = "Upgrade RockStream binary or use a backup with supported format version."
+doc_anchor = "rs-3617"
+
+[[error]]
+code = "RS-3618"
+key = "backup.broken_catalog_reference"
+title = "Broken catalog reference or catalog revision inconsistency"
+severity = "Fatal"
+sqlstate = "42P01"
+retry_class = "NonRetryable"
+default_next_steps = "Verify catalog snapshot and frontier consistency; ensure catalog revision matches cluster checkpoint."
+doc_anchor = "rs-3618"
+
+[[error]]
 code = "RS-3701"
 key = "view.waiting_on_source"
 title = "View is waiting on source/frontier progress"

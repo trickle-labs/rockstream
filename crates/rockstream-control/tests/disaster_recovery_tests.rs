@@ -347,6 +347,25 @@ async fn minio_tc_truncated_export_fails_closed_rs5035() {
         .is_err());
 }
 
+#[tokio::test]
+async fn test_disaster_recovery_lfs_full_lifecycle() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = Arc::new(LocalFileSystem::new_with_prefix(source_dir.path()).unwrap());
+    let export = Arc::new(LocalFileSystem::new_with_prefix(export_dir.path()).unwrap());
+    let target = Arc::new(LocalFileSystem::new_with_prefix(target_dir.path()).unwrap());
+    export_restore_and_assert(source, export, target, "lfs-lifecycle").await;
+}
+
+#[tokio::test]
+async fn test_disaster_recovery_minio_full_lifecycle() {
+    let Some((_container, source, export, target)) = minio_stores("full-lifecycle").await else {
+        return;
+    };
+    export_restore_and_assert(source, export, target, "minio-lifecycle").await;
+}
+
 #[test]
 fn export_restore_uses_no_slatedb_range_deletion() {
     let source = std::fs::read_to_string(format!(

@@ -80,3 +80,8 @@ fn runbook_only_drill_records_measured_rpo_and_rto() {
         )
     );
 }
+
+#[test]
+fn test_runbook_standalone_drill() {
+    runbook_only_drill_records_measured_rpo_and_rto();
+}

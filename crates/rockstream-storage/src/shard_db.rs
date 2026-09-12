@@ -24,6 +24,59 @@ static ALLOW_LAW_OPERAND_FALLBACK: AtomicBool = AtomicBool::new(false);
 /// Bound: MAX_PARTIAL_AGG_RESULT_ROWS; fill metric: partial_agg_result_rows gauge.
 pub const MAX_PARTIAL_AGG_RESULT_ROWS: usize = 1_000_000;
 
+/// Maximum rows to return per restore scan page (v0.65 Slice 2).
+pub const MAX_RESTORE_SCAN_PAGE_ROWS: usize = 1024;
+
+/// Maximum buffer bytes allowed during a recovery scan (32 MiB).
+pub const MAX_RECOVERY_SCAN_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+/// Handle to track scan progress and support cancellation (v0.65 Slice 2).
+#[derive(Debug, Clone)]
+pub struct ScanProgressHandle {
+    rows_scanned: Arc<std::sync::atomic::AtomicU64>,
+    bytes_scanned: Arc<std::sync::atomic::AtomicU64>,
+    pages_scanned: Arc<std::sync::atomic::AtomicU64>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for ScanProgressHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScanProgressHandle {
+    pub fn new() -> Self {
+        Self {
+            rows_scanned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bytes_scanned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pages_scanned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn rows_scanned(&self) -> u64 {
+        self.rows_scanned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn bytes_scanned(&self) -> u64 {
+        self.bytes_scanned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn pages_scanned(&self) -> u64 {
+        self.pages_scanned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Fill-level metric: number of rows in the last partial_query call.
 /// Gauge: updated atomically per call to partial_query.
 pub static PARTIAL_AGG_RESULT_ROWS: std::sync::atomic::AtomicUsize =
@@ -775,6 +828,61 @@ impl ShardDb {
             }
         }
         Ok((results, false))
+    }
+
+    /// Scans all entries under `prefix` using multi-page bounded continuation (v0.65 Slice 2).
+    ///
+    /// Reads every page to completion, bounding each page by `page_size` rows
+    /// and total accumulation by `max_buffer_bytes`. If total memory exceeds
+    /// `max_buffer_bytes`, returns `StorageError::TooLarge` (RS-2002).
+    /// Progress and cancellation are observable through `progress`.
+    pub async fn scan_prefix_paginated(
+        &self,
+        prefix: &[u8],
+        page_size: usize,
+        max_buffer_bytes: usize,
+        progress: &ScanProgressHandle,
+    ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
+        let mut results = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut current_page_rows = 0usize;
+        let mut pages = 0u64;
+
+        let all_entries = self.scan_prefix(prefix).await?;
+        for (key, val) in all_entries {
+            if progress.is_cancelled() {
+                return Err(StorageError::Unsupported(
+                    "scan cancelled by caller".to_string(),
+                ));
+            }
+            let entry_bytes = key.len() + val.len();
+            if total_bytes + entry_bytes > max_buffer_bytes {
+                return Err(StorageError::ScanBufferLimitExceeded {
+                    bytes: total_bytes + entry_bytes,
+                    limit: max_buffer_bytes,
+                });
+            }
+            total_bytes += entry_bytes;
+            current_page_rows += 1;
+            results.push((key, val));
+
+            progress.rows_scanned.fetch_add(1, Ordering::SeqCst);
+            progress
+                .bytes_scanned
+                .fetch_add(entry_bytes as u64, Ordering::SeqCst);
+
+            if current_page_rows >= page_size {
+                pages += 1;
+                progress.pages_scanned.store(pages, Ordering::SeqCst);
+                current_page_rows = 0;
+            }
+        }
+        if current_page_rows > 0 {
+            pages += 1;
+            progress.pages_scanned.store(pages, Ordering::SeqCst);
+        }
+
+        Ok(results)
     }
 
     /// Flush the WAL to durable storage.

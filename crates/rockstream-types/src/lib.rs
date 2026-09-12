@@ -82,7 +82,7 @@ pub use ids::{
 pub use key_capsule::{KeyCapsule, KeyCapsuleError, KeyValue};
 pub use lifecycle::{
     DependencyHealthReport, DependencyStatus, HealthReason, HealthReport, LifecycleState,
-    LifecycleTracker, LiveResponse, ReadyResponse,
+    LifecycleTracker, LiveResponse, ReadyResponse, RecoveryPhase,
 };
 pub use limits::{SystemLimit, SystemLimitsCatalog};
 pub use platform::{ClassificationTier, PlatformClassification, PlatformClassifier};

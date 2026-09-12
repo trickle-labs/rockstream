@@ -14,6 +14,7 @@ use rockstream_cli::transport::{
     RemoteTopologyClient, StorageClient,
 };
 use rockstream_cli::{
+    run_admin_backup_create, run_admin_backup_inspect, run_admin_backup_verify, run_admin_restore,
     run_audit_query, run_audit_tail, run_checkpoint_export, run_checkpoint_list,
     run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
     run_cluster_workers_drain, run_cluster_workers_list, run_cluster_workers_status,
@@ -123,6 +124,40 @@ fn main() -> ExitCode {
                     ),
                 };
                 handle_result(res, format)
+            }
+            AdminCommand::Backup { ref command } => {
+                let storage = StorageClient::with_identity(identity.clone());
+                let storage_path = cli
+                    .storage_dir
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let res = match command {
+                    BackupCommand::Create { destination } => {
+                        run_admin_backup_create(format, &storage, &storage_path, destination)
+                    }
+                    BackupCommand::Inspect { destination } => {
+                        run_admin_backup_inspect(format, &storage, destination)
+                    }
+                    BackupCommand::Verify { destination } => {
+                        run_admin_backup_verify(format, &storage, destination)
+                    }
+                };
+                handle_result(res, format)
+            }
+            AdminCommand::Restore {
+                ref source,
+                ref target,
+                yes,
+            } => {
+                let storage = StorageClient::with_identity(identity.clone());
+                let target_path = target
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .or_else(|| cli.storage_dir.clone())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                handle_result(
+                    run_admin_restore(format, &storage, source, &target_path, *yes),
+                    format,
+                )
             }
         },
         Command::Dev { ref command } => match command {

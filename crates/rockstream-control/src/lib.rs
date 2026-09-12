@@ -26,6 +26,7 @@ pub mod config_deriver;
 pub mod freshness;
 pub mod frontier;
 pub mod kek;
+pub mod manifest;
 pub mod migration;
 pub mod namespace;
 pub mod placement;
@@ -59,6 +60,13 @@ pub use freshness::{
 };
 pub use frontier::{AggregatorError, FrontierAggregator};
 pub use kek::{AwsKmsKekProvider, EnvKekProvider, KekError, KekProvider};
+pub use manifest::{
+    compute_file_sha256, validate_catalog_reference, verify_backup_payload_files,
+    BackupConcurrencyGovernor, BackupFileEntry, BackupManifest, BackupPoint,
+    BACKUP_MANIFEST_FILENAME, CURRENT_BACKUP_MANIFEST_VERSION, CURRENT_STORAGE_FORMAT,
+    MAX_BACKUP_COPY_CONCURRENCY, MAX_BACKUP_PENDING_BYTES, MAX_BACKUP_RETRY_COUNT,
+    MAX_BACKUP_SCAN_WINDOW_OBJECTS,
+};
 pub use migration::{
     BucketMapVersionTracker, MigrationConsumerFrontierTracker, MigrationCoordinator,
     MigrationCopyStats, MigrationError, MigrationFillLevel, MigrationPersistentStore,

@@ -1,7 +1,9 @@
 //! Tests verifying the restructured CLI command hierarchy (v0.60 Slice 3).
 
 use clap::Parser;
-use rockstream_cli::cli_args::{AdminCommand, Cli, Command, DevCommand, ProjectCommand};
+use rockstream_cli::cli_args::{
+    AdminCommand, BackupCommand, Cli, Command, DevCommand, ProjectCommand,
+};
 
 #[test]
 fn test_status_command_promoted_to_top_level() {
@@ -86,6 +88,64 @@ fn test_admin_commands_hierarchy() {
         Command::Admin {
             command: AdminCommand::Checkpoint { .. }
         }
+    ));
+
+    // admin backup create
+    let cli = Cli::try_parse_from(["rockstream", "admin", "backup", "create", "/tmp/backup"])
+        .expect("failed to parse admin backup create");
+    assert!(matches!(
+        cli.command,
+        Command::Admin {
+            command: AdminCommand::Backup {
+                command: BackupCommand::Create { .. }
+            }
+        }
+    ));
+
+    // admin backup inspect
+    let cli = Cli::try_parse_from(["rockstream", "admin", "backup", "inspect", "/tmp/backup"])
+        .expect("failed to parse admin backup inspect");
+    assert!(matches!(
+        cli.command,
+        Command::Admin {
+            command: AdminCommand::Backup {
+                command: BackupCommand::Inspect { .. }
+            }
+        }
+    ));
+
+    // admin backup verify
+    let cli = Cli::try_parse_from(["rockstream", "admin", "backup", "verify", "/tmp/backup"])
+        .expect("failed to parse admin backup verify");
+    assert!(matches!(
+        cli.command,
+        Command::Admin {
+            command: AdminCommand::Backup {
+                command: BackupCommand::Verify { .. }
+            }
+        }
+    ));
+
+    // admin restore
+    let cli = Cli::try_parse_from([
+        "rockstream",
+        "admin",
+        "restore",
+        "/tmp/backup",
+        "--target",
+        "/tmp/target",
+        "--yes",
+    ])
+    .expect("failed to parse admin restore");
+    assert!(matches!(
+        cli.command,
+        Command::Admin {
+            command: AdminCommand::Restore {
+                ref source,
+                target: Some(ref target),
+                yes: true,
+            }
+        } if source == "/tmp/backup" && target == "/tmp/target"
     ));
 }
 

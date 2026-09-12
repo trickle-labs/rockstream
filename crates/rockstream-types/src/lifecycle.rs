@@ -195,6 +195,87 @@ impl LifecycleState {
     }
 }
 
+/// Recovery phases during node startup/recovery before reaching `LifecycleState::Ready`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPhase {
+    OpeningStorage,
+    RecoveringCatalog,
+    RecoveringEpoch,
+    RecoveringOperators,
+    ValidatingState,
+    Ready,
+}
+
+impl RecoveryPhase {
+    const CODE_OPENING_STORAGE: u8 = 1;
+    const CODE_RECOVERING_CATALOG: u8 = 2;
+    const CODE_RECOVERING_EPOCH: u8 = 3;
+    const CODE_RECOVERING_OPERATORS: u8 = 4;
+    const CODE_VALIDATING_STATE: u8 = 5;
+    const CODE_READY: u8 = 6;
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::OpeningStorage => Self::CODE_OPENING_STORAGE,
+            Self::RecoveringCatalog => Self::CODE_RECOVERING_CATALOG,
+            Self::RecoveringEpoch => Self::CODE_RECOVERING_EPOCH,
+            Self::RecoveringOperators => Self::CODE_RECOVERING_OPERATORS,
+            Self::ValidatingState => Self::CODE_VALIDATING_STATE,
+            Self::Ready => Self::CODE_READY,
+        }
+    }
+
+    pub fn from_u8(code: u8) -> Option<Self> {
+        match code {
+            Self::CODE_OPENING_STORAGE => Some(Self::OpeningStorage),
+            Self::CODE_RECOVERING_CATALOG => Some(Self::RecoveringCatalog),
+            Self::CODE_RECOVERING_EPOCH => Some(Self::RecoveringEpoch),
+            Self::CODE_RECOVERING_OPERATORS => Some(Self::RecoveringOperators),
+            Self::CODE_VALIDATING_STATE => Some(Self::ValidatingState),
+            Self::CODE_READY => Some(Self::Ready),
+            _ => None,
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpeningStorage => "opening_storage",
+            Self::RecoveringCatalog => "recovering_catalog",
+            Self::RecoveringEpoch => "recovering_epoch",
+            Self::RecoveringOperators => "recovering_operators",
+            Self::ValidatingState => "validating_state",
+            Self::Ready => "ready",
+        }
+    }
+
+    pub fn can_transition_to(&self, next: RecoveryPhase) -> bool {
+        matches!(
+            (*self, next),
+            (Self::OpeningStorage, Self::RecoveringCatalog)
+                | (Self::RecoveringCatalog, Self::RecoveringEpoch)
+                | (Self::RecoveringEpoch, Self::RecoveringOperators)
+                | (Self::RecoveringOperators, Self::ValidatingState)
+                | (Self::ValidatingState, Self::Ready)
+        )
+    }
+
+    pub fn transition_to(&self, next: RecoveryPhase) -> Result<(), String> {
+        if self.can_transition_to(next) {
+            Ok(())
+        } else {
+            Err(format!(
+                "[{}] Illegal recovery phase transition from {:?} to {:?}",
+                RS_0001, self, next
+            ))
+        }
+    }
+}
+
 /// Dependency health status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -280,6 +361,7 @@ pub struct HealthReport {
 pub struct LifecycleTracker {
     role: String,
     state: AtomicU8,
+    recovery_phase: AtomicU8,
     active_shards: AtomicUsize,
     start_time: Instant,
     identity: CandidateIdentity,
@@ -298,6 +380,7 @@ impl LifecycleTracker {
         Self {
             role: role.into(),
             state: AtomicU8::new(state.to_u8()),
+            recovery_phase: AtomicU8::new(0),
             active_shards: AtomicUsize::new(0),
             start_time: Instant::now(),
             identity: CandidateIdentity::current(),
@@ -318,6 +401,32 @@ impl LifecycleTracker {
         self.state.store(state.to_u8(), Ordering::SeqCst);
     }
 
+    pub fn recovery_phase(&self) -> Option<RecoveryPhase> {
+        RecoveryPhase::from_u8(self.recovery_phase.load(Ordering::SeqCst))
+    }
+
+    pub fn set_recovery_phase(&self, phase: RecoveryPhase) {
+        self.recovery_phase.store(phase.to_u8(), Ordering::SeqCst);
+        if phase.is_ready() {
+            self.set_state(LifecycleState::Ready);
+        } else {
+            self.set_state(LifecycleState::Recovering);
+        }
+    }
+
+    pub fn transition_recovery_phase(&self, next: RecoveryPhase) -> Result<(), String> {
+        if let Some(current) = self.recovery_phase() {
+            current.transition_to(next)?;
+        }
+        self.set_recovery_phase(next);
+        Ok(())
+    }
+
+    pub fn fail_recovery(&self, reason: HealthReason) {
+        self.add_reason(reason);
+        self.set_state(LifecycleState::Fatal);
+    }
+
     pub fn transition_to(&self, next: LifecycleState) -> Result<(), String> {
         let current = self.state();
         if current.can_transition_to(next) {
@@ -336,6 +445,11 @@ impl LifecycleTracker {
     }
 
     pub fn is_ready(&self) -> bool {
+        if let Some(phase) = self.recovery_phase() {
+            if !phase.is_ready() {
+                return false;
+            }
+        }
         self.state().is_ready()
     }
 

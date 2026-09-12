@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "d7393eeacca6fedfd980bb657ef237a120e97390a90c2ba76456914ce019a288",
+    "candidate_identity_digest": "2f65e688ef9b98aeebbf367b0c57202f3901090bc87079d63af12f7115930940",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -12,6 +12,144 @@
         "name": "admin",
         "about": "Administrative operations (drain, migrate, raft, checkpoint)",
         "subcommands": [
+          {
+            "name": "backup",
+            "about": "Point-in-time durable backup operations (create, inspect, verify)",
+            "subcommands": [
+              {
+                "name": "create",
+                "about": "Create a full point-in-time backup",
+                "options": [
+                  {
+                    "name": "destination",
+                    "help": "Destination directory or URI",
+                    "required": true,
+                    "value_name": "DESTINATION"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "inspect",
+                "about": "Inspect a backup manifest and point-in-time consistency metadata",
+                "options": [
+                  {
+                    "name": "destination",
+                    "help": "Destination directory or URI",
+                    "required": true,
+                    "value_name": "DESTINATION"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "verify",
+                "about": "Cryptographically verify backup integrity against manifest checksums",
+                "options": [
+                  {
+                    "name": "destination",
+                    "help": "Destination directory or URI",
+                    "required": true,
+                    "value_name": "DESTINATION"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
           {
             "name": "checkpoint",
             "about": "Checkpoint administration and manual triggering",
@@ -335,6 +473,62 @@
                   "RS-1012",
                   "RS-1013",
                   "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "restore",
+            "about": "Restore a database backup into a clean or authorized destination",
+            "options": [
+              {
+                "name": "source",
+                "help": "Source backup directory or object-store URI",
+                "required": true,
+                "value_name": "SOURCE"
+              },
+              {
+                "name": "target",
+                "short": "t",
+                "long": "target",
+                "help": "Target destination directory",
+                "required": false,
+                "value_name": "TARGET"
+              },
+              {
+                "name": "yes",
+                "short": "y",
+                "long": "yes",
+                "help": "Force overwrite of existing non-empty destination",
+                "required": false,
+                "value_name": "YES",
+                "possible_values": [
+                  "true",
+                  "false"
                 ]
               }
             ],
@@ -7125,6 +7319,46 @@
         "retry_class": "ExponentialBackoff",
         "default_next_steps": "Wait for in-flight shard drain tasks to complete before enqueueing additional assignments.",
         "doc_anchor": "rs-3612"
+      },
+      {
+        "code": "RS-3615",
+        "key": "backup.missing_file_or_manifest",
+        "title": "Missing payload file or truncated/unfinalized manifest",
+        "severity": "FATAL",
+        "sqlstate": "58030",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Restore missing file from backup replica or retry backup creation; ensure backup completes cleanly.",
+        "doc_anchor": "rs-3615"
+      },
+      {
+        "code": "RS-3616",
+        "key": "backup.checksum_mismatch",
+        "title": "Checksum mismatch on manifest or data file",
+        "severity": "FATAL",
+        "sqlstate": "XX000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Replace corrupted file from verified backup replica; discard invalid backup.",
+        "doc_anchor": "rs-3616"
+      },
+      {
+        "code": "RS-3617",
+        "key": "backup.incompatible_format",
+        "title": "Incompatible backup manifest format version or unsupported storage layout",
+        "severity": "FATAL",
+        "sqlstate": "0A000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Upgrade RockStream binary or use a backup with supported format version.",
+        "doc_anchor": "rs-3617"
+      },
+      {
+        "code": "RS-3618",
+        "key": "backup.broken_catalog_reference",
+        "title": "Broken catalog reference or catalog revision inconsistency",
+        "severity": "FATAL",
+        "sqlstate": "42P01",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Verify catalog snapshot and frontier consistency; ensure catalog revision matches cluster checkpoint.",
+        "doc_anchor": "rs-3618"
       },
       {
         "code": "RS-3701",

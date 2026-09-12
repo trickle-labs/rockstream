@@ -1287,6 +1287,99 @@ impl Formattable for DiagnosticSupportInfo {
     }
 }
 
+// ─── Backup and Restore Models (v0.65 Slice 4 & 5) ──────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupCreateOutput {
+    pub destination: String,
+    pub catalog_revision: u64,
+    pub checkpoint_id: u64,
+    pub frontier: u64,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub manifest_checksum: String,
+    pub status: String,
+}
+
+impl Formattable for BackupCreateOutput {
+    fn to_text(&self) -> String {
+        format!(
+            "Backup created at {}\n  catalog revision: {}\n  checkpoint ID: {}\n  frontier: {}\n  files: {}\n  total bytes: {}\n  manifest checksum: {}\n  status: {}",
+            self.destination, self.catalog_revision, self.checkpoint_id, self.frontier, self.file_count, self.total_bytes, self.manifest_checksum, self.status
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupInspectOutput {
+    pub destination: String,
+    pub format_version: u32,
+    pub catalog_revision: u64,
+    pub checkpoint_id: u64,
+    pub frontier: u64,
+    pub storage_format: u32,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub manifest_checksum: String,
+    pub status: String,
+    pub errors: Vec<String>,
+}
+
+impl Formattable for BackupInspectOutput {
+    fn to_text(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!("Backup inspect at {}", self.destination));
+        lines.push(format!("  format version: {}", self.format_version));
+        lines.push(format!("  catalog revision: {}", self.catalog_revision));
+        lines.push(format!("  checkpoint ID: {}", self.checkpoint_id));
+        lines.push(format!("  frontier: {}", self.frontier));
+        lines.push(format!("  storage format: {}", self.storage_format));
+        lines.push(format!("  files: {}", self.file_count));
+        lines.push(format!("  total bytes: {}", self.total_bytes));
+        lines.push(format!("  manifest checksum: {}", self.manifest_checksum));
+        lines.push(format!("  status: {}", self.status));
+        if !self.errors.is_empty() {
+            lines.push("  errors:".to_string());
+            for err in &self.errors {
+                lines.push(format!("    - {}", err));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupVerifyOutput {
+    pub destination: String,
+    pub file_count: usize,
+    pub verified_files: usize,
+    pub total_bytes: u64,
+    pub manifest_checksum: String,
+    pub status: String,
+    pub errors: Vec<String>,
+}
+
+impl Formattable for BackupVerifyOutput {
+    fn to_text(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!("Backup verification at {}", self.destination));
+        lines.push(format!("  status: {}", self.status));
+        lines.push(format!(
+            "  files verified: {}/{}",
+            self.verified_files, self.file_count
+        ));
+        lines.push(format!("  total bytes: {}", self.total_bytes));
+        lines.push(format!("  manifest checksum: {}", self.manifest_checksum));
+        if !self.errors.is_empty() {
+            lines.push("  errors:".to_string());
+            for err in &self.errors {
+                lines.push(format!("    - {}", err));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
 // ─── Configuration Output Models ────────────────────────────────────────────
 
 impl Formattable for rockstream_types::config_validation::ConfigValidationReport {

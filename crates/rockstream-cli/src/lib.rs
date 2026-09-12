@@ -1684,6 +1684,50 @@ pub fn run_checkpoint_export(
     Ok(output::render_output(&outcome, format))
 }
 
+pub fn run_backup_create(
+    format: output::OutputFormat,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
+    storage_path: &Path,
+    destination: &str,
+) -> Result<String, CliError> {
+    let outcome = storage.create_backup(storage_path, destination)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_backup_inspect(
+    format: output::OutputFormat,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
+    destination: &str,
+) -> Result<String, CliError> {
+    let outcome = storage.inspect_backup(destination)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_backup_verify(
+    format: output::OutputFormat,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
+    destination: &str,
+) -> Result<String, CliError> {
+    let outcome = storage.verify_backup(destination)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_backup_restore(
+    format: output::OutputFormat,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
+    source: &str,
+    target: &Path,
+    yes: bool,
+) -> Result<String, CliError> {
+    let outcome = storage.restore_backup(source, target, yes)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub use run_backup_create as run_admin_backup_create;
+pub use run_backup_inspect as run_admin_backup_inspect;
+pub use run_backup_restore as run_admin_restore;
+pub use run_backup_verify as run_admin_backup_verify;
+
 pub fn run_support_bundle(
     format: output::OutputFormat,
     storage: &transport::StorageClient,

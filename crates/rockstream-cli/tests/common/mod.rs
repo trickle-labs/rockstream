@@ -542,6 +542,33 @@ impl StorageAdminApi for MockStorageAdminClient {
                 &[],
             )
     }
+    fn create_backup(
+        &self,
+        storage_path: &Path,
+        destination: &str,
+    ) -> Result<rockstream_cli::output::BackupCreateOutput, CliError> {
+        self.storage_client.create_backup(storage_path, destination)
+    }
+    fn inspect_backup(
+        &self,
+        destination: &str,
+    ) -> Result<rockstream_cli::output::BackupInspectOutput, CliError> {
+        self.storage_client.inspect_backup(destination)
+    }
+    fn verify_backup(
+        &self,
+        destination: &str,
+    ) -> Result<rockstream_cli::output::BackupVerifyOutput, CliError> {
+        self.storage_client.verify_backup(destination)
+    }
+    fn restore_backup(
+        &self,
+        source: &str,
+        target: &Path,
+        yes: bool,
+    ) -> Result<rockstream_cli::output::RestoreOutcome, CliError> {
+        self.storage_client.restore_backup(source, target, yes)
+    }
 }
 
 pub fn catalog_with_defaults() -> CatalogClient {

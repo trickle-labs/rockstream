@@ -40,7 +40,8 @@ pub use rockstream_types::config::StorageUrl;
 pub use rockstream_types::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 pub use shard_db::{
     is_allow_law_operand_fallback, set_allow_law_operand_fallback, BatchOp, CheckpointHandle,
-    PartialAggSpec, ShardDb, WriteBatch,
+    PartialAggSpec, ScanProgressHandle, ShardDb, WriteBatch, MAX_RECOVERY_SCAN_BUFFER_BYTES,
+    MAX_RESTORE_SCAN_PAGE_ROWS,
 };
 pub use storage_context::{
     BlockCacheKey, SharedStorageContext, StorageCacheStats, WorkerStorageContext,

@@ -30,7 +30,9 @@ use parking_lot::Mutex;
 
 use rockstream_storage::ShardReader;
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
+use rockstream_types::error_code::*;
 use rockstream_types::ids::{LeaseToken, ShardId};
+use rockstream_types::lifecycle::{HealthReason, LifecycleTracker, RecoveryPhase};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -61,6 +63,36 @@ pub enum RecoveryError {
     LeaseReacquisitionFailed { shard_id: ShardId },
     /// Storage open error during reader initialization.
     StorageError(String),
+    /// Catalog recovery failed.
+    CatalogRecoveryFailed(String),
+    /// Epoch or frontier validation failed.
+    EpochRecoveryFailed(String),
+    /// Operator state rehydration failed.
+    OperatorRecoveryFailed(String),
+    /// Cross-category state validation or checksum check failed.
+    StateValidationFailed(String),
+    /// Corrupted state or missing dependencies.
+    CorruptedState(String),
+    /// Broken catalog reference or snapshot inconsistency.
+    CatalogReferenceBroken(String),
+    /// Illegal lifecycle transition.
+    IllegalTransition(String),
+}
+
+impl RecoveryError {
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::NoCheckpointAvailable | Self::EpochRecoveryFailed(_) => RS_3605,
+            Self::BudgetExceeded { .. } | Self::OperatorRecoveryFailed(_) => RS_3610,
+            Self::LeaseReacquisitionFailed { .. } => RS_3611,
+            Self::StorageError(_) => RS_3612,
+            Self::CatalogRecoveryFailed(_) => RS_1002,
+            Self::StateValidationFailed(_) => RS_3615,
+            Self::CorruptedState(_) => RS_3616,
+            Self::CatalogReferenceBroken(_) => RS_3618,
+            Self::IllegalTransition(_) => RS_0001,
+        }
+    }
 }
 
 impl std::fmt::Display for RecoveryError {
@@ -87,6 +119,41 @@ impl std::fmt::Display for RecoveryError {
                  next_steps: check for concurrent workers holding an active lease"
             ),
             Self::StorageError(e) => write!(f, "RS-3612: storage error during recovery: {e}"),
+            Self::CatalogRecoveryFailed(e) => write!(
+                f,
+                "RS-1002: catalog recovery failed: {e}; \
+                 next_steps: verify catalog snapshot and transaction log"
+            ),
+            Self::EpochRecoveryFailed(e) => write!(
+                f,
+                "RS-3605: epoch recovery failed: {e}; \
+                 next_steps: verify cluster checkpoint and frontier sequence"
+            ),
+            Self::OperatorRecoveryFailed(e) => write!(
+                f,
+                "RS-3610: operator state recovery failed: {e}; \
+                 next_steps: rehydrate arrangements and check operator state"
+            ),
+            Self::StateValidationFailed(e) => write!(
+                f,
+                "RS-3615: state validation failed: {e}; \
+                 next_steps: ensure all mandatory state categories validate before opening gateway"
+            ),
+            Self::CorruptedState(e) => write!(
+                f,
+                "RS-3616: corrupted recovery state: {e}; \
+                 next_steps: restore from clean backup"
+            ),
+            Self::CatalogReferenceBroken(e) => write!(
+                f,
+                "RS-3618: broken catalog reference during recovery: {e}; \
+                 next_steps: verify catalog metadata and table references"
+            ),
+            Self::IllegalTransition(e) => write!(
+                f,
+                "RS-0001: illegal recovery transition: {e}; \
+                 next_steps: follow declared recovery state machine"
+            ),
         }
     }
 }
@@ -150,6 +217,8 @@ pub struct RecoveryDriver {
 }
 
 struct RecoveryDriverInner {
+    phase: RecoveryPhase,
+    lifecycle: Option<Arc<LifecycleTracker>>,
     /// Latest committed cluster checkpoint (source of truth for recovery).
     checkpoint: Option<ClusterCheckpoint>,
     /// Per-shard recovery budget SLO.
@@ -168,11 +237,70 @@ impl RecoveryDriver {
     pub fn with_budget(budget: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RecoveryDriverInner {
+                phase: RecoveryPhase::OpeningStorage,
+                lifecycle: None,
                 checkpoint: None,
                 shard_recovery_budget: budget,
                 recovered_count: 0,
             })),
         }
+    }
+
+    /// Create a recovery driver attached to a [`LifecycleTracker`].
+    pub fn with_lifecycle(lifecycle: Arc<LifecycleTracker>) -> Self {
+        lifecycle.set_recovery_phase(RecoveryPhase::OpeningStorage);
+        Self {
+            inner: Arc::new(Mutex::new(RecoveryDriverInner {
+                phase: RecoveryPhase::OpeningStorage,
+                lifecycle: Some(lifecycle),
+                checkpoint: None,
+                shard_recovery_budget: DEFAULT_SHARD_RECOVERY_BUDGET,
+                recovered_count: 0,
+            })),
+        }
+    }
+
+    /// Current recovery phase.
+    pub fn phase(&self) -> RecoveryPhase {
+        self.inner.lock().phase
+    }
+
+    /// Whether recovery is complete and the node is ready.
+    pub fn is_ready(&self) -> bool {
+        let guard = self.inner.lock();
+        if let Some(ref lc) = guard.lifecycle {
+            lc.is_ready()
+        } else {
+            guard.phase.is_ready()
+        }
+    }
+
+    /// Transition recovery to the next declared phase.
+    pub fn transition_phase(&self, next: RecoveryPhase) -> Result<(), RecoveryError> {
+        let mut guard = self.inner.lock();
+        guard
+            .phase
+            .transition_to(next)
+            .map_err(RecoveryError::IllegalTransition)?;
+        guard.phase = next;
+        if let Some(ref lc) = guard.lifecycle {
+            let _ = lc.transition_recovery_phase(next);
+        }
+        tracing::info!(phase = next.as_str(), "audit: recovery.phase_transition");
+        Ok(())
+    }
+
+    /// Fail recovery immediately, transitioning the lifecycle to Fatal.
+    pub fn fail_recovery(&self, error: &RecoveryError) {
+        let guard = self.inner.lock();
+        if let Some(ref lc) = guard.lifecycle {
+            lc.fail_recovery(HealthReason::new(error.code(), error.to_string()));
+        }
+        tracing::error!(
+            code = error.code().to_string(),
+            error = %error,
+            "RS-3612: recovery failed permanently; node entering fatal state"
+        );
     }
 
     /// Load a committed [`ClusterCheckpoint`] as the recovery source.

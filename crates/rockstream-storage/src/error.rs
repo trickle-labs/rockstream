@@ -30,6 +30,10 @@ pub enum StorageError {
     #[error("[RS-2002] view.state_budget_exceeded: partial-agg result exceeded MAX_PARTIAL_AGG_RESULT_ROWS ({limit} groups). Reduce GROUP BY cardinality.")]
     PartialAggResultTooLarge { limit: usize },
 
+    /// RS-2002: scan buffer limit exceeded during recovery/restore.
+    #[error("[RS-2002] view.state_budget_exceeded: scan buffer limit exceeded ({bytes} bytes > {limit} bytes)")]
+    ScanBufferLimitExceeded { bytes: usize, limit: usize },
+
     /// RS-5002: arrangement header references a merge law that is not
     /// registered in the catalog. The shard refuses to attach until the law
     /// is either registered or the arrangement is migrated.

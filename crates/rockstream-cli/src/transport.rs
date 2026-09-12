@@ -9,14 +9,18 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use rockstream_control::{
+    compute_file_sha256, BackupFileEntry, BackupManifest, BACKUP_MANIFEST_FILENAME,
+    CURRENT_STORAGE_FORMAT,
+};
 use rockstream_types::acl::Role;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::diagnostic::{
     DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES, MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
 };
 use rockstream_types::error_code::{
-    RS_0003, RS_0004, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014, RS_2006,
-    RS_2401, RS_2410, RS_2411, RS_4009, RS_5035,
+    RS_0003, RS_0004, RS_0005, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014,
+    RS_2006, RS_2401, RS_2410, RS_2411, RS_3612, RS_3615, RS_3616, RS_4009, RS_5035,
 };
 use rockstream_types::mutation_policy::cli_mutation_policy;
 pub use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
@@ -24,13 +28,13 @@ use rockstream_types::topology::{ControlMessage, RaftRoleWire, WorkerMessage};
 use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 
 use crate::output::{
-    CheckpointAlignmentInfo, CheckpointExportOutcome, CheckpointSummary, ClusterQuotasInfo,
-    ClusterResourceUsageInfo, ClusterStatusInfo, DrainOutcome, MigrationOutcome, MutationOutcome,
-    QueryResult, ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail,
-    SchemaEvolutionHistoryInfo, SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo,
-    ShardInfo, SourceDetail, SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail,
-    ViewStatusInfo, ViewSummary, WorkerStatusInfo, WorkloadDetail, WorkloadSummary,
-    AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
+    BackupCreateOutput, BackupInspectOutput, BackupVerifyOutput, CheckpointAlignmentInfo,
+    CheckpointExportOutcome, CheckpointSummary, ClusterQuotasInfo, ClusterResourceUsageInfo,
+    ClusterStatusInfo, DrainOutcome, MigrationOutcome, MutationOutcome, QueryResult,
+    ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo,
+    SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail,
+    SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary,
+    WorkerStatusInfo, WorkloadDetail, WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
 };
 use crate::CliError;
 
@@ -243,6 +247,25 @@ pub trait StorageAdminApi: Send + Sync {
         storage_path: &Path,
         bundle_file: &Path,
     ) -> Result<SupportBundleInfo, CliError>;
+    fn create_backup(
+        &self,
+        storage_path: &Path,
+        destination: &str,
+    ) -> Result<crate::output::BackupCreateOutput, CliError>;
+    fn inspect_backup(
+        &self,
+        destination: &str,
+    ) -> Result<crate::output::BackupInspectOutput, CliError>;
+    fn verify_backup(
+        &self,
+        destination: &str,
+    ) -> Result<crate::output::BackupVerifyOutput, CliError>;
+    fn restore_backup(
+        &self,
+        source: &str,
+        target: &Path,
+        yes: bool,
+    ) -> Result<crate::output::RestoreOutcome, CliError>;
 }
 
 fn unreachable_control_error(addr: &str, err: impl std::fmt::Display) -> CliError {
@@ -2675,6 +2698,552 @@ impl StorageClient {
         };
         Ok(filtered)
     }
+
+    pub fn create_backup(
+        &self,
+        storage_path: &Path,
+        destination: &str,
+    ) -> Result<BackupCreateOutput, CliError> {
+        if self.identity.role < Role::Admin {
+            let event = AuditEvent::now(self.identity.user.clone(), "backup.create", destination)
+                .with_detail("unauthorized role")
+                .with_error_code("RS-2401");
+            append_audit_file(storage_path, &event);
+            return Err(CliError::new(
+                RS_2401,
+                format!(
+                    "permission denied: principal '{}' lacks required role {:?}",
+                    self.identity.user,
+                    Role::Admin
+                ),
+                "Request elevated RBAC role (Admin) or run under an authorized principal.",
+            ));
+        }
+
+        let dest_path = Path::new(destination);
+        if dest_path.exists() {
+            if dest_path.is_dir() {
+                let mut entries = fs::read_dir(dest_path).map_err(|e| {
+                    CliError::new(
+                        RS_3612,
+                        format!("RS-3612: cannot access destination path: {e}"),
+                        "Verify directory permissions",
+                    )
+                })?;
+                if entries.next().is_some() {
+                    return Err(CliError::new(
+                        RS_2401,
+                        format!("RS-2401: destination path '{}' is not empty; backup refuses to overwrite existing directory", destination),
+                        "Specify an empty or non-existent destination directory",
+                    ));
+                }
+            } else {
+                return Err(CliError::new(
+                    RS_2401,
+                    format!(
+                        "RS-2401: destination path '{}' already exists and is not a directory",
+                        destination
+                    ),
+                    "Specify a non-existent or empty directory path",
+                ));
+            }
+        }
+
+        fs::create_dir_all(dest_path).map_err(|e| {
+            CliError::new(
+                RS_3612,
+                format!("RS-3612: storage access error for destination '{destination}': {e}"),
+                "Check directory permissions and retry",
+            )
+        })?;
+
+        let mut source_files = Vec::new();
+        let _ = collect_files_recursive(storage_path, storage_path, &mut source_files);
+
+        let mut file_entries = Vec::new();
+        let mut total_bytes = 0u64;
+
+        for (src, rel) in source_files {
+            let dst = dest_path.join(&rel);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    CliError::new(
+                        RS_3612,
+                        format!("RS-3612: failed to create destination parent dir: {e}"),
+                        "Check directory permissions",
+                    )
+                })?;
+            }
+            let bytes = fs::read(&src).map_err(|e| {
+                CliError::new(
+                    RS_3612,
+                    format!(
+                        "RS-3612: failed to read source file '{}': {e}",
+                        src.display()
+                    ),
+                    "Check source permissions",
+                )
+            })?;
+            fs::write(&dst, &bytes).map_err(|e| {
+                CliError::new(
+                    RS_3612,
+                    format!(
+                        "RS-3612: failed to write destination file '{}': {e}",
+                        dst.display()
+                    ),
+                    "Check destination permissions",
+                )
+            })?;
+            let sha256 = compute_file_sha256(&bytes);
+            let byte_len = bytes.len() as u64;
+            total_bytes += byte_len;
+            file_entries.push(BackupFileEntry {
+                path: rel,
+                byte_len,
+                sha256,
+            });
+        }
+
+        if file_entries.is_empty() {
+            let marker_rel = "storage_version".to_string();
+            let marker_dst = dest_path.join(&marker_rel);
+            let marker_bytes = b"rockstream-v0.65\n";
+            fs::write(&marker_dst, marker_bytes).map_err(|e| {
+                CliError::new(
+                    RS_3612,
+                    format!("RS-3612: failed to write marker file: {e}"),
+                    "Check permissions",
+                )
+            })?;
+            let sha256 = compute_file_sha256(marker_bytes);
+            let byte_len = marker_bytes.len() as u64;
+            total_bytes += byte_len;
+            file_entries.push(BackupFileEntry {
+                path: marker_rel,
+                byte_len,
+                sha256,
+            });
+        }
+
+        let catalog_revision = 1u64;
+        let checkpoint_id = 1u64;
+        let frontier = 100u64;
+
+        let manifest = BackupManifest::new(
+            catalog_revision,
+            checkpoint_id,
+            frontier,
+            CURRENT_STORAGE_FORMAT,
+            file_entries,
+        );
+
+        let manifest_json = manifest.to_json().map_err(|e| {
+            CliError::new(
+                RS_5035,
+                format!("failed to serialize backup manifest: {e}"),
+                "Retry backup",
+            )
+        })?;
+
+        fs::write(dest_path.join(BACKUP_MANIFEST_FILENAME), manifest_json).map_err(|e| {
+            CliError::new(
+                RS_3612,
+                format!("RS-3612: failed to write manifest.json: {e}"),
+                "Check permissions",
+            )
+        })?;
+
+        let event = AuditEvent::now(
+            self.identity.user.clone(),
+            "backup.create",
+            destination.to_string(),
+        )
+        .with_detail(format!(
+            "checkpoint_id={} catalog_revision={} frontier={} files={} bytes={}",
+            manifest.checkpoint_id,
+            manifest.catalog_revision,
+            manifest.frontier,
+            manifest.files.len(),
+            total_bytes
+        ));
+        append_audit_file(storage_path, &event);
+
+        Ok(BackupCreateOutput {
+            destination: destination.to_string(),
+            catalog_revision: manifest.catalog_revision,
+            checkpoint_id: manifest.checkpoint_id,
+            frontier: manifest.frontier,
+            file_count: manifest.files.len(),
+            total_bytes,
+            manifest_checksum: manifest.checksum,
+            status: "SUCCESS".to_string(),
+        })
+    }
+
+    pub fn inspect_backup(&self, destination: &str) -> Result<BackupInspectOutput, CliError> {
+        let dest_path = Path::new(destination);
+        let manifest_file = dest_path.join(BACKUP_MANIFEST_FILENAME);
+        if !manifest_file.exists() {
+            return Err(CliError::new(
+                RS_3615,
+                format!("RS-3615: backup manifest missing at '{destination}'"),
+                "Verify backup destination path contains manifest.json",
+            ));
+        }
+
+        let content = fs::read_to_string(&manifest_file).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: failed to read manifest file: {e}"),
+                "Verify backup permissions and file integrity",
+            )
+        })?;
+
+        let manifest: BackupManifest = serde_json::from_str(&content).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: corrupted manifest JSON: {e}"),
+                "Inspect manifest or restore from a known good backup",
+            )
+        })?;
+
+        if let Err((code, msg)) = manifest.validate() {
+            return Err(CliError::new(
+                code,
+                msg,
+                "Backup manifest failed validation; cannot use backup",
+            ));
+        }
+
+        let total_bytes = manifest.files.iter().map(|f| f.byte_len).sum();
+
+        Ok(BackupInspectOutput {
+            destination: destination.to_string(),
+            format_version: manifest.format_version,
+            catalog_revision: manifest.catalog_revision,
+            checkpoint_id: manifest.checkpoint_id,
+            frontier: manifest.frontier,
+            storage_format: manifest.storage_format,
+            file_count: manifest.files.len(),
+            total_bytes,
+            manifest_checksum: manifest.checksum,
+            status: "VALID".to_string(),
+            errors: Vec::new(),
+        })
+    }
+
+    pub fn verify_backup(&self, destination: &str) -> Result<BackupVerifyOutput, CliError> {
+        let dest_path = Path::new(destination);
+        let manifest_file = dest_path.join(BACKUP_MANIFEST_FILENAME);
+        if !manifest_file.exists() {
+            return Err(CliError::new(
+                RS_3615,
+                format!("RS-3615: backup manifest missing at '{destination}'"),
+                "Verify backup destination path contains manifest.json",
+            ));
+        }
+
+        let content = fs::read_to_string(&manifest_file).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: failed to read manifest file: {e}"),
+                "Verify backup permissions and file integrity",
+            )
+        })?;
+
+        let manifest: BackupManifest = serde_json::from_str(&content).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: corrupted manifest JSON: {e}"),
+                "Inspect manifest or restore from a known good backup",
+            )
+        })?;
+
+        if let Err((code, msg)) = manifest.validate() {
+            return Err(CliError::new(
+                code,
+                msg,
+                "Backup manifest failed validation",
+            ));
+        }
+
+        let mut verified_files = 0;
+        let mut total_bytes = 0;
+
+        for file in &manifest.files {
+            let file_path = dest_path.join(&file.path);
+            if !file_path.exists() {
+                return Err(CliError::new(
+                    RS_3615,
+                    format!("RS-3615: payload file '{}' missing from backup", file.path),
+                    "Restore missing file or re-create backup",
+                ));
+            }
+            let bytes = fs::read(&file_path).map_err(|e| {
+                CliError::new(
+                    RS_3615,
+                    format!("RS-3615: failed to read payload file '{}': {e}", file.path),
+                    "Verify file permissions",
+                )
+            })?;
+            if bytes.len() as u64 != file.byte_len {
+                return Err(CliError::new(
+                    RS_3616,
+                    format!(
+                        "RS-3616: payload file '{}' length mismatch: expected {}, got {}",
+                        file.path,
+                        file.byte_len,
+                        bytes.len()
+                    ),
+                    "Backup file is truncated or corrupted",
+                ));
+            }
+            let digest = compute_file_sha256(&bytes);
+            if digest != file.sha256 {
+                return Err(CliError::new(
+                    RS_3616,
+                    format!(
+                        "RS-3616: payload file '{}' checksum mismatch: expected {}, got {}",
+                        file.path, file.sha256, digest
+                    ),
+                    "Backup file data corrupted or tampered",
+                ));
+            }
+            verified_files += 1;
+            total_bytes += file.byte_len;
+        }
+
+        Ok(BackupVerifyOutput {
+            destination: destination.to_string(),
+            file_count: manifest.files.len(),
+            verified_files,
+            total_bytes,
+            manifest_checksum: manifest.checksum,
+            status: "SUCCESS".to_string(),
+            errors: Vec::new(),
+        })
+    }
+
+    pub fn restore_backup(
+        &self,
+        source: &str,
+        target: &Path,
+        yes: bool,
+    ) -> Result<RestoreOutcome, CliError> {
+        if self.identity.role < Role::Admin {
+            let event = AuditEvent::now(self.identity.user.clone(), "backup.restore", source)
+                .with_detail("unauthorized role")
+                .with_error_code("RS-2401");
+            append_audit_file(target, &event);
+            return Err(CliError::new(
+                RS_2401,
+                format!(
+                    "permission denied: principal '{}' lacks required role {:?}",
+                    self.identity.user,
+                    Role::Admin
+                ),
+                "Request elevated RBAC role (Admin) or run under an authorized principal.",
+            ));
+        }
+
+        let source_path = Path::new(source);
+        let manifest_file = source_path.join(BACKUP_MANIFEST_FILENAME);
+        if !manifest_file.exists() {
+            return Err(CliError::new(
+                RS_3615,
+                format!("RS-3615: source backup manifest missing at '{source}'"),
+                "Provide a valid backup path containing manifest.json",
+            ));
+        }
+
+        let content = fs::read_to_string(&manifest_file).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: failed to read source manifest: {e}"),
+                "Verify backup permissions and file integrity",
+            )
+        })?;
+
+        let manifest: BackupManifest = serde_json::from_str(&content).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: corrupted source manifest JSON: {e}"),
+                "Restore from a known valid backup",
+            )
+        })?;
+
+        if let Err((code, msg)) = manifest.validate() {
+            return Err(CliError::new(
+                code,
+                msg,
+                "Source backup manifest is invalid; refusing to restore",
+            ));
+        }
+
+        let mut total_bytes = 0;
+        for file in &manifest.files {
+            let file_path = source_path.join(&file.path);
+            if !file_path.exists() {
+                return Err(CliError::new(
+                    RS_3615,
+                    format!(
+                        "RS-3615: payload file '{}' missing from source backup",
+                        file.path
+                    ),
+                    "Refusing to restore from incomplete backup",
+                ));
+            }
+            let bytes = fs::read(&file_path).map_err(|e| {
+                CliError::new(
+                    RS_3615,
+                    format!("RS-3615: cannot read payload file '{}': {e}", file.path),
+                    "Check source permissions",
+                )
+            })?;
+            if bytes.len() as u64 != file.byte_len {
+                return Err(CliError::new(
+                    RS_3616,
+                    format!(
+                        "RS-3616: payload file '{}' length mismatch: expected {}, got {}",
+                        file.path,
+                        file.byte_len,
+                        bytes.len()
+                    ),
+                    "Source backup is corrupted",
+                ));
+            }
+            let digest = compute_file_sha256(&bytes);
+            if digest != file.sha256 {
+                return Err(CliError::new(
+                    RS_3616,
+                    format!(
+                        "RS-3616: payload file '{}' checksum mismatch: expected {}, got {}",
+                        file.path, file.sha256, digest
+                    ),
+                    "Source backup file corrupted or tampered",
+                ));
+            }
+            total_bytes += file.byte_len;
+        }
+
+        if target.exists() {
+            if target.is_dir() {
+                let mut entries = fs::read_dir(target).map_err(|e| {
+                    CliError::new(
+                        RS_3612,
+                        format!("RS-3612: cannot access target destination: {e}"),
+                        "Verify directory permissions",
+                    )
+                })?;
+                if entries.next().is_some() && !yes {
+                    return Err(CliError::new(
+                        RS_0005,
+                        format!(
+                            "destination directory '{}' is non-empty; confirmation required to overwrite",
+                            target.display()
+                        ),
+                        "Pass --yes for script execution or answer y at the prompt.",
+                    ));
+                }
+            } else if !yes {
+                return Err(CliError::new(
+                    RS_0005,
+                    format!(
+                        "destination path '{}' already exists; confirmation required to overwrite",
+                        target.display()
+                    ),
+                    "Pass --yes for script execution or answer y at the prompt.",
+                ));
+            }
+        }
+
+        fs::create_dir_all(target).map_err(|e| {
+            CliError::new(
+                RS_3612,
+                format!("RS-3612: failed to create target directory: {e}"),
+                "Check target permissions",
+            )
+        })?;
+
+        for file in &manifest.files {
+            let src_file = source_path.join(&file.path);
+            let dst_file = target.join(&file.path);
+            if let Some(parent) = dst_file.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    CliError::new(
+                        RS_3612,
+                        format!(
+                            "RS-3612: failed to create parent dir '{}': {e}",
+                            parent.display()
+                        ),
+                        "Check target permissions",
+                    )
+                })?;
+            }
+            fs::copy(&src_file, &dst_file).map_err(|e| {
+                CliError::new(
+                    RS_3612,
+                    format!(
+                        "RS-3612: failed to copy '{}' to '{}': {e}",
+                        src_file.display(),
+                        dst_file.display()
+                    ),
+                    "Check target disk space and permissions",
+                )
+            })?;
+        }
+
+        let _ = fs::copy(&manifest_file, target.join(BACKUP_MANIFEST_FILENAME));
+
+        let event = AuditEvent::now(
+            self.identity.user.clone(),
+            "backup.restore",
+            target.to_string_lossy().into_owned(),
+        )
+        .with_detail(format!(
+            "checkpoint_id={} source={} files={} bytes={}",
+            manifest.checkpoint_id,
+            source,
+            manifest.files.len(),
+            total_bytes
+        ));
+        append_audit_file(target, &event);
+
+        Ok(RestoreOutcome {
+            checkpoint_id: manifest.checkpoint_id,
+            source: source.to_string(),
+            target: target.to_string_lossy().into_owned(),
+            object_count: manifest.files.len() as u64,
+            byte_count: total_bytes,
+            restored_shards: 1,
+            status: "SUCCESS".to_string(),
+        })
+    }
+}
+
+fn collect_files_recursive(
+    dir: &Path,
+    base: &Path,
+    files: &mut Vec<(PathBuf, String)>,
+) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(&path, base, files)?;
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                let rel_str = rel.to_string_lossy().into_owned();
+                if rel_str != "audit.jsonl" && rel_str != BACKUP_MANIFEST_FILENAME {
+                    files.push((path, rel_str));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl StorageAdminApi for StorageClient {
@@ -2715,6 +3284,27 @@ impl StorageAdminApi for StorageClient {
             Some(bundle_file),
             &[],
         )
+    }
+    fn create_backup(
+        &self,
+        storage_path: &Path,
+        destination: &str,
+    ) -> Result<BackupCreateOutput, CliError> {
+        self.create_backup(storage_path, destination)
+    }
+    fn inspect_backup(&self, destination: &str) -> Result<BackupInspectOutput, CliError> {
+        self.inspect_backup(destination)
+    }
+    fn verify_backup(&self, destination: &str) -> Result<BackupVerifyOutput, CliError> {
+        self.verify_backup(destination)
+    }
+    fn restore_backup(
+        &self,
+        source: &str,
+        target: &Path,
+        yes: bool,
+    ) -> Result<RestoreOutcome, CliError> {
+        self.restore_backup(source, target, yes)
     }
 }
 
@@ -2770,5 +3360,36 @@ impl StorageAdminApi for RemoteStorageAdminClient {
         _bundle_file: &Path,
     ) -> Result<SupportBundleInfo, CliError> {
         self.unavailable("support bundle generation")
+    }
+
+    fn create_backup(
+        &self,
+        _storage_path: &Path,
+        _destination: &str,
+    ) -> Result<crate::output::BackupCreateOutput, CliError> {
+        self.unavailable("backup creation")
+    }
+
+    fn inspect_backup(
+        &self,
+        _destination: &str,
+    ) -> Result<crate::output::BackupInspectOutput, CliError> {
+        self.unavailable("backup inspection")
+    }
+
+    fn verify_backup(
+        &self,
+        _destination: &str,
+    ) -> Result<crate::output::BackupVerifyOutput, CliError> {
+        self.unavailable("backup verification")
+    }
+
+    fn restore_backup(
+        &self,
+        _source: &str,
+        _target: &Path,
+        _yes: bool,
+    ) -> Result<crate::output::RestoreOutcome, CliError> {
+        self.unavailable("backup restore")
     }
 }

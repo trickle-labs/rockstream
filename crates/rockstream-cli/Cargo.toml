@@ -21,6 +21,7 @@ rockstream-runtime = { workspace = true }
 rockstream-gateway = { workspace = true }
 rockstream-storage = { workspace = true }
 object_store = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
