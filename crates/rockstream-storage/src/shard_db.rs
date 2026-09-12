@@ -146,6 +146,8 @@ pub struct ShardDb {
     concurrency_governor: Option<Arc<crate::concurrency_governor::ConcurrencyGovernor>>,
     disk_cache_dir: Option<std::path::PathBuf>,
     cleanup_on_drop: bool,
+    fail_writes: Arc<std::sync::atomic::AtomicBool>,
+    fail_flushes: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Builder for creating a `ShardDb`.
@@ -194,6 +196,12 @@ impl ShardDbBuilder {
     /// Set custom database settings.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    /// Set custom flush interval.
+    pub fn with_flush_interval(mut self, interval: std::time::Duration) -> Self {
+        self.settings.flush_interval = Some(interval);
         self
     }
 
@@ -353,6 +361,8 @@ impl ShardDbBuilder {
             concurrency_governor: self.concurrency_governor,
             disk_cache_dir: self.disk_cache_dir,
             cleanup_on_drop: self.cleanup_on_drop,
+            fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_flushes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 }
@@ -615,8 +625,12 @@ impl ShardDb {
     /// INVARIANT-BY-CONSTRUCTION: M1-S6 — point deletes and tombstones in atomic
     /// write batches prevent state resurrection without relying on range deletions.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
-        if self.migration_pending {
-            return Err(StorageError::MigrationInProgress);
+        if self.migration_pending || self.fail_writes.load(Ordering::SeqCst) {
+            return Err(if self.migration_pending {
+                StorageError::MigrationInProgress
+            } else {
+                StorageError::Unsupported("injected storage write failure".to_string())
+            });
         }
         let frontier_key = ShardKeyEncoder::frontier_key();
         for op in &batch.ops {
@@ -887,8 +901,23 @@ impl ShardDb {
 
     /// Flush the WAL to durable storage.
     pub async fn flush(&self) -> Result<(), StorageError> {
+        if self.fail_flushes.load(Ordering::SeqCst) {
+            return Err(StorageError::Unsupported(
+                "injected storage flush failure".to_string(),
+            ));
+        }
         self.db.flush().await?;
         Ok(())
+    }
+
+    /// Inject write failures for testing.
+    pub fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes.store(fail, Ordering::SeqCst);
+    }
+
+    /// Inject flush failures for testing.
+    pub fn set_fail_flushes(&self, fail: bool) {
+        self.fail_flushes.store(fail, Ordering::SeqCst);
     }
 
     /// Validate that all merge laws referenced in arrangement headers stored
@@ -1275,6 +1304,18 @@ impl WriteBatch {
     /// Returns true if the batch has no operations.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+
+    /// Returns the total byte size of keys and values in this batch.
+    pub fn byte_size(&self) -> usize {
+        self.ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put { key, value } => key.len() + value.len(),
+                BatchOp::Delete { key } => key.len(),
+                BatchOp::Merge { key, value } => key.len() + value.len(),
+            })
+            .sum()
     }
 }
 

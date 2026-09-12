@@ -39,6 +39,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 rockstream-test-support.workspace = true

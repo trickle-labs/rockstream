@@ -247,7 +247,7 @@ Changes to persistent formats or public protocols require:
 | v0.62.1 | Worker memory budgets | Shards share bounded caches and propagate backpressure ✅ Done |
 | **v0.63** | Durable Catalog | DDL and metadata survive process destruction ✅ Done |
 | v0.64.0 | SQL Execution Integrity | Standard PostgreSQL DML replaces ad-hoc command parsing ✅ Done |
-| **v0.65** | Standalone Recovery | Complete standalone crash recovery, backup, and restore ✅ Done |
+| v0.65.0 | Standalone Recovery | Complete standalone crash recovery, backup, and restore ✅ Done |
 | v0.65.1 | Concurrent maintenance and group commit | Independent work overlaps without weakening durable visibility |
 | **v0.66** | Management Plane | Real typed management API and truthful operational CLI |
 | **v0.67** | Distributed Data Plane | Row traffic leaves the control plane |

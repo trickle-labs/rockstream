@@ -4367,10 +4367,12 @@ impl GatewayHandler {
         envelope: BufferedPgOutputEnvelope,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
-        let _guard = self.shard_commit_lock.lock().await;
-        let epoch = shard_db
-            .try_next_epoch()
-            .ok_or(GatewayError::CommitEpochExhausted)?;
+        let epoch = {
+            let _guard = self.shard_commit_lock.lock().await;
+            shard_db
+                .try_next_epoch()
+                .ok_or(GatewayError::CommitEpochExhausted)?
+        };
         let staged_routes = envelope
             .route_updates
             .iter()
@@ -4562,11 +4564,14 @@ impl GatewayHandler {
                 detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
             }
         })?;
-        coordinator
-            .runtime
-            .commit_replayable_epoch(&lease, epoch, offset, &lifecycles, m3)
-            .await
-            .map_err(source_backfill_error)?;
+        {
+            let _guard = self.shard_commit_lock.lock().await;
+            coordinator
+                .runtime
+                .commit_replayable_epoch(&lease, epoch, offset, &lifecycles, m3)
+                .await
+                .map_err(source_backfill_error)?;
+        }
         for view_name in &affected {
             if let Some(compiled) = self.compiled_views.get(view_name) {
                 if let Some(join) = &compiled.join {
@@ -9720,95 +9725,97 @@ impl GatewayHandler {
 
         let ops = entry.drain();
         drop(entry); // release DashMap entry guard before await
-        let _commit_guard = self.shard_commit_lock.lock().await;
-        let ops = committed_dml_ops(shard_db, ops)
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
-        let affected = ops.len();
-        if ops.is_empty() {
-            self.flush_pending_notifies(conn_id);
-            return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
-                "COMMIT",
-            )))]);
-        }
+        let (epoch, ops) = {
+            let _commit_guard = self.shard_commit_lock.lock().await;
+            let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
+                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+            })?;
+            if ops.is_empty() {
+                self.flush_pending_notifies(conn_id);
+                return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
+                    "COMMIT",
+                )))]);
+            }
 
-        // Allocate next epoch
-        let epoch = shard_db.try_next_epoch().ok_or_else(|| {
-            PgWireError::ApiError(Box::new(crate::error::GatewayError::CommitEpochExhausted))
-        })?;
+            // Allocate next epoch
+            let epoch = shard_db.try_next_epoch().ok_or_else(|| {
+                PgWireError::ApiError(Box::new(crate::error::GatewayError::CommitEpochExhausted))
+            })?;
 
-        let mut batch = rockstream_storage::WriteBatch::new();
-        append_dml_ops(&mut batch, &ops);
-        // Persist idempotency key so replays are no-ops
-        if let Some(key_hash) = idempotency_key {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            rockstream_storage::ShardDb::put_idempotency_key(
-                &mut batch, 0, key_hash, epoch, now_ms,
+            let mut batch = rockstream_storage::WriteBatch::new();
+            append_dml_ops(&mut batch, &ops);
+            // Persist idempotency key so replays are no-ops
+            if let Some(key_hash) = idempotency_key {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                rockstream_storage::ShardDb::put_idempotency_key(
+                    &mut batch, 0, key_hash, epoch, now_ms,
+                );
+            }
+            // Advance shard frontier
+            batch.put(
+                &rockstream_storage::ShardKeyEncoder::frontier_key(),
+                &epoch.to_be_bytes(),
             );
-        }
-        // Advance shard frontier
-        batch.put(
-            &rockstream_storage::ShardKeyEncoder::frontier_key(),
-            &epoch.to_be_bytes(),
-        );
 
-        shard_db
-            .write_batch(batch)
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
-        self.frontier_published_at_ms
-            .store(current_time_ms(), Ordering::SeqCst);
+            shard_db.write_batch(batch).await.map_err(|e| {
+                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+            })?;
+            self.frontier_published_at_ms
+                .store(current_time_ms(), Ordering::SeqCst);
 
-        for op in &ops {
-            let (table, row_key, mz_diff, encoded_row) = match op {
-                DmlOp::Insert {
-                    table,
-                    row_key,
-                    values_tsv,
-                    ..
-                } => (table.clone(), row_key.clone(), 1, values_tsv.clone()),
-                DmlOp::Delete {
-                    table,
-                    row_key,
-                    returning_tsv,
-                } => (
-                    table.clone(),
-                    row_key.clone(),
-                    -1,
-                    returning_tsv.clone().unwrap_or_default(),
-                ),
-                DmlOp::Update {
-                    table,
-                    old_row_key,
-                    old_tsv,
-                    new_row_key,
-                    new_tsv,
-                } => {
-                    self.subscribe_registry.push(
+            for op in &ops {
+                let (table, row_key, mz_diff, encoded_row) = match op {
+                    DmlOp::Insert {
                         table,
-                        crate::change_log::ChangeEntry {
-                            epoch,
-                            row_key: Bytes::from(old_row_key.clone()),
-                            mz_diff: -1,
-                            encoded_row: Bytes::from(old_tsv.clone()),
-                        },
-                    );
-                    (table.clone(), new_row_key.clone(), 1, new_tsv.clone())
-                }
-            };
-            self.subscribe_registry.push(
-                &table,
-                crate::change_log::ChangeEntry {
-                    epoch,
-                    row_key: Bytes::from(row_key),
-                    mz_diff,
-                    encoded_row: Bytes::from(encoded_row),
-                },
-            );
-        }
+                        row_key,
+                        values_tsv,
+                        ..
+                    } => (table.clone(), row_key.clone(), 1, values_tsv.clone()),
+                    DmlOp::Delete {
+                        table,
+                        row_key,
+                        returning_tsv,
+                    } => (
+                        table.clone(),
+                        row_key.clone(),
+                        -1,
+                        returning_tsv.clone().unwrap_or_default(),
+                    ),
+                    DmlOp::Update {
+                        table,
+                        old_row_key,
+                        old_tsv,
+                        new_row_key,
+                        new_tsv,
+                    } => {
+                        self.subscribe_registry.push(
+                            table,
+                            crate::change_log::ChangeEntry {
+                                epoch,
+                                row_key: Bytes::from(old_row_key.clone()),
+                                mz_diff: -1,
+                                encoded_row: Bytes::from(old_tsv.clone()),
+                            },
+                        );
+                        (table.clone(), new_row_key.clone(), 1, new_tsv.clone())
+                    }
+                };
+                self.subscribe_registry.push(
+                    &table,
+                    crate::change_log::ChangeEntry {
+                        epoch,
+                        row_key: Bytes::from(row_key),
+                        mz_diff,
+                        encoded_row: Bytes::from(encoded_row),
+                    },
+                );
+            }
+            (epoch, ops)
+        };
+        let affected = ops.len();
 
         // ── Last hop: materialise dependent views ─────────────────────────────
         // Collect the unique tables touched by this commit, then re-evaluate

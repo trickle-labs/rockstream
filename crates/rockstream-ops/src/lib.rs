@@ -16,6 +16,7 @@
 
 pub mod aggregate;
 pub mod bench_regression;
+pub mod branch_scheduler;
 pub mod compile;
 pub mod debugger;
 pub mod distinct;
@@ -61,6 +62,10 @@ pub use aggregate::{
     load_frontier, persist_agg_state, persist_bucketed_agg_state, persist_frontier, AggState,
     AggregateOp, BucketedAggregateOp,
 };
+pub use branch_scheduler::{
+    BranchScheduler, FnExecutor, ViewBranchExecutor, ViewDependencyGraph,
+    MAX_CONCURRENT_BRANCH_TASKS,
+};
 pub use compile::{
     compile_plan, compile_plan_with_sink_id, compile_plan_with_sink_id_and_strategy,
     compile_plan_with_strategy, CompiledView,
@@ -84,7 +89,9 @@ pub use governor::{
     FACTORIZED_SELECTION_RULE_VERSION,
 };
 pub use group_commit::{
-    GroupCommit, PhysicalCommitGroup, GROUP_COMMIT_MAX_BATCHES, PHYSICAL_COMMIT_GROUP_MAX_EPOCHS,
+    GroupCommit, PhysicalCommitGroup, DEFAULT_GROUP_COMMIT_MAX_DELAY_MS, GROUP_COMMIT_MAX_BATCHES,
+    MAX_GROUP_COMMIT_PENDING_BYTES, MAX_GROUP_COMMIT_RETRY_COUNT, MAX_GROUP_COMMIT_WAITERS,
+    PHYSICAL_COMMIT_GROUP_MAX_EPOCHS,
 };
 pub use join::JoinOp;
 pub use lateral::LateralOp;
