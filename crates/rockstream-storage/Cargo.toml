@@ -15,7 +15,7 @@ rockstream-types = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 slatedb = { workspace = true }
-slatedb-common = "0.13.1"
+slatedb-common = "0.15.0"
 moka = { version = "0.12.15", features = ["future"] }
 object_store = { workspace = true }
 thiserror = { workspace = true }
