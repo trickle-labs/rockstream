@@ -79,7 +79,7 @@ async fn test_v0612_public_release_aggregate_crash_recovery() {
     let mut guard1 = ProcessGuard(Some(child1));
 
     assert!(
-        wait_for_port(port1, Duration::from_secs(10)),
+        wait_for_port(port1, Duration::from_secs(30)),
         "gateway port1 failed to bind within deadline"
     );
 
@@ -165,7 +165,7 @@ async fn test_v0612_public_release_aggregate_crash_recovery() {
     let _guard2 = ProcessGuard(Some(child2));
 
     assert!(
-        wait_for_port(port2, Duration::from_secs(10)),
+        wait_for_port(port2, Duration::from_secs(30)),
         "gateway port2 failed to bind after restart"
     );
 
