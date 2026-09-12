@@ -1,15 +1,12 @@
-//! Qualification evidence store durability tests across LFS and MinIO (v0.59.24 Slice 7 / Phase 3b).
-
-mod support;
-
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use rockstream_control::QualificationEvidenceStore;
+use rockstream_test_support::docker_available;
+use rockstream_test_support::minio::{minio_object_store, start_minio};
 use rockstream_types::candidate_identity::CandidateIdentity;
 use rockstream_types::qualification::QualificationEvidenceManifest;
-use support::{create_minio_bucket, docker_available, minio_object_store};
 
 const MINIO_BUCKET: &str = "rockstream-qualification-manifest-durability-test";
 
@@ -68,17 +65,14 @@ async fn lfs_qualification_evidence_store_preserves_exact_manifest() {
 #[tokio::test]
 async fn minio_qualification_evidence_store_preserves_exact_manifest() {
     if !docker_available() {
-        eprintln!("Skipping MinIO test: Docker not available");
+        eprintln!("SKIP minio_qualification_evidence_store_preserves_exact_manifest: Docker not available");
         return;
     }
 
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let minio_port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(minio_port, MINIO_BUCKET).await;
+    let (_container, minio_port) = match start_minio(MINIO_BUCKET).await {
+        Some(res) => res,
+        None => return,
+    };
     let minio: Arc<dyn ObjectStore> = minio_object_store(minio_port, MINIO_BUCKET);
     let store = QualificationEvidenceStore::new(minio.clone());
 

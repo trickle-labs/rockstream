@@ -34,7 +34,7 @@ use rockstream_types::topology::{
     CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
     WorkerLocation,
 };
-use support::{create_minio_bucket, docker_available, minio_object_store};
+use support::minio_object_store;
 use tokio::sync::mpsc;
 
 const MINIO_DIRECT_BUCKET: &str = "rockstream-direct-grpc-fast-path-elision-test";
@@ -315,20 +315,16 @@ async fn direct_grpc_fast_path_replays_from_frontier_after_lfs_restart_without_s
 
 #[tokio::test]
 async fn direct_grpc_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal() {
-    if !docker_available() {
-        eprintln!("SKIP direct_grpc_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal: Docker not available");
-        return;
-    }
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_DIRECT_BUCKET).await;
+    let (_container, port) = match support::start_minio(MINIO_DIRECT_BUCKET).await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP direct_grpc_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal: Docker not available");
+            return;
+        }
+    };
     exercise_direct_grpc_replay(
-        minio_object_store(port, MINIO_DIRECT_BUCKET),
-        minio_object_store(port, MINIO_DIRECT_BUCKET),
+        Arc::new(minio_object_store(port, MINIO_DIRECT_BUCKET)),
+        Arc::new(minio_object_store(port, MINIO_DIRECT_BUCKET)),
     )
     .await;
 }
@@ -403,20 +399,16 @@ async fn loopback_fast_path_replays_from_frontier_after_lfs_restart_without_shuf
 
 #[tokio::test]
 async fn loopback_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal() {
-    if !docker_available() {
-        eprintln!("SKIP loopback_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal: Docker not available");
-        return;
-    }
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_LOOPBACK_BUCKET).await;
+    let (_container, port) = match support::start_minio(MINIO_LOOPBACK_BUCKET).await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP loopback_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal: Docker not available");
+            return;
+        }
+    };
     exercise_loopback_replay(
-        minio_object_store(port, MINIO_LOOPBACK_BUCKET),
-        minio_object_store(port, MINIO_LOOPBACK_BUCKET),
+        Arc::new(minio_object_store(port, MINIO_LOOPBACK_BUCKET)),
+        Arc::new(minio_object_store(port, MINIO_LOOPBACK_BUCKET)),
     )
     .await;
 }
@@ -519,11 +511,7 @@ async fn exercise_durable_catch_up_survives_restart(
         )
         .await
         .unwrap();
-    tokio::select! {
-        maybe = inlet_rx2.recv() => panic!("unexpected durable re-delivery: {:?}", maybe),
-        _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {}
-    }
-    let _ = reopened_target;
+    assert!(inlet_rx2.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -540,21 +528,17 @@ async fn durable_shuffle_catch_up_survives_lfs_restart_with_fast_path_elision_en
 
 #[tokio::test]
 async fn durable_shuffle_catch_up_survives_minio_tc_restart_with_fast_path_elision_enabled() {
-    if !docker_available() {
-        eprintln!("SKIP durable_shuffle_catch_up_survives_minio_tc_restart_with_fast_path_elision_enabled: Docker not available");
-        return;
-    }
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_DURABLE_BUCKET).await;
+    let (_container, port) = match support::start_minio(MINIO_DURABLE_BUCKET).await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP durable_shuffle_catch_up_survives_minio_tc_restart_with_fast_path_elision_enabled: Docker not available");
+            return;
+        }
+    };
     exercise_durable_catch_up_survives_restart(
-        minio_object_store(port, MINIO_DURABLE_BUCKET),
-        minio_object_store(port, MINIO_DURABLE_BUCKET),
-        minio_object_store(port, MINIO_DURABLE_BUCKET),
+        Arc::new(minio_object_store(port, MINIO_DURABLE_BUCKET)),
+        Arc::new(minio_object_store(port, MINIO_DURABLE_BUCKET)),
+        Arc::new(minio_object_store(port, MINIO_DURABLE_BUCKET)),
     )
     .await;
 }

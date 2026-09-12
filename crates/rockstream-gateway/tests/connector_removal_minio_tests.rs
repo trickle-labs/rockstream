@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use object_store::ObjectStore;
 use rockstream_gateway::{
     catalog_stubs::{CatalogSinkEntry, CatalogSourceEntry, CatalogStubs, V0522ConnectorCatalog},
     view_reader::{ViewReadStrategy, ViewReader},
@@ -27,79 +26,26 @@ impl ViewReader for NoopViewReader {
 
 const REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.";
 
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(data))
-}
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
-    type HmacSha256 = Hmac<sha2::Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key).unwrap();
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-async fn create_bucket(port: u16, bucket: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let datetime = chrono::DateTime::from_timestamp(now as i64, 0)
-        .unwrap()
-        .format("%Y%m%dT%H%M%SZ")
-        .to_string();
-    let date = &datetime[..8];
-    let host = format!("127.0.0.1:{port}");
-    let empty_hash = sha256_hex(b"");
-    let scope = format!("{date}/us-east-1/s3/aws4_request");
-    let canonical = format!("PUT\n/{bucket}\n\nhost:{host}\nx-amz-content-sha256:{empty_hash}\nx-amz-date:{datetime}\n\nhost;x-amz-content-sha256;x-amz-date\n{empty_hash}");
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{}",
-        sha256_hex(canonical.as_bytes())
-    );
-    let k_date = hmac_sha256(b"AWS4minioadmin", date.as_bytes());
-    let k_region = hmac_sha256(&k_date, b"us-east-1");
-    let k_service = hmac_sha256(&k_region, b"s3");
-    let signing_key = hmac_sha256(&k_service, b"aws4_request");
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-    let response = reqwest::Client::new().put(format!("http://{host}/{bucket}")).header("Host", &host).header("X-Amz-Content-Sha256", &empty_hash).header("X-Amz-Date", &datetime).header("Authorization", format!("AWS4-HMAC-SHA256 Credential=minioadmin/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}")).send().await.unwrap();
-    assert!(response.status().is_success() || response.status().as_u16() == 409);
-}
-
-fn store(port: u16, bucket: &str) -> Arc<dyn ObjectStore> {
-    use object_store::aws::AmazonS3Builder;
-    Arc::new(
-        AmazonS3Builder::new()
-            .with_endpoint(format!("http://127.0.0.1:{port}"))
-            .with_bucket_name(bucket)
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_region("us-east-1")
-            .with_allow_http(true)
-            .build()
-            .unwrap(),
-    )
-}
-
 #[tokio::test]
 async fn v0522_removed_connector_catalog_loads_as_removed_exactly() {
-    if !rockstream_test_support::docker_available() {
-        eprintln!("SKIP v0522_removed_connector_catalog_loads_as_removed_exactly: Docker is not available locally");
-        return;
-    }
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
     let bucket = "connector-removal-v0523";
-    create_bucket(port, bucket).await;
+    let (_container, port) = match rockstream_test_support::minio::start_minio(bucket).await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP v0522_removed_connector_catalog_loads_as_removed_exactly: Docker is not available locally");
+            return;
+        }
+    };
     let shard_db = Arc::new(
-        ShardDb::builder("connector-removal", store(port, bucket))
-            .build()
-            .await
-            .unwrap(),
+        ShardDb::builder(
+            "connector-removal",
+            Arc::new(rockstream_test_support::minio::minio_object_store(
+                port, bucket,
+            )),
+        )
+        .build()
+        .await
+        .unwrap(),
     );
     CatalogStubs::seed_v0522_connector_catalog(
         &shard_db,

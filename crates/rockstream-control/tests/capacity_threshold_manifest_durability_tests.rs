@@ -1,19 +1,18 @@
 //! Capacity threshold manifest and raw chunk durability tests (v0.59.23 Slice 5 / Phase 3b).
 
-mod support;
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use rockstream_control::CapacityThresholdStore;
+use rockstream_test_support::docker_available;
+use rockstream_test_support::minio::{minio_object_store, start_minio};
 use rockstream_types::candidate_identity::CandidateIdentity;
 use rockstream_types::capacity::{
     CapacityProfile, CapacityReducer, CapacityThresholdManifest, HardwareIdentity,
     PhysicalStrategy, ProfileThresholds, RawCapacityRecord, ThresholdFloorCeiling, WorkloadDigest,
 };
-use support::{create_minio_bucket, docker_available, minio_object_store};
 
 const MINIO_BUCKET: &str = "rockstream-capacity-manifest-durability-test";
 
@@ -176,17 +175,14 @@ async fn lfs_reopen_preserves_exact_sealed_manifest() {
 #[tokio::test]
 async fn minio_reopen_preserves_exact_sealed_manifest() {
     if !docker_available() {
-        eprintln!("Docker not available; skipping MinIO capacity durability test");
+        eprintln!("SKIP minio_reopen_preserves_exact_sealed_manifest: Docker not available");
         return;
     }
 
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let minio_port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(minio_port, MINIO_BUCKET).await;
+    let (_container, minio_port) = match start_minio(MINIO_BUCKET).await {
+        Some(res) => res,
+        None => return,
+    };
 
     let store = minio_object_store(minio_port, MINIO_BUCKET);
     let capacity_store = CapacityThresholdStore::new(store.clone());

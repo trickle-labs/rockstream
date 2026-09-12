@@ -6,7 +6,7 @@
 //! infrastructure: every test brings up its own MinIO container and tears it
 //! down on exit.
 //!
-//! Uses `testcontainers_modules::minio::MinIO` which wraps `quay.io/minio/minio`
+//! Uses `MinIO2024` which wraps `minio/minio:RELEASE.2024-11-07T00-52-20Z`
 //! with the correct image, command, wait condition, and exposed ports.
 //! The test bucket is created programmatically via the S3 API with AWS SigV4.
 //!

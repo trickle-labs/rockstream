@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::ObjectStore;
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
@@ -58,123 +57,19 @@ async fn client(port: u16) -> tokio_postgres::Client {
     client
 }
 
-fn s3_store(port: u16, bucket: &str) -> Arc<dyn ObjectStore> {
-    Arc::new(
-        AmazonS3Builder::new()
-            .with_endpoint(format!("http://127.0.0.1:{port}"))
-            .with_bucket_name(bucket)
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_region("us-east-1")
-            .with_allow_http(true)
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .build()
-            .unwrap(),
-    )
-}
-
-async fn create_bucket(port: u16, bucket: &str) {
-    use hmac::{Hmac, Mac};
-    use sha2::{Digest, Sha256};
-    type HmacSha256 = Hmac<Sha256>;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let days = now / 86_400;
-    let mut year = 1970;
-    let mut remaining = days;
-    loop {
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-        let length = if leap { 366 } else { 365 };
-        if remaining < length {
-            break;
-        }
-        remaining -= length;
-        year += 1;
-    }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let month_lengths = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 1;
-    for length in month_lengths {
-        if remaining < length {
-            break;
-        }
-        remaining -= length;
-        month += 1;
-    }
-    let day = remaining + 1;
-    let seconds = now % 86_400;
-    let datetime = format!(
-        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
-        seconds / 3600,
-        (seconds % 3600) / 60,
-        seconds % 60
-    );
-    let date = &datetime[..8];
-    let host = format!("127.0.0.1:{port}");
-    let empty_hash = format!("{:x}", Sha256::digest(b""));
-    let canonical = format!(
-        "PUT\n/{bucket}\n\nhost:{host}\nx-amz-content-sha256:{empty_hash}\n\
-         x-amz-date:{datetime}\n\nhost;x-amz-content-sha256;x-amz-date\n{empty_hash}"
-    );
-    let canonical_hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
-    let scope = format!("{date}/us-east-1/s3/aws4_request");
-    let string_to_sign = format!("AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{canonical_hash}");
-    let sign = |key: &[u8], data: &[u8]| {
-        let mut mac = HmacSha256::new_from_slice(key).unwrap();
-        mac.update(data);
-        mac.finalize().into_bytes().to_vec()
-    };
-    let k1 = sign(b"AWS4minioadmin", date.as_bytes());
-    let k2 = sign(&k1, b"us-east-1");
-    let k3 = sign(&k2, b"s3");
-    let signing_key = sign(&k3, b"aws4_request");
-    let signature = hex::encode(sign(&signing_key, string_to_sign.as_bytes()));
-    let auth = format!(
-        "AWS4-HMAC-SHA256 Credential=minioadmin/{scope}, \
-         SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
-    );
-    let response = reqwest::Client::new()
-        .put(format!("http://{host}/{bucket}"))
-        .header("Host", &host)
-        .header("X-Amz-Content-Sha256", &empty_hash)
-        .header("X-Amz-Date", &datetime)
-        .header("Authorization", auth)
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success() || response.status().as_u16() == 409);
-}
-
 #[tokio::test]
 async fn compiled_join_state_persists_across_restart_minio() {
-    if !rockstream_test_support::docker_available() {
-        eprintln!("SKIP compiled_join_state_persists_across_restart_minio: Docker is not available locally");
-        return;
-    }
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
     let bucket = "rockstream-core-join-durability";
-    create_bucket(port, bucket).await;
-    let store = s3_store(port, bucket);
+    let (_container, port) = match rockstream_test_support::minio::start_minio(bucket).await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP compiled_join_state_persists_across_restart_minio: Docker is not available locally");
+            return;
+        }
+    };
+    let store = Arc::new(rockstream_test_support::minio::minio_object_store(
+        port, bucket,
+    ));
     let catalog = Arc::new(CatalogStubs::new());
     let (port1, handle1, db1) = gateway("core-join-minio", store.clone(), catalog.clone()).await;
     let client1 = client(port1).await;
@@ -216,19 +111,17 @@ async fn compiled_join_state_persists_across_restart_minio() {
 
 #[tokio::test]
 async fn compiled_tumble_window_state_persists_across_restart_minio() {
-    if !rockstream_test_support::docker_available() {
-        eprintln!("SKIP compiled_tumble_window_state_persists_across_restart_minio: Docker is not available locally");
-        return;
-    }
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
     let bucket = "rockstream-core-window-durability";
-    create_bucket(port, bucket).await;
-    let store = s3_store(port, bucket);
+    let (_container, port) = match rockstream_test_support::minio::start_minio(bucket).await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP compiled_tumble_window_state_persists_across_restart_minio: Docker is not available locally");
+            return;
+        }
+    };
+    let store = Arc::new(rockstream_test_support::minio::minio_object_store(
+        port, bucket,
+    ));
     let catalog = Arc::new(CatalogStubs::new());
     let (port1, handle1, db1) = gateway("core-window-minio", store.clone(), catalog.clone()).await;
     let client1 = client(port1).await;

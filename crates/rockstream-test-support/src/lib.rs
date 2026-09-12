@@ -1,4 +1,5 @@
 pub mod external_harness;
+pub mod minio;
 pub mod pki;
 
 pub fn docker_available() -> bool {

@@ -5345,6 +5345,7 @@ dependencies = [
  "rockstream-plan",
  "rockstream-sim",
  "rockstream-storage",
+ "rockstream-test-support",
  "rockstream-types",
  "serde",
  "serde_json",
@@ -5396,12 +5397,18 @@ dependencies = [
 name = "rockstream-test-support"
 version = "0.64.0"
 dependencies = [
+ "hex",
+ "hmac 0.12.1",
+ "object_store 0.12.5",
  "rcgen",
+ "reqwest",
  "rockstream-types",
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
+ "testcontainers",
 ]
 
 [[package]]

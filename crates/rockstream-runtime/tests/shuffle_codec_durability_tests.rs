@@ -29,7 +29,7 @@ use rockstream_types::topology::{
     CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
     WorkerLocation,
 };
-use support::{create_minio_bucket, docker_available, minio_object_store};
+use support::minio_object_store;
 use tokio::sync::mpsc;
 
 const MINIO_BUCKET: &str = "rockstream-shuffle-codec-durability-test";
@@ -264,23 +264,18 @@ async fn legacy_and_codec_v1_shuffle_payloads_replay_after_lfs_restart() {
 
 #[tokio::test]
 async fn legacy_and_codec_v1_shuffle_payloads_replay_after_minio_tc_restart() {
-    if !docker_available() {
-        eprintln!(
-            "SKIP legacy_and_codec_v1_shuffle_payloads_replay_after_minio_tc_restart: Docker not available"
-        );
-        return;
-    }
-
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_BUCKET).await;
+    let (_container, port) = match support::start_minio(MINIO_BUCKET).await {
+        Some(m) => m,
+        None => {
+            eprintln!(
+                "SKIP legacy_and_codec_v1_shuffle_payloads_replay_after_minio_tc_restart: Docker not available"
+            );
+            return;
+        }
+    };
     exercise_shuffle_codec_reload(
-        minio_object_store(port, MINIO_BUCKET),
-        minio_object_store(port, MINIO_BUCKET),
+        Arc::new(minio_object_store(port, MINIO_BUCKET)),
+        Arc::new(minio_object_store(port, MINIO_BUCKET)),
     )
     .await;
 }
@@ -298,23 +293,18 @@ async fn same_host_shm_fast_path_replays_from_frontier_after_lfs_restart_without
 #[tokio::test]
 async fn same_host_shm_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal()
 {
-    if !docker_available() {
-        eprintln!(
-            "SKIP same_host_shm_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal: Docker not available"
-        );
-        return;
-    }
-
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_SHM_BUCKET).await;
+    let (_container, port) = match support::start_minio(MINIO_SHM_BUCKET).await {
+        Some(m) => m,
+        None => {
+            eprintln!(
+                "SKIP same_host_shm_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal: Docker not available"
+            );
+            return;
+        }
+    };
     exercise_same_host_shm_replay(
-        minio_object_store(port, MINIO_SHM_BUCKET),
-        minio_object_store(port, MINIO_SHM_BUCKET),
+        Arc::new(minio_object_store(port, MINIO_SHM_BUCKET)),
+        Arc::new(minio_object_store(port, MINIO_SHM_BUCKET)),
         WorkerId(703),
         WorkerId(704),
     )

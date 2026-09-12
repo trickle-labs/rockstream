@@ -1,12 +1,11 @@
-mod support;
-
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::secret_store::SecretStore;
+use rockstream_test_support::docker_available;
+use rockstream_test_support::minio::{minio_object_store, start_minio};
 use rockstream_types::secret::SecretType;
 use slatedb::Db;
 use std::collections::HashMap;
 use std::sync::Arc;
-use support::{create_minio_bucket, docker_available, minio_object_store};
 use tempfile::TempDir;
 
 const MINIO_BUCKET: &str = "rockstream-secrets-durability-test";
@@ -61,13 +60,10 @@ async fn secrets_survive_minio_tc_reopen_and_kek_rotation() {
         return;
     }
 
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_BUCKET).await;
+    let (_container, port) = match start_minio(MINIO_BUCKET).await {
+        Some(res) => res,
+        None => return,
+    };
 
     let db = Arc::new(
         Db::builder("catalog_db", minio_object_store(port, MINIO_BUCKET))

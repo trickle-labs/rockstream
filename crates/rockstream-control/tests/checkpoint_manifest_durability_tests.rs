@@ -1,15 +1,14 @@
-mod support;
-
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use rockstream_control::{ChangelogCheckpointContribution, CheckpointManifestStore};
+use rockstream_test_support::docker_available;
+use rockstream_test_support::minio::{minio_object_store, start_minio};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::ids::ShardId;
 use rockstream_types::state_mutation::{EpochStateDelta, StateMutation};
-use support::{create_minio_bucket, docker_available, minio_object_store};
 
 const MINIO_BUCKET: &str = "rockstream-checkpoint-manifest-durability-test";
 
@@ -96,13 +95,10 @@ async fn legacy_json_and_zstd_checkpoint_manifests_survive_minio_tc_restart() {
         return;
     }
 
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_BUCKET).await;
+    let (_container, port) = match start_minio(MINIO_BUCKET).await {
+        Some(res) => res,
+        None => return,
+    };
 
     let zstd_manifest = manifest(8, 3);
     let legacy_manifest = manifest(9, 5);
@@ -140,13 +136,10 @@ async fn aligned_changelog_checkpoint_survives_minio_tc_restart() {
         return;
     }
 
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_BUCKET).await;
+    let (_container, port) = match start_minio(MINIO_BUCKET).await {
+        Some(res) => res,
+        None => return,
+    };
 
     let expected = changelog(8);
     let checkpoints = CheckpointManifestStore::new(minio_object_store(port, MINIO_BUCKET));

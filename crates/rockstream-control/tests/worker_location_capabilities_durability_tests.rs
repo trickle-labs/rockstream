@@ -10,7 +10,7 @@ use rockstream_types::topology::{
     CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
     WorkerLocation,
 };
-use support::{create_minio_bucket, docker_available, minio_object_store};
+use support::{docker_available, minio_object_store};
 
 const MINIO_BUCKET: &str = "rockstream-worker-location-capabilities-durability-test";
 
@@ -65,13 +65,10 @@ async fn worker_location_and_capabilities_survive_minio_tc_reload() {
         return;
     }
 
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_BUCKET).await;
+    let (_container, port) = match support::start_minio(MINIO_BUCKET).await {
+        Some(res) => res,
+        None => return,
+    };
 
     let worker = make_worker();
     TopologyPersistentStore::new(minio_object_store(port, MINIO_BUCKET))

@@ -11,8 +11,9 @@
 
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
-use object_store::aws::AmazonS3Builder;
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use object_store::ObjectStore;
 use rockstream_ops::aggregate::{load_frontier, persist_frontier};
 use rockstream_ops::minmax::{persist_minmax_state, MinMaxKind, MinMaxOp};
@@ -20,136 +21,20 @@ use rockstream_ops::op::Operator;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::OperatorId;
-use sha2::{Digest, Sha256};
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::minio::MinIO;
-
-const MINIO_USER: &str = "minioadmin";
-const MINIO_PASS: &str = "minioadmin";
 const MINIO_BUCKET: &str = "rockstream-test-minmax";
 
-fn docker_available() -> bool {
-    rockstream_test_support::docker_available()
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key).unwrap();
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let sod = secs % 86400;
-    let mut days = (secs / 86400) as u32;
-    let h = (sod / 3600) as u32;
-    let m = ((sod % 3600) / 60) as u32;
-    let s = (sod % 60) as u32;
-    let mut year = 1970u32;
-    loop {
-        let leap =
-            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let dy = if leap { 366 } else { 365 };
-        if days < dy {
-            break;
-        }
-        days -= dy;
-        year += 1;
-    }
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let dpm: [u32; 12] = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 0u32;
-    for &d in &dpm {
-        if days < d {
-            break;
-        }
-        days -= d;
-        month += 1;
-    }
-    (year, month + 1, days + 1, h, m, s)
-}
-
-async fn create_minio_bucket(port: u16, bucket: &str) {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let (y, mo, d, hh, mm, ss) = epoch_to_ymd_hms(secs);
-    let date = format!("{y:04}{mo:02}{d:02}");
-    let datetime = format!("{y:04}{mo:02}{d:02}T{hh:02}{mm:02}{ss:02}Z");
-    let host = format!("127.0.0.1:{port}");
-    let region = "us-east-1";
-    let empty_hash = sha256_hex(b"");
-    let canonical = format!(
-        "PUT\n/{bucket}\n\nhost:{host}\nx-amz-content-sha256:{empty_hash}\nx-amz-date:{datetime}\n\nhost;x-amz-content-sha256;x-amz-date\n{empty_hash}"
-    );
-    let canonical_hash = sha256_hex(canonical.as_bytes());
-    let scope = format!("{date}/{region}/s3/aws4_request");
-    let sts = format!("AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{canonical_hash}");
-    let k1 = hmac_sha256(format!("AWS4{MINIO_PASS}").as_bytes(), date.as_bytes());
-    let k2 = hmac_sha256(&k1, region.as_bytes());
-    let k3 = hmac_sha256(&k2, b"s3");
-    let signing_key = hmac_sha256(&k3, b"aws4_request");
-    let sig = hex::encode(hmac_sha256(&signing_key, sts.as_bytes()));
-    let auth = format!(
-        "AWS4-HMAC-SHA256 Credential={MINIO_USER}/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={sig}"
-    );
-    let resp = reqwest::Client::new()
-        .put(format!("http://{host}/{bucket}"))
-        .header("Host", &host)
-        .header("X-Amz-Content-Sha256", &empty_hash)
-        .header("X-Amz-Date", &datetime)
-        .header("Authorization", &auth)
-        .header("Content-Length", "0")
-        .send()
-        .await
-        .expect("CreateBucket PUT request failed");
-    let status = resp.status();
-    assert!(
-        status.is_success() || status.as_u16() == 409,
-        "CreateBucket failed: {status}"
-    );
-}
-
-async fn start_minio() -> (testcontainers::ContainerAsync<MinIO>, u16) {
-    let container = MinIO::default()
-        .start()
-        .await
-        .expect("failed to start MinIO container; is Docker running?");
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_BUCKET).await;
-    (container, port)
+async fn start_minio() -> Option<(
+    testcontainers::ContainerAsync<rockstream_test_support::minio::MinIO2024>,
+    u16,
+)> {
+    rockstream_test_support::minio::start_minio(MINIO_BUCKET).await
 }
 
 fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
-    Arc::new(
-        AmazonS3Builder::new()
-            .with_endpoint(format!("http://127.0.0.1:{port}"))
-            .with_bucket_name(MINIO_BUCKET)
-            .with_access_key_id(MINIO_USER)
-            .with_secret_access_key(MINIO_PASS)
-            .with_region("us-east-1")
-            .with_allow_http(true)
-            .build()
-            .expect("failed to build S3 object store for MinIO"),
-    )
+    Arc::new(rockstream_test_support::minio::minio_object_store(
+        port,
+        MINIO_BUCKET,
+    ))
 }
 
 async fn open_minio_shard_db(port: u16, path: &str) -> Arc<ShardDb> {
@@ -163,16 +48,13 @@ async fn open_minio_shard_db(port: u16, path: &str) -> Arc<ShardDb> {
 }
 
 fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
-    use arrow::array::Int64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
+    let k_vals: Vec<i64> = rows.iter().map(|(k, _, _)| *k).collect();
+    let v_vals: Vec<i64> = rows.iter().map(|(_, v, _)| *v).collect();
+    let weights: Vec<i64> = rows.iter().map(|(_, _, w)| *w).collect();
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
         Field::new("v", DataType::Int64, false),
     ]));
-    let k_vals: Vec<i64> = rows.iter().map(|(k, _, _)| *k).collect();
-    let v_vals: Vec<i64> = rows.iter().map(|(_, v, _)| *v).collect();
-    let weights: Vec<i64> = rows.iter().map(|(_, _, w)| *w).collect();
     let data = RecordBatch::try_new(
         schema,
         vec![
@@ -185,7 +67,6 @@ fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
 }
 
 fn extract_output(batch: &ArrowZSet) -> Vec<(i64, i64, i64)> {
-    use arrow::array::Int64Array;
     let k_col = batch
         .data
         .column(0)
@@ -211,12 +92,14 @@ fn extract_output(batch: &ArrowZSet) -> Vec<(i64, i64, i64)> {
 /// close/reopen on the S3-compatible MinIO backend.
 #[tokio::test]
 async fn minio_minmax_writes_and_persists() {
-    if !docker_available() {
-        eprintln!("SKIP minio_minmax_writes_and_persists: Docker not available");
-        return;
-    }
+    let (_container, port) = match start_minio().await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP minio_minmax_writes_and_persists: Docker not available");
+            return;
+        }
+    };
 
-    let (_container, port) = start_minio().await;
     let db = open_minio_shard_db(port, "shard-mm-persist").await;
     let op = MinMaxOp::new_min(OperatorId(10));
 
@@ -262,12 +145,13 @@ async fn minio_minmax_writes_and_persists() {
 /// epoch 2 from persisted frontier (epoch 1) to bit-identical output.
 #[tokio::test]
 async fn minio_minmax_crash_replay_bit_identical() {
-    if !docker_available() {
-        eprintln!("SKIP minio_minmax_crash_replay_bit_identical: Docker not available");
-        return;
-    }
-
-    let (_container, port) = start_minio().await;
+    let (_container, port) = match start_minio().await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP minio_minmax_crash_replay_bit_identical: Docker not available");
+            return;
+        }
+    };
 
     let delta1 = make_kv_batch(&[(1, 10, 1), (1, 5, 1), (2, 20, 1)]);
     let delta2 = make_kv_batch(&[(1, 5, -1), (2, 15, 1)]);
