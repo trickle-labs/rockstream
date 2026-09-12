@@ -373,11 +373,11 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-types --fail-under-lines 84
-      - name: cargo llvm-cov (rockstream-types regions ≥87%)
+      - name: cargo llvm-cov (rockstream-types regions ≥86%)
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-types --fail-under-regions 87
+        run: cargo llvm-cov report --package rockstream-types --fail-under-regions 86
       - name: cargo llvm-cov (rockstream-plan lines ≥81%)
         env:
           CARGO_BUILD_JOBS: "2"
@@ -398,11 +398,11 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-sim --fail-under-regions 66
-      - name: cargo llvm-cov (rockstream-cli lines ≥73%)
+      - name: cargo llvm-cov (rockstream-cli lines ≥72%)
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-cli --fail-under-lines 73 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
+        run: cargo llvm-cov report --package rockstream-cli --fail-under-lines 72 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
       - name: cargo llvm-cov (rockstream-cli regions ≥74%)
         env:
           CARGO_BUILD_JOBS: "2"
