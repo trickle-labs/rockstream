@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 
@@ -4274,7 +4275,7 @@ async fn test_nexmark_q0_q9_minio() {
         let psql_res = client
             .simple_query(&format!("SELECT * FROM {view}"))
             .await
-            .expect(&format!("SELECT * FROM {view} failed"));
+            .unwrap_or_else(|_| panic!("SELECT * FROM {view} failed"));
         let mut psql_rows = Vec::new();
         for msg in psql_res {
             if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {

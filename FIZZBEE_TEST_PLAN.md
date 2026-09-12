@@ -985,4 +985,4 @@ RockStream usage. (Sourced from the FizzBee design-verification tutorials.)
 > back to the explicit-collections message-passing model
 > ([FizzBee msg-delivery-guarantees](https://fizzbee.io/design/tutorials/msg-delivery-guarantees/)),
 > which is the more established mechanism and is mandatory for M2's
-> reordering proof regardless.
+> reordering proof regardless. Test harness and durability assertions align with v0.64.

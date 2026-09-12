@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use rockstream_gateway::{
     catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable},
@@ -11,13 +9,8 @@ use rockstream_gateway::{
     GatewayError, GatewayServer, QueryTimeShardTopology,
 };
 use rockstream_storage::{ShardDb, ShardReader};
-use sha2::{Digest, Sha256};
-use testcontainers::runners::AsyncRunner;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
-
-const MINIO_USER: &str = "minioadmin";
-const MINIO_PASS: &str = "minioadmin";
 
 struct NoopViewReader;
 
