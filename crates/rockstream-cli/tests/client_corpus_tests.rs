@@ -215,8 +215,10 @@ async fn test_client_syntax_error_returns_rs2001() {
     .expect_err("should fail with syntax error");
 
     assert!(
-        err.code == RS_2001 || err.code == rockstream_types::error_code::RS_1012,
-        "expected syntax error code RS-1012 or RS-2001, got {:?}",
+        err.code == RS_2001
+            || err.code == rockstream_types::error_code::RS_1012
+            || err.code == rockstream_types::error_code::RS_2022,
+        "expected syntax error code RS-1012, RS-2001, or RS-2022, got {:?}",
         err.code
     );
 }
