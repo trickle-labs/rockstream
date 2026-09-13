@@ -83,6 +83,9 @@ fn assert_json_status_transcript(
             active_operations: 0,
             retained_operations: 0,
             request_fill: 1,
+            request_capacity: 64,
+            ack_waiter_fill: 0,
+            ack_waiter_capacity: 64,
         }
     );
     status
@@ -206,7 +209,7 @@ fn acceptance_suite_proves_product_truth_lifecycle() {
     assert_eq!(
         live_stdout,
         format!(
-            "Cluster State: unknown\nObserved At: {observed_at}\nSource Version: topology:1\nOperations: 0 active, 0 retained\nRequest Fill: 1\nNodes: 0\n"
+            "Cluster State: unknown\nObserved At: {observed_at}\nSource Version: topology:1\nOperations: 0 active, 0 retained\nRequest Fill: 1 / 64\nACK Waiters: 0 / 64\nNodes: 0\n"
         )
     );
 

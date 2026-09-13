@@ -155,20 +155,12 @@ async fn management_drain_retries_after_mismatched_recipient_ack() {
     .await;
     tokio::time::sleep(Duration::from_millis(30)).await;
     let awaiting_ack = operation(&mut client, &accepted.operation_id).await;
-    assert_eq!(awaiting_ack.state, "running");
+    assert_eq!(awaiting_ack.state, "waiting");
     assert!(matches!(
         catalog.get(WorkerId(31)).unwrap().lifecycle,
         WorkerLifecycleState::Draining { .. }
     ));
 
-    send_on(
-        &mut donor,
-        &WorkerMessage::DrainAck {
-            worker_id: WorkerId(31),
-            shards_remaining: 0,
-        },
-    )
-    .await;
     let retry_assignment = read_until(&mut recipient, |message| {
         matches!(message, ControlMessage::ShardAssigned { lease, operation_id: Some(_)}
             if lease.shard_id == ShardId(301))

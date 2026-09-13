@@ -29,6 +29,9 @@ message GetClusterStatusResponse {
   uint32 active_operations = 6;
   uint32 retained_operations = 7;
   uint32 request_fill = 8;
+  uint32 request_capacity = 9;
+  uint32 ack_waiter_fill = 10;
+  uint32 ack_waiter_capacity = 11;
 }
 
 message ListNodesRequest {
