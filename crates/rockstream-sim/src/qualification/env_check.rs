@@ -62,7 +62,7 @@ impl PrerequisiteReport {
 /// Required container images for the distributed qualification topology.
 pub const REQUIRED_CONTAINER_IMAGES: &[&str] = &[
     "redpandadata/redpanda:v24.2.4",
-    "minio/minio:RELEASE.2024-05-10T01-41-38Z",
+    "quay.io/minio/minio:RELEASE.2024-11-07T00-52-20Z",
     "postgres:16-alpine",
     "rockstream-tc-test:latest",
 ];
