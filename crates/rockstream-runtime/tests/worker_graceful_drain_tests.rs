@@ -91,7 +91,40 @@ async fn test_worker_epoch_flush_lease_release_durability() {
     let handle = service.start("127.0.0.1:0").await.unwrap();
 
     let mut w1_conn = register_worker(handle.addr, 1).await;
-    let _w2_conn = register_worker(handle.addr, 2).await;
+    let w2_conn = register_worker(handle.addr, 2).await;
+    let mut w2_reader = BufReader::new(w2_conn);
+    let recipient_ack = tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = w2_reader.read_line(&mut line).await.unwrap();
+            assert_ne!(
+                read, 0,
+                "recipient control connection closed before assignment"
+            );
+            if let ControlMessage::ShardAssigned {
+                lease,
+                operation_id: Some(operation_id),
+            } = serde_json::from_str(line.trim()).unwrap()
+            {
+                let ack = WorkerMessage::ShardTransferAck {
+                    operation_id,
+                    stage: "recipient".to_owned(),
+                    worker_id: WorkerId(2),
+                    shard_id: lease.shard_id,
+                    lease_token: lease.lease_token,
+                    success: true,
+                    error: None,
+                };
+                w2_reader
+                    .get_mut()
+                    .write_all((serde_json::to_string(&ack).unwrap() + "\n").as_bytes())
+                    .await
+                    .unwrap();
+                break w2_reader;
+            }
+        }
+    });
 
     // Worker 1 acquires Shard 42
     manager.acquire(ShardId(42), WorkerId(1)).unwrap();
@@ -130,6 +163,22 @@ async fn test_worker_epoch_flush_lease_release_durability() {
         },
     )
     .await;
+    let _w2_reader = recipient_ack.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if catalog.get(WorkerId(1)).is_some_and(|worker| {
+                matches!(
+                    worker.lifecycle,
+                    WorkerLifecycleState::Decommissioned { .. }
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recipient acknowledgement should complete the drain");
 
     // 4. Verify lease is immediately released to control plane
     let w1 = catalog.get(WorkerId(1)).unwrap();

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use rockstream_cli::output::{ManagementClusterStatusInfo, ManagementNodeInfo};
 use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_types::data_plane::WorkerExecutionStatus;
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
@@ -40,6 +41,108 @@ fn spawn(args: &[&str]) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .unwrap()
+}
+
+fn management_status_json(management_addr: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .env("RUST_LOG", "off")
+        .args([
+            "--output",
+            "json",
+            "--management",
+            management_addr,
+            "--control",
+            "127.0.0.1:1",
+            "status",
+        ])
+        .output()
+        .unwrap()
+}
+
+fn assert_management_status_transcript(
+    output: &Output,
+    state: &str,
+    mut nodes: Vec<ManagementNodeInfo>,
+) -> ManagementClusterStatusInfo {
+    assert!(
+        output.status.success(),
+        "management status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, b"");
+    let mut status: ManagementClusterStatusInfo =
+        serde_json::from_slice(&output.stdout).expect("management status JSON");
+    assert_eq!(
+        String::from_utf8(output.stdout.clone()).unwrap(),
+        format!("{}\n", serde_json::to_string_pretty(&status).unwrap())
+    );
+    assert!(status.observed_at.ends_with('Z'));
+    assert!(status.nodes.iter().all(|node| node.registered_at_ms > 0));
+    let source_version = status.source_version.clone();
+    for node in &mut nodes {
+        node.source_version = source_version.clone();
+    }
+    status.observed_at = "<timestamp>".to_owned();
+    for node in &mut status.nodes {
+        node.registered_at_ms = 0;
+    }
+    assert_eq!(
+        status,
+        ManagementClusterStatusInfo {
+            observed_at: "<timestamp>".to_owned(),
+            source_version,
+            state: state.to_owned(),
+            nodes,
+            active_operations: 0,
+            retained_operations: 0,
+            request_fill: 1,
+        }
+    );
+    status
+}
+
+async fn wait_for_management_status_nodes(management_addr: &str, expected_nodes: usize) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = String::new();
+    while Instant::now() < deadline {
+        let output = management_status_json(management_addr);
+        if output.status.success() {
+            let status: ManagementClusterStatusInfo =
+                serde_json::from_slice(&output.stdout).expect("management status JSON");
+            if status.nodes.len() == expected_nodes {
+                return output;
+            }
+        } else {
+            last_error = String::from_utf8_lossy(&output.stderr).into_owned();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("management status never reported {expected_nodes} nodes: {last_error}");
+}
+
+fn topology_revision(status: &ManagementClusterStatusInfo) -> u64 {
+    status
+        .source_version
+        .strip_prefix("topology:")
+        .expect("topology source version")
+        .parse()
+        .expect("numeric topology revision")
+}
+
+struct ManagementProcesses {
+    control: Child,
+    workers: Vec<Child>,
+}
+
+impl Drop for ManagementProcesses {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            let _ = worker.kill();
+            let _ = worker.wait();
+        }
+        let _ = self.control.kill();
+        let _ = self.control.wait();
+    }
 }
 
 async fn wait_for_registered_workers(audit_path: &std::path::Path, expected: usize) {
@@ -450,4 +553,116 @@ async fn real_workers_execute_aggregate_join_and_fenced_failover() {
     run_cluster(1, false).await;
     run_cluster(2, true).await;
     run_cluster(4, false).await;
+}
+
+#[tokio::test]
+async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_transcript() {
+    let root = tempfile::tempdir().unwrap();
+    let control_addr = free_addr();
+    let mut management_addr = free_addr();
+    while management_addr == control_addr {
+        management_addr = free_addr();
+    }
+    let control_storage = root.path().join("management-control");
+    let control = spawn(&[
+        "start",
+        "--storage",
+        control_storage.to_str().unwrap(),
+        "--role",
+        "control",
+        "--control-bind",
+        &control_addr,
+        "--management-addr",
+        &management_addr,
+        "--daemon",
+    ]);
+    let mut processes = ManagementProcesses {
+        control,
+        workers: Vec::new(),
+    };
+
+    let empty_output = wait_for_management_status_nodes(&management_addr, 0).await;
+    let empty = assert_management_status_transcript(&empty_output, "unknown", vec![]);
+    let empty_revision = topology_revision(&empty);
+
+    for (worker_id, host_id, zone) in [
+        (501_u64, "multi-host-a", "multi-zone-a"),
+        (502_u64, "multi-host-b", "multi-zone-b"),
+    ] {
+        let storage = root.path().join(format!("management-worker-{worker_id}"));
+        let id = worker_id.to_string();
+        processes.workers.push(spawn(&[
+            "start",
+            "--storage",
+            storage.to_str().unwrap(),
+            "--role",
+            "worker",
+            "--control",
+            &control_addr,
+            "--worker-id",
+            &id,
+            "--host-id",
+            host_id,
+            "--availability-zone",
+            zone,
+        ]));
+    }
+    wait_for_registered_workers(&control_storage.join("audit.jsonl"), 2).await;
+
+    let two_workers_output = wait_for_management_status_nodes(&management_addr, 2).await;
+    let two_workers = assert_management_status_transcript(
+        &two_workers_output,
+        "healthy",
+        vec![
+            ManagementNodeInfo {
+                node_id: 501,
+                role: "worker".to_owned(),
+                address: "127.0.0.1:0".to_owned(),
+                state: "active".to_owned(),
+                capacity_headroom: 1.0,
+                host_id: "multi-host-a".to_owned(),
+                availability_zone: "multi-zone-a".to_owned(),
+                healthy: true,
+                lifecycle_state: "active".to_owned(),
+                registered_at_ms: 0,
+                source_version: String::new(),
+            },
+            ManagementNodeInfo {
+                node_id: 502,
+                role: "worker".to_owned(),
+                address: "127.0.0.1:0".to_owned(),
+                state: "active".to_owned(),
+                capacity_headroom: 1.0,
+                host_id: "multi-host-b".to_owned(),
+                availability_zone: "multi-zone-b".to_owned(),
+                healthy: true,
+                lifecycle_state: "active".to_owned(),
+                registered_at_ms: 0,
+                source_version: String::new(),
+            },
+        ],
+    );
+    assert!(topology_revision(&two_workers) > empty_revision);
+
+    processes.workers[0].kill().unwrap();
+    processes.workers[0].wait().unwrap();
+    let one_worker_output = wait_for_management_status_nodes(&management_addr, 1).await;
+    let one_worker = assert_management_status_transcript(
+        &one_worker_output,
+        "healthy",
+        vec![ManagementNodeInfo {
+            node_id: 502,
+            role: "worker".to_owned(),
+            address: "127.0.0.1:0".to_owned(),
+            state: "active".to_owned(),
+            capacity_headroom: 1.0,
+            host_id: "multi-host-b".to_owned(),
+            availability_zone: "multi-zone-b".to_owned(),
+            healthy: true,
+            lifecycle_state: "active".to_owned(),
+            registered_at_ms: 0,
+            source_version: String::new(),
+        }],
+    );
+    assert!(topology_revision(&one_worker) > topology_revision(&two_workers));
 }
