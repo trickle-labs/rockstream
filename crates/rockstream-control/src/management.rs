@@ -18,7 +18,10 @@ use crate::management_store::{
     ManagementOperationStore, OperationRecord, OperationStatus, OperationStoreError,
     MAX_OPERATION_PAGE_SIZE,
 };
-use crate::service::{ManagementBackupRuntime, ManagementDrainRuntime, ManagementMigrationRuntime};
+use crate::service::{
+    ManagementAckWaiters, ManagementBackupRuntime, ManagementDrainRuntime,
+    ManagementMigrationRuntime, MAX_MANAGEMENT_ACK_WAITERS,
+};
 use crate::shard::ShardManager;
 use crate::topology::TopologyCatalog;
 
@@ -51,6 +54,8 @@ pub struct ManagementService {
     drain_runtime: Option<ManagementDrainRuntime>,
     migration_runtime: Option<ManagementMigrationRuntime>,
     backup_runtime: Option<ManagementBackupRuntime>,
+    migration_waiters: Option<ManagementAckWaiters>,
+    backup_waiters: Option<ManagementAckWaiters>,
     request_gate: Arc<Semaphore>,
 }
 
@@ -69,6 +74,8 @@ impl ManagementService {
             drain_runtime: None,
             migration_runtime: None,
             backup_runtime: None,
+            migration_waiters: None,
+            backup_waiters: None,
             request_gate: Arc::new(Semaphore::new(MAX_MANAGEMENT_REQUESTS)),
         }
     }
@@ -79,11 +86,13 @@ impl ManagementService {
     }
 
     pub(crate) fn with_migration_runtime(mut self, runtime: ManagementMigrationRuntime) -> Self {
+        self.migration_waiters = Some(runtime.waiters.clone());
         self.migration_runtime = Some(runtime);
         self
     }
 
     pub(crate) fn with_backup_runtime(mut self, runtime: ManagementBackupRuntime) -> Self {
+        self.backup_waiters = Some(runtime.waiters.clone());
         self.backup_runtime = Some(runtime);
         self
     }
@@ -412,6 +421,15 @@ impl v1::management_service_server::ManagementService for ManagementService {
         nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let (active_operations, retained_operations) =
             self.operations.counts().await.map_err(store_error)?;
+        let mut ack_waiter_fill = 0u32;
+        let mut ack_waiter_capacity = 0u32;
+        for waiters in [&self.migration_waiters, &self.backup_waiters]
+            .into_iter()
+            .flatten()
+        {
+            ack_waiter_fill += waiters.lock().await.len() as u32;
+            ack_waiter_capacity += MAX_MANAGEMENT_ACK_WAITERS as u32;
+        }
         let state = if self.catalog.healthy_workers().is_empty() {
             "unknown"
         } else if self
@@ -433,6 +451,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
             active_operations: active_operations as u32,
             retained_operations: retained_operations as u32,
             request_fill: (MAX_MANAGEMENT_REQUESTS - self.request_gate.available_permits()) as u32,
+            request_capacity: MAX_MANAGEMENT_REQUESTS as u32,
+            ack_waiter_fill,
+            ack_waiter_capacity,
         }))
     }
 
@@ -876,5 +897,81 @@ impl v1::management_service_server::ManagementService for ManagementService {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             operation: Some(Self::operation(record)),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use rockstream_types::topology::WorkerMessage;
+
+    async fn cluster_status(
+        service: &ManagementService,
+    ) -> Result<v1::GetClusterStatusResponse, Status> {
+        <ManagementService as v1::management_service_server::ManagementService>::get_cluster_status(
+            service,
+            Request::new(v1::GetClusterStatusRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            }),
+        )
+        .await
+        .map(Response::into_inner)
+    }
+
+    #[tokio::test]
+    async fn cluster_status_reports_request_and_ack_waiter_fill_and_recovery() {
+        let mut service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
+            NodeConfig::default(),
+        );
+        let migration_waiters: ManagementAckWaiters =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let backup_waiters: ManagementAckWaiters =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        service.migration_waiters = Some(migration_waiters.clone());
+        service.backup_waiters = Some(backup_waiters.clone());
+        let (migration_sender, _migration_receiver) =
+            tokio::sync::oneshot::channel::<WorkerMessage>();
+        let (backup_sender, _backup_receiver) = tokio::sync::oneshot::channel::<WorkerMessage>();
+        migration_waiters
+            .lock()
+            .await
+            .insert("migration".to_owned(), migration_sender);
+        backup_waiters
+            .lock()
+            .await
+            .insert("backup".to_owned(), backup_sender);
+
+        let full = cluster_status(&service).await.unwrap();
+        assert_eq!(full.request_fill, 1);
+        assert_eq!(full.request_capacity, 64);
+        assert_eq!(full.ack_waiter_fill, 2);
+        assert_eq!(full.ack_waiter_capacity, 128);
+
+        migration_waiters.lock().await.remove("migration");
+        backup_waiters.lock().await.remove("backup");
+        let recovered = cluster_status(&service).await.unwrap();
+        assert_eq!(recovered.ack_waiter_fill, 0);
+        assert_eq!(recovered.ack_waiter_capacity, 128);
+
+        let mut permits = (0..MAX_MANAGEMENT_REQUESTS)
+            .map(|_| service.request_gate.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let saturated = cluster_status(&service).await.unwrap_err();
+        assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            saturated.message(),
+            "management request limit of 64 reached"
+        );
+        permits.pop();
+        let after_release = cluster_status(&service).await.unwrap();
+        assert_eq!(after_release.request_fill, 64);
+        assert_eq!(after_release.request_capacity, 64);
+        drop(permits);
+        let after_recovery = cluster_status(&service).await.unwrap();
+        assert_eq!(after_recovery.request_fill, 1);
     }
 }

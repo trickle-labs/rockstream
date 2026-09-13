@@ -607,6 +607,9 @@ pub struct ManagementClusterStatusInfo {
     pub active_operations: u32,
     pub retained_operations: u32,
     pub request_fill: u32,
+    pub request_capacity: u32,
+    pub ack_waiter_fill: u32,
+    pub ack_waiter_capacity: u32,
 }
 
 impl Formattable for ManagementClusterStatusInfo {
@@ -619,7 +622,14 @@ impl Formattable for ManagementClusterStatusInfo {
                 "Operations: {} active, {} retained",
                 self.active_operations, self.retained_operations
             ),
-            format!("Request Fill: {}", self.request_fill),
+            format!(
+                "Request Fill: {} / {}",
+                self.request_fill, self.request_capacity
+            ),
+            format!(
+                "ACK Waiters: {} / {}",
+                self.ack_waiter_fill, self.ack_waiter_capacity
+            ),
             format!("Nodes: {}", self.nodes.len()),
         ];
         for node in &self.nodes {

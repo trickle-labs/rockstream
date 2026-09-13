@@ -96,6 +96,9 @@ fn assert_management_status_transcript(
             active_operations: 0,
             retained_operations: 0,
             request_fill: 1,
+            request_capacity: 64,
+            ack_waiter_fill: 0,
+            ack_waiter_capacity: 64,
         }
     );
     status

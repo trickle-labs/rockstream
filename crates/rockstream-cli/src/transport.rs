@@ -333,6 +333,9 @@ impl ManagementCliClient {
             active_operations: response.active_operations,
             retained_operations: response.retained_operations,
             request_fill: response.request_fill,
+            request_capacity: response.request_capacity,
+            ack_waiter_fill: response.ack_waiter_fill,
+            ack_waiter_capacity: response.ack_waiter_capacity,
         })
     }
 

@@ -4,7 +4,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use rockstream_cli::output::{
-    ManagementClusterStatusInfo, ManagementNodeInfo, ManagementOperationInfo,
+    ManagementCapabilitiesInfo, ManagementClusterStatusInfo, ManagementConfigSummaryInfo,
+    ManagementHealthInfo, ManagementNodeDetailInfo, ManagementNodeInfo, ManagementNodesInfo,
+    ManagementOperationInfo, ManagementOperationsInfo, ManagementShardDetailInfo,
+    ManagementShardsInfo,
 };
 use rockstream_control::{CheckpointExportOutcome, CheckpointExportService};
 use rockstream_management_proto::v1::{
@@ -156,6 +159,54 @@ fn run_json_status(binary: &Path, management: SocketAddr) -> Output {
         ])
         .output()
         .expect("run management cluster status")
+}
+
+fn run_documented_management_examples(
+    binary: &Path,
+    management: SocketAddr,
+    operation_id: &str,
+) -> Vec<Output> {
+    let docs = include_str!("../../../docs/reference/management-api.md");
+    let examples = docs
+        .split_once("## CLI examples\n")
+        .expect("management API CLI examples section")
+        .1
+        .split_once("```sh\n")
+        .expect("management API shell example")
+        .1
+        .split_once("\n```")
+        .expect("closed management API shell example")
+        .0;
+    examples
+        .lines()
+        .filter(|line| line.starts_with("rockstream "))
+        .map(|line| {
+            let args = line
+                .split_whitespace()
+                .skip(1)
+                .map(|argument| match argument {
+                    "127.0.0.1:9201" => management.to_string(),
+                    "<operation-id>" => operation_id.to_owned(),
+                    other => other.to_owned(),
+                })
+                .collect::<Vec<_>>();
+            let output = Command::new(binary)
+                .env("RUST_LOG", "off")
+                .args(args)
+                .output()
+                .expect("run documented management CLI command");
+            assert!(
+                output.status.success(),
+                "documented management command failed: {line}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.stderr, b"",
+                "documented command wrote to stderr: {line}"
+            );
+            output
+        })
+        .collect()
 }
 
 fn management_operation(operation: WireOperation) -> ManagementOperationInfo {
@@ -317,8 +368,25 @@ fn assert_status_transcript(output: &Output, retained_operations: u32) {
             active_operations: 0,
             retained_operations,
             request_fill: 1,
+            request_capacity: 64,
+            ack_waiter_fill: 0,
+            ack_waiter_capacity: 128,
         }
     );
+}
+
+fn deserialize_exact_json<T>(output: &Output) -> T
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let transcript = String::from_utf8(output.stdout.clone()).expect("CLI JSON is UTF-8");
+    let response = serde_json::from_slice::<T>(&output.stdout).expect("management CLI JSON");
+    assert_eq!(
+        transcript,
+        format!("{}\n", serde_json::to_string_pretty(&response).unwrap()),
+        "stdout must contain the complete pretty-printed JSON transcript"
+    );
+    response
 }
 
 async fn wait_for_backup_success(
@@ -435,6 +503,69 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
 
     let terminal = wait_for_backup_success(binary, management_addr, &operation_id).await;
     assert_eq!(terminal.state, "succeeded");
+
+    let documented = run_documented_management_examples(binary, management_addr, &operation_id);
+    assert_eq!(documented.len(), 10);
+    assert_status_transcript(&documented[0], 1);
+    let status: ManagementClusterStatusInfo = deserialize_exact_json(&documented[0]);
+    let health: ManagementHealthInfo = deserialize_exact_json(&documented[1]);
+    assert_eq!(health.state, "unknown");
+    assert_eq!(
+        health.reason,
+        "authoritative process health telemetry is not registered"
+    );
+    assert_eq!(health.source_version, status.source_version);
+    assert!(timestamp_is_utc_millis(&health.observed_at));
+
+    let capabilities: ManagementCapabilitiesInfo = deserialize_exact_json(&documented[2]);
+    assert_eq!(capabilities.source_version, "management-service:v1");
+    assert_eq!(
+        capabilities.capabilities,
+        [
+            "GetClusterStatus",
+            "ListNodes",
+            "GetNode",
+            "ListShards",
+            "GetShard",
+            "ListOperations",
+            "GetOperation",
+            "GetConfigSummary",
+            "GetCapabilities",
+            "GetHealth",
+            "DrainWorker",
+            "CancelOperation",
+            "MigrateShard",
+            "CreateBackup",
+        ]
+    );
+
+    let nodes: ManagementNodesInfo = deserialize_exact_json(&documented[3]);
+    let node_detail: ManagementNodeDetailInfo = deserialize_exact_json(&documented[4]);
+    assert_eq!(nodes.source_version, status.source_version);
+    assert_eq!(node_detail.source_version, nodes.source_version);
+    assert_eq!(nodes.nodes, [node_detail.node]);
+
+    let shards: ManagementShardsInfo = deserialize_exact_json(&documented[5]);
+    let shard: ManagementShardDetailInfo = deserialize_exact_json(&documented[6]);
+    assert_eq!(shards.shards, [shard.shard]);
+    assert_eq!(shards.shards[0].shard_id, 0);
+    assert_eq!(shards.shards[0].owner_node_id, 1);
+    assert_eq!(shards.shards[0].state, "leased");
+    assert!(shards.shards[0].lease_token > 0);
+    assert_eq!(shards.shards[0].key_range, None);
+
+    let config: ManagementConfigSummaryInfo = deserialize_exact_json(&documented[7]);
+    assert_eq!(config.source_version, "effective-node-config:v0.62");
+    assert!(!config.values.is_empty());
+    assert!(config.values.iter().all(|value| !value.key.is_empty()));
+
+    let operations: ManagementOperationsInfo = deserialize_exact_json(&documented[8]);
+    let shown_operation: ManagementOperationInfo = deserialize_exact_json(&documented[9]);
+    assert_eq!(
+        operations.operations.as_slice(),
+        std::slice::from_ref(&terminal)
+    );
+    assert_eq!(shown_operation, terminal);
 
     let generation = format!("management-{operation_id}");
     let destination_store = build_migration_object_store(destination.to_str().unwrap())

@@ -58,6 +58,25 @@ use crate::topology::{TopologyCatalog, TopologyPersistentStore};
 const DEFAULT_DRAIN_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_DECOMMISSION_GRACE_MS: u64 = 5_000;
 const MAX_DRAIN_QUEUE: usize = 1024;
+pub(crate) const MAX_MANAGEMENT_ACK_WAITERS: usize = 64;
+
+pub(crate) type ManagementAckWaiters =
+    Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>;
+
+fn try_insert_management_ack_waiter(
+    waiters: &mut HashMap<String, oneshot::Sender<WorkerMessage>>,
+    key: String,
+    sender: oneshot::Sender<WorkerMessage>,
+) -> Result<(), &'static str> {
+    if waiters.contains_key(&key) {
+        return Err("management ACK waiter key already exists");
+    }
+    if waiters.len() >= MAX_MANAGEMENT_ACK_WAITERS {
+        return Err("management ACK waiter capacity 64 reached");
+    }
+    waiters.insert(key, sender);
+    Ok(())
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -438,9 +457,11 @@ impl ControlService {
                 shard_manager: self.shard_manager.clone(),
                 data_plane: self.data_plane.clone(),
                 audit: self.audit.clone(),
+                shard_store: self.shard_store.clone(),
                 topology_store: self.topology_store.clone(),
                 drain_state: self.drain_state.clone(),
                 worker_senders: self.worker_senders.clone(),
+                migration_waiters: migration_waiters.clone(),
                 operations: operations.clone(),
                 started: Arc::new(AsyncMutex::new(HashSet::new())),
             };
@@ -656,9 +677,11 @@ pub(crate) struct ManagementDrainRuntime {
     shard_manager: ShardManager,
     data_plane: Arc<AsyncMutex<DataPlaneState>>,
     audit: Option<Arc<FileAuditLog>>,
+    shard_store: Option<Arc<ShardPersistentStore>>,
     topology_store: Option<Arc<TopologyPersistentStore>>,
     drain_state: Arc<AsyncMutex<DrainState>>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    migration_waiters: ManagementAckWaiters,
     operations: ManagementOperationStore,
     started: Arc<AsyncMutex<HashSet<String>>>,
 }
@@ -775,6 +798,28 @@ impl ManagementDrainRuntime {
         .await
         {
             Ok((state, queue_fill, queue_capacity, request)) => {
+                if self
+                    .drain_state
+                    .lock()
+                    .await
+                    .acked_workers
+                    .contains(&worker_id)
+                {
+                    process_drain_queue(
+                        &self.catalog,
+                        &self.shard_manager,
+                        self.audit.as_ref(),
+                        self.shard_store.as_ref(),
+                        self.topology_store.as_ref(),
+                        &self.drain_state,
+                        &self.worker_senders,
+                        worker_id,
+                        &self.migration_waiters,
+                        Some(&self.operations),
+                    )
+                    .await;
+                    return;
+                }
                 send_message(&worker_sender, &ControlMessage::BeginDrain(request)).await;
                 send_message(
                     &worker_sender,
@@ -869,7 +914,7 @@ pub(crate) struct ManagementMigrationRuntime {
     data_plane: Arc<AsyncMutex<DataPlaneState>>,
     shard_store: Option<Arc<ShardPersistentStore>>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
-    waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
+    pub(crate) waiters: ManagementAckWaiters,
     operations: ManagementOperationStore,
     started: Arc<AsyncMutex<HashSet<String>>>,
 }
@@ -1164,7 +1209,10 @@ impl ManagementMigrationRuntime {
         {
             if self.operation_cancelled(operation_id).await {
                 self.reopen_donor(operation_id, &lease).await;
-            } else if error.contains("connection closed") || error.contains("timed out") {
+            } else if error.contains("connection closed")
+                || error.contains("timed out")
+                || error.contains("capacity")
+            {
                 self.wait(operation_id, &error).await;
             } else {
                 self.fail(operation_id, "RS-3610", &error).await;
@@ -1271,7 +1319,10 @@ impl ManagementMigrationRuntime {
         {
             self.rollback(operation_id, &lease, &new_lease).await;
             let message = format!("target failed to open shard; transfer rolled back: {error}");
-            if error.contains("connection closed") || error.contains("timed out") {
+            if error.contains("connection closed")
+                || error.contains("timed out")
+                || error.contains("capacity")
+            {
                 self.wait(operation_id, &message).await;
             } else {
                 self.fail(operation_id, "RS-3610", &message).await;
@@ -1308,7 +1359,7 @@ impl ManagementMigrationRuntime {
     ) -> Result<(), String> {
         let key = format!("{operation_id}:{stage}");
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().await.insert(key.clone(), tx);
+        try_insert_management_ack_waiter(&mut *self.waiters.lock().await, key.clone(), tx)?;
         send_message(sender, &message).await;
         let result = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(WorkerMessage::ShardTransferAck {
@@ -1470,7 +1521,7 @@ pub(crate) struct ManagementBackupRuntime {
     shard_manager: ShardManager,
     data_plane: Arc<AsyncMutex<DataPlaneState>>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
-    waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
+    pub(crate) waiters: ManagementAckWaiters,
     operations: ManagementOperationStore,
     source: Arc<dyn object_store::ObjectStore>,
     source_store_id: Option<[u8; 32]>,
@@ -1723,7 +1774,13 @@ impl ManagementBackupRuntime {
             };
             let request_id = format!("{operation_id}:{}:{}", checkpoint_id.0, lease.shard_id.0);
             let (tx, rx) = oneshot::channel();
-            self.waiters.lock().await.insert(request_id.clone(), tx);
+            if let Err(error) = try_insert_management_ack_waiter(
+                &mut *self.waiters.lock().await,
+                request_id.clone(),
+                tx,
+            ) {
+                return Err(BackupFailure::Waiting(error.to_owned()));
+            }
             if sender
                 .send(ControlMessage::CreateShardCheckpoint {
                     request_id: request_id.clone(),
@@ -2092,9 +2149,29 @@ async fn request_worker_drain(
             "Run `rockstream cluster status` to confirm the worker id, then retry the drain request.",
         ));
     };
+    if let WorkerLifecycleState::Draining { started_at_ms, .. } = &worker.lifecycle {
+        let guard = drain_state.lock().await;
+        let resumes_this_operation = operation_id.as_ref().is_some_and(|operation_id| {
+            guard
+                .operation_ids
+                .get(&worker_id)
+                .is_some_and(|operation_ids| operation_ids.iter().any(|id| id == operation_id))
+        });
+        if resumes_this_operation {
+            return Ok((
+                worker.lifecycle.clone(),
+                guard.queue.len() as u32,
+                MAX_DRAIN_QUEUE as u32,
+                DrainRequest {
+                    worker_id,
+                    deadline_ms: started_at_ms.saturating_add(DEFAULT_DRAIN_DEADLINE_MS),
+                },
+            ));
+        }
+    }
     if matches!(
         worker.lifecycle,
-        WorkerLifecycleState::Draining { .. } | WorkerLifecycleState::Decommissioned { .. }
+        WorkerLifecycleState::Decommissioned { .. }
     ) {
         return Err(DrainFailure::new(
             RS_3604,
@@ -2293,9 +2370,27 @@ async fn process_drain_queue(
             retry.push(task);
             continue;
         };
+        let acknowledgement_id = operation_id
+            .as_ref()
+            .map(|operation_id| format!("{operation_id}:shard:{}", task.shard_id.0))
+            .unwrap_or_else(|| {
+                format!(
+                    "drain:{}:{}:{}",
+                    donor_worker_id.0, task.shard_id.0, current_lease.lease_token.0
+                )
+            });
+        let key = format!("{acknowledgement_id}:recipient");
+        let (tx, rx) = oneshot::channel();
+        if try_insert_management_ack_waiter(&mut *migration_waiters.lock().await, key.clone(), tx)
+            .is_err()
+        {
+            retry.push(task);
+            continue;
+        }
         let lease = if current_lease.worker_id == task.donor_worker_id {
             let (lease, evicted) = shard_manager.force_acquire(task.shard_id, recipient.worker_id);
             if evicted != Some(task.donor_worker_id) {
+                migration_waiters.lock().await.remove(&key);
                 retry.push(task);
                 continue;
             }
@@ -2306,15 +2401,6 @@ async fn process_drain_queue(
         } else {
             current_lease
         };
-        let acknowledgement_id = operation_id
-            .as_ref()
-            .map(|operation_id| format!("{operation_id}:shard:{}", task.shard_id.0))
-            .unwrap_or_else(|| {
-                format!(
-                    "drain:{}:{}:{}",
-                    donor_worker_id.0, task.shard_id.0, lease.lease_token.0
-                )
-            });
         if donor_sender
             .send(ControlMessage::ShardRevoked {
                 shard_id: task.shard_id,
@@ -2323,12 +2409,10 @@ async fn process_drain_queue(
             .await
             .is_err()
         {
+            migration_waiters.lock().await.remove(&key);
             retry.push(task);
             continue;
         }
-        let key = format!("{acknowledgement_id}:recipient");
-        let (tx, rx) = oneshot::channel();
-        migration_waiters.lock().await.insert(key.clone(), tx);
         if recipient_sender
             .send(ControlMessage::ShardAssigned {
                 lease: lease.clone(),
@@ -2381,7 +2465,7 @@ async fn process_drain_queue(
         .into_iter()
         .filter(|lease| lease.worker_id == donor_worker_id)
         .count();
-    let (completed, operation_ids) = {
+    let (completed, pending, operation_ids) = {
         let mut drain_state = drain_state.lock().await;
         drain_state.queue.extend(retry);
         drain_state.processing_workers.remove(&donor_worker_id);
@@ -2396,10 +2480,16 @@ async fn process_drain_queue(
                 .operation_ids
                 .remove(&donor_worker_id)
                 .unwrap_or_default()
+        } else if pending {
+            drain_state
+                .operation_ids
+                .get(&donor_worker_id)
+                .cloned()
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
-        (completed, operation_ids)
+        (completed, pending, operation_ids)
     };
     if completed {
         if let Some(updated) = catalog.set_lifecycle(
@@ -2436,6 +2526,37 @@ async fn process_drain_queue(
                     .await
                 {
                     tracing::error!(%operation_id, %error, "drain completed but operation record update failed");
+                }
+            }
+        }
+    } else if pending {
+        if let Some(operations) = operation_store {
+            for operation_id in operation_ids {
+                let Ok(Some(record)) = operations.get(&operation_id).await else {
+                    continue;
+                };
+                if record.status() != OperationStatus::Running {
+                    continue;
+                }
+                if let Err(error) = operations
+                    .transition_if(
+                        &operation_id,
+                        OperationStatus::Running,
+                        record.phase(),
+                        OperationUpdate {
+                            status: OperationStatus::Waiting,
+                            updated_at_ms: now_ms() as i64,
+                            progress: record.progress(),
+                            phase: record.phase().map(str::to_owned),
+                            error_code: Some(RS_3610.to_string()),
+                            next_steps: vec![
+                                "A recipient ACK was missing or rejected; management will retry after reconciliation.".to_owned(),
+                            ],
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!(%operation_id, %error, "drain retry state could not be persisted");
                 }
             }
         }
@@ -3512,6 +3633,38 @@ mod tests {
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
+
+    #[test]
+    fn management_ack_waiters_reject_overflow_without_replacing_entries() {
+        let mut waiters = HashMap::new();
+        for index in 0..MAX_MANAGEMENT_ACK_WAITERS {
+            let (sender, _receiver) = oneshot::channel();
+            try_insert_management_ack_waiter(&mut waiters, format!("op-{index}"), sender).unwrap();
+        }
+        assert_eq!(waiters.len(), 64);
+
+        let (overflow_sender, _overflow_receiver) = oneshot::channel();
+        assert_eq!(
+            try_insert_management_ack_waiter(&mut waiters, "overflow".to_owned(), overflow_sender),
+            Err("management ACK waiter capacity 64 reached")
+        );
+        assert_eq!(waiters.len(), 64);
+        assert!(!waiters.contains_key("overflow"));
+
+        let (duplicate_sender, _duplicate_receiver) = oneshot::channel();
+        assert_eq!(
+            try_insert_management_ack_waiter(&mut waiters, "op-0".to_owned(), duplicate_sender),
+            Err("management ACK waiter key already exists")
+        );
+        assert_eq!(waiters.len(), 64);
+
+        waiters.remove("op-0");
+        let (recovered_sender, _recovered_receiver) = oneshot::channel();
+        try_insert_management_ack_waiter(&mut waiters, "recovered".to_owned(), recovered_sender)
+            .unwrap();
+        assert_eq!(waiters.len(), 64);
+        assert!(waiters.contains_key("recovered"));
+    }
 
     async fn start_test_service() -> (ControlServiceHandle, TopologyCatalog) {
         let catalog = TopologyCatalog::new();

@@ -16,7 +16,7 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 
 | Method | Behavior |
 |---|---|
-| `GetClusterStatus` | Returns the observed cluster state, node snapshot, operation counts, and management request fill. |
+| `GetClusterStatus` | Returns the observed cluster state, node snapshot, operation counts, management request fill, and ACK waiter fill. |
 | `ListNodes` | Returns a page of registered nodes. |
 | `GetNode` | Returns one registered node or `NOT_FOUND`. |
 | `ListShards` | Returns a page of current shard leases. |
@@ -33,6 +33,25 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 
 The control service attaches drain and migration executors. It attaches the backup executor only when it can read the authoritative shard store. Embedded `--role all` supports one local worker. Multi-worker backups require every shard owner to use the same configured shared object store.
 
+The CLI sends `admin backup create` to `CreateBackup` only when you pass `--management`. Without that flag, it writes the legacy local manifest used by `admin backup inspect` and `admin backup verify`.
+
+## CLI examples
+
+These commands target a local management endpoint. Replace `<operation-id>` with an ID returned by an operation command.
+
+```sh
+rockstream --output json --management 127.0.0.1:9201 status
+rockstream --output json --management 127.0.0.1:9201 health
+rockstream --output json --management 127.0.0.1:9201 capabilities
+rockstream --output json --management 127.0.0.1:9201 cluster workers list
+rockstream --output json --management 127.0.0.1:9201 cluster workers status 1
+rockstream --output json --management 127.0.0.1:9201 shard list
+rockstream --output json --management 127.0.0.1:9201 shard show 0
+rockstream --output json --management 127.0.0.1:9201 config summary
+rockstream --output json --management 127.0.0.1:9201 admin operation list
+rockstream --output json --management 127.0.0.1:9201 admin operation show <operation-id>
+```
+
 `CreateBackup` accepts a local path, a `file://` path, or an `s3://bucket/prefix` destination. It requires an idle cluster with no active workload deployments or source writes. The operation record stores the destination and checkpoint phase. The server stores its checkpoint manifest in the source store and writes the export under `checkpoint-exports/management-<operation_id>`. A missing worker or temporary storage error leaves the operation waiting. An invalid destination or checkpoint integrity error leaves it failed.
 
 The management backup format is a committed checkpoint generation with inventory records and a terminal `commit` marker. It is separate from the local `manifest.json` format used by the legacy `admin backup inspect` and `admin backup verify` commands.
@@ -42,6 +61,8 @@ A successful `DrainWorker` result requires a matching recipient-open acknowledge
 ## Response fields
 
 `observed_at` uses RFC 3339 UTC. `source_version` identifies the state source or record version. Compound status fields do not share a transactional snapshot across the catalog and lease store.
+
+`request_fill` and `request_capacity` report the management request semaphore. `ack_waiter_fill` and `ack_waiter_capacity` report registered migration and backup worker acknowledgements. Each executor admits at most 64 ACK waiters. The reported ACK waiter capacity is 64 for each attached executor.
 
 `Node` includes its registered address, role, capacity headroom, host and zone, health, registration time, and lifecycle state. Missing process-health telemetry remains `unknown`.
 
@@ -55,7 +76,7 @@ A successful `DrainWorker` result requires a matching recipient-open acknowledge
 
 `page_size=0` selects the default of 50. The maximum page size is 100. Page tokens are decimal offsets; malformed or out-of-range tokens return `INVALID_ARGUMENT`.
 
-The server admits at most 64 concurrent management requests. It limits gRPC messages to 1 MiB. The operation store retains at most 1,000 active records and 10,000 total records. Terminal records remain for seven days. Idempotency keys remain bound for 24 hours. Each operation accepts at most 64 state transitions.
+The server admits at most 64 concurrent management requests and 64 ACK waiters for each attached migration or backup executor. It limits gRPC messages to 1 MiB. The operation store retains at most 1,000 active records and 10,000 total records. Terminal records remain for seven days. Idempotency keys remain bound for 24 hours. Each operation accepts at most 64 state transitions.
 
 ## Idempotency and cancellation
 
