@@ -81,7 +81,7 @@ async fn test_manifest_invariant_under_fault_injection() {
 
         // 3. Invariants on manifest metadata
         assert_eq!(m1.manifest_metadata.schema_version, "1.0.0");
-        assert_eq!(m1.manifest_metadata.engine_version, "0.59.13");
+        assert_eq!(m1.manifest_metadata.engine_version, "0.59.20");
         assert_eq!(m1.manifest_metadata.generator_version, "1.0.0");
         assert!(!m1.manifest_metadata.candidate_identity_digest.is_empty());
     }

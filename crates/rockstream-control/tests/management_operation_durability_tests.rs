@@ -35,6 +35,19 @@ fn exact_record(record: &OperationRecord) -> Value {
     serde_json::to_value(record).unwrap()
 }
 
+async fn seed_operation(store: &dyn ObjectStore, record: &OperationRecord) {
+    store
+        .put(
+            &Path::from(format!(
+                "control/management-operations/{}.json",
+                hex::encode(record.operation_id().as_bytes())
+            )),
+            serde_json::to_vec(record).unwrap().into(),
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn management_operation_store_upgrades_v1_records_without_request_payloads() {
     let backing = Arc::new(InMemory::new());
@@ -601,6 +614,154 @@ async fn management_operation_list_pages_exact_records_and_rejects_invalid_token
         store.list(101, "").await,
         Err(OperationStoreError::InvalidPageSize)
     ));
+}
+
+#[tokio::test]
+async fn operation_store_rejects_active_limit_with_exact_records() {
+    let backing = Arc::new(InMemory::new());
+    for index in 0..1_000 {
+        let record = OperationRecord::accepted(
+            format!("active_{index:04}"),
+            OperationKind::CreateBackup,
+            1_000,
+        );
+        seed_operation(backing.as_ref(), &record).await;
+    }
+    let store = ManagementOperationStore::new(backing);
+
+    assert_eq!(store.counts().await.unwrap(), (1_000, 1_000));
+    assert_eq!(
+        exact_record(&store.get("active_0000").await.unwrap().unwrap()),
+        json!({
+            "record_version": 2,
+            "operation_id": "active_0000",
+            "kind": "create_backup",
+            "status": "pending",
+            "started_at": 1000,
+            "updated_at": 1000,
+            "progress": null,
+            "phase": null,
+            "error_code": null,
+            "next_steps": []
+        })
+    );
+    let error = store
+        .accept("active_overflow", OperationKind::CreateBackup, 2_000)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "active operation limit of 1000 reached");
+    assert_eq!(store.get("active_overflow").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn operation_store_rejects_retained_limit_with_exact_records() {
+    let backing = Arc::new(InMemory::new());
+    for index in 0..10_000 {
+        let mut record = OperationRecord::accepted(
+            format!("retained_{index:05}"),
+            OperationKind::CreateBackup,
+            1_000,
+        );
+        record
+            .apply_update(update(
+                OperationStatus::Running,
+                1_001,
+                Some(50),
+                Some("checkpointing"),
+                None,
+                &[],
+            ))
+            .unwrap();
+        record
+            .apply_update(update(
+                OperationStatus::Succeeded,
+                1_002,
+                Some(100),
+                Some("completed"),
+                None,
+                &[],
+            ))
+            .unwrap();
+        seed_operation(backing.as_ref(), &record).await;
+    }
+    let store = ManagementOperationStore::new(backing);
+
+    assert_eq!(store.counts().await.unwrap(), (0, 10_000));
+    assert_eq!(
+        exact_record(&store.get("retained_09999").await.unwrap().unwrap()),
+        json!({
+            "record_version": 2,
+            "operation_id": "retained_09999",
+            "kind": "create_backup",
+            "status": "succeeded",
+            "started_at": 1000,
+            "updated_at": 1002,
+            "progress": 100,
+            "phase": "completed",
+            "error_code": null,
+            "next_steps": []
+        })
+    );
+    let error = store
+        .accept("retained_overflow", OperationKind::CreateBackup, 2_000)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "retained operation limit of 10000 reached"
+    );
+    assert_eq!(store.get("retained_overflow").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn operation_store_cleans_expired_terminal_records_before_acceptance() {
+    let backing = Arc::new(InMemory::new());
+    let mut expired =
+        OperationRecord::accepted("expired_operation", OperationKind::CreateBackup, 1_000);
+    expired
+        .apply_update(update(
+            OperationStatus::Running,
+            1_001,
+            Some(50),
+            Some("checkpointing"),
+            None,
+            &[],
+        ))
+        .unwrap();
+    expired
+        .apply_update(update(
+            OperationStatus::Succeeded,
+            1_002,
+            Some(100),
+            Some("completed"),
+            None,
+            &[],
+        ))
+        .unwrap();
+    seed_operation(backing.as_ref(), &expired).await;
+    let store = ManagementOperationStore::new(backing);
+    let now = 7 * 24 * 60 * 60 * 1_000 + 1_003;
+    let accepted = store
+        .accept("after_cleanup", OperationKind::DrainWorker, now)
+        .await
+        .unwrap();
+
+    assert_eq!(store.get("expired_operation").await.unwrap(), None);
+    assert_eq!(
+        exact_record(&accepted),
+        json!({
+            "record_version": 2,
+            "operation_id": "after_cleanup",
+            "kind": "drain_worker",
+            "status": "pending",
+            "started_at": now,
+            "updated_at": now,
+            "progress": null,
+            "phase": null,
+            "error_code": null,
+            "next_steps": []
+        })
+    );
 }
 
 #[tokio::test]

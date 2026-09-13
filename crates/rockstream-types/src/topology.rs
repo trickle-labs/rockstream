@@ -319,6 +319,12 @@ pub enum ControlMessage {
         operation_id: String,
         lease: ShardLease,
     },
+    /// Create a durable SlateDB checkpoint for an idle shard.
+    CreateShardCheckpoint {
+        request_id: String,
+        checkpoint_id: crate::checkpoint::CheckpointId,
+        lease: ShardLease,
+    },
     /// The control plane has revoked a previously assigned shard lease.
     ///
     /// The worker must stop writing to `shard_id` immediately and discard
@@ -838,6 +844,17 @@ pub enum WorkerMessage {
         shard_id: ShardId,
         lease_token: crate::ids::LeaseToken,
         success: bool,
+        error: Option<String>,
+    },
+    /// Worker reports the exact durable SlateDB snapshot created for a shard.
+    ShardCheckpointAck {
+        request_id: String,
+        checkpoint_id: crate::checkpoint::CheckpointId,
+        worker_id: WorkerId,
+        shard_id: ShardId,
+        lease_token: crate::ids::LeaseToken,
+        shard_checkpoint_id: Option<u64>,
+        snapshot_id: Option<String>,
         error: Option<String>,
     },
     /// Worker reports its updated lifecycle state (v0.38).

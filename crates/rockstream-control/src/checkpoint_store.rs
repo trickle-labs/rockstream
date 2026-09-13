@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, PutMode, PutOptions};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
 use rockstream_types::error_code::RS_3022;
 use rockstream_types::ids::ShardId;
@@ -126,10 +126,30 @@ impl CheckpointManifestStore {
         audit: Option<&FileAuditLog>,
     ) -> Result<(), String> {
         let payload = encode_manifest(manifest, codec_capability_floor)?;
-        self.store
-            .put(&self.manifest_path(manifest.checkpoint_id), payload.into())
+        match self
+            .store
+            .put_opts(
+                &self.manifest_path(manifest.checkpoint_id),
+                payload.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
             .await
-            .map_err(|e| format!("persist checkpoint manifest: {e}"))?;
+        {
+            Ok(_) => {}
+            Err(object_store::Error::AlreadyExists { .. })
+                if self.load_manifest_checked(manifest.checkpoint_id).await?
+                    == Some(manifest.clone()) => {}
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                return Err(format!(
+                    "checkpoint manifest {} is already committed with different contents",
+                    manifest.checkpoint_id.0
+                ));
+            }
+            Err(error) => return Err(format!("persist checkpoint manifest: {error}")),
+        }
         if let Some(audit) = audit {
             let event = AuditEvent::now(
                 "system",
@@ -156,15 +176,29 @@ impl CheckpointManifestStore {
             .flatten()
     }
 
+    /// Load a manifest while preserving storage and corruption errors.
+    pub async fn load_manifest_exact(
+        &self,
+        checkpoint_id: CheckpointId,
+    ) -> Result<Option<ClusterCheckpoint>, String> {
+        self.load_manifest_checked(checkpoint_id).await
+    }
+
     async fn load_manifest_checked(
         &self,
         checkpoint_id: CheckpointId,
     ) -> Result<Option<ClusterCheckpoint>, String> {
-        let bytes = self
-            .store
-            .get(&self.manifest_path(checkpoint_id))
-            .await
-            .map_err(|error| format!("load checkpoint manifest {}: {error}", checkpoint_id.0))?
+        let object = match self.store.get(&self.manifest_path(checkpoint_id)).await {
+            Ok(object) => object,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "load checkpoint manifest {}: {error}",
+                    checkpoint_id.0
+                ));
+            }
+        };
+        let bytes = object
             .bytes()
             .await
             .map_err(|error| format!("read checkpoint manifest {}: {error}", checkpoint_id.0))?;

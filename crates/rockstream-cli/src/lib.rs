@@ -752,6 +752,10 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                         |e| CliError::new(RS_0003, format!("failed to open management store: {e}"), "Check storage directory permissions."),
                     )?,
                 );
+                service = service.with_single_worker_local_backup_source_store(
+                    store.clone(),
+                    rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
+                );
                 if let Some(addr) = &node_config.control.management_addr {
                     service = service.with_management(addr.clone(), store, node_config.clone());
                 }

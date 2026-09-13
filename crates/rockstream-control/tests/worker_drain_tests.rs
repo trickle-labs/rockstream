@@ -120,7 +120,7 @@ async fn draining_worker_receives_no_new_shards() {
 async fn drain_completes_after_all_shards_migrate() {
     let (handle, catalog, manager) = start_service().await;
     let mut worker_1 = register(handle.addr, 1).await;
-    let _worker_2 = register(handle.addr, 2).await;
+    let mut worker_2 = register(handle.addr, 2).await;
     manager.acquire(ShardId(7), WorkerId(1)).unwrap();
     manager.acquire(ShardId(8), WorkerId(1)).unwrap();
 
@@ -140,6 +140,12 @@ async fn drain_completes_after_all_shards_migrate() {
         },
     )
     .await;
+    let mut moved_shards = vec![
+        acknowledge_next_shard_assignment(&mut worker_2).await,
+        acknowledge_next_shard_assignment(&mut worker_2).await,
+    ];
+    moved_shards.sort_by_key(|shard_id| shard_id.0);
+    assert_eq!(moved_shards, vec![ShardId(7), ShardId(8)]);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert!(matches!(
@@ -155,7 +161,7 @@ async fn drain_completes_after_all_shards_migrate() {
 async fn decommissioned_worker_removed_from_topology_after_grace_period() {
     let (handle, catalog, manager) = start_service().await;
     let mut worker_1 = register(handle.addr, 1).await;
-    let _worker_2 = register(handle.addr, 2).await;
+    let mut worker_2 = register(handle.addr, 2).await;
     manager.acquire(ShardId(10), WorkerId(1)).unwrap();
 
     send_on(
@@ -174,6 +180,10 @@ async fn decommissioned_worker_removed_from_topology_after_grace_period() {
         },
     )
     .await;
+    assert_eq!(
+        acknowledge_next_shard_assignment(&mut worker_2).await,
+        ShardId(10)
+    );
     tokio::time::sleep(Duration::from_millis(150)).await;
     tokio::time::sleep(Duration::from_millis(5_100)).await;
     let _ = send(handle.addr, &WorkerMessage::ClusterStatusQuery).await;
@@ -199,6 +209,33 @@ async fn wait_for_begin_drain(stream: &mut TcpStream) {
         }
     }
     panic!("worker did not receive BeginDrain");
+}
+
+async fn acknowledge_next_shard_assignment(stream: &mut TcpStream) -> ShardId {
+    for _ in 0..8 {
+        if let ControlMessage::ShardAssigned {
+            lease,
+            operation_id: Some(operation_id),
+        } = receive(stream).await
+        {
+            let shard_id = lease.shard_id;
+            send_on(
+                stream,
+                &WorkerMessage::ShardTransferAck {
+                    operation_id,
+                    stage: "recipient".to_owned(),
+                    worker_id: lease.worker_id,
+                    shard_id,
+                    lease_token: lease.lease_token,
+                    success: true,
+                    error: None,
+                },
+            )
+            .await;
+            return shard_id;
+        }
+    }
+    panic!("recipient did not receive a shard assignment");
 }
 
 async fn send_on(stream: &mut TcpStream, msg: &WorkerMessage) {

@@ -18,7 +18,7 @@ use crate::management_store::{
     ManagementOperationStore, OperationRecord, OperationStatus, OperationStoreError,
     MAX_OPERATION_PAGE_SIZE,
 };
-use crate::service::{ManagementDrainRuntime, ManagementMigrationRuntime};
+use crate::service::{ManagementBackupRuntime, ManagementDrainRuntime, ManagementMigrationRuntime};
 use crate::shard::ShardManager;
 use crate::topology::TopologyCatalog;
 
@@ -37,6 +37,11 @@ struct MigrateShardDigest {
     target_node_id: u64,
 }
 
+#[derive(Serialize)]
+struct CreateBackupDigest {
+    destination: String,
+}
+
 #[derive(Clone)]
 pub struct ManagementService {
     catalog: TopologyCatalog,
@@ -45,6 +50,7 @@ pub struct ManagementService {
     config: Arc<NodeConfig>,
     drain_runtime: Option<ManagementDrainRuntime>,
     migration_runtime: Option<ManagementMigrationRuntime>,
+    backup_runtime: Option<ManagementBackupRuntime>,
     request_gate: Arc<Semaphore>,
 }
 
@@ -62,6 +68,7 @@ impl ManagementService {
             config: Arc::new(config),
             drain_runtime: None,
             migration_runtime: None,
+            backup_runtime: None,
             request_gate: Arc::new(Semaphore::new(MAX_MANAGEMENT_REQUESTS)),
         }
     }
@@ -73,6 +80,11 @@ impl ManagementService {
 
     pub(crate) fn with_migration_runtime(mut self, runtime: ManagementMigrationRuntime) -> Self {
         self.migration_runtime = Some(runtime);
+        self
+    }
+
+    pub(crate) fn with_backup_runtime(mut self, runtime: ManagementBackupRuntime) -> Self {
+        self.backup_runtime = Some(runtime);
         self
     }
 
@@ -269,7 +281,11 @@ impl ManagementService {
                         .await;
                 }
             }
-            crate::management_store::OperationKind::CreateBackup => {}
+            crate::management_store::OperationKind::CreateBackup => {
+                if let Some(runtime) = self.backup_runtime.as_ref() {
+                    runtime.schedule(record.operation_id().to_owned()).await;
+                }
+            }
         }
     }
 }
@@ -624,6 +640,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
         if self.migration_runtime.is_some() {
             capabilities.push("MigrateShard".to_owned());
         }
+        if self.backup_runtime.is_some() {
+            capabilities.push("CreateBackup".to_owned());
+        }
         Ok(Response::new(v1::GetCapabilitiesResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -755,8 +774,51 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::CreateBackupRequest>,
     ) -> Result<Response<v1::CreateBackupResponse>, Status> {
         let _permit = self.acquire_request()?;
-        Self::ensure_version(request.into_inner().protocol_version)?;
-        Err(Status::unavailable("CreateBackup executor is not attached"))
+        let request = request.into_inner();
+        Self::ensure_version(request.protocol_version)?;
+        let runtime = self
+            .backup_runtime
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("CreateBackup executor is not attached"))?;
+        let destination = request.destination.trim();
+        if destination.is_empty()
+            || destination.chars().any(char::is_control)
+            || destination
+                .split_once("://")
+                .is_some_and(|(scheme, _)| !matches!(scheme, "file" | "s3"))
+            || destination
+                .strip_prefix("s3://")
+                .is_some_and(|rest| rest.split('/').next().unwrap_or_default().is_empty())
+            || destination == "file://"
+        {
+            return Err(Status::invalid_argument(
+                "destination must be a local path, file:// path, or s3://bucket/prefix",
+            ));
+        }
+        let accepted = self
+            .operations
+            .accept_idempotent(
+                &request.idempotency_key,
+                request.protocol_version as u16,
+                &CreateBackupDigest {
+                    destination: destination.to_owned(),
+                },
+                uuid::Uuid::new_v4().to_string(),
+                crate::management_store::OperationKind::CreateBackup,
+                Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(store_error)?;
+        if matches!(
+            accepted.status(),
+            OperationStatus::Pending | OperationStatus::Waiting
+        ) {
+            runtime.schedule(accepted.operation_id().to_owned()).await;
+        }
+        Ok(Response::new(v1::CreateBackupResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation: Some(Self::operation(accepted)),
+        }))
     }
 
     async fn cancel_operation(

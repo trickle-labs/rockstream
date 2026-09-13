@@ -2,7 +2,7 @@
 
 The management API exposes typed status reads and long-running administrative operations. The protocol source is [`management.proto`](../../crates/rockstream-management-proto/proto/management/v1/management.proto).
 
-**Qualification status:** v0.66 is not signed off. `CreateBackup` has no executor, server-side authorization is absent, and the release-process transcripts are missing.
+**Qualification status:** v0.66 is not signed off. `CreateBackup` runs only when the server has an attached shard store. Server-side authorization and health telemetry are absent.
 
 ## Endpoint and protocol
 
@@ -28,10 +28,16 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 | `GetHealth` | Returns `unknown` until the process registers authoritative health telemetry. |
 | `DrainWorker` | Persists an idempotent operation request, then drains a worker asynchronously. |
 | `MigrateShard` | Persists an idempotent request, flushes and closes the donor shard, transfers its lease, and waits for the recipient to open it. Before donor handoff, the v0.66 executor rejects a shard with a registered active workload deployment. |
-| `CreateBackup` | The request defines an `idempotency_key`, but the server returns `UNAVAILABLE` before acceptance. No backup executor is attached, and this method is absent from capabilities. |
+| `CreateBackup` | Persists an idempotent operation, requests a durable checkpoint from every shard owner, exports a committed generation, and reports success only after validating its terminal marker. The method appears in capabilities only when a backup source store is attached. |
 | `CancelOperation` | Cancels a pending operation or one still in its validation phase. It returns `FAILED_PRECONDITION` after worker handoff starts. |
 
-The control service attaches the drain and migration executors. `CreateBackup` never reports success. A successful `DrainWorker` result is not qualified until recipient-open acknowledgments and real-process drain transcripts pass.
+The control service attaches drain and migration executors. It attaches the backup executor only when it can read the authoritative shard store. Embedded `--role all` supports one local worker. Multi-worker backups require every shard owner to use the same configured shared object store.
+
+`CreateBackup` accepts a local path, a `file://` path, or an `s3://bucket/prefix` destination. It requires an idle cluster with no active workload deployments or source writes. The operation record stores the destination and checkpoint phase. The server stores its checkpoint manifest in the source store and writes the export under `checkpoint-exports/management-<operation_id>`. A missing worker or temporary storage error leaves the operation waiting. An invalid destination or checkpoint integrity error leaves it failed.
+
+The management backup format is a committed checkpoint generation with inventory records and a terminal `commit` marker. It is separate from the local `manifest.json` format used by the legacy `admin backup inspect` and `admin backup verify` commands.
+
+A successful `DrainWorker` result requires a matching recipient-open acknowledgement for every moved shard. A drain remains active while a recipient is unavailable or has not acknowledged its lease.
 
 ## Response fields
 
@@ -53,7 +59,7 @@ The server admits at most 64 concurrent management requests. It limits gRPC mess
 
 ## Idempotency and cancellation
 
-`DrainWorker` and `MigrateShard` accept an `idempotency_key`. The server binds the key to the protocol version, operation kind, canonical request digest, and operation ID before it dispatches work. An exact retry returns the same record. A changed request under the same key returns `ALREADY_EXISTS`. An expired key returns `FAILED_PRECONDITION`.
+`DrainWorker`, `MigrateShard`, and `CreateBackup` accept an `idempotency_key`. The server binds the key to the protocol version, operation kind, request digest, and operation ID before it dispatches work. An exact retry returns the same record. A changed request under the same key returns `ALREADY_EXISTS`. An expired key returns `FAILED_PRECONDITION`.
 
 The valid status transitions are:
 
@@ -78,4 +84,4 @@ Management RPC errors retain their gRPC status. The CLI currently maps managemen
 
 The management endpoint has no TLS or server-side role check. Do not expose it to an untrusted network. The CLI's local identity flags do not authenticate a caller to the management service.
 
-The current release work has no release-binary transcript tests for standalone and multi-process clusters. The v0.66 criteria remain incomplete until those tests and the backup executor pass.
+The server has no authoritative process-health telemetry, so `GetHealth` returns `unknown`. The v0.66 criteria remain incomplete until the full workspace gate and release-process evidence pass.

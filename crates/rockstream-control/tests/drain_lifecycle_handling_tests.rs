@@ -65,6 +65,40 @@ async fn send_on(stream: &mut TcpStream, msg: &WorkerMessage) -> Vec<ControlMess
     responses
 }
 
+async fn acknowledge_shard_assignment(stream: &mut TcpStream, expected_shard: ShardId) {
+    let mut reader = BufReader::new(stream);
+    for _ in 0..8 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let ControlMessage::ShardAssigned {
+            lease,
+            operation_id: Some(operation_id),
+        } = serde_json::from_str(line.trim()).unwrap()
+        else {
+            continue;
+        };
+        if lease.shard_id == expected_shard {
+            let ack = serde_json::to_string(&WorkerMessage::ShardTransferAck {
+                operation_id,
+                stage: "recipient".to_owned(),
+                worker_id: lease.worker_id,
+                shard_id: lease.shard_id,
+                lease_token: lease.lease_token,
+                success: true,
+                error: None,
+            })
+            .unwrap()
+                + "\n";
+            reader.get_mut().write_all(ack.as_bytes()).await.unwrap();
+            return;
+        }
+    }
+    panic!("recipient did not receive shard {expected_shard}");
+}
+
 fn worker_lease_count(manager: &ShardManager, worker_id: WorkerId) -> usize {
     manager
         .leases()
@@ -85,7 +119,7 @@ async fn test_drain_ack_completes_drain_and_evicts_worker() {
     let handle = service.start("127.0.0.1:0").await.unwrap();
 
     let mut worker_1 = register(handle.addr, 1).await;
-    let _worker_2 = register(handle.addr, 2).await;
+    let mut worker_2 = register(handle.addr, 2).await;
     manager.acquire(ShardId(101), WorkerId(1)).unwrap();
 
     let pool = ShuffleClientPool::default();
@@ -116,13 +150,21 @@ async fn test_drain_ack_completes_drain_and_evicts_worker() {
         },
     )
     .await;
+    acknowledge_shard_assignment(&mut worker_2, ShardId(101)).await;
 
-    // Lifecycle should advance to Decommissioned
-    let w1 = catalog.get(WorkerId(1)).unwrap();
-    assert!(matches!(
-        w1.lifecycle,
-        WorkerLifecycleState::Decommissioned { .. }
-    ));
+    // The control loop completes the drain after it processes the recipient ACK.
+    let mut decommissioned = false;
+    for _ in 0..50 {
+        if matches!(
+            catalog.get(WorkerId(1)).unwrap().lifecycle,
+            WorkerLifecycleState::Decommissioned { .. }
+        ) {
+            decommissioned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(decommissioned, "recipient ACK did not complete the drain");
 
     // The lease must move to the acknowledged recipient, not become unowned.
     assert_eq!(worker_lease_count(&manager, WorkerId(1)), 0);

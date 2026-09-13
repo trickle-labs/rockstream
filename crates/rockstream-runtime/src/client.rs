@@ -1193,6 +1193,58 @@ where
                         })
                         .await;
                 }
+                ControlMessage::CreateShardCheckpoint {
+                    request_id,
+                    checkpoint_id,
+                    lease,
+                } => {
+                    let result = async {
+                        if *worker_id_clone.read() != Some(lease.worker_id) {
+                            return Err("worker identity does not match the shard lease".to_owned());
+                        }
+                        if deployments_clone
+                            .read()
+                            .keys()
+                            .any(|(_, shard_id)| *shard_id == lease.shard_id)
+                        {
+                            return Err(
+                                "shard has an active workload; backup requires an idle shard"
+                                    .to_owned(),
+                            );
+                        }
+                        let db = active_shards_clone
+                            .read()
+                            .get(&lease.shard_id)
+                            .filter(|state| state.lease == lease)
+                            .and_then(|state| state.db.clone())
+                            .ok_or_else(|| {
+                                "worker does not hold the requested active shard lease".to_owned()
+                            })?;
+                        db.create_checkpoint()
+                            .await
+                            .map(|handle| (handle.shard_checkpoint_id, handle.snapshot_id))
+                            .map_err(|error| format!("create SlateDB checkpoint: {error}"))
+                    }
+                    .await;
+                    let (shard_checkpoint_id, snapshot_id, error) = match result {
+                        Ok((manifest_id, snapshot_id)) => {
+                            (Some(manifest_id), Some(snapshot_id), None)
+                        }
+                        Err(error) => (None, None, Some(error)),
+                    };
+                    let _ = msg_tx
+                        .send(WorkerMessage::ShardCheckpointAck {
+                            request_id,
+                            checkpoint_id,
+                            worker_id: lease.worker_id,
+                            shard_id: lease.shard_id,
+                            lease_token: lease.lease_token,
+                            shard_checkpoint_id,
+                            snapshot_id,
+                            error,
+                        })
+                        .await;
+                }
                 ControlMessage::ShardRevoked { shard_id, reason } => {
                     tracing::info!(
                         "Received ShardRevoked for {:?} due to {:?}",

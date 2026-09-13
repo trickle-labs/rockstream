@@ -23,9 +23,8 @@ async fn test_golden_path_under_fault_injection() {
             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         }
 
-        // 1. Valid scaffold generation across template variants
-        let templates = ["local", "kafka", "postgres-cdc"];
-        let selected_template = templates[(seed as usize) % templates.len()];
+        // 1. Valid scaffold generation for the supported template
+        let selected_template = "local";
         let project_dir = iter_dir.join(format!("proj_{selected_template}"));
 
         let opts = InitOptions {
@@ -37,12 +36,29 @@ async fn test_golden_path_under_fault_injection() {
 
         let res = run_init(OutputFormat::Json, &opts).expect("scaffold must succeed on clean dir");
         let outcome: InitOutcome = serde_json::from_str(&res).expect("valid JSON outcome");
-        assert_eq!(outcome.template, selected_template);
-        assert_eq!(outcome.status, "created");
+        assert_eq!(
+            outcome,
+            InitOutcome {
+                project_name: format!("proj_{selected_template}"),
+                template: selected_template.to_string(),
+                target_dir: project_dir.to_string_lossy().into_owned(),
+                generated_files: vec![
+                    "rockstream.toml".to_string(),
+                    "project.toml".to_string(),
+                    "schema.sql".to_string(),
+                    "data/seed.csv".to_string(),
+                    "queries/verify.sql".to_string(),
+                    "README.md".to_string(),
+                ],
+                status: "created".to_string(),
+            }
+        );
         assert!(project_dir.join("rockstream.toml").exists());
+        assert!(project_dir.join("project.toml").exists());
         assert!(project_dir.join("schema.sql").exists());
-        assert!(project_dir.join("scripts/verify.sh").exists());
-        assert!(project_dir.join("scripts/cleanup.sh").exists());
+        assert!(project_dir.join("data/seed.csv").exists());
+        assert!(project_dir.join("queries/verify.sql").exists());
+        assert!(project_dir.join("README.md").exists());
 
         // 2. Pre-flight guard against non-empty dir without --force
         let non_empty_opts = InitOptions {
@@ -95,9 +111,7 @@ async fn test_golden_path_under_fault_injection() {
             assert!(ready, "Verifier retry loop should synchronize successfully");
         }
 
-        // 6. Cleanup idempotency
-        let cleanup_script = project_dir.join("scripts/cleanup.sh");
-        assert!(cleanup_script.exists());
+        // 6. Remove the generated project after assertions.
         let _ = fs::remove_dir_all(&project_dir);
         assert!(!project_dir.exists());
     }

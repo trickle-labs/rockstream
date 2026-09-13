@@ -1,17 +1,13 @@
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
 
+use rockstream_types::ids::WorkerId;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
-use rockstream_types::ids::{ShardId, WorkerId};
-use rockstream_types::lease::ShardLease;
-use rockstream_types::topology::{
-    CapacityHeadroom, ControlMessage, NodeRole, WorkerMessage, WorkerRegistration,
-};
+#[path = "common/management_worker.rs"]
+mod management_worker;
+use management_worker::{run_drain_cli, wait_for_operation_state, WorkerPeer};
 
 const IMAGE_NAME: &str = "rockstream-tc-test";
 const IMAGE_TAG: &str = "latest";
@@ -38,6 +34,7 @@ struct TcCluster {
     _control_name: String,
     donor_name: String,
     control_addr: SocketAddr,
+    management_addr: SocketAddr,
     network: String,
     _shared_dir: tempfile::TempDir,
 }
@@ -60,12 +57,14 @@ impl TcCluster {
         let control = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
             .with_wait_for(WaitFor::message_on_stdout("control service listening"))
             .with_exposed_port(ContainerPort::Tcp(8000))
+            .with_exposed_port(ContainerPort::Tcp(9201))
             .with_cmd(vec![
                 "start".to_string(),
                 "--storage=/data".to_string(),
                 "--role=control".to_string(),
                 "--daemon".to_string(),
                 "--control-bind=0.0.0.0:8000".to_string(),
+                "--management-addr=0.0.0.0:9201".to_string(),
                 "--control-shared-storage=/shared".to_string(),
             ])
             .with_container_name(control_name.clone())
@@ -79,6 +78,8 @@ impl TcCluster {
             .unwrap();
         let host_port = control.get_host_port_ipv4(8000).await.unwrap();
         let control_addr = format!("127.0.0.1:{host_port}").parse().unwrap();
+        let management_port = control.get_host_port_ipv4(9201).await.unwrap();
+        let management_addr = format!("127.0.0.1:{management_port}").parse().unwrap();
 
         let donor = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
             .with_wait_for(WaitFor::seconds(1))
@@ -128,6 +129,7 @@ impl TcCluster {
             _control_name: control_name,
             donor_name,
             control_addr,
+            management_addr,
             network,
             _shared_dir: shared_dir,
         }
@@ -144,86 +146,6 @@ impl TcCluster {
     }
 }
 
-async fn send(addr: SocketAddr, msg: &WorkerMessage) -> Vec<ControlMessage> {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let line = serde_json::to_string(msg).unwrap() + "\n";
-    stream.write_all(line.as_bytes()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut reader = BufReader::new(stream);
-    let mut out = Vec::new();
-    loop {
-        let mut line = String::new();
-        let Ok(read) =
-            tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut line)).await
-        else {
-            break;
-        };
-        let Ok(read) = read else { break };
-        if read == 0 || line.trim().is_empty() {
-            break;
-        }
-        out.push(serde_json::from_str(line.trim()).unwrap());
-    }
-    out
-}
-
-async fn register_worker(addr: SocketAddr, worker_id: u64) {
-    let reg = WorkerRegistration::new(
-        WorkerId(worker_id),
-        NodeRole::Worker,
-        format!("host-{worker_id}:7000"),
-        CapacityHeadroom::FULL,
-    );
-    let _ = send(addr, &WorkerMessage::Register(reg)).await;
-}
-
-async fn request_shard(addr: SocketAddr, worker_id: u64, shard_id: u64) -> Option<ShardLease> {
-    let replies = send(
-        addr,
-        &WorkerMessage::RequestShard {
-            worker_id: WorkerId(worker_id),
-            shard_id: ShardId(shard_id),
-        },
-    )
-    .await;
-    replies.into_iter().find_map(|reply| match reply {
-        ControlMessage::ShardAssigned { lease, .. } => Some(lease),
-        _ => None,
-    })
-}
-
-async fn wait_for_lease(addr: SocketAddr, worker_id: u64, shard_id: u64) -> ShardLease {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(lease) = request_shard(addr, worker_id, shard_id).await {
-            return lease;
-        }
-        assert!(Instant::now() < deadline, "lease did not converge");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-fn exec_drain(control_addr: SocketAddr, worker_id: u64) {
-    let binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target/debug/rockstream");
-    let status = std::process::Command::new(binary)
-        .args([
-            "cluster",
-            "workers",
-            "drain",
-            "--control",
-            &control_addr.to_string(),
-            "--identity-role",
-            "admin",
-            &worker_id.to_string(),
-            "--yes",
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success(), "drain CLI failed");
-}
-
 #[tokio::test]
 async fn live_migration_zero_loss_tc() {
     if !docker_available() || !image_available() {
@@ -233,23 +155,21 @@ async fn live_migration_zero_loss_tc() {
         return;
     }
     let cluster = TcCluster::boot("live").await;
-    register_worker(cluster.control_addr, 1).await;
-    register_worker(cluster.control_addr, 2).await;
+    let mut donor = WorkerPeer::register(cluster.control_addr, 1).await;
+    let mut recipient = WorkerPeer::register(cluster.control_addr, 2).await;
+    assert_eq!(donor.request_shard(11).await.worker_id, WorkerId(1));
+    let accepted = run_drain_cli(cluster.management_addr, 1);
+    let operation_id = accepted["operation_id"].as_str().unwrap().to_owned();
+    donor.wait_for_drain().await;
+    donor.acknowledge_drain().await;
     assert_eq!(
-        request_shard(cluster.control_addr, 1, 11)
-            .await
-            .unwrap()
-            .worker_id,
-        WorkerId(1)
-    );
-    exec_drain(cluster.control_addr, 1);
-    for _ in 0..10 {
-        let _ = send(cluster.control_addr, &WorkerMessage::ClusterStatusQuery).await;
-    }
-    assert_eq!(
-        wait_for_lease(cluster.control_addr, 2, 11).await.worker_id,
+        recipient.acknowledge_recipient(11).await.worker_id,
         WorkerId(2)
     );
+    let completed =
+        wait_for_operation_state(cluster.management_addr, &operation_id, "succeeded").await;
+    assert_eq!(completed["phase"], "completed");
+    assert_eq!(completed["progress"], "100%");
     cluster.cleanup().await;
 }
 
@@ -262,19 +182,21 @@ async fn donor_killed_mid_dual_writing_tc() {
         return;
     }
     let cluster = TcCluster::boot("dual").await;
-    register_worker(cluster.control_addr, 1).await;
-    register_worker(cluster.control_addr, 2).await;
-    let _ = request_shard(cluster.control_addr, 1, 21).await;
-    exec_drain(cluster.control_addr, 1);
+    let mut donor = WorkerPeer::register(cluster.control_addr, 1).await;
+    let _recipient = WorkerPeer::register(cluster.control_addr, 2).await;
+    assert_eq!(donor.request_shard(21).await.worker_id, WorkerId(1));
+    let accepted = run_drain_cli(cluster.management_addr, 1);
+    let operation_id = accepted["operation_id"].as_str().unwrap().to_owned();
+    donor.wait_for_drain().await;
     let status = std::process::Command::new("docker")
         .args(["rm", "-f", &cluster.donor_name])
         .status()
         .unwrap();
     assert!(status.success());
-    assert_eq!(
-        wait_for_lease(cluster.control_addr, 2, 21).await.worker_id,
-        WorkerId(2)
-    );
+    drop(donor);
+    let pending = wait_for_operation_state(cluster.management_addr, &operation_id, "running").await;
+    assert_eq!(pending["state"], "running");
+    assert_eq!(pending["phase"], "waiting_for_worker_flush_ack");
     cluster.cleanup().await;
 }
 
@@ -287,19 +209,29 @@ async fn donor_killed_mid_cutover_tc() {
         return;
     }
     let cluster = TcCluster::boot("cut").await;
-    register_worker(cluster.control_addr, 1).await;
-    register_worker(cluster.control_addr, 2).await;
-    let _ = request_shard(cluster.control_addr, 1, 22).await;
-    exec_drain(cluster.control_addr, 1);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let mut donor = WorkerPeer::register(cluster.control_addr, 1).await;
+    let mut recipient = WorkerPeer::register(cluster.control_addr, 2).await;
+    assert_eq!(donor.request_shard(22).await.worker_id, WorkerId(1));
+    let accepted = run_drain_cli(cluster.management_addr, 1);
+    let operation_id = accepted["operation_id"].as_str().unwrap().to_owned();
+    donor.wait_for_drain().await;
+    donor.acknowledge_drain().await;
+    let (lease, transfer_id) = recipient.wait_for_assignment(22).await;
+    assert_eq!(lease.worker_id, WorkerId(2));
+    assert_eq!(
+        wait_for_operation_state(cluster.management_addr, &operation_id, "running").await["state"],
+        "running"
+    );
     let status = std::process::Command::new("docker")
         .args(["rm", "-f", &cluster.donor_name])
         .status()
         .unwrap();
     assert!(status.success());
-    assert_eq!(
-        wait_for_lease(cluster.control_addr, 2, 22).await.worker_id,
-        WorkerId(2)
-    );
+    drop(donor);
+    recipient.acknowledge_assignment(&lease, transfer_id).await;
+    let completed =
+        wait_for_operation_state(cluster.management_addr, &operation_id, "succeeded").await;
+    assert_eq!(completed["state"], "succeeded");
+    assert_eq!(completed["phase"], "completed");
     cluster.cleanup().await;
 }

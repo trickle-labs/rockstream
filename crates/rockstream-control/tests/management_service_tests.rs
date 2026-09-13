@@ -411,11 +411,53 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
         matches!(message, ControlMessage::ShardAssigned { lease, .. } if lease.shard_id == ShardId(77))
     })
     .await;
+    let (lease, transfer_id) = match assignment {
+        ControlMessage::ShardAssigned {
+            lease,
+            operation_id: Some(transfer_id),
+        } => (lease, transfer_id),
+        other => panic!("expected recipient shard assignment, got {other:?}"),
+    };
+    assert_eq!(lease.worker_id, WorkerId(2));
+    assert_eq!(lease.shard_id, ShardId(77));
+    assert!(transfer_id.starts_with(&format!("{}:shard:", accepted.operation_id)));
+
+    let awaiting_recipient = client
+        .get_operation(GetOperationRequest {
+            protocol_version: 1,
+            operation_id: accepted.operation_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
     assert!(matches!(
-        assignment,
-        ControlMessage::ShardAssigned { lease, .. }
-            if lease.worker_id == WorkerId(2) && lease.shard_id == ShardId(77)
+        awaiting_recipient.state.as_str(),
+        "pending" | "running" | "waiting"
     ));
+    assert!(matches!(
+        catalog.get(WorkerId(1)).unwrap().lifecycle,
+        rockstream_types::topology::WorkerLifecycleState::Draining { .. }
+    ));
+
+    recipient
+        .write_all(
+            (serde_json::to_string(&WorkerMessage::ShardTransferAck {
+                operation_id: transfer_id,
+                stage: "recipient".to_owned(),
+                worker_id: lease.worker_id,
+                shard_id: lease.shard_id,
+                lease_token: lease.lease_token,
+                success: true,
+                error: None,
+            })
+            .unwrap()
+                + "\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
 
     let mut completed = None;
     let mut last_state = None;
