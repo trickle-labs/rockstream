@@ -187,7 +187,7 @@ async fn request_shard(addr: SocketAddr, worker_id: u64, shard_id: u64) -> Optio
     )
     .await;
     replies.into_iter().find_map(|reply| match reply {
-        ControlMessage::ShardAssigned { lease } => Some(lease),
+        ControlMessage::ShardAssigned { lease, .. } => Some(lease),
         _ => None,
     })
 }

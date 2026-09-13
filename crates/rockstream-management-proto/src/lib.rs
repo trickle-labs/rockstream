@@ -2,10 +2,12 @@
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+#[allow(clippy::result_large_err)]
 pub mod v1 {
     tonic::include_proto!("rockstream.management.v1");
 }
 
+#[allow(clippy::result_large_err)]
 pub fn ensure_protocol_version(version: u32) -> Result<(), tonic::Status> {
     if version == PROTOCOL_VERSION {
         Ok(())

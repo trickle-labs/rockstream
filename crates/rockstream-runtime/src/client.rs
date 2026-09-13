@@ -965,8 +965,36 @@ where
                         );
                     }
                 }
-                ControlMessage::ShardAssigned { lease } => {
+                ControlMessage::ShardAssigned {
+                    lease,
+                    operation_id,
+                } => {
                     tracing::info!("Received ShardAssigned lease for {:?}", lease.shard_id);
+                    let already_open =
+                        active_shards_clone
+                            .read()
+                            .get(&lease.shard_id)
+                            .is_some_and(|state| {
+                                state.lease.worker_id == lease.worker_id
+                                    && state.lease.lease_token == lease.lease_token
+                                    && state.db.is_some()
+                            });
+                    if already_open {
+                        if let Some(operation_id) = operation_id {
+                            let _ = msg_tx
+                                .send(WorkerMessage::ShardTransferAck {
+                                    operation_id,
+                                    stage: "recipient".to_owned(),
+                                    worker_id: lease.worker_id,
+                                    shard_id: lease.shard_id,
+                                    lease_token: lease.lease_token,
+                                    success: true,
+                                    error: None,
+                                })
+                                .await;
+                        }
+                        continue;
+                    }
                     // Open database for this shard
                     let shard_path = storage_dir
                         .join("shards")
@@ -983,6 +1011,19 @@ where
                                 shard = ?lease.shard_id,
                                 "Failed to configure shard object store: {error}"
                             );
+                            if let Some(operation_id) = operation_id {
+                                let _ = msg_tx
+                                    .send(WorkerMessage::ShardTransferAck {
+                                        operation_id,
+                                        stage: "recipient".to_owned(),
+                                        worker_id: lease.worker_id,
+                                        shard_id: lease.shard_id,
+                                        lease_token: lease.lease_token,
+                                        success: false,
+                                        error: Some(error.to_string()),
+                                    })
+                                    .await;
+                            }
                             continue;
                         }
                     };
@@ -1019,43 +1060,138 @@ where
                                 owner,
                                 active_shards_clone.read().len() as u64,
                             );
+                            if let Some(operation_id) = operation_id {
+                                let _ = msg_tx
+                                    .send(WorkerMessage::ShardTransferAck {
+                                        operation_id,
+                                        stage: "recipient".to_owned(),
+                                        worker_id: owner,
+                                        shard_id,
+                                        lease_token,
+                                        success: true,
+                                        error: None,
+                                    })
+                                    .await;
+                            }
                         }
-                        Err(e) => match &e {
-                            rockstream_storage::StorageError::IncompatibleFormat {
-                                stored,
-                                min,
-                                max,
-                            } => tracing::error!(
-                                code = %rockstream_types::error_code::RS_5001,
-                                stored,
-                                min,
-                                max,
-                                "Failed to open ShardDb for {:?}: {}",
-                                lease.shard_id,
-                                e
-                            ),
-                            rockstream_storage::StorageError::MalformedFormatMarker {
-                                length,
-                                min,
-                                max,
-                            } => tracing::error!(
-                                code = %rockstream_types::error_code::RS_5001,
-                                stored = "malformed",
-                                marker_length = length,
-                                min,
-                                max,
-                                "Failed to open ShardDb for {:?}: {}",
-                                lease.shard_id,
-                                e
-                            ),
-                            _ => tracing::error!(
-                                code = %rockstream_types::error_code::RS_0003,
-                                "Failed to open ShardDb for {:?}: {}",
-                                lease.shard_id,
-                                e
-                            ),
-                        },
+                        Err(e) => {
+                            if let Some(operation_id) = operation_id {
+                                let _ = msg_tx
+                                    .send(WorkerMessage::ShardTransferAck {
+                                        operation_id,
+                                        stage: "recipient".to_owned(),
+                                        worker_id: lease.worker_id,
+                                        shard_id: lease.shard_id,
+                                        lease_token: lease.lease_token,
+                                        success: false,
+                                        error: Some(e.to_string()),
+                                    })
+                                    .await;
+                            }
+                            match &e {
+                                rockstream_storage::StorageError::IncompatibleFormat {
+                                    stored,
+                                    min,
+                                    max,
+                                } => tracing::error!(
+                                    code = %rockstream_types::error_code::RS_5001,
+                                    stored,
+                                    min,
+                                    max,
+                                    "Failed to open ShardDb for {:?}: {}",
+                                    lease.shard_id,
+                                    e
+                                ),
+                                rockstream_storage::StorageError::MalformedFormatMarker {
+                                    length,
+                                    min,
+                                    max,
+                                } => tracing::error!(
+                                    code = %rockstream_types::error_code::RS_5001,
+                                    stored = "malformed",
+                                    marker_length = length,
+                                    min,
+                                    max,
+                                    "Failed to open ShardDb for {:?}: {}",
+                                    lease.shard_id,
+                                    e
+                                ),
+                                _ => tracing::error!(
+                                    code = %rockstream_types::error_code::RS_0003,
+                                    "Failed to open ShardDb for {:?}: {}",
+                                    lease.shard_id,
+                                    e
+                                ),
+                            }
+                        }
                     }
+                }
+                ControlMessage::PrepareShardTransfer {
+                    operation_id,
+                    lease,
+                } => {
+                    let worker_id = *worker_id_clone.read();
+                    let active_lease = active_shards_clone
+                        .read()
+                        .get(&lease.shard_id)
+                        .map(|state| state.lease.lease_token);
+                    let has_lease = worker_id == Some(lease.worker_id)
+                        && active_lease.is_none_or(|token| token == lease.lease_token);
+                    let result = if !has_lease {
+                        Err("worker does not hold the requested shard lease".to_owned())
+                    } else {
+                        actor_registry_clone.revoke(lease.shard_id);
+                        let mut databases = deployments_clone
+                            .read()
+                            .values()
+                            .filter(|deployment| {
+                                deployment.descriptor.shard.shard_id == lease.shard_id
+                            })
+                            .map(|deployment| deployment.db.as_ref().clone())
+                            .collect::<Vec<_>>();
+                        if let Some(db) = active_shards_clone
+                            .read()
+                            .get(&lease.shard_id)
+                            .and_then(|state| state.db.clone())
+                        {
+                            databases.push(db);
+                        }
+                        let mut failure = None;
+                        for db in databases {
+                            if let Err(error) = db.flush().await {
+                                failure = Some(format!("shard flush failed: {error}"));
+                                break;
+                            }
+                            if let Err(error) = db.close().await {
+                                failure = Some(format!("shard close failed: {error}"));
+                                break;
+                            }
+                        }
+                        if let Some(error) = failure {
+                            Err(error)
+                        } else {
+                            active_shards_clone.write().remove(&lease.shard_id);
+                            deployments_clone.write().retain(|_, deployment| {
+                                deployment.descriptor.shard.shard_id != lease.shard_id
+                            });
+                            rockstream_types::metrics::set_r1_worker_shards_owned(
+                                lease.worker_id,
+                                active_shards_clone.read().len() as u64,
+                            );
+                            Ok(())
+                        }
+                    };
+                    let _ = msg_tx
+                        .send(WorkerMessage::ShardTransferAck {
+                            operation_id,
+                            stage: "donor".to_owned(),
+                            worker_id: lease.worker_id,
+                            shard_id: lease.shard_id,
+                            lease_token: lease.lease_token,
+                            success: result.is_ok(),
+                            error: result.err(),
+                        })
+                        .await;
                 }
                 ControlMessage::ShardRevoked { shard_id, reason } => {
                     tracing::info!(

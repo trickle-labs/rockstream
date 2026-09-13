@@ -222,6 +222,74 @@ Exit codes
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
+### `rockstream admin operation`
+
+Inspect or cancel durable management operations
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream admin operation cancel`
+
+Cancel an operation before its irreversible boundary
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| operation_id | — | — | OPERATION_ID | yes | — | — |  |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream admin operation list`
+
+List retained management operations
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream admin operation show`
+
+Show one management operation
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| operation_id | — | — | OPERATION_ID | yes | — | — |  |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
 ### `rockstream admin raft`
 
 Raft consensus administrative inspection and operations
@@ -316,6 +384,20 @@ Options
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | max | — | --max | MAX | no | 100 | — | Maximum events to return (max 1000) |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+## `rockstream capabilities`
+
+List capabilities advertised by the management service
 
 Exit codes
 
@@ -584,6 +666,20 @@ Options
 | show_origins | — | --show-origins | SHOW_ORIGINS | no | — | true, false | Include source origin annotations in the printed configuration |
 | state_budget_gb | — | --state-budget-gb | STATE_BUDGET_GB | no | — | — |  |
 | webhook_listen | — | --webhook-listen | WEBHOOK_LISTEN | no | — | — |  |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream config summary`
+
+Show the server's effective configuration with secret values redacted
 
 Exit codes
 
@@ -905,6 +1001,20 @@ Options
 | estimate | — | --estimate | ESTIMATE | no | — | true, false | Show calibrated capacity, state memory, and throughput estimates without deploying |
 | op_ids | — | --op-ids | OP_IDS | no | — | true, false | Show operator IDs and addressability details for intermediate state |
 | view | — | — | VIEW | yes | — | — | View name to explain |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+## `rockstream health`
+
+Show authoritative process health from the management service
 
 Exit codes
 
@@ -1376,6 +1486,26 @@ Exit codes
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
+### `rockstream shard show`
+
+Show one shard and its current lease
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| shard_id | — | — | SHARD_ID | yes | — | — | Shard ID |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
 ## `rockstream shell`
 
 Launch interactive SQL/admin REPL shell over live pgwire connection
@@ -1546,6 +1676,7 @@ Options
 | exchange_spill_threshold_mb | — | --exchange-spill-threshold-mb | EXCHANGE_SPILL_THRESHOLD_MB | no | — | — |  |
 | host_id | — | --host-id | HOST_ID | no | — | — | Stable same-host identity advertised during worker registration |
 | listen | — | --listen | LISTEN | no | 127.0.0.1:5432 | — | PostgreSQL wire gateway listen address |
+| management_addr | — | --management-addr | MANAGEMENT_ADDR | no | — | — | Address the typed management RPC listener binds to |
 | max_exchange_compression_states | — | --max-exchange-compression-states | MAX_EXCHANGE_COMPRESSION_STATES | no | — | — |  |
 | metrics_addr | — | --metrics-addr | METRICS_ADDR | no | — | — | Metrics HTTP server listen address |
 | min_epoch_ms | — | --min-epoch-ms | MIN_EPOCH_MS | no | — | — |  |

@@ -8,26 +8,25 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use rockstream_cli::cli_args::*;
-use rockstream_cli::output::OutputFormat;
+use rockstream_cli::output::{render_output, Formattable, OutputFormat};
 use rockstream_cli::transport::{
-    ClientIdentity, RemoteCatalogClient, RemoteOperationClient, RemoteStorageAdminClient,
+    ClientIdentity, ManagementCliClient, RemoteCatalogClient, RemoteStorageAdminClient,
     RemoteTopologyClient, StorageClient,
 };
 use rockstream_cli::{
     run_admin_backup_create, run_admin_backup_inspect, run_admin_backup_verify, run_admin_restore,
     run_audit_query, run_audit_tail, run_checkpoint_export, run_checkpoint_list,
     run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
-    run_cluster_workers_drain, run_cluster_workers_list, run_cluster_workers_status,
     run_completions, run_config_print_effective, run_config_validate, run_debug_arrangement,
     run_demo, run_doctor, run_embedded_query, run_explain_view, run_format_migrate, run_init,
     run_interactive_shell, run_manifest_validate, run_project_apply, run_project_verify,
     run_qualify, run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
     run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
-    run_shard_list, run_shard_migrate, run_source_drop, run_source_list, run_source_pause,
-    run_source_resume, run_source_show, run_sql_compile, run_start, run_support_bundle,
-    run_view_list, run_view_pause, run_view_query, run_view_resume, run_view_show, run_view_status,
-    run_view_subscribe, run_workload_alter, run_workload_create, run_workload_drop,
-    run_workload_list, run_workload_show, DemoOptions, DoctorOptions, InitOptions, StartOptions,
+    run_source_drop, run_source_list, run_source_pause, run_source_resume, run_source_show,
+    run_sql_compile, run_start, run_support_bundle, run_view_list, run_view_pause, run_view_query,
+    run_view_resume, run_view_show, run_view_status, run_view_subscribe, run_workload_alter,
+    run_workload_create, run_workload_drop, run_workload_list, run_workload_show, DemoOptions,
+    DoctorOptions, InitOptions, StartOptions,
 };
 use rockstream_types::acl::Role as AclRole;
 use rockstream_types::config_resolver::CliConfigOverrides;
@@ -46,10 +45,9 @@ fn main() -> ExitCode {
     let format = cli.effective_output_format();
 
     match cli.command.clone() {
-        Command::Status => {
-            let control = make_control_client(&cli, None);
-            handle_result(run_cluster_status(format, &control), format)
-        }
+        Command::Status => run_management(&cli, None, format, |client| client.cluster_status()),
+        Command::Health => run_management(&cli, None, format, |client| client.health()),
+        Command::Capabilities => run_management(&cli, None, format, |client| client.capabilities()),
         Command::Query {
             query,
             file,
@@ -73,24 +71,35 @@ fn main() -> ExitCode {
                 worker_id,
                 control: ref ctrl_addr,
                 yes,
-            } => {
-                let control_client = make_operation_client(&cli, ctrl_addr.clone());
-                handle_result(
-                    run_cluster_workers_drain(format, &control_client, *worker_id, *yes),
-                    format,
-                )
-            }
+            } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
+                rockstream_cli::prompt_confirmation(
+                    &format!("Are you sure you want to drain worker {worker_id}?"),
+                    *yes,
+                )?;
+                client.drain_worker(*worker_id)
+            }),
             AdminCommand::Migrate {
                 shard_id,
                 target_worker,
                 control: ref ctrl_addr,
-            } => {
-                let control = make_operation_client(&cli, ctrl_addr.clone());
-                handle_result(
-                    run_shard_migrate(format, &control, *shard_id, *target_worker, true),
-                    format,
-                )
-            }
+            } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
+                client.migrate_shard(*shard_id, *target_worker)
+            }),
+            AdminCommand::Operation { command } => match command {
+                OperationCommand::List => {
+                    run_management(&cli, None, format, |client| client.list_operations())
+                }
+                OperationCommand::Show { operation_id } => {
+                    run_management(&cli, None, format, |client| {
+                        client.get_operation(operation_id)
+                    })
+                }
+                OperationCommand::Cancel { operation_id } => {
+                    run_management(&cli, None, format, |client| {
+                        client.cancel_operation(operation_id)
+                    })
+                }
+            },
             AdminCommand::Raft {
                 command: RaftAdminCommand::Status,
             } => {
@@ -126,13 +135,21 @@ fn main() -> ExitCode {
                 handle_result(res, format)
             }
             AdminCommand::Backup { ref command } => {
+                if let (BackupCommand::Create { destination }, Some(addr)) =
+                    (command, cli.management.as_deref())
+                {
+                    return run_management(&cli, Some(addr), format, |client| {
+                        client.create_backup(destination)
+                    });
+                }
                 let storage = StorageClient::with_identity(identity.clone());
-                let storage_path = cli
-                    .storage_dir
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
                 let res = match command {
                     BackupCommand::Create { destination } => {
-                        run_admin_backup_create(format, &storage, &storage_path, destination)
+                        let storage_path = cli
+                            .storage_dir
+                            .as_deref()
+                            .unwrap_or_else(|| std::path::Path::new("."));
+                        run_admin_backup_create(format, &storage, storage_path, destination)
                     }
                     BackupCommand::Inspect { destination } => {
                         run_admin_backup_inspect(format, &storage, destination)
@@ -490,55 +507,57 @@ fn main() -> ExitCode {
             };
             handle_result(res, format)
         }
-        Command::Cluster { ref command } => {
-            let control = make_control_client(&cli, None);
-            match command {
-                ClusterCommand::Status => {
-                    handle_result(run_cluster_status(format, &control), format)
-                }
-                ClusterCommand::Quotas => {
-                    handle_result(run_cluster_quotas(format, &control), format)
-                }
-                ClusterCommand::Workers {
-                    command: WorkerCommand::List,
-                } => handle_result(run_cluster_workers_list(format, &control), format),
-                ClusterCommand::Workers {
-                    command: WorkerCommand::Status { worker_id },
-                } => handle_result(
-                    run_cluster_workers_status(format, &control, *worker_id),
-                    format,
-                ),
-                ClusterCommand::Workers {
-                    command:
-                        WorkerCommand::Drain {
-                            control: ctrl_addr,
-                            worker_id,
-                            yes,
-                        },
-                } => {
-                    let control_client = if let Some(addr) = ctrl_addr {
-                        make_operation_client(&cli, Some(addr.clone()))
-                    } else {
-                        make_operation_client(&cli, None)
-                    };
-                    handle_result(
-                        run_cluster_workers_drain(format, &control_client, *worker_id, *yes),
-                        format,
-                    )
-                }
+        Command::Cluster { ref command } => match command {
+            ClusterCommand::Status => {
+                run_management(&cli, None, format, |client| client.cluster_status())
             }
-        }
-        Command::Shard { ref command } => {
-            let control = make_control_client(&cli, None);
-            let res = match command {
-                ShardCommand::List => run_shard_list(format, &control),
-                ShardCommand::Migrate { shard_id, to, yes } => {
-                    let operation = make_operation_client(&cli, None);
-                    run_shard_migrate(format, &operation, *shard_id, *to, *yes)
+            ClusterCommand::Quotas => {
+                let control = make_control_client(&cli, None);
+                handle_result(run_cluster_quotas(format, &control), format)
+            }
+            ClusterCommand::Workers {
+                command: WorkerCommand::List,
+            } => run_management(&cli, None, format, |client| client.list_nodes()),
+            ClusterCommand::Workers {
+                command: WorkerCommand::Status { worker_id },
+            } => match worker_id {
+                Some(worker_id) => {
+                    run_management(&cli, None, format, |client| client.get_node(*worker_id))
                 }
-            };
-            handle_result(res, format)
-        }
+                None => run_management(&cli, None, format, |client| client.list_nodes()),
+            },
+            ClusterCommand::Workers {
+                command:
+                    WorkerCommand::Drain {
+                        control: ctrl_addr,
+                        worker_id,
+                        yes,
+                    },
+            } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
+                rockstream_cli::prompt_confirmation(
+                    &format!("Are you sure you want to drain worker {worker_id}?"),
+                    *yes,
+                )?;
+                client.drain_worker(*worker_id)
+            }),
+        },
+        Command::Shard { ref command } => match command {
+            ShardCommand::List => run_management(&cli, None, format, |client| client.list_shards()),
+            ShardCommand::Show { shard_id } => {
+                run_management(&cli, None, format, |client| client.get_shard(*shard_id))
+            }
+            ShardCommand::Migrate { shard_id, to, yes } => {
+                run_management(&cli, None, format, |client| {
+                    rockstream_cli::prompt_confirmation(
+                        &format!(
+                            "Are you sure you want to migrate shard {shard_id} to worker {to}?"
+                        ),
+                        *yes,
+                    )?;
+                    client.migrate_shard(*shard_id, *to)
+                })
+            }
+        },
         Command::Checkpoint { command } => {
             let storage = StorageClient::with_identity(identity.clone());
             let storage_path = cli
@@ -675,6 +694,9 @@ fn main() -> ExitCode {
             format,
         ),
         Command::Config { command } => match command {
+            ConfigCommand::Summary => {
+                run_management(&cli, None, format, |client| client.config_summary())
+            }
             ConfigCommand::Validate {
                 file,
                 strict,
@@ -793,6 +815,25 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_management<T>(
+    cli: &Cli,
+    override_addr: Option<&str>,
+    format: OutputFormat,
+    request: impl FnOnce(&mut ManagementCliClient) -> Result<T, rockstream_cli::CliError>,
+) -> ExitCode
+where
+    T: serde::Serialize + Formattable,
+{
+    let result = ManagementCliClient::connect(
+        override_addr
+            .or(cli.management.as_deref())
+            .unwrap_or("127.0.0.1:9201"),
+    )
+    .and_then(|mut client| request(&mut client))
+    .map(|output| render_output(&output, format));
+    handle_result(result, format)
+}
+
 fn make_control_client(cli: &Cli, override_addr: Option<String>) -> RemoteTopologyClient {
     let mut identity = cli_identity(cli);
     if let Some(ref p) = cli.tls_cert_path {
@@ -800,17 +841,6 @@ fn make_control_client(cli: &Cli, override_addr: Option<String>) -> RemoteTopolo
     }
     let mut client =
         RemoteTopologyClient::new(override_addr.or_else(|| cli.control.clone()), identity);
-    if let Some(config) = tls_config(cli) {
-        client = client.with_internal_tls(config);
-    }
-    client
-}
-
-fn make_operation_client(cli: &Cli, override_addr: Option<String>) -> RemoteOperationClient {
-    let mut client = RemoteOperationClient::new(
-        override_addr.or_else(|| cli.control.clone()),
-        cli_identity(cli),
-    );
     if let Some(config) = tls_config(cli) {
         client = client.with_internal_tls(config);
     }

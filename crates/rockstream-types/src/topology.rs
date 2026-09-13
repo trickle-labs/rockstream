@@ -310,6 +310,14 @@ pub enum ControlMessage {
     ShardAssigned {
         /// The new lease (includes shard_id, worker_id, lease_token).
         lease: ShardLease,
+        /// Set only when assignment is part of a management migration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+    },
+    /// Flush and close one shard before the control plane transfers its lease.
+    PrepareShardTransfer {
+        operation_id: String,
+        lease: ShardLease,
     },
     /// The control plane has revoked a previously assigned shard lease.
     ///
@@ -821,6 +829,16 @@ pub enum WorkerMessage {
     DrainAck {
         worker_id: WorkerId,
         shards_remaining: u32,
+    },
+    /// A worker confirms that one migration stage completed.
+    ShardTransferAck {
+        operation_id: String,
+        stage: String,
+        worker_id: WorkerId,
+        shard_id: ShardId,
+        lease_token: crate::ids::LeaseToken,
+        success: bool,
+        error: Option<String>,
     },
     /// Worker reports its updated lifecycle state (v0.38).
     LifecycleState {

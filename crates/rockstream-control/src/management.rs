@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -9,23 +11,30 @@ use rockstream_types::ids::{ShardId, WorkerId};
 use rockstream_types::topology::WorkerInfo;
 use serde::Serialize;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
 use crate::management_store::{
     ManagementOperationStore, OperationRecord, OperationStatus, OperationStoreError,
     MAX_OPERATION_PAGE_SIZE,
 };
-use crate::service::ManagementDrainRuntime;
+use crate::service::{ManagementDrainRuntime, ManagementMigrationRuntime};
 use crate::shard::ShardManager;
 use crate::topology::TopologyCatalog;
 
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_MANAGEMENT_REQUESTS: usize = 64;
 
 #[derive(Serialize)]
 struct DrainWorkerDigest {
     worker_id: u64,
+}
+
+#[derive(Serialize)]
+struct MigrateShardDigest {
+    shard_id: u64,
+    target_node_id: u64,
 }
 
 #[derive(Clone)]
@@ -35,6 +44,8 @@ pub struct ManagementService {
     operations: ManagementOperationStore,
     config: Arc<NodeConfig>,
     drain_runtime: Option<ManagementDrainRuntime>,
+    migration_runtime: Option<ManagementMigrationRuntime>,
+    request_gate: Arc<Semaphore>,
 }
 
 impl ManagementService {
@@ -50,6 +61,8 @@ impl ManagementService {
             operations,
             config: Arc::new(config),
             drain_runtime: None,
+            migration_runtime: None,
+            request_gate: Arc::new(Semaphore::new(MAX_MANAGEMENT_REQUESTS)),
         }
     }
 
@@ -58,7 +71,58 @@ impl ManagementService {
         self
     }
 
+    pub(crate) fn with_migration_runtime(mut self, runtime: ManagementMigrationRuntime) -> Self {
+        self.migration_runtime = Some(runtime);
+        self
+    }
+
     pub async fn start(&self, bind_addr: &str) -> std::io::Result<ManagementServiceHandle> {
+        let mut recover = self
+            .operations
+            .nonterminal()
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut recovery_conflicts = std::collections::HashSet::new();
+        for record in &mut recover {
+            if record.status() == crate::management_store::OperationStatus::Running {
+                match self
+                    .operations
+                    .transition_if(
+                        record.operation_id(),
+                        record.status(),
+                        record.phase(),
+                        crate::management_store::OperationUpdate {
+                            status: crate::management_store::OperationStatus::Waiting,
+                            updated_at_ms: Utc::now().timestamp_millis(),
+                            progress: record.progress(),
+                            phase: record.phase().map(str::to_owned),
+                            error_code: None,
+                            next_steps: vec![
+                                "Management restarted; reconcile this operation before retrying."
+                                    .to_owned(),
+                            ],
+                        },
+                    )
+                    .await
+                {
+                    Ok(recovered) => *record = recovered,
+                    Err(crate::management_store::OperationStoreError::TransitionConflict(_)) => {
+                        recovery_conflicts.insert(record.operation_id().to_owned());
+                    }
+                    Err(error) => {
+                        return Err(std::io::Error::other(error.to_string()));
+                    }
+                }
+            }
+        }
+        recover.retain(|record| {
+            !recovery_conflicts.contains(record.operation_id())
+                && matches!(
+                    record.status(),
+                    crate::management_store::OperationStatus::Pending
+                        | crate::management_store::OperationStatus::Waiting
+                )
+        });
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -82,11 +146,39 @@ impl ManagementService {
                 tracing::error!(%error, "management service stopped");
             }
         });
+        let reconciler = self.clone();
+        let mut reconcile_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => match reconciler.operations.nonterminal().await {
+                        Ok(records) => {
+                            for record in records {
+                                reconciler.reconcile(&record).await;
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "management reconciliation scan failed"),
+                    },
+                    _ = reconcile_shutdown.recv() => break,
+                }
+            }
+        });
+        for record in recover {
+            self.reconcile(&record).await;
+        }
         Ok(ManagementServiceHandle { addr, shutdown_tx })
     }
 
     fn ensure_version(version: u32) -> Result<(), Status> {
         ensure_protocol_version(version)
+    }
+
+    fn acquire_request(&self) -> Result<OwnedSemaphorePermit, Status> {
+        self.request_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("management request limit of 64 reached"))
     }
 
     fn nodes(&self) -> (Vec<WorkerInfo>, String) {
@@ -105,6 +197,13 @@ impl ManagementService {
             address: worker.address,
             state,
             source_version,
+            role: format!("{:?}", worker.role).to_lowercase(),
+            capacity_headroom: worker.capacity_headroom.0,
+            host_id: worker.location.host_id,
+            availability_zone: worker.location.availability_zone,
+            healthy: worker.healthy,
+            registered_at_ms: worker.registered_at_ms,
+            lifecycle_state: format!("{:?}", worker.lifecycle).to_lowercase(),
         }
     }
 
@@ -128,6 +227,49 @@ impl ManagementService {
             error_code: record.error_code().unwrap_or_default().to_owned(),
             next_steps: record.next_steps().to_vec(),
             source_version: format!("operation-record:{}", record.record_version()),
+        }
+    }
+
+    async fn reconcile(&self, record: &OperationRecord) {
+        if !matches!(
+            record.status(),
+            crate::management_store::OperationStatus::Pending
+                | crate::management_store::OperationStatus::Waiting
+        ) {
+            return;
+        }
+        let Some(request) = record.request() else {
+            return;
+        };
+        match record.kind() {
+            crate::management_store::OperationKind::DrainWorker => {
+                if let (Some(runtime), Some(worker_id)) = (
+                    self.drain_runtime.as_ref(),
+                    request.get("worker_id").and_then(serde_json::Value::as_u64),
+                ) {
+                    runtime
+                        .schedule(WorkerId(worker_id), record.operation_id().to_owned())
+                        .await;
+                }
+            }
+            crate::management_store::OperationKind::MigrateShard => {
+                if let (Some(runtime), Some(shard_id), Some(target_node_id)) = (
+                    self.migration_runtime.as_ref(),
+                    request.get("shard_id").and_then(serde_json::Value::as_u64),
+                    request
+                        .get("target_node_id")
+                        .and_then(serde_json::Value::as_u64),
+                ) {
+                    runtime
+                        .schedule(
+                            ShardId(shard_id),
+                            WorkerId(target_node_id),
+                            record.operation_id().to_owned(),
+                        )
+                        .await;
+                }
+            }
+            crate::management_store::OperationKind::CreateBackup => {}
         }
     }
 }
@@ -191,11 +333,15 @@ fn store_error(error: OperationStoreError) -> Status {
         }
         OperationStoreError::ActiveLimit
         | OperationStoreError::RetainedLimit
-        | OperationStoreError::HistoryLimit => Status::resource_exhausted(error.to_string()),
+        | OperationStoreError::HistoryLimit
+        | OperationStoreError::TransitionLimit(_) => Status::resource_exhausted(error.to_string()),
         OperationStoreError::IdempotencyConflict { .. } => {
             Status::already_exists(error.to_string())
         }
         OperationStoreError::IdempotencyExpired { .. } => {
+            Status::failed_precondition(error.to_string())
+        }
+        OperationStoreError::TransitionConflict(_) => {
             Status::failed_precondition(error.to_string())
         }
         _ => Status::unavailable(error.to_string()),
@@ -240,12 +386,14 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::GetClusterStatusRequest>,
     ) -> Result<Response<v1::GetClusterStatusResponse>, Status> {
+        let _permit = self.acquire_request()?;
         Self::ensure_version(request.into_inner().protocol_version)?;
         let (workers, source_version) = self.nodes();
-        let nodes = workers
+        let mut nodes = workers
             .into_iter()
             .map(|worker| Self::node(worker, source_version.clone()))
-            .collect();
+            .collect::<Vec<_>>();
+        nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let (active_operations, retained_operations) =
             self.operations.counts().await.map_err(store_error)?;
         let state = if self.catalog.healthy_workers().is_empty() {
@@ -268,7 +416,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
             nodes,
             active_operations: active_operations as u32,
             retained_operations: retained_operations as u32,
-            request_fill: 0,
+            request_fill: (MAX_MANAGEMENT_REQUESTS - self.request_gate.available_permits()) as u32,
         }))
     }
 
@@ -276,18 +424,17 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::ListNodesRequest>,
     ) -> Result<Response<v1::ListNodesResponse>, Status> {
+        let _permit = self.acquire_request()?;
         let request = request.into_inner();
         Self::ensure_version(request.protocol_version)?;
         let size = page_size(request.page_size)?;
         let (workers, source_version) = self.nodes();
-        let (items, next_page_token) = page(
-            workers
-                .into_iter()
-                .map(|worker| Self::node(worker, source_version.clone()))
-                .collect(),
-            size,
-            &request.page_token,
-        )?;
+        let mut nodes = workers
+            .into_iter()
+            .map(|worker| Self::node(worker, source_version.clone()))
+            .collect::<Vec<_>>();
+        nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let (items, next_page_token) = page(nodes, size, &request.page_token)?;
         Ok(Response::new(v1::ListNodesResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -301,6 +448,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::GetNodeRequest>,
     ) -> Result<Response<v1::GetNodeResponse>, Status> {
+        let _permit = self.acquire_request()?;
         let request = request.into_inner();
         Self::ensure_version(request.protocol_version)?;
         let worker_id = request
@@ -324,6 +472,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::ListShardsRequest>,
     ) -> Result<Response<v1::ListShardsResponse>, Status> {
+        let _permit = self.acquire_request()?;
         let request = request.into_inner();
         Self::ensure_version(request.protocol_version)?;
         let size = page_size(request.page_size)?;
@@ -338,6 +487,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 owner_node_id: lease.worker_id.0.to_string(),
                 state: "leased".to_owned(),
                 source_version: source_version.clone(),
+                lease_token: lease.lease_token.0,
+                key_range: String::new(),
+                key_range_known: false,
             })
             .collect::<Vec<_>>();
         shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
@@ -355,6 +507,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::GetShardRequest>,
     ) -> Result<Response<v1::GetShardResponse>, Status> {
+        let _permit = self.acquire_request()?;
         let request = request.into_inner();
         Self::ensure_version(request.protocol_version)?;
         let shard_id = request
@@ -375,6 +528,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 owner_node_id: lease.worker_id.0.to_string(),
                 state: "leased".to_owned(),
                 source_version: format!("lease:{}:{}", snapshot.leader_epoch, snapshot.next_token),
+                lease_token: lease.lease_token.0,
+                key_range: String::new(),
+                key_range_known: false,
             }),
         }))
     }
@@ -383,6 +539,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::ListOperationsRequest>,
     ) -> Result<Response<v1::ListOperationsResponse>, Status> {
+        let _permit = self.acquire_request()?;
         let request = request.into_inner();
         Self::ensure_version(request.protocol_version)?;
         let size = page_size(request.page_size)?;
@@ -404,6 +561,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::GetOperationRequest>,
     ) -> Result<Response<v1::GetOperationResponse>, Status> {
+        let _permit = self.acquire_request()?;
         let request = request.into_inner();
         Self::ensure_version(request.protocol_version)?;
         let record = self
@@ -426,6 +584,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::GetConfigSummaryRequest>,
     ) -> Result<Response<v1::GetConfigSummaryResponse>, Status> {
+        let _permit = self.acquire_request()?;
         Self::ensure_version(request.into_inner().protocol_version)?;
         let redacted = toml::Value::try_from(self.config.as_ref()).map_err(|error| {
             Status::internal(format!("effective config serialization failed: {error}"))
@@ -444,6 +603,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::GetCapabilitiesRequest>,
     ) -> Result<Response<v1::GetCapabilitiesResponse>, Status> {
+        let _permit = self.acquire_request()?;
         Self::ensure_version(request.into_inner().protocol_version)?;
         let mut capabilities = vec![
             "GetClusterStatus".to_owned(),
@@ -461,6 +621,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
             capabilities.push("DrainWorker".to_owned());
             capabilities.push("CancelOperation".to_owned());
         }
+        if self.migration_runtime.is_some() {
+            capabilities.push("MigrateShard".to_owned());
+        }
         Ok(Response::new(v1::GetCapabilitiesResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -473,6 +636,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::GetHealthRequest>,
     ) -> Result<Response<v1::GetHealthResponse>, Status> {
+        let _permit = self.acquire_request()?;
         Self::ensure_version(request.into_inner().protocol_version)?;
         Ok(Response::new(v1::GetHealthResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -487,6 +651,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::DrainWorkerRequest>,
     ) -> Result<Response<v1::DrainWorkerResponse>, Status> {
+        let _permit = self.acquire_request()?;
         let request = request.into_inner();
         Self::ensure_version(request.protocol_version)?;
         let runtime = self
@@ -509,7 +674,11 @@ impl v1::management_service_server::ManagementService for ManagementService {
             )
             .await
             .map_err(store_error)?;
-        if accepted.status() == OperationStatus::Pending {
+        if matches!(
+            accepted.status(),
+            crate::management_store::OperationStatus::Pending
+                | crate::management_store::OperationStatus::Waiting
+        ) {
             runtime
                 .schedule(WorkerId(worker_id), accepted.operation_id().to_owned())
                 .await;
@@ -524,14 +693,68 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::MigrateShardRequest>,
     ) -> Result<Response<v1::MigrateShardResponse>, Status> {
-        Self::ensure_version(request.into_inner().protocol_version)?;
-        Err(Status::unavailable("MigrateShard executor is not attached"))
+        let _permit = self.acquire_request()?;
+        let request = request.into_inner();
+        Self::ensure_version(request.protocol_version)?;
+        let shard_id = request
+            .shard_id
+            .parse::<u64>()
+            .map_err(|_| Status::invalid_argument("shard_id must be an unsigned integer"))?;
+        let target_node_id = request
+            .target_node_id
+            .parse::<u64>()
+            .map_err(|_| Status::invalid_argument("target_node_id must be an unsigned integer"))?;
+        if self.shard_manager.get(ShardId(shard_id)).is_none() {
+            return Err(Status::not_found(format!("shard {shard_id} not found")));
+        }
+        if self.catalog.get(WorkerId(target_node_id)).is_none() {
+            return Err(Status::not_found(format!(
+                "node {target_node_id} not found"
+            )));
+        }
+        let runtime = self
+            .migration_runtime
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("MigrateShard executor is not attached"))?;
+        let accepted = self
+            .operations
+            .accept_idempotent(
+                &request.idempotency_key,
+                request.protocol_version as u16,
+                &MigrateShardDigest {
+                    shard_id,
+                    target_node_id,
+                },
+                uuid::Uuid::new_v4().to_string(),
+                crate::management_store::OperationKind::MigrateShard,
+                Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(store_error)?;
+        if matches!(
+            accepted.status(),
+            crate::management_store::OperationStatus::Pending
+                | crate::management_store::OperationStatus::Waiting
+        ) {
+            runtime
+                .schedule(
+                    ShardId(shard_id),
+                    WorkerId(target_node_id),
+                    accepted.operation_id().to_owned(),
+                )
+                .await;
+        }
+        Ok(Response::new(v1::MigrateShardResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation: Some(Self::operation(accepted)),
+        }))
     }
 
     async fn create_backup(
         &self,
         request: Request<v1::CreateBackupRequest>,
     ) -> Result<Response<v1::CreateBackupResponse>, Status> {
+        let _permit = self.acquire_request()?;
         Self::ensure_version(request.into_inner().protocol_version)?;
         Err(Status::unavailable("CreateBackup executor is not attached"))
     }
@@ -540,6 +763,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         &self,
         request: Request<v1::CancelOperationRequest>,
     ) -> Result<Response<v1::CancelOperationResponse>, Status> {
+        let _permit = self.acquire_request()?;
         let request = request.into_inner();
         Self::ensure_version(request.protocol_version)?;
         let record = self
@@ -550,20 +774,36 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .ok_or_else(|| {
                 Status::not_found(format!("operation {} not found", request.operation_id))
             })?;
-        if record.status() != OperationStatus::Pending {
+        let safe = record.status() == OperationStatus::Pending
+            || (matches!(
+                record.status(),
+                OperationStatus::Running | OperationStatus::Waiting
+            ) && matches!(
+                record.phase(),
+                Some("validating_worker_and_shard_ownership" | "validating_lease_and_workers")
+            ));
+        if !safe {
             return Err(Status::failed_precondition(
-                "operation cancellation is only safe before execution starts",
+                "operation cancellation is past its safe boundary",
             ));
         }
+        let status = record.status();
+        let phase = if status == OperationStatus::Pending {
+            "cancelled_before_start"
+        } else {
+            "cancelled_before_worker_handoff"
+        };
         let record = self
             .operations
-            .transition(
+            .transition_if(
                 record.operation_id(),
+                status,
+                record.phase(),
                 crate::management_store::OperationUpdate {
                     status: OperationStatus::Cancelled,
                     updated_at_ms: Utc::now().timestamp_millis(),
                     progress: record.progress(),
-                    phase: Some("cancelled_before_start".to_owned()),
+                    phase: Some(phase.to_owned()),
                     error_code: None,
                     next_steps: Vec::new(),
                 },

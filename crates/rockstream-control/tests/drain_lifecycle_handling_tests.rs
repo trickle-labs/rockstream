@@ -17,29 +17,6 @@ use rockstream_types::topology::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-async fn send(addr: std::net::SocketAddr, msg: &WorkerMessage) -> Vec<ControlMessage> {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let line = serde_json::to_string(msg).unwrap() + "\n";
-    stream.write_all(line.as_bytes()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut reader = BufReader::new(stream);
-    let mut responses = Vec::new();
-    loop {
-        let mut line = String::new();
-        let Ok(read) =
-            tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut line)).await
-        else {
-            break;
-        };
-        let Ok(read) = read else { break };
-        if read == 0 || line.trim().is_empty() {
-            break;
-        }
-        responses.push(serde_json::from_str(line.trim()).unwrap());
-    }
-    responses
-}
-
 async fn register(addr: std::net::SocketAddr, worker_id: u64) -> TcpStream {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let reg = WorkerRegistration::new(

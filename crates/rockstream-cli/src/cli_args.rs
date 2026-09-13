@@ -84,9 +84,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub control: Option<String>,
 
-    /// Management API endpoint.
-    #[arg(long, global = true, default_value = "127.0.0.1:9201")]
-    pub management: String,
+    /// Management API endpoint. Defaults to 127.0.0.1:9201 for management commands.
+    #[arg(long, global = true)]
+    pub management: Option<String>,
 
     /// Storage directory for local state and artifacts.
     #[arg(long, global = true)]
@@ -144,6 +144,10 @@ impl Cli {
 pub enum Command {
     /// Print cluster topology and health status.
     Status,
+    /// Show authoritative process health from the management service.
+    Health,
+    /// List capabilities advertised by the management service.
+    Capabilities,
     /// Execute an incremental query against a view or stream via embedded pgwire client.
     Query {
         /// SQL query to execute.
@@ -476,6 +480,8 @@ pub enum Command {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ConfigCommand {
+    /// Show the server's effective configuration with secret values redacted.
+    Summary,
     /// Validate RockStream configuration files for syntax, unknown keys, and semantic bounds.
     Validate {
         /// Path to configuration file to validate (defaults to standard search paths).
@@ -711,6 +717,11 @@ pub enum WorkloadCommand {
 pub enum ShardCommand {
     /// List all shards and their lease assignments.
     List,
+    /// Show one shard and its current lease.
+    Show {
+        /// Shard ID.
+        shard_id: u64,
+    },
     /// Migrate a shard to another worker.
     Migrate {
         /// Shard ID.
@@ -881,6 +892,11 @@ pub enum AdminCommand {
         #[arg(long)]
         control: Option<String>,
     },
+    /// Inspect or cancel durable management operations.
+    Operation {
+        #[command(subcommand)]
+        command: OperationCommand,
+    },
     /// Raft consensus administrative inspection and operations.
     Raft {
         #[command(subcommand)]
@@ -907,6 +923,16 @@ pub enum AdminCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum OperationCommand {
+    /// List retained management operations.
+    List,
+    /// Show one management operation.
+    Show { operation_id: String },
+    /// Cancel an operation before its irreversible boundary.
+    Cancel { operation_id: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]

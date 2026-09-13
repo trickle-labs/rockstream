@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-pub const MANAGEMENT_OPERATION_RECORD_VERSION: u16 = 1;
+pub const MANAGEMENT_OPERATION_RECORD_VERSION: u16 = 2;
 pub const IDEMPOTENCY_KEY_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const TERMINAL_OPERATION_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 pub const MAX_ACTIVE_OPERATIONS: usize = 1_000;
@@ -18,6 +18,8 @@ pub const MAX_OPERATION_PAGE_SIZE: usize = 100;
 const MAX_OPERATION_ID_BYTES: usize = 128;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const IDEMPOTENCY_RECORD_VERSION: u16 = 1;
+const LEGACY_OPERATION_RECORD_VERSION: u16 = 1;
+const MAX_OPERATION_TRANSITIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +74,8 @@ pub struct OperationRecord {
     phase: Option<String>,
     error_code: Option<String>,
     next_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<serde_json::Value>,
 }
 
 /// Durable binding of one client idempotency key to one accepted operation.
@@ -103,6 +107,15 @@ impl OperationRecord {
         kind: OperationKind,
         accepted_at_ms: i64,
     ) -> Self {
+        Self::accepted_with_request(operation_id, kind, accepted_at_ms, None)
+    }
+
+    fn accepted_with_request(
+        operation_id: impl Into<String>,
+        kind: OperationKind,
+        accepted_at_ms: i64,
+        request: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             record_version: MANAGEMENT_OPERATION_RECORD_VERSION,
             operation_id: operation_id.into(),
@@ -114,6 +127,7 @@ impl OperationRecord {
             phase: None,
             error_code: None,
             next_steps: Vec::new(),
+            request,
         }
     }
 
@@ -155,6 +169,10 @@ impl OperationRecord {
 
     pub fn next_steps(&self) -> &[String] {
         &self.next_steps
+    }
+
+    pub fn request(&self) -> Option<&serde_json::Value> {
+        self.request.as_ref()
     }
 
     pub fn apply_update(&mut self, update: OperationUpdate) -> Result<(), OperationLifecycleError> {
@@ -243,6 +261,10 @@ pub enum OperationStoreError {
     RetainedLimit,
     #[error("operation {0} was not found")]
     NotFound(String),
+    #[error("operation {0} changed while the request was processed")]
+    TransitionConflict(String),
+    #[error("operation {0} exceeded the transition limit of {MAX_OPERATION_TRANSITIONS}")]
+    TransitionLimit(String),
     #[error(
         "idempotency key is already bound to operation {operation_id} with a different request"
     )]
@@ -259,12 +281,30 @@ pub enum OperationStoreError {
     Lifecycle(#[from] OperationLifecycleError),
 }
 
+fn decode_operation_record(bytes: &[u8]) -> Result<OperationRecord, OperationStoreError> {
+    let mut record: OperationRecord = serde_json::from_slice(bytes)
+        .map_err(|error| OperationStoreError::CorruptRecord(error.to_string()))?;
+    match record.record_version {
+        LEGACY_OPERATION_RECORD_VERSION => {
+            record.record_version = MANAGEMENT_OPERATION_RECORD_VERSION;
+        }
+        MANAGEMENT_OPERATION_RECORD_VERSION => {}
+        actual => {
+            return Err(OperationStoreError::UnsupportedRecordVersion {
+                actual,
+                expected: MANAGEMENT_OPERATION_RECORD_VERSION,
+            });
+        }
+    }
+    Ok(record)
+}
+
 /// Durable, versioned operation records stored alongside control metadata.
 #[derive(Clone)]
 pub struct ManagementOperationStore {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
-    // ponytail: one process-local store lock serializes operations; use per-key fencing for throughput or multi-leader writes.
+    // ponytail: one process-local lock serializes scans; create-only transition records fence shared-store writers.
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -286,7 +326,35 @@ impl ManagementOperationStore {
             .child(format!("{}.json", hex::encode(operation_id.as_bytes()))))
     }
 
+    fn transition_path(
+        &self,
+        operation_id: &str,
+        previous_record: &[u8],
+    ) -> Result<Path, OperationStoreError> {
+        if operation_id.is_empty() || operation_id.len() > MAX_OPERATION_ID_BYTES {
+            return Err(OperationStoreError::InvalidOperationId);
+        }
+        Ok(self
+            .prefix
+            .child("transitions")
+            .child(hex::encode(operation_id.as_bytes()))
+            .child(format!(
+                "{}.json",
+                hex::encode(Sha256::digest(previous_record))
+            )))
+    }
+
     fn idempotency_path(&self, key: &str) -> Result<Path, OperationStoreError> {
+        if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+            return Err(OperationStoreError::InvalidIdempotencyKey);
+        }
+        Ok(self.prefix.child("idempotency").child(format!(
+            "{}.json",
+            hex::encode(Sha256::digest(key.as_bytes()))
+        )))
+    }
+
+    fn legacy_idempotency_path(&self, key: &str) -> Result<Path, OperationStoreError> {
         if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
             return Err(OperationStoreError::InvalidIdempotencyKey);
         }
@@ -337,7 +405,8 @@ impl ManagementOperationStore {
         accepted_at_ms: i64,
     ) -> Result<OperationRecord, OperationStoreError> {
         let _guard = self.write_lock.lock().await;
-        self.accept_locked(operation_id, kind, accepted_at_ms).await
+        self.accept_locked(operation_id, kind, accepted_at_ms, None)
+            .await
     }
 
     /// Persist an idempotency binding and its Pending operation before dispatching an effect.
@@ -350,22 +419,18 @@ impl ManagementOperationStore {
         kind: OperationKind,
         accepted_at_ms: i64,
     ) -> Result<OperationRecord, OperationStoreError> {
-        let request_digest = Self::canonical_request_digest(protocol_version, request)?;
+        let canonical_request = (kind, request);
+        let request_digest = Self::canonical_request_digest(protocol_version, &canonical_request)?;
+        let request = serde_json::to_value(request)
+            .map_err(|error| OperationStoreError::Serialization(error.to_string()))?;
         let _guard = self.write_lock.lock().await;
         let path = self.idempotency_path(idempotency_key)?;
-        if let Some(binding) = self.read_idempotency(idempotency_key).await? {
-            return self
-                .resolve_idempotency(binding, &request_digest, accepted_at_ms)
-                .await;
-        }
-
-        let record = self
-            .accept_locked(operation_id, kind, accepted_at_ms)
-            .await?;
+        let operation_id = operation_id.into();
+        self.operation_path(&operation_id)?;
         let binding = IdempotencyRecord {
             record_version: IDEMPOTENCY_RECORD_VERSION,
             request_digest: request_digest.clone(),
-            operation_id: record.operation_id().to_owned(),
+            operation_id,
             accepted_at: accepted_at_ms,
         };
         let payload = serde_json::to_vec(&binding)
@@ -382,21 +447,19 @@ impl ManagementOperationStore {
             )
             .await
         {
-            Ok(_) => Ok(record),
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                let binding = self
-                    .read_idempotency(idempotency_key)
-                    .await?
-                    .ok_or_else(|| {
-                        OperationStoreError::CorruptIdempotencyRecord(
-                            "idempotency binding disappeared after create conflict".to_owned(),
-                        )
-                    })?;
-                self.resolve_idempotency(binding, &request_digest, accepted_at_ms)
-                    .await
-            }
-            Err(error) => Err(OperationStoreError::Storage(error.to_string())),
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+            Err(error) => return Err(OperationStoreError::Storage(error.to_string())),
         }
+        let binding = self
+            .read_idempotency(idempotency_key)
+            .await?
+            .ok_or_else(|| {
+                OperationStoreError::CorruptIdempotencyRecord(
+                    "idempotency binding disappeared after create".to_owned(),
+                )
+            })?;
+        self.resolve_idempotency(binding, &request_digest, kind, &request, accepted_at_ms)
+            .await
     }
 
     async fn accept_locked(
@@ -404,6 +467,7 @@ impl ManagementOperationStore {
         operation_id: impl Into<String>,
         kind: OperationKind,
         accepted_at_ms: i64,
+        request: Option<serde_json::Value>,
     ) -> Result<OperationRecord, OperationStoreError> {
         let records = self.load_all().await?;
         let expired = records
@@ -420,6 +484,19 @@ impl ManagementOperationStore {
                 .delete(&self.operation_path(&operation_id)?)
                 .await
                 .map_err(|error| OperationStoreError::Storage(error.to_string()))?;
+            let transition_prefix = self
+                .prefix
+                .child("transitions")
+                .child(hex::encode(operation_id.as_bytes()));
+            let mut listing = self.store.list(Some(&transition_prefix));
+            while let Some(entry) = listing.next().await {
+                let meta =
+                    entry.map_err(|error| OperationStoreError::Storage(error.to_string()))?;
+                self.store
+                    .delete(&meta.location)
+                    .await
+                    .map_err(|error| OperationStoreError::Storage(error.to_string()))?;
+            }
         }
         let records = self.load_all().await?;
         if records.len() >= MAX_RETAINED_OPERATIONS {
@@ -433,7 +510,8 @@ impl ManagementOperationStore {
         {
             return Err(OperationStoreError::ActiveLimit);
         }
-        let record = OperationRecord::accepted(operation_id, kind, accepted_at_ms);
+        let record =
+            OperationRecord::accepted_with_request(operation_id, kind, accepted_at_ms, request);
         let path = self.operation_path(record.operation_id())?;
         let payload = serde_json::to_vec(&record)
             .map_err(|error| OperationStoreError::Serialization(error.to_string()))?;
@@ -461,6 +539,8 @@ impl ManagementOperationStore {
         &self,
         binding: IdempotencyRecord,
         request_digest: &str,
+        kind: OperationKind,
+        request: &serde_json::Value,
         now_ms: i64,
     ) -> Result<OperationRecord, OperationStoreError> {
         if binding.accepted_at < now_ms.saturating_sub(IDEMPOTENCY_KEY_RETENTION_MS) {
@@ -473,11 +553,28 @@ impl ManagementOperationStore {
                 operation_id: binding.operation_id,
             });
         }
-        self.get(&binding.operation_id).await?.ok_or_else(|| {
-            OperationStoreError::CorruptIdempotencyRecord(
-                "binding references a missing operation".to_owned(),
+        if let Some(record) = self.get(&binding.operation_id).await? {
+            return Ok(record);
+        }
+        match self
+            .accept_locked(
+                binding.operation_id.clone(),
+                kind,
+                binding.accepted_at,
+                Some(request.clone()),
             )
-        })
+            .await
+        {
+            Ok(record) => Ok(record),
+            Err(OperationStoreError::AlreadyExists(_)) => {
+                self.get(&binding.operation_id).await?.ok_or_else(|| {
+                    OperationStoreError::CorruptIdempotencyRecord(
+                        "binding references a missing operation".to_owned(),
+                    )
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn get(
@@ -532,54 +629,170 @@ impl ManagementOperationStore {
         Ok((active, records.len()))
     }
 
+    pub async fn nonterminal(&self) -> Result<Vec<OperationRecord>, OperationStoreError> {
+        let bound = self.bound_operation_ids().await?;
+        let mut records = self
+            .load_all()
+            .await?
+            .into_iter()
+            .filter(|record| {
+                !record.status().is_terminal()
+                    && (record.request().is_none() || bound.contains(record.operation_id()))
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.operation_id().cmp(right.operation_id()));
+        Ok(records)
+    }
+
+    async fn bound_operation_ids(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, OperationStoreError> {
+        let mut listing = self.store.list(Some(&self.prefix.child("idempotency")));
+        let mut operation_ids = std::collections::HashSet::new();
+        while let Some(entry) = listing.next().await {
+            let meta = entry.map_err(|error| OperationStoreError::Storage(error.to_string()))?;
+            let bytes = self
+                .store
+                .get(&meta.location)
+                .await
+                .map_err(|error| OperationStoreError::Storage(error.to_string()))?
+                .bytes()
+                .await
+                .map_err(|error| OperationStoreError::Storage(error.to_string()))?;
+            let binding: IdempotencyRecord = serde_json::from_slice(&bytes).map_err(|error| {
+                OperationStoreError::CorruptIdempotencyRecord(error.to_string())
+            })?;
+            if binding.record_version != IDEMPOTENCY_RECORD_VERSION {
+                return Err(OperationStoreError::CorruptIdempotencyRecord(format!(
+                    "record version {} is unsupported; expected {IDEMPOTENCY_RECORD_VERSION}",
+                    binding.record_version
+                )));
+            }
+            operation_ids.insert(binding.operation_id);
+        }
+        Ok(operation_ids)
+    }
+
     pub async fn transition(
         &self,
         operation_id: &str,
         update: OperationUpdate,
     ) -> Result<OperationRecord, OperationStoreError> {
+        self.write_transition(operation_id, None, None, update)
+            .await
+    }
+
+    pub async fn transition_if(
+        &self,
+        operation_id: &str,
+        expected_status: OperationStatus,
+        expected_phase: Option<&str>,
+        update: OperationUpdate,
+    ) -> Result<OperationRecord, OperationStoreError> {
+        self.write_transition(operation_id, Some(expected_status), expected_phase, update)
+            .await
+    }
+
+    async fn write_transition(
+        &self,
+        operation_id: &str,
+        expected_status: Option<OperationStatus>,
+        expected_phase: Option<&str>,
+        update: OperationUpdate,
+    ) -> Result<OperationRecord, OperationStoreError> {
         let _guard = self.write_lock.lock().await;
-        let path = self.operation_path(operation_id)?;
-        let Some(mut record) = self.get(operation_id).await? else {
-            return Err(OperationStoreError::NotFound(operation_id.to_owned()));
-        };
+        let (mut record, previous_bytes) = self
+            .read_state(operation_id)
+            .await?
+            .ok_or_else(|| OperationStoreError::NotFound(operation_id.to_owned()))?;
+        if let Some(expected_status) = expected_status {
+            if record.status() != expected_status || record.phase() != expected_phase {
+                return Err(OperationStoreError::TransitionConflict(
+                    operation_id.to_owned(),
+                ));
+            }
+        }
         record.apply_update(update)?;
         let payload = serde_json::to_vec(&record)
             .map_err(|error| OperationStoreError::Serialization(error.to_string()))?;
+        if payload == previous_bytes {
+            return Ok(record);
+        }
         self.store
-            .put(&path, payload.into())
+            .put_opts(
+                &self.transition_path(operation_id, &previous_bytes)?,
+                payload.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
             .await
-            .map_err(|error| OperationStoreError::Storage(error.to_string()))?;
+            .map_err(|error| match error {
+                object_store::Error::AlreadyExists { .. } => {
+                    OperationStoreError::TransitionConflict(operation_id.to_owned())
+                }
+                error => OperationStoreError::Storage(error.to_string()),
+            })?;
         Ok(record)
+    }
+
+    async fn read_state(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<(OperationRecord, Vec<u8>)>, OperationStoreError> {
+        let path = self.operation_path(operation_id)?;
+        let object = match self.store.get(&path).await {
+            Ok(object) => object,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(OperationStoreError::Storage(error.to_string())),
+        };
+        let mut bytes = object
+            .bytes()
+            .await
+            .map_err(|error| OperationStoreError::Storage(error.to_string()))?
+            .to_vec();
+        let mut record = decode_operation_record(&bytes)?;
+        if record.operation_id() != operation_id {
+            return Err(OperationStoreError::CorruptRecord(
+                "record identifier does not match its storage key".to_owned(),
+            ));
+        }
+        for transition in 0..=MAX_OPERATION_TRANSITIONS {
+            let path = self.transition_path(operation_id, &bytes)?;
+            let next = match self.store.get(&path).await {
+                Ok(next) if transition < MAX_OPERATION_TRANSITIONS => next,
+                Ok(_) => {
+                    return Err(OperationStoreError::TransitionLimit(
+                        operation_id.to_owned(),
+                    ))
+                }
+                Err(object_store::Error::NotFound { .. }) => return Ok(Some((record, bytes))),
+                Err(error) => return Err(OperationStoreError::Storage(error.to_string())),
+            };
+            bytes = next
+                .bytes()
+                .await
+                .map_err(|error| OperationStoreError::Storage(error.to_string()))?
+                .to_vec();
+            record = decode_operation_record(&bytes)?;
+            if record.operation_id() != operation_id {
+                return Err(OperationStoreError::CorruptRecord(
+                    "transition record identifier does not match its storage key".to_owned(),
+                ));
+            }
+        }
+        unreachable!("the transition limit returns an error before this point")
     }
 
     async fn read_entry(
         &self,
         operation_id: &str,
     ) -> Result<Option<OperationRecord>, OperationStoreError> {
-        let path = self.operation_path(operation_id)?;
-        let result = match self.store.get(&path).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(OperationStoreError::Storage(error.to_string())),
-        };
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|error| OperationStoreError::Storage(error.to_string()))?;
-        let record: OperationRecord = serde_json::from_slice(&bytes)
-            .map_err(|error| OperationStoreError::CorruptRecord(error.to_string()))?;
-        if record.record_version() != MANAGEMENT_OPERATION_RECORD_VERSION {
-            return Err(OperationStoreError::UnsupportedRecordVersion {
-                actual: record.record_version(),
-                expected: MANAGEMENT_OPERATION_RECORD_VERSION,
-            });
-        }
-        if record.operation_id() != operation_id {
-            return Err(OperationStoreError::CorruptRecord(
-                "record identifier does not match its storage key".to_owned(),
-            ));
-        }
-        Ok(Some(record))
+        Ok(self
+            .read_state(operation_id)
+            .await?
+            .map(|(record, _)| record))
     }
 
     async fn load_all(&self) -> Result<Vec<OperationRecord>, OperationStoreError> {
@@ -587,7 +800,8 @@ impl ManagementOperationStore {
         let mut records = Vec::new();
         while let Some(entry) = listing.next().await {
             let meta = entry.map_err(|error| OperationStoreError::Storage(error.to_string()))?;
-            if meta.location.to_string().split('/').count() != 3 {
+            let location = meta.location.to_string();
+            if location.contains("idempotency") || location.contains("transitions") {
                 continue;
             }
             let bytes = self
@@ -598,14 +812,11 @@ impl ManagementOperationStore {
                 .bytes()
                 .await
                 .map_err(|error| OperationStoreError::Storage(error.to_string()))?;
-            let record: OperationRecord = serde_json::from_slice(&bytes)
-                .map_err(|error| OperationStoreError::CorruptRecord(error.to_string()))?;
-            if record.record_version() != MANAGEMENT_OPERATION_RECORD_VERSION {
-                return Err(OperationStoreError::UnsupportedRecordVersion {
-                    actual: record.record_version(),
-                    expected: MANAGEMENT_OPERATION_RECORD_VERSION,
-                });
-            }
+            let base_record = decode_operation_record(&bytes)?;
+            let record = self
+                .read_entry(base_record.operation_id())
+                .await?
+                .unwrap_or(base_record);
             records.push(record);
             if records.len() > MAX_RETAINED_OPERATIONS {
                 return Err(OperationStoreError::HistoryLimit);
@@ -621,7 +832,14 @@ impl ManagementOperationStore {
         let path = self.idempotency_path(idempotency_key)?;
         let result = match self.store.get(&path).await {
             Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(object_store::Error::NotFound { .. }) => {
+                let legacy_path = self.legacy_idempotency_path(idempotency_key)?;
+                match self.store.get(&legacy_path).await {
+                    Ok(result) => result,
+                    Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                    Err(error) => return Err(OperationStoreError::Storage(error.to_string())),
+                }
+            }
             Err(error) => return Err(OperationStoreError::Storage(error.to_string())),
         };
         let bytes = result

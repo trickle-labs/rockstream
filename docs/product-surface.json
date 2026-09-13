@@ -444,6 +444,136 @@
             ]
           },
           {
+            "name": "operation",
+            "about": "Inspect or cancel durable management operations",
+            "subcommands": [
+              {
+                "name": "cancel",
+                "about": "Cancel an operation before its irreversible boundary",
+                "options": [
+                  {
+                    "name": "operation_id",
+                    "help": "",
+                    "required": true,
+                    "value_name": "OPERATION_ID"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "list",
+                "about": "List retained management operations",
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "show",
+                "about": "Show one management operation",
+                "options": [
+                  {
+                    "name": "operation_id",
+                    "help": "",
+                    "required": true,
+                    "value_name": "OPERATION_ID"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
             "name": "raft",
             "about": "Raft consensus administrative inspection and operations",
             "subcommands": [
@@ -671,6 +801,34 @@
             ]
           }
         ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
+        "name": "capabilities",
+        "about": "List capabilities advertised by the management service",
         "exit_codes": [
           {
             "code": 0,
@@ -1266,6 +1424,34 @@
                 "value_name": "WEBHOOK_LISTEN"
               }
             ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "summary",
+            "about": "Show the server's effective configuration with secret values redacted",
             "exit_codes": [
               {
                 "code": 0,
@@ -2070,6 +2256,34 @@
             "value_name": "VIEW"
           }
         ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
+        "name": "health",
+        "about": "Show authoritative process health from the management service",
         "exit_codes": [
           {
             "code": 0,
@@ -3125,6 +3339,42 @@
               "RS-1013",
               "RS-2001"
             ]
+          },
+          {
+            "name": "show",
+            "about": "Show one shard and its current lease",
+            "options": [
+              {
+                "name": "shard_id",
+                "help": "Shard ID",
+                "required": true,
+                "value_name": "SHARD_ID"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
           }
         ],
         "exit_codes": [
@@ -3552,6 +3802,13 @@
             "required": false,
             "value_name": "LISTEN",
             "default_value": "127.0.0.1:5432"
+          },
+          {
+            "name": "management_addr",
+            "long": "management-addr",
+            "help": "Address the typed management RPC listener binds to",
+            "required": false,
+            "value_name": "MANAGEMENT_ADDR"
           },
           {
             "name": "max_exchange_compression_states",
