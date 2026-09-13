@@ -56,6 +56,13 @@ message Node {
   string address = 2;
   string state = 3;
   string source_version = 4;
+  string role = 5;
+  double capacity_headroom = 6;
+  string host_id = 7;
+  string availability_zone = 8;
+  bool healthy = 9;
+  uint64 registered_at_ms = 10;
+  string lifecycle_state = 11;
 }
 
 message ListShardsRequest {
@@ -82,6 +89,9 @@ message Shard {
   string owner_node_id = 2;
   string state = 3;
   string source_version = 4;
+  uint64 lease_token = 5;
+  string key_range = 6;
+  bool key_range_known = 7;
 }
 
 message ListOperationsRequest {

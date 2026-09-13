@@ -2660,7 +2660,7 @@ mod tests {
                 storage: dir.path().to_path_buf(), role: "all".to_string(), control: None,
                 worker_id: None,
                 auth_mode: "off".to_string(), worker_location: WorkerLocation::default(),
-                worker_capabilities: WorkerCapabilities::default(), config, metrics_addr: None,
+                worker_capabilities: WorkerCapabilities::default(), config, node_config: None, metrics_addr: None,
                 listen_addr: None, raft_peers: None, raft_node_id: None, raft_bind: None,
                 raft_bootstrap: false, daemon: false, control_bind: None,
                 control_shared_storage: None, query_time_shard_dirs: Vec::new(),

@@ -18,6 +18,7 @@ Choose a path by what you need to do:
 - [Functions](reference/functions.md)
 - [SQL support](reference/sql-support.md)
 - [Catalog](reference/catalog.md)
+- [Management API](reference/management-api.md)
 - [Metrics](reference/metrics.md)
 - [Errors](reference/errors.md)
 

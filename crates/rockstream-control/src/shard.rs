@@ -192,6 +192,22 @@ impl ShardManager {
         self.force_acquire_with_heat_locked(&mut guard, shard_id, worker_id, heat_hint)
     }
 
+    /// Transfer a lease only if its complete fenced owner record is unchanged.
+    pub fn transfer_if_owner(
+        &self,
+        expected: &ShardLease,
+        worker_id: WorkerId,
+    ) -> Option<ShardLease> {
+        let mut guard = self.inner.write();
+        if guard.leases.get(&expected.shard_id) != Some(expected) {
+            return None;
+        }
+        let lease = ShardLease::new(expected.shard_id, worker_id, mint_token(&mut guard))
+            .with_heat_hint(expected.heat_hint.clone());
+        guard.leases.insert(expected.shard_id, lease.clone());
+        Some(lease)
+    }
+
     /// Force-acquire while explicitly carrying the latest heat summary.
     pub fn force_acquire_with_heat(
         &self,
@@ -426,6 +442,18 @@ mod tests {
         assert_eq!(lease.shard_id, ShardId(1));
         assert_eq!(lease.worker_id, WorkerId(10));
         assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn transfer_if_owner_fences_stale_lease_requests() {
+        let manager = mgr();
+        let original = manager.acquire(ShardId(9), WorkerId(10)).unwrap();
+        let transferred = manager.transfer_if_owner(&original, WorkerId(11)).unwrap();
+        assert_eq!(transferred.shard_id, ShardId(9));
+        assert_eq!(transferred.worker_id, WorkerId(11));
+        assert!(transferred.lease_token.0 > original.lease_token.0);
+        assert_eq!(manager.transfer_if_owner(&original, WorkerId(12)), None);
+        assert_eq!(manager.get(ShardId(9)), Some(transferred));
     }
 
     #[test]

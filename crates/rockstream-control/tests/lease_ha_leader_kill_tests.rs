@@ -78,7 +78,7 @@ async fn test_leader_sigkill_follower_takeover_lease_continuity() {
     let resp1 = send_and_recv(&mut stream_a, &req1).await;
     let reply1: ControlMessage = serde_json::from_str(resp1.trim()).unwrap();
     let lease1 = match reply1 {
-        ControlMessage::ShardAssigned { lease } => lease,
+        ControlMessage::ShardAssigned { lease, .. } => lease,
         other => panic!("Expected ShardAssigned, got: {other:?}"),
     };
     assert_eq!(lease1.shard_id, ShardId(10));
@@ -125,7 +125,7 @@ async fn test_leader_sigkill_follower_takeover_lease_continuity() {
     let resp2 = send_and_recv(&mut stream_b, &req2).await;
     let reply2: ControlMessage = serde_json::from_str(resp2.trim()).unwrap();
     let lease2 = match reply2 {
-        ControlMessage::ShardAssigned { lease } => lease,
+        ControlMessage::ShardAssigned { lease, .. } => lease,
         other => panic!("Expected ShardAssigned on takeover, got: {other:?}"),
     };
 
@@ -234,7 +234,7 @@ async fn test_deposed_leader_fenced_zero_dual_writer() {
     let resp_a = send_and_recv(&mut stream_a, &req_a).await;
     let reply_a: ControlMessage = serde_json::from_str(resp_a.trim()).unwrap();
     let _lease_a = match reply_a {
-        ControlMessage::ShardAssigned { lease } => lease,
+        ControlMessage::ShardAssigned { lease, .. } => lease,
         other => panic!("Expected ShardAssigned on Node A, got: {other:?}"),
     };
 
