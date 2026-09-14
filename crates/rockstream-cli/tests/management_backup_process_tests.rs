@@ -12,7 +12,7 @@ use rockstream_cli::output::{
 use rockstream_control::{CheckpointExportOutcome, CheckpointExportService};
 use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CreateBackupRequest,
-    Operation as WireOperation,
+    GetClusterStatusRequest, Operation as WireOperation,
 };
 use rockstream_storage::build_migration_object_store;
 use rockstream_types::checkpoint::ClusterCheckpoint;
@@ -40,6 +40,8 @@ fn start_embedded(
     storage: &Path,
     listen_addr: SocketAddr,
     management_addr: Option<SocketAddr>,
+    shared_management_storage: Option<&Path>,
+    worker_id: Option<u64>,
 ) -> RunningNode {
     let mut args = vec![
         "start".to_owned(),
@@ -54,6 +56,15 @@ fn start_embedded(
     ];
     if let Some(addr) = management_addr {
         args.extend(["--management-addr".to_owned(), addr.to_string()]);
+    }
+    if let Some(path) = shared_management_storage {
+        args.extend([
+            "--control-shared-storage".to_owned(),
+            path.display().to_string(),
+        ]);
+    }
+    if let Some(worker_id) = worker_id {
+        args.extend(["--worker-id".to_owned(), worker_id.to_string()]);
     }
     RunningNode(
         Command::new(binary)
@@ -90,6 +101,27 @@ async fn connect_gateway(addr: SocketAddr) -> Client {
                 "embedded gateway did not accept PostgreSQL connections: {error}"
             ),
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_management(management: SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(mut client) =
+            ManagementServiceClient::connect(format!("http://{management}")).await
+        {
+            if client
+                .get_cluster_status(GetClusterStatusRequest {
+                    protocol_version: 1,
+                })
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "management server did not start");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -467,7 +499,14 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
     let listen_addr = free_addr();
     let management_addr = free_addr();
     seed_backup_value(&storage).await;
-    let node = start_embedded(binary, &storage, listen_addr, Some(management_addr));
+    let node = start_embedded(
+        binary,
+        &storage,
+        listen_addr,
+        Some(management_addr),
+        None,
+        None,
+    );
 
     let client = connect_gateway(listen_addr).await;
     client
@@ -669,7 +708,14 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     let first_management = free_addr();
     seed_backup_value(&storage).await;
 
-    let first_node = start_embedded(binary, &storage, first_listen, Some(first_management));
+    let first_node = start_embedded(
+        binary,
+        &storage,
+        first_listen,
+        Some(first_management),
+        None,
+        None,
+    );
     let first_client = connect_gateway(first_listen).await;
     let accepted = submit_backup_request(first_management, &destination, idempotency_key).await;
     assert_eq!(
@@ -684,7 +730,14 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
 
     let second_listen = free_addr();
     let second_management = free_addr();
-    let second_node = start_embedded(binary, &storage, second_listen, Some(second_management));
+    let second_node = start_embedded(
+        binary,
+        &storage,
+        second_listen,
+        Some(second_management),
+        None,
+        None,
+    );
     let second_client = connect_gateway(second_listen).await;
     wait_for_registered_worker(binary, second_management, 1).await;
 
@@ -692,6 +745,25 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     assert_eq!(
         retried, completed,
         "same idempotency key must return the exact durable record"
+    );
+    let mut conflict_client =
+        ManagementServiceClient::connect(format!("http://{second_management}"))
+            .await
+            .expect("connect after restart for conflicting retry");
+    let conflict = conflict_client
+        .create_backup(CreateBackupRequest {
+            protocol_version: 1,
+            destination: root.path().join("different-backup").display().to_string(),
+            idempotency_key: idempotency_key.to_owned(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+    assert_eq!(
+        conflict.message(),
+        format!(
+            "idempotency key is already bound to operation {operation_id} with a different request"
+        )
     );
     let shown = run_operation_show(binary, second_management, &operation_id);
     let after_restart = assert_operation_transcript(
@@ -718,5 +790,76 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     assert_eq!(outcome.generation, generation);
     assert_eq!(outcome.status, "SUCCESS");
     drop(second_client);
+    drop(second_node);
+}
+
+#[tokio::test]
+async fn release_management_backup_idempotency_is_atomic_across_processes() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_rockstream"));
+    let root = TempDir::new().expect("create cross-process fixture");
+    let shared_storage = root.path().join("shared-control");
+    let first_management = free_addr();
+    let second_management = free_addr();
+    let first_node = start_embedded(
+        binary,
+        &root.path().join("control-one"),
+        free_addr(),
+        Some(first_management),
+        Some(&shared_storage),
+        Some(1),
+    );
+    let second_node = start_embedded(
+        binary,
+        &root.path().join("control-two"),
+        free_addr(),
+        Some(second_management),
+        Some(&shared_storage),
+        Some(2),
+    );
+    wait_for_management(first_management).await;
+    wait_for_management(second_management).await;
+
+    let destination = root.path().join("backup");
+    let idempotency_key = "v066-cross-process-idempotency-key";
+    let (first, second) = tokio::join!(
+        submit_backup_request(first_management, &destination, idempotency_key),
+        submit_backup_request(second_management, &destination, idempotency_key),
+    );
+    assert_eq!(
+        first.operation_id, second.operation_id,
+        "independent management processes must share one durable idempotency claim"
+    );
+    let completed = wait_for_backup_success(binary, first_management, &first.operation_id).await;
+    assert_eq!(completed.state, "succeeded");
+    let generation = format!("management-{}", first.operation_id);
+    let generation_root = destination.join("checkpoint-exports");
+    let mut generations: Vec<_> = std::fs::read_dir(&generation_root)
+        .expect("list backup generations from concurrent retries")
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    generations.sort();
+    assert_eq!(generations.as_slice(), std::slice::from_ref(&generation));
+    assert!(generation_root.join(&generation).join("commit").is_file());
+
+    let mut client = ManagementServiceClient::connect(format!("http://{second_management}"))
+        .await
+        .expect("connect to second management process");
+    let conflict = client
+        .create_backup(CreateBackupRequest {
+            protocol_version: 1,
+            destination: root.path().join("different-backup").display().to_string(),
+            idempotency_key: idempotency_key.to_owned(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+    assert_eq!(
+        conflict.message(),
+        format!(
+            "idempotency key is already bound to operation {} with a different request",
+            first.operation_id
+        )
+    );
+    drop(first_node);
     drop(second_node);
 }

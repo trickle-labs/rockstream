@@ -6,9 +6,11 @@ use rockstream_control::{
     ShardManager, TopologyCatalog,
 };
 use rockstream_management_proto::v1::{
-    management_service_client::ManagementServiceClient, CancelOperationRequest, DrainWorkerRequest,
-    GetHealthRequest, GetNodeRequest, GetOperationRequest, ListNodesRequest, MigrateShardRequest,
-    Operation,
+    management_service_client::ManagementServiceClient, CancelOperationRequest,
+    CreateBackupRequest, DrainWorkerRequest, GetCapabilitiesRequest, GetClusterStatusRequest,
+    GetConfigSummaryRequest, GetHealthRequest, GetNodeRequest, GetOperationRequest,
+    GetShardRequest, ListNodesRequest, ListOperationsRequest, ListShardsRequest,
+    MigrateShardRequest, Operation,
 };
 use rockstream_types::config::NodeConfig;
 use rockstream_types::ids::{ShardId, WorkerId};
@@ -138,18 +140,121 @@ async fn management_rejects_incompatible_versions_before_reading_state() {
     let server = service.start("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", server.addr);
     let mut client = ManagementServiceClient::connect(endpoint).await.unwrap();
-    let error = client
-        .list_nodes(ListNodesRequest {
+    macro_rules! assert_incompatible {
+        ($method:ident, $request:expr) => {{
+            let error = client.$method($request).await.unwrap_err();
+            assert_eq!(
+                error.code(),
+                tonic::Code::FailedPrecondition,
+                stringify!($method)
+            );
+            assert_eq!(
+                error.message(),
+                "unsupported protocol version 2; supported range is 1..=1",
+                stringify!($method)
+            );
+        }};
+    }
+    assert_incompatible!(
+        get_cluster_status,
+        GetClusterStatusRequest {
+            protocol_version: 2
+        }
+    );
+    assert_incompatible!(
+        list_nodes,
+        ListNodesRequest {
             protocol_version: 2,
             page_size: 0,
-            page_token: String::new(),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        error.message(),
-        "unsupported protocol version 2; supported range is 1..=1"
+            page_token: String::new()
+        }
+    );
+    assert_incompatible!(
+        get_node,
+        GetNodeRequest {
+            protocol_version: 2,
+            node_id: String::new()
+        }
+    );
+    assert_incompatible!(
+        list_shards,
+        ListShardsRequest {
+            protocol_version: 2,
+            page_size: 0,
+            page_token: String::new()
+        }
+    );
+    assert_incompatible!(
+        get_shard,
+        GetShardRequest {
+            protocol_version: 2,
+            shard_id: String::new()
+        }
+    );
+    assert_incompatible!(
+        list_operations,
+        ListOperationsRequest {
+            protocol_version: 2,
+            page_size: 0,
+            page_token: String::new()
+        }
+    );
+    assert_incompatible!(
+        get_operation,
+        GetOperationRequest {
+            protocol_version: 2,
+            operation_id: String::new()
+        }
+    );
+    assert_incompatible!(
+        get_config_summary,
+        GetConfigSummaryRequest {
+            protocol_version: 2
+        }
+    );
+    assert_incompatible!(
+        get_capabilities,
+        GetCapabilitiesRequest {
+            protocol_version: 2
+        }
+    );
+    assert_incompatible!(
+        get_health,
+        GetHealthRequest {
+            protocol_version: 2
+        }
+    );
+    assert_incompatible!(
+        drain_worker,
+        DrainWorkerRequest {
+            protocol_version: 2,
+            worker_id: String::new(),
+            idempotency_key: String::new()
+        }
+    );
+    assert_incompatible!(
+        migrate_shard,
+        MigrateShardRequest {
+            protocol_version: 2,
+            shard_id: String::new(),
+            target_node_id: String::new(),
+            idempotency_key: String::new()
+        }
+    );
+    assert_incompatible!(
+        create_backup,
+        CreateBackupRequest {
+            protocol_version: 2,
+            destination: String::new(),
+            idempotency_key: String::new()
+        }
+    );
+    assert_incompatible!(
+        cancel_operation,
+        CancelOperationRequest {
+            protocol_version: 2,
+            operation_id: String::new()
+        }
     );
     server.shutdown();
 }
