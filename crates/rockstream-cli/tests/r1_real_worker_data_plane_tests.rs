@@ -1,9 +1,20 @@
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rockstream_cli::output::{ManagementClusterStatusInfo, ManagementNodeInfo};
+use object_store::{local::LocalFileSystem, prefix::PrefixStore, ObjectStore};
+use rockstream_cli::output::{
+    ManagementClusterStatusInfo, ManagementNodeInfo, ManagementOperationInfo,
+};
+use rockstream_control::{ShardManager, ShardPersistentStore};
+use rockstream_management_proto::v1::{
+    management_service_client::ManagementServiceClient, GetOperationRequest, GetShardRequest,
+    ListShardsRequest, MigrateShardRequest,
+};
 use rockstream_runtime::data_plane::DataPlaneClient;
+use rockstream_storage::ShardDb;
+use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS, MINIO_USER};
 use rockstream_types::data_plane::WorkerExecutionStatus;
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -668,4 +679,223 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
         }],
     );
     assert!(topology_revision(&one_worker) > topology_revision(&two_workers));
+}
+
+#[tokio::test]
+async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_data() {
+    let root = tempfile::tempdir().unwrap();
+    let control_addr = free_addr();
+    let management_addr = free_addr();
+    let control_storage = root.path().join("migration-control");
+    let shared_control_storage = root.path().join("shared-control-state");
+    std::fs::create_dir_all(&control_storage).unwrap();
+    std::fs::create_dir_all(&shared_control_storage).unwrap();
+    let bucket = "v066-migration";
+    let (_minio, minio_port) = start_minio(bucket)
+        .await
+        .expect("release-process migration test requires Docker MinIO");
+
+    let shard_manager = ShardManager::new();
+    let old_lease = shard_manager.acquire(ShardId(77), WorkerId(601)).unwrap();
+    let control_store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(&shared_control_storage).unwrap());
+    ShardPersistentStore::new(control_store)
+        .save(&shard_manager.snapshot())
+        .await;
+    let worker_store = minio_object_store(minio_port, bucket);
+    let shard_store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(worker_store, "shards/77"));
+    let db = ShardDb::builder("db", shard_store)
+        .build()
+        .await
+        .expect("open seeded shard 77");
+    db.put(b"v066-migration-key", b"retained-after-migration")
+        .await
+        .unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+
+    let control = spawn(&[
+        "start",
+        "--storage",
+        control_storage.to_str().unwrap(),
+        "--role",
+        "control",
+        "--control-shared-storage",
+        shared_control_storage.to_str().unwrap(),
+        "--control-bind",
+        &control_addr,
+        "--management-addr",
+        &management_addr,
+        "--daemon",
+    ]);
+    let mut workers = Vec::new();
+    for worker_id in [601_u64, 602] {
+        let worker_id = worker_id.to_string();
+        let worker_storage = root.path().join(format!("worker-{worker_id}"));
+        std::fs::create_dir_all(&worker_storage).unwrap();
+        workers.push(
+            Command::new(env!("CARGO_BIN_EXE_rockstream"))
+                .args([
+                    "start",
+                    "--storage",
+                    worker_storage.to_str().unwrap(),
+                    "--role",
+                    "worker",
+                    "--control",
+                    &control_addr,
+                    "--worker-id",
+                    &worker_id,
+                ])
+                .env(
+                    "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
+                    format!("http://127.0.0.1:{minio_port}"),
+                )
+                .env("ROCKSTREAM_OBJECT_STORE_BUCKET", bucket)
+                .env("ROCKSTREAM_OBJECT_STORE_REGION", "us-east-1")
+                .env("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY", MINIO_USER)
+                .env("ROCKSTREAM_OBJECT_STORE_SECRET_KEY", MINIO_PASS)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    wait_for_registered_workers(&control_storage.join("audit.jsonl"), 2).await;
+    let processes = ManagementProcesses { control, workers };
+    wait_for_management_status_nodes(&management_addr, 2).await;
+
+    let endpoint = format!("http://{management_addr}");
+    let mut management = ManagementServiceClient::connect(endpoint)
+        .await
+        .expect("connect to release management process");
+    let shard_page = management
+        .list_shards(ListShardsRequest {
+            protocol_version: 1,
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .await
+        .expect("list release-process shards")
+        .into_inner();
+    assert_eq!(shard_page.shards.len(), 1);
+    let shard = &shard_page.shards[0];
+    assert_eq!(shard.shard_id, "77");
+    assert_eq!(shard.owner_node_id, "601");
+    assert_eq!(shard.lease_token, old_lease.lease_token.0);
+    let shard_id = shard.shard_id.clone();
+    let old_lease_token = shard.lease_token;
+    let target_node_id = 602_u64;
+    let request = MigrateShardRequest {
+        protocol_version: 1,
+        shard_id: shard_id.clone(),
+        target_node_id: target_node_id.to_string(),
+        idempotency_key: "v066-release-process-migration".to_owned(),
+    };
+    let accepted = management
+        .migrate_shard(request.clone())
+        .await
+        .expect("accept release-process migration")
+        .into_inner()
+        .operation
+        .expect("migration operation");
+    let retried = management
+        .migrate_shard(request)
+        .await
+        .expect("retry release-process migration")
+        .into_inner()
+        .operation
+        .expect("retried migration operation");
+    assert_eq!(retried.operation_id, accepted.operation_id);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let terminal = loop {
+        let operation = management
+            .get_operation(GetOperationRequest {
+                protocol_version: 1,
+                operation_id: accepted.operation_id.clone(),
+            })
+            .await
+            .expect("read release-process migration operation")
+            .into_inner()
+            .operation
+            .expect("persisted migration operation");
+        match operation.state.as_str() {
+            "succeeded" => break operation,
+            "failed" | "cancelled" => panic!("migration ended unexpectedly: {operation:?}"),
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "migration did not finish");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(terminal.kind, "migrate_shard");
+    assert_eq!(terminal.state, "succeeded");
+    assert_eq!(terminal.progress, "100%");
+    assert_eq!(terminal.phase, "completed");
+    assert_eq!(terminal.error_code, "");
+    assert!(terminal.next_steps.is_empty());
+    assert_eq!(terminal.source_version, "operation-record:2");
+
+    let current_shard = management
+        .get_shard(GetShardRequest {
+            protocol_version: 1,
+            shard_id,
+        })
+        .await
+        .expect("read migrated shard")
+        .into_inner()
+        .shard
+        .expect("migrated shard");
+    assert_eq!(current_shard.owner_node_id, target_node_id.to_string());
+    assert!(current_shard.lease_token > old_lease_token);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .env("RUST_LOG", "off")
+        .args([
+            "--output",
+            "json",
+            "--management",
+            &management_addr,
+            "--control",
+            "127.0.0.1:1",
+            "admin",
+            "operation",
+            "show",
+            &accepted.operation_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stderr, b"");
+    let operation: ManagementOperationInfo =
+        serde_json::from_slice(&output.stdout).expect("release CLI operation JSON");
+    assert_eq!(
+        output.stdout,
+        format!("{}\n", serde_json::to_string_pretty(&operation).unwrap()).as_bytes()
+    );
+    assert_eq!(operation.operation_id, accepted.operation_id);
+    assert_eq!(operation.kind, "migrate_shard");
+    assert_eq!(operation.state, "succeeded");
+    assert_eq!(operation.progress, "100%");
+    assert_eq!(operation.phase, "completed");
+    assert_eq!(operation.error_code, "");
+    assert!(operation.next_steps.is_empty());
+    assert_eq!(operation.source_version, "operation-record:2");
+
+    drop(management);
+    drop(processes);
+    let worker_store = minio_object_store(minio_port, bucket);
+    let shard_store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(worker_store, "shards/77"));
+    let db = ShardDb::builder("db", shard_store)
+        .build()
+        .await
+        .expect("reopen migrated shard after worker processes stop");
+    assert_eq!(
+        db.get(b"v066-migration-key")
+            .await
+            .unwrap()
+            .expect("migrated value")
+            .as_ref(),
+        b"retained-after-migration"
+    );
+    db.close().await.unwrap();
 }
