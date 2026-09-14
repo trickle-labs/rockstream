@@ -863,3 +863,45 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     drop(first_node);
     drop(second_node);
 }
+
+#[tokio::test]
+async fn release_management_backups_allocate_distinct_checkpoints_concurrently() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_rockstream"));
+    let root = TempDir::new().expect("create concurrent-backup fixture");
+    let storage = root.path().join("source-storage");
+    seed_backup_value(&storage).await;
+    let management = free_addr();
+    let node = start_embedded(binary, &storage, free_addr(), Some(management), None, None);
+    wait_for_management(management).await;
+    let first_destination = root.path().join("backup-one");
+    let second_destination = root.path().join("backup-two");
+    let (first, second) = tokio::join!(
+        submit_backup_request(management, &first_destination, "concurrent-backup-one"),
+        submit_backup_request(management, &second_destination, "concurrent-backup-two"),
+    );
+    assert_ne!(first.operation_id, second.operation_id);
+
+    let first = wait_for_backup_success(binary, management, &first.operation_id).await;
+    let second = wait_for_backup_success(binary, management, &second.operation_id).await;
+    assert_eq!(first.state, "succeeded");
+    assert_eq!(second.state, "succeeded");
+
+    let read_outcome = |destination: &Path, operation_id: &str| {
+        let generation = format!("management-{operation_id}");
+        let commit = destination
+            .join("checkpoint-exports")
+            .join(&generation)
+            .join("commit");
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(commit).expect("committed backup marker"))
+                .expect("commit marker JSON");
+        let outcome: CheckpointExportOutcome =
+            serde_json::from_value(record["outcome"].clone()).expect("checkpoint outcome");
+        assert_eq!(outcome.generation, generation);
+        outcome
+    };
+    let first_outcome = read_outcome(&first_destination, &first.operation_id);
+    let second_outcome = read_outcome(&second_destination, &second.operation_id);
+    assert_ne!(first_outcome.checkpoint_id, second_outcome.checkpoint_id);
+    drop(node);
+}
