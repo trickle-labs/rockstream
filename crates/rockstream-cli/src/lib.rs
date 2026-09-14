@@ -757,7 +757,32 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
                 );
                 if let Some(addr) = &node_config.control.management_addr {
-                    service = service.with_management(addr.clone(), store, node_config.clone());
+                    let management_store = if let Some(shared_dir) = &opts.control_shared_storage {
+                        fs::create_dir_all(shared_dir).map_err(|e| {
+                            CliError::new(
+                                RS_0003,
+                                format!("failed to create management shared-storage dir: {e}"),
+                                "Check filesystem permissions for --control-shared-storage.",
+                            )
+                        })?;
+                        Arc::new(
+                            object_store::local::LocalFileSystem::new_with_prefix(shared_dir)
+                                .map_err(|e| {
+                                    CliError::new(
+                                        RS_0003,
+                                        format!("failed to open management shared storage: {e}"),
+                                        "Check filesystem permissions for --control-shared-storage.",
+                                    )
+                                })?,
+                        ) as Arc<dyn object_store::ObjectStore>
+                    } else {
+                        store.clone()
+                    };
+                    service = service.with_management(
+                        addr.clone(),
+                        management_store,
+                        node_config.clone(),
+                    );
                 }
             }
             let handle = service.start("127.0.0.1:0").await.unwrap();
