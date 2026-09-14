@@ -432,6 +432,11 @@ impl ControlService {
     /// Returns a [`ControlServiceHandle`] which can be used to query the
     /// bound address and send a shutdown signal.
     pub async fn start(self, bind_addr: &str) -> io::Result<ControlServiceHandle> {
+        if self.raft.is_none() && self.shard_manager.is_empty() {
+            if let Some(store) = &self.shard_store {
+                self.shard_manager.restore(store.load().await);
+            }
+        }
         if let Some(store) = &self.topology_store {
             if let Ok(workers) = store.load_all().await {
                 self.catalog.restore_workers(workers);
