@@ -13,7 +13,7 @@ use rockstream_gateway::{
 };
 use rockstream_storage::ShardDb;
 use tempfile::TempDir;
-use testcontainers::core::WaitFor;
+use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use tokio_postgres::NoTls;
@@ -177,6 +177,7 @@ async fn pgoutput_aggregate_rows(
         "Docker is required for the PostgreSQL CDC matrix proof"
     );
     let postgres = GenericImage::new("postgres", "11-alpine")
+        .with_exposed_port(ContainerPort::Tcp(5432))
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
         ))
@@ -572,6 +573,7 @@ async fn pgoutput_join_rows(
         "Docker is required for the PostgreSQL CDC matrix proof"
     );
     let postgres = GenericImage::new("postgres", "11-alpine")
+        .with_exposed_port(ContainerPort::Tcp(5432))
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
         ))
@@ -871,6 +873,7 @@ async fn pgoutput_window_rows(
         "Docker is required for the PostgreSQL CDC matrix proof"
     );
     let postgres = GenericImage::new("postgres", "11-alpine")
+        .with_exposed_port(ContainerPort::Tcp(5432))
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
         ))

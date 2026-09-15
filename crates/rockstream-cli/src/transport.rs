@@ -30,11 +30,15 @@ use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 use crate::output::{
     BackupCreateOutput, BackupInspectOutput, BackupVerifyOutput, CheckpointAlignmentInfo,
     CheckpointExportOutcome, CheckpointSummary, ClusterQuotasInfo, ClusterResourceUsageInfo,
-    ClusterStatusInfo, DrainOutcome, MigrationOutcome, MutationOutcome, QueryResult,
-    ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo,
-    SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail,
-    SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary,
-    WorkerStatusInfo, WorkloadDetail, WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
+    ClusterStatusInfo, DrainOutcome, ManagementCapabilitiesInfo, ManagementClusterStatusInfo,
+    ManagementConfigSummaryInfo, ManagementConfigValue, ManagementHealthInfo,
+    ManagementNodeDetailInfo, ManagementNodeInfo, ManagementNodesInfo, ManagementOperationInfo,
+    ManagementOperationsInfo, ManagementShardDetailInfo, ManagementShardInfo, ManagementShardsInfo,
+    MigrationOutcome, MutationOutcome, QueryResult, ResourceUsageInfo, RestoreOutcome,
+    SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo, SchemaEvolutionStatusInfo,
+    SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail, SourceSummary, SubscribeEvent,
+    SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary, WorkerStatusInfo, WorkloadDetail,
+    WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
 };
 use crate::CliError;
 
@@ -143,6 +147,602 @@ impl ClientIdentity {
 /// Unified CLI transport trait.
 pub trait CliTransport: Send + Sync {
     fn identity(&self) -> &ClientIdentity;
+}
+
+pub struct ManagementClient {
+    client: rockstream_management_proto::v1::management_service_client::ManagementServiceClient<
+        tonic::transport::Channel,
+    >,
+}
+
+#[allow(clippy::result_large_err)]
+impl ManagementClient {
+    pub async fn connect(addr: impl AsRef<str>) -> Result<Self, tonic::transport::Error> {
+        let addr = addr.as_ref();
+        let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
+            addr.to_owned()
+        } else {
+            format!("http://{addr}")
+        };
+        Ok(Self {
+            client:
+                rockstream_management_proto::v1::management_service_client::ManagementServiceClient::connect(endpoint)
+                    .await?,
+        })
+    }
+
+    pub async fn get_cluster_status(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetClusterStatusRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::GetClusterStatusResponse>,
+        tonic::Status,
+    > {
+        self.client.get_cluster_status(request).await
+    }
+
+    pub async fn list_nodes(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::ListNodesRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::ListNodesResponse>, tonic::Status>
+    {
+        self.client.list_nodes(request).await
+    }
+
+    pub async fn get_node(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetNodeRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetNodeResponse>, tonic::Status>
+    {
+        self.client.get_node(request).await
+    }
+
+    pub async fn list_shards(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::ListShardsRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::ListShardsResponse>, tonic::Status>
+    {
+        self.client.list_shards(request).await
+    }
+
+    pub async fn get_shard(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetShardRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetShardResponse>, tonic::Status>
+    {
+        self.client.get_shard(request).await
+    }
+
+    pub async fn list_operations(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::ListOperationsRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::ListOperationsResponse>,
+        tonic::Status,
+    > {
+        self.client.list_operations(request).await
+    }
+
+    pub async fn get_operation(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetOperationRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetOperationResponse>, tonic::Status>
+    {
+        self.client.get_operation(request).await
+    }
+
+    pub async fn get_config_summary(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetConfigSummaryRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::GetConfigSummaryResponse>,
+        tonic::Status,
+    > {
+        self.client.get_config_summary(request).await
+    }
+
+    pub async fn get_capabilities(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetCapabilitiesRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::GetCapabilitiesResponse>,
+        tonic::Status,
+    > {
+        self.client.get_capabilities(request).await
+    }
+
+    pub async fn get_health(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetHealthRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetHealthResponse>, tonic::Status>
+    {
+        self.client.get_health(request).await
+    }
+
+    pub async fn drain_worker(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::DrainWorkerRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::DrainWorkerResponse>, tonic::Status>
+    {
+        self.client.drain_worker(request).await
+    }
+
+    pub async fn migrate_shard(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::MigrateShardRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::MigrateShardResponse>, tonic::Status>
+    {
+        self.client.migrate_shard(request).await
+    }
+
+    pub async fn create_backup(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::CreateBackupRequest>,
+    ) -> Result<tonic::Response<rockstream_management_proto::v1::CreateBackupResponse>, tonic::Status>
+    {
+        self.client.create_backup(request).await
+    }
+
+    pub async fn cancel_operation(
+        &mut self,
+        request: impl tonic::IntoRequest<rockstream_management_proto::v1::CancelOperationRequest>,
+    ) -> Result<
+        tonic::Response<rockstream_management_proto::v1::CancelOperationResponse>,
+        tonic::Status,
+    > {
+        self.client.cancel_operation(request).await
+    }
+}
+
+pub struct ManagementCliClient {
+    runtime: tokio::runtime::Runtime,
+    client: ManagementClient,
+}
+
+impl ManagementCliClient {
+    pub fn connect(addr: &str) -> Result<Self, CliError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| management_client_error("create runtime", error.to_string()))?;
+        let client = runtime
+            .block_on(ManagementClient::connect(addr))
+            .map_err(|error| management_client_error("connect", error.to_string()))?;
+        Ok(Self { runtime, client })
+    }
+
+    pub fn cluster_status(&mut self) -> Result<ManagementClusterStatusInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(self.client.get_cluster_status(
+                rockstream_management_proto::v1::GetClusterStatusRequest {
+                    protocol_version: 1,
+                },
+            ))
+            .map_err(|error| management_status_error("GetClusterStatus", error))?
+            .into_inner();
+        Ok(ManagementClusterStatusInfo {
+            observed_at: response.observed_at,
+            source_version: response.source_version,
+            state: response.state,
+            nodes: response
+                .nodes
+                .into_iter()
+                .map(management_node)
+                .collect::<Result<_, _>>()?,
+            active_operations: response.active_operations,
+            retained_operations: response.retained_operations,
+            request_fill: response.request_fill,
+            request_capacity: response.request_capacity,
+            ack_waiter_fill: response.ack_waiter_fill,
+            ack_waiter_capacity: response.ack_waiter_capacity,
+        })
+    }
+
+    pub fn list_nodes(&mut self) -> Result<ManagementNodesInfo, CliError> {
+        let runtime = &self.runtime;
+        let client = &mut self.client;
+        let (observed_at, source_version, nodes) = runtime
+            .block_on(async {
+                let mut token = String::new();
+                let mut metadata = None;
+                let mut nodes = Vec::new();
+                loop {
+                    let response = client
+                        .list_nodes(rockstream_management_proto::v1::ListNodesRequest {
+                            protocol_version: 1,
+                            page_size: 100,
+                            page_token: token,
+                        })
+                        .await?;
+                    let response = response.into_inner();
+                    metadata.get_or_insert_with(|| {
+                        (
+                            response.observed_at.clone(),
+                            response.source_version.clone(),
+                        )
+                    });
+                    nodes.extend(
+                        response
+                            .nodes
+                            .into_iter()
+                            .map(management_node)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| tonic::Status::internal(error.message))?,
+                    );
+                    token = response.next_page_token;
+                    if token.is_empty() {
+                        break;
+                    }
+                }
+                let (observed_at, source_version) = metadata.unwrap_or_default();
+                Ok::<_, tonic::Status>((observed_at, source_version, nodes))
+            })
+            .map_err(|error| management_status_error("ListNodes", error))?;
+        Ok(ManagementNodesInfo {
+            observed_at,
+            source_version,
+            nodes,
+        })
+    }
+
+    pub fn get_node(&mut self, node_id: u64) -> Result<ManagementNodeDetailInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(
+                self.client
+                    .get_node(rockstream_management_proto::v1::GetNodeRequest {
+                        protocol_version: 1,
+                        node_id: node_id.to_string(),
+                    }),
+            )
+            .map_err(|error| management_status_error("GetNode", error))?
+            .into_inner();
+        Ok(ManagementNodeDetailInfo {
+            observed_at: response.observed_at,
+            source_version: response.source_version,
+            node: management_node(response.node.ok_or_else(|| {
+                management_client_error("GetNode", "server returned no node".to_owned())
+            })?)?,
+        })
+    }
+
+    pub fn list_shards(&mut self) -> Result<ManagementShardsInfo, CliError> {
+        let runtime = &self.runtime;
+        let client = &mut self.client;
+        let (observed_at, source_version, shards) = runtime
+            .block_on(async {
+                let mut token = String::new();
+                let mut metadata = None;
+                let mut shards = Vec::new();
+                loop {
+                    let response = client
+                        .list_shards(rockstream_management_proto::v1::ListShardsRequest {
+                            protocol_version: 1,
+                            page_size: 100,
+                            page_token: token,
+                        })
+                        .await?;
+                    let response = response.into_inner();
+                    metadata.get_or_insert_with(|| {
+                        (
+                            response.observed_at.clone(),
+                            response.source_version.clone(),
+                        )
+                    });
+                    shards.extend(
+                        response
+                            .shards
+                            .into_iter()
+                            .map(management_shard)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| tonic::Status::internal(error.message))?,
+                    );
+                    token = response.next_page_token;
+                    if token.is_empty() {
+                        break;
+                    }
+                }
+                let (observed_at, source_version) = metadata.unwrap_or_default();
+                Ok::<_, tonic::Status>((observed_at, source_version, shards))
+            })
+            .map_err(|error| management_status_error("ListShards", error))?;
+        Ok(ManagementShardsInfo {
+            observed_at,
+            source_version,
+            shards,
+        })
+    }
+
+    pub fn get_shard(&mut self, shard_id: u64) -> Result<ManagementShardDetailInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(
+                self.client
+                    .get_shard(rockstream_management_proto::v1::GetShardRequest {
+                        protocol_version: 1,
+                        shard_id: shard_id.to_string(),
+                    }),
+            )
+            .map_err(|error| management_status_error("GetShard", error))?
+            .into_inner();
+        Ok(ManagementShardDetailInfo {
+            observed_at: response.observed_at,
+            source_version: response.source_version,
+            shard: management_shard(response.shard.ok_or_else(|| {
+                management_client_error("GetShard", "server returned no shard".to_owned())
+            })?)?,
+        })
+    }
+
+    pub fn list_operations(&mut self) -> Result<ManagementOperationsInfo, CliError> {
+        let runtime = &self.runtime;
+        let client = &mut self.client;
+        let (observed_at, source_version, operations) = runtime
+            .block_on(async {
+                let mut token = String::new();
+                let mut metadata = None;
+                let mut operations = Vec::new();
+                loop {
+                    let response = client
+                        .list_operations(rockstream_management_proto::v1::ListOperationsRequest {
+                            protocol_version: 1,
+                            page_size: 100,
+                            page_token: token,
+                        })
+                        .await?;
+                    let response = response.into_inner();
+                    metadata.get_or_insert_with(|| {
+                        (
+                            response.observed_at.clone(),
+                            response.source_version.clone(),
+                        )
+                    });
+                    operations.extend(response.operations.into_iter().map(management_operation));
+                    token = response.next_page_token;
+                    if token.is_empty() {
+                        break;
+                    }
+                }
+                let (observed_at, source_version) = metadata.unwrap_or_default();
+                Ok::<_, tonic::Status>((observed_at, source_version, operations))
+            })
+            .map_err(|error| management_status_error("ListOperations", error))?;
+        Ok(ManagementOperationsInfo {
+            observed_at,
+            source_version,
+            operations,
+        })
+    }
+
+    pub fn get_operation(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<ManagementOperationInfo, CliError> {
+        self.runtime
+            .block_on(self.client.get_operation(
+                rockstream_management_proto::v1::GetOperationRequest {
+                    protocol_version: 1,
+                    operation_id: operation_id.to_owned(),
+                },
+            ))
+            .map(|response| response.into_inner().operation)
+            .map_err(|error| management_status_error("GetOperation", error))?
+            .map(management_operation)
+            .ok_or_else(|| {
+                management_client_error("GetOperation", "server returned no operation".to_owned())
+            })
+    }
+
+    pub fn config_summary(&mut self) -> Result<ManagementConfigSummaryInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(self.client.get_config_summary(
+                rockstream_management_proto::v1::GetConfigSummaryRequest {
+                    protocol_version: 1,
+                },
+            ))
+            .map_err(|error| management_status_error("GetConfigSummary", error))?
+            .into_inner();
+        Ok(ManagementConfigSummaryInfo {
+            observed_at: response.observed_at,
+            source_version: response.source_version,
+            values: response
+                .values
+                .into_iter()
+                .map(|value| ManagementConfigValue {
+                    key: value.key,
+                    value: value.value,
+                    redacted: value.redacted,
+                })
+                .collect(),
+        })
+    }
+
+    pub fn capabilities(&mut self) -> Result<ManagementCapabilitiesInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(self.client.get_capabilities(
+                rockstream_management_proto::v1::GetCapabilitiesRequest {
+                    protocol_version: 1,
+                },
+            ))
+            .map_err(|error| management_status_error("GetCapabilities", error))?
+            .into_inner();
+        Ok(ManagementCapabilitiesInfo {
+            observed_at: response.observed_at,
+            source_version: response.source_version,
+            capabilities: response.capabilities,
+        })
+    }
+
+    pub fn health(&mut self) -> Result<ManagementHealthInfo, CliError> {
+        let response =
+            self.runtime
+                .block_on(self.client.get_health(
+                    rockstream_management_proto::v1::GetHealthRequest {
+                        protocol_version: 1,
+                    },
+                ))
+                .map_err(|error| management_status_error("GetHealth", error))?
+                .into_inner();
+        Ok(ManagementHealthInfo {
+            observed_at: response.observed_at,
+            source_version: response.source_version,
+            state: response.state,
+            reason: response.reason,
+        })
+    }
+
+    pub fn drain_worker(&mut self, worker_id: u64) -> Result<ManagementOperationInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(self.client.drain_worker(
+                rockstream_management_proto::v1::DrainWorkerRequest {
+                    protocol_version: 1,
+                    worker_id: worker_id.to_string(),
+                    idempotency_key: uuid::Uuid::new_v4().to_string(),
+                },
+            ))
+            .map_err(|error| management_status_error("DrainWorker", error))?
+            .into_inner();
+        response.operation.map(management_operation).ok_or_else(|| {
+            management_client_error("DrainWorker", "server returned no operation".to_owned())
+        })
+    }
+
+    pub fn migrate_shard(
+        &mut self,
+        shard_id: u64,
+        target_node_id: u64,
+    ) -> Result<ManagementOperationInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(self.client.migrate_shard(
+                rockstream_management_proto::v1::MigrateShardRequest {
+                    protocol_version: 1,
+                    shard_id: shard_id.to_string(),
+                    target_node_id: target_node_id.to_string(),
+                    idempotency_key: uuid::Uuid::new_v4().to_string(),
+                },
+            ))
+            .map_err(|error| management_status_error("MigrateShard", error))?
+            .into_inner();
+        response.operation.map(management_operation).ok_or_else(|| {
+            management_client_error("MigrateShard", "server returned no operation".to_owned())
+        })
+    }
+
+    pub fn create_backup(
+        &mut self,
+        destination: &str,
+    ) -> Result<ManagementOperationInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(self.client.create_backup(
+                rockstream_management_proto::v1::CreateBackupRequest {
+                    protocol_version: 1,
+                    destination: destination.to_owned(),
+                    idempotency_key: uuid::Uuid::new_v4().to_string(),
+                },
+            ))
+            .map_err(|error| management_status_error("CreateBackup", error))?
+            .into_inner();
+        response.operation.map(management_operation).ok_or_else(|| {
+            management_client_error("CreateBackup", "server returned no operation".to_owned())
+        })
+    }
+
+    pub fn cancel_operation(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<ManagementOperationInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(self.client.cancel_operation(
+                rockstream_management_proto::v1::CancelOperationRequest {
+                    protocol_version: 1,
+                    operation_id: operation_id.to_owned(),
+                },
+            ))
+            .map_err(|error| management_status_error("CancelOperation", error))?
+            .into_inner();
+        response.operation.map(management_operation).ok_or_else(|| {
+            management_client_error("CancelOperation", "server returned no operation".to_owned())
+        })
+    }
+}
+
+fn management_status_error(method: &str, error: tonic::Status) -> CliError {
+    management_client_error(method, format!("{}: {}", error.code(), error.message()))
+}
+
+fn management_client_error(method: &str, message: String) -> CliError {
+    CliError::new(
+        RS_0003,
+        format!("management {method} failed: {message}"),
+        "Check the management endpoint, protocol compatibility, and server logs.",
+    )
+}
+
+fn management_node(
+    node: rockstream_management_proto::v1::Node,
+) -> Result<ManagementNodeInfo, CliError> {
+    let node_id = node
+        .node_id
+        .parse::<u64>()
+        .map_err(|error| management_client_error("decode Node", error.to_string()))?;
+    Ok(ManagementNodeInfo {
+        node_id,
+        role: node.role,
+        address: node.address,
+        state: node.state,
+        capacity_headroom: node.capacity_headroom,
+        host_id: node.host_id,
+        availability_zone: node.availability_zone,
+        healthy: node.healthy,
+        lifecycle_state: node.lifecycle_state,
+        registered_at_ms: node.registered_at_ms,
+        source_version: node.source_version,
+    })
+}
+
+fn management_shard(
+    shard: rockstream_management_proto::v1::Shard,
+) -> Result<ManagementShardInfo, CliError> {
+    let shard_id = shard
+        .shard_id
+        .parse::<u64>()
+        .map_err(|error| management_client_error("decode Shard", error.to_string()))?;
+    let owner_node_id = shard
+        .owner_node_id
+        .parse::<u64>()
+        .map_err(|error| management_client_error("decode Shard", error.to_string()))?;
+    Ok(ManagementShardInfo {
+        shard_id,
+        owner_node_id,
+        state: shard.state,
+        lease_token: shard.lease_token,
+        key_range: shard.key_range_known.then_some(shard.key_range),
+        source_version: shard.source_version,
+    })
+}
+
+fn management_operation(
+    operation: rockstream_management_proto::v1::Operation,
+) -> ManagementOperationInfo {
+    ManagementOperationInfo {
+        operation_id: operation.operation_id,
+        kind: operation.kind,
+        state: operation.state,
+        started_at: operation.started_at,
+        updated_at: operation.updated_at,
+        progress: operation.progress,
+        phase: operation.phase,
+        error_code: operation.error_code,
+        next_steps: operation.next_steps,
+        source_version: operation.source_version,
+    }
 }
 
 // ─── API Traits ──────────────────────────────────────────────────────────────

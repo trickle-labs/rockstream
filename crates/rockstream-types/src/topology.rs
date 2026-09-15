@@ -40,11 +40,12 @@ impl std::fmt::Display for NodeRole {
     }
 }
 
-/// Fraction of available capacity on a worker node, in [0.0, 1.0].
+/// Fraction of physical memory currently available on a worker host, in [0.0, 1.0].
 ///
-/// 1.0 means the worker is completely idle; 0.0 means it is saturated.
+/// 1.0 means all physical pages are available; 0.0 means none are available.
 /// The placement algorithm prefers workers with higher `capacity_headroom`
-/// when assigning shards or operator instances.
+/// when assigning shards or operator instances. This is a memory signal, not a
+/// measure of CPU utilization.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CapacityHeadroom(pub f64);
 
@@ -122,6 +123,9 @@ pub struct WorkerCapabilities {
     /// Supports compressed checkpoint-manifest codec framing.
     #[serde(default)]
     pub checkpoint_manifest_codec_v1: bool,
+    /// Identifies the shared object store used for durable shard data.
+    #[serde(default)]
+    pub shared_shard_store_id: Option<[u8; 32]>,
 }
 
 /// Registration request sent by a worker to the control plane.
@@ -306,6 +310,20 @@ pub enum ControlMessage {
     /// current [`LeaseToken`].
     ShardAssigned {
         /// The new lease (includes shard_id, worker_id, lease_token).
+        lease: ShardLease,
+        /// Set only when assignment is part of a management migration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+    },
+    /// Flush and close one shard before the control plane transfers its lease.
+    PrepareShardTransfer {
+        operation_id: String,
+        lease: ShardLease,
+    },
+    /// Create a durable SlateDB checkpoint for an idle shard.
+    CreateShardCheckpoint {
+        request_id: String,
+        checkpoint_id: crate::checkpoint::CheckpointId,
         lease: ShardLease,
     },
     /// The control plane has revoked a previously assigned shard lease.
@@ -819,6 +837,27 @@ pub enum WorkerMessage {
         worker_id: WorkerId,
         shards_remaining: u32,
     },
+    /// A worker confirms that one migration stage completed.
+    ShardTransferAck {
+        operation_id: String,
+        stage: String,
+        worker_id: WorkerId,
+        shard_id: ShardId,
+        lease_token: crate::ids::LeaseToken,
+        success: bool,
+        error: Option<String>,
+    },
+    /// Worker reports the exact durable SlateDB snapshot created for a shard.
+    ShardCheckpointAck {
+        request_id: String,
+        checkpoint_id: crate::checkpoint::CheckpointId,
+        worker_id: WorkerId,
+        shard_id: ShardId,
+        lease_token: crate::ids::LeaseToken,
+        shard_checkpoint_id: Option<u64>,
+        snapshot_id: Option<String>,
+        error: Option<String>,
+    },
     /// Worker reports its updated lifecycle state (v0.38).
     LifecycleState {
         worker_id: WorkerId,
@@ -883,6 +922,7 @@ mod tests {
             same_host_arrow_shm_v1: true,
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: true,
+            shared_shard_store_id: None,
         });
         let json = serde_json::to_string(&reg).unwrap();
         let decoded: WorkerRegistration = serde_json::from_str(&json).unwrap();
@@ -961,6 +1001,7 @@ mod tests {
             same_host_arrow_shm_v1: true,
             shuffle_codec_v1: false,
             checkpoint_manifest_codec_v1: true,
+            shared_shard_store_id: None,
         });
         let info = WorkerInfo::from_registration(&reg);
         assert_eq!(info.worker_id, WorkerId(5));

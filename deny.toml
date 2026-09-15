@@ -1,5 +1,6 @@
 [advisories]
 version = 2
+unused-ignored-advisory = "allow"
 # Transitive deps from SlateDB that are unmaintained but not a security concern.
 ignore = [
     "RUSTSEC-2025-0141", # bincode - unmaintained (SlateDB transitive dep)

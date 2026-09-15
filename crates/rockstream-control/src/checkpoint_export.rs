@@ -215,7 +215,7 @@ impl CheckpointExportService {
         prefix: &Path,
     ) -> Result<Vec<Path>, CheckpointExportError> {
         let mut objects = Self::list_export_objects(source, prefix).await?;
-        objects.retain(|path| !is_shard_path(path));
+        objects.retain(|path| !is_shard_path(path) && !is_uncheckpointed_operational_path(path));
         for (shard_id, shard_checkpoint) in &checkpoint.shards {
             let shard_path = format!("shards/{}", shard_id.0);
             let shard_objects = match shard_checkpoint.snapshot_id.as_deref() {
@@ -576,8 +576,20 @@ impl CheckpointExportService {
             .await?
         {
             Some(existing) if existing != generation_record => {
+                if existing.checkpoint_id == generation_record.checkpoint_id
+                    && existing.object_count == generation_record.object_count
+                {
+                    return Err(CheckpointExportError::InFlight);
+                }
                 return Err(CheckpointExportError::Integrity(
-                    "existing generation record belongs to a different checkpoint".to_string(),
+                    format!(
+                        "existing generation record conflicts with retry: checkpoint_equal={}, checkpoint_ids={}/{}, object_counts={}/{}",
+                        existing.checkpoint == generation_record.checkpoint,
+                        existing.checkpoint_id.0,
+                        generation_record.checkpoint_id.0,
+                        existing.object_count,
+                        generation_record.object_count,
+                    ),
                 ));
             }
             Some(_) => {}
@@ -609,7 +621,8 @@ impl CheckpointExportService {
             {
                 if existing != record {
                     return Err(CheckpointExportError::Integrity(format!(
-                        "inventory record {index} does not match the selected checkpoint"
+                        "inventory record {index} for source {} does not match the selected checkpoint",
+                        record.source
                     )));
                 }
                 let existing_bytes = self
@@ -753,17 +766,26 @@ fn is_shard_path(path: &Path) -> bool {
     parts.next() == Some("shards") && parts.next().is_some()
 }
 
+fn is_uncheckpointed_operational_path(path: &Path) -> bool {
+    let path = path.as_ref();
+    path == "audit.jsonl"
+        || path.starts_with("control/management-operations/")
+        || path.starts_with("topology/workers/")
+}
+
 async fn snapshot_object_paths(
     source: Arc<dyn ObjectStore>,
     shard_path: &str,
     snapshot_id: &str,
 ) -> Result<Vec<Path>, CheckpointExportError> {
+    let shard_path = resolve_shard_db_path(&source, shard_path).await?;
     let checkpoint_id = Uuid::parse_str(snapshot_id).map_err(|error| {
         CheckpointExportError::Integrity(format!(
             "invalid SlateDB snapshot id `{snapshot_id}`: {error}"
         ))
     })?;
-    let admin = slatedb::admin::AdminBuilder::new(Path::from(shard_path), source.clone()).build();
+    let admin =
+        slatedb::admin::AdminBuilder::new(Path::from(shard_path.as_str()), source.clone()).build();
     let checkpoint = admin
         .list_checkpoints(None)
         .await
@@ -775,7 +797,7 @@ async fn snapshot_object_paths(
                 "SlateDB snapshot `{snapshot_id}` is not present in shard `{shard_path}`"
             ))
         })?;
-    manifest_object_paths(source, shard_path, checkpoint.manifest_id).await
+    manifest_object_paths_at(source, &shard_path, checkpoint.manifest_id).await
 }
 
 async fn manifest_object_paths(
@@ -783,7 +805,37 @@ async fn manifest_object_paths(
     shard_path: &str,
     manifest_id: u64,
 ) -> Result<Vec<Path>, CheckpointExportError> {
-    let admin = slatedb::admin::AdminBuilder::new(Path::from(shard_path), source).build();
+    let shard_path = resolve_shard_db_path(&source, shard_path).await?;
+    manifest_object_paths_at(source, &shard_path, manifest_id).await
+}
+
+async fn resolve_shard_db_path(
+    source: &Arc<dyn ObjectStore>,
+    shard_path: &str,
+) -> Result<String, CheckpointExportError> {
+    let current = format!("{shard_path}/db");
+    let mut listing = source.list(Some(&Path::from(current.clone())));
+    match listing.next().await {
+        Some(Ok(_)) => return Ok(current),
+        Some(Err(error)) => return Err(CheckpointExportError::ObjectStore(error.to_string())),
+        None => {}
+    }
+    let mut listing = source.list(Some(&Path::from(shard_path)));
+    match listing.next().await {
+        Some(Ok(_)) => Ok(shard_path.to_owned()),
+        Some(Err(error)) => Err(CheckpointExportError::ObjectStore(error.to_string())),
+        None => Err(CheckpointExportError::Integrity(format!(
+            "SlateDB database for shard `{shard_path}` is missing"
+        ))),
+    }
+}
+
+async fn manifest_object_paths_at(
+    source: Arc<dyn ObjectStore>,
+    shard_path: &str,
+    manifest_id: u64,
+) -> Result<Vec<Path>, CheckpointExportError> {
+    let admin = slatedb::admin::AdminBuilder::new(Path::from(shard_path), source.clone()).build();
     let manifest = admin
         .read_manifest(Some(manifest_id))
         .await
@@ -793,6 +845,11 @@ async fn manifest_object_paths(
                 "SlateDB manifest {manifest_id} for shard `{shard_path}` is missing"
             ))
         })?;
+    if manifest.wal_object_store_uri().is_some() {
+        return Err(CheckpointExportError::Integrity(
+            "checkpoint uses a separate WAL object store that is not attached for export".into(),
+        ));
+    }
 
     let mut objects = BTreeSet::new();
     objects.insert(Path::from(format!(
@@ -839,6 +896,31 @@ async fn manifest_object_paths(
                 }
             };
             objects.insert(Path::from(path));
+        }
+    }
+    let wal_prefix = Path::from(format!("{shard_path}/wal"));
+    let mut wal_objects = source.list(Some(&wal_prefix));
+    let first_wal_id = manifest.replay_after_wal_id().saturating_add(1);
+    let next_wal_id = manifest.next_wal_sst_id();
+    let mut scanned_wal_objects = 0;
+    while let Some(meta) = wal_objects.next().await {
+        let meta = meta.map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
+        scanned_wal_objects += 1;
+        if scanned_wal_objects > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
+            return Err(CheckpointExportError::Integrity(format!(
+                "checkpoint WAL scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}"
+            )));
+        }
+        let Some(wal_id) = meta
+            .location
+            .filename()
+            .and_then(|filename| filename.strip_suffix(".sst"))
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if wal_id >= first_wal_id && wal_id < next_wal_id {
+            objects.insert(meta.location);
         }
     }
     Ok(objects.into_iter().collect())
@@ -898,12 +980,138 @@ mod tests {
     use std::sync::Arc;
 
     use object_store::{memory::InMemory, path::Path, ObjectStore};
-    use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
+    use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
+    use rockstream_types::ids::ShardId;
 
     use super::*;
 
     fn checkpoint() -> ClusterCheckpoint {
         ClusterCheckpoint::new(CheckpointId(7))
+    }
+
+    #[tokio::test]
+    async fn checkpoint_export_selects_runtime_db_namespace_and_legacy_namespace() {
+        for (name, db_path, expected_root) in [
+            ("runtime", "db", "shards/1/db/"),
+            ("legacy", "shards/1", "shards/1/"),
+        ] {
+            let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let destination: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let db_store: Arc<dyn ObjectStore> = if name == "runtime" {
+                Arc::new(object_store::prefix::PrefixStore::new(
+                    source.clone(),
+                    "shards/1",
+                ))
+            } else {
+                source.clone()
+            };
+            let db = rockstream_storage::ShardDb::builder(db_path, db_store)
+                .build()
+                .await
+                .unwrap();
+            db.put(b"namespace-key", b"namespace-value").await.unwrap();
+            db.flush().await.unwrap();
+            let handle = db.create_checkpoint().await.unwrap();
+            let source_reader = rockstream_storage::ShardReader::open_with_snapshot_id(
+                db_path,
+                if name == "runtime" {
+                    Arc::new(object_store::prefix::PrefixStore::new(
+                        source.clone(),
+                        "shards/1",
+                    ))
+                } else {
+                    source.clone()
+                },
+                &handle.snapshot_id,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                source_reader
+                    .get(b"namespace-key")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                b"namespace-value"
+            );
+            db.close().await.unwrap();
+            let mut cluster = checkpoint();
+            cluster.record_shard(
+                ShardId(1),
+                PerShardCheckpoint::new(CheckpointId(7), handle.shard_checkpoint_id)
+                    .with_snapshot_id(handle.snapshot_id),
+            );
+            let snapshot_id = cluster.shards[&ShardId(1)]
+                .snapshot_id
+                .as_deref()
+                .unwrap()
+                .to_owned();
+
+            let objects = CheckpointExportService::list_checkpoint_objects(
+                &source,
+                &cluster,
+                &Path::from(""),
+            )
+            .await
+            .unwrap();
+            assert!(!objects.is_empty());
+            assert!(objects
+                .iter()
+                .all(|path| path.as_ref().starts_with(expected_root)));
+            assert!(objects.iter().any(|path| {
+                path.as_ref().ends_with(&format!(
+                    "manifest/{:020}.manifest",
+                    handle.shard_checkpoint_id
+                ))
+            }));
+
+            let outcome = CheckpointExportService::new()
+                .export_prefix(
+                    source.clone(),
+                    destination.clone(),
+                    cluster,
+                    format!("namespace-{name}"),
+                    &Path::from(""),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.checkpoint_id, 7);
+            assert_eq!(outcome.generation, format!("namespace-{name}"));
+            assert_eq!(outcome.object_count as usize, objects.len());
+            assert_eq!(outcome.status, "SUCCESS");
+            let committed = CheckpointExportService::new()
+                .validate_generation(destination.clone(), &format!("namespace-{name}"))
+                .await
+                .unwrap();
+            assert_eq!(committed, outcome);
+            let restored: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            CheckpointExportService::new()
+                .restore_generation(destination, restored.clone(), &format!("namespace-{name}"))
+                .await
+                .unwrap();
+            let restored_db_store: Arc<dyn ObjectStore> = if name == "runtime" {
+                Arc::new(object_store::prefix::PrefixStore::new(restored, "shards/1"))
+            } else {
+                restored
+            };
+            let restored_reader = rockstream_storage::ShardReader::open_with_snapshot_id(
+                db_path,
+                restored_db_store,
+                &snapshot_id,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                restored_reader
+                    .get(b"namespace-key")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                b"namespace-value"
+            );
+        }
     }
 
     #[tokio::test]

@@ -44,6 +44,7 @@ pub struct CliConfigOverrides {
     pub gateway_max_connections: Option<usize>,
     pub gateway_query_timeout_secs: Option<u64>,
     pub control_bind: Option<String>,
+    pub management_addr: Option<String>,
     pub control_url: Option<String>,
     pub control_shared_storage: Option<String>,
     pub worker_id: Option<u64>,
@@ -881,6 +882,13 @@ fn apply_cli_overrides(
         origins.insert(
             "control.listen_addr".to_string(),
             ConfigOrigin::Cli("--control-bind".to_string()),
+        );
+    }
+    if let Some(ref val) = cli.management_addr {
+        node_config.control.management_addr = Some(val.clone());
+        origins.insert(
+            "control.management_addr".to_string(),
+            ConfigOrigin::Cli("--management-addr".to_string()),
         );
     }
     if let Some(ref val) = cli.control_url {

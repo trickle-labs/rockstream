@@ -16,6 +16,7 @@ fn test_options(storage: PathBuf, auth_mode: &str, listen: Option<String>) -> St
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: None,
         metrics_addr: None,
         listen_addr: listen,
         raft_peers: None,

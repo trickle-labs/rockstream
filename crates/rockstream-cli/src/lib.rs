@@ -156,6 +156,8 @@ pub struct StartOptions {
     pub worker_capabilities: WorkerCapabilities,
     /// Effective Rockstream configuration for this process.
     pub config: RockstreamConfig,
+    /// Effective v0.62 node configuration, including management bind settings.
+    pub node_config: Option<rockstream_types::config::NodeConfig>,
     /// Optional metrics server listen address.
     pub metrics_addr: Option<String>,
     /// PostgreSQL wire gateway listen address.
@@ -236,6 +238,7 @@ impl Default for StartOptions {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -568,6 +571,10 @@ pub async fn start_gateway_with_shard_and_catalog(
 pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let started_ms = now_ms();
     validate_role(&opts.role)?;
+    let node_config = opts
+        .node_config
+        .clone()
+        .unwrap_or_else(|| rockstream_types::config::NodeConfig::from(&opts.config));
 
     if let Err(e) = rockstream_types::platform::PlatformClassifier::validate_startup() {
         return Err(CliError::new(
@@ -633,6 +640,15 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 RS_0002,
                 format!("invalid --metrics-addr address `{metrics}`: {e}"),
                 "Pass a valid socket address such as 127.0.0.1:9090.",
+            )
+        })?;
+    }
+    if let Some(ref management) = node_config.control.management_addr {
+        management.parse::<std::net::SocketAddr>().map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("invalid management address `{management}`: {e}"),
+                "Pass a valid socket address such as 127.0.0.1:9201.",
             )
         })?;
     }
@@ -727,9 +743,48 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         if opts.role == "all" {
             let catalog = rockstream_control::TopologyCatalog::new();
             let manager = rockstream_control::ShardManager::new();
-            let service = rockstream_control::ControlService::new(catalog)
-                .with_shard_manager(manager)
+            let mut service = rockstream_control::ControlService::new(catalog.clone())
+                .with_shard_manager(manager.clone())
                 .with_audit(audit_log.clone());
+            if opts.listen_addr.is_some() {
+                let store: Arc<dyn object_store::ObjectStore> = Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(&opts.storage).map_err(
+                        |e| CliError::new(RS_0003, format!("failed to open management store: {e}"), "Check storage directory permissions."),
+                    )?,
+                );
+                service = service.with_single_worker_local_backup_source_store(
+                    store.clone(),
+                    rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
+                );
+                if let Some(addr) = &node_config.control.management_addr {
+                    let management_store = if let Some(shared_dir) = &opts.control_shared_storage {
+                        fs::create_dir_all(shared_dir).map_err(|e| {
+                            CliError::new(
+                                RS_0003,
+                                format!("failed to create management shared-storage dir: {e}"),
+                                "Check filesystem permissions for --control-shared-storage.",
+                            )
+                        })?;
+                        Arc::new(
+                            object_store::local::LocalFileSystem::new_with_prefix(shared_dir)
+                                .map_err(|e| {
+                                    CliError::new(
+                                        RS_0003,
+                                        format!("failed to open management shared storage: {e}"),
+                                        "Check filesystem permissions for --control-shared-storage.",
+                                    )
+                                })?,
+                        ) as Arc<dyn object_store::ObjectStore>
+                    } else {
+                        store.clone()
+                    };
+                    service = service.with_management(
+                        addr.clone(),
+                        management_store,
+                        node_config.clone(),
+                    );
+                }
+            }
             let handle = service.start("127.0.0.1:0").await.unwrap();
             control_url = Some(handle.addr.to_string());
             control_handle = Some(handle);
@@ -785,8 +840,16 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 )))
                 .with_migration_store(Arc::new(rockstream_control::MigrationPersistentStore::new(
                     shared_object_store.clone(),
-                )))
-                .with_auto_drain(true);
+                )));
+            if opts.daemon {
+                if let Some(addr) = &node_config.control.management_addr {
+                    service = service.with_management(
+                        addr.clone(),
+                        shared_object_store.clone(),
+                        node_config.clone(),
+                    );
+                }
+            }
 
             // v0.45.2 M7: join a real multi-node Raft group when
             // `--raft-peers` is provided; otherwise run exactly as before
@@ -2593,6 +2656,7 @@ mod tests {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -2625,7 +2689,7 @@ mod tests {
                 storage: dir.path().to_path_buf(), role: "all".to_string(), control: None,
                 worker_id: None,
                 auth_mode: "off".to_string(), worker_location: WorkerLocation::default(),
-                worker_capabilities: WorkerCapabilities::default(), config, metrics_addr: None,
+                worker_capabilities: WorkerCapabilities::default(), config, node_config: None, metrics_addr: None,
                 listen_addr: None, raft_peers: None, raft_node_id: None, raft_bind: None,
                 raft_bootstrap: false, daemon: false, control_bind: None,
                 control_shared_storage: None, query_time_shard_dirs: Vec::new(),
@@ -2647,6 +2711,7 @@ mod tests {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: Some("not-an-address".to_string()),
             raft_peers: None,
@@ -2728,6 +2793,7 @@ mod tests {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -2781,6 +2847,7 @@ mod tests {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -2809,6 +2876,7 @@ mod tests {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -2839,6 +2907,7 @@ mod tests {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -2869,6 +2938,7 @@ mod tests {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -2919,6 +2989,7 @@ mod tests {
                 worker_location: WorkerLocation::default(),
                 worker_capabilities: WorkerCapabilities::default(),
                 config: RockstreamConfig::default(),
+                node_config: None,
                 metrics_addr: None,
                 listen_addr: None,
                 raft_peers: None,
@@ -2948,6 +3019,7 @@ mod tests {
                 worker_location: WorkerLocation::default(),
                 worker_capabilities: WorkerCapabilities::default(),
                 config: RockstreamConfig::default(),
+                node_config: None,
                 metrics_addr: None,
                 listen_addr: None,
                 raft_peers: Some(String::new()),
@@ -2980,6 +3052,7 @@ mod tests {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: None,
             raft_peers: Some(String::new()),
@@ -3011,6 +3084,7 @@ mod tests {
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
             config: RockstreamConfig::default(),
+            node_config: None,
             metrics_addr: None,
             listen_addr: None,
             raft_peers: Some(String::new()),

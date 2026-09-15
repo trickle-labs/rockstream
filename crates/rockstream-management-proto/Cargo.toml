@@ -1,0 +1,18 @@
+[package]
+name = "rockstream-management-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Versioned tonic contract for the RockStream management API"
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { workspace = true }

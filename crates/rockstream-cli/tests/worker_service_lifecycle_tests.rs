@@ -34,6 +34,7 @@ async fn test_worker_service_lifecycle_and_explicit_worker_id() {
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: None,
         metrics_addr: None,
         listen_addr: None,
         raft_peers: None,
