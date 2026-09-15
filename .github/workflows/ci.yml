@@ -81,10 +81,10 @@ jobs:
           cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
       - name: Remove Docker test image
         run: docker image rm rockstream-tc-test:latest || true
-      - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@v2
       - name: install cargo-deny
         uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny
+        run: cargo deny --all-features check
       - name: install cargo-audit
         uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
