@@ -144,11 +144,11 @@ impl CheckpointManifestStore {
                     == Some(manifest.clone()) => {}
             Err(object_store::Error::AlreadyExists { .. }) => {
                 return Err(format!(
-                    "checkpoint manifest {} is already committed with different contents",
+                    "[{RS_3022}] checkpoint manifest {} is already committed with different contents",
                     manifest.checkpoint_id.0
                 ));
             }
-            Err(error) => return Err(format!("persist checkpoint manifest: {error}")),
+            Err(error) => return Err(format!("[{RS_3022}] persist checkpoint manifest: {error}")),
         }
         if let Some(audit) = audit {
             let event = AuditEvent::now(
@@ -193,7 +193,7 @@ impl CheckpointManifestStore {
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => {
                 return Err(format!(
-                    "load checkpoint manifest {}: {error}",
+                    "[{RS_3022}] load checkpoint manifest {}: {error}",
                     checkpoint_id.0
                 ));
             }

@@ -164,7 +164,7 @@ impl ManagementService {
                 })
                 .await;
             if let Err(error) = result {
-                tracing::error!(%error, "management service stopped");
+                tracing::error!(code = %rockstream_types::error_code::RS_0001, %error, "management service stopped");
             }
         });
         let reconciler = self.clone();
