@@ -1557,7 +1557,10 @@ impl ManagementBackupRuntime {
         let Some(record) = self.operations.get(operation_id).await.ok().flatten() else {
             return;
         };
-        if record.status().is_terminal() {
+        if !matches!(
+            record.status(),
+            OperationStatus::Pending | OperationStatus::Waiting
+        ) {
             return;
         }
         let Some(destination) = record
