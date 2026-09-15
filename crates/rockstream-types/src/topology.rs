@@ -40,11 +40,12 @@ impl std::fmt::Display for NodeRole {
     }
 }
 
-/// Fraction of available capacity on a worker node, in [0.0, 1.0].
+/// Fraction of physical memory currently available on a worker host, in [0.0, 1.0].
 ///
-/// 1.0 means the worker is completely idle; 0.0 means it is saturated.
+/// 1.0 means all physical pages are available; 0.0 means none are available.
 /// The placement algorithm prefers workers with higher `capacity_headroom`
-/// when assigning shards or operator instances.
+/// when assigning shards or operator instances. This is a memory signal, not a
+/// measure of CPU utilization.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CapacityHeadroom(pub f64);
 

@@ -42,6 +42,7 @@ rustls-pemfile = { workspace = true }
 x509-parser = { workspace = true }
 ring = { workspace = true }
 sha2 = { workspace = true }
+libc = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"

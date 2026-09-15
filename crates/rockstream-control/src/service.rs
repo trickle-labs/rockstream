@@ -3631,10 +3631,10 @@ mod tests {
     use super::*;
     use crate::shard::ShardManager;
     use crate::topology::TopologyCatalog;
-    use rockstream_types::ids::WorkerId;
+    use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
     use rockstream_types::topology::{
-        CapacityHeadroom, NodeRole, RaftRoleWire, WorkerCapabilities, WorkerLocation,
-        WorkerMessage, WorkerRegistration,
+        CapacityHeadroom, NodeRole, RaftRoleWire, WorkerCapabilities, WorkerLifecycleState,
+        WorkerLocation, WorkerMessage, WorkerRegistration,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
@@ -3669,6 +3669,143 @@ mod tests {
             .unwrap();
         assert_eq!(waiters.len(), 64);
         assert!(waiters.contains_key("recovered"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn management_ack_waiter_timeout_releases_its_bounded_slot() {
+        let waiters = Arc::new(AsyncMutex::new(HashMap::new()));
+        let runtime = ManagementMigrationRuntime {
+            catalog: TopologyCatalog::new(),
+            shard_manager: ShardManager::new(),
+            data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),
+            shard_store: None,
+            worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
+            waiters: waiters.clone(),
+            operations: ManagementOperationStore::new(Arc::new(
+                object_store::memory::InMemory::new(),
+            )),
+            started: Arc::new(AsyncMutex::new(HashSet::new())),
+        };
+        let worker_id = WorkerId(7);
+        let lease = rockstream_types::lease::ShardLease::new(ShardId(3), worker_id, LeaseToken(1));
+        let (sender, mut receiver) = mpsc::channel(1);
+        let wait = tokio::spawn(async move {
+            runtime
+                .send_and_wait(
+                    &sender,
+                    ControlMessage::PrepareShardTransfer {
+                        operation_id: "op-timeout".to_owned(),
+                        lease: lease.clone(),
+                    },
+                    "op-timeout",
+                    "donor",
+                    worker_id,
+                    &lease,
+                )
+                .await
+        });
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ControlMessage::PrepareShardTransfer { .. })
+        ));
+        assert_eq!(waiters.lock().await.len(), 1);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "ACK waiter expired before its 30-second bound"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            wait.await.unwrap(),
+            Err("donor acknowledgement timed out".to_owned())
+        );
+        assert!(waiters.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_drain_queue_rejects_overflow_and_recovers_after_pressure() {
+        let catalog = TopologyCatalog::new();
+        let shard_manager = ShardManager::new();
+        for worker_id in 1..=3 {
+            catalog.register(&registration_with_location(
+                worker_id,
+                0.9,
+                &format!("host-{worker_id}"),
+                "az-1",
+            ));
+        }
+        for shard_id in 0..MAX_DRAIN_QUEUE as u64 {
+            shard_manager
+                .acquire(ShardId(shard_id), WorkerId(1))
+                .unwrap();
+        }
+        shard_manager
+            .acquire(ShardId(MAX_DRAIN_QUEUE as u64), WorkerId(2))
+            .unwrap();
+        let drain_state = Arc::new(AsyncMutex::new(DrainState::default()));
+
+        let (lifecycle, queue_fill, queue_capacity, request) = request_worker_drain(
+            &catalog,
+            &shard_manager,
+            None,
+            None,
+            &drain_state,
+            WorkerId(1),
+            None,
+        )
+        .await
+        .unwrap();
+        let started_at_ms = match lifecycle {
+            WorkerLifecycleState::Draining { started_at_ms, .. } => started_at_ms,
+            lifecycle => panic!("expected draining lifecycle, got {lifecycle:?}"),
+        };
+        assert_eq!(queue_fill, MAX_DRAIN_QUEUE as u32);
+        assert_eq!(queue_capacity, MAX_DRAIN_QUEUE as u32);
+        assert_eq!(
+            request.deadline_ms - started_at_ms,
+            DEFAULT_DRAIN_DEADLINE_MS
+        );
+
+        let overflow = request_worker_drain(
+            &catalog,
+            &shard_manager,
+            None,
+            None,
+            &drain_state,
+            WorkerId(2),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(overflow.code, "RS-3612");
+        assert_eq!(
+            overflow.message,
+            "worker drain queue would exceed its bound (1025/1024)"
+        );
+        assert_eq!(
+            overflow.next_steps,
+            "Let the existing drain queue drain, or increase the configured bound only if memory headroom allows."
+        );
+        assert_eq!(drain_state.lock().await.queue.len(), MAX_DRAIN_QUEUE);
+        assert!(catalog.get(WorkerId(2)).unwrap().lifecycle.is_active());
+
+        drain_state.lock().await.queue.pop_front().unwrap();
+        let (_, recovered_fill, recovered_capacity, _) = request_worker_drain(
+            &catalog,
+            &shard_manager,
+            None,
+            None,
+            &drain_state,
+            WorkerId(2),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered_fill, MAX_DRAIN_QUEUE as u32);
+        assert_eq!(recovered_capacity, MAX_DRAIN_QUEUE as u32);
+        assert_eq!(drain_state.lock().await.queue.len(), MAX_DRAIN_QUEUE);
     }
 
     async fn start_test_service() -> (ControlServiceHandle, TopologyCatalog) {

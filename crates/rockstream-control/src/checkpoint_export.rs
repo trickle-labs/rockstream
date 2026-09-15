@@ -215,7 +215,7 @@ impl CheckpointExportService {
         prefix: &Path,
     ) -> Result<Vec<Path>, CheckpointExportError> {
         let mut objects = Self::list_export_objects(source, prefix).await?;
-        objects.retain(|path| !is_shard_path(path));
+        objects.retain(|path| !is_shard_path(path) && !is_uncheckpointed_operational_path(path));
         for (shard_id, shard_checkpoint) in &checkpoint.shards {
             let shard_path = format!("shards/{}", shard_id.0);
             let shard_objects = match shard_checkpoint.snapshot_id.as_deref() {
@@ -577,7 +577,14 @@ impl CheckpointExportService {
         {
             Some(existing) if existing != generation_record => {
                 return Err(CheckpointExportError::Integrity(
-                    "existing generation record belongs to a different checkpoint".to_string(),
+                    format!(
+                        "existing generation record conflicts with retry: checkpoint_equal={}, checkpoint_ids={}/{}, object_counts={}/{}",
+                        existing.checkpoint == generation_record.checkpoint,
+                        existing.checkpoint_id.0,
+                        generation_record.checkpoint_id.0,
+                        existing.object_count,
+                        generation_record.object_count,
+                    ),
                 ));
             }
             Some(_) => {}
@@ -609,7 +616,8 @@ impl CheckpointExportService {
             {
                 if existing != record {
                     return Err(CheckpointExportError::Integrity(format!(
-                        "inventory record {index} does not match the selected checkpoint"
+                        "inventory record {index} for source {} does not match the selected checkpoint",
+                        record.source
                     )));
                 }
                 let existing_bytes = self
@@ -751,6 +759,13 @@ fn generation_path(generation: &str) -> Path {
 fn is_shard_path(path: &Path) -> bool {
     let mut parts = path.as_ref().split('/');
     parts.next() == Some("shards") && parts.next().is_some()
+}
+
+fn is_uncheckpointed_operational_path(path: &Path) -> bool {
+    let path = path.as_ref();
+    path == "audit.jsonl"
+        || path.starts_with("control/management-operations/")
+        || path.starts_with("topology/workers/")
 }
 
 async fn snapshot_object_paths(
