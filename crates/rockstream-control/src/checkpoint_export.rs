@@ -576,6 +576,11 @@ impl CheckpointExportService {
             .await?
         {
             Some(existing) if existing != generation_record => {
+                if existing.checkpoint_id == generation_record.checkpoint_id
+                    && existing.object_count == generation_record.object_count
+                {
+                    return Err(CheckpointExportError::InFlight);
+                }
                 return Err(CheckpointExportError::Integrity(
                     format!(
                         "existing generation record conflicts with retry: checkpoint_equal={}, checkpoint_ids={}/{}, object_counts={}/{}",
