@@ -863,7 +863,12 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 OperationStatus::Running | OperationStatus::Waiting
             ) && matches!(
                 record.phase(),
-                Some("validating_worker_and_shard_ownership" | "validating_lease_and_workers")
+                Some(
+                    "validating_worker_and_shard_ownership"
+                        | "validating_lease_and_workers"
+                        | "donor_handoff_started"
+                        | "donor_flushed_and_closed"
+                )
             ));
         if !safe {
             return Err(Status::failed_precondition(
@@ -874,7 +879,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         let phase = if status == OperationStatus::Pending {
             "cancelled_before_start"
         } else {
-            "cancelled_before_worker_handoff"
+            "cancelled_before_lease_transfer"
         };
         let record = self
             .operations

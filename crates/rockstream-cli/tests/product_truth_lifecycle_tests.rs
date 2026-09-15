@@ -67,6 +67,14 @@ fn assert_json_status_transcript(
     assert!(status.nodes.iter().all(|node| node.registered_at_ms > 0));
     let source_version = status.source_version.clone();
     for node in &mut nodes {
+        let actual = status
+            .nodes
+            .iter()
+            .find(|actual| actual.node_id == node.node_id)
+            .expect("expected node is present in status");
+        assert!((0.0..=1.0).contains(&actual.capacity_headroom));
+        node.capacity_headroom = actual.capacity_headroom;
+        node.registered_at_ms = 0;
         node.source_version = source_version.clone();
     }
     status.observed_at = "<timestamp>".to_owned();
@@ -108,6 +116,14 @@ fn wait_for_status(binary: &Path, management_addr: &str, expected_nodes: usize) 
         thread::sleep(Duration::from_millis(50));
     }
     panic!("management status never reported {expected_nodes} nodes: {last_error}");
+}
+
+fn allocate_memory_pressure() -> Vec<u8> {
+    let mut memory = vec![0_u8; 128 * 1024 * 1024];
+    for page in memory.chunks_mut(4096) {
+        page[0] = 1;
+    }
+    memory
 }
 
 fn topology_revision(status: &ManagementClusterStatusInfo) -> u64 {
@@ -313,6 +329,37 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
         }],
     );
     assert!(topology_revision(&live) > empty_revision);
+    let before_headroom = live.nodes[0].capacity_headroom;
+    let memory_pressure = allocate_memory_pressure();
+    let pressure_deadline = Instant::now() + Duration::from_secs(10);
+    let pressure_output = loop {
+        let output = run_json_status(binary, &management_addr);
+        if output.status.success()
+            && serde_json::from_slice::<ManagementClusterStatusInfo>(&output.stdout).is_ok_and(
+                |status| {
+                    status.nodes.len() == 1 && status.nodes[0].capacity_headroom < before_headroom
+                },
+            )
+        {
+            break output;
+        }
+        assert!(
+            Instant::now() < pressure_deadline,
+            "worker status headroom did not fall under memory pressure"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let mut pressure_nodes =
+        serde_json::from_slice::<ManagementClusterStatusInfo>(&pressure_output.stdout)
+            .unwrap()
+            .nodes;
+    for node in &mut pressure_nodes {
+        node.registered_at_ms = 0;
+    }
+    let pressure_status =
+        assert_json_status_transcript(&pressure_output, "healthy", pressure_nodes);
+    assert!(pressure_status.nodes[0].capacity_headroom < before_headroom);
+    std::hint::black_box(&memory_pressure);
 
     let config = Command::new(binary)
         .env("RUST_LOG", "off")

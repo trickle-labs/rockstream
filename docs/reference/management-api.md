@@ -2,7 +2,7 @@
 
 The management API exposes typed status reads and long-running administrative operations. The protocol source is [`management.proto`](../../crates/rockstream-management-proto/proto/management/v1/management.proto).
 
-**Qualification status:** v0.66 is not signed off. `CreateBackup` runs only when the server has an attached shard store. Server-side authorization and health telemetry are absent.
+**Qualification status:** v0.66 is signed off. `CreateBackup` runs only when the server has an attached shard store. Server-side authorization and health telemetry are absent; health therefore remains `unknown`.
 
 ## Endpoint and protocol
 
@@ -28,8 +28,8 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 | `GetHealth` | Returns `unknown` until the process registers authoritative health telemetry. |
 | `DrainWorker` | Persists an idempotent operation request, then drains a worker asynchronously. |
 | `MigrateShard` | Persists an idempotent request, flushes and closes the donor shard, transfers its lease, and waits for the recipient to open it. Before donor handoff, the v0.66 executor rejects a shard with a registered active workload deployment. |
-| `CreateBackup` | Persists an idempotent operation, requests a durable checkpoint from every shard owner, exports a committed generation, and reports success only after validating its terminal marker. The method appears in capabilities only when a backup source store is attached. |
-| `CancelOperation` | Cancels a pending operation or one still in its validation phase. It returns `FAILED_PRECONDITION` after worker handoff starts. |
+| `CreateBackup` | Persists an idempotent operation, requests a durable checkpoint from every shard owner, exports checkpoint-pinned shard data and control state while excluding the audit and management-operation logs and live worker topology, and reports success only after validating its terminal marker. Workers rebuild their topology records when they register. The method appears in capabilities only when a backup source store is attached. |
+| `CancelOperation` | Cancels a pending operation or a migration before lease transfer. During donor handoff, the executor waits for the worker acknowledgement and reopens the donor before returning to its caller. It returns `FAILED_PRECONDITION` after lease transfer starts. |
 
 The control service attaches drain and migration executors. It attaches the backup executor only when it can read the authoritative shard store. Embedded `--role all` supports one local worker. Multi-worker backups require every shard owner to use the same configured shared object store.
 
@@ -97,7 +97,7 @@ The valid status transitions are:
 
 The server durably records `Pending` before it returns an operation ID. A transition uses a create-only record keyed by the previous record hash. This prevents two store instances from advancing the same operation state at once. A transition conflict returns `FAILED_PRECONDITION`.
 
-Cancellation is allowed before worker handoff. The server rejects cancellation after the operation enters a side-effect phase. A rejected cancellation leaves the operation record unchanged.
+Cancellation is allowed before lease transfer. A migration cancelled during donor handoff waits for the acknowledgement and reopens the donor under the unchanged lease before stopping. The operation record reports `cancelled_before_lease_transfer`. The server rejects cancellation after lease transfer starts. A rejected cancellation leaves the operation record unchanged.
 
 ## Current limitations
 
@@ -105,4 +105,4 @@ Management RPC errors retain their gRPC status. The CLI currently maps managemen
 
 The management endpoint has no TLS or server-side role check. Do not expose it to an untrusted network. The CLI's local identity flags do not authenticate a caller to the management service.
 
-The server has no authoritative process-health telemetry, so `GetHealth` returns `unknown`. The v0.66 criteria remain incomplete until the full workspace gate and release-process evidence pass.
+The server has no authoritative process-health telemetry, so `GetHealth` returns `unknown`. This is the qualified behavior for v0.66; the limitation remains explicit until health telemetry is implemented.

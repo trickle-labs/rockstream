@@ -5267,6 +5267,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.12.1",
+ "libc",
  "lz4_flex 0.14.0",
  "object_store 0.12.5",
  "parking_lot",

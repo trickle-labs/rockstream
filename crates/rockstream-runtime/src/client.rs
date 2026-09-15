@@ -578,6 +578,7 @@ pub async fn start_worker_client_with_tls_and_metadata(
     capabilities: WorkerCapabilities,
     tls_config: InternalTlsConfig,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    let initial_headroom = system_memory_headroom()?;
     let clean_url = control_url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
@@ -607,6 +608,7 @@ pub async fn start_worker_client_with_tls_and_metadata(
             storage_dir,
             location,
             capabilities,
+            initial_headroom,
             reader,
             writer,
         )
@@ -618,6 +620,7 @@ pub async fn start_worker_client_with_tls_and_metadata(
             storage_dir,
             location,
             capabilities,
+            initial_headroom,
             reader,
             writer,
         )
@@ -625,11 +628,59 @@ pub async fn start_worker_client_with_tls_and_metadata(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn system_memory_headroom() -> io::Result<CapacityHeadroom> {
+    // ponytail: host-wide free pages ignore container quotas; use cgroup limits if constrained workers become supported.
+    let total_pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let available_pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
+    if total_pages <= 0 || available_pages < 0 {
+        return Err(io::Error::other("could not read physical memory headroom"));
+    }
+    Ok(CapacityHeadroom::new(
+        available_pages as f64 / total_pages as f64,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn system_memory_headroom() -> io::Result<CapacityHeadroom> {
+    let total_pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    if total_pages <= 0 {
+        return Err(io::Error::other("could not read physical memory headroom"));
+    }
+    let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let result = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            &mut stats as *mut _ as libc::host_info64_t,
+            &mut count,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::other("could not read physical memory headroom"));
+    }
+    let available_pages =
+        stats.free_count + stats.inactive_count + stats.speculative_count + stats.purgeable_count;
+    Ok(CapacityHeadroom::new(
+        available_pages as f64 / total_pages as f64,
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn system_memory_headroom() -> io::Result<CapacityHeadroom> {
+    Err(io::Error::other(
+        "physical memory headroom is unsupported on this platform",
+    ))
+}
+
 async fn run_worker_client<R, W>(
     proposed_worker_id: u64,
     storage_dir: &Path,
     location: WorkerLocation,
     capabilities: WorkerCapabilities,
+    initial_headroom: CapacityHeadroom,
     reader: R,
     mut writer: W,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)>
@@ -701,7 +752,7 @@ where
             WorkerId(proposed_worker_id),
             NodeRole::Worker,
             "127.0.0.1:0", // Default loopback
-            CapacityHeadroom::FULL,
+            initial_headroom,
         )
         .with_location(location.clone())
         .with_capabilities(capabilities)
@@ -757,9 +808,14 @@ where
             loop {
                 let wid_opt = *worker_id_hb.read();
                 if let Some(wid) = wid_opt {
+                    let Ok(capacity_headroom) = system_memory_headroom() else {
+                        tracing::warn!("could not sample worker memory headroom");
+                        sleep(Duration::from_millis(500)).await;
+                        continue;
+                    };
                     let hb = WorkerMessage::Heartbeat {
                         worker_id: wid,
-                        capacity_headroom: CapacityHeadroom::FULL,
+                        capacity_headroom,
                     };
                     if msg_tx_hb.send(hb).await.is_err() {
                         break;
