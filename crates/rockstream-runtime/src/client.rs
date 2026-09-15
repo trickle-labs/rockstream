@@ -850,7 +850,7 @@ where
                         continue;
                     };
                     if request.worker_id != id {
-                        tracing::error!(worker = %id, requested = %request.worker_id, "worker rejected a drain request for another identity");
+                        tracing::error!(code = %rockstream_types::error_code::RS_0001, worker = %id, requested = %request.worker_id, "worker rejected a drain request for another identity");
                         continue;
                     }
                     let shard_ids = active_shards_clone
@@ -878,12 +878,12 @@ where
                     let mut flushed = true;
                     for db in databases {
                         if let Err(error) = db.flush().await {
-                            tracing::error!(worker = %id, %error, "worker drain stopped because shard flush failed");
+                            tracing::error!(code = %rockstream_types::error_code::RS_0001, worker = %id, %error, "worker drain stopped because shard flush failed");
                             flushed = false;
                             break;
                         }
                         if let Err(error) = db.close().await {
-                            tracing::error!(worker = %id, %error, "worker drain stopped because shard close failed");
+                            tracing::error!(code = %rockstream_types::error_code::RS_0001, worker = %id, %error, "worker drain stopped because shard close failed");
                             flushed = false;
                             break;
                         }

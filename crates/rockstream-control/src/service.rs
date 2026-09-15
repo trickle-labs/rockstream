@@ -853,7 +853,7 @@ impl ManagementDrainRuntime {
                     )
                     .await
                 {
-                    tracing::error!(%operation_id, %error, "drain was sent but its progress record could not be persisted");
+                    tracing::error!(code = %rockstream_types::error_code::RS_0001, %operation_id, %error, "drain was sent but its progress record could not be persisted");
                 }
             }
             Err(error) => {
@@ -879,7 +879,7 @@ impl ManagementDrainRuntime {
             )
             .await
         {
-            tracing::error!(%operation_id, %error, "failed drain outcome could not be persisted");
+            tracing::error!(code = %code, %operation_id, %error, "failed drain outcome could not be persisted");
         }
     }
 
@@ -907,7 +907,7 @@ impl ManagementDrainRuntime {
             )
             .await
         {
-            tracing::error!(%operation_id, %error, "drain wait state could not be persisted");
+            tracing::error!(code = %rockstream_types::error_code::RS_3610, %operation_id, %error, "drain wait state could not be persisted");
         }
     }
 }
@@ -1349,7 +1349,7 @@ impl ManagementMigrationRuntime {
             )
             .await
         {
-            tracing::error!(%operation_id, %error, "migrated shard but could not persist success");
+            tracing::error!(code = %rockstream_types::error_code::RS_0001, %operation_id, %error, "migrated shard but could not persist success");
         }
     }
 
@@ -1387,9 +1387,9 @@ impl ManagementMigrationRuntime {
                     Err(error.unwrap_or_else(|| format!("{stage} rejected shard transfer")))
                 }
             }
-            Ok(Ok(_)) => Err(format!("unexpected {stage} shard transfer acknowledgement")),
-            Ok(Err(_)) => Err(format!("{stage} connection closed before acknowledgement")),
-            Err(_) => Err(format!("{stage} acknowledgement timed out")),
+            Ok(Ok(_)) => Err(format!("RS-3610: unexpected {stage} shard transfer acknowledgement")),
+            Ok(Err(_)) => Err(format!("RS-3610: {stage} connection closed before acknowledgement")),
+            Err(_) => Err(format!("RS-3610: {stage} acknowledgement timed out")),
         };
         self.waiters.lock().await.remove(&key);
         result
@@ -1487,7 +1487,7 @@ impl ManagementMigrationRuntime {
             )
             .await
         {
-            tracing::error!(%operation_id, %error, "migration failure could not be persisted");
+            tracing::error!(code = %code, %operation_id, %error, "migration failure could not be persisted");
         }
     }
 
@@ -1515,7 +1515,7 @@ impl ManagementMigrationRuntime {
             )
             .await
         {
-            tracing::error!(%operation_id, %error, "migration wait state could not be persisted");
+            tracing::error!(code = %rockstream_types::error_code::RS_3610, %operation_id, %error, "migration wait state could not be persisted");
         }
     }
 }
@@ -1707,7 +1707,7 @@ impl ManagementBackupRuntime {
                     )
                     .await
                 {
-                    tracing::error!(%operation_id, %error, "validated backup could not persist success");
+                    tracing::error!(code = %rockstream_types::error_code::RS_0001, %operation_id, %error, "validated backup could not persist success");
                 }
             }
             Ok(_) => {
@@ -1900,7 +1900,7 @@ impl ManagementBackupRuntime {
             )
             .await
         {
-            tracing::error!(%operation_id, %error, "backup failure could not be persisted");
+            tracing::error!(code = %code, %operation_id, %error, "backup failure could not be persisted");
         }
     }
 
@@ -1928,7 +1928,7 @@ impl ManagementBackupRuntime {
             )
             .await
         {
-            tracing::error!(%operation_id, %error, "backup wait state could not be persisted");
+            tracing::error!(code = %rockstream_types::error_code::RS_3610, %operation_id, %error, "backup wait state could not be persisted");
         }
     }
 }
@@ -2530,7 +2530,7 @@ async fn process_drain_queue(
                     )
                     .await
                 {
-                    tracing::error!(%operation_id, %error, "drain completed but operation record update failed");
+                    tracing::error!(code = %rockstream_types::error_code::RS_0001, %operation_id, %error, "drain completed but operation record update failed");
                 }
             }
         }
@@ -3719,7 +3719,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(
             wait.await.unwrap(),
-            Err("donor acknowledgement timed out".to_owned())
+            Err("RS-3610: donor acknowledgement timed out".to_owned())
         );
         assert!(waiters.lock().await.is_empty());
     }
