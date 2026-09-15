@@ -1387,8 +1387,12 @@ impl ManagementMigrationRuntime {
                     Err(error.unwrap_or_else(|| format!("{stage} rejected shard transfer")))
                 }
             }
-            Ok(Ok(_)) => Err(format!("RS-3610: unexpected {stage} shard transfer acknowledgement")),
-            Ok(Err(_)) => Err(format!("RS-3610: {stage} connection closed before acknowledgement")),
+            Ok(Ok(_)) => Err(format!(
+                "RS-3610: unexpected {stage} shard transfer acknowledgement"
+            )),
+            Ok(Err(_)) => Err(format!(
+                "RS-3610: {stage} connection closed before acknowledgement"
+            )),
             Err(_) => Err(format!("RS-3610: {stage} acknowledgement timed out")),
         };
         self.waiters.lock().await.remove(&key);
