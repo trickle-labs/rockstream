@@ -5,8 +5,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use rockstream_control::{
@@ -149,154 +151,46 @@ pub trait CliTransport: Send + Sync {
     fn identity(&self) -> &ClientIdentity;
 }
 
-pub struct ManagementClient {
-    client: rockstream_management_proto::v1::management_service_client::ManagementServiceClient<
+type ManagementGrpcClient =
+    rockstream_management_proto::v1::management_service_client::ManagementServiceClient<
         tonic::transport::Channel,
-    >,
-}
+    >;
+
+type ManagementPage<T> = (String, String, Vec<T>, String);
 
 #[allow(clippy::result_large_err)]
-impl ManagementClient {
-    pub async fn connect(addr: impl AsRef<str>) -> Result<Self, tonic::transport::Error> {
-        let addr = addr.as_ref();
-        let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
-            addr.to_owned()
-        } else {
-            format!("http://{addr}")
-        };
-        Ok(Self {
-            client:
-                rockstream_management_proto::v1::management_service_client::ManagementServiceClient::connect(endpoint)
-                    .await?,
-        })
+async fn collect_management_pages<C, T, F>(
+    client: &mut C,
+    mut fetch_page: F,
+) -> Result<(String, String, Vec<T>), tonic::Status>
+where
+    F: for<'a> FnMut(
+        &'a mut C,
+        String,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ManagementPage<T>, tonic::Status>> + 'a>,
+    >,
+{
+    let mut token = String::new();
+    let mut metadata = None;
+    let mut items = Vec::new();
+    loop {
+        let (observed_at, source_version, page_items, next_page_token) =
+            fetch_page(client, token).await?;
+        metadata.get_or_insert((observed_at, source_version));
+        items.extend(page_items);
+        token = next_page_token;
+        if token.is_empty() {
+            break;
+        }
     }
-
-    pub async fn get_cluster_status(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetClusterStatusRequest>,
-    ) -> Result<
-        tonic::Response<rockstream_management_proto::v1::GetClusterStatusResponse>,
-        tonic::Status,
-    > {
-        self.client.get_cluster_status(request).await
-    }
-
-    pub async fn list_nodes(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::ListNodesRequest>,
-    ) -> Result<tonic::Response<rockstream_management_proto::v1::ListNodesResponse>, tonic::Status>
-    {
-        self.client.list_nodes(request).await
-    }
-
-    pub async fn get_node(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetNodeRequest>,
-    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetNodeResponse>, tonic::Status>
-    {
-        self.client.get_node(request).await
-    }
-
-    pub async fn list_shards(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::ListShardsRequest>,
-    ) -> Result<tonic::Response<rockstream_management_proto::v1::ListShardsResponse>, tonic::Status>
-    {
-        self.client.list_shards(request).await
-    }
-
-    pub async fn get_shard(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetShardRequest>,
-    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetShardResponse>, tonic::Status>
-    {
-        self.client.get_shard(request).await
-    }
-
-    pub async fn list_operations(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::ListOperationsRequest>,
-    ) -> Result<
-        tonic::Response<rockstream_management_proto::v1::ListOperationsResponse>,
-        tonic::Status,
-    > {
-        self.client.list_operations(request).await
-    }
-
-    pub async fn get_operation(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetOperationRequest>,
-    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetOperationResponse>, tonic::Status>
-    {
-        self.client.get_operation(request).await
-    }
-
-    pub async fn get_config_summary(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetConfigSummaryRequest>,
-    ) -> Result<
-        tonic::Response<rockstream_management_proto::v1::GetConfigSummaryResponse>,
-        tonic::Status,
-    > {
-        self.client.get_config_summary(request).await
-    }
-
-    pub async fn get_capabilities(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetCapabilitiesRequest>,
-    ) -> Result<
-        tonic::Response<rockstream_management_proto::v1::GetCapabilitiesResponse>,
-        tonic::Status,
-    > {
-        self.client.get_capabilities(request).await
-    }
-
-    pub async fn get_health(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::GetHealthRequest>,
-    ) -> Result<tonic::Response<rockstream_management_proto::v1::GetHealthResponse>, tonic::Status>
-    {
-        self.client.get_health(request).await
-    }
-
-    pub async fn drain_worker(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::DrainWorkerRequest>,
-    ) -> Result<tonic::Response<rockstream_management_proto::v1::DrainWorkerResponse>, tonic::Status>
-    {
-        self.client.drain_worker(request).await
-    }
-
-    pub async fn migrate_shard(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::MigrateShardRequest>,
-    ) -> Result<tonic::Response<rockstream_management_proto::v1::MigrateShardResponse>, tonic::Status>
-    {
-        self.client.migrate_shard(request).await
-    }
-
-    pub async fn create_backup(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::CreateBackupRequest>,
-    ) -> Result<tonic::Response<rockstream_management_proto::v1::CreateBackupResponse>, tonic::Status>
-    {
-        self.client.create_backup(request).await
-    }
-
-    pub async fn cancel_operation(
-        &mut self,
-        request: impl tonic::IntoRequest<rockstream_management_proto::v1::CancelOperationRequest>,
-    ) -> Result<
-        tonic::Response<rockstream_management_proto::v1::CancelOperationResponse>,
-        tonic::Status,
-    > {
-        self.client.cancel_operation(request).await
-    }
+    let (observed_at, source_version) = metadata.unwrap_or_default();
+    Ok((observed_at, source_version, items))
 }
 
 pub struct ManagementCliClient {
     runtime: tokio::runtime::Runtime,
-    client: ManagementClient,
+    client: ManagementGrpcClient,
 }
 
 impl ManagementCliClient {
@@ -305,8 +199,13 @@ impl ManagementCliClient {
             .enable_all()
             .build()
             .map_err(|error| management_client_error("create runtime", error.to_string()))?;
+        let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
+            addr.to_owned()
+        } else {
+            format!("http://{addr}")
+        };
         let client = runtime
-            .block_on(ManagementClient::connect(addr))
+            .block_on(ManagementGrpcClient::connect(endpoint))
             .map_err(|error| management_client_error("connect", error.to_string()))?;
         Ok(Self { runtime, client })
     }
@@ -343,11 +242,8 @@ impl ManagementCliClient {
         let runtime = &self.runtime;
         let client = &mut self.client;
         let (observed_at, source_version, nodes) = runtime
-            .block_on(async {
-                let mut token = String::new();
-                let mut metadata = None;
-                let mut nodes = Vec::new();
-                loop {
+            .block_on(collect_management_pages(client, |client, token| {
+                Box::pin(async move {
                     let response = client
                         .list_nodes(rockstream_management_proto::v1::ListNodesRequest {
                             protocol_version: 1,
@@ -356,28 +252,19 @@ impl ManagementCliClient {
                         })
                         .await?;
                     let response = response.into_inner();
-                    metadata.get_or_insert_with(|| {
-                        (
-                            response.observed_at.clone(),
-                            response.source_version.clone(),
-                        )
-                    });
-                    nodes.extend(
+                    Ok((
+                        response.observed_at,
+                        response.source_version,
                         response
                             .nodes
                             .into_iter()
                             .map(management_node)
                             .collect::<Result<Vec<_>, _>>()
                             .map_err(|error| tonic::Status::internal(error.message))?,
-                    );
-                    token = response.next_page_token;
-                    if token.is_empty() {
-                        break;
-                    }
-                }
-                let (observed_at, source_version) = metadata.unwrap_or_default();
-                Ok::<_, tonic::Status>((observed_at, source_version, nodes))
-            })
+                        response.next_page_token,
+                    ))
+                })
+            }))
             .map_err(|error| management_status_error("ListNodes", error))?;
         Ok(ManagementNodesInfo {
             observed_at,
@@ -411,11 +298,8 @@ impl ManagementCliClient {
         let runtime = &self.runtime;
         let client = &mut self.client;
         let (observed_at, source_version, shards) = runtime
-            .block_on(async {
-                let mut token = String::new();
-                let mut metadata = None;
-                let mut shards = Vec::new();
-                loop {
+            .block_on(collect_management_pages(client, |client, token| {
+                Box::pin(async move {
                     let response = client
                         .list_shards(rockstream_management_proto::v1::ListShardsRequest {
                             protocol_version: 1,
@@ -424,28 +308,19 @@ impl ManagementCliClient {
                         })
                         .await?;
                     let response = response.into_inner();
-                    metadata.get_or_insert_with(|| {
-                        (
-                            response.observed_at.clone(),
-                            response.source_version.clone(),
-                        )
-                    });
-                    shards.extend(
+                    Ok((
+                        response.observed_at,
+                        response.source_version,
                         response
                             .shards
                             .into_iter()
                             .map(management_shard)
                             .collect::<Result<Vec<_>, _>>()
                             .map_err(|error| tonic::Status::internal(error.message))?,
-                    );
-                    token = response.next_page_token;
-                    if token.is_empty() {
-                        break;
-                    }
-                }
-                let (observed_at, source_version) = metadata.unwrap_or_default();
-                Ok::<_, tonic::Status>((observed_at, source_version, shards))
-            })
+                        response.next_page_token,
+                    ))
+                })
+            }))
             .map_err(|error| management_status_error("ListShards", error))?;
         Ok(ManagementShardsInfo {
             observed_at,
@@ -479,11 +354,8 @@ impl ManagementCliClient {
         let runtime = &self.runtime;
         let client = &mut self.client;
         let (observed_at, source_version, operations) = runtime
-            .block_on(async {
-                let mut token = String::new();
-                let mut metadata = None;
-                let mut operations = Vec::new();
-                loop {
+            .block_on(collect_management_pages(client, |client, token| {
+                Box::pin(async move {
                     let response = client
                         .list_operations(rockstream_management_proto::v1::ListOperationsRequest {
                             protocol_version: 1,
@@ -492,21 +364,18 @@ impl ManagementCliClient {
                         })
                         .await?;
                     let response = response.into_inner();
-                    metadata.get_or_insert_with(|| {
-                        (
-                            response.observed_at.clone(),
-                            response.source_version.clone(),
-                        )
-                    });
-                    operations.extend(response.operations.into_iter().map(management_operation));
-                    token = response.next_page_token;
-                    if token.is_empty() {
-                        break;
-                    }
-                }
-                let (observed_at, source_version) = metadata.unwrap_or_default();
-                Ok::<_, tonic::Status>((observed_at, source_version, operations))
-            })
+                    Ok((
+                        response.observed_at,
+                        response.source_version,
+                        response
+                            .operations
+                            .into_iter()
+                            .map(management_operation)
+                            .collect(),
+                        response.next_page_token,
+                    ))
+                })
+            }))
             .map_err(|error| management_status_error("ListOperations", error))?;
         Ok(ManagementOperationsInfo {
             observed_at,
