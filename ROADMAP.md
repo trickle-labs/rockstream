@@ -258,7 +258,7 @@ Changes to persistent formats or public protocols require:
 | **v0.71** | Observability | Operators can explain health, lag, state, and failures |
 | **v0.72** | Resource Control | Bounded execution and reproducible capacity behavior |
 | **v0.73** | Security | Authentication, authorization, and identity become production-coherent |
-| v0.73.1 | Console API Foundation | Browser-class clients can safely consume qualified public capabilities |
+| v0.73.1 | Console Role/API Foundation | Browser-class clients can safely consume qualified public capabilities |
 | **v0.74** | Upgrade Compatibility | Rolling/versioned upgrades and durable format migration |
 | **v0.75** | Stable Technical Preview | Long-lived 0.x compatibility, qualification, and UI-readiness contract |
 
@@ -331,20 +331,30 @@ group criteria that are implemented and proved by the roadmap owners below.
 | v0.71 | M4/M6 canonical object and status models, lineage, health, freshness diagnosis, diagnostics, and metric provenance |
 | v0.72 | M5 and workload-control portions of M7: bounded interactive execution, cancellation cleanup, subscriptions, admission, and effective limit changes |
 | v0.73 | M2/M8 durable principals and grants, shared authorization, operator/admin/data separation, management authentication, secrets, audit, and redaction |
-| v0.73.1 | M3 secured browser-facing console API, sessions, adapters, generated client, and browser-security boundary |
+| v0.73.1 | M3 secured browser-facing `ConsoleComponent` role, sessions, adapters, generated client, and browser-security boundary |
 | v0.74 | M10 compatibility for the console API, event stream, delegated actor assertions, public resource identities, generated client, and changed durable formats |
 | v0.75 | Remaining M7 integration and M9-M11 guarded operations, packaging, load/security qualification, persona journeys, and final UI-readiness gate |
 
 Existing milestones remain the owners of their behavior and evidence. Do not
 create a second catalog, authorization store, diagnostic engine, query scheduler,
-or operation system for the console. A criterion may cite one owning milestone's
-evidence when that evidence proves the complete UIE claim. Completing a UIE
-subset does not sign off an otherwise incomplete release.
+or operation system for the console. The console is a first-class component in
+the existing `rockstream` binary and node lifecycle, not a separate executable
+or service product. A criterion may cite one owning milestone's evidence when
+that evidence proves the complete UIE claim. Completing a UIE subset does not
+sign off an otherwise incomplete release.
 
 M2 is a logical prerequisite for the console API but is fulfilled by v0.73; it
 is not pulled ahead of v0.71 or v0.72. The console API in v0.73.1 is the only new
 subsystem introduced by this track. UI implementation begins only after v0.75
 qualifies the complete headless contract.
+
+The v0.73.1 entry point is `rockstream start --role console`. It owns the
+browser-facing HTTPS endpoint and later static UI assets. The browser connects
+only to that endpoint; pgwire, management, telemetry, and artifact-storage
+interfaces remain internal upstreams behind the authenticated and authorized
+console boundary. Once qualified, standalone `rockstream start --role all`
+composes exactly one `ConsoleComponent` alongside the existing gateway, control,
+worker, metrics, and connector-supervision components.
 
 ---
 
@@ -910,7 +920,16 @@ MetricsComponent
 ConnectorSupervisor
 ```
 
-`role=all` composes the same components as separate-process deployment.
+The v0.73.1 UI-enablement extension adds:
+
+```text
+ConsoleComponent
+```
+
+`rockstream start --role console` composes that component through the same
+`NodeRuntime` lifecycle and shutdown coordination. After qualification,
+`role=all` composes it once, using the same implementation as the separate
+console role. It must not introduce a parallel `console serve` lifecycle.
 
 ---
 
@@ -2693,19 +2712,20 @@ No secret values may appear in ordinary diagnostics or support bundles.
 The allowed and denied matrix must cover the fixed presets across pgwire,
 management RPCs, and CLI calls, including an operator denied business data,
 secret values, and grant administration. These requirements own UIE-M2 and
-UIE-M8. The console service may expose their results only after this shared
+UIE-M8. The `ConsoleComponent` may expose their results only after this shared
 security model passes.
 
 ---
 
 <a id="v0-73-1"></a>
 
-# 19A. v0.73.1 — Console API Foundation
+# 19A. v0.73.1 — Console Role/API Foundation
 
 ## Focus
 
 Expose already qualified RockStream capabilities through one secured,
-browser-compatible HTTP API. This milestone adds no user interface and does not
+browser-compatible HTTP API hosted by a first-class `ConsoleComponent` in the
+existing `rockstream` binary. This milestone adds no user interface and does not
 expand engine, lifecycle, query, or operational semantics.
 
 ## User outcome
@@ -2718,17 +2738,21 @@ operation adapters without private APIs or privileged proxy behavior.
 
 ## Implementation Plan
 
-### 19A.1 Service boundary and packaging
+### 19A.1 Console role boundary and packaging
 
-Add `crates/rockstream-console` and `rockstream console serve`. Package the
-service in the release binary or container with validated gateway, management,
+Add `ConsoleComponent` to the existing `Component`/`NodeRuntime` model and expose
+it through `rockstream start --role console`. Package the existing `rockstream`
+binary or container with validated console, gateway, management,
 identity-provider, telemetry, artifact-store, limit, and shutdown configuration.
 Backend targets come from deployment configuration, never user-supplied URLs.
-Refuse production startup against an insufficiently secured backend.
+Refuse production startup against an insufficiently secured backend. Do not add
+a nested console subcommand or a separate console executable or process
+lifecycle.
 
 ### 19A.2 Browser sessions and actor delegation
 
-Use OIDC authorization-code flow with PKCE and server-held tokens. Validate
+Use OIDC authorization-code flow with PKCE and server-held tokens in the
+`ConsoleComponent`. Validate
 issuer, audience, signature, state, nonce, redirect targets, and expiry. Use
 secure, HttpOnly cookies plus explicit SameSite, CSRF, origin, logout, revocation,
 and session-fixation behavior.
@@ -2747,7 +2771,8 @@ diagnostics, operations, and backups. Preserve stable resource identities,
 revisions, exact numeric and SQL value semantics, authoritative errors, and
 unknown/stale/unavailable states.
 
-Adapters call the v0.71-v0.73 public owners. They may reshape responses but may
+Adapters inside `ConsoleComponent` call the v0.71-v0.73 public owners. They may
+reshape responses but may
 not duplicate catalog, authorization, diagnosis, scheduling, or operation
 semantics.
 
@@ -2756,9 +2781,10 @@ semantics.
 Enforce same-origin defaults, explicit allowed origins, content types, request
 and response limits, rate and concurrency limits, bounded pools and streams,
 privacy/cache headers, correlation, and safe logs. Authenticate streaming and
-download paths. Reset pooled state between actors. Console restart invalidates
-ephemeral sessions and query handles predictably without changing accepted
-engine operations.
+download paths. Reset pooled state between actors. Console-component restart
+invalidates ephemeral sessions and query handles predictably without changing
+accepted engine operations. The browser has no direct connection to any
+upstream pgwire, management, telemetry, or artifact endpoint.
 
 Publish support, authorization, and current eligibility as separate decisions.
 Execution rechecks policy, versions, and prerequisites at the authoritative
@@ -2778,7 +2804,8 @@ Use the generated client to consume canonical v0.71 records, bounded v0.72 query
 paths, and v0.73 policy decisions. Mocks may test adapters but cannot qualify a
 product route. Every route must retain the underlying permission, boundedness,
 durability, and unsupported-operation semantics. This milestone owns UIE-M3 and
-the console-adapter portions of UIE-M4-M9.
+the console-adapter portions of UIE-M4-M9. The adapter is a runtime component of
+`rockstream`, not a separately started service.
 
 ---
 
@@ -3177,7 +3204,7 @@ Experimental capabilities retain weaker guarantees.
 ### 21.7 Qualify the UI-readiness contract
 
 Complete the remaining UIE-M7 integration and UIE-M9-M11 criteria through the
-packaged v0.73.1 service. The console may expose only operations qualified by
+packaged v0.73.1 console role. The console may expose only operations qualified by
 v0.66/v0.68 and later owning milestones; adding an API route cannot broaden
 migration, cancellation, backup, source-lifecycle, or restore guarantees.
 
@@ -3278,7 +3305,7 @@ v0.69 PostgreSQL CDC   v0.70 Kafka
          v0.73 Security [UIE M2/M8]
                │
                ▼
-         v0.73.1 Console API [UIE M3]
+         v0.73.1 Console role/API [UIE M3]
                │
                ▼
          v0.74 Upgrade [UIE M10 compatibility]
@@ -3571,7 +3598,7 @@ The first concrete sequence is:
 10. Build the UIE M0/M1 capability map, contracts, and headless harness alongside v0.66-v0.70 without making a UI product claim.
 11. Make v0.71's canonical observations satisfy UIE M4/M6 and v0.72's bounded execution satisfy UIE M5 and the workload portion of M7.
 12. Make v0.73's shared security model satisfy UIE M2/M8, including operator/admin/data separation.
-13. Ship the secured console API as v0.73.1, adapting rather than duplicating the v0.71-v0.73 owners.
+13. Ship the secured console role/API inside the existing `rockstream` binary as v0.73.1, adapting rather than duplicating the v0.71-v0.73 owners.
 14. Include console contracts in v0.74 compatibility and complete UIE M7/M9-M11 qualification in v0.75.
 ```
 

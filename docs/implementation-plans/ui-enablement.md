@@ -65,7 +65,7 @@ when the same behavior is needed by a browser-class client.
 | v0.71 observability | M4 and M6 canonical object/status read models, lineage, health dimensions, freshness diagnosis, diagnostics, and metric provenance. |
 | v0.72 resource control | M5 and the workload-control portion of M7: producer-side interactive-query bounds, cancellation cleanup, subscriptions, query admission, and effective workload changes. |
 | v0.73 security coherence | M2 and M8 durable principals/grants, management authentication, common authorization, separated operator/admin/data authority, secrets, audit, and redaction. |
-| v0.73.1 console API foundation | M3: the secured browser-facing API service, sessions, adapters, generated client, and browser-security boundary. This is the only new subsystem introduced by this track. |
+| v0.73.1 console role/API foundation | M3: the secured browser-facing `ConsoleComponent` role, sessions, adapters, generated client, and browser-security boundary. This is the only new subsystem introduced by this track. |
 | v0.74 compatibility | The compatibility portion of M10: version the console API, event stream, delegated actor assertions, public resource identities, generated client, and changed durable/protocol formats. |
 | v0.75 stable technical preview | The remaining M7 integration plus M9-M11 guarded operations, complete headless persona journeys, packaging, load/security qualification, and the final **Ready for UI implementation** gate. |
 
@@ -89,7 +89,7 @@ Future browser or headless acceptance client
                  |
            HTTPS + session
                  |
-      rockstream-console API service
+        rockstream ConsoleComponent
        /             |               \
  scoped SQL      authenticated      bounded telemetry
  adapter         management client  and diagnostics adapter
@@ -99,9 +99,21 @@ Future browser or headless acceptance client
      +------- existing runtime, catalog, and storage -------+
 ```
 
-Introduce one proposed Rust crate, `crates/rockstream-console`, for the browser-facing API and adapters. Extend existing shared types, policy, gateway, management protocol, and runtime components rather than duplicating their domain logic. Add a proposed `rockstream console serve` entry point to the existing binary; it serves APIs only during this program.
+Implement `ConsoleComponent` in the existing `rockstream` binary's
+`Component`/`NodeRuntime` model, alongside gateway, control, worker, metrics, and
+connector supervision. Supporting HTTP/API modules may be factored internally,
+but there is no separate console executable or parallel lifecycle. The entry
+point is `rockstream start --role console`; after qualification,
+`rockstream start --role all` composes exactly one console component.
 
-The API service may own sessions, bounded query handles, ephemeral stream buffers, and retained export artifacts. It must not become the authoritative owner of engine objects, grants, worker placement, workload settings, or management-operation outcomes.
+The console component owns the browser-facing HTTPS listener and later static UI
+assets, plus sessions, bounded query handles, ephemeral stream buffers, and
+retained export artifacts. The browser communicates only with this endpoint. The
+component is an authenticated, authorized boundary to pgwire, management,
+telemetry, and artifact storage; those upstream interfaces are not exposed
+directly to the browser. It must not become the authoritative owner of engine
+objects, grants, worker placement, workload settings, or management-operation
+outcomes.
 
 ### Security and authority
 
@@ -194,7 +206,7 @@ For every criterion below, record the implementation, documentation, named posit
 
 ### M2 — Establish durable identity and shared authorization
 
-**Outcome:** Engine and management endpoints enforce the eventual UI's permissions without depending on the UI service to hide privileged operations.
+**Outcome:** Engine and management endpoints enforce the eventual UI's permissions without depending on the console component to hide privileged operations.
 
 **UIE-M2-01 — Persist security state.** Reuse the durable catalog for principals, grants, password verifiers where supported, and policy revisions. Define bootstrap, grant/revoke, revocation propagation, credential rotation, and recovery. Couple acknowledged security changes with durable audit evidence. Corrupt or unavailable security state must fail closed, not produce an empty permissive store. This is shared v0.73 work, not a console-local ACL database. [R7]
 
@@ -208,19 +220,35 @@ For every criterion below, record the implementation, documentation, named posit
 
 **Proposed suite:** `ui_identity_public_paths`. Exercise an allowed/denied matrix through every applicable transport, cross-namespace access, forged delegation, cross-user connection reuse, revocation during a query/subscription, expired credentials, and process destruction after grant/revoke. Compare exact grants and audit records after recovery. M2 fails if an operator can retrieve protected data through SQL, diagnostics, exports, or management.
 
-### M3 — Implement the secured console API service
+### M3 — Implement the secured console API `ConsoleComponent`
 
-**Outcome:** A real browser-compatible service exists, with no UI and no unrestricted privileged proxy.
+**Outcome:** A real browser-compatible `ConsoleComponent` exists inside the
+`rockstream` binary, with no UI and no unrestricted privileged proxy.
 
-**UIE-M3-01 — Add service packaging and adapters.** Implement `rockstream console serve` with validated gateway, management, identity-provider, telemetry, and artifact-store configuration. Targets are deployment configuration, never arbitrary URLs supplied by users. Establish authenticated adapters, bounded pools, request deadlines, admission limits, and graceful shutdown. Refuse production startup against an insufficiently secured backend. An unavailable optional telemetry provider must not prevent authorized catalog/query use.
+**UIE-M3-01 — Add the console role and adapters.** Implement
+`rockstream start --role console` by adding `ConsoleComponent` to the existing
+`Component`/`NodeRuntime` composition and lifecycle. Add the corresponding
+`NodeRole::Console` support and compose the same component exactly once for
+`rockstream start --role all` after it is qualified. Targets are deployment
+configuration, never arbitrary URLs supplied by users. Establish authenticated
+adapters, bounded pools, request deadlines, admission limits, and graceful
+shutdown. Refuse production startup against an insufficiently secured backend.
+An unavailable optional telemetry provider must not prevent authorized
+catalog/query use. Extend `NodeConfig` with a `[console]` section for the
+HTTPS listener, authentication/session settings, upstream gateway and management
+targets, optional telemetry and artifact storage, and console resource limits.
+Resolve it through the existing defaults < file < environment < CLI precedence,
+redacted origin reporting, unknown-key rejection, role validation, and
+startup/drain lifecycle. Do not add a nested console subcommand or another
+console process lifecycle.
 
-**UIE-M3-02 — Add browser sessions.** Use OIDC authorization-code flow with PKCE and server-held tokens; validate issuer, audience, signature, state, nonce, redirect targets, and expiry. Use secure, HttpOnly session cookies with an explicitly tested SameSite policy; implement CSRF/origin protections, logout, revocation, and session fixation defenses. Reject unconfigured identity modes. Use established protocol libraries rather than creating an identity provider. [S1]
+**UIE-M3-02 — Add browser sessions.** Use OIDC authorization-code flow with PKCE and server-held tokens in `ConsoleComponent`; validate issuer, audience, signature, state, nonce, redirect targets, and expiry. Use secure, HttpOnly session cookies with an explicitly tested SameSite policy; implement CSRF/origin protections, logout, revocation, and session fixation defenses. Reject unconfigured identity modes. Use established protocol libraries rather than creating an identity provider. [S1]
 
 **UIE-M3-03 — Publish identity, capabilities, and action decisions.** Implement session inspection, deployment identity, supported API versions, SQL capability discovery, attached management methods, optional providers, effective permissions, and per-resource action eligibility. Do not treat management `GetCapabilities` as the SQL capability registry. Keep permission failures and sensitive precondition details from becoming an object-enumeration channel.
 
-**UIE-M3-04 — Enforce a safe HTTP boundary.** Add same-origin defaults, explicit allowed origins, content-type and request-size validation, rate limits, cache/privacy headers, safe logs, and correlation IDs. Streaming connections and downloads require authentication too. Pool cleanup must reset database/session state and prohibit identity leakage. Console restart invalidates ephemeral sessions/queries predictably without altering accepted engine operations.
+**UIE-M3-04 — Enforce a safe HTTP boundary.** Add same-origin defaults, explicit allowed origins, content-type and request-size validation, rate limits, cache/privacy headers, safe logs, and correlation IDs. Streaming connections and downloads require authentication too. Pool cleanup must reset database/session state and prohibit identity leakage. Console-component restart invalidates ephemeral sessions/queries predictably without altering accepted engine operations. The browser has no direct route to pgwire, management, telemetry, or artifact storage.
 
-**Proposed suite:** `ui_console_security`. Test OIDC login/logout against a controlled provider, CSRF rejection, malicious origins/targets, pooled-session isolation, rate limiting, backend outage, startup misconfiguration, and reconnect after service restart. Use HTTP/protocol clients; no application screens are necessary.
+**Proposed suite:** `ui_console_security`. Test OIDC login/logout against a controlled provider, CSRF rejection, malicious origins/targets, pooled-session isolation, rate limiting, backend outage, startup misconfiguration, and reconnect after console-component restart. Use HTTP/protocol clients; no application screens are necessary.
 
 ### M4 — Expose authoritative objects, definitions, and dependencies
 
@@ -244,7 +272,7 @@ For every criterion below, record the implementation, documentation, named posit
 
 **UIE-M5-02 — Enforce query budgets at the producer.** Support a bounded, single-statement read-only query path, including permitted inspection statements. Reject mutations and unauthorized reads in the engine dispatcher, not with a frontend regex. Use proven portals/cursors or a bounded gateway execution path. Audit whether result construction materializes the complete relation before suspension; fix it where necessary. Bound compilation, intermediate state, queued work, rows, encoded bytes, wall time, concurrency, and snapshot lifetime. Return explicit truncation/limit errors; do not append unsupported `LIMIT` or promise that client-side sorting orders the full relation. [R3], [R4]
 
-**UIE-M5-03 — Make cancellation and result handles real.** Bind query IDs/cursors to actor, deployment, scope, and policy. Cancellation, timeout, disconnect, cursor expiry, and service shutdown must close or cancel upstream work and release reservations. Report cancellation complete only after cleanup is acknowledged. Define ephemeral-query loss on console restart and retain no ambiguous promise of resumability. For the required materialized-view result path, return a snapshot/commit token tied to the actual read; add gateway response metadata if the current protocol does not expose it. Other statement classes may explicitly report that this metadata is not applicable or unavailable, but cannot present that absence as a proven freshness guarantee.
+**UIE-M5-03 — Make cancellation and result handles real.** Bind query IDs/cursors to actor, deployment, scope, and policy. Cancellation, timeout, disconnect, cursor expiry, and console-component shutdown must close or cancel upstream work and release reservations. Report cancellation complete only after cleanup is acknowledged. Define ephemeral-query loss on console restart and retain no ambiguous promise of resumability. For the required materialized-view result path, return a snapshot/commit token tied to the actual read; add gateway response metadata if the current protocol does not expose it. Other statement classes may explicitly report that this metadata is not applicable or unavailable, but cannot present that absence as a proven freshness guarantee.
 
 **UIE-M5-04 — Implement a bounded committed subscription bridge.** Define snapshot start/end and committed epoch frames with sequence information, weighted changes, and explicit reset behavior. Preserve duplicates and atomic epoch application; never display an uncommitted half-update. Bound snapshot size, per-epoch accumulation, total buffers, stream count, and slow-client lifetime. Reject an oversized complete snapshot/epoch rather than silently dropping rows. On reconnect or lost replay history, require resnapshot unless durable replay is independently qualified.
 
@@ -316,7 +344,7 @@ For every criterion below, record the implementation, documentation, named posit
 
 **Outcome:** The backend can be installed, upgraded, operated, and load-tested without the prototype or a developer-only runtime.
 
-**UIE-M10-01 — Ship a reproducible deployment.** Include the API service in the release binary/container and provide standalone and qualified multi-process examples. Document TLS, OIDC, bootstrap, gateway/management trust, optional Prometheus, secret references, storage, limits, and shutdown. Keep network targets allowlisted and sensitive listeners isolated. Provide API liveness/readiness probes that do not confuse optional history availability with cluster health. Execute installation examples in CI.
+**UIE-M10-01 — Ship a reproducible deployment.** Include the console role in the release `rockstream` binary/container and provide standalone and qualified multi-process examples. Document TLS, OIDC, bootstrap, gateway/management trust, optional Prometheus, secret references, storage, limits, role composition, and shutdown. Keep network targets allowlisted and sensitive listeners isolated. Provide console-role liveness/readiness probes that do not confuse optional history availability with cluster health. Execute installation examples in CI.
 
 **UIE-M10-02 — Version formats and qualify compatibility.** Test the API client/server and engine/API combinations frozen in M0. Version changed grant, operation, object, and session/delegation formats. Exercise interrupted migration and documented rollback boundaries. Reject incompatible or insecure backends clearly, with no silent downgrade. Test unknown optional fields and new enum values against the generated client. Do not claim upgrade safety for combinations not exercised.
 
@@ -330,7 +358,7 @@ For every criterion below, record the implementation, documentation, named posit
 
 **Outcome:** A frontend team can implement the proposed UI without discovering missing security, data, or operation semantics.
 
-**UIE-M11-01 — Execute complete persona journeys.** Use the generated client or a headless HTTP client against the packaged service, never private Rust setters or prototype fixtures, to complete every journey in Section 6. Correlate its responses with the engine, durable state, and audit/observation sources. Include denied and faulted paths as well as success.
+**UIE-M11-01 — Execute complete persona journeys.** Use the generated client or a headless HTTP client against the packaged `rockstream` binary's console role, never private Rust setters or prototype fixtures, to complete every journey in Section 6. Correlate its responses with the engine, durable state, and audit/observation sources. Include denied and faulted paths as well as success.
 
 **UIE-M11-02 — Close the capability map.** Every first-UI interaction has a working API, authoritative producer, permission rule, absence/error semantics, resource limits, documented compatibility, and linked positive/negative evidence. Required features cannot pass solely by returning unsupported. Explicitly deferred features have a documented future owner and no first-UI affordance that suggests they work.
 
@@ -369,11 +397,11 @@ These are **proposed starting decisions**, not measured current capacities or de
 | Catalog page | Default 50 objects, maximum 100; bounded backend scan work even when many rows are unauthorized. |
 | Query preview | At most 1,000 rows and 8 MiB of encoded results per query, including all result pages. |
 | Interactive query | 10-second overall budget, including admission/compilation; explicit rejection or timeout, not unbounded queuing. |
-| Query concurrency | At most 2 active queries per principal and 16 per service instance, further constrained by shared engine admission. Aggregate limits must remain safe if service instances are added. |
+| Query concurrency | At most 2 active queries per principal and 16 per console instance, further constrained by shared engine admission. Aggregate limits must remain safe if console nodes are added. |
 | Cursor lifetime | 30-second idle timeout and 60-second absolute snapshot lifetime. |
 | Cancellation cleanup | Producer cancellation/resource release acknowledged within 2 seconds on the qualified profile; failures report a cancellation failure rather than false completion. |
 | Subscription | At most 4 streams per principal; 4 MiB per-stream buffer with a 64 MiB aggregate service buffer budget; slow-reader reset/disconnect is explicit. |
-| API service memory | 256 MiB accounted application budget, with a separately measured/frozen runtime/allocator overhead allowance; all component maxima remain subject to aggregate reservations. |
+| ConsoleComponent memory | 256 MiB accounted application budget, with a separately measured/frozen runtime/allocator overhead allowance; all component maxima remain subject to aggregate reservations. |
 | History query | Maximum 24-hour range, 20 series, 2,000 points per series, and 8 MiB response; reject incompatible requests or return an explicit coarser resolution. |
 | Support artifact | 10 MiB maximum; actor-scoped download expires after 10 minutes; retained artifact deletion follows a frozen policy. |
 | Mutation review | 30-second preflight expiry plus mandatory execution-time checks; expiry does not substitute for version checking. |
@@ -408,7 +436,8 @@ All mutation verbs, schemas, and authorization rules must be explicit in OpenAPI
 Proposed additions and outputs:
 
 ```text
-crates/rockstream-console/                # Rust API service and bounded adapters
+crates/rockstream-cli/src/component.rs    # ConsoleComponent in NodeRuntime
+crates/rockstream-cli/src/console.rs      # API handlers and bounded adapters
 api/console/v1/                          # Generated OpenAPI/event schemas
 packages/rockstream-console-client/       # Generated client; no UI dependencies
 tools/ui-readiness-harness/               # Public-interface scenario runner

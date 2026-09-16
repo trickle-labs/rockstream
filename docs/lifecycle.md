@@ -1,6 +1,6 @@
 # Node Lifecycle, Graceful Shutdown & Health Contract
 
-RockStream nodes implement a deterministic, state-machine-driven lifecycle protocol across all node roles (`gateway`, `worker`, `control`, `frontier`, and standalone `all`).
+RockStream nodes implement a deterministic, state-machine-driven lifecycle protocol across all node roles (`gateway`, `worker`, `control`, `frontier`, and standalone `all`). The `console` role is planned in v0.73.1 as a `ConsoleComponent` in the existing `rockstream` binary; it is not a separate executable or lifecycle.
 
 ## 1. Lifecycle State Machine
 
@@ -57,8 +57,18 @@ Each node process progresses through explicit lifecycle states:
 1. Computes final watermark snapshot and notifies downstream subscribers.
 2. Emits audit events and closes subscriber stream listeners.
 
+### Console (`--role console`, planned v0.73.1)
+1. Owns the browser-facing HTTPS listener and later static UI assets.
+2. Authenticates and authorizes browser requests before reaching pgwire, the management API, telemetry, or artifact storage.
+3. Drains HTTP sessions, streams, and upstream work through the same `Component` lifecycle and shutdown deadline as the other node roles.
+4. Does not expose its upstream interfaces directly to the browser.
+
 ### Standalone Profile (`--role all`)
-Coordinates ordered shutdown: Gateway client drain -> Worker shard & epoch flush -> Control store persistence -> Metrics listener teardown.
+Once the v0.73.1 console role is qualified, composes one `ConsoleComponent` with
+the gateway, worker, control, metrics, and connector-supervision components and
+coordinates its ordered shutdown: browser/API drain -> Gateway client drain ->
+Worker shard & epoch flush -> Control store persistence -> Metrics listener
+teardown.
 
 ---
 
