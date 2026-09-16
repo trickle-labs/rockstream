@@ -583,6 +583,128 @@ impl Formattable for ClusterStatusInfo {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagementNodeInfo {
+    pub node_id: u64,
+    pub role: String,
+    pub address: String,
+    pub state: String,
+    pub capacity_headroom: f64,
+    pub host_id: String,
+    pub availability_zone: String,
+    pub healthy: bool,
+    pub lifecycle_state: String,
+    pub registered_at_ms: u64,
+    pub source_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagementClusterStatusInfo {
+    pub observed_at: String,
+    pub source_version: String,
+    pub state: String,
+    pub nodes: Vec<ManagementNodeInfo>,
+    pub active_operations: u32,
+    pub retained_operations: u32,
+    pub request_fill: u32,
+    pub request_capacity: u32,
+    pub ack_waiter_fill: u32,
+    pub ack_waiter_capacity: u32,
+}
+
+impl Formattable for ManagementClusterStatusInfo {
+    fn to_text(&self) -> String {
+        let mut lines = vec![
+            format!("Cluster State: {}", self.state),
+            format!("Observed At: {}", self.observed_at),
+            format!("Source Version: {}", self.source_version),
+            format!(
+                "Operations: {} active, {} retained",
+                self.active_operations, self.retained_operations
+            ),
+            format!(
+                "Request Fill: {} / {}",
+                self.request_fill, self.request_capacity
+            ),
+            format!(
+                "ACK Waiters: {} / {}",
+                self.ack_waiter_fill, self.ack_waiter_capacity
+            ),
+            format!("Nodes: {}", self.nodes.len()),
+        ];
+        for node in &self.nodes {
+            lines.push(format!(
+                "  {} {} {} state={} healthy={} headroom={:.2} host={} az={} registered_at_ms={} source={}",
+                node.node_id,
+                node.role,
+                node.address,
+                node.lifecycle_state,
+                node.healthy,
+                node.capacity_headroom,
+                node.host_id,
+                node.availability_zone,
+                node.registered_at_ms,
+                node.source_version,
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagementNodesInfo {
+    pub observed_at: String,
+    pub source_version: String,
+    pub nodes: Vec<ManagementNodeInfo>,
+}
+
+impl Formattable for ManagementNodesInfo {
+    fn to_text(&self) -> String {
+        if self.nodes.is_empty() {
+            return format!(
+                "No nodes found.\nObserved At: {}\nSource Version: {}",
+                self.observed_at, self.source_version
+            );
+        }
+        let mut lines = vec![
+            format!("Observed At: {}", self.observed_at),
+            format!("Source Version: {}", self.source_version),
+        ];
+        for node in &self.nodes {
+            lines.push(format!(
+                "{} {} {} state={} healthy={} headroom={:.2} host={} az={} registered_at_ms={} source={}",
+                node.node_id, node.role, node.address, node.lifecycle_state, node.healthy,
+                node.capacity_headroom, node.host_id, node.availability_zone,
+                node.registered_at_ms, node.source_version,
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagementNodeDetailInfo {
+    pub observed_at: String,
+    pub source_version: String,
+    pub node: ManagementNodeInfo,
+}
+
+impl Formattable for ManagementNodeDetailInfo {
+    fn to_text(&self) -> String {
+        format!(
+            "Observed At: {}\nSource Version: {}\n{}",
+            self.observed_at,
+            self.source_version,
+            ManagementNodesInfo {
+                observed_at: self.observed_at.clone(),
+                source_version: self.source_version.clone(),
+                nodes: vec![self.node.clone()],
+            }
+            .to_text()
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterQuotasInfo {
     pub total_memory_budget_bytes: u64,
@@ -723,6 +845,67 @@ impl Formattable for Vec<ShardInfo> {
             ));
         }
         lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementShardInfo {
+    pub shard_id: u64,
+    pub owner_node_id: u64,
+    pub state: String,
+    pub lease_token: u64,
+    pub key_range: Option<String>,
+    pub source_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementShardsInfo {
+    pub observed_at: String,
+    pub source_version: String,
+    pub shards: Vec<ManagementShardInfo>,
+}
+
+impl Formattable for ManagementShardsInfo {
+    fn to_text(&self) -> String {
+        let mut lines = vec![
+            format!("Observed At: {}", self.observed_at),
+            format!("Source Version: {}", self.source_version),
+        ];
+        if self.shards.is_empty() {
+            lines.push("No shards found.".to_owned());
+        } else {
+            lines.push("SHARD ID  OWNER  STATE  LEASE TOKEN  KEY RANGE  SOURCE".to_owned());
+            for shard in &self.shards {
+                lines.push(format!(
+                    "{}  {}  {}  {}  {}  {}",
+                    shard.shard_id,
+                    shard.owner_node_id,
+                    shard.state,
+                    shard.lease_token,
+                    shard.key_range.as_deref().unwrap_or("unknown"),
+                    shard.source_version
+                ));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementShardDetailInfo {
+    pub observed_at: String,
+    pub source_version: String,
+    pub shard: ManagementShardInfo,
+}
+
+impl Formattable for ManagementShardDetailInfo {
+    fn to_text(&self) -> String {
+        ManagementShardsInfo {
+            observed_at: self.observed_at.clone(),
+            source_version: self.source_version.clone(),
+            shards: vec![self.shard.clone()],
+        }
+        .to_text()
     }
 }
 
@@ -1195,6 +1378,119 @@ impl Formattable for MigrationOutcome {
         format!(
             "Shard {}: migrated from worker {} to worker {} (status: {}, duration: {}ms)",
             self.shard_id, self.source_worker, self.target_worker, self.status, self.duration_ms
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementOperationInfo {
+    pub operation_id: String,
+    pub kind: String,
+    pub state: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub progress: String,
+    pub phase: String,
+    pub error_code: String,
+    pub next_steps: Vec<String>,
+    pub source_version: String,
+}
+
+impl Formattable for ManagementOperationInfo {
+    fn to_text(&self) -> String {
+        format!("Operation: {}\nKind: {}\nState: {}\nStarted At: {}\nUpdated At: {}\nProgress: {}\nPhase: {}\nError Code: {}\nNext Steps: {}\nSource Version: {}", self.operation_id, self.kind, self.state, self.started_at, self.updated_at, self.progress, self.phase, self.error_code, if self.next_steps.is_empty() { "none".to_owned() } else { self.next_steps.join("; ") }, self.source_version)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementOperationsInfo {
+    pub observed_at: String,
+    pub source_version: String,
+    pub operations: Vec<ManagementOperationInfo>,
+}
+
+impl Formattable for ManagementOperationsInfo {
+    fn to_text(&self) -> String {
+        let mut lines = vec![
+            format!("Observed At: {}", self.observed_at),
+            format!("Source Version: {}", self.source_version),
+        ];
+        if self.operations.is_empty() {
+            lines.push("No operations found.".to_owned());
+        } else {
+            for operation in &self.operations {
+                lines.push(operation.to_text());
+                lines.push(String::new());
+            }
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementConfigValue {
+    pub key: String,
+    pub value: String,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementConfigSummaryInfo {
+    pub observed_at: String,
+    pub source_version: String,
+    pub values: Vec<ManagementConfigValue>,
+}
+
+impl Formattable for ManagementConfigSummaryInfo {
+    fn to_text(&self) -> String {
+        let mut lines = vec![
+            format!("Observed At: {}", self.observed_at),
+            format!("Source Version: {}", self.source_version),
+        ];
+        lines.extend(self.values.iter().map(|value| {
+            format!(
+                "{} = {}{}",
+                value.key,
+                value.value,
+                if value.redacted { " (redacted)" } else { "" }
+            )
+        }));
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementCapabilitiesInfo {
+    pub observed_at: String,
+    pub source_version: String,
+    pub capabilities: Vec<String>,
+}
+
+impl Formattable for ManagementCapabilitiesInfo {
+    fn to_text(&self) -> String {
+        format!(
+            "Observed At: {}\nSource Version: {}\nCapabilities: {}",
+            self.observed_at,
+            self.source_version,
+            self.capabilities.join(", ")
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementHealthInfo {
+    pub observed_at: String,
+    pub source_version: String,
+    pub state: String,
+    pub reason: String,
+}
+
+impl Formattable for ManagementHealthInfo {
+    fn to_text(&self) -> String {
+        format!(
+            "Health: {}\nReason: {}\nObserved At: {}\nSource Version: {}",
+            self.state, self.reason, self.observed_at, self.source_version
         )
     }
 }

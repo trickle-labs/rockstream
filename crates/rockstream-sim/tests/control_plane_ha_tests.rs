@@ -691,7 +691,7 @@ mod tc {
                 continue;
             };
             match message {
-                ControlMessage::ShardAssigned { lease } => return Some(lease),
+                ControlMessage::ShardAssigned { lease, .. } => return Some(lease),
                 ControlMessage::NotLeader { current_leader } => {
                     if let Some(current_leader) = current_leader {
                         if let Some(node) = cluster

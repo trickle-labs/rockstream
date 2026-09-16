@@ -24,12 +24,14 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
+use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::data_plane::{
     DeploymentDescriptor, DeploymentRequest, RuntimeExchangeMessage, RuntimeOutputDelta,
     ShardOutput, WorkerExecutionStatus, WorkloadSnapshot,
@@ -38,14 +40,14 @@ use rockstream_types::error_code::{RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, 
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardRevokeReason;
-use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
 use rockstream_types::topology::{
     ControlMessage, DrainRequest, RaftRoleWire, WorkerLifecycleState, WorkerMessage,
 };
 
 use crate::audit::{AuditEvent, FileAuditLog};
 use crate::frontier::FrontierAggregator;
-use crate::migration::{MigrationCoordinator, MigrationPersistentStore};
+use crate::management_store::{ManagementOperationStore, OperationStatus, OperationUpdate};
+use crate::migration::MigrationPersistentStore;
 use crate::placement::PlacementAlgorithm;
 use crate::raft::{RaftHandle, RaftRole};
 use crate::scheduler::ShardScheduler;
@@ -56,12 +58,44 @@ use crate::topology::{TopologyCatalog, TopologyPersistentStore};
 const DEFAULT_DRAIN_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_DECOMMISSION_GRACE_MS: u64 = 5_000;
 const MAX_DRAIN_QUEUE: usize = 1024;
+pub(crate) const MAX_MANAGEMENT_ACK_WAITERS: usize = 64;
+
+pub(crate) type ManagementAckWaiters =
+    Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>;
+
+fn try_insert_management_ack_waiter(
+    waiters: &mut HashMap<String, oneshot::Sender<WorkerMessage>>,
+    key: String,
+    sender: oneshot::Sender<WorkerMessage>,
+) -> Result<(), &'static str> {
+    if waiters.contains_key(&key) {
+        return Err("management ACK waiter key already exists");
+    }
+    if waiters.len() >= MAX_MANAGEMENT_ACK_WAITERS {
+        return Err("management ACK waiter capacity 64 reached");
+    }
+    waiters.insert(key, sender);
+    Ok(())
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn configured_shared_shard_store_id() -> Option<[u8; 32]> {
+    let endpoint = std::env::var("ROCKSTREAM_OBJECT_STORE_ENDPOINT").ok()?;
+    let bucket = std::env::var("ROCKSTREAM_OBJECT_STORE_BUCKET").ok()?;
+    let region =
+        std::env::var("ROCKSTREAM_OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
+    let mut digest = Sha256::new();
+    for value in [endpoint, bucket, region] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    Some(digest.finalize().into())
 }
 
 fn secret_error_code(error: &SecretStoreError) -> rockstream_types::error_code::ErrorCode {
@@ -88,7 +122,6 @@ fn secret_error_next_steps(error: &SecretStoreError) -> String {
 
 #[derive(Debug, Clone)]
 struct DrainTask {
-    migration_id: String,
     donor_worker_id: WorkerId,
     recipient_worker_id: WorkerId,
     shard_id: ShardId,
@@ -119,7 +152,9 @@ impl DrainFailure {
 #[derive(Default)]
 struct DrainState {
     queue: std::collections::VecDeque<DrainTask>,
-    next_migration_id: u64,
+    operation_ids: HashMap<WorkerId, Vec<String>>,
+    acked_workers: HashSet<WorkerId>,
+    processing_workers: HashSet<WorkerId>,
 }
 
 #[derive(Default)]
@@ -202,6 +237,7 @@ pub struct ControlServiceHandle {
     pub addr: SocketAddr,
     /// Shutdown sender; drop or send to stop the service.
     shutdown_tx: broadcast::Sender<()>,
+    management: Option<crate::management::ManagementServiceHandle>,
     /// TLS certificate reloader (if internal mTLS is enabled).
     pub reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
 }
@@ -210,6 +246,9 @@ impl ControlServiceHandle {
     /// Signal the service to shut down.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
+        if let Some(management) = &self.management {
+            management.shutdown();
+        }
     }
 
     /// Reload the server certificate, private key, and/or CA certificate without restarting.
@@ -221,6 +260,12 @@ impl ControlServiceHandle {
         }
     }
 }
+
+type BackupSource = (
+    Arc<dyn object_store::ObjectStore>,
+    Option<[u8; 32]>,
+    Option<WorkerId>,
+);
 
 /// Control-plane service: listens for worker registrations and shard lease
 /// requests on TCP.
@@ -252,13 +297,17 @@ pub struct ControlService {
     migration_store: Option<Arc<MigrationPersistentStore>>,
     /// Shared drain queue state with a named bound.
     drain_state: Arc<AsyncMutex<DrainState>>,
-    /// Automatically process queued drain migrations in the background.
-    auto_drain: bool,
     /// Optional internal TLS configuration for control plane mTLS.
     internal_tls: Option<InternalTlsConfig>,
     secret_store: Arc<SecretStore>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     data_plane: Arc<AsyncMutex<DataPlaneState>>,
+    management: Option<(
+        String,
+        Arc<dyn object_store::ObjectStore>,
+        rockstream_types::config::NodeConfig,
+    )>,
+    backup_source: Option<BackupSource>,
 }
 
 impl ControlService {
@@ -274,7 +323,6 @@ impl ControlService {
             topology_store: None,
             migration_store: None,
             drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
-            auto_drain: false,
             internal_tls: None,
             secret_store: Arc::new(SecretStore::new(
                 None,
@@ -284,6 +332,8 @@ impl ControlService {
             )),
             worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
             data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),
+            management: None,
+            backup_source: None,
         }
     }
 
@@ -334,12 +384,6 @@ impl ControlService {
         self
     }
 
-    /// Enable automatic background drain processing.
-    pub fn with_auto_drain(mut self, enabled: bool) -> Self {
-        self.auto_drain = enabled;
-        self
-    }
-
     /// Attach an [`InternalTlsConfig`] for internal mTLS mutual authentication.
     pub fn with_internal_tls(mut self, config: InternalTlsConfig) -> Self {
         self.internal_tls = Some(config);
@@ -352,11 +396,47 @@ impl ControlService {
         self
     }
 
+    /// Attach the versioned management API on its own listener.
+    pub fn with_management(
+        mut self,
+        bind_addr: impl Into<String>,
+        operation_store: Arc<dyn object_store::ObjectStore>,
+        config: rockstream_types::config::NodeConfig,
+    ) -> Self {
+        self.management = Some((bind_addr.into(), operation_store, config));
+        self
+    }
+
+    /// Attach the authoritative shard object store used by management backups.
+    pub fn with_backup_source_store(
+        mut self,
+        store: Arc<dyn object_store::ObjectStore>,
+        shared_store_id: [u8; 32],
+    ) -> Self {
+        self.backup_source = Some((store, Some(shared_store_id), None));
+        self
+    }
+
+    /// Attach a local shard store for the embedded `--role all` worker only.
+    pub fn with_single_worker_local_backup_source_store(
+        mut self,
+        store: Arc<dyn object_store::ObjectStore>,
+        worker_id: WorkerId,
+    ) -> Self {
+        self.backup_source = Some((store, None, Some(worker_id)));
+        self
+    }
+
     /// Start the service on `bind_addr`.
     ///
     /// Returns a [`ControlServiceHandle`] which can be used to query the
     /// bound address and send a shutdown signal.
     pub async fn start(self, bind_addr: &str) -> io::Result<ControlServiceHandle> {
+        if self.raft.is_none() && self.shard_manager.is_empty() {
+            if let Some(store) = &self.shard_store {
+                self.shard_manager.restore(store.load().await);
+            }
+        }
         if let Some(store) = &self.topology_store {
             if let Ok(workers) = store.load_all().await {
                 self.catalog.restore_workers(workers);
@@ -365,6 +445,82 @@ impl ControlService {
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
         tracing::info!(addr = %addr, "control service listening");
+
+        let operation_store = self
+            .management
+            .as_ref()
+            .map(|(_, store, _)| ManagementOperationStore::new(store.clone()));
+        let migration_waiters = Arc::new(AsyncMutex::new(HashMap::new()));
+        let backup_waiters = Arc::new(AsyncMutex::new(HashMap::new()));
+        let management = if let Some((management_addr, _, config)) = &self.management {
+            let operations = operation_store
+                .as_ref()
+                .expect("management config has an operation store")
+                .clone();
+            let drain_runtime = ManagementDrainRuntime {
+                catalog: self.catalog.clone(),
+                shard_manager: self.shard_manager.clone(),
+                data_plane: self.data_plane.clone(),
+                audit: self.audit.clone(),
+                shard_store: self.shard_store.clone(),
+                topology_store: self.topology_store.clone(),
+                drain_state: self.drain_state.clone(),
+                worker_senders: self.worker_senders.clone(),
+                migration_waiters: migration_waiters.clone(),
+                operations: operations.clone(),
+                started: Arc::new(AsyncMutex::new(HashSet::new())),
+            };
+            let migration_runtime = ManagementMigrationRuntime {
+                catalog: self.catalog.clone(),
+                shard_manager: self.shard_manager.clone(),
+                data_plane: self.data_plane.clone(),
+                shard_store: self.shard_store.clone(),
+                worker_senders: self.worker_senders.clone(),
+                waiters: migration_waiters.clone(),
+                operations: operations.clone(),
+                started: Arc::new(AsyncMutex::new(HashSet::new())),
+            };
+            let backup_source = self.backup_source.clone().or_else(|| {
+                let store_id = configured_shared_shard_store_id()?;
+                let store =
+                    rockstream_storage::build_runtime_object_store(std::path::Path::new("."), "")
+                        .ok()?;
+                Some((store, Some(store_id), None))
+            });
+            let management = crate::management::ManagementService::new(
+                self.catalog.clone(),
+                self.shard_manager.clone(),
+                operations,
+                config.clone(),
+            )
+            .with_drain_runtime(drain_runtime)
+            .with_migration_runtime(migration_runtime);
+            let management = if let Some((source, shared_store_id, local_worker_id)) = backup_source
+            {
+                management.with_backup_runtime(ManagementBackupRuntime {
+                    catalog: self.catalog.clone(),
+                    shard_manager: self.shard_manager.clone(),
+                    data_plane: self.data_plane.clone(),
+                    worker_senders: self.worker_senders.clone(),
+                    waiters: backup_waiters.clone(),
+                    operations: operation_store
+                        .as_ref()
+                        .expect("management config has an operation store")
+                        .clone(),
+                    source: source.clone(),
+                    source_store_id: shared_store_id,
+                    local_worker_id,
+                    manifests: crate::checkpoint_store::CheckpointManifestStore::new(source),
+                    started: Arc::new(AsyncMutex::new(HashSet::new())),
+                    serial: Arc::new(AsyncMutex::new(())),
+                })
+            } else {
+                management
+            };
+            Some(management.start(management_addr).await?)
+        } else {
+            None
+        };
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let shutdown_tx2 = shutdown_tx.clone();
@@ -382,11 +538,12 @@ impl ControlService {
             synced_epoch,
             frontier: self.frontier.clone(),
             topology_store: self.topology_store.clone(),
-            migration_store: self.migration_store.clone(),
+            operation_store,
             drain_state: self.drain_state.clone(),
-            auto_drain: self.auto_drain,
             secret_store: self.secret_store.clone(),
             worker_senders: self.worker_senders.clone(),
+            migration_waiters,
+            backup_waiters,
             data_plane: self.data_plane.clone(),
         };
 
@@ -460,6 +617,7 @@ impl ControlService {
         Ok(ControlServiceHandle {
             addr,
             shutdown_tx,
+            management,
             reloader: reloader_for_handle,
         })
     }
@@ -509,12 +667,1290 @@ struct ConnectionContext {
     synced_epoch: Arc<AsyncMutex<Option<u64>>>,
     frontier: Option<Arc<FrontierAggregator>>,
     topology_store: Option<Arc<TopologyPersistentStore>>,
-    migration_store: Option<Arc<MigrationPersistentStore>>,
+    operation_store: Option<ManagementOperationStore>,
     drain_state: Arc<AsyncMutex<DrainState>>,
-    auto_drain: bool,
     secret_store: Arc<SecretStore>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    migration_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
+    backup_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
     data_plane: Arc<AsyncMutex<DataPlaneState>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagementDrainRuntime {
+    catalog: TopologyCatalog,
+    shard_manager: ShardManager,
+    data_plane: Arc<AsyncMutex<DataPlaneState>>,
+    audit: Option<Arc<FileAuditLog>>,
+    shard_store: Option<Arc<ShardPersistentStore>>,
+    topology_store: Option<Arc<TopologyPersistentStore>>,
+    drain_state: Arc<AsyncMutex<DrainState>>,
+    worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    migration_waiters: ManagementAckWaiters,
+    operations: ManagementOperationStore,
+    started: Arc<AsyncMutex<HashSet<String>>>,
+}
+
+impl ManagementDrainRuntime {
+    pub(crate) async fn schedule(&self, worker_id: WorkerId, operation_id: String) {
+        if !self.started.lock().await.insert(operation_id.clone()) {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.execute(worker_id, &operation_id).await;
+            runtime.started.lock().await.remove(&operation_id);
+        });
+    }
+
+    async fn execute(&self, worker_id: WorkerId, operation_id: &str) {
+        let previous = match self.operations.get(operation_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) | Err(_) => return,
+        };
+        if !matches!(
+            previous.status(),
+            OperationStatus::Pending | OperationStatus::Waiting
+        ) {
+            return;
+        }
+        let expected_phase = previous.phase().map(str::to_owned);
+        let start_phase = expected_phase
+            .clone()
+            .unwrap_or_else(|| "validating_worker_and_shard_ownership".to_owned());
+        let transition = self
+            .operations
+            .transition_if(
+                operation_id,
+                previous.status(),
+                expected_phase.as_deref(),
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: previous.progress().or(Some(0)),
+                    phase: Some(start_phase.clone()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await;
+        if let Err(error) = transition {
+            tracing::warn!(%operation_id, %error, "drain operation was cancelled or could not start");
+            return;
+        }
+
+        let active_workload = self
+            .data_plane
+            .lock()
+            .await
+            .deployments
+            .values()
+            .any(|deployment| {
+                deployment
+                    .descriptors
+                    .values()
+                    .any(|descriptor| descriptor.shard.worker_id == worker_id)
+            });
+        if active_workload {
+            self.fail(
+                operation_id,
+                "RS-3604",
+                "worker has active workloads; stop them before draining in v0.66",
+                "Retry after the worker has no active workload deployments.",
+            )
+            .await;
+            return;
+        }
+
+        let worker_sender = self.worker_senders.lock().await.get(&worker_id).cloned();
+        let Some(worker_sender) = worker_sender.filter(|sender| !sender.is_closed()) else {
+            self.wait(
+                operation_id,
+                "worker has no active control connection; retry after it reconnects",
+            )
+            .await;
+            return;
+        };
+        if self
+            .operations
+            .transition_if(
+                operation_id,
+                OperationStatus::Running,
+                Some(&start_phase),
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(5),
+                    phase: Some("worker_handoff_started".to_owned()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match request_worker_drain(
+            &self.catalog,
+            &self.shard_manager,
+            self.audit.as_ref(),
+            self.topology_store.as_ref(),
+            &self.drain_state,
+            worker_id,
+            Some(operation_id.to_owned()),
+        )
+        .await
+        {
+            Ok((state, queue_fill, queue_capacity, request)) => {
+                if self
+                    .drain_state
+                    .lock()
+                    .await
+                    .acked_workers
+                    .contains(&worker_id)
+                {
+                    process_drain_queue(
+                        &self.catalog,
+                        &self.shard_manager,
+                        self.audit.as_ref(),
+                        self.shard_store.as_ref(),
+                        self.topology_store.as_ref(),
+                        &self.drain_state,
+                        &self.worker_senders,
+                        worker_id,
+                        &self.migration_waiters,
+                        Some(&self.operations),
+                    )
+                    .await;
+                    return;
+                }
+                send_message(&worker_sender, &ControlMessage::BeginDrain(request)).await;
+                send_message(
+                    &worker_sender,
+                    &ControlMessage::DrainStatus {
+                        worker_id,
+                        state,
+                        queue_fill,
+                        queue_capacity,
+                    },
+                )
+                .await;
+                if let Err(error) = self
+                    .operations
+                    .transition(
+                        operation_id,
+                        OperationUpdate {
+                            status: OperationStatus::Running,
+                            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                            progress: Some(10),
+                            phase: Some("waiting_for_worker_flush_ack".to_owned()),
+                            error_code: None,
+                            next_steps: vec![
+                                "Query the operation again after the worker flushes its shard data.".to_owned(),
+                            ],
+                        },
+                    )
+                    .await
+                {
+                    tracing::error!(code = %rockstream_types::error_code::RS_0001, %operation_id, %error, "drain was sent but its progress record could not be persisted");
+                }
+            }
+            Err(error) => {
+                self.fail(operation_id, error.code, &error.message, &error.next_steps)
+                    .await;
+            }
+        }
+    }
+
+    async fn fail(&self, operation_id: &str, code: &str, message: &str, next_steps: &str) {
+        if let Err(error) = self
+            .operations
+            .transition(
+                operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Failed,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: None,
+                    phase: Some("rejected_before_worker_handoff".to_owned()),
+                    error_code: Some(code.to_owned()),
+                    next_steps: vec![message.to_owned(), next_steps.to_owned()],
+                },
+            )
+            .await
+        {
+            tracing::error!(code = %code, %operation_id, %error, "failed drain outcome could not be persisted");
+        }
+    }
+
+    async fn wait(&self, operation_id: &str, message: &str) {
+        let phase = self
+            .operations
+            .get(operation_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record.phase().map(str::to_owned))
+            .unwrap_or_else(|| "waiting_for_worker_connection".to_owned());
+        if let Err(error) = self
+            .operations
+            .transition(
+                operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Waiting,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: None,
+                    phase: Some(phase),
+                    error_code: Some("RS-3610".to_owned()),
+                    next_steps: vec![message.to_owned()],
+                },
+            )
+            .await
+        {
+            tracing::error!(code = %rockstream_types::error_code::RS_3610, %operation_id, %error, "drain wait state could not be persisted");
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagementMigrationRuntime {
+    catalog: TopologyCatalog,
+    shard_manager: ShardManager,
+    data_plane: Arc<AsyncMutex<DataPlaneState>>,
+    shard_store: Option<Arc<ShardPersistentStore>>,
+    worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    pub(crate) waiters: ManagementAckWaiters,
+    operations: ManagementOperationStore,
+    started: Arc<AsyncMutex<HashSet<String>>>,
+}
+
+impl ManagementMigrationRuntime {
+    pub(crate) async fn schedule(&self, shard_id: ShardId, target: WorkerId, operation_id: String) {
+        if !self.started.lock().await.insert(operation_id.clone()) {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.execute(shard_id, target, &operation_id).await;
+            runtime.started.lock().await.remove(&operation_id);
+        });
+    }
+
+    async fn execute(&self, shard_id: ShardId, target: WorkerId, operation_id: &str) {
+        let previous = match self.operations.get(operation_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) | Err(_) => return,
+        };
+        if !matches!(
+            previous.status(),
+            OperationStatus::Pending | OperationStatus::Waiting
+        ) {
+            return;
+        }
+        let expected_phase = previous.phase().map(str::to_owned);
+        let start_phase = expected_phase
+            .clone()
+            .unwrap_or_else(|| "validating_lease_and_workers".to_owned());
+        if self
+            .operations
+            .transition_if(
+                operation_id,
+                previous.status(),
+                expected_phase.as_deref(),
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: previous.progress().or(Some(0)),
+                    phase: Some(start_phase.clone()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if matches!(
+            previous.phase(),
+            None | Some("validating_lease_and_workers")
+        ) && self
+            .data_plane
+            .lock()
+            .await
+            .deployments
+            .values()
+            .any(|deployment| deployment.descriptors.contains_key(&shard_id))
+        {
+            self.fail(
+                operation_id,
+                "RS-3604",
+                "shard has active workloads; stop them before migrating in v0.66",
+            )
+            .await;
+            return;
+        }
+        if let Some(lease) = self.shard_manager.get(shard_id) {
+            if lease.worker_id == target
+                && matches!(
+                    previous.phase(),
+                    Some("lease_transfer_started" | "recipient_opening")
+                )
+            {
+                if let Some(sender) = self
+                    .worker_senders
+                    .lock()
+                    .await
+                    .get(&target)
+                    .filter(|sender| !sender.is_closed())
+                    .cloned()
+                {
+                    if self
+                        .send_and_wait(
+                            &sender,
+                            ControlMessage::ShardAssigned {
+                                lease: lease.clone(),
+                                operation_id: Some(operation_id.to_owned()),
+                            },
+                            operation_id,
+                            "recipient",
+                            target,
+                            &lease,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        let _ = self
+                            .operations
+                            .transition(
+                                operation_id,
+                                OperationUpdate {
+                                    status: OperationStatus::Succeeded,
+                                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                                    progress: Some(100),
+                                    phase: Some("completed".to_owned()),
+                                    error_code: None,
+                                    next_steps: Vec::new(),
+                                },
+                            )
+                            .await;
+                    } else {
+                        self.wait(
+                            operation_id,
+                            "target worker must reconnect to finish opening the transferred shard",
+                        )
+                        .await;
+                    }
+                } else {
+                    self.wait(
+                        operation_id,
+                        "target worker must reconnect to finish opening the transferred shard",
+                    )
+                    .await;
+                }
+                return;
+            }
+            if lease.worker_id != target && previous.phase() == Some("donor_flushed_and_closed") {
+                if let Some(sender) = self
+                    .worker_senders
+                    .lock()
+                    .await
+                    .get(&lease.worker_id)
+                    .filter(|sender| !sender.is_closed())
+                    .cloned()
+                {
+                    if self
+                        .send_and_wait(
+                            &sender,
+                            ControlMessage::ShardAssigned {
+                                lease: lease.clone(),
+                                operation_id: Some(operation_id.to_owned()),
+                            },
+                            operation_id,
+                            "recipient",
+                            lease.worker_id,
+                            &lease,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        self.wait(
+                            operation_id,
+                            "current shard owner must reconnect before migration can resume",
+                        )
+                        .await;
+                        return;
+                    }
+                } else {
+                    self.wait(
+                        operation_id,
+                        "current shard owner must reconnect before migration can resume",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        if self
+            .operations
+            .transition_if(
+                operation_id,
+                OperationStatus::Running,
+                Some(&start_phase),
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(0),
+                    phase: Some("validating_lease_and_workers".to_owned()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let Some(lease) = self.shard_manager.get(shard_id) else {
+            self.fail(operation_id, "RS-3604", "shard has no active lease")
+                .await;
+            return;
+        };
+        let donor = lease.worker_id;
+        let Some(donor_info) = self.catalog.get(donor) else {
+            self.fail(
+                operation_id,
+                "RS-3610",
+                "current shard owner is unavailable",
+            )
+            .await;
+            return;
+        };
+        if !donor_info.healthy || !donor_info.lifecycle.is_active() {
+            self.fail(
+                operation_id,
+                "RS-3610",
+                "current shard owner is not active and healthy",
+            )
+            .await;
+            return;
+        }
+        let Some(target_info) = self
+            .catalog
+            .get(target)
+            .filter(|worker| worker.healthy && worker.lifecycle.is_active())
+        else {
+            self.fail(
+                operation_id,
+                "RS-3604",
+                "target worker is not active and healthy",
+            )
+            .await;
+            return;
+        };
+        if donor == target
+            || donor_info.capabilities.shared_shard_store_id.is_none()
+            || donor_info.capabilities.shared_shard_store_id
+                != target_info.capabilities.shared_shard_store_id
+        {
+            self.fail(
+                operation_id,
+                "RS-3604",
+                "source and target must be different workers sharing the same shard store",
+            )
+            .await;
+            return;
+        }
+        let senders = self.worker_senders.lock().await.clone();
+        let Some(donor_sender) = senders.get(&donor).filter(|sender| !sender.is_closed()) else {
+            self.wait(
+                operation_id,
+                "current shard owner must reconnect before migration can resume",
+            )
+            .await;
+            return;
+        };
+        let Some(target_sender) = senders.get(&target).filter(|sender| !sender.is_closed()) else {
+            self.wait(
+                operation_id,
+                "target worker must reconnect before migration can resume",
+            )
+            .await;
+            return;
+        };
+        if self
+            .operations
+            .transition_if(
+                operation_id,
+                OperationStatus::Running,
+                Some("validating_lease_and_workers"),
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(10),
+                    phase: Some("donor_handoff_started".to_owned()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if let Err(error) = self
+            .send_and_wait(
+                donor_sender,
+                ControlMessage::PrepareShardTransfer {
+                    operation_id: operation_id.to_owned(),
+                    lease: lease.clone(),
+                },
+                operation_id,
+                "donor",
+                donor,
+                &lease,
+            )
+            .await
+        {
+            if self.operation_cancelled(operation_id).await {
+                self.reopen_donor(operation_id, &lease).await;
+            } else if error.contains("connection closed")
+                || error.contains("timed out")
+                || error.contains("capacity")
+            {
+                self.wait(operation_id, &error).await;
+            } else {
+                self.fail(operation_id, "RS-3610", &error).await;
+            }
+            return;
+        }
+        if self
+            .operations
+            .transition_if(
+                operation_id,
+                OperationStatus::Running,
+                Some("donor_handoff_started"),
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(50),
+                    phase: Some("donor_flushed_and_closed".to_owned()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            if self.operation_cancelled(operation_id).await {
+                self.reopen_donor(operation_id, &lease).await;
+            }
+            return;
+        }
+        if self.shard_manager.get(shard_id) != Some(lease.clone()) {
+            self.fail(
+                operation_id,
+                "RS-3604",
+                "shard lease changed during preparation",
+            )
+            .await;
+            return;
+        }
+        if self
+            .operations
+            .transition_if(
+                operation_id,
+                OperationStatus::Running,
+                Some("donor_flushed_and_closed"),
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(60),
+                    phase: Some("lease_transfer_started".to_owned()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            self.reopen_donor(operation_id, &lease).await;
+            return;
+        }
+        let Some(new_lease) = self.shard_manager.transfer_if_owner(&lease, target) else {
+            self.fail(
+                operation_id,
+                "RS-3604",
+                "shard ownership changed before transfer",
+            )
+            .await;
+            return;
+        };
+        if let Some(store) = &self.shard_store {
+            store.save(&self.shard_manager.snapshot()).await;
+        }
+        if self
+            .operations
+            .transition(
+                operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(80),
+                    phase: Some("recipient_opening".to_owned()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            self.rollback(operation_id, &lease, &new_lease).await;
+            return;
+        }
+        if let Err(error) = self
+            .send_and_wait(
+                target_sender,
+                ControlMessage::ShardAssigned {
+                    lease: new_lease.clone(),
+                    operation_id: Some(operation_id.to_owned()),
+                },
+                operation_id,
+                "recipient",
+                target,
+                &new_lease,
+            )
+            .await
+        {
+            self.rollback(operation_id, &lease, &new_lease).await;
+            let message = format!("target failed to open shard; transfer rolled back: {error}");
+            if error.contains("connection closed")
+                || error.contains("timed out")
+                || error.contains("capacity")
+            {
+                self.wait(operation_id, &message).await;
+            } else {
+                self.fail(operation_id, "RS-3610", &message).await;
+            }
+            return;
+        }
+        if let Err(error) = self
+            .operations
+            .transition(
+                operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Succeeded,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(100),
+                    phase: Some("completed".to_owned()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+        {
+            tracing::error!(code = %rockstream_types::error_code::RS_0001, %operation_id, %error, "migrated shard but could not persist success");
+        }
+    }
+
+    async fn send_and_wait(
+        &self,
+        sender: &mpsc::Sender<ControlMessage>,
+        message: ControlMessage,
+        operation_id: &str,
+        stage: &str,
+        worker_id: WorkerId,
+        lease: &rockstream_types::lease::ShardLease,
+    ) -> Result<(), String> {
+        let key = format!("{operation_id}:{stage}");
+        let (tx, rx) = oneshot::channel();
+        try_insert_management_ack_waiter(&mut *self.waiters.lock().await, key.clone(), tx)?;
+        send_message(sender, &message).await;
+        let result = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(WorkerMessage::ShardTransferAck {
+                operation_id: actual,
+                stage: actual_stage,
+                worker_id: actual_worker,
+                shard_id,
+                lease_token,
+                success,
+                error,
+            })) if actual == operation_id
+                && actual_stage == stage
+                && actual_worker == worker_id
+                && shard_id == lease.shard_id
+                && lease_token == lease.lease_token =>
+            {
+                if success {
+                    Ok(())
+                } else {
+                    Err(error.unwrap_or_else(|| format!("{stage} rejected shard transfer")))
+                }
+            }
+            Ok(Ok(_)) => Err(format!(
+                "RS-3610: unexpected {stage} shard transfer acknowledgement"
+            )),
+            Ok(Err(_)) => Err(format!(
+                "RS-3610: {stage} connection closed before acknowledgement"
+            )),
+            Err(_) => Err(format!("RS-3610: {stage} acknowledgement timed out")),
+        };
+        self.waiters.lock().await.remove(&key);
+        result
+    }
+
+    async fn rollback(
+        &self,
+        operation_id: &str,
+        original: &rockstream_types::lease::ShardLease,
+        transferred: &rockstream_types::lease::ShardLease,
+    ) {
+        if self.shard_manager.get(original.shard_id) != Some(transferred.clone()) {
+            return;
+        }
+        let Some(lease) = self
+            .shard_manager
+            .transfer_if_owner(transferred, original.worker_id)
+        else {
+            return;
+        };
+        if let Some(store) = &self.shard_store {
+            store.save(&self.shard_manager.snapshot()).await;
+        }
+        let sender = self
+            .worker_senders
+            .lock()
+            .await
+            .get(&original.worker_id)
+            .filter(|sender| !sender.is_closed())
+            .cloned();
+        if let Some(sender) = sender {
+            let _ = self
+                .send_and_wait(
+                    &sender,
+                    ControlMessage::ShardAssigned {
+                        lease: lease.clone(),
+                        operation_id: Some(operation_id.to_owned()),
+                    },
+                    operation_id,
+                    "recipient",
+                    original.worker_id,
+                    &lease,
+                )
+                .await;
+        }
+    }
+
+    async fn operation_cancelled(&self, operation_id: &str) -> bool {
+        self.operations
+            .get(operation_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|operation| operation.status() == OperationStatus::Cancelled)
+    }
+
+    async fn reopen_donor(&self, operation_id: &str, lease: &rockstream_types::lease::ShardLease) {
+        let sender = self
+            .worker_senders
+            .lock()
+            .await
+            .get(&lease.worker_id)
+            .filter(|sender| !sender.is_closed())
+            .cloned();
+        if let Some(sender) = sender {
+            let _ = self
+                .send_and_wait(
+                    &sender,
+                    ControlMessage::ShardAssigned {
+                        lease: lease.clone(),
+                        operation_id: Some(operation_id.to_owned()),
+                    },
+                    operation_id,
+                    "recipient",
+                    lease.worker_id,
+                    lease,
+                )
+                .await;
+        }
+    }
+
+    async fn fail(&self, operation_id: &str, code: &str, message: &str) {
+        if let Err(error) = self
+            .operations
+            .transition(
+                operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Failed,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: None,
+                    phase: Some("failed".to_owned()),
+                    error_code: Some(code.to_owned()),
+                    next_steps: vec![message.to_owned()],
+                },
+            )
+            .await
+        {
+            tracing::error!(code = %code, %operation_id, %error, "migration failure could not be persisted");
+        }
+    }
+
+    async fn wait(&self, operation_id: &str, message: &str) {
+        let phase = self
+            .operations
+            .get(operation_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record.phase().map(str::to_owned))
+            .unwrap_or_else(|| "waiting_for_worker_connection".to_owned());
+        if let Err(error) = self
+            .operations
+            .transition(
+                operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Waiting,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: None,
+                    phase: Some(phase),
+                    error_code: Some("RS-3610".to_owned()),
+                    next_steps: vec![message.to_owned()],
+                },
+            )
+            .await
+        {
+            tracing::error!(code = %rockstream_types::error_code::RS_3610, %operation_id, %error, "migration wait state could not be persisted");
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagementBackupRuntime {
+    catalog: TopologyCatalog,
+    shard_manager: ShardManager,
+    data_plane: Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    pub(crate) waiters: ManagementAckWaiters,
+    operations: ManagementOperationStore,
+    source: Arc<dyn object_store::ObjectStore>,
+    source_store_id: Option<[u8; 32]>,
+    local_worker_id: Option<WorkerId>,
+    manifests: crate::checkpoint_store::CheckpointManifestStore,
+    started: Arc<AsyncMutex<HashSet<String>>>,
+    serial: Arc<AsyncMutex<()>>,
+}
+
+impl ManagementBackupRuntime {
+    pub(crate) async fn schedule(&self, operation_id: String) {
+        if !self.started.lock().await.insert(operation_id.clone()) {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.execute(&operation_id).await;
+            runtime.started.lock().await.remove(&operation_id);
+        });
+    }
+
+    async fn execute(&self, operation_id: &str) {
+        let _serial = self.serial.lock().await;
+        let Some(record) = self.operations.get(operation_id).await.ok().flatten() else {
+            return;
+        };
+        if !matches!(
+            record.status(),
+            OperationStatus::Pending | OperationStatus::Waiting
+        ) {
+            return;
+        }
+        let Some(destination) = record
+            .request()
+            .and_then(|request| request.get("destination"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            self.fail(operation_id, "RS-0002", "backup destination is missing")
+                .await;
+            return;
+        };
+        let destination_store = match rockstream_storage::build_migration_object_store(destination)
+        {
+            Ok(store) => store,
+            Err(error) => {
+                self.fail(operation_id, "RS-0002", &error).await;
+                return;
+            }
+        };
+
+        let checkpoint_id = match record.phase().and_then(parse_backup_checkpoint_id) {
+            Some(checkpoint_id) => checkpoint_id,
+            None => match self.manifests.load_latest_manifest().await {
+                Ok(manifest) => match manifest
+                    .map(|manifest| manifest.checkpoint_id.checked_next())
+                    .unwrap_or(Some(CheckpointId(1)))
+                {
+                    Some(checkpoint_id) => checkpoint_id,
+                    None => {
+                        self.fail(operation_id, "RS-3604", "checkpoint id space is exhausted")
+                            .await;
+                        return;
+                    }
+                },
+                Err(error) => {
+                    self.fail(operation_id, "RS-3022", &error).await;
+                    return;
+                }
+            },
+        };
+        let checkpoint_phase = format!("backup_checkpoint:{}", checkpoint_id.0);
+        if self
+            .operations
+            .transition_if(
+                operation_id,
+                record.status(),
+                record.phase(),
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: now_ms() as i64,
+                    progress: Some(5),
+                    phase: Some(checkpoint_phase.clone()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let checkpoint = match self.manifests.load_manifest_exact(checkpoint_id).await {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => match self.create_manifest(operation_id, checkpoint_id).await {
+                Ok(checkpoint) => checkpoint,
+                Err(BackupFailure::Waiting(message)) => {
+                    self.wait(operation_id, &message).await;
+                    return;
+                }
+                Err(BackupFailure::Failed(code, message)) => {
+                    self.fail(operation_id, code, &message).await;
+                    return;
+                }
+            },
+            Err(error) => {
+                self.fail(operation_id, "RS-3022", &error).await;
+                return;
+            }
+        };
+
+        let export_phase = format!("backup_exporting:{}", checkpoint_id.0);
+        if self
+            .operations
+            .transition(
+                operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: now_ms() as i64,
+                    progress: Some(70),
+                    phase: Some(export_phase),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let generation = format!("management-{operation_id}");
+        let exporter = crate::checkpoint_export::CheckpointExportService::new();
+        match exporter
+            .validate_generation(destination_store.clone(), &generation)
+            .await
+        {
+            Ok(_) => {}
+            Err(crate::checkpoint_export::CheckpointExportError::Integrity(message))
+                if message.contains("terminal commit marker is missing") =>
+            {
+                if let Err(error) = exporter
+                    .export_prefix(
+                        self.source.clone(),
+                        destination_store.clone(),
+                        checkpoint,
+                        generation.clone(),
+                        &object_store::path::Path::from(""),
+                    )
+                    .await
+                {
+                    self.handle_export_error(operation_id, error).await;
+                    return;
+                }
+            }
+            Err(error) => {
+                self.handle_export_error(operation_id, error).await;
+                return;
+            }
+        }
+        match exporter
+            .validate_generation(destination_store, &generation)
+            .await
+        {
+            Ok(outcome)
+                if outcome.checkpoint_id == checkpoint_id.0
+                    && outcome.generation == generation
+                    && outcome.status == "SUCCESS" =>
+            {
+                if let Err(error) = self
+                    .operations
+                    .transition(
+                        operation_id,
+                        OperationUpdate {
+                            status: OperationStatus::Succeeded,
+                            updated_at_ms: now_ms() as i64,
+                            progress: Some(100),
+                            phase: Some("completed".to_owned()),
+                            error_code: None,
+                            next_steps: Vec::new(),
+                        },
+                    )
+                    .await
+                {
+                    tracing::error!(code = %rockstream_types::error_code::RS_0001, %operation_id, %error, "validated backup could not persist success");
+                }
+            }
+            Ok(_) => {
+                self.fail(
+                    operation_id,
+                    "RS-5035",
+                    "export commit marker did not match the accepted backup",
+                )
+                .await
+            }
+            Err(error) => self.handle_export_error(operation_id, error).await,
+        }
+    }
+
+    async fn create_manifest(
+        &self,
+        operation_id: &str,
+        checkpoint_id: CheckpointId,
+    ) -> Result<ClusterCheckpoint, BackupFailure> {
+        let state = self.data_plane.lock().await;
+        if !state.deployments.is_empty() || !state.source_waiters.is_empty() {
+            return Err(BackupFailure::Failed(
+                "RS-3604",
+                "CreateBackup requires an idle cluster with no active workloads or source writes"
+                    .to_owned(),
+            ));
+        }
+        let leases = self.shard_manager.snapshot().leases;
+        if let Some(local_worker_id) = self.local_worker_id {
+            let workers = self.catalog.all_workers();
+            if workers.len() != 1 || workers[0].worker_id != local_worker_id {
+                return Err(BackupFailure::Failed(
+                    "RS-3604",
+                    "local backup requires exactly its embedded worker; use a shared object store for multiple workers".to_owned(),
+                ));
+            }
+        }
+        let senders = self.worker_senders.lock().await.clone();
+        let mut checkpoint = ClusterCheckpoint::new(checkpoint_id);
+        let mut expected_leases = leases.values().cloned().collect::<Vec<_>>();
+        expected_leases.sort_by_key(|lease| lease.shard_id);
+        for lease in &expected_leases {
+            let worker = self.catalog.get(lease.worker_id).filter(|worker| {
+                worker.healthy
+                    && worker.lifecycle.is_active()
+                    && if let Some(local_worker_id) = self.local_worker_id {
+                        lease.worker_id == local_worker_id
+                    } else {
+                        worker.capabilities.shared_shard_store_id == self.source_store_id
+                    }
+            });
+            if worker.is_none() {
+                return Err(BackupFailure::Failed(
+                    "RS-3604",
+                    format!(
+                        "shard {} owner is unavailable or uses a different shard store",
+                        lease.shard_id.0
+                    ),
+                ));
+            }
+            let Some(sender) = senders
+                .get(&lease.worker_id)
+                .filter(|sender| !sender.is_closed())
+            else {
+                return Err(BackupFailure::Waiting(format!(
+                    "worker {} must reconnect before backup can resume",
+                    lease.worker_id.0
+                )));
+            };
+            let request_id = format!("{operation_id}:{}:{}", checkpoint_id.0, lease.shard_id.0);
+            let (tx, rx) = oneshot::channel();
+            if let Err(error) = try_insert_management_ack_waiter(
+                &mut *self.waiters.lock().await,
+                request_id.clone(),
+                tx,
+            ) {
+                return Err(BackupFailure::Waiting(error.to_owned()));
+            }
+            if sender
+                .send(ControlMessage::CreateShardCheckpoint {
+                    request_id: request_id.clone(),
+                    checkpoint_id,
+                    lease: lease.clone(),
+                })
+                .await
+                .is_err()
+            {
+                self.waiters.lock().await.remove(&request_id);
+                return Err(BackupFailure::Waiting(format!(
+                    "worker {} disconnected before checkpoint request",
+                    lease.worker_id.0
+                )));
+            }
+            let response = tokio::time::timeout(Duration::from_secs(30), rx).await;
+            self.waiters.lock().await.remove(&request_id);
+            match response {
+                Ok(Ok(WorkerMessage::ShardCheckpointAck {
+                    request_id: actual_request,
+                    checkpoint_id: actual_checkpoint,
+                    worker_id,
+                    shard_id,
+                    lease_token,
+                    shard_checkpoint_id: Some(shard_checkpoint_id),
+                    snapshot_id: Some(snapshot_id),
+                    error: None,
+                })) if actual_request == request_id
+                    && actual_checkpoint == checkpoint_id
+                    && worker_id == lease.worker_id
+                    && shard_id == lease.shard_id
+                    && lease_token == lease.lease_token =>
+                {
+                    checkpoint.record_shard(
+                        lease.shard_id,
+                        PerShardCheckpoint::new(checkpoint_id, shard_checkpoint_id)
+                            .with_snapshot_id(snapshot_id),
+                    );
+                }
+                Ok(Ok(WorkerMessage::ShardCheckpointAck {
+                    error: Some(error), ..
+                })) => {
+                    return Err(BackupFailure::Failed("RS-3604", error));
+                }
+                Ok(Ok(_)) => {
+                    return Err(BackupFailure::Failed(
+                        "RS-2401",
+                        format!(
+                            "worker {} returned an invalid checkpoint acknowledgement",
+                            lease.worker_id.0
+                        ),
+                    ));
+                }
+                Ok(Err(_)) => {
+                    return Err(BackupFailure::Waiting(format!(
+                        "worker {} disconnected before checkpoint acknowledgement",
+                        lease.worker_id.0
+                    )));
+                }
+                Err(_) => {
+                    return Err(BackupFailure::Waiting(format!(
+                        "worker {} checkpoint acknowledgement timed out",
+                        lease.worker_id.0
+                    )));
+                }
+            }
+        }
+        if self.shard_manager.snapshot().leases != leases {
+            return Err(BackupFailure::Waiting(
+                "shard ownership changed while checkpoints were being created".to_owned(),
+            ));
+        }
+        if checkpoint.shards.len() != expected_leases.len() {
+            return Err(BackupFailure::Failed(
+                "RS-3604",
+                "checkpoint manifest is incomplete".to_owned(),
+            ));
+        }
+        if let Err(error) = self.manifests.save_manifest(&checkpoint, false, None).await {
+            return Err(BackupFailure::Failed("RS-3022", error));
+        }
+        drop(state);
+        Ok(checkpoint)
+    }
+
+    async fn handle_export_error(
+        &self,
+        operation_id: &str,
+        error: crate::checkpoint_export::CheckpointExportError,
+    ) {
+        match error {
+            crate::checkpoint_export::CheckpointExportError::Integrity(message) => {
+                self.fail(operation_id, "RS-5035", &message).await;
+            }
+            error => self.wait(operation_id, &error.to_string()).await,
+        }
+    }
+
+    async fn fail(&self, operation_id: &str, code: &str, message: &str) {
+        if let Err(error) = self
+            .operations
+            .transition(
+                operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Failed,
+                    updated_at_ms: now_ms() as i64,
+                    progress: None,
+                    phase: Some("failed".to_owned()),
+                    error_code: Some(code.to_owned()),
+                    next_steps: vec![message.to_owned()],
+                },
+            )
+            .await
+        {
+            tracing::error!(code = %code, %operation_id, %error, "backup failure could not be persisted");
+        }
+    }
+
+    async fn wait(&self, operation_id: &str, message: &str) {
+        let phase = self
+            .operations
+            .get(operation_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record.phase().map(str::to_owned))
+            .unwrap_or_else(|| "waiting_for_worker_connection".to_owned());
+        if let Err(error) = self
+            .operations
+            .transition(
+                operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Waiting,
+                    updated_at_ms: now_ms() as i64,
+                    progress: None,
+                    phase: Some(phase),
+                    error_code: Some("RS-3610".to_owned()),
+                    next_steps: vec![message.to_owned()],
+                },
+            )
+            .await
+        {
+            tracing::error!(code = %rockstream_types::error_code::RS_3610, %operation_id, %error, "backup wait state could not be persisted");
+        }
+    }
+}
+
+enum BackupFailure {
+    Waiting(String),
+    Failed(&'static str, String),
+}
+
+fn parse_backup_checkpoint_id(phase: &str) -> Option<CheckpointId> {
+    phase
+        .strip_prefix("backup_checkpoint:")
+        .or_else(|| phase.strip_prefix("backup_exporting:"))
+        .and_then(|id| id.parse().ok())
+        .map(CheckpointId)
 }
 
 async fn persist_worker_if_needed(
@@ -615,6 +2051,7 @@ async fn deploy_workload(
                 target,
                 &ControlMessage::ShardAssigned {
                     lease: descriptor.shard.clone(),
+                    operation_id: None,
                 },
             )
             .await;
@@ -715,6 +2152,7 @@ async fn request_worker_drain(
     topology_store: Option<&Arc<TopologyPersistentStore>>,
     drain_state: &Arc<AsyncMutex<DrainState>>,
     worker_id: WorkerId,
+    operation_id: Option<String>,
 ) -> Result<(WorkerLifecycleState, u32, u32, DrainRequest), DrainFailure> {
     let Some(worker) = catalog.get(worker_id) else {
         return Err(DrainFailure::new(
@@ -723,9 +2161,29 @@ async fn request_worker_drain(
             "Run `rockstream cluster status` to confirm the worker id, then retry the drain request.",
         ));
     };
+    if let WorkerLifecycleState::Draining { started_at_ms, .. } = &worker.lifecycle {
+        let guard = drain_state.lock().await;
+        let resumes_this_operation = operation_id.as_ref().is_some_and(|operation_id| {
+            guard
+                .operation_ids
+                .get(&worker_id)
+                .is_some_and(|operation_ids| operation_ids.iter().any(|id| id == operation_id))
+        });
+        if resumes_this_operation {
+            return Ok((
+                worker.lifecycle.clone(),
+                guard.queue.len() as u32,
+                MAX_DRAIN_QUEUE as u32,
+                DrainRequest {
+                    worker_id,
+                    deadline_ms: started_at_ms.saturating_add(DEFAULT_DRAIN_DEADLINE_MS),
+                },
+            ));
+        }
+    }
     if matches!(
         worker.lifecycle,
-        WorkerLifecycleState::Draining { .. } | WorkerLifecycleState::Decommissioned { .. }
+        WorkerLifecycleState::Decommissioned { .. }
     ) {
         return Err(DrainFailure::new(
             RS_3604,
@@ -764,10 +2222,21 @@ async fn request_worker_drain(
         }
     };
     let mut chosen = Vec::with_capacity(shards.len());
+    if !shards.is_empty() && worker.capabilities.shared_shard_store_id.is_none() {
+        return Err(DrainFailure::new(
+            RS_3611,
+            format!("worker {worker_id} cannot drain shards stored outside a verified shared object store"),
+            "Configure every worker that owns these shards to use the same ROCKSTREAM_OBJECT_STORE_ENDPOINT, BUCKET, and REGION, then restart the workers.",
+        ));
+    }
     for shard_id in &shards {
         let eligible: Vec<_> = recipients
             .iter()
-            .filter(|candidate| candidate.worker_id != worker_id)
+            .filter(|candidate| {
+                candidate.worker_id != worker_id
+                    && candidate.capabilities.shared_shard_store_id
+                        == worker.capabilities.shared_shard_store_id
+            })
             .cloned()
             .collect();
         let Some(recipient) = crate::placement::PlacementAlgorithm::choose_with_preference(
@@ -777,18 +2246,11 @@ async fn request_worker_drain(
             return Err(DrainFailure::new(
                 RS_3611,
                 format!("worker {worker_id} cannot drain shard {shard_id}: no active recipient worker is available"),
-                "Register or recover at least one other active worker, then retry the drain request.",
+                "Register or recover another active worker with the same verified shared shard store, then retry the drain request.",
             ));
         };
         chosen.push((*shard_id, recipient.worker_id));
     }
-
-    let started_at_ms = now_ms();
-    let lifecycle = WorkerLifecycleState::draining(shards.len() as u32, started_at_ms);
-    let updated = catalog
-        .set_lifecycle(worker_id, lifecycle.clone())
-        .expect("worker existence checked above");
-    persist_worker_if_needed(topology_store, &updated).await;
 
     let mut guard = drain_state.lock().await;
     if guard.queue.len() + chosen.len() > MAX_DRAIN_QUEUE {
@@ -801,15 +2263,26 @@ async fn request_worker_drain(
             "Let the existing drain queue drain, or increase the configured bound only if memory headroom allows.",
         ));
     }
+    let started_at_ms = now_ms();
+    let lifecycle = WorkerLifecycleState::draining(shards.len() as u32, started_at_ms);
+    let updated = catalog
+        .set_lifecycle(worker_id, lifecycle.clone())
+        .expect("worker existence checked above");
+    persist_worker_if_needed(topology_store, &updated).await;
+
     for (shard_id, recipient_worker_id) in chosen {
-        let migration_id = format!("drain-{worker_id}-{shard_id}-{}", guard.next_migration_id);
-        guard.next_migration_id += 1;
         guard.queue.push_back(DrainTask {
-            migration_id,
             donor_worker_id: worker_id,
             recipient_worker_id,
             shard_id,
         });
+    }
+    if let Some(operation_id) = operation_id {
+        guard
+            .operation_ids
+            .entry(worker_id)
+            .or_default()
+            .push(operation_id);
     }
     let queue_fill = guard.queue.len() as u32;
     drop(guard);
@@ -830,100 +2303,272 @@ async fn request_worker_drain(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_drain_queue(
     catalog: &TopologyCatalog,
     shard_manager: &ShardManager,
     audit: Option<&Arc<FileAuditLog>>,
     shard_store: Option<&Arc<ShardPersistentStore>>,
     topology_store: Option<&Arc<TopologyPersistentStore>>,
-    migration_store: Option<&Arc<MigrationPersistentStore>>,
     drain_state: &Arc<AsyncMutex<DrainState>>,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    donor_worker_id: WorkerId,
+    migration_waiters: &Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
+    operation_store: Option<&ManagementOperationStore>,
 ) {
-    let mut local = Vec::new();
-    {
+    let (tasks, operation_id) = {
         let mut guard = drain_state.lock().await;
-        while let Some(task) = guard.queue.pop_front() {
-            local.push(task);
+        if !guard.acked_workers.contains(&donor_worker_id)
+            || !guard.processing_workers.insert(donor_worker_id)
+        {
+            return;
+        }
+        let operation_id = guard
+            .operation_ids
+            .get(&donor_worker_id)
+            .and_then(|operation_ids| operation_ids.first())
+            .cloned();
+        let mut tasks = Vec::new();
+        guard.queue.retain(|task| {
+            if task.donor_worker_id == donor_worker_id {
+                tasks.push(task.clone());
+                false
+            } else {
+                true
+            }
+        });
+        (tasks, operation_id)
+    };
+    let mut moved = 0usize;
+    let mut retry = Vec::new();
+    for task in tasks {
+        let Some(worker) = catalog.get(task.donor_worker_id) else {
+            retry.push(task);
+            continue;
+        };
+        let Some(recipient) = catalog.get(task.recipient_worker_id).filter(|candidate| {
+            candidate.healthy
+                && candidate.capabilities.shared_shard_store_id
+                    == worker.capabilities.shared_shard_store_id
+                && worker.capabilities.shared_shard_store_id.is_some()
+        }) else {
+            tracing::warn!(shard = %task.shard_id, recipient = %task.recipient_worker_id, "drain recipient no longer supports the shared shard store");
+            retry.push(task);
+            continue;
+        };
+        let Some(current_lease) = shard_manager.get(task.shard_id) else {
+            retry.push(task);
+            continue;
+        };
+        if current_lease.worker_id != task.donor_worker_id
+            && current_lease.worker_id != recipient.worker_id
+        {
+            tracing::warn!(shard = %task.shard_id, donor = %task.donor_worker_id, "drain shard ownership changed before handoff");
+            retry.push(task);
+            continue;
+        }
+        let senders = worker_senders.lock().await.clone();
+        let Some(donor_sender) = senders
+            .get(&task.donor_worker_id)
+            .filter(|sender| !sender.is_closed())
+        else {
+            retry.push(task);
+            continue;
+        };
+        let Some(recipient_sender) = senders
+            .get(&recipient.worker_id)
+            .filter(|sender| !sender.is_closed())
+        else {
+            retry.push(task);
+            continue;
+        };
+        let acknowledgement_id = operation_id
+            .as_ref()
+            .map(|operation_id| format!("{operation_id}:shard:{}", task.shard_id.0))
+            .unwrap_or_else(|| {
+                format!(
+                    "drain:{}:{}:{}",
+                    donor_worker_id.0, task.shard_id.0, current_lease.lease_token.0
+                )
+            });
+        let key = format!("{acknowledgement_id}:recipient");
+        let (tx, rx) = oneshot::channel();
+        if try_insert_management_ack_waiter(&mut *migration_waiters.lock().await, key.clone(), tx)
+            .is_err()
+        {
+            retry.push(task);
+            continue;
+        }
+        let lease = if current_lease.worker_id == task.donor_worker_id {
+            let (lease, evicted) = shard_manager.force_acquire(task.shard_id, recipient.worker_id);
+            if evicted != Some(task.donor_worker_id) {
+                migration_waiters.lock().await.remove(&key);
+                retry.push(task);
+                continue;
+            }
+            if let Some(store) = shard_store {
+                persist_shard_state(shard_manager, store).await;
+            }
+            lease
+        } else {
+            current_lease
+        };
+        if donor_sender
+            .send(ControlMessage::ShardRevoked {
+                shard_id: task.shard_id,
+                reason: ShardRevokeReason::WorkerDrain,
+            })
+            .await
+            .is_err()
+        {
+            migration_waiters.lock().await.remove(&key);
+            retry.push(task);
+            continue;
+        }
+        if recipient_sender
+            .send(ControlMessage::ShardAssigned {
+                lease: lease.clone(),
+                operation_id: Some(acknowledgement_id.clone()),
+            })
+            .await
+            .is_err()
+        {
+            migration_waiters.lock().await.remove(&key);
+            retry.push(task);
+            continue;
+        }
+        let acknowledgement = tokio::time::timeout(Duration::from_secs(30), rx).await;
+        migration_waiters.lock().await.remove(&key);
+        match acknowledgement {
+            Ok(Ok(WorkerMessage::ShardTransferAck {
+                operation_id: actual_operation_id,
+                stage,
+                worker_id,
+                shard_id,
+                lease_token,
+                success,
+                error: _,
+            })) if actual_operation_id == acknowledgement_id
+                && stage == "recipient"
+                && worker_id == recipient.worker_id
+                && shard_id == task.shard_id
+                && lease_token == lease.lease_token
+                && success =>
+            {
+                moved += 1
+            }
+            Ok(Ok(WorkerMessage::ShardTransferAck { error, .. })) => {
+                tracing::warn!(
+                    shard = %task.shard_id,
+                    recipient = %recipient.worker_id,
+                    error = ?error,
+                    "drain recipient acknowledgement did not confirm the assigned lease"
+                );
+                retry.push(task);
+            }
+            Ok(Err(_)) | Err(_) => {
+                retry.push(task);
+            }
+            Ok(Ok(_)) => retry.push(task),
         }
     }
-
-    let coordinator = MigrationCoordinator::new();
-    for task in local {
-        let mut record = MigrationRecord::new(
-            task.migration_id.clone(),
-            vec![task.shard_id],
-            task.shard_id,
-            BucketSet::new([task.shard_id.0]),
-            0,
-            0,
-        );
-        if let Some(store) = migration_store {
-            let _ = store.save(&record).await;
+    let remaining = shard_manager
+        .leases()
+        .into_iter()
+        .filter(|lease| lease.worker_id == donor_worker_id)
+        .count();
+    let (completed, pending, operation_ids) = {
+        let mut drain_state = drain_state.lock().await;
+        drain_state.queue.extend(retry);
+        drain_state.processing_workers.remove(&donor_worker_id);
+        let pending = drain_state
+            .queue
+            .iter()
+            .any(|task| task.donor_worker_id == donor_worker_id);
+        let completed =
+            remaining == 0 && !pending && drain_state.acked_workers.remove(&donor_worker_id);
+        let operation_ids = if completed {
+            drain_state
+                .operation_ids
+                .remove(&donor_worker_id)
+                .unwrap_or_default()
+        } else if pending {
+            drain_state
+                .operation_ids
+                .get(&donor_worker_id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (completed, pending, operation_ids)
+    };
+    if completed {
+        if let Some(updated) = catalog.set_lifecycle(
+            donor_worker_id,
+            WorkerLifecycleState::Decommissioned {
+                completed_at_ms: now_ms(),
+            },
+        ) {
+            persist_worker_if_needed(topology_store, &updated).await;
         }
-        for state in [
-            MigrationState::Snapshotting,
-            MigrationState::Copying,
-            MigrationState::DualWriting,
-            MigrationState::CatchingUp,
-            MigrationState::FencingOld,
-            MigrationState::Cutover,
-            MigrationState::Verifying,
-            MigrationState::GcEligible,
-            MigrationState::Done,
-        ] {
-            let _ = coordinator
-                .begin_dual_writing(&mut record, audit.map(|value| value.as_ref()))
-                .or_else(|_| {
-                    coordinator
-                        .advance_to_catching_up(&mut record, audit.map(|value| value.as_ref()))
-                });
-            let _ = record.apply_transition(state);
-            if state == MigrationState::Cutover {
-                record.cutover_epoch = Some(0);
-            }
-            if let Some(store) = migration_store {
-                let _ = store.save(&record).await;
-            }
+        if let Some(audit) = audit {
+            let event = AuditEvent::now(
+                "control",
+                "worker.drain_completed",
+                donor_worker_id.to_string(),
+            )
+            .with_detail(format!("shards_moved={moved}"));
+            let _ = audit.append(&event);
         }
-        if let Some(store) = migration_store {
-            let _ = store
-                .archive(&record, audit.map(|value| value.as_ref()))
-                .await;
-        }
-
-        let _ = shard_manager.force_acquire(task.shard_id, task.recipient_worker_id);
-        if let Some(store) = shard_store {
-            persist_shard_state(shard_manager, store).await;
-        }
-
-        let current = catalog.get(task.donor_worker_id);
-        if let Some(worker) = current {
-            let remaining = shard_manager
-                .leases()
-                .into_iter()
-                .filter(|lease| lease.worker_id == task.donor_worker_id)
-                .count() as u32;
-            let next_state = if remaining == 0 {
-                WorkerLifecycleState::Decommissioned {
-                    completed_at_ms: now_ms(),
-                }
-            } else {
-                let mut state = worker.lifecycle.clone();
-                state.advance_drain_progress(remaining, None, None);
-                state
-            };
-            if let Some(updated) = catalog.set_lifecycle(task.donor_worker_id, next_state.clone()) {
-                persist_worker_if_needed(topology_store, &updated).await;
-            }
-            if remaining == 0 {
-                if let Some(audit) = audit {
-                    let event = AuditEvent::now(
-                        "control",
-                        "worker.drain_completed",
-                        task.donor_worker_id.to_string(),
+        if let Some(operations) = operation_store {
+            for operation_id in operation_ids {
+                if let Err(error) = operations
+                    .transition(
+                        &operation_id,
+                        OperationUpdate {
+                            status: OperationStatus::Succeeded,
+                            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                            progress: Some(100),
+                            phase: Some("completed".to_owned()),
+                            error_code: None,
+                            next_steps: Vec::new(),
+                        },
                     )
-                    .with_detail(format!("recipient={}", task.recipient_worker_id));
-                    let _ = audit.append(&event);
+                    .await
+                {
+                    tracing::error!(code = %rockstream_types::error_code::RS_0001, %operation_id, %error, "drain completed but operation record update failed");
+                }
+            }
+        }
+    } else if pending {
+        if let Some(operations) = operation_store {
+            for operation_id in operation_ids {
+                let Ok(Some(record)) = operations.get(&operation_id).await else {
+                    continue;
+                };
+                if record.status() != OperationStatus::Running {
+                    continue;
+                }
+                if let Err(error) = operations
+                    .transition_if(
+                        &operation_id,
+                        OperationStatus::Running,
+                        record.phase(),
+                        OperationUpdate {
+                            status: OperationStatus::Waiting,
+                            updated_at_ms: now_ms() as i64,
+                            progress: record.progress(),
+                            phase: record.phase().map(str::to_owned),
+                            error_code: Some(RS_3610.to_string()),
+                            next_steps: vec![
+                                "A recipient ACK was missing or rejected; management will retry after reconciliation.".to_owned(),
+                            ],
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!(%operation_id, %error, "drain retry state could not be persisted");
                 }
             }
         }
@@ -1034,11 +2679,12 @@ async fn handle_connection_stream<R, W>(
         synced_epoch,
         frontier,
         topology_store,
-        migration_store,
+        operation_store,
         drain_state,
-        auto_drain,
         secret_store,
         worker_senders,
+        migration_waiters,
+        backup_waiters,
         data_plane,
     } = ctx;
     let (sender, mut outbound) = mpsc::channel::<ControlMessage>(32);
@@ -1153,6 +2799,28 @@ async fn handle_connection_stream<R, W>(
                     },
                 )
                 .await;
+                let acked = drain_state
+                    .lock()
+                    .await
+                    .acked_workers
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                for donor_worker_id in acked {
+                    process_drain_queue(
+                        &catalog,
+                        &shard_manager,
+                        audit.as_ref(),
+                        shard_store.as_ref(),
+                        topology_store.as_ref(),
+                        &drain_state,
+                        &worker_senders,
+                        donor_worker_id,
+                        &migration_waiters,
+                        operation_store.as_ref(),
+                    )
+                    .await;
+                }
             }
             WorkerMessage::DeployWorkload(request) => {
                 deploy_workload(
@@ -1516,7 +3184,10 @@ async fn handle_connection_stream<R, W>(
                         if let Some(store) = &shard_store {
                             persist_shard_state(&shard_manager, store).await;
                         }
-                        let reply = ControlMessage::ShardAssigned { lease };
+                        let reply = ControlMessage::ShardAssigned {
+                            lease,
+                            operation_id: None,
+                        };
                         send_message(&sender, &reply).await;
                     }
                     Err(e) => {
@@ -1554,46 +3225,159 @@ async fn handle_connection_stream<R, W>(
                 let reply = ControlMessage::FenceAck { shard_id, valid };
                 send_message(&sender, &reply).await;
             }
-            // v0.38 drain / lifecycle messages — acknowledged but not yet
-            // fully handled by the control-plane service stub.
             WorkerMessage::DrainAck {
                 worker_id,
                 shards_remaining,
             } => {
+                if connected_worker_id != Some(worker_id) {
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: "RS-2401".to_owned(),
+                            message: "drain acknowledgement worker does not match this connection".to_owned(),
+                            next_steps: "Send drain acknowledgements only on the registered worker connection.".to_owned(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
                 tracing::info!(
                     %worker_id,
                     shards_remaining,
                     "control: drain ack received"
                 );
-                let state = if shards_remaining == 0 {
-                    WorkerLifecycleState::Decommissioned {
-                        completed_at_ms: now_ms(),
-                    }
-                } else {
-                    WorkerLifecycleState::draining(shards_remaining, now_ms())
-                };
-                if let Some(worker) = catalog.set_lifecycle(worker_id, state) {
-                    persist_worker_if_needed(topology_store.as_ref(), &worker).await;
-                }
                 if shards_remaining == 0 {
-                    shard_manager.release_worker(worker_id);
-                    let mut guard = drain_state.lock().await;
-                    guard.queue.retain(|task| task.donor_worker_id != worker_id);
+                    drain_state.lock().await.acked_workers.insert(worker_id);
+                    process_drain_queue(
+                        &catalog,
+                        &shard_manager,
+                        audit.as_ref(),
+                        shard_store.as_ref(),
+                        topology_store.as_ref(),
+                        &drain_state,
+                        &worker_senders,
+                        worker_id,
+                        &migration_waiters,
+                        operation_store.as_ref(),
+                    )
+                    .await;
+                    cleanup_decommissioned_workers(&catalog, topology_store.as_ref()).await;
+                } else {
+                    let state = WorkerLifecycleState::draining(shards_remaining, now_ms());
+                    if let Some(worker) = catalog.set_lifecycle(worker_id, state) {
+                        persist_worker_if_needed(topology_store.as_ref(), &worker).await;
+                    }
+                }
+            }
+            WorkerMessage::ShardTransferAck {
+                operation_id,
+                stage,
+                worker_id,
+                shard_id,
+                lease_token,
+                success,
+                error,
+            } => {
+                if connected_worker_id != Some(worker_id) {
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: "RS-2401".to_owned(),
+                            message: "shard transfer acknowledgement worker does not match this connection".to_owned(),
+                            next_steps: "Send migration acknowledgements only on the registered worker connection.".to_owned(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                let key = format!("{operation_id}:{stage}");
+                if let Some(waiter) = migration_waiters.lock().await.remove(&key) {
+                    let _ = waiter.send(WorkerMessage::ShardTransferAck {
+                        operation_id,
+                        stage,
+                        worker_id,
+                        shard_id,
+                        lease_token,
+                        success,
+                        error,
+                    });
+                }
+            }
+            WorkerMessage::ShardCheckpointAck {
+                request_id,
+                checkpoint_id,
+                worker_id,
+                shard_id,
+                lease_token,
+                shard_checkpoint_id,
+                snapshot_id,
+                error,
+            } => {
+                if connected_worker_id != Some(worker_id) {
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: "RS-2401".to_owned(),
+                            message: "shard checkpoint acknowledgement worker does not match this connection".to_owned(),
+                            next_steps: "Send checkpoint acknowledgements only on the registered worker connection.".to_owned(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                if let Some(waiter) = backup_waiters.lock().await.remove(&request_id) {
+                    let _ = waiter.send(WorkerMessage::ShardCheckpointAck {
+                        request_id,
+                        checkpoint_id,
+                        worker_id,
+                        shard_id,
+                        lease_token,
+                        shard_checkpoint_id,
+                        snapshot_id,
+                        error,
+                    });
                 }
             }
             WorkerMessage::LifecycleState { worker_id, state } => {
+                if connected_worker_id != Some(worker_id) {
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: "RS-2401".to_owned(),
+                            message: "lifecycle update worker does not match this connection"
+                                .to_owned(),
+                            next_steps:
+                                "Send lifecycle updates only on the registered worker connection."
+                                    .to_owned(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                if matches!(
+                    state,
+                    WorkerLifecycleState::Decommissioned { .. }
+                        | WorkerLifecycleState::Draining {
+                            shards_remaining: 0,
+                            ..
+                        }
+                ) {
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: "RS-3604".to_owned(),
+                            message: "only the control plane can complete a drain after shard handoff".to_owned(),
+                            next_steps: "Request a drain and wait for the control plane to transfer every shard lease.".to_owned(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
                 tracing::info!(
                     %worker_id,
                     state = ?state,
                     "control: worker lifecycle state update"
                 );
-                if matches!(state, WorkerLifecycleState::Decommissioned { .. })
-                    || matches!(state, WorkerLifecycleState::Draining { shards_remaining, .. } if shards_remaining == 0)
-                {
-                    shard_manager.release_worker(worker_id);
-                    let mut guard = drain_state.lock().await;
-                    guard.queue.retain(|task| task.donor_worker_id != worker_id);
-                }
                 if let Some(worker) = catalog.set_lifecycle(worker_id, state) {
                     persist_worker_if_needed(topology_store.as_ref(), &worker).await;
                 }
@@ -1698,6 +3482,25 @@ async fn handle_connection_stream<R, W>(
                 }
             }
             WorkerMessage::RequestDrain { worker_id } => {
+                let worker_sender = if connected_worker_id == Some(worker_id) {
+                    Some(sender.clone())
+                } else {
+                    worker_senders.lock().await.get(&worker_id).cloned()
+                };
+                let Some(worker_sender) = worker_sender else {
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: RS_3610.to_string(),
+                            message: format!("worker {worker_id} has no active control connection"),
+                            next_steps:
+                                "Wait for the worker to reconnect, then retry the drain request."
+                                    .to_owned(),
+                        },
+                    )
+                    .await;
+                    continue;
+                };
                 match request_worker_drain(
                     &catalog,
                     &shard_manager,
@@ -1705,11 +3508,12 @@ async fn handle_connection_stream<R, W>(
                     topology_store.as_ref(),
                     &drain_state,
                     worker_id,
+                    None,
                 )
                 .await
                 {
                     Ok((state, queue_fill, queue_capacity, request)) => {
-                        send_message(&sender, &ControlMessage::BeginDrain(request)).await;
+                        send_message(&worker_sender, &ControlMessage::BeginDrain(request)).await;
                         let status = ControlMessage::DrainStatus {
                             worker_id,
                             state,
@@ -1726,6 +3530,8 @@ async fn handle_connection_stream<R, W>(
             }
         }
 
+        cleanup_decommissioned_workers(&catalog, topology_store.as_ref()).await;
+
         if rotation_rx.has_changed().unwrap_or(false) {
             let rotation = {
                 let current = rotation_rx.borrow_and_update();
@@ -1734,20 +3540,6 @@ async fn handle_connection_stream<R, W>(
             if let Some(rotation) = rotation {
                 send_message(&sender, &ControlMessage::SecretRotated { rotation }).await;
             }
-        }
-
-        if auto_drain {
-            process_drain_queue(
-                &catalog,
-                &shard_manager,
-                audit.as_ref(),
-                shard_store.as_ref(),
-                topology_store.as_ref(),
-                migration_store.as_ref(),
-                &drain_state,
-            )
-            .await;
-            cleanup_decommissioned_workers(&catalog, topology_store.as_ref()).await;
         }
     }
 
@@ -1802,6 +3594,7 @@ async fn handle_connection_stream<R, W>(
                     &target,
                     &ControlMessage::ShardAssigned {
                         lease: assignment.lease,
+                        operation_id: None,
                     },
                 )
                 .await;
@@ -1845,12 +3638,182 @@ mod tests {
     use super::*;
     use crate::shard::ShardManager;
     use crate::topology::TopologyCatalog;
-    use rockstream_types::ids::WorkerId;
+    use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
     use rockstream_types::topology::{
-        CapacityHeadroom, NodeRole, RaftRoleWire, WorkerLocation, WorkerMessage, WorkerRegistration,
+        CapacityHeadroom, NodeRole, RaftRoleWire, WorkerCapabilities, WorkerLifecycleState,
+        WorkerLocation, WorkerMessage, WorkerRegistration,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
+
+    #[test]
+    fn management_ack_waiters_reject_overflow_without_replacing_entries() {
+        let mut waiters = HashMap::new();
+        for index in 0..MAX_MANAGEMENT_ACK_WAITERS {
+            let (sender, _receiver) = oneshot::channel();
+            try_insert_management_ack_waiter(&mut waiters, format!("op-{index}"), sender).unwrap();
+        }
+        assert_eq!(waiters.len(), 64);
+
+        let (overflow_sender, _overflow_receiver) = oneshot::channel();
+        assert_eq!(
+            try_insert_management_ack_waiter(&mut waiters, "overflow".to_owned(), overflow_sender),
+            Err("management ACK waiter capacity 64 reached")
+        );
+        assert_eq!(waiters.len(), 64);
+        assert!(!waiters.contains_key("overflow"));
+
+        let (duplicate_sender, _duplicate_receiver) = oneshot::channel();
+        assert_eq!(
+            try_insert_management_ack_waiter(&mut waiters, "op-0".to_owned(), duplicate_sender),
+            Err("management ACK waiter key already exists")
+        );
+        assert_eq!(waiters.len(), 64);
+
+        waiters.remove("op-0");
+        let (recovered_sender, _recovered_receiver) = oneshot::channel();
+        try_insert_management_ack_waiter(&mut waiters, "recovered".to_owned(), recovered_sender)
+            .unwrap();
+        assert_eq!(waiters.len(), 64);
+        assert!(waiters.contains_key("recovered"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn management_ack_waiter_timeout_releases_its_bounded_slot() {
+        let waiters = Arc::new(AsyncMutex::new(HashMap::new()));
+        let runtime = ManagementMigrationRuntime {
+            catalog: TopologyCatalog::new(),
+            shard_manager: ShardManager::new(),
+            data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),
+            shard_store: None,
+            worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
+            waiters: waiters.clone(),
+            operations: ManagementOperationStore::new(Arc::new(
+                object_store::memory::InMemory::new(),
+            )),
+            started: Arc::new(AsyncMutex::new(HashSet::new())),
+        };
+        let worker_id = WorkerId(7);
+        let lease = rockstream_types::lease::ShardLease::new(ShardId(3), worker_id, LeaseToken(1));
+        let (sender, mut receiver) = mpsc::channel(1);
+        let wait = tokio::spawn(async move {
+            runtime
+                .send_and_wait(
+                    &sender,
+                    ControlMessage::PrepareShardTransfer {
+                        operation_id: "op-timeout".to_owned(),
+                        lease: lease.clone(),
+                    },
+                    "op-timeout",
+                    "donor",
+                    worker_id,
+                    &lease,
+                )
+                .await
+        });
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ControlMessage::PrepareShardTransfer { .. })
+        ));
+        assert_eq!(waiters.lock().await.len(), 1);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "ACK waiter expired before its 30-second bound"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            wait.await.unwrap(),
+            Err("RS-3610: donor acknowledgement timed out".to_owned())
+        );
+        assert!(waiters.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_drain_queue_rejects_overflow_and_recovers_after_pressure() {
+        let catalog = TopologyCatalog::new();
+        let shard_manager = ShardManager::new();
+        for worker_id in 1..=3 {
+            catalog.register(&registration_with_location(
+                worker_id,
+                0.9,
+                &format!("host-{worker_id}"),
+                "az-1",
+            ));
+        }
+        for shard_id in 0..MAX_DRAIN_QUEUE as u64 {
+            shard_manager
+                .acquire(ShardId(shard_id), WorkerId(1))
+                .unwrap();
+        }
+        shard_manager
+            .acquire(ShardId(MAX_DRAIN_QUEUE as u64), WorkerId(2))
+            .unwrap();
+        let drain_state = Arc::new(AsyncMutex::new(DrainState::default()));
+
+        let (lifecycle, queue_fill, queue_capacity, request) = request_worker_drain(
+            &catalog,
+            &shard_manager,
+            None,
+            None,
+            &drain_state,
+            WorkerId(1),
+            None,
+        )
+        .await
+        .unwrap();
+        let started_at_ms = match lifecycle {
+            WorkerLifecycleState::Draining { started_at_ms, .. } => started_at_ms,
+            lifecycle => panic!("expected draining lifecycle, got {lifecycle:?}"),
+        };
+        assert_eq!(queue_fill, MAX_DRAIN_QUEUE as u32);
+        assert_eq!(queue_capacity, MAX_DRAIN_QUEUE as u32);
+        assert_eq!(
+            request.deadline_ms - started_at_ms,
+            DEFAULT_DRAIN_DEADLINE_MS
+        );
+
+        let overflow = request_worker_drain(
+            &catalog,
+            &shard_manager,
+            None,
+            None,
+            &drain_state,
+            WorkerId(2),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(overflow.code, "RS-3612");
+        assert_eq!(
+            overflow.message,
+            "worker drain queue would exceed its bound (1025/1024)"
+        );
+        assert_eq!(
+            overflow.next_steps,
+            "Let the existing drain queue drain, or increase the configured bound only if memory headroom allows."
+        );
+        assert_eq!(drain_state.lock().await.queue.len(), MAX_DRAIN_QUEUE);
+        assert!(catalog.get(WorkerId(2)).unwrap().lifecycle.is_active());
+
+        drain_state.lock().await.queue.pop_front().unwrap();
+        let (_, recovered_fill, recovered_capacity, _) = request_worker_drain(
+            &catalog,
+            &shard_manager,
+            None,
+            None,
+            &drain_state,
+            WorkerId(2),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered_fill, MAX_DRAIN_QUEUE as u32);
+        assert_eq!(recovered_capacity, MAX_DRAIN_QUEUE as u32);
+        assert_eq!(drain_state.lock().await.queue.len(), MAX_DRAIN_QUEUE);
+    }
 
     async fn start_test_service() -> (ControlServiceHandle, TopologyCatalog) {
         let catalog = TopologyCatalog::new();
@@ -1890,6 +3853,10 @@ mod tests {
             CapacityHeadroom::new(headroom),
         )
         .with_location(WorkerLocation::new(host, az))
+        .with_capabilities(WorkerCapabilities {
+            shared_shard_store_id: Some([1; 32]),
+            ..Default::default()
+        })
     }
 
     #[tokio::test]
@@ -2013,7 +3980,7 @@ mod tests {
         let resp = send_and_recv(&mut stream, &req).await;
         let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
         match reply {
-            ControlMessage::ShardAssigned { lease } => {
+            ControlMessage::ShardAssigned { lease, .. } => {
                 assert_eq!(lease.shard_id, ShardId(42));
                 assert_eq!(lease.worker_id, WorkerId(1));
                 // Verify the manager also has the lease.
@@ -2547,6 +4514,7 @@ mod tests {
             None,
             &drain_state,
             WorkerId(1),
+            None,
         )
         .await
         .unwrap();
@@ -2603,7 +4571,7 @@ mod tests {
         let resp = send_and_recv(&mut stream, &req).await;
         let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
 
-        if let ControlMessage::ShardAssigned { lease } = reply {
+        if let ControlMessage::ShardAssigned { lease, .. } = reply {
             assert_eq!(lease.shard_id, ShardId(42));
             assert_eq!(lease.worker_id, WorkerId(101));
         } else {

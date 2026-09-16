@@ -58,6 +58,8 @@ async fn test_binary_lifecycle_gateway_worker_control_roles() {
     let pg_port = get_free_port();
     let metrics_addr = format!("127.0.0.1:{metrics_port}");
     let listen_addr = format!("127.0.0.1:{pg_port}");
+    let mut node_config = rockstream_types::config::NodeConfig::default();
+    node_config.control.management_addr = Some("127.0.0.1:0".to_string());
 
     let opts = StartOptions {
         storage: storage_dir.clone(),
@@ -67,6 +69,7 @@ async fn test_binary_lifecycle_gateway_worker_control_roles() {
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: Some(node_config),
         metrics_addr: Some(metrics_addr.clone()),
         listen_addr: Some(listen_addr.clone()),
         raft_peers: None,
@@ -260,6 +263,7 @@ async fn test_invalid_config_fails_before_port_bind() {
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: None,
         metrics_addr: None,
         listen_addr: Some("999.999.999.999:5432".to_string()),
         raft_peers: None,
@@ -290,6 +294,7 @@ async fn test_invalid_config_fails_before_port_bind() {
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: None,
         metrics_addr: Some("999.999.999.999:9090".to_string()),
         listen_addr: Some(test_addr.clone()),
         raft_peers: None,
@@ -325,6 +330,7 @@ async fn test_invalid_config_fails_before_port_bind() {
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: None,
         metrics_addr: Some(test_addr.clone()),
         listen_addr: None,
         raft_peers: None,
@@ -355,6 +361,7 @@ async fn test_invalid_config_fails_before_port_bind() {
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: None,
         metrics_addr: Some(test_addr.clone()),
         listen_addr: None,
         raft_peers: None,
@@ -421,6 +428,8 @@ async fn test_server_roles_remain_alive_until_explicit_signal() {
     let pg_port = get_free_port();
     let metrics_addr = format!("127.0.0.1:{metrics_port}");
     let listen_addr = format!("127.0.0.1:{pg_port}");
+    let mut node_config = rockstream_types::config::NodeConfig::default();
+    node_config.control.management_addr = Some("127.0.0.1:0".to_string());
 
     let opts = StartOptions {
         storage: storage_dir.clone(),
@@ -430,6 +439,7 @@ async fn test_server_roles_remain_alive_until_explicit_signal() {
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: Some(node_config),
         metrics_addr: Some(metrics_addr.clone()),
         listen_addr: Some(listen_addr.clone()),
         raft_peers: None,

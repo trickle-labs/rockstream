@@ -58,7 +58,7 @@ run_bad unsupported_claim "unsupported documentation claim: docs/schema-evolutio
 
 setup_tree
 python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/README.md"); p.write_text(p.read_text().replace("A **view** is", "A **pipeline** is", 1))'
-run_bad obsolete_term "obsolete term 'pipeline'; use 'view' at docs/README.md:28"
+run_bad obsolete_term "obsolete term 'pipeline'; use 'view' at docs/README.md:29"
 
 setup_tree
 python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/test-commands.md"); p.write_text(p.read_text().replace("make fmt", "make missing", 1))'

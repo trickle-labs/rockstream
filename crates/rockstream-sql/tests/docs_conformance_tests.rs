@@ -80,32 +80,23 @@ fn tokenize(span: &str) -> Vec<String> {
 /// underscore-insensitive substring match (e.g. the SQL keyword `TRY_CAST`
 /// matching the Rust identifier `TryCast`), since RockStream's
 /// SQL-keyword-to-Rust-identifier naming isn't 1:1.
-fn contains_word(haystack: &str, needle: &str) -> bool {
-    let haystack_lower = haystack.to_ascii_lowercase();
+fn contains_word(haystack_lower: &str, haystack_without_underscores: &str, needle: &str) -> bool {
     let needle_lower = needle.to_ascii_lowercase();
     let mut start = 0;
     while let Some(pos) = haystack_lower[start..].find(&needle_lower) {
         let abs = start + pos;
-        let before_ok = haystack_lower[..abs]
-            .chars()
-            .next_back()
-            .map(|c| !c.is_ascii_alphanumeric())
-            .unwrap_or(true);
+        let before_ok = abs == 0 || !haystack_lower.as_bytes()[abs - 1].is_ascii_alphanumeric();
         let after_idx = abs + needle_lower.len();
-        let after_ok = haystack_lower[after_idx..]
-            .chars()
-            .next()
-            .map(|c| !c.is_ascii_alphanumeric())
-            .unwrap_or(true);
+        let after_ok = after_idx == haystack_lower.len()
+            || !haystack_lower.as_bytes()[after_idx].is_ascii_alphanumeric();
         if before_ok && after_ok {
             return true;
         }
         start = abs + 1;
     }
     if needle_lower.contains('_') {
-        let haystack_no_us: String = haystack_lower.chars().filter(|c| *c != '_').collect();
         let needle_no_us: String = needle_lower.chars().filter(|c| *c != '_').collect();
-        if haystack_no_us.contains(&needle_no_us) {
+        if haystack_without_underscores.contains(&needle_no_us) {
             return true;
         }
     }
@@ -170,13 +161,14 @@ fn test_language_features_doc_keywords_are_parseable() {
     // than through DataFusion's generic SQL parser).
     let sql_src = concat_rust_sources(&repo_root.join("crates/rockstream-sql/src"));
     let gateway_src = concat_rust_sources(&repo_root.join("crates/rockstream-gateway/src"));
-    let combined_src = format!("{sql_src}\n{gateway_src}");
+    let combined_src = format!("{sql_src}\n{gateway_src}").to_ascii_lowercase();
+    let source_without_underscores: String = combined_src.chars().filter(|c| *c != '_').collect();
 
     let mut unrecognized = Vec::new();
     for span in &checkable_spans {
         let tokens = tokenize(span);
         for token in tokens {
-            if !contains_word(&combined_src, &token) {
+            if !contains_word(&combined_src, &source_without_underscores, &token) {
                 unrecognized.push(format!(
                     "`{span}` (token `{token}`) not found anywhere in rockstream-sql's or \
                      rockstream-gateway's source"

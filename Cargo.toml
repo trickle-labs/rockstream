@@ -7,6 +7,7 @@ members = [
     "crates/rockstream-diff",
     "crates/rockstream-docgen",
     "crates/rockstream-gateway",
+    "crates/rockstream-management-proto",
     "crates/rockstream-ops",
     "crates/rockstream-oracle",
     "crates/rockstream-plan",
@@ -99,6 +100,7 @@ rockstream-control = { path = "crates/rockstream-control" }
 rockstream-diff = { path = "crates/rockstream-diff" }
 rockstream-docgen = { path = "crates/rockstream-docgen" }
 rockstream-gateway = { path = "crates/rockstream-gateway" }
+rockstream-management-proto = { path = "crates/rockstream-management-proto" }
 rockstream-ops = { path = "crates/rockstream-ops" }
 rockstream-oracle = { path = "crates/rockstream-oracle" }
 rockstream-plan = { path = "crates/rockstream-plan" }

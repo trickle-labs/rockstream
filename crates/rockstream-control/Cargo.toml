@@ -18,6 +18,8 @@ bytes = { workspace = true, features = ["serde"] }
 rockstream-plan = { workspace = true }
 rockstream-storage = { workspace = true }
 rockstream-types = { workspace = true }
+rockstream-management-proto = { workspace = true }
+tonic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

@@ -15,6 +15,7 @@ fn test_gateway_opts(dir: &TempDir) -> StartOptions {
         worker_location: WorkerLocation::default(),
         worker_capabilities: WorkerCapabilities::default(),
         config: RockstreamConfig::default(),
+        node_config: None,
         metrics_addr: None,
         listen_addr: Some("127.0.0.1:0".to_string()),
         raft_peers: None,
