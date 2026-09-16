@@ -264,8 +264,8 @@ def generated_block(text: str) -> str | None:
 def check_full_semantics(
     root: Path, contract: dict, capabilities: list[dict], errors: list[str]
 ) -> None:
-    if contract.get("version") not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0", "v0.65.0"}:
-        fail(errors, "capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, v0.64.0, or v0.65.0")
+    if contract.get("version") not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0", "v0.65.0", "v0.66.0"}:
+        fail(errors, "capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, v0.64.0, v0.65.0, or v0.66.0")
 
 
     for capability in capabilities:
