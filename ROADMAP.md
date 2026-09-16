@@ -8,7 +8,7 @@
 **Roadmap range:** v0.60 through v0.75  
 **Primary objective:** Turn RockStream from a technically ambitious IVM engine with uneven product surfaces into a coherent, trustworthy, durable, operable database system.
 
-**Implementation plans:** [v0.61 through v0.74, including performance patches](docs/implementation-plans/README.md).
+**Implementation plans:** [v0.61 through v0.75, including performance patches and the UI-readiness track](docs/implementation-plans/README.md).
 These plans define implementation steps, documentation changes, and numbered exit criteria.
 Carry every criterion into implementation and sign-off before marking a milestone Done.
 
@@ -257,9 +257,10 @@ Changes to persistent formats or public protocols require:
 | **v0.70** | Kafka | Second complete external ingestion golden path |
 | **v0.71** | Observability | Operators can explain health, lag, state, and failures |
 | **v0.72** | Resource Control | Bounded execution and reproducible capacity behavior |
-| **v0.73** | Security | Authentication and identity become production-coherent |
+| **v0.73** | Security | Authentication, authorization, and identity become production-coherent |
+| v0.73.1 | Console API Foundation | Browser-class clients can safely consume qualified public capabilities |
 | **v0.74** | Upgrade Compatibility | Rolling/versioned upgrades and durable format migration |
-| **v0.75** | Stable Technical Preview | Long-lived 0.x compatibility and qualification contract |
+| **v0.75** | Stable Technical Preview | Long-lived 0.x compatibility, qualification, and UI-readiness contract |
 
 ### 5.1 Performance work starts with v0.61
 
@@ -317,6 +318,33 @@ Compare one and twenty views under light and sustained load. Require exact resul
 Reuse existing spillable arrangements. Make ordinary aggregate state demand-loaded or spillable, and audit every supported stateful operator and recovery path for full-state materialization. Page restoration to completion; a truncated bounded scan must never count as successful recovery. The complete-recovery requirement already applies at v0.65.
 
 Prove exact output after eviction, restart, and compaction with state larger than the configured worker memory budget. Bound spill I/O, disk occupancy, checkpoint buffers, and storage backlog. Unsupported operators must reject the workload explicitly. Extend this proof to large-state migration at v0.68, before expanding the connector workload envelope in v0.69.
+
+### 5.7 UI enablement is a cross-cutting qualification track
+
+The [UI-enablement plan](docs/implementation-plans/ui-enablement.md) is an
+acceptance dependency graph, not a second release sequence. Its M0-M11 labels
+group criteria that are implemented and proved by the roadmap owners below.
+
+| Roadmap owner | UI-enablement responsibility |
+|---|---|
+| v0.66-v0.70 | M0-M1 capability map, architecture decisions, public contracts, and headless proof harness; no product claim |
+| v0.71 | M4/M6 canonical object and status models, lineage, health, freshness diagnosis, diagnostics, and metric provenance |
+| v0.72 | M5 and workload-control portions of M7: bounded interactive execution, cancellation cleanup, subscriptions, admission, and effective limit changes |
+| v0.73 | M2/M8 durable principals and grants, shared authorization, operator/admin/data separation, management authentication, secrets, audit, and redaction |
+| v0.73.1 | M3 secured browser-facing console API, sessions, adapters, generated client, and browser-security boundary |
+| v0.74 | M10 compatibility for the console API, event stream, delegated actor assertions, public resource identities, generated client, and changed durable formats |
+| v0.75 | Remaining M7 integration and M9-M11 guarded operations, packaging, load/security qualification, persona journeys, and final UI-readiness gate |
+
+Existing milestones remain the owners of their behavior and evidence. Do not
+create a second catalog, authorization store, diagnostic engine, query scheduler,
+or operation system for the console. A criterion may cite one owning milestone's
+evidence when that evidence proves the complete UIE claim. Completing a UIE
+subset does not sign off an otherwise incomplete release.
+
+M2 is a logical prerequisite for the console API but is fulfilled by v0.73; it
+is not pulled ahead of v0.71 or v0.72. The console API in v0.73.1 is the only new
+subsystem introduced by this track. UI implementation begins only after v0.75
+qualifies the complete headless contract.
 
 ---
 
@@ -2155,7 +2183,8 @@ The Kafka template becomes Supported only after these tests pass.
 
 ## Focus
 
-Make RockStream explain itself.
+Make RockStream explain itself through one canonical observation model shared by
+the CLI, SQL catalog, and later console API adapters.
 
 ## User outcome
 
@@ -2212,6 +2241,12 @@ ViewStatus {
 }
 ```
 
+Every field must identify its authoritative producer, observation time, relevant
+revision or epoch, units, and availability state. Preserve `unknown`, `stale`,
+`unavailable`, and `not applicable`; do not translate missing knowledge into zero
+or healthy. The console adapter may reshape this model but must not implement a
+second freshness or health interpretation.
+
 ---
 
 ### 17.3 `rockstream doctor`
@@ -2260,6 +2295,14 @@ rockstream_catalog.checkpoints
 
 Avoid generating a large pseudo-catalog whose fields are not authoritative.
 
+The same canonical records must support bounded read services for namespaces,
+tables, views, sources, workloads, nodes, shards, operations, and checkpoints.
+Expose authorized definitions, lifecycle, stable resource identity, source
+provenance, and compiler/catalog lineage where those facts exist. Apply
+authorization before pagination or counts, bound lineage traversal, and report
+live-list or stale-provider semantics explicitly. Do not maintain a console-only
+catalog or derive lineage by parsing SQL in a client.
+
 ---
 
 ### 17.5 Structured logging
@@ -2297,6 +2340,10 @@ connector lag
 errors by RS code
 ```
 
+Publish units, producer ownership, sample times, counter-reset behavior, bounded
+labels, and missing-series semantics. Optional history adapters may query approved
+templates, but current authoritative status cannot depend on a telemetry service.
+
 ---
 
 ## Required Proof
@@ -2315,6 +2362,10 @@ connector lagging
 storage unavailable
 ```
 
+The exact canonical records, lineage edges, health dimensions, degraded causes,
+diagnostic outcomes, and metric provenance also provide the owning evidence for
+UIE-M4 and UIE-M6. Console-specific serialization remains v0.73.1 work.
+
 ---
 
 <a id="v0-72"></a>
@@ -2326,6 +2377,10 @@ storage unavailable
 Make resource limits meaningful and predictable.
 
 This milestone completes cross-workload fairness and capacity qualification. Initial memory bounds, backpressure, and performance evidence ship through section 5's earlier milestones; they must not wait for v0.72.
+
+Bounded interactive SQL is an engine and gateway responsibility. A console cannot
+claim a safe row preview by executing an unrestricted query and discarding rows
+after materialization.
 
 ## User outcome
 
@@ -2440,6 +2495,35 @@ Performance regressions beyond the selected threshold require explicit approval 
 
 ---
 
+### 18.7 Bounded interactive execution and effective changes
+
+Provide a budgeted, single-statement read-only execution path for browser-class
+and other interactive clients. Enforce limits before and during producer work,
+including:
+
+```text
+compilation
+intermediate state
+queued work
+returned rows
+encoded bytes
+wall time
+concurrency
+snapshot lifetime
+```
+
+Reject mutations and unauthorized reads in the authoritative dispatcher, not
+with client-side SQL inspection. Cancellation, timeout, disconnect, cursor
+expiry, and service shutdown must reach the producer and release reservations.
+Bound committed subscriptions by snapshot, epoch, buffer, stream count, and
+slow-client lifetime; require resnapshot when replay cannot be guaranteed.
+
+Workload limit changes use revision-checked admission and propagate to active
+owners. Report requested and effective revisions separately. Prove the changed
+behavior under load; a catalog readback alone does not establish enforcement.
+
+---
+
 ## Required Proof
 
 Sustained overload must reach a bounded degraded state rather than:
@@ -2453,6 +2537,13 @@ control starvation
 
 Performance claims must be reproducible from repository commands.
 
+Interactive-query proof must show bounded producer memory, CPU, queueing, result
+size, snapshot lifetime, and cleanup for success, limit rejection, timeout,
+cancellation, disconnect, slow subscription consumers, and restart. Workload
+change proof must show revision conflicts, unavailable owners, rejected
+non-reclaimable reductions, propagation, and actual enforcement. This evidence
+owns UIE-M5 and the workload-control portion of UIE-M7; v0.73.1 only adapts it.
+
 ---
 
 <a id="v0-73"></a>
@@ -2461,7 +2552,8 @@ Performance claims must be reproducible from repository commands.
 
 ## Focus
 
-Turn authentication implementations into complete identity systems.
+Turn authentication implementations into complete identity and authorization
+systems shared by every public entry point.
 
 ## User outcome
 
@@ -2483,16 +2575,21 @@ No password mode may start in an apparently enabled state with no meaningful cre
 
 Identity metadata belongs in the durable catalog.
 
-Support an intentionally narrow initial model:
+Define only the concrete actions needed by the supported product surface and map
+them to fixed presets:
 
 ```text
-login role
-admin role
-read role
-write role
+data reader
+builder
+administrator
+operator
 ```
 
-Add finer authorization only when justified.
+An operator does not automatically gain business-data read, secret-value, or
+grant authority. Preserve existing `Viewer`, `PipelineOwner`, and `Admin`
+behavior through explicit compatibility mappings and migrations. Login
+capability remains distinct from authorization. Do not build a generic IAM
+language.
 
 ---
 
@@ -2532,6 +2629,11 @@ worker-worker mTLS
 management API auth
 ```
 
+Pgwire, management RPCs, CLI-driven calls, and the later console API must use the
+same underlying action decisions. Delegation authenticates both the service peer
+and the current user actor; caller-supplied role names or headers confer no
+authority.
+
 ---
 
 ### 19.5 Secret references
@@ -2562,6 +2664,11 @@ admin operation completed
 
 must be auditable.
 
+Security administration must expose durable, bounded grant/revoke, secret
+rotation, audit-history, redaction, and support-artifact behavior without
+revealing existing secret values or allowing operational access to bypass data
+permissions.
+
 ---
 
 ## Required Proof
@@ -2582,6 +2689,96 @@ secret rotation during operation
 ```
 
 No secret values may appear in ordinary diagnostics or support bundles.
+
+The allowed and denied matrix must cover the fixed presets across pgwire,
+management RPCs, and CLI calls, including an operator denied business data,
+secret values, and grant administration. These requirements own UIE-M2 and
+UIE-M8. The console service may expose their results only after this shared
+security model passes.
+
+---
+
+<a id="v0-73-1"></a>
+
+# 19A. v0.73.1 — Console API Foundation
+
+## Focus
+
+Expose already qualified RockStream capabilities through one secured,
+browser-compatible HTTP API. This milestone adds no user interface and does not
+expand engine, lifecycle, query, or operational semantics.
+
+## User outcome
+
+A browser-class or headless client can authenticate, discover supported
+capabilities, and use authorized catalog, query, diagnostic, administration, and
+operation adapters without private APIs or privileged proxy behavior.
+
+---
+
+## Implementation Plan
+
+### 19A.1 Service boundary and packaging
+
+Add `crates/rockstream-console` and `rockstream console serve`. Package the
+service in the release binary or container with validated gateway, management,
+identity-provider, telemetry, artifact-store, limit, and shutdown configuration.
+Backend targets come from deployment configuration, never user-supplied URLs.
+Refuse production startup against an insufficiently secured backend.
+
+### 19A.2 Browser sessions and actor delegation
+
+Use OIDC authorization-code flow with PKCE and server-held tokens. Validate
+issuer, audience, signature, state, nonce, redirect targets, and expiry. Use
+secure, HttpOnly cookies plus explicit SameSite, CSRF, origin, logout, revocation,
+and session-fixation behavior.
+
+Authenticate the service peer and delegate a short-lived, audience- and
+deployment-bound actor assertion. The receiver intersects delegation scope with
+the actor's current v0.73 policy. Do not forward identity tokens as unrestricted
+database credentials.
+
+### 19A.3 Versioned contracts and generated client
+
+Publish `/api/v1`, event schemas, and one generated TypeScript client from the
+M1 contracts. Cover sessions, capabilities, canonical objects, bounded queries
+and subscriptions, reviewed changes, workloads, policy, secrets, observations,
+diagnostics, operations, and backups. Preserve stable resource identities,
+revisions, exact numeric and SQL value semantics, authoritative errors, and
+unknown/stale/unavailable states.
+
+Adapters call the v0.71-v0.73 public owners. They may reshape responses but may
+not duplicate catalog, authorization, diagnosis, scheduling, or operation
+semantics.
+
+### 19A.4 Safe browser boundary
+
+Enforce same-origin defaults, explicit allowed origins, content types, request
+and response limits, rate and concurrency limits, bounded pools and streams,
+privacy/cache headers, correlation, and safe logs. Authenticate streaming and
+download paths. Reset pooled state between actors. Console restart invalidates
+ephemeral sessions and query handles predictably without changing accepted
+engine operations.
+
+Publish support, authorization, and current eligibility as separate decisions.
+Execution rechecks policy, versions, and prerequisites at the authoritative
+mutation boundary.
+
+---
+
+## Required Proof
+
+Run release-process HTTP tests with a controlled OIDC provider and real secured
+gateway and management backends. Cover login/logout, revocation, forged
+delegation, CSRF, malicious origins and targets, pooled-session isolation,
+rate/admission limits, slow streams, cancellation cleanup, backend outages,
+startup misconfiguration, service restart, and complete error payloads.
+
+Use the generated client to consume canonical v0.71 records, bounded v0.72 query
+paths, and v0.73 policy decisions. Mocks may test adapters but cannot qualify a
+product route. Every route must retain the underlying permission, boundedness,
+durability, and unsupported-operation semantics. This milestone owns UIE-M3 and
+the console-adapter portions of UIE-M4-M9.
 
 ---
 
@@ -2614,6 +2811,11 @@ shard/storage format
 compiled-plan format
 backup format
 connector cursor format
+console HTTP API
+console event stream
+delegated actor assertion
+public resource identity
+generated client compatibility
 ```
 
 Do not reuse package version as the only compatibility signal.
@@ -2701,6 +2903,12 @@ restore/read with new version
 
 where compatibility policy promises this behavior.
 
+The console API must publish supported engine/API combinations and reject an
+incompatible or insecure backend without silent downgrade. Clients must tolerate
+documented unknown optional fields and enum values. Session, actor delegation,
+query-handle, event-frame, action, and resource-identity changes follow explicit
+version and migration rules.
+
 ---
 
 ## Required Proof
@@ -2717,9 +2925,16 @@ restart migration
 newer-state downgrade rejection
 backup from previous version
 restore under new version
+v0.73.1 client/API compatibility
+console API against each supported engine version
 ```
 
+The console compatibility cases are the v0.74-owned portion of UIE-M10. Packaging,
+load, adversarial, and complete journey qualification remain v0.75 work.
+
 ---
+
+<a id="v0-75"></a>
 
 # 21. v0.75 — Stable Technical Preview Contract
 
@@ -2728,6 +2943,10 @@ restore under new version
 Consolidate everything from v0.60–v0.74 into a stable long-lived 0.x product contract.
 
 This is **not** v1.0 qualification.
+
+UI readiness is one technical-preview qualification dimension. v0.75 proves that
+the preceding subsystems compose into complete human workflows before a frontend
+is implemented.
 
 ## User outcome
 
@@ -2755,6 +2974,7 @@ Kafka ingestion
 backup/restore
 management API
 operational CLI
+versioned console API and generated client
 documented distributed experimental profile
 ```
 
@@ -2783,6 +3003,7 @@ network port
 auth mode
 connector
 operator
+console API route/event
 ```
 
 Every item receives exactly one classification:
@@ -2880,6 +3101,17 @@ rolling or standalone upgrade
 exact state
 ```
 
+## Q9 — UI readiness
+
+```text
+generated or headless client
+Build journey
+Administer journey
+Operate journey
+success, denial, degradation, and recovery
+authoritative state and audit reconciliation
+```
+
 ---
 
 ### 21.4 Documentation reset
@@ -2942,6 +3174,35 @@ Experimental capabilities retain weaker guarantees.
 
 ---
 
+### 21.7 Qualify the UI-readiness contract
+
+Complete the remaining UIE-M7 integration and UIE-M9-M11 criteria through the
+packaged v0.73.1 service. The console may expose only operations qualified by
+v0.66/v0.68 and later owning milestones; adding an API route cannot broaden
+migration, cancellation, backup, source-lifecycle, or restore guarantees.
+
+Use the generated client or another headless HTTP client to complete every
+mandatory Build, Administer, and Operate journey. Exercise healthy, degraded,
+stale, denied, unavailable, conflict, cancelled, unsupported, restart, and
+upgrade paths. Reconcile responses with durable engine state, committed results,
+authoritative observations, and audit records.
+
+Qualify packaging, installation, browser security, load, bounded cleanup, and
+supported API/engine combinations. Every first-UI interaction must have a public
+route, authoritative producer, permission rule, absence/error semantics, named
+resource limits, compatibility policy, and linked positive and negative
+evidence. No private Rust API, fixture state, mock service, or unsupported
+placeholder can close a required journey.
+
+Publish the versioned OpenAPI and event schemas, generated client, exact examples,
+authentication setup, status/error contracts, capability/permission/eligibility
+semantics, local integration setup, and mechanical evidence manifest. Only after
+all M0-M11 and referenced owning criteria pass may the program status become
+**Ready for UI implementation**. React or other frontend implementation remains
+outside v0.75.
+
+---
+
 ## Required Proof
 
 A candidate v0.75 artifact must pass all top-level qualification scenarios using the exact binaries and container images intended for publication.
@@ -2963,6 +3224,10 @@ NOT SUPPORTED
 ```
 
 There is no `SKIPPED BUT GREEN`.
+
+Q9 must run against the candidate package and satisfy the final UI-readiness gate.
+A frontend engineer must be able to complete the supported workflows from the
+published contract without private interfaces or fixture state.
 
 ---
 
@@ -2991,7 +3256,7 @@ v0.65 Recovery         │
        │               │
        ▼               │
 v0.66 Management API ◄─┘
-       │
+       │  UIE M0/M1 contracts + headless harness
        ▼
 v0.67 Data Plane
        │
@@ -3004,24 +3269,36 @@ v0.69 PostgreSQL CDC   v0.70 Kafka
        │               │
        └───────┬───────┘
                ▼
-         v0.71 Observability
+         v0.71 Observability [UIE M4/M6]
                │
                ▼
-         v0.72 Resource Control
+         v0.72 Resource Control [UIE M5/M7]
                │
                ▼
-         v0.73 Security
+         v0.73 Security [UIE M2/M8]
                │
                ▼
-         v0.74 Upgrade
+         v0.73.1 Console API [UIE M3]
                │
                ▼
-         v0.75 Stable Preview
+         v0.74 Upgrade [UIE M10 compatibility]
+               │
+               ▼
+         v0.75 Stable Preview [UIE M7/M9-M11]
+               │
+               ▼
+         READY FOR UI
 ```
 
 Some implementation streams may overlap, but sign-off should preserve the logical dependencies.
 
 Section 5's performance patches attach to their named parent milestones. Baseline collection and aggregate delta reduction can start alongside v0.61. Worker budgeting follows `NodeConfig`; concurrent commits follow recovery proof. Direct transport and shared execution remain v0.67 gates, and state beyond RAM follows at v0.67.1. Pressure-driven movement requires v0.68's durable migration protocol. Later observability and resource-control releases complete this work rather than delaying its start.
+
+UIE M0/M1 may begin alongside v0.66-v0.70 because they establish contracts and
+test infrastructure rather than product claims. All other UIE work follows the
+owning release and acceptance dependencies above. In particular, v0.73 security
+is not pulled ahead of observability or resource control, and v0.73.1 cannot pass
+before their public providers and the v0.73 security boundary are qualified.
 
 ---
 
@@ -3291,6 +3568,11 @@ The first concrete sequence is:
 7. Ship the management API and direct Arrow path through v0.67.
 8. Prove shared execution and bounded state beyond RAM by v0.67.1.
 9. Qualify pressure-driven movement with durable lifecycle work in v0.68.
+10. Build the UIE M0/M1 capability map, contracts, and headless harness alongside v0.66-v0.70 without making a UI product claim.
+11. Make v0.71's canonical observations satisfy UIE M4/M6 and v0.72's bounded execution satisfy UIE M5 and the workload portion of M7.
+12. Make v0.73's shared security model satisfy UIE M2/M8, including operator/admin/data separation.
+13. Ship the secured console API as v0.73.1, adapting rather than duplicating the v0.71-v0.73 owners.
+14. Include console contracts in v0.74 compatibility and complete UIE M7/M9-M11 qualification in v0.75.
 ```
 
 Each performance change carries its before-and-after external evidence. Complete these gates before connector expansion in v0.69 and v0.70; do not postpone measurement until v0.72.
@@ -3310,6 +3592,12 @@ It ends with:
 > RockStream's supported 0.x surface is coherent enough that future engineering can be chosen based on actual user and operational needs rather than filling gaps between partially connected subsystems.
 
 At v0.75, the correct next action may be:
+
+```text
+implement the UI against the qualified headless contract
+```
+
+or:
 
 ```text
 v0.76 — improve something users are actually struggling with

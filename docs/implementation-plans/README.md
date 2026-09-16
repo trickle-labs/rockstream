@@ -1,4 +1,4 @@
-# Implement v0.61 through v0.74
+# Implement v0.61 through v0.75
 
 Status: Planned. These documents specify future work. They do not establish
 that a capability exists or that a release has passed qualification.
@@ -11,8 +11,9 @@ historical references. Their version assignments do not govern this work.
 ## Select the plan
 
 Use the matching document for each milestone, including the five performance
-patches. A version ending in `.0` uses its minor-version plan, so `v0.61.0`
-uses `v0.61.md`. Other patches retain their full version number.
+patches and the console API patch. A version ending in `.0` uses its minor-version
+plan, so `v0.61.0` uses `v0.61.md`. Other patches retain their full version
+number.
 
 | Version | Plan | Required predecessor work |
 |---|---|---|
@@ -34,12 +35,18 @@ uses `v0.61.md`. Other patches retain their full version number.
 | v0.71 | [Operational observability](v0.71.md) | v0.69 and v0.70 |
 | v0.72 | [Resource control and capacity](v0.72.md) | v0.71 and earlier budget and performance patches |
 | v0.73 | [Security coherence](v0.73.md) | v0.72 |
-| v0.74 | [Upgrade and compatibility](v0.74.md) | v0.73 |
+| v0.73.1 | [Console API foundation](v0.73.1.md) | v0.71-v0.73 qualified providers and UIE M0-M2 |
+| v0.74 | [Upgrade and compatibility](v0.74.md) | v0.73.1 |
+| v0.75 | [Stable technical preview](v0.75.md) | v0.74 and all required UIE owning criteria |
 
 Follow logical dependencies rather than numeric adjacency. Kafka and PostgreSQL
 CDC can proceed independently after v0.68. Do not delay the baseline until v0.72
-or make v0.61 depend on its own performance patches. v0.75 and research programs
-remain outside this plan set. No plan schedules v1.0.
+or make v0.61 depend on its own performance patches. The
+[UI-enablement plan](ui-enablement.md) is a cross-cutting qualification track:
+M0/M1 may establish contracts and test infrastructure during v0.66-v0.70, while
+v0.71-v0.75 own implementation and product evidence. It is not an independent
+M0-through-M11 release sequence. Research programs remain outside this plan set.
+No plan schedules v1.0.
 
 ## Carry requirements into implementation
 
