@@ -665,6 +665,16 @@ interesting state trivially satisfies every `always`), each spec includes
   in-flight write (both the plain and shard-fence write families) is rejected
   (see §3.8 above).
 
+The v0.66 management backup workflow uses the durable operation record as its
+cross-process execution claim: only `pending` and `waiting` records may enter
+the executor, while a `running` record is left to its current owner. The
+paired process-level assertion is
+`release_management_backup_idempotency_is_atomic_across_processes` in
+`crates/rockstream-cli/tests/management_backup_process_tests.rs`. This
+management workflow is outside the M1–M7 FizzBee state machines, but is
+documented here to keep the runtime protocol and verification inventory
+synchronized.
+
 Postgres CDC polling consumes one credit for every queued change in a complete
 transaction, including changes at or before the caller's offset that are
 filtered from the returned batch. The exact boundary is covered by
