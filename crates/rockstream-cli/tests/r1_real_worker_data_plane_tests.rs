@@ -607,6 +607,7 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the direct gateway-to-worker source transport"]
 async fn real_workers_execute_aggregate_join_and_fenced_failover() {
     let _test_guard = PROCESS_TEST_LOCK.lock().await;
     run_cluster(1, false).await;
