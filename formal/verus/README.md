@@ -27,3 +27,18 @@ cargo build --locked --release -p rockstream-cli
 target, a failed theorem, or a failed contract checker is an error. The
 production function remains the only implementation; specifications and proof
 code do not select a different runtime algorithm.
+
+VS6 keeps the qualification contract in [`qualification.toml`](qualification.toml)
+and the maintenance rules in [`MAINTENANCE.md`](MAINTENANCE.md). Run the
+machine-readable checker before the proof gate; run the clean qualification
+matrix when recording release evidence:
+
+```sh
+python3 scripts/check-verus-qualification.py
+make verify-proof-contracts
+make qualify-verus
+```
+
+The matrix records the source revision, SHA-256 digests, exact commands, raw
+logs, exit statuses, and elapsed time. Missing tools, backends, or tests are
+blocked and never converted into passing evidence.
