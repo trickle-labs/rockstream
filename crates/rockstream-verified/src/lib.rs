@@ -1,14 +1,17 @@
 use vstd::prelude::*;
 
+pub mod aggregate;
 pub mod arithmetic;
 pub mod codecs;
 pub mod keys;
 pub mod laws;
 pub mod routing;
+pub mod zset;
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{codecs, keys, routing};
+    use super::{aggregate, codecs, keys, routing, zset};
 
     #[test]
     fn fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths() {
@@ -51,6 +54,22 @@ mod tests {
         assert_eq!(routing::route_power_of_two_hash(42, 1), Some(0));
         assert_eq!(routing::route_power_of_two_hash(u64::MAX, 8), Some(7));
         assert_eq!(routing::route_power_of_two_hash(0, 32), Some(0));
+    }
+
+    #[test]
+    fn vs3_kernels_return_exact_transition_and_boundary_results() {
+        assert!(zset::validate_aligned_lengths(3, 3));
+        assert!(!zset::validate_aligned_lengths(3, 2));
+        assert!(zset::validate_index(2, 3));
+        assert!(!zset::validate_index(3, 3));
+        assert_eq!(zset::checked_weight_add(i64::MAX, 1), None);
+        assert_eq!(zset::checked_weight_add(4, -1), Some(3));
+
+        assert_eq!(aggregate::transition(10, 1, 5, 1), Some((15, 2)));
+        assert_eq!(aggregate::transition(10, 1, -10, -1), Some((0, 0)));
+        assert_eq!(aggregate::transition(10, 1, -9, -1), None);
+        assert_eq!(aggregate::transition(i64::MAX, 1, 1, 1), None);
+        assert_eq!(aggregate::transition(1, 0, 0, 1), None);
     }
 }
 

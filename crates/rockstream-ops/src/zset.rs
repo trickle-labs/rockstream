@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{ArrayRef, Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
@@ -35,22 +35,43 @@ pub struct ArrowZSet {
 }
 
 impl ArrowZSet {
+    /// Fallible constructor for adapter boundaries.
+    pub fn try_new(data: RecordBatch, weights: Vec<i64>) -> Result<Self, OpError> {
+        if !rockstream_verified::zset::validate_aligned_lengths(data.num_rows(), weights.len()) {
+            return Err(OpError::invalid_literal(format!(
+                "Z-set row/weight length mismatch: {} rows, {} weights",
+                data.num_rows(),
+                weights.len()
+            )));
+        }
+        Ok(Self {
+            data,
+            weights,
+            frontier: None,
+        })
+    }
+
     /// Create an `ArrowZSet` from a data batch and weight vector.
     ///
     /// # Panics
     /// Panics if `data.num_rows() != weights.len()`.
     pub fn new(data: RecordBatch, weights: Vec<i64>) -> Self {
-        assert_eq!(
-            data.num_rows(),
-            weights.len(),
-            "ArrowZSet: data rows ({}) != weights len ({})",
-            data.num_rows(),
-            weights.len()
-        );
-        ArrowZSet {
-            data,
-            weights,
-            frontier: None,
+        Self::try_new(data, weights).expect("ArrowZSet: data rows != weights len")
+    }
+
+    /// Validate the executable Z-set boundary, including public-field edits.
+    pub fn validate(&self) -> Result<(), OpError> {
+        if rockstream_verified::zset::validate_aligned_lengths(
+            self.data.num_rows(),
+            self.weights.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(OpError::invalid_literal(format!(
+                "Z-set row/weight length mismatch: {} rows, {} weights",
+                self.data.num_rows(),
+                self.weights.len()
+            )))
         }
     }
 
@@ -88,11 +109,7 @@ impl ArrowZSet {
             })
             .collect();
         let data = RecordBatch::try_new(schema, columns).expect("empty batch");
-        ArrowZSet {
-            data,
-            weights: Vec::new(),
-            frontier: None,
-        }
+        Self::try_new(data, Vec::new()).expect("empty ArrowZSet")
     }
 
     /// Build an `ArrowZSet` from a list of `(a: i64, b: i64)` rows with a
@@ -142,7 +159,11 @@ impl ArrowZSet {
     }
 
     /// Compact the Z-set: remove rows whose weight is zero.
+    ///
+    /// Equal rows remain separate; duplicate consolidation is a separate operation.
     pub fn compact(self) -> Self {
+        self.validate()
+            .expect("ArrowZSet: invalid row/weight alignment");
         let mask: Vec<bool> = self.weights.iter().map(|&w| w != 0).collect();
         if mask.iter().all(|&b| b) {
             return self; // nothing to remove
@@ -197,56 +218,74 @@ impl ArrowZSet {
     ///
     /// Returns a `Vec<(row_bytes, weight)>` using a stable key representation.
     /// For the oracle test, use `accumulate_ab` instead.
-    pub fn accumulate_ab(&self, acc: &mut std::collections::BTreeMap<(i64, i64), i64>) {
+    pub fn try_accumulate_ab(
+        &self,
+        acc: &mut std::collections::BTreeMap<(i64, i64), i64>,
+    ) -> Result<(), OpError> {
+        self.validate()?;
         if self.is_empty() {
-            return;
+            return Ok(());
         }
         let a_col = self.data.column(0).as_any().downcast_ref::<Int64Array>();
         let b_col = self.data.column(1).as_any().downcast_ref::<Int64Array>();
         if let (Some(a), Some(b)) = (a_col, b_col) {
             for i in 0..self.num_rows() {
                 let key = (a.value(i), b.value(i));
-                let entry = acc.entry(key).or_insert(0);
-                *entry += self.weights[i];
-                if *entry == 0 {
+                let current = acc.get(&key).copied().unwrap_or(0);
+                let next = rockstream_verified::zset::checked_weight_add(current, self.weights[i])
+                    .ok_or_else(|| OpError::numeric_overflow("Z-set weight consolidation"))?;
+                if next == 0 {
                     acc.remove(&key);
+                } else {
+                    acc.insert(key, next);
                 }
             }
         }
+        Ok(())
     }
 
-    /// Filter by indices: return only the rows at the given positions.
+    /// Accumulate this test/oracle batch, preserving its historical panic-on-invalid API.
+    pub fn accumulate_ab(&self, acc: &mut std::collections::BTreeMap<(i64, i64), i64>) {
+        self.try_accumulate_ab(acc)
+            .expect("Z-set weight consolidation failed")
+    }
+
+    /// Gather rows in the requested order, preserving repeated indices.
     pub fn select_rows(&self, indices: &[usize]) -> Result<ArrowZSet, OpError> {
+        self.validate()?;
         if indices.is_empty() {
-            return Ok(ArrowZSet::empty(self.data.schema()));
+            let mut empty = ArrowZSet::empty(self.data.schema());
+            empty.frontier = self.frontier.clone();
+            return Ok(empty);
         }
         let n = self.num_rows();
-        let mut mask = vec![false; n];
+        let mut take_indices = Vec::with_capacity(indices.len());
         for &i in indices {
-            if i < n {
-                mask[i] = true;
+            if !rockstream_verified::zset::validate_index(i, n) {
+                return Err(OpError::invalid_literal(format!(
+                    "Z-set row index {i} out of bounds for {n} rows"
+                )));
             }
+            take_indices.push(
+                u64::try_from(i)
+                    .map_err(|_| OpError::invalid_literal("Z-set row index exceeds u64"))?,
+            );
         }
-        let bool_array = arrow::array::BooleanArray::from(mask.clone());
+        let indices_array = UInt64Array::from(take_indices);
         let filtered_cols: Vec<ArrayRef> = self
             .data
             .columns()
             .iter()
-            .map(|col| arrow::compute::filter(col.as_ref(), &bool_array).map_err(OpError::arrow))
+            .map(|col| {
+                arrow::compute::take(col.as_ref(), &indices_array, None).map_err(OpError::arrow)
+            })
             .collect::<Result<_, _>>()?;
         let new_data =
             RecordBatch::try_new(self.data.schema(), filtered_cols).map_err(OpError::arrow)?;
-        let new_weights: Vec<i64> = mask
-            .iter()
-            .zip(&self.weights)
-            .filter(|(b, _)| **b)
-            .map(|(_, w)| *w)
-            .collect();
-        Ok(ArrowZSet {
-            data: new_data,
-            weights: new_weights,
-            frontier: self.frontier.clone(),
-        })
+        let new_weights = indices.iter().map(|&i| self.weights[i]).collect();
+        let mut result = Self::try_new(new_data, new_weights)?;
+        result.frontier = self.frontier.clone();
+        Ok(result)
     }
 }
 
@@ -261,6 +300,17 @@ mod tests {
         assert_eq!(zs.weights, vec![1, 1]);
         assert_eq!(zs.schema().field(0).name(), "a");
         assert_eq!(zs.schema().field(1).name(), "b");
+    }
+
+    #[test]
+    fn try_new_rejects_misaligned_weights() {
+        let zs = ArrowZSet::from_ab_rows(&[(1, 10)], 1);
+        assert_eq!(
+            ArrowZSet::try_new(zs.data, Vec::new())
+                .unwrap_err()
+                .to_string(),
+            "[RS-1013] Invalid literal: Z-set row/weight length mismatch: 1 rows, 0 weights; next_steps: Z-set row/weight length mismatch: 1 rows, 0 weights"
+        );
     }
 
     #[test]
@@ -282,9 +332,20 @@ mod tests {
     #[test]
     fn select_rows_subset() {
         let zs = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20), (3, 30)], 1);
-        let sub = zs.select_rows(&[0, 2]).unwrap();
-        assert_eq!(sub.num_rows(), 2);
+        let sub = zs.select_rows(&[2, 2, 0]).unwrap();
+        assert_eq!(sub.num_rows(), 3);
         let rows = sub.positive_ab_rows();
-        assert_eq!(rows, vec![(1, 10), (3, 30)]);
+        assert_eq!(rows, vec![(3, 30), (3, 30), (1, 10)]);
+    }
+
+    #[test]
+    fn select_rows_rejects_out_of_range_and_preserves_empty_frontier() {
+        let frontier = rockstream_types::frontier::FreshnessToken::new(Default::default(), 11);
+        let zs = ArrowZSet::from_ab_rows(&[(1, 10)], 1).with_frontier(frontier.clone());
+        assert_eq!(
+            zs.select_rows(&[1]).unwrap_err().to_string(),
+            "[RS-1013] Invalid literal: Z-set row index 1 out of bounds for 1 rows; next_steps: Z-set row index 1 out of bounds for 1 rows"
+        );
+        assert_eq!(zs.select_rows(&[]).unwrap().frontier, Some(frontier));
     }
 }

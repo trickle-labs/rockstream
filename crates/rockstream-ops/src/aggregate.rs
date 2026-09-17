@@ -202,6 +202,26 @@ impl Operator for DecimalAggregateFormatOp {
 ///
 /// The arrangement is bounded by the number of distinct group keys in the input
 /// stream.  The fill level is tracked via `entry_count()`.
+fn encode_state_mutation(
+    op_id: OperatorId,
+    group_key: i64,
+    state: Option<(i64, i64)>,
+) -> rockstream_types::state_mutation::StateMutation {
+    let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &group_key.to_be_bytes());
+    match state {
+        Some((sum, count)) => {
+            let mut value = [0u8; 16];
+            value[..8].copy_from_slice(&encode_i64(sum));
+            value[8..].copy_from_slice(&encode_i64(count));
+            rockstream_types::state_mutation::StateMutation::Put {
+                key,
+                value: bytes::Bytes::copy_from_slice(&value),
+            }
+        }
+        None => rockstream_types::state_mutation::StateMutation::Delete { key },
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AggState {
     /// Group key → (sum_v, count).
@@ -268,20 +288,34 @@ impl AggState {
         } else {
             None
         };
+        if old_count < 0 || (old_count == 0 && old_sum != 0) {
+            return Err(OpError::invalid_literal(format!(
+                "aggregate group {k} has an invalid existing state"
+            )));
+        }
 
-        // Checked arithmetic for sum to detect overflow.
+        // Calculate every candidate before changing the arrangement.
         let contribution = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
-        let new_sum =
-            checked_add_i64(old_sum, contribution).map_err(|_| OpError::aggregate_overflow(k))?;
         let new_count =
             checked_add_i64(old_count, w).map_err(|_| OpError::aggregate_overflow(k))?;
         if new_count < 0 {
             return Err(OpError::invalid_multiplicity(k, new_count));
         }
+        let next =
+            rockstream_verified::aggregate::transition(old_sum, old_count, contribution as i128, w)
+                .ok_or_else(|| {
+                    if new_count == 0 {
+                        OpError::invalid_literal(format!(
+                            "aggregate group {k} has zero count with nonzero sum"
+                        ))
+                    } else {
+                        OpError::aggregate_overflow(k)
+                    }
+                })?;
 
         let new_state = if new_count > 0 {
-            self.entries.insert(k, (new_sum, new_count));
-            Some((new_sum, new_count))
+            self.entries.insert(k, next);
+            Some(next)
         } else {
             self.entries.remove(&k);
             None
@@ -311,25 +345,10 @@ impl AggState {
         op_id: OperatorId,
         dirty_keys: &[i64],
     ) -> Vec<rockstream_types::state_mutation::StateMutation> {
-        let mut mutations = Vec::with_capacity(dirty_keys.len());
-        for &k in dirty_keys {
-            let key_bytes =
-                ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &k.to_be_bytes());
-            if let Some(&(sum, count)) = self.entries.get(&k) {
-                let mut val = [0u8; 16];
-                val[..8].copy_from_slice(&encode_i64(sum));
-                val[8..].copy_from_slice(&encode_i64(count));
-                mutations.push(rockstream_types::state_mutation::StateMutation::Put {
-                    key: key_bytes,
-                    value: bytes::Bytes::copy_from_slice(&val),
-                });
-            } else {
-                mutations.push(rockstream_types::state_mutation::StateMutation::Delete {
-                    key: key_bytes,
-                });
-            }
-        }
-        mutations
+        dirty_keys
+            .iter()
+            .map(|&key| encode_state_mutation(op_id, key, self.entries.get(&key).copied()))
+            .collect()
     }
 
     /// Decode from the raw entries stored by a previous `encode_as_write_batch`.
@@ -450,15 +469,26 @@ impl StagedEpochAggregator {
         let prod = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
 
         if let Some((sum, count)) = self.entries.get_mut(&k) {
-            *sum = sum
+            let next_sum = sum
                 .checked_add(prod as i128)
                 .ok_or_else(|| OpError::aggregate_overflow(k))?;
-            *count = checked_add_i64(*count, w).map_err(|_| OpError::aggregate_overflow(k))?;
+            let next_count =
+                checked_add_i64(*count, w).map_err(|_| OpError::aggregate_overflow(k))?;
+            *sum = next_sum;
+            *count = next_count;
         } else {
-            if self.entries.len() >= self.max_groups {
+            let next_groups = self.entries.len().checked_add(1).ok_or_else(|| {
+                OpError::capacity_exceeded(
+                    "epoch consolidation groups",
+                    usize::MAX,
+                    self.max_groups,
+                    "reduce epoch distinct groups or increase MAX_EPOCH_CONSOLIDATION_GROUPS",
+                )
+            })?;
+            if next_groups > self.max_groups {
                 return Err(OpError::capacity_exceeded(
                     "epoch consolidation groups",
-                    self.entries.len() + 1,
+                    next_groups,
                     self.max_groups,
                     "reduce epoch distinct groups or increase MAX_EPOCH_CONSOLIDATION_GROUPS",
                 ));
@@ -466,10 +496,21 @@ impl StagedEpochAggregator {
 
             // Approximate memory: 8 bytes key + 24 bytes (i128, i64) + 8 bytes order + 24 bytes map overhead = 64 bytes
             const ENTRY_ESTIMATED_BYTES: usize = 64;
-            if self.estimated_bytes + ENTRY_ESTIMATED_BYTES > self.max_bytes {
+            let next_bytes = self
+                .estimated_bytes
+                .checked_add(ENTRY_ESTIMATED_BYTES)
+                .ok_or_else(|| {
+                    OpError::capacity_exceeded(
+                        "epoch consolidation bytes",
+                        usize::MAX,
+                        self.max_bytes,
+                        "reduce epoch batch size or increase MAX_EPOCH_CONSOLIDATION_BYTES",
+                    )
+                })?;
+            if next_bytes > self.max_bytes {
                 return Err(OpError::capacity_exceeded(
                     "epoch consolidation bytes",
-                    self.estimated_bytes + ENTRY_ESTIMATED_BYTES,
+                    next_bytes,
                     self.max_bytes,
                     "reduce epoch batch size or increase MAX_EPOCH_CONSOLIDATION_BYTES",
                 ));
@@ -477,7 +518,7 @@ impl StagedEpochAggregator {
 
             self.entries.insert(k, (prod as i128, w));
             self.order.push(k);
-            self.estimated_bytes += ENTRY_ESTIMATED_BYTES;
+            self.estimated_bytes = next_bytes;
         }
 
         Ok(())
@@ -636,6 +677,7 @@ impl AggregateOp {
         delta: ArrowZSet,
     ) -> Result<crate::op::OperatorEpochResult, OpError> {
         let started_at = Instant::now();
+        delta.validate()?;
         if delta.is_empty() {
             return Ok(crate::op::OperatorEpochResult::new(
                 ArrowZSet::empty(output_schema()),
@@ -758,6 +800,11 @@ impl AggregateOp {
             } else {
                 None
             };
+            if old_count < 0 || (old_count == 0 && old_sum != 0) {
+                return Err(OpError::invalid_literal(format!(
+                    "aggregate group {k} has an invalid existing state"
+                )));
+            }
 
             if delta_sum == 0 && delta_count == 0 {
                 transitions.push(GroupTransition {
@@ -775,17 +822,22 @@ impl AggregateOp {
                 return Err(OpError::invalid_multiplicity(k, new_count));
             }
 
-            let new_state = if new_count > 0 {
-                let old_sum_128 = old_sum as i128;
-                let total_sum_128 = old_sum_128
-                    .checked_add(delta_sum)
-                    .ok_or_else(|| OpError::aggregate_overflow(k))?;
-                let new_sum = checked_i128_to_i64(total_sum_128)
-                    .map_err(|_| OpError::aggregate_overflow(k))?;
-                Some((new_sum, new_count))
-            } else {
-                None
-            };
+            let next = rockstream_verified::aggregate::transition(
+                old_sum,
+                old_count,
+                delta_sum,
+                delta_count,
+            )
+            .ok_or_else(|| {
+                if new_count == 0 {
+                    OpError::invalid_literal(format!(
+                        "aggregate group {k} has zero count with nonzero sum"
+                    ))
+                } else {
+                    OpError::aggregate_overflow(k)
+                }
+            })?;
+            let new_state = (new_count > 0).then_some(next);
 
             let changed = old_state != new_state;
             transitions.push(GroupTransition {
@@ -801,14 +853,10 @@ impl AggregateOp {
         let mut out_count: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_avg: Vec<f64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_weights: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
-        let mut dirty_keys = std::collections::HashSet::new();
-
-        for t in transitions {
+        for t in &transitions {
             if !t.changed {
                 continue;
             }
-
-            dirty_keys.insert(t.key);
 
             // Retract old aggregate row
             if let Some((old_sum, old_count)) = t.old_state {
@@ -822,22 +870,58 @@ impl AggregateOp {
 
             // Insert new aggregate row
             if let Some((new_sum, new_count)) = t.new_state {
-                state.entries.insert(t.key, (new_sum, new_count));
                 let new_avg = avg_from_sum_count(new_sum, new_count).unwrap_or(0.0);
                 out_k.push(t.key);
                 out_sum.push(new_sum);
                 out_count.push(new_count);
                 out_avg.push(new_avg);
                 out_weights.push(1);
-            } else {
-                state.entries.remove(&t.key);
             }
         }
 
-        let mut dirty_keys_vec: Vec<i64> = dirty_keys.into_iter().collect();
+        let mut dirty_keys_vec: Vec<i64> = transitions
+            .iter()
+            .filter(|transition| transition.changed)
+            .map(|transition| transition.key)
+            .collect();
         dirty_keys_vec.sort_unstable();
-        let mutations = state.encode_mutations_for_keys(self.op_id, &dirty_keys_vec);
+        let mut mutation_states: Vec<(i64, Option<(i64, i64)>)> = transitions
+            .iter()
+            .filter(|transition| transition.changed)
+            .map(|transition| (transition.key, transition.new_state))
+            .collect();
+        mutation_states.sort_unstable_by_key(|(key, _)| *key);
+        let mutations = mutation_states
+            .iter()
+            .map(|&(key, new_state)| encode_state_mutation(self.op_id, key, new_state))
+            .collect::<Vec<_>>();
         let logical_mutation_bytes = mutations.iter().map(|mutation| mutation.size_bytes()).sum();
+
+        // Build the fallible output before installing any planned state.
+        let output_zset = if out_k.is_empty() {
+            ArrowZSet::empty(output_schema())
+        } else {
+            let schema = output_schema();
+            let cols: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(out_k)),
+                Arc::new(Int64Array::from(out_sum)),
+                Arc::new(Int64Array::from(out_count)),
+                Arc::new(Float64Array::from(out_avg)),
+            ];
+            let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
+            ArrowZSet::try_new(data, out_weights)?
+        };
+
+        for transition in &transitions {
+            if !transition.changed {
+                continue;
+            }
+            if let Some(new_state) = transition.new_state {
+                state.entries.insert(transition.key, new_state);
+            } else {
+                state.entries.remove(&transition.key);
+            }
+        }
         let state_bytes = state.state_bytes() as usize;
 
         self.dirty_keys
@@ -849,7 +933,7 @@ impl AggregateOp {
         debug!(
             op_id = self.op_id.0,
             input_rows = n,
-            output_rows = out_k.len(),
+            output_rows = output_zset.num_rows(),
             dirty_keys = dirty_keys_vec.len(),
             "AggregateOp: processed delta"
         );
@@ -869,20 +953,6 @@ impl AggregateOp {
             started_at.elapsed(),
             0,
         );
-
-        let output_zset = if out_k.is_empty() {
-            ArrowZSet::empty(output_schema())
-        } else {
-            let schema = output_schema();
-            let cols: Vec<ArrayRef> = vec![
-                Arc::new(Int64Array::from(out_k)),
-                Arc::new(Int64Array::from(out_sum)),
-                Arc::new(Int64Array::from(out_count)),
-                Arc::new(Float64Array::from(out_avg)),
-            ];
-            let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
-            ArrowZSet::new(data, out_weights)
-        };
 
         let metrics = rockstream_types::state_mutation::OperatorEpochMetrics {
             input_records: n,
@@ -1602,5 +1672,40 @@ mod tests {
         op.process_delta(make_batch(&[(3, 5, -1), (3, 7, -1)]))
             .unwrap();
         assert_eq!(op.live_groups(), 0);
+    }
+
+    #[test]
+    fn staging_overflow_leaves_the_existing_entry_unchanged() {
+        let mut staged = StagedEpochAggregator::with_limits(4, 256);
+        staged.ingest_delta(7, i64::MAX, 1).unwrap();
+        let before = staged.entries.clone();
+
+        assert!(matches!(
+            staged.ingest_delta(7, 0, i64::MAX),
+            Err(OpError::AggregateOverflow { group_key: 7, .. })
+        ));
+        assert_eq!(staged.entries, before);
+        assert_eq!(staged.order, vec![7]);
+        assert_eq!(staged.estimated_bytes(), 64);
+    }
+
+    #[test]
+    fn failed_later_transition_does_not_install_earlier_state() {
+        let mut initial = AggState::new();
+        initial.insert(1, (1, 1));
+        initial.insert(2, (i64::MAX, 1));
+        let op = AggregateOp::with_state(OperatorId(9), initial);
+
+        assert!(matches!(
+            op.process_delta(make_batch(&[(1, 1, 1), (2, 1, 1)])),
+            Err(OpError::AggregateOverflow { group_key: 2, .. })
+        ));
+        assert_eq!(op.live_groups(), 2);
+
+        let output = op.process_delta(make_batch(&[(1, 1, 1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 1, 1, 1.0, -1), (1, 2, 2, 1.0, 1)]
+        );
     }
 }

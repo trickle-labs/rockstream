@@ -5204,6 +5204,7 @@ dependencies = [
  "rockstream-storage",
  "rockstream-test-support",
  "rockstream-types",
+ "rockstream-verified",
  "serde",
  "serde_json",
  "sha2 0.10.9",

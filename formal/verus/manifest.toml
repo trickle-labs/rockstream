@@ -325,3 +325,160 @@ evidence = [
     "cargo test --locked -p rockstream-storage keys --lib",
     "cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests",
 ]
+
+[[claims]]
+id = "VS3-01"
+status = "adapter-qualified"
+domain = "ArrowZSet row data and weights have aligned lengths; ordered index selection rejects out-of-range indices and preserves repeated indices and frontier metadata."
+assumptions = ["Arrow RecordBatch columns remain the row-equality and decoding adapter; duplicate consolidation is a separate operation."]
+implementation = [
+    "crates/rockstream-ops/src/zset.rs::try_new",
+    "crates/rockstream-ops/src/zset.rs::validate",
+    "crates/rockstream-ops/src/zset.rs::select_rows",
+]
+theorems = [
+    "crates/rockstream-verified/src/zset.rs::validate_aligned_lengths",
+    "crates/rockstream-verified/src/zset.rs::validate_index",
+]
+production_callers = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+    "crates/rockstream-ops/src/filter.rs::process_delta",
+]
+regression_tests = [
+    "crates/rockstream-ops/src/zset.rs::select_rows_subset",
+    "crates/rockstream-ops/src/zset.rs::select_rows_rejects_out_of_range_and_preserves_empty_frontier",
+]
+evidence = [
+    "cargo test --locked -p rockstream-ops --lib zset::tests",
+    "cargo test --locked -p rockstream-ops --test delta_native_aggregate_tests",
+]
+
+[[claims]]
+id = "VS3-02"
+status = "adapter-qualified"
+domain = "Primitive Z-set alignment, index bounds, and checked weight consolidation over i64 weights."
+assumptions = ["Arrow decoding, row equality, and allocation limits remain adapter obligations."]
+implementation = [
+    "crates/rockstream-verified/src/zset.rs::validate_aligned_lengths",
+    "crates/rockstream-verified/src/zset.rs::validate_index",
+    "crates/rockstream-verified/src/zset.rs::checked_weight_add",
+]
+theorems = [
+    "crates/rockstream-verified/src/zset.rs::validate_aligned_lengths",
+    "crates/rockstream-verified/src/zset.rs::validate_index",
+    "crates/rockstream-verified/src/zset.rs::checked_weight_add",
+]
+production_callers = [
+    "crates/rockstream-ops/src/zset.rs::try_accumulate_ab",
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::vs3_kernels_return_exact_transition_and_boundary_results",
+    "crates/rockstream-ops/src/zset.rs::select_rows_subset",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-ops --lib zset::tests",
+]
+
+[[claims]]
+id = "VS3-03"
+status = "adapter-qualified"
+domain = "Epoch staging checks multiplication, count, and capacity candidates before changing an existing entry; rejected staging input leaves that entry unchanged."
+assumptions = ["Allocator aborts and process loss are crash/recovery cases owned by VS5; returned errors cover the reusable stager contract."]
+implementation = [
+    "crates/rockstream-ops/src/aggregate.rs::ingest_delta",
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+]
+theorems = [
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_mul",
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+]
+production_callers = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+]
+regression_tests = [
+    "crates/rockstream-ops/src/aggregate.rs::staging_overflow_leaves_the_existing_entry_unchanged",
+    "crates/rockstream-ops/tests/delta_native_aggregate_tests.rs::test_v0612_consolidation_group_limit_enforced",
+]
+evidence = [
+    "cargo test --locked -p rockstream-ops --lib aggregate::tests",
+    "cargo test --locked -p rockstream-ops --test delta_native_aggregate_tests",
+]
+
+[[claims]]
+id = "VS3-04"
+status = "adapter-qualified"
+domain = "A valid positive-count aggregate state plus a consolidated integer delta produces an exact present or deleted state, rejects negative counts and zero-count nonzero-sum states, and suppresses unchanged results."
+assumptions = ["The caller supplies a valid absent state as (0, 0) or a positive-count state; valid-retraction semantics are an adapter obligation."]
+implementation = [
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+    "crates/rockstream-ops/src/aggregate.rs::apply_delta",
+]
+theorems = [
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+]
+production_callers = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+    "crates/rockstream-ops/src/aggregate.rs::apply_delta",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::vs3_kernels_return_exact_transition_and_boundary_results",
+    "crates/rockstream-ops/tests/delta_native_aggregate_tests.rs::test_v0612_repeated_updates_emit_old_and_final_only",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-ops --test delta_native_aggregate_tests",
+]
+
+[[claims]]
+id = "VS3-05"
+status = "adapter-qualified"
+domain = "Aggregate transitions and exact dirty-key mutations are planned before fallible output construction and state installation; unchanged keys emit no mutation."
+assumptions = ["RecordBatch construction and storage mutation application remain external adapters; VS5 owns durable epoch atomicity."]
+implementation = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+    "crates/rockstream-ops/src/aggregate.rs::encode_mutations_for_keys",
+]
+theorems = [
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+]
+production_callers = [
+    "crates/rockstream-ops/src/live_exec.rs::append_state",
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+]
+regression_tests = [
+    "crates/rockstream-ops/src/aggregate.rs::failed_later_transition_does_not_install_earlier_state",
+    "crates/rockstream-ops/tests/constant_write_amplification_scale_tests.rs::test_v0612_repeated_keys_intermediate_rows_reduction",
+]
+evidence = [
+    "cargo test --locked -p rockstream-ops --lib aggregate::tests",
+    "cargo test --locked -p rockstream-ops --test constant_write_amplification_scale_tests",
+]
+
+[[claims]]
+id = "VS3-06"
+status = "adapter-qualified"
+domain = "Supported integer aggregate ingestion preserves exact old/new deltas, duplicate consolidation, deletion, overflow rejection, and touched-key mutation complexity on the existing operator path."
+assumptions = ["NULL/cast behavior is defined by the existing Arrow adapter; large-state spill and demand loading remain owned by v0.67.1 and VS5."]
+implementation = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+    "crates/rockstream-ops/src/compile.rs::compile_aggregate_body",
+]
+theorems = [
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+]
+production_callers = [
+    "crates/rockstream-ops/src/compile.rs::compile_aggregate_body",
+    "crates/rockstream-ops/src/aggregate.rs::process_delta",
+]
+regression_tests = [
+    "crates/rockstream-ops/tests/delta_native_aggregate_tests.rs::test_delta_native_aggregate_incremental_emission_and_oracle_match",
+    "crates/rockstream-ops/tests/constant_write_amplification_scale_tests.rs::test_constant_write_amplification_across_scales",
+]
+evidence = [
+    "cargo test --locked -p rockstream-ops --test delta_native_aggregate_tests",
+    "cargo test --locked -p rockstream-ops --test constant_write_amplification_scale_tests",
+]

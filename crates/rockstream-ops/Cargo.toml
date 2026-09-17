@@ -28,6 +28,7 @@ harness = false
 
 [dependencies]
 rockstream-types = { workspace = true }
+rockstream-verified = { workspace = true }
 rockstream-plan = { workspace = true }
 rockstream-storage = { workspace = true }
 arrow = { workspace = true }
