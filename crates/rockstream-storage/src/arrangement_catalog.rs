@@ -7,6 +7,7 @@
 use crate::error::StorageError;
 use rockstream_types::arrangement::ArrangementSpec;
 use rockstream_types::ids::{ArrangementId, TenantId, ViewId};
+use rockstream_verified::persistence;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -58,7 +59,8 @@ impl ArrangementCatalog {
     /// Register a view/consumer for the given `ArrangementSpec`.
     ///
     /// If an arrangement with identical canonical specification already exists,
-    /// increments its reference count and returns `(ArrangementId, false)` (reused).
+    /// increments its reference count for a new view and returns `(ArrangementId, false)` (reused).
+    /// Re-registering the same view is idempotent.
     /// If no matching arrangement exists, creates a new entry with refcount 1
     /// and returns `(ArrangementId, true)` (newly created).
     pub async fn register_consumer(
@@ -80,8 +82,9 @@ impl ArrangementCatalog {
                 "Security policy digest mismatch for same ArrangementId"
             );
 
-            entry.consumer_count += 1;
-            entry.consumers.insert(view_id);
+            if entry.consumers.insert(view_id) {
+                entry.consumer_count += 1;
+            }
             entry.marked_for_reclamation = false;
             (id, false)
         } else {
@@ -111,8 +114,9 @@ impl ArrangementCatalog {
 
     /// Deregister a view/consumer from an arrangement.
     ///
-    /// Decrements the reference count. When the reference count reaches 0,
-    /// marks the arrangement for deferred reclamation.
+    /// Decrements the reference count for a registered view. Removing an
+    /// unknown view is a no-op. When the reference count reaches 0, marks the
+    /// arrangement for deferred reclamation.
     pub async fn deregister_consumer(
         &self,
         view_id: ViewId,
@@ -123,10 +127,10 @@ impl ArrangementCatalog {
             StorageError::InvalidKey(format!("Arrangement {} not found in catalog", id))
         })?;
 
-        entry.consumers.remove(&view_id);
-        if entry.consumer_count > 0 {
-            entry.consumer_count -= 1;
+        if !entry.consumers.remove(&view_id) {
+            return Ok(false);
         }
+        entry.consumer_count -= 1;
 
         if entry.consumer_count == 0 {
             entry.marked_for_reclamation = true;
@@ -155,7 +159,13 @@ impl ArrangementCatalog {
         for (id, entry) in guard.arrangements.iter() {
             if entry.consumer_count == 0
                 && entry.marked_for_reclamation
-                && entry.compaction_frontier >= safe_horizon
+                && persistence::compaction_is_eligible(
+                    entry.compaction_frontier,
+                    safe_horizon,
+                    safe_horizon,
+                    false,
+                    false,
+                )
             {
                 assert!(
                     entry.consumer_count == 0 && entry.marked_for_reclamation,

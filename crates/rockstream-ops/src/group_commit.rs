@@ -40,6 +40,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use rockstream_storage::{ShardDb, WriteBatch};
+use rockstream_verified::persistence;
 
 use crate::error::OpError;
 
@@ -226,6 +227,7 @@ pub struct PhysicalCommitGroup {
     flush_lock: Arc<tokio::sync::Mutex<()>>,
     notify: Arc<tokio::sync::Notify>,
     timer_started: Arc<AtomicBool>,
+    outcome_unknown: Arc<AtomicBool>,
 }
 
 impl PhysicalCommitGroup {
@@ -258,6 +260,7 @@ impl PhysicalCommitGroup {
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             notify: Arc::new(tokio::sync::Notify::new()),
             timer_started: Arc::new(AtomicBool::new(false)),
+            outcome_unknown: Arc::new(AtomicBool::new(false)),
         };
         group.ensure_timer_running();
         group
@@ -286,6 +289,11 @@ impl PhysicalCommitGroup {
         self.last_committed.load(Ordering::Acquire)
     }
 
+    /// Whether a write succeeded but its flush outcome is unresolved.
+    pub fn outcome_unknown(&self) -> bool {
+        self.outcome_unknown.load(Ordering::Acquire)
+    }
+
     fn ensure_timer_running(&self) {
         if self
             .timer_started
@@ -302,6 +310,7 @@ impl PhysicalCommitGroup {
                 let pending_bytes = self.pending_bytes.clone();
                 let active_waiters = self.active_waiters.clone();
                 let flush_lock = self.flush_lock.clone();
+                let outcome_unknown = self.outcome_unknown.clone();
 
                 handle.spawn(async move {
                     loop {
@@ -328,6 +337,7 @@ impl PhysicalCommitGroup {
                                 &has_committed,
                                 &active_waiters,
                                 &flush_lock,
+                                &outcome_unknown,
                             )
                             .await;
                         } else {
@@ -342,6 +352,7 @@ impl PhysicalCommitGroup {
                                         &has_committed,
                                         &active_waiters,
                                         &flush_lock,
+                                        &outcome_unknown,
                                     )
                                     .await;
                                 }
@@ -361,6 +372,11 @@ impl PhysicalCommitGroup {
         batch: WriteBatch,
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), OpError>>>,
     ) -> Result<bool, OpError> {
+        if self.outcome_unknown.load(Ordering::Acquire) {
+            return Err(OpError::internal(
+                "durable commit outcome is unknown; recover before adding another epoch",
+            ));
+        }
         let last_committed = self.last_committed();
         let batch_bytes = batch.byte_size();
         let should_flush_immediately;
@@ -432,10 +448,12 @@ impl PhysicalCommitGroup {
             &self.has_committed,
             &self.active_waiters,
             &self.flush_lock,
+            &self.outcome_unknown,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn do_flush(
         db: &Arc<ShardDb>,
         pending: &Arc<Mutex<BTreeMap<rockstream_types::timestamp::Epoch, PendingEpochEntry>>>,
@@ -444,8 +462,35 @@ impl PhysicalCommitGroup {
         has_committed: &Arc<AtomicBool>,
         active_waiters: &Arc<AtomicUsize>,
         flush_lock: &Arc<tokio::sync::Mutex<()>>,
+        outcome_unknown: &Arc<AtomicBool>,
     ) -> Result<Vec<rockstream_types::timestamp::Epoch>, OpError> {
         let _guard = flush_lock.lock().await;
+
+        if outcome_unknown.load(Ordering::Acquire) {
+            if let Err(error) = db.flush().await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                return Err(OpError::storage(error));
+            }
+            let (entries, epochs) = {
+                let mut lock = pending.lock().expect("PhysicalCommitGroup mutex poisoned");
+                let epochs = lock.keys().copied().collect::<Vec<_>>();
+                let entries = std::mem::take(&mut *lock);
+                pending_bytes.store(0, Ordering::SeqCst);
+                (entries, epochs)
+            };
+            if let Some(last) = epochs.last().copied() {
+                last_committed.store(last, Ordering::Release);
+                has_committed.store(true, Ordering::Release);
+            }
+            outcome_unknown.store(false, Ordering::Release);
+            for (_, mut entry) in entries {
+                for waiter in entry.waiters.drain(..) {
+                    active_waiters.fetch_sub(1, Ordering::SeqCst);
+                    let _ = waiter.send(Ok(()));
+                }
+            }
+            return Ok(epochs);
+        }
 
         let (entries, merged) = {
             let mut lock = pending.lock().expect("PhysicalCommitGroup mutex poisoned");
@@ -512,6 +557,9 @@ impl PhysicalCommitGroup {
         }
 
         if let Some(error) = flush_err {
+            if persistence::commit_outcome(true, false) == persistence::COMMIT_UNKNOWN {
+                outcome_unknown.store(true, Ordering::Release);
+            }
             Self::restore_pending_static(pending, pending_bytes, active_waiters, entries, &error);
             return Err(error);
         }

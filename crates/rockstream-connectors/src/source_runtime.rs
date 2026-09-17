@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use rockstream_storage::WriteBatch;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
+use rockstream_verified::persistence;
 
 use crate::source_connector::{PollDeltaResult, SnapshotStream, SourceConnector, SourceError};
 use crate::source_epoch::SnapshotDeltaFence;
@@ -113,7 +114,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
 
     /// The next source epoch that can be committed under the active lease.
     pub fn next_epoch(&self) -> Result<Epoch, SourceError> {
-        self.source_epochs.current_epoch().checked_add(1).ok_or_else(|| {
+        persistence::next_epoch(self.source_epochs.current_epoch()).ok_or_else(|| {
             SourceError::Io(
                 "RS-4018: source epoch exhausted; next_steps: create a new connector before retrying"
                     .to_string(),
@@ -250,10 +251,16 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
                 "RS-4014: source_runtime_in_flight_epochs reached SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS; next steps: wait for upstream acknowledgements before polling more input",
             );
         }
-        let Some(next_epoch) = self.source_epochs.current_epoch().checked_add(1) else {
+        let Some(next_epoch) = persistence::next_epoch(self.source_epochs.current_epoch()) else {
             return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying");
         };
-        if epoch < next_epoch {
+        if !persistence::epoch_is_admissible(
+            self.source_epochs.current_epoch(),
+            epoch,
+            false,
+            true,
+            false,
+        ) {
             return self.block(&format!(
                 "RS-4015: source epoch {epoch} is not the next fenced epoch {}; next steps: recover the committed checkpoint and retry",
                 next_epoch
@@ -328,10 +335,16 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
                 "RS-4014: source_runtime_in_flight_epochs reached SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS; next_steps: wait for upstream acknowledgements before polling more input",
             );
         }
-        let Some(next_epoch) = self.source_epochs.current_epoch().checked_add(1) else {
+        let Some(next_epoch) = persistence::next_epoch(self.source_epochs.current_epoch()) else {
             return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying");
         };
-        if epoch < next_epoch {
+        if !persistence::epoch_is_admissible(
+            self.source_epochs.current_epoch(),
+            epoch,
+            false,
+            true,
+            false,
+        ) {
             return self.block(&format!(
                 "RS-4015: source epoch {epoch} is not the next fenced epoch {}; next steps: recover the committed checkpoint and retry",
                 next_epoch

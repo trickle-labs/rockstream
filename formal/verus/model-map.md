@@ -45,3 +45,14 @@ generation and incarnation admission.
 | `crates/rockstream-verified/src/frontier.rs::fixed_membership_transition` | A fixed-membership report transition never lowers the admitted epoch. | The control adapter computes the meet only across the configured active set and treats missing reports as no completeness. |
 | `crates/rockstream-verified/src/frontier.rs::activation_preserves_publication` | A new member's durable bootstrap is at least the currently published frontier, or no publication exists. | Membership activation/replacement supplies the durable catch-up evidence and rejects generation overflow. |
 | `crates/rockstream-verified/src/frontier.rs::completes_before` | Frontier `F` completes epochs strictly less than `F`. | Reporters, readers, and cleanup consumers use the exclusive comparison. |
+
+VS5 covers the local persistence decisions at the storage boundary. The
+FizzBee M1/M3/M4/M6 models remain bounded protocol and failure references; they
+do not establish refinement of SlateDB or ObjectStore implementations.
+
+| Production code | Verus contract | Caller obligation |
+|---|---|---|
+| `crates/rockstream-verified/src/persistence.rs::{epoch_is_admissible,next_epoch}` | Valid authority admits only a newer epoch; consecutive and gapped source/shard sequences reject duplicates and exhaustion. | Source epoch registries validate identity and persist the entry before advancing in-memory state. |
+| `crates/rockstream-verified/src/persistence.rs::{commit_outcome,coupled_commit_is_durable}` | State, outputs, source markers, and frontier are authoritative only after one successful write and flush; write-success/flush-failure remains unknown. | `SourceCheckpointStore` and group commit keep acknowledgements/frontiers closed until the durable boundary succeeds. |
+| `crates/rockstream-verified/src/persistence.rs::{replay_decision,recovery_scan_status,recovery_is_ready}` | Prepared/invalid records do not advance replay; duplicates are no-ops; bounded scans distinguish completion, quota, cancellation, corruption, and continuation; readiness requires complete restored state. | Storage scans continue with progress, reject incomplete metadata, and recover the highest valid committed record. |
+| `crates/rockstream-verified/src/persistence.rs::compaction_is_eligible` | Reclamation requires both reader and replay horizons and excludes retained snapshots/in-flight deltas. | Arrangement/catalog adapters supply the real horizons and storage-specific snapshot/lease evidence. |

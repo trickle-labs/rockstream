@@ -566,3 +566,89 @@ evidence = [
     "cargo test --locked -p rockstream-control --lib frontier::tests",
     "cargo test --locked -p rockstream-types --lib frontier",
 ]
+
+[[claims]]
+id = "VS5-01"
+status = "adapter-qualified"
+domain = "A logical commit is authoritative only after the complete batch succeeds at the write and flush boundary; a write-success/flush-failure result is unknown."
+assumptions = ["SlateDB and ObjectStore provide the documented atomic write, flush, and ambiguous-I/O behavior; cross-process fencing remains an adapter responsibility."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::commit_outcome"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::commit_outcome"]
+production_callers = ["crates/rockstream-connectors/src/source_epoch.rs::commit_m3", "crates/rockstream-ops/src/group_commit.rs::do_flush"]
+regression_tests = ["crates/rockstream-verified/src/lib.rs::vs5_kernels_reject_replay_and_protect_boundaries"]
+evidence = [
+    "docs/adr/0006-persistence-replay-compaction.md",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-connectors --lib source_epoch",
+]
+
+[[claims]]
+id = "VS5-02"
+status = "adapter-qualified"
+domain = "Source epochs are consecutive or globally allocated and strictly increasing; authority and duplicate checks reject a second logical application and numeric exhaustion."
+assumptions = ["The source/shard caller supplies the identity and scope checks represented by the kernel booleans."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::next_epoch", "crates/rockstream-verified/src/persistence.rs::epoch_is_admissible", "crates/rockstream-verified/src/persistence.rs::replay_decision"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::next_epoch", "crates/rockstream-verified/src/persistence.rs::epoch_is_admissible"]
+production_callers = ["crates/rockstream-connectors/src/source_epoch.rs::prepare_commit", "crates/rockstream-connectors/src/source_epoch.rs::prepare_commit_at", "crates/rockstream-connectors/src/source_epoch.rs::commit_epoch_monotonic", "crates/rockstream-connectors/src/source_runtime.rs::next_epoch", "crates/rockstream-connectors/src/source_runtime.rs::commit_epoch", "crates/rockstream-connectors/src/source_runtime.rs::commit_backfill_epoch"]
+regression_tests = ["crates/rockstream-connectors/src/source_epoch.rs::epoch_exhaustion_returns_rs4018_without_wrapping", "crates/rockstream-verified/src/lib.rs::vs5_kernels_reject_replay_and_protect_boundaries"]
+evidence = [
+    "cargo test --locked -p rockstream-connectors --lib source_epoch",
+    "cargo test --locked -p rockstream-verified --lib",
+]
+
+[[claims]]
+id = "VS5-03"
+status = "adapter-qualified"
+domain = "State, outputs, source markers, and frontier progress share one durable write/flush boundary before acknowledgement or in-memory advancement."
+assumptions = ["The caller constructs the single batch with all required categories; storage flush success means the batch is durable under the selected backend contract."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::coupled_commit_is_durable", "crates/rockstream-connectors/src/source_epoch.rs::commit_m3"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::coupled_commit_is_durable"]
+production_callers = ["crates/rockstream-connectors/src/source_runtime.rs::commit_epoch", "crates/rockstream-connectors/src/source_epoch.rs::commit_m3"]
+regression_tests = ["crates/rockstream-ops/tests/group_commit_timer_tests.rs::test_flush_failure_withholds_acknowledgment", "crates/rockstream-ops/tests/group_commit_durability_lfs_tests.rs::test_group_commit_lfs_multi_epoch_durability"]
+evidence = [
+    "docs/adr/0006-persistence-replay-compaction.md",
+    "cargo test --locked -p rockstream-ops --lib group_commit",
+    "cargo test --locked -p rockstream-connectors --lib source_epoch",
+]
+
+[[claims]]
+id = "VS5-04"
+status = "adapter-qualified"
+domain = "Replay distinguishes completed scans from quota, cancellation, corruption, and continuation; recovery readiness requires complete restored state and matching metadata."
+assumptions = ["The storage adapter reports scan and object-store failures without converting them into successful empty pages."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::recovery_scan_status", "crates/rockstream-verified/src/persistence.rs::recovery_is_ready"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::recovery_scan_status", "crates/rockstream-verified/src/persistence.rs::recovery_is_ready"]
+production_callers = ["crates/rockstream-storage/src/catalog/log.rs::scan_page", "crates/rockstream-runtime/src/recovery.rs::is_ready"]
+regression_tests = ["crates/rockstream-storage/tests/catalog_storage_tests.rs::test_zero_page_size_still_advances_replay_cursor", "crates/rockstream-runtime/src/recovery.rs::ready_requires_complete_checkpoint"]
+evidence = [
+    "cargo test --locked -p rockstream-storage --test catalog_storage_tests",
+    "cargo test --locked -p rockstream-runtime --lib recovery",
+]
+
+[[claims]]
+id = "VS5-05"
+status = "adapter-qualified"
+domain = "Compaction is eligible only after the compaction frontier covers retained-reader and replay horizons and no retained snapshot or in-flight delta remains."
+assumptions = ["The arrangement/catalog adapter supplies conservative reader and replay horizons; external snapshot deletion remains a storage qualification obligation."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::compaction_is_eligible", "crates/rockstream-storage/src/arrangement_catalog.rs::reclaim_unreferenced_arrangements"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::compaction_is_eligible"]
+production_callers = ["crates/rockstream-storage/src/arrangement_catalog.rs::reclaim_unreferenced_arrangements"]
+regression_tests = ["crates/rockstream-storage/tests/arrangement_lifecycle_reclamation_tests.rs::test_duplicate_consumer_registration_and_drop_are_idempotent"]
+evidence = [
+    "cargo test --locked -p rockstream-storage --test arrangement_lifecycle_reclamation_tests",
+    "cargo test --locked -p rockstream-verified --lib",
+]
+
+[[claims]]
+id = "VS5-06"
+status = "adapter-qualified"
+domain = "A recovered shard cannot rejoin progress publication until its checkpoint metadata, fence, bounded scan, and restored state validate."
+assumptions = ["Process destruction, backend acknowledgement loss, and cross-process handoff are qualified by the LFS/MinIO and runtime release matrices."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::recovery_is_ready", "crates/rockstream-runtime/src/recovery.rs::recover_shard"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::recovery_is_ready"]
+production_callers = ["crates/rockstream-runtime/src/recovery.rs::is_ready"]
+regression_tests = ["crates/rockstream-runtime/src/recovery.rs::ready_requires_complete_checkpoint", "crates/rockstream-storage/tests/catalog_storage_tests.rs::test_interrupted_compaction_falls_back_safely"]
+evidence = [
+    "cargo test --locked -p rockstream-runtime --lib recovery",
+    "cargo test --locked -p rockstream-storage --test catalog_storage_tests",
+]
