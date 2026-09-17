@@ -87,6 +87,10 @@ fn hot_key_split_during_concurrent_migration_sim() {
         )
         .unwrap()
         .expect("expected hot-key split decision");
-    assert!(matches!(decision.plan, HotKeyMitigationPlan::Split { .. }));
+    assert!(matches!(
+        decision.plan,
+        HotKeyMitigationPlan::Spill { code, .. }
+            if code == rockstream_types::error_code::RS_5036
+    ));
     buggify_disable();
 }

@@ -6,8 +6,8 @@
 //! For each incoming row (k, v) with weight w:
 //!   1. Look up old state (sum, count) for group key k.
 //!   2. Compute new_sum = old_sum + v * w, new_count = old_count + w.
-//!   3. If old_count != 0 → retract: emit (k, old_sum, old_count, avg) with weight -1.
-//!   4. If new_count != 0 → insert:  emit (k, new_sum, new_count, avg) with weight +1.
+//!   3. If old_count > 0 → retract: emit (k, old_sum, old_count, avg) with weight -1.
+//!   4. If new_count > 0 → insert:  emit (k, new_sum, new_count, avg) with weight +1.
 //!   5. Update state: remove k if new_count == 0, else store (new_sum, new_count).
 //! ```
 //!
@@ -47,6 +47,10 @@ use rockstream_plan::virtual_bucket::{
 };
 use rockstream_storage::{ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::laws::arithmetic::{
+    checked_add_i64, checked_i128_to_i64, checked_mul_i64, decode_i64, decode_u64, encode_i64,
+    encode_u64,
+};
 use rockstream_types::laws::sum_count::avg_from_sum_count;
 
 use crate::error::OpError;
@@ -259,27 +263,23 @@ impl AggState {
         w: i64,
     ) -> Result<(Option<(i64, i64)>, Option<(i64, i64)>), OpError> {
         let (old_sum, old_count) = self.entries.get(&k).copied().unwrap_or((0, 0));
-        let old_state = if old_count != 0 {
+        let old_state = if old_count > 0 {
             Some((old_sum, old_count))
         } else {
             None
         };
 
         // Checked arithmetic for sum to detect overflow.
-        let new_sum = old_sum
-            .checked_add(
-                v.checked_mul(w)
-                    .ok_or_else(|| OpError::aggregate_overflow(k))?,
-            )
-            .ok_or_else(|| OpError::aggregate_overflow(k))?;
-        let new_count = old_count
-            .checked_add(w)
-            .ok_or_else(|| OpError::aggregate_overflow(k))?;
+        let contribution = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
+        let new_sum =
+            checked_add_i64(old_sum, contribution).map_err(|_| OpError::aggregate_overflow(k))?;
+        let new_count =
+            checked_add_i64(old_count, w).map_err(|_| OpError::aggregate_overflow(k))?;
         if new_count < 0 {
             return Err(OpError::invalid_multiplicity(k, new_count));
         }
 
-        let new_state = if new_count != 0 {
+        let new_state = if new_count > 0 {
             self.entries.insert(k, (new_sum, new_count));
             Some((new_sum, new_count))
         } else {
@@ -298,8 +298,8 @@ impl AggState {
         for (&k, &(sum, count)) in &self.entries {
             let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &k.to_be_bytes());
             let mut value = [0u8; 16];
-            value[..8].copy_from_slice(&sum.to_be_bytes());
-            value[8..].copy_from_slice(&count.to_be_bytes());
+            value[..8].copy_from_slice(&encode_i64(sum));
+            value[8..].copy_from_slice(&encode_i64(count));
             wb.put(&key, &value);
         }
         wb
@@ -317,8 +317,8 @@ impl AggState {
                 ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &k.to_be_bytes());
             if let Some(&(sum, count)) = self.entries.get(&k) {
                 let mut val = [0u8; 16];
-                val[..8].copy_from_slice(&sum.to_be_bytes());
-                val[8..].copy_from_slice(&count.to_be_bytes());
+                val[..8].copy_from_slice(&encode_i64(sum));
+                val[8..].copy_from_slice(&encode_i64(count));
                 mutations.push(rockstream_types::state_mutation::StateMutation::Put {
                     key: key_bytes,
                     value: bytes::Bytes::copy_from_slice(&val),
@@ -344,14 +344,14 @@ impl AggState {
         let mut state = AggState::new();
         for (key, value) in raw_entries {
             // Strip the operator prefix to get the group key bytes.
-            if key.len() < op_prefix.len() + 8 || !key.starts_with(&op_prefix) {
+            if key.len() != op_prefix.len() + 8 || !key.starts_with(&op_prefix) {
                 continue;
             }
             let k_bytes: [u8; 8] = match key[op_prefix.len()..op_prefix.len() + 8].try_into() {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            if value.len() < 16 {
+            if value.len() != 16 {
                 continue;
             }
             let sum_bytes: [u8; 8] = match value[..8].try_into() {
@@ -362,10 +362,19 @@ impl AggState {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let k = i64::from_be_bytes(k_bytes);
-            let sum = i64::from_be_bytes(sum_bytes);
-            let count = i64::from_be_bytes(count_bytes);
-            if count != 0 {
+            let k = match decode_i64(&k_bytes) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let sum = match decode_i64(&sum_bytes) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let count = match decode_i64(&count_bytes) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if count > 0 {
                 state.entries.insert(k, (sum, count));
             }
         }
@@ -439,17 +448,13 @@ impl StagedEpochAggregator {
         }
 
         // Per-row multiplication checked strictly upon ingestion
-        let prod = v
-            .checked_mul(w)
-            .ok_or_else(|| OpError::aggregate_overflow(k))?;
+        let prod = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
 
         if let Some((sum, count)) = self.entries.get_mut(&k) {
             *sum = sum
                 .checked_add(prod as i128)
                 .ok_or_else(|| OpError::aggregate_overflow(k))?;
-            *count = count
-                .checked_add(w)
-                .ok_or_else(|| OpError::aggregate_overflow(k))?;
+            *count = checked_add_i64(*count, w).map_err(|_| OpError::aggregate_overflow(k))?;
         } else {
             if self.entries.len() >= self.max_groups {
                 return Err(OpError::capacity_exceeded(
@@ -853,7 +858,7 @@ impl AggregateOp {
                         if arr.is_null(row) {
                             Ok(0)
                         } else {
-                            i64::try_from(arr.value(row)).map_err(|_| {
+                            checked_i128_to_i64(arr.value(row)).map_err(|_| {
                                 OpError::column_type_mismatch(
                                     "Decimal128 fitting Int64",
                                     "Decimal128",
@@ -989,9 +994,8 @@ impl AggregateOp {
                 continue;
             }
 
-            let new_count = old_count
-                .checked_add(delta_count)
-                .ok_or_else(|| OpError::aggregate_overflow(k))?;
+            let new_count = checked_add_i64(old_count, delta_count)
+                .map_err(|_| OpError::aggregate_overflow(k))?;
             if new_count < 0 {
                 return Err(OpError::invalid_multiplicity(k, new_count));
             }
@@ -1001,8 +1005,8 @@ impl AggregateOp {
                 let total_sum_128 = old_sum_128
                     .checked_add(delta_sum)
                     .ok_or_else(|| OpError::aggregate_overflow(k))?;
-                let new_sum =
-                    i64::try_from(total_sum_128).map_err(|_| OpError::aggregate_overflow(k))?;
+                let new_sum = checked_i128_to_i64(total_sum_128)
+                    .map_err(|_| OpError::aggregate_overflow(k))?;
                 Some((new_sum, new_count))
             } else {
                 None
@@ -1250,21 +1254,32 @@ impl BucketedAggregateOp {
             .lock()
             .expect("BucketedAggregateOp mutex poisoned");
         for (key, value) in &entries {
-            if key.len() < prefix.len() + 8 || !key.starts_with(&prefix) || value.len() < 16 {
+            if !key.starts_with(&prefix)
+                || (key.len() != prefix.len() + 8 && key.len() != prefix.len() + 10)
+                || value.len() != 16
+            {
                 continue;
             }
-            let Ok(group_key_bytes) = key[prefix.len()..prefix.len() + 8].try_into() else {
+            let Ok(group_key_bytes): Result<[u8; 8], _> =
+                key[prefix.len()..prefix.len() + 8].try_into()
+            else {
                 continue;
             };
-            let Ok(sum_bytes) = value[..8].try_into() else {
+            let Ok(sum_bytes): Result<[u8; 8], _> = value[..8].try_into() else {
                 continue;
             };
-            let Ok(count_bytes) = value[8..16].try_into() else {
+            let Ok(count_bytes): Result<[u8; 8], _> = value[8..16].try_into() else {
                 continue;
             };
-            let group_key = i64::from_be_bytes(group_key_bytes);
-            let sum = i64::from_be_bytes(sum_bytes);
-            let count = i64::from_be_bytes(count_bytes);
+            let Ok(group_key) = decode_i64(&group_key_bytes) else {
+                continue;
+            };
+            let Ok(sum) = decode_i64(&sum_bytes) else {
+                continue;
+            };
+            let Ok(count) = decode_i64(&count_bytes) else {
+                continue;
+            };
             if key.len() == prefix.len() + 10 {
                 let Ok(bucket_bytes) = key[prefix.len() + 8..prefix.len() + 10].try_into() else {
                     continue;
@@ -1278,13 +1293,23 @@ impl BucketedAggregateOp {
         for (&(group_key, _bucket), &(sum, count)) in partials.iter() {
             if let Some((combined_sum, combined_count)) = combined.get_mut(&group_key) {
                 if *combined_count == 0 {
-                    *combined_sum += sum;
-                    *combined_count += count;
+                    *combined_sum = checked_add_i64(*combined_sum, sum)
+                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                    *combined_count = checked_add_i64(*combined_count, count)
+                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                    if *combined_count < 0 {
+                        return Err(OpError::invalid_multiplicity(group_key, *combined_count));
+                    }
                 }
             } else {
                 let entry = combined.entry(group_key).or_insert((0, 0));
-                entry.0 += sum;
-                entry.1 += count;
+                entry.0 = checked_add_i64(entry.0, sum)
+                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                entry.1 = checked_add_i64(entry.1, count)
+                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                if entry.1 < 0 {
+                    return Err(OpError::invalid_multiplicity(group_key, entry.1));
+                }
             }
         }
         drop(partials);
@@ -1356,28 +1381,26 @@ impl Operator for BucketedAggregateOp {
             }
 
             let (old_sum, old_count) = combined.get(&k).copied().unwrap_or((0, 0));
-            let old_state = (old_count != 0).then_some((old_sum, old_count));
+            let old_state = (old_count > 0).then_some((old_sum, old_count));
 
-            let new_sum = old_sum
-                .checked_add(
-                    v.checked_mul(w)
-                        .ok_or_else(|| OpError::aggregate_overflow(k))?,
-                )
-                .ok_or_else(|| OpError::aggregate_overflow(k))?;
-            let new_count = old_count + w;
+            let contribution = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
+            let new_sum = checked_add_i64(old_sum, contribution)
+                .map_err(|_| OpError::aggregate_overflow(k))?;
+            let new_count =
+                checked_add_i64(old_count, w).map_err(|_| OpError::aggregate_overflow(k))?;
+            if new_count < 0 {
+                return Err(OpError::invalid_multiplicity(k, new_count));
+            }
 
             if k == self.hot_key && self.bucket_count > 1 {
                 let bucket = self.bucket_for(k, v);
                 let partial_key = (k, bucket);
                 let (partial_sum, partial_count) =
                     partials.get(&partial_key).copied().unwrap_or((0, 0));
-                let next_partial_sum = partial_sum
-                    .checked_add(
-                        v.checked_mul(w)
-                            .ok_or_else(|| OpError::aggregate_overflow(k))?,
-                    )
-                    .ok_or_else(|| OpError::aggregate_overflow(k))?;
-                let next_partial_count = partial_count + w;
+                let next_partial_sum = checked_add_i64(partial_sum, contribution)
+                    .map_err(|_| OpError::aggregate_overflow(k))?;
+                let next_partial_count = checked_add_i64(partial_count, w)
+                    .map_err(|_| OpError::aggregate_overflow(k))?;
                 if next_partial_count != 0 {
                     partials.insert(partial_key, (next_partial_sum, next_partial_count));
                 } else {
@@ -1385,7 +1408,7 @@ impl Operator for BucketedAggregateOp {
                 }
             }
 
-            let new_state = if new_count != 0 {
+            let new_state = if new_count > 0 {
                 combined.insert(k, (new_sum, new_count));
                 Some((new_sum, new_count))
             } else {
@@ -1454,7 +1477,7 @@ impl Operator for BucketedAggregateOp {
 /// Value: `epoch: u64` as 8 bytes big-endian.
 pub async fn persist_frontier(db: &ShardDb, epoch: u64) -> Result<(), OpError> {
     let key = ShardKeyEncoder::frontier_key();
-    let value = epoch.to_be_bytes();
+    let value = encode_u64(epoch);
     db.put(&key, &value).await.map_err(OpError::storage)
 }
 
@@ -1466,10 +1489,7 @@ pub async fn load_frontier(db: &ShardDb) -> Result<Option<u64>, OpError> {
     let raw = db.get(&key).await.map_err(OpError::storage)?;
     match raw {
         None => Ok(None),
-        Some(bytes) if bytes.len() == 8 => {
-            let epoch = u64::from_be_bytes(bytes[..8].try_into().unwrap());
-            Ok(Some(epoch))
-        }
+        Some(bytes) if bytes.len() == 8 => Ok(decode_u64(&bytes).ok()),
         Some(_) => Ok(None), // malformed — treat as absent
     }
 }
@@ -1557,14 +1577,14 @@ pub async fn persist_bucketed_agg_state(
 
         for (&k, &(sum, count)) in combined.iter() {
             let mut value = [0u8; 16];
-            value[..8].copy_from_slice(&sum.to_be_bytes());
-            value[8..].copy_from_slice(&count.to_be_bytes());
+            value[..8].copy_from_slice(&encode_i64(sum));
+            value[8..].copy_from_slice(&encode_i64(count));
             wb.put(&bucketed_combined_key(op.op_id, k), &value);
         }
         for (&(k, bucket), &(sum, count)) in partials.iter() {
             let mut value = [0u8; 16];
-            value[..8].copy_from_slice(&sum.to_be_bytes());
-            value[8..].copy_from_slice(&count.to_be_bytes());
+            value[..8].copy_from_slice(&encode_i64(sum));
+            value[8..].copy_from_slice(&encode_i64(count));
             wb.put(&bucketed_partial_key(op.op_id, k, bucket), &value);
         }
         wb

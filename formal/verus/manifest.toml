@@ -13,3 +13,141 @@ evidence = [
     "cargo verus verify -p rockstream-verified --locked",
     "cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests",
 ]
+
+[[claims]]
+id = "VS1-02"
+status = "kernel-verified"
+domain = "Checked i64/u64 arithmetic and exact-width big-endian scalar decoding."
+assumptions = ["Rust primitive integer semantics and the pinned Verus/vstd specifications."]
+implementation = [
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_add",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_mul",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_u64_add",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_neg",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i128_to_i64",
+    "crates/rockstream-verified/src/arithmetic.rs::decode_i64",
+    "crates/rockstream-verified/src/arithmetic.rs::decode_u64",
+]
+theorems = [
+    "crates/rockstream-types/src/laws/arithmetic.rs::checked_add_i64",
+    "crates/rockstream-types/src/laws/arithmetic.rs::checked_mul_i64",
+    "crates/rockstream-types/src/laws/arithmetic.rs::checked_i128_to_i64",
+]
+production_callers = [
+    "crates/rockstream-types/src/laws/weight_add.rs::merge",
+    "crates/rockstream-types/src/laws/sum_count.rs::merge",
+    "crates/rockstream-storage/src/merge_registry.rs::merge",
+    "crates/rockstream-ops/src/aggregate.rs::apply_delta",
+]
+regression_tests = [
+    "crates/rockstream-types/src/laws/arithmetic.rs::checked_arithmetic_has_exact_i64_boundaries",
+    "crates/rockstream-types/src/laws/arithmetic.rs::fixed_width_codecs_reject_truncation_and_trailing_bytes",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-types laws::arithmetic --lib",
+    "cargo test --locked -p rockstream-storage merge_registry --lib",
+]
+
+[[claims]]
+id = "VS1-03"
+status = "adapter-qualified"
+domain = "WeightAdd and SumCount mathematical laws over their checked i64 representation; regrouping requires an absolute-sum admission."
+assumptions = ["The law descriptor is consumed only after its executable domain and evidence reference are inspected."]
+implementation = [
+    "crates/rockstream-types/src/laws/weight_add.rs::inverse",
+    "crates/rockstream-types/src/laws/sum_count.rs::inverse",
+    "crates/rockstream-types/src/merge_law.rs::can_reassociate",
+]
+theorems = [
+    "crates/rockstream-verified/src/laws.rs::i64_add_identity",
+    "crates/rockstream-verified/src/laws.rs::i64_add_commutative",
+    "crates/rockstream-verified/src/laws.rs::i64_add_associative",
+    "crates/rockstream-verified/src/laws.rs::i64_add_inverse",
+    "crates/rockstream-types/src/laws/arithmetic.rs::admit_i64_reassociation",
+]
+production_callers = [
+    "crates/rockstream-control/src/skew.rs::plan_hot_key_mitigation",
+    "crates/rockstream-types/src/laws/registry.rs::descriptors",
+]
+regression_tests = [
+    "crates/rockstream-types/tests/merge_law_composable_flag_tests.rs::registered_laws_expose_expected_composable_flags",
+]
+evidence = [
+    "cargo test --locked -p rockstream-types --tests",
+    "cargo test --locked -p rockstream-control --test hot_key_planning_tests --test skew_split_control_tests",
+]
+
+[[claims]]
+id = "VS1-04"
+status = "adapter-qualified"
+domain = "Existing tagged storage formats: one tag byte followed by exactly 8 or 16 payload bytes."
+assumptions = ["Persisted tags remain the existing external format; no unversioned migration is performed."]
+implementation = [
+    "crates/rockstream-storage/src/merge_registry.rs::merge",
+    "crates/rockstream-storage/src/merge_registry.rs::validate_operand",
+]
+theorems = [
+    "crates/rockstream-types/src/laws/weight_add.rs::merge",
+    "crates/rockstream-types/src/laws/sum_count.rs::merge",
+]
+production_callers = [
+    "crates/rockstream-storage/src/shard_db.rs::merge",
+    "crates/rockstream-storage/src/shard_db.rs::get_merged",
+]
+regression_tests = [
+    "crates/rockstream-storage/src/merge_registry.rs::malformed_first_operand_returns_error",
+    "crates/rockstream-storage/src/merge_registry.rs::trailing_bytes_are_rejected",
+]
+evidence = [
+    "cargo test --locked -p rockstream-storage merge_registry --lib",
+]
+
+[[claims]]
+id = "VS1-05"
+status = "adapter-qualified"
+domain = "Reordering is disabled unless a descriptor carries executable concrete-operand admission."
+assumptions = ["The spill fallback preserves single-shard merge semantics for unadmitted laws."]
+implementation = [
+    "crates/rockstream-types/src/merge_law.rs::can_reassociate",
+    "crates/rockstream-control/src/skew.rs::plan_hot_key_mitigation",
+]
+theorems = [
+    "crates/rockstream-types/src/laws/arithmetic.rs::admit_i64_reassociation",
+]
+production_callers = [
+    "crates/rockstream-control/src/skew.rs::observe",
+]
+regression_tests = [
+    "crates/rockstream-control/tests/hot_key_planning_tests.rs::composable_laws_without_operand_admission_use_spill_fallback",
+    "crates/rockstream-sim/tests/hot_key_detection_sim_tests.rs::hot_key_split_during_concurrent_migration_sim",
+]
+evidence = [
+    "cargo test --locked -p rockstream-control --test hot_key_planning_tests --test skew_split_control_tests",
+]
+
+[[claims]]
+id = "VS1-06"
+status = "adapter-qualified"
+domain = "Complete SumCount output requires an exact frontier; integer accumulator semantics are in scope, floating-point finalization is not."
+assumptions = ["SQL NULL and decimal boundary behavior is documented at the current public-query frontier."]
+implementation = [
+    "crates/rockstream-types/src/laws/sum_count.rs::frontier_policy",
+    "crates/rockstream-types/src/laws/sum_count.rs::avg_from_sum_count",
+]
+theorems = [
+    "crates/rockstream-types/src/laws/sum_count.rs::decode_sum_count",
+]
+production_callers = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta",
+    "crates/rockstream-types/src/frontier.rs::has_committed_through",
+]
+regression_tests = [
+    "crates/rockstream-types/src/laws/sum_count.rs::avg_undefined_when_count_zero",
+    "crates/rockstream-types/src/laws/sum_count.rs::properties_are_abelian_group",
+]
+evidence = [
+    "cargo test --locked -p rockstream-types laws::sum_count --lib",
+    "docs/adr/0004-merge-law-arithmetic.md",
+    "docs/ivm-operators.md",
+]
