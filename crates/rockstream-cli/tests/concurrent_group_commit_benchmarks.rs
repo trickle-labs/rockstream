@@ -214,6 +214,10 @@ async fn bench_one_view_sustained_load() {
 /// Profile: 20 independent views on single table, 1 op / 50ms spacing.
 /// Targets: flushes/epoch <= 1.0, Commit p99 <= 30ms, Read p99 <= 10ms, Freshness p99 <= 40ms.
 #[tokio::test]
+#[cfg_attr(
+    coverage,
+    ignore = "timing thresholds are not meaningful under coverage instrumentation"
+)]
 async fn bench_twenty_views_light_load() {
     let mut graph = ViewDependencyGraph::new();
     let num_views = 20;
