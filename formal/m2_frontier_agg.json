@@ -6,18 +6,18 @@
       "column": 1
     },
     "end": {
-      "line": 143
+      "line": 191
     }
   },
   "invariants": [
     {
       "sourceInfo": {
         "start": {
-          "line": 118,
+          "line": 140,
           "column": 1
         },
         "end": {
-          "line": 121
+          "line": 146
         }
       },
       "name": "M2_S1_MeetCorrectness",
@@ -27,11 +27,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 119,
+            "line": 141,
             "column": 5
           },
           "end": {
-            "line": 121
+            "line": 146
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -39,52 +39,52 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 119,
+                "line": 141,
                 "column": 5
               },
               "end": {
-                "line": 121
+                "line": 146
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 119,
+                  "line": 141,
                   "column": 5
                 },
                 "end": {
-                  "line": 119,
-                  "column": 99
+                  "line": 144,
+                  "column": 5
                 }
               },
-              "pyExpr": "vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)",
+              "pyExpr": "vector_ge(\n        active_vector_meet(active_members, [shards[0].frontier, shards[1].frontier]),\n        store.published_frontier,\n    )",
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 119,
+                    "line": 141,
                     "column": 12
                   },
                   "end": {
-                    "line": 119,
-                    "column": 99
+                    "line": 144,
+                    "column": 5
                   }
                 },
-                "pyExpr": "vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)"
+                "pyExpr": "vector_ge(\n        active_vector_meet(active_members, [shards[0].frontier, shards[1].frontier]),\n        store.published_frontier,\n    )"
               }
             }
           }
         ]
       },
-      "pyCode": "def M2_S1_MeetCorrectness():\n    return vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)\n\n"
+      "pyCode": "def M2_S1_MeetCorrectness():\n    return vector_ge(\n        active_vector_meet(active_members, [shards[0].frontier, shards[1].frontier]),\n        store.published_frontier,\n    )\n\n"
     },
     {
       "sourceInfo": {
         "start": {
-          "line": 121,
+          "line": 146,
           "column": 1
         },
         "end": {
-          "line": 124
+          "line": 152
         }
       },
       "name": "M2_S2_PessimisticStaleness",
@@ -94,11 +94,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 122,
+            "line": 147,
             "column": 5
           },
           "end": {
-            "line": 124
+            "line": 152
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -106,52 +106,186 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 122,
+                "line": 147,
                 "column": 5
               },
               "end": {
-                "line": 124
+                "line": 152
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 122,
+                  "line": 147,
                   "column": 5
                 },
                 "end": {
-                  "line": 122,
-                  "column": 99
+                  "line": 150,
+                  "column": 5
                 }
               },
-              "pyExpr": "vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)",
+              "pyExpr": "vector_ge(\n        active_vector_meet(active_members, [shards[0].frontier, shards[1].frontier]),\n        store.published_frontier,\n    )",
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 122,
+                    "line": 147,
                     "column": 12
                   },
                   "end": {
-                    "line": 122,
-                    "column": 99
+                    "line": 150,
+                    "column": 5
                   }
                 },
-                "pyExpr": "vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)"
+                "pyExpr": "vector_ge(\n        active_vector_meet(active_members, [shards[0].frontier, shards[1].frontier]),\n        store.published_frontier,\n    )"
               }
             }
           }
         ]
       },
-      "pyCode": "def M2_S2_PessimisticStaleness():\n    return vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)\n\n"
+      "pyCode": "def M2_S2_PessimisticStaleness():\n    return vector_ge(\n        active_vector_meet(active_members, [shards[0].frontier, shards[1].frontier]),\n        store.published_frontier,\n    )\n\n"
     },
     {
       "sourceInfo": {
         "start": {
-          "line": 124,
+          "line": 152,
           "column": 1
         },
         "end": {
-          "line": 131
+          "line": 158
+        }
+      },
+      "name": "M2_S8_ConfigurationScopedSafety",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 153,
+            "column": 5
+          },
+          "end": {
+            "line": 158
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 153,
+                "column": 5
+              },
+              "end": {
+                "line": 158
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 153,
+                  "column": 5
+                },
+                "end": {
+                  "line": 156,
+                  "column": 5
+                }
+              },
+              "pyExpr": "(not active_members[0] and not active_members[1]) or vector_ge(\n        active_vector_meet(active_members, [shards[0].frontier, shards[1].frontier]),\n        store.published_frontier,\n    )",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 153,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 156,
+                    "column": 5
+                  }
+                },
+                "pyExpr": "(not active_members[0] and not active_members[1]) or vector_ge(\n        active_vector_meet(active_members, [shards[0].frontier, shards[1].frontier]),\n        store.published_frontier,\n    )"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M2_S8_ConfigurationScopedSafety():\n    return (not active_members[0] and not active_members[1]) or vector_ge(\n        active_vector_meet(active_members, [shards[0].frontier, shards[1].frontier]),\n        store.published_frontier,\n    )\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 158,
+          "column": 1
+        },
+        "end": {
+          "line": 161
+        }
+      },
+      "name": "M2_S9_EmptyMembershipPublishesNoCompleteness",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 159,
+            "column": 5
+          },
+          "end": {
+            "line": 161
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 159,
+                "column": 5
+              },
+              "end": {
+                "line": 161
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 159,
+                  "column": 5
+                },
+                "end": {
+                  "line": 159,
+                  "column": 89
+                }
+              },
+              "pyExpr": "(active_members[0] or active_members[1]) or store.published_frontier == [0, 0]",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 159,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 159,
+                    "column": 89
+                  }
+                },
+                "pyExpr": "(active_members[0] or active_members[1]) or store.published_frontier == [0, 0]"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M2_S9_EmptyMembershipPublishesNoCompleteness():\n    return (active_members[0] or active_members[1]) or store.published_frontier == [0, 0]\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 161,
+          "column": 1
+        },
+        "end": {
+          "line": 168
         }
       },
       "name": "M2_S3_SinglePublisherSafety",
@@ -161,11 +295,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 125,
+            "line": 162,
             "column": 5
           },
           "end": {
-            "line": 131
+            "line": 168
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -173,22 +307,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 125,
+                "line": 162,
                 "column": 5
               },
               "end": {
-                "line": 126,
+                "line": 163,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 125,
+                  "line": 162,
                   "column": 5
                 },
                 "end": {
-                  "line": 125,
+                  "line": 162,
                   "column": 25
                 }
               },
@@ -198,22 +332,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 126,
+                "line": 163,
                 "column": 5
               },
               "end": {
-                "line": 129,
+                "line": 166,
                 "column": 4
               }
             },
             "forStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 126,
+                  "line": 163,
                   "column": 5
                 },
                 "end": {
-                  "line": 129,
+                  "line": 166,
                   "column": 4
                 }
               },
@@ -224,11 +358,11 @@
               "block": {
                 "sourceInfo": {
                   "start": {
-                    "line": 127,
+                    "line": 164,
                     "column": 9
                   },
                   "end": {
-                    "line": 129,
+                    "line": 166,
                     "column": 4
                   }
                 },
@@ -236,22 +370,22 @@
                   {
                     "sourceInfo": {
                       "start": {
-                        "line": 127,
+                        "line": 164,
                         "column": 9
                       },
                       "end": {
-                        "line": 129,
+                        "line": 166,
                         "column": 4
                       }
                     },
                     "ifStmt": {
                       "sourceInfo": {
                         "start": {
-                          "line": 127,
+                          "line": 164,
                           "column": 9
                         },
                         "end": {
-                          "line": 129,
+                          "line": 166,
                           "column": 4
                         }
                       },
@@ -259,11 +393,11 @@
                         {
                           "sourceInfo": {
                             "start": {
-                              "line": 127,
+                              "line": 164,
                               "column": 12
                             },
                             "end": {
-                              "line": 129,
+                              "line": 166,
                               "column": 4
                             }
                           },
@@ -271,11 +405,11 @@
                           "block": {
                             "sourceInfo": {
                               "start": {
-                                "line": 128,
+                                "line": 165,
                                 "column": 13
                               },
                               "end": {
-                                "line": 129,
+                                "line": 166,
                                 "column": 4
                               }
                             },
@@ -283,22 +417,22 @@
                               {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 128,
+                                    "line": 165,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 129,
+                                    "line": 166,
                                     "column": 4
                                   }
                                 },
                                 "pyStmt": {
                                   "sourceInfo": {
                                     "start": {
-                                      "line": 128,
+                                      "line": 165,
                                       "column": 13
                                     },
                                     "end": {
-                                      "line": 128,
+                                      "line": 165,
                                       "column": 53
                                     }
                                   },
@@ -310,11 +444,11 @@
                           "conditionExpr": {
                             "sourceInfo": {
                               "start": {
-                                "line": 127,
+                                "line": 164,
                                 "column": 12
                               },
                               "end": {
-                                "line": 127,
+                                "line": 164,
                                 "column": 68
                               }
                             },
@@ -329,11 +463,11 @@
               "iterExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 126,
+                    "line": 163,
                     "column": 16
                   },
                   "end": {
-                    "line": 126,
+                    "line": 163,
                     "column": 26
                   }
                 },
@@ -344,21 +478,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 129,
+                "line": 166,
                 "column": 5
               },
               "end": {
-                "line": 131
+                "line": 168
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 129,
+                  "line": 166,
                   "column": 5
                 },
                 "end": {
-                  "line": 129,
+                  "line": 166,
                   "column": 33
                 }
               },
@@ -366,11 +500,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 129,
+                    "line": 166,
                     "column": 12
                   },
                   "end": {
-                    "line": 129,
+                    "line": 166,
                     "column": 33
                   }
                 },
@@ -385,11 +519,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 131,
+          "line": 168,
           "column": 1
         },
         "end": {
-          "line": 134
+          "line": 171
         }
       },
       "name": "M2_S4_StaleWriteRejection",
@@ -399,11 +533,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 132,
+            "line": 169,
             "column": 5
           },
           "end": {
-            "line": 134
+            "line": 171
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -411,21 +545,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 132,
+                "line": 169,
                 "column": 5
               },
               "end": {
-                "line": 134
+                "line": 171
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 132,
+                  "line": 169,
                   "column": 5
                 },
                 "end": {
-                  "line": 132,
+                  "line": 169,
                   "column": 70
                 }
               },
@@ -433,11 +567,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 132,
+                    "line": 169,
                     "column": 12
                   },
                   "end": {
-                    "line": 132,
+                    "line": 169,
                     "column": 70
                   }
                 },
@@ -452,11 +586,212 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 134,
+          "line": 171,
           "column": 1
         },
         "end": {
-          "line": 137
+          "line": 174
+        }
+      },
+      "name": "M2_S5_SlowestConsumerCompactionSafety",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 172,
+            "column": 5
+          },
+          "end": {
+            "line": 174
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 172,
+                "column": 5
+              },
+              "end": {
+                "line": 174
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 172,
+                  "column": 5
+                },
+                "end": {
+                  "line": 172,
+                  "column": 54
+                }
+              },
+              "pyExpr": "vector_ge(store.published_frontier, [0, 0])",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 172,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 172,
+                    "column": 54
+                  }
+                },
+                "pyExpr": "vector_ge(store.published_frontier, [0, 0])"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M2_S5_SlowestConsumerCompactionSafety():\n    return vector_ge(store.published_frontier, [0, 0])\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 174,
+          "column": 1
+        },
+        "end": {
+          "line": 177
+        }
+      },
+      "name": "M2_S6_AttachFrontierCompleteness",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 175,
+            "column": 5
+          },
+          "end": {
+            "line": 177
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 175,
+                "column": 5
+              },
+              "end": {
+                "line": 177
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 175,
+                  "column": 5
+                },
+                "end": {
+                  "line": 175,
+                  "column": 54
+                }
+              },
+              "pyExpr": "vector_ge(store.published_frontier, [0, 0])",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 175,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 175,
+                    "column": 54
+                  }
+                },
+                "pyExpr": "vector_ge(store.published_frontier, [0, 0])"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M2_S6_AttachFrontierCompleteness():\n    return vector_ge(store.published_frontier, [0, 0])\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 177,
+          "column": 1
+        },
+        "end": {
+          "line": 180
+        }
+      },
+      "name": "M2_S7_TraceReclamationSafety",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 178,
+            "column": 5
+          },
+          "end": {
+            "line": 180
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 178,
+                "column": 5
+              },
+              "end": {
+                "line": 180
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 178,
+                  "column": 5
+                },
+                "end": {
+                  "line": 178,
+                  "column": 54
+                }
+              },
+              "pyExpr": "vector_ge(store.published_frontier, [0, 0])",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 178,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 178,
+                    "column": 54
+                  }
+                },
+                "pyExpr": "vector_ge(store.published_frontier, [0, 0])"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M2_S7_TraceReclamationSafety():\n    return vector_ge(store.published_frontier, [0, 0])\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 180,
+          "column": 1
+        },
+        "end": {
+          "line": 183
         }
       },
       "name": "M2_L1_PublicationProgress",
@@ -467,11 +802,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 135,
+            "line": 181,
             "column": 5
           },
           "end": {
-            "line": 137
+            "line": 183
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -479,21 +814,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 135,
+                "line": 181,
                 "column": 5
               },
               "end": {
-                "line": 137
+                "line": 183
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 135,
+                  "line": 181,
                   "column": 5
                 },
                 "end": {
-                  "line": 135,
+                  "line": 181,
                   "column": 61
                 }
               },
@@ -501,11 +836,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 135,
+                    "line": 181,
                     "column": 12
                   },
                   "end": {
-                    "line": 135,
+                    "line": 181,
                     "column": 61
                   }
                 },
@@ -520,11 +855,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 137,
+          "line": 183,
           "column": 1
         },
         "end": {
-          "line": 140
+          "line": 186
         }
       },
       "name": "M2_L2_FailoverProgress",
@@ -535,11 +870,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 138,
+            "line": 184,
             "column": 5
           },
           "end": {
-            "line": 140
+            "line": 186
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -547,21 +882,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 138,
+                "line": 184,
                 "column": 5
               },
               "end": {
-                "line": 140
+                "line": 186
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 138,
+                  "line": 184,
                   "column": 5
                 },
                 "end": {
-                  "line": 138,
+                  "line": 184,
                   "column": 61
                 }
               },
@@ -569,11 +904,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 138,
+                    "line": 184,
                     "column": 12
                   },
                   "end": {
-                    "line": 138,
+                    "line": 184,
                     "column": 61
                   }
                 },
@@ -588,11 +923,79 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 140,
+          "line": 186,
           "column": 1
         },
         "end": {
-          "line": 143
+          "line": 189
+        }
+      },
+      "name": "M2_L3_ReclamationProgress",
+      "temporalOperators": [
+        "always",
+        "eventually"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 187,
+            "column": 5
+          },
+          "end": {
+            "line": 189
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 187,
+                "column": 5
+              },
+              "end": {
+                "line": 189
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 187,
+                  "column": 5
+                },
+                "end": {
+                  "line": 187,
+                  "column": 61
+                }
+              },
+              "pyExpr": "store.published_frontier == [MAX_EPOCH, MAX_EPOCH]",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 187,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 187,
+                    "column": 61
+                  }
+                },
+                "pyExpr": "store.published_frontier == [MAX_EPOCH, MAX_EPOCH]"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M2_L3_ReclamationProgress():\n    return store.published_frontier == [MAX_EPOCH, MAX_EPOCH]\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 189,
+          "column": 1
+        },
+        "end": {
+          "line": 191
         }
       },
       "name": "COV_M2",
@@ -602,11 +1005,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 141,
+            "line": 190,
             "column": 5
           },
           "end": {
-            "line": 143
+            "line": 191
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -614,21 +1017,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 141,
+                "line": 190,
                 "column": 5
               },
               "end": {
-                "line": 143
+                "line": 191
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 141,
+                  "line": 190,
                   "column": 5
                 },
                 "end": {
-                  "line": 141,
+                  "line": 190,
                   "column": 27
                 }
               },
@@ -636,11 +1039,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 141,
+                    "line": 190,
                     "column": 12
                   },
                   "end": {
-                    "line": 141,
+                    "line": 190,
                     "column": 27
                   }
                 },
@@ -650,18 +1053,18 @@
           }
         ]
       },
-      "pyCode": "def COV_M2():\n    return fencing_occurred\n\n"
+      "pyCode": "def COV_M2():\n    return fencing_occurred\n"
     }
   ],
   "actions": [
     {
       "sourceInfo": {
         "start": {
-          "line": 16,
+          "line": 25,
           "column": 1
         },
         "end": {
-          "line": 36
+          "line": 50
         }
       },
       "name": "Init",
@@ -672,11 +1075,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 17,
+            "line": 26,
             "column": 5
           },
           "end": {
-            "line": 36
+            "line": 50
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -684,22 +1087,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 17,
+                "line": 26,
                 "column": 5
               },
               "end": {
-                "line": 18,
+                "line": 27,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 17,
+                  "line": 26,
                   "column": 5
                 },
                 "end": {
-                  "line": 17,
+                  "line": 26,
                   "column": 37
                 }
               },
@@ -709,22 +1112,147 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 18,
+                "line": 27,
                 "column": 5
               },
               "end": {
-                "line": 21,
+                "line": 28,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 18,
+                  "line": 27,
                   "column": 5
                 },
                 "end": {
-                  "line": 18,
+                  "line": 27,
+                  "column": 32
+                }
+              },
+              "code": "message_generations = [0, 0]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 28,
+                "column": 5
+              },
+              "end": {
+                "line": 29,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 28,
+                  "column": 5
+                },
+                "end": {
+                  "line": 28,
+                  "column": 33
+                }
+              },
+              "code": "message_incarnations = [0, 0]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 29,
+                "column": 5
+              },
+              "end": {
+                "line": 30,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 29,
+                  "column": 5
+                },
+                "end": {
+                  "line": 29,
+                  "column": 33
+                }
+              },
+              "code": "active_members = [True, True]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 30,
+                "column": 5
+              },
+              "end": {
+                "line": 31,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 30,
+                  "column": 5
+                },
+                "end": {
+                  "line": 30,
+                  "column": 29
+                }
+              },
+              "code": "membership_generation = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 31,
+                "column": 5
+              },
+              "end": {
+                "line": 32,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 31,
+                  "column": 5
+                },
+                "end": {
+                  "line": 31,
+                  "column": 31
+                }
+              },
+              "code": "shard_incarnations = [0, 0]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 32,
+                "column": 5
+              },
+              "end": {
+                "line": 35,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 32,
+                  "column": 5
+                },
+                "end": {
+                  "line": 32,
                   "column": 21
                 }
               },
@@ -734,22 +1262,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 21,
+                "line": 35,
                 "column": 5
               },
               "end": {
-                "line": 22,
+                "line": 36,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 21,
+                  "line": 35,
                   "column": 5
                 },
                 "end": {
-                  "line": 21,
+                  "line": 35,
                   "column": 15
                 }
               },
@@ -759,22 +1287,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 22,
+                "line": 36,
                 "column": 5
               },
               "end": {
-                "line": 23,
+                "line": 37,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 22,
+                  "line": 36,
                   "column": 5
                 },
                 "end": {
-                  "line": 22,
+                  "line": 36,
                   "column": 30
                 }
               },
@@ -783,11 +1311,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 22,
+                      "line": 36,
                       "column": 19
                     },
                     "end": {
-                      "line": 22,
+                      "line": 36,
                       "column": 29
                     }
                   },
@@ -795,11 +1323,11 @@
                   "expr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 22,
+                        "line": 36,
                         "column": 19
                       },
                       "end": {
-                        "line": 22,
+                        "line": 36,
                         "column": 29
                       }
                     },
@@ -813,22 +1341,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 23,
+                "line": 37,
                 "column": 5
               },
               "end": {
-                "line": 25,
+                "line": 39,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 23,
+                  "line": 37,
                   "column": 5
                 },
                 "end": {
-                  "line": 23,
+                  "line": 37,
                   "column": 30
                 }
               },
@@ -837,11 +1365,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 23,
+                      "line": 37,
                       "column": 19
                     },
                     "end": {
-                      "line": 23,
+                      "line": 37,
                       "column": 29
                     }
                   },
@@ -849,11 +1377,11 @@
                   "expr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 23,
+                        "line": 37,
                         "column": 19
                       },
                       "end": {
-                        "line": 23,
+                        "line": 37,
                         "column": 29
                       }
                     },
@@ -867,22 +1395,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 25,
+                "line": 39,
                 "column": 5
               },
               "end": {
-                "line": 28,
+                "line": 42,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 25,
+                  "line": 39,
                   "column": 5
                 },
                 "end": {
-                  "line": 25,
+                  "line": 39,
                   "column": 25
                 }
               },
@@ -895,22 +1423,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 28,
+                "line": 42,
                 "column": 5
               },
               "end": {
-                "line": 29,
+                "line": 43,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 28,
+                  "line": 42,
                   "column": 5
                 },
                 "end": {
-                  "line": 28,
+                  "line": 42,
                   "column": 20
                 }
               },
@@ -920,22 +1448,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 29,
+                "line": 43,
                 "column": 5
               },
               "end": {
-                "line": 30,
+                "line": 44,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 29,
+                  "line": 43,
                   "column": 5
                 },
                 "end": {
-                  "line": 29,
+                  "line": 43,
                   "column": 48
                 }
               },
@@ -944,11 +1472,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 29,
+                      "line": 43,
                       "column": 24
                     },
                     "end": {
-                      "line": 29,
+                      "line": 43,
                       "column": 47
                     }
                   },
@@ -956,11 +1484,11 @@
                   "expr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 29,
+                        "line": 43,
                         "column": 24
                       },
                       "end": {
-                        "line": 29,
+                        "line": 43,
                         "column": 47
                       }
                     },
@@ -974,22 +1502,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 30,
+                "line": 44,
                 "column": 5
               },
               "end": {
-                "line": 32,
+                "line": 46,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 30,
+                  "line": 44,
                   "column": 5
                 },
                 "end": {
-                  "line": 30,
+                  "line": 44,
                   "column": 48
                 }
               },
@@ -998,11 +1526,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 30,
+                      "line": 44,
                       "column": 24
                     },
                     "end": {
-                      "line": 30,
+                      "line": 44,
                       "column": 47
                     }
                   },
@@ -1010,11 +1538,11 @@
                   "expr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 30,
+                        "line": 44,
                         "column": 24
                       },
                       "end": {
-                        "line": 30,
+                        "line": 44,
                         "column": 47
                       }
                     },
@@ -1028,22 +1556,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 32,
+                "line": 46,
                 "column": 5
               },
               "end": {
-                "line": 33,
+                "line": 47,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 32,
+                  "line": 46,
                   "column": 5
                 },
                 "end": {
-                  "line": 32,
+                  "line": 46,
                   "column": 35
                 }
               },
@@ -1053,22 +1581,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 33,
+                "line": 47,
                 "column": 5
               },
               "end": {
-                "line": 34,
+                "line": 48,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 33,
+                  "line": 47,
                   "column": 5
                 },
                 "end": {
-                  "line": 33,
+                  "line": 47,
                   "column": 28
                 }
               },
@@ -1078,21 +1606,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 34,
+                "line": 48,
                 "column": 5
               },
               "end": {
-                "line": 36
+                "line": 50
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 34,
+                  "line": 48,
                   "column": 5
                 },
                 "end": {
-                  "line": 34,
+                  "line": 48,
                   "column": 26
                 }
               },
@@ -1105,11 +1633,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 106,
+          "line": 129,
           "column": 1
         },
         "end": {
-          "line": 118
+          "line": 140
         }
       },
       "name": "CrashAggregator",
@@ -1120,11 +1648,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 107,
+            "line": 130,
             "column": 5
           },
           "end": {
-            "line": 118
+            "line": 140
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1132,22 +1660,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 107,
+                "line": 130,
                 "column": 5
               },
               "end": {
-                "line": 108,
+                "line": 131,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 107,
+                  "line": 130,
                   "column": 5
                 },
                 "end": {
-                  "line": 107,
+                  "line": 130,
                   "column": 30
                 }
               },
@@ -1155,11 +1683,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 107,
+                    "line": 130,
                     "column": 13
                   },
                   "end": {
-                    "line": 107,
+                    "line": 130,
                     "column": 30
                   }
                 },
@@ -1170,22 +1698,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 108,
+                "line": 131,
                 "column": 5
               },
               "end": {
-                "line": 109,
+                "line": 132,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 108,
+                  "line": 131,
                   "column": 5
                 },
                 "end": {
-                  "line": 108,
+                  "line": 131,
                   "column": 25
                 }
               },
@@ -1195,22 +1723,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 109,
+                "line": 132,
                 "column": 5
               },
               "end": {
-                "line": 110,
+                "line": 133,
                 "column": 4
               }
             },
             "anyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 109,
+                  "line": 132,
                   "column": 5
                 },
                 "end": {
-                  "line": 109,
+                  "line": 132,
                   "column": 27
                 }
               },
@@ -1221,11 +1749,11 @@
               "iterExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 109,
+                    "line": 132,
                     "column": 17
                   },
                   "end": {
-                    "line": 109,
+                    "line": 132,
                     "column": 27
                   }
                 },
@@ -1236,22 +1764,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 110,
+                "line": 133,
                 "column": 5
               },
               "end": {
-                "line": 111,
+                "line": 134,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 110,
+                  "line": 133,
                   "column": 5
                 },
                 "end": {
-                  "line": 110,
+                  "line": 133,
                   "column": 28
                 }
               },
@@ -1261,22 +1789,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 111,
+                "line": 134,
                 "column": 5
               },
               "end": {
-                "line": 112,
+                "line": 135,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 111,
+                  "line": 134,
                   "column": 5
                 },
                 "end": {
-                  "line": 111,
+                  "line": 134,
                   "column": 23
                 }
               },
@@ -1286,21 +1814,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 112,
+                "line": 135,
                 "column": 5
               },
               "end": {
-                "line": 118
+                "line": 140
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 112,
+                  "line": 135,
                   "column": 5
                 },
                 "end": {
-                  "line": 112,
+                  "line": 135,
                   "column": 48
                 }
               },
@@ -1437,7 +1965,7 @@
           "column": 1
         },
         "end": {
-          "line": 16
+          "line": 15
         }
       },
       "pyStmt": {
@@ -1447,10 +1975,33 @@
             "column": 1
           },
           "end": {
-            "line": 16
+            "line": 15
           }
         },
-        "code": "def vector_ge(v1, v2):\n    return v1[0] >= v2[0] and v1[1] >= v2[1]\n\n# State variables\n"
+        "code": "def vector_ge(v1, v2):\n    return v1[0] >= v2[0] and v1[1] >= v2[1]\n\n"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 15,
+          "column": 1
+        },
+        "end": {
+          "line": 25
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 15,
+            "column": 1
+          },
+          "end": {
+            "line": 25
+          }
+        },
+        "code": "def active_vector_meet(active_members, shard_frontiers):\n    result = [MAX_EPOCH, MAX_EPOCH]\n    has_active = False\n    for i in range(NUM_SHARDS):\n        if active_members[i]:\n            result = vector_meet(result, shard_frontiers[i])\n            has_active = True\n    return result if has_active else [0, 0]\n\n# State variables\n"
       }
     }
   ],
@@ -1458,11 +2009,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 36,
+          "line": 50,
           "column": 1
         },
         "end": {
-          "line": 46
+          "line": 63
         }
       },
       "name": "Shard",
@@ -1470,11 +2021,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 37,
+              "line": 51,
               "column": 5
             },
             "end": {
-              "line": 40,
+              "line": 54,
               "column": 4
             }
           },
@@ -1486,11 +2037,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 38,
+                "line": 52,
                 "column": 9
               },
               "end": {
-                "line": 40,
+                "line": 54,
                 "column": 4
               }
             },
@@ -1499,22 +2050,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 38,
+                    "line": 52,
                     "column": 9
                   },
                   "end": {
-                    "line": 40,
+                    "line": 54,
                     "column": 4
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 38,
+                      "line": 52,
                       "column": 9
                     },
                     "end": {
-                      "line": 38,
+                      "line": 52,
                       "column": 30
                     }
                   },
@@ -1527,11 +2078,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 40,
+              "line": 54,
               "column": 5
             },
             "end": {
-              "line": 46
+              "line": 63
             }
           },
           "name": "AdvanceAndReport",
@@ -1539,11 +2090,11 @@
           "fairness": {
             "sourceInfo": {
               "start": {
-                "line": 40,
+                "line": 54,
                 "column": 12
               },
               "end": {
-                "line": 40,
+                "line": 54,
                 "column": 15
               }
             },
@@ -1552,11 +2103,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 41,
+                "line": 55,
                 "column": 9
               },
               "end": {
-                "line": 46
+                "line": 63
               }
             },
             "flow": "FLOW_ATOMIC",
@@ -1564,22 +2115,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 41,
+                    "line": 55,
                     "column": 9
                   },
                   "end": {
-                    "line": 42,
+                    "line": 56,
                     "column": 8
                   }
                 },
                 "anyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 41,
+                      "line": 55,
                       "column": 9
                     },
                     "end": {
-                      "line": 41,
+                      "line": 55,
                       "column": 44
                     }
                   },
@@ -1590,11 +2141,11 @@
                   "iterExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 41,
+                        "line": 55,
                         "column": 27
                       },
                       "end": {
-                        "line": 41,
+                        "line": 55,
                         "column": 44
                       }
                     },
@@ -1605,22 +2156,60 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 42,
+                    "line": 56,
                     "column": 9
                   },
                   "end": {
-                    "line": 43,
+                    "line": 57,
                     "column": 8
                   }
                 },
                 "requireStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 42,
+                      "line": 56,
                       "column": 9
                     },
                     "end": {
-                      "line": 42,
+                      "line": 56,
+                      "column": 39
+                    }
+                  },
+                  "condition": "active_members[self.id]",
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 56,
+                        "column": 17
+                      },
+                      "end": {
+                        "line": 56,
+                        "column": 39
+                      }
+                    },
+                    "pyExpr": "active_members[self.id]"
+                  }
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 57,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 58,
+                    "column": 8
+                  }
+                },
+                "requireStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 57,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 57,
                       "column": 52
                     }
                   },
@@ -1628,11 +2217,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 42,
+                        "line": 57,
                         "column": 17
                       },
                       "end": {
-                        "line": 42,
+                        "line": 57,
                         "column": 52
                       }
                     },
@@ -1643,22 +2232,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 43,
+                    "line": 58,
                     "column": 9
                   },
                   "end": {
-                    "line": 44,
+                    "line": 59,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 43,
+                      "line": 58,
                       "column": 9
                     },
                     "end": {
-                      "line": 43,
+                      "line": 58,
                       "column": 63
                     }
                   },
@@ -1668,25 +2257,75 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 44,
+                    "line": 59,
                     "column": 9
                   },
                   "end": {
-                    "line": 46
+                    "line": 60,
+                    "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 44,
+                      "line": 59,
                       "column": 9
                     },
                     "end": {
-                      "line": 44,
+                      "line": 59,
                       "column": 64
                     }
                   },
                   "code": "messages[self.id] = [self.frontier[0], self.frontier[1]]"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 60,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 61,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 60,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 60,
+                      "column": 60
+                    }
+                  },
+                  "code": "message_generations[self.id] = membership_generation"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 61,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 63
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 61,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 61,
+                      "column": 67
+                    }
+                  },
+                  "code": "message_incarnations[self.id] = shard_incarnations[self.id]"
                 }
               }
             ]
@@ -1697,11 +2336,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 46,
+          "line": 63,
           "column": 1
         },
         "end": {
-          "line": 67
+          "line": 84
         }
       },
       "name": "ObjectStore",
@@ -1709,11 +2348,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 47,
+              "line": 64,
               "column": 5
             },
             "end": {
-              "line": 52,
+              "line": 69,
               "column": 4
             }
           },
@@ -1725,11 +2364,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 48,
+                "line": 65,
                 "column": 9
               },
               "end": {
-                "line": 52,
+                "line": 69,
                 "column": 4
               }
             },
@@ -1738,22 +2377,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 48,
+                    "line": 65,
                     "column": 9
                   },
                   "end": {
-                    "line": 49,
+                    "line": 66,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 48,
+                      "line": 65,
                       "column": 9
                     },
                     "end": {
-                      "line": 48,
+                      "line": 65,
                       "column": 30
                     }
                   },
@@ -1763,22 +2402,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 49,
+                    "line": 66,
                     "column": 9
                   },
                   "end": {
-                    "line": 50,
+                    "line": 67,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 49,
+                      "line": 66,
                       "column": 9
                     },
                     "end": {
-                      "line": 49,
+                      "line": 66,
                       "column": 28
                     }
                   },
@@ -1788,22 +2427,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 50,
+                    "line": 67,
                     "column": 9
                   },
                   "end": {
-                    "line": 52,
+                    "line": 69,
                     "column": 4
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 50,
+                      "line": 67,
                       "column": 9
                     },
                     "end": {
-                      "line": 50,
+                      "line": 67,
                       "column": 40
                     }
                   },
@@ -1818,22 +2457,22 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 52,
+              "line": 69,
               "column": 5
             },
             "end": {
-              "line": 59,
+              "line": 76,
               "column": 4
             }
           },
           "pyStmt": {
             "sourceInfo": {
               "start": {
-                "line": 52,
+                "line": 69,
                 "column": 5
               },
               "end": {
-                "line": 59,
+                "line": 76,
                 "column": 4
               }
             },
@@ -1843,21 +2482,21 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 59,
+              "line": 76,
               "column": 5
             },
             "end": {
-              "line": 67
+              "line": 84
             }
           },
           "pyStmt": {
             "sourceInfo": {
               "start": {
-                "line": 59,
+                "line": 76,
                 "column": 5
               },
               "end": {
-                "line": 67
+                "line": 84
               }
             },
             "code": "def write_frontier(self, token, frontier):\n        if token >= self.fence_token:\n            if vector_ge(frontier, self.published_frontier):\n                self.published_frontier = frontier\n                self.fence_token = token\n                return True\n        return False\n\n"
@@ -1868,11 +2507,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 68,
+          "line": 85,
           "column": 1
         },
         "end": {
-          "line": 106
+          "line": 129
         }
       },
       "name": "FrontierAggregator",
@@ -1880,11 +2519,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 69,
+              "line": 86,
               "column": 5
             },
             "end": {
-              "line": 74,
+              "line": 91,
               "column": 4
             }
           },
@@ -1896,11 +2535,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 70,
+                "line": 87,
                 "column": 9
               },
               "end": {
-                "line": 74,
+                "line": 91,
                 "column": 4
               }
             },
@@ -1909,22 +2548,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 70,
+                    "line": 87,
                     "column": 9
                   },
                   "end": {
-                    "line": 71,
+                    "line": 88,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 70,
+                      "line": 87,
                       "column": 9
                     },
                     "end": {
-                      "line": 70,
+                      "line": 87,
                       "column": 33
                     }
                   },
@@ -1934,22 +2573,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 71,
+                    "line": 88,
                     "column": 9
                   },
                   "end": {
-                    "line": 72,
+                    "line": 89,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 71,
+                      "line": 88,
                       "column": 9
                     },
                     "end": {
-                      "line": 71,
+                      "line": 88,
                       "column": 28
                     }
                   },
@@ -1959,22 +2598,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 72,
+                    "line": 89,
                     "column": 9
                   },
                   "end": {
-                    "line": 74,
+                    "line": 91,
                     "column": 4
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 72,
+                      "line": 89,
                       "column": 9
                     },
                     "end": {
-                      "line": 72,
+                      "line": 89,
                       "column": 53
                     }
                   },
@@ -1987,11 +2626,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 74,
+              "line": 91,
               "column": 5
             },
             "end": {
-              "line": 89,
+              "line": 106,
               "column": 4
             }
           },
@@ -2000,11 +2639,11 @@
           "fairness": {
             "sourceInfo": {
               "start": {
-                "line": 74,
+                "line": 91,
                 "column": 12
               },
               "end": {
-                "line": 74,
+                "line": 91,
                 "column": 15
               }
             },
@@ -2013,11 +2652,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 75,
+                "line": 92,
                 "column": 9
               },
               "end": {
-                "line": 89,
+                "line": 106,
                 "column": 4
               }
             },
@@ -2026,22 +2665,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 75,
+                    "line": 92,
                     "column": 9
                   },
                   "end": {
-                    "line": 76,
+                    "line": 93,
                     "column": 8
                   }
                 },
                 "requireStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 75,
+                      "line": 92,
                       "column": 9
                     },
                     "end": {
-                      "line": 75,
+                      "line": 92,
                       "column": 37
                     }
                   },
@@ -2049,11 +2688,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 75,
+                        "line": 92,
                         "column": 17
                       },
                       "end": {
-                        "line": 75,
+                        "line": 92,
                         "column": 37
                       }
                     },
@@ -2064,22 +2703,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 76,
+                    "line": 93,
                     "column": 9
                   },
                   "end": {
-                    "line": 77,
+                    "line": 94,
                     "column": 8
                   }
                 },
                 "requireStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 76,
+                      "line": 93,
                       "column": 9
                     },
                     "end": {
-                      "line": 76,
+                      "line": 93,
                       "column": 33
                     }
                   },
@@ -2087,11 +2726,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 76,
+                        "line": 93,
                         "column": 17
                       },
                       "end": {
-                        "line": 76,
+                        "line": 93,
                         "column": 33
                       }
                     },
@@ -2102,22 +2741,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 77,
+                    "line": 94,
                     "column": 9
                   },
                   "end": {
-                    "line": 78,
+                    "line": 95,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 77,
+                      "line": 94,
                       "column": 9
                     },
                     "end": {
-                      "line": 77,
+                      "line": 94,
                       "column": 41
                     }
                   },
@@ -2127,22 +2766,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 78,
+                    "line": 95,
                     "column": 9
                   },
                   "end": {
-                    "line": 79,
+                    "line": 96,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 78,
+                      "line": 95,
                       "column": 9
                     },
                     "end": {
-                      "line": 78,
+                      "line": 95,
                       "column": 41
                     }
                   },
@@ -2152,22 +2791,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 79,
+                    "line": 96,
                     "column": 9
                   },
                   "end": {
-                    "line": 80,
+                    "line": 97,
                     "column": 8
                   }
                 },
                 "callStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 79,
+                      "line": 96,
                       "column": 9
                     },
                     "end": {
-                      "line": 79,
+                      "line": 96,
                       "column": 72
                     }
                   },
@@ -2179,11 +2818,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 79,
+                          "line": 96,
                           "column": 35
                         },
                         "end": {
-                          "line": 79,
+                          "line": 96,
                           "column": 41
                         }
                       },
@@ -2191,11 +2830,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 79,
+                            "line": 96,
                             "column": 35
                           },
                           "end": {
-                            "line": 79,
+                            "line": 96,
                             "column": 41
                           }
                         },
@@ -2205,11 +2844,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 79,
+                          "line": 96,
                           "column": 44
                         },
                         "end": {
-                          "line": 79,
+                          "line": 96,
                           "column": 56
                         }
                       },
@@ -2217,11 +2856,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 79,
+                            "line": 96,
                             "column": 44
                           },
                           "end": {
-                            "line": 79,
+                            "line": 96,
                             "column": 56
                           }
                         },
@@ -2231,11 +2870,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 79,
+                          "line": 96,
                           "column": 59
                         },
                         "end": {
-                          "line": 79,
+                          "line": 96,
                           "column": 71
                         }
                       },
@@ -2243,11 +2882,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 79,
+                            "line": 96,
                             "column": 59
                           },
                           "end": {
-                            "line": 79,
+                            "line": 96,
                             "column": 71
                           }
                         },
@@ -2261,22 +2900,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 80,
+                    "line": 97,
                     "column": 9
                   },
                   "end": {
-                    "line": 89,
+                    "line": 106,
                     "column": 4
                   }
                 },
                 "ifStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 80,
+                      "line": 97,
                       "column": 9
                     },
                     "end": {
-                      "line": 89,
+                      "line": 106,
                       "column": 4
                     }
                   },
@@ -2284,11 +2923,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 80,
+                          "line": 97,
                           "column": 12
                         },
                         "end": {
-                          "line": 86,
+                          "line": 103,
                           "column": 8
                         }
                       },
@@ -2296,11 +2935,11 @@
                       "block": {
                         "sourceInfo": {
                           "start": {
-                            "line": 81,
+                            "line": 98,
                             "column": 13
                           },
                           "end": {
-                            "line": 86,
+                            "line": 103,
                             "column": 8
                           }
                         },
@@ -2308,22 +2947,22 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 81,
+                                "line": 98,
                                 "column": 13
                               },
                               "end": {
-                                "line": 82,
+                                "line": 99,
                                 "column": 12
                               }
                             },
                             "pyStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 81,
+                                  "line": 98,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 81,
+                                  "line": 98,
                                   "column": 44
                                 }
                               },
@@ -2333,22 +2972,22 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 82,
+                                "line": 99,
                                 "column": 13
                               },
                               "end": {
-                                "line": 84,
+                                "line": 101,
                                 "column": 12
                               }
                             },
                             "pyStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 82,
+                                  "line": 99,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 82,
+                                  "line": 99,
                                   "column": 36
                                 }
                               },
@@ -2358,22 +2997,22 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 84,
+                                "line": 101,
                                 "column": 13
                               },
                               "end": {
-                                "line": 86,
+                                "line": 103,
                                 "column": 8
                               }
                             },
                             "forStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 84,
+                                  "line": 101,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 86,
+                                  "line": 103,
                                   "column": 8
                                 }
                               },
@@ -2384,11 +3023,11 @@
                               "block": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 85,
+                                    "line": 102,
                                     "column": 17
                                   },
                                   "end": {
-                                    "line": 86,
+                                    "line": 103,
                                     "column": 8
                                   }
                                 },
@@ -2396,22 +3035,22 @@
                                   {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 85,
+                                        "line": 102,
                                         "column": 17
                                       },
                                       "end": {
-                                        "line": 86,
+                                        "line": 103,
                                         "column": 8
                                       }
                                     },
                                     "pyStmt": {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 85,
+                                          "line": 102,
                                           "column": 17
                                         },
                                         "end": {
-                                          "line": 85,
+                                          "line": 102,
                                           "column": 116
                                         }
                                       },
@@ -2423,11 +3062,11 @@
                               "iterExpr": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 84,
+                                    "line": 101,
                                     "column": 22
                                   },
                                   "end": {
-                                    "line": 84,
+                                    "line": 101,
                                     "column": 38
                                   }
                                 },
@@ -2440,11 +3079,11 @@
                       "conditionExpr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 80,
+                            "line": 97,
                             "column": 12
                           },
                           "end": {
-                            "line": 80,
+                            "line": 97,
                             "column": 18
                           }
                         },
@@ -2454,11 +3093,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 86,
+                          "line": 103,
                           "column": 9
                         },
                         "end": {
-                          "line": 89,
+                          "line": 106,
                           "column": 4
                         }
                       },
@@ -2466,11 +3105,11 @@
                       "block": {
                         "sourceInfo": {
                           "start": {
-                            "line": 87,
+                            "line": 104,
                             "column": 13
                           },
                           "end": {
-                            "line": 89,
+                            "line": 106,
                             "column": 4
                           }
                         },
@@ -2478,22 +3117,22 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 87,
+                                "line": 104,
                                 "column": 13
                               },
                               "end": {
-                                "line": 89,
+                                "line": 106,
                                 "column": 4
                               }
                             },
                             "pyStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 87,
+                                  "line": 104,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 87,
+                                  "line": 104,
                                   "column": 37
                                 }
                               },
@@ -2515,11 +3154,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 89,
+              "line": 106,
               "column": 5
             },
             "end": {
-              "line": 93,
+              "line": 113,
               "column": 4
             }
           },
@@ -2528,11 +3167,11 @@
           "fairness": {
             "sourceInfo": {
               "start": {
-                "line": 89,
+                "line": 106,
                 "column": 12
               },
               "end": {
-                "line": 89,
+                "line": 106,
                 "column": 15
               }
             },
@@ -2541,11 +3180,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 90,
+                "line": 107,
                 "column": 9
               },
               "end": {
-                "line": 93,
+                "line": 113,
                 "column": 4
               }
             },
@@ -2554,22 +3193,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 90,
+                    "line": 107,
                     "column": 9
                   },
                   "end": {
-                    "line": 91,
+                    "line": 108,
                     "column": 8
                   }
                 },
                 "anyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 90,
+                      "line": 107,
                       "column": 9
                     },
                     "end": {
-                      "line": 90,
+                      "line": 107,
                       "column": 42
                     }
                   },
@@ -2580,11 +3219,11 @@
                   "iterExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 90,
+                        "line": 107,
                         "column": 26
                       },
                       "end": {
-                        "line": 90,
+                        "line": 107,
                         "column": 42
                       }
                     },
@@ -2595,22 +3234,136 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 91,
+                    "line": 108,
                     "column": 9
                   },
                   "end": {
-                    "line": 93,
+                    "line": 109,
+                    "column": 8
+                  }
+                },
+                "requireStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 108,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 108,
+                      "column": 40
+                    }
+                  },
+                  "condition": "active_members[shard_id]",
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 108,
+                        "column": 17
+                      },
+                      "end": {
+                        "line": 108,
+                        "column": 40
+                      }
+                    },
+                    "pyExpr": "active_members[shard_id]"
+                  }
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 109,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 110,
+                    "column": 8
+                  }
+                },
+                "requireStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 109,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 109,
+                      "column": 70
+                    }
+                  },
+                  "condition": "message_generations[shard_id] == membership_generation",
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 109,
+                        "column": 17
+                      },
+                      "end": {
+                        "line": 109,
+                        "column": 70
+                      }
+                    },
+                    "pyExpr": "message_generations[shard_id] == membership_generation"
+                  }
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 110,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 111,
+                    "column": 8
+                  }
+                },
+                "requireStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 110,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 110,
+                      "column": 78
+                    }
+                  },
+                  "condition": "message_incarnations[shard_id] == shard_incarnations[shard_id]",
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 110,
+                        "column": 17
+                      },
+                      "end": {
+                        "line": 110,
+                        "column": 78
+                      }
+                    },
+                    "pyExpr": "message_incarnations[shard_id] == shard_incarnations[shard_id]"
+                  }
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 111,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 113,
                     "column": 4
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 91,
+                      "line": 111,
                       "column": 9
                     },
                     "end": {
-                      "line": 91,
+                      "line": 111,
                       "column": 116
                     }
                   },
@@ -2623,11 +3376,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 93,
+              "line": 113,
               "column": 5
             },
             "end": {
-              "line": 106
+              "line": 129
             }
           },
           "name": "PublishFrontier",
@@ -2635,11 +3388,11 @@
           "fairness": {
             "sourceInfo": {
               "start": {
-                "line": 93,
+                "line": 113,
                 "column": 12
               },
               "end": {
-                "line": 93,
+                "line": 113,
                 "column": 15
               }
             },
@@ -2648,11 +3401,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 94,
+                "line": 114,
                 "column": 9
               },
               "end": {
-                "line": 106
+                "line": 129
               }
             },
             "flow": "FLOW_ATOMIC",
@@ -2660,22 +3413,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 94,
+                    "line": 114,
                     "column": 9
                   },
                   "end": {
-                    "line": 96,
+                    "line": 116,
                     "column": 8
                   }
                 },
                 "requireStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 94,
+                      "line": 114,
                       "column": 9
                     },
                     "end": {
-                      "line": 94,
+                      "line": 114,
                       "column": 33
                     }
                   },
@@ -2683,11 +3436,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 94,
+                        "line": 114,
                         "column": 17
                       },
                       "end": {
-                        "line": 94,
+                        "line": 114,
                         "column": 33
                       }
                     },
@@ -2698,104 +3451,250 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 96,
+                    "line": 116,
                     "column": 9
                   },
                   "end": {
-                    "line": 98,
+                    "line": 117,
                     "column": 8
                   }
                 },
-                "callStmt": {
+                "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 96,
+                      "line": 116,
                       "column": 9
                     },
                     "end": {
-                      "line": 96,
-                      "column": 92
+                      "line": 116,
+                      "column": 41
                     }
                   },
-                  "vars": [
-                    "meet_val"
-                  ],
-                  "name": "vector_meet",
-                  "args": [
-                    {
-                      "sourceInfo": {
-                        "start": {
-                          "line": 96,
-                          "column": 32
-                        },
-                        "end": {
-                          "line": 96,
-                          "column": 60
-                        }
-                      },
-                      "pyExpr": "self.local_shard_frontiers[0]",
-                      "expr": {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 96,
-                            "column": 32
-                          },
-                          "end": {
-                            "line": 96,
-                            "column": 60
-                          }
-                        },
-                        "pyExpr": "self.local_shard_frontiers[0]"
-                      }
-                    },
-                    {
-                      "sourceInfo": {
-                        "start": {
-                          "line": 96,
-                          "column": 63
-                        },
-                        "end": {
-                          "line": 96,
-                          "column": 91
-                        }
-                      },
-                      "pyExpr": "self.local_shard_frontiers[1]",
-                      "expr": {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 96,
-                            "column": 63
-                          },
-                          "end": {
-                            "line": 96,
-                            "column": 91
-                          }
-                        },
-                        "pyExpr": "self.local_shard_frontiers[1]"
-                      }
-                    }
-                  ]
+                  "code": "meet_val = [MAX_EPOCH, MAX_EPOCH]"
                 }
               },
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 98,
+                    "line": 117,
                     "column": 9
                   },
                   "end": {
-                    "line": 99,
+                    "line": 121,
+                    "column": 8
+                  }
+                },
+                "forStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 117,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 121,
+                      "column": 8
+                    }
+                  },
+                  "loopVars": [
+                    "i"
+                  ],
+                  "pyExpr": "range(NUM_SHARDS)",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 118,
+                        "column": 13
+                      },
+                      "end": {
+                        "line": 121,
+                        "column": 8
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 118,
+                            "column": 13
+                          },
+                          "end": {
+                            "line": 121,
+                            "column": 8
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 118,
+                              "column": 13
+                            },
+                            "end": {
+                              "line": 121,
+                              "column": 8
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 118,
+                                  "column": 16
+                                },
+                                "end": {
+                                  "line": 121,
+                                  "column": 8
+                                }
+                              },
+                              "condition": "active_members[i]",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 119,
+                                    "column": 17
+                                  },
+                                  "end": {
+                                    "line": 121,
+                                    "column": 8
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 119,
+                                        "column": 17
+                                      },
+                                      "end": {
+                                        "line": 121,
+                                        "column": 8
+                                      }
+                                    },
+                                    "callStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 119,
+                                          "column": 17
+                                        },
+                                        "end": {
+                                          "line": 119,
+                                          "column": 79
+                                        }
+                                      },
+                                      "vars": [
+                                        "meet_val"
+                                      ],
+                                      "name": "vector_meet",
+                                      "args": [
+                                        {
+                                          "sourceInfo": {
+                                            "start": {
+                                              "line": 119,
+                                              "column": 40
+                                            },
+                                            "end": {
+                                              "line": 119,
+                                              "column": 47
+                                            }
+                                          },
+                                          "pyExpr": "meet_val",
+                                          "expr": {
+                                            "sourceInfo": {
+                                              "start": {
+                                                "line": 119,
+                                                "column": 40
+                                              },
+                                              "end": {
+                                                "line": 119,
+                                                "column": 47
+                                              }
+                                            },
+                                            "pyExpr": "meet_val"
+                                          }
+                                        },
+                                        {
+                                          "sourceInfo": {
+                                            "start": {
+                                              "line": 119,
+                                              "column": 50
+                                            },
+                                            "end": {
+                                              "line": 119,
+                                              "column": 78
+                                            }
+                                          },
+                                          "pyExpr": "self.local_shard_frontiers[i]",
+                                          "expr": {
+                                            "sourceInfo": {
+                                              "start": {
+                                                "line": 119,
+                                                "column": 50
+                                              },
+                                              "end": {
+                                                "line": 119,
+                                                "column": 78
+                                              }
+                                            },
+                                            "pyExpr": "self.local_shard_frontiers[i]"
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 118,
+                                    "column": 16
+                                  },
+                                  "end": {
+                                    "line": 118,
+                                    "column": 32
+                                  }
+                                },
+                                "pyExpr": "active_members[i]"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  "iterExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 117,
+                        "column": 18
+                      },
+                      "end": {
+                        "line": 117,
+                        "column": 34
+                      }
+                    },
+                    "pyExpr": "range(NUM_SHARDS)"
+                  }
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 121,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 122,
                     "column": 8
                   }
                 },
                 "callStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 98,
+                      "line": 121,
                       "column": 9
                     },
                     "end": {
-                      "line": 98,
+                      "line": 121,
                       "column": 66
                     }
                   },
@@ -2807,11 +3706,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 98,
+                          "line": 121,
                           "column": 40
                         },
                         "end": {
-                          "line": 98,
+                          "line": 121,
                           "column": 55
                         }
                       },
@@ -2819,11 +3718,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 98,
+                            "line": 121,
                             "column": 40
                           },
                           "end": {
-                            "line": 98,
+                            "line": 121,
                             "column": 55
                           }
                         },
@@ -2833,11 +3732,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 98,
+                          "line": 121,
                           "column": 58
                         },
                         "end": {
-                          "line": 98,
+                          "line": 121,
                           "column": 65
                         }
                       },
@@ -2845,11 +3744,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 98,
+                            "line": 121,
                             "column": 58
                           },
                           "end": {
-                            "line": 98,
+                            "line": 121,
                             "column": 65
                           }
                         },
@@ -2863,32 +3762,32 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 99,
+                    "line": 122,
                     "column": 9
                   },
                   "end": {
-                    "line": 106
+                    "line": 129
                   }
                 },
                 "ifStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 99,
+                      "line": 122,
                       "column": 9
                     },
                     "end": {
-                      "line": 106
+                      "line": 129
                     }
                   },
                   "branches": [
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 99,
+                          "line": 122,
                           "column": 12
                         },
                         "end": {
-                          "line": 101,
+                          "line": 124,
                           "column": 8
                         }
                       },
@@ -2896,11 +3795,11 @@
                       "block": {
                         "sourceInfo": {
                           "start": {
-                            "line": 100,
+                            "line": 123,
                             "column": 13
                           },
                           "end": {
-                            "line": 101,
+                            "line": 124,
                             "column": 8
                           }
                         },
@@ -2908,22 +3807,22 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 100,
+                                "line": 123,
                                 "column": 13
                               },
                               "end": {
-                                "line": 101,
+                                "line": 124,
                                 "column": 8
                               }
                             },
                             "callStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 100,
+                                  "line": 123,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 100,
+                                  "line": 123,
                                   "column": 82
                                 }
                               },
@@ -2935,11 +3834,11 @@
                                 {
                                   "sourceInfo": {
                                     "start": {
-                                      "line": 100,
+                                      "line": 123,
                                       "column": 50
                                     },
                                     "end": {
-                                      "line": 100,
+                                      "line": 123,
                                       "column": 71
                                     }
                                   },
@@ -2947,11 +3846,11 @@
                                   "expr": {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 100,
+                                        "line": 123,
                                         "column": 50
                                       },
                                       "end": {
-                                        "line": 100,
+                                        "line": 123,
                                         "column": 71
                                       }
                                     },
@@ -2961,11 +3860,11 @@
                                 {
                                   "sourceInfo": {
                                     "start": {
-                                      "line": 100,
+                                      "line": 123,
                                       "column": 74
                                     },
                                     "end": {
-                                      "line": 100,
+                                      "line": 123,
                                       "column": 81
                                     }
                                   },
@@ -2973,11 +3872,11 @@
                                   "expr": {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 100,
+                                        "line": 123,
                                         "column": 74
                                       },
                                       "end": {
-                                        "line": 100,
+                                        "line": 123,
                                         "column": 81
                                       }
                                     },
@@ -2992,11 +3891,11 @@
                       "conditionExpr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 99,
+                            "line": 122,
                             "column": 12
                           },
                           "end": {
-                            "line": 99,
+                            "line": 122,
                             "column": 18
                           }
                         },
@@ -3006,44 +3905,44 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 101,
+                          "line": 124,
                           "column": 9
                         },
                         "end": {
-                          "line": 106
+                          "line": 129
                         }
                       },
                       "condition": "True",
                       "block": {
                         "sourceInfo": {
                           "start": {
-                            "line": 102,
+                            "line": 125,
                             "column": 13
                           },
                           "end": {
-                            "line": 106
+                            "line": 129
                           }
                         },
                         "stmts": [
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 102,
+                                "line": 125,
                                 "column": 13
                               },
                               "end": {
-                                "line": 103,
+                                "line": 126,
                                 "column": 12
                               }
                             },
                             "pyStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 102,
+                                  "line": 125,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 102,
+                                  "line": 125,
                                   "column": 37
                                 }
                               },
@@ -3053,21 +3952,21 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 103,
+                                "line": 126,
                                 "column": 13
                               },
                               "end": {
-                                "line": 106
+                                "line": 129
                               }
                             },
                             "pyStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 103,
+                                  "line": 126,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 103,
+                                  "line": 126,
                                   "column": 35
                                 }
                               },
@@ -3091,11 +3990,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 67,
+              "line": 84,
               "column": 1
             },
             "end": {
-              "line": 68
+              "line": 85
             }
           },
           "name": "state",
@@ -3103,11 +4002,11 @@
             {
               "sourceInfo": {
                 "start": {
-                  "line": 67,
+                  "line": 84,
                   "column": 8
                 },
                 "end": {
-                  "line": 67,
+                  "line": 84,
                   "column": 73
                 }
               },
@@ -3115,11 +4014,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 67,
+                    "line": 84,
                     "column": 8
                   },
                   "end": {
-                    "line": 67,
+                    "line": 84,
                     "column": 73
                   }
                 },

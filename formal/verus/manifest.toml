@@ -482,3 +482,87 @@ evidence = [
     "cargo test --locked -p rockstream-ops --test delta_native_aggregate_tests",
     "cargo test --locked -p rockstream-ops --test constant_write_amplification_scale_tests",
 ]
+
+[[claims]]
+id = "VS4-01"
+status = "adapter-qualified"
+domain = "Versioned frontier reports are scoped to a deployment/view, membership generation, active shard, and shard incarnation."
+assumptions = ["The control-plane membership authority supplies the active set and durable bootstrap evidence."]
+implementation = ["crates/rockstream-types/src/frontier.rs::new"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::admit_frontier_report"]
+production_callers = ["crates/rockstream-control/src/frontier.rs::ingest_membership_report"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::configured_aggregators_reject_legacy_scalar_reports"]
+evidence = [
+    "docs/adr/0005-frontier-membership.md",
+    "cargo test --locked -p rockstream-control --lib frontier::tests",
+]
+
+[[claims]]
+id = "VS4-02"
+status = "adapter-qualified"
+domain = "Fixed-membership report transitions are monotone, reject stale authority, and preserve state on rejection."
+assumptions = ["The unverified adapter checks report scope, active membership, and the current shard lease before the kernel call."]
+implementation = ["crates/rockstream-control/src/frontier.rs::ingest_membership_report"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::fixed_membership_transition"]
+production_callers = ["crates/rockstream-control/src/service.rs::handle_connection_stream"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::stale_generation_and_incarnation_reports_leave_state_unchanged"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-control --lib frontier::tests",
+]
+
+[[claims]]
+id = "VS4-03"
+status = "adapter-qualified"
+domain = "Activation and replacement require a bootstrap epoch at or above publication; retirement changes the active meet by generation."
+assumptions = ["Bootstrap epochs are supplied by the authority that established durable catch-up."]
+implementation = ["crates/rockstream-control/src/frontier.rs::activate_shard", "crates/rockstream-control/src/frontier.rs::replace_shard"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::activation_preserves_publication"]
+production_callers = ["crates/rockstream-control/src/frontier.rs::retire_shard"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::membership_publication_never_overstates_a_new_member"]
+evidence = [
+    "cargo test --locked -p rockstream-control --lib frontier::tests",
+    "formal/m2_frontier_agg.fizz",
+]
+
+[[claims]]
+id = "VS4-04"
+status = "adapter-qualified"
+domain = "The executable admission transition is mapped to the bounded M2 protocol model; rejected and no-op report steps do not mutate state."
+assumptions = ["FizzBee covers bounded interleavings and lease/failover; storage and network durability remain adapter assumptions."]
+implementation = ["crates/rockstream-verified/src/frontier.rs::admitted_transition_is_monotone"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::admitted_transition_is_monotone"]
+production_callers = ["crates/rockstream-control/src/frontier.rs::try_publish"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::membership_publication_uses_a_generation_scoped_durable_key"]
+evidence = [
+    "formal/verus/model-map.md",
+    "rtk fizz formal/m2_frontier_agg.fizz",
+]
+
+[[claims]]
+id = "VS4-05"
+status = "adapter-qualified"
+domain = "Exclusive frontier comparisons authorize epochs below the frontier; source progress, watermarks, publication, and diagnostic hashes remain distinct fields."
+assumptions = ["Consumers do not use FreshnessToken's XOR hash as an idempotent progress lattice."]
+implementation = ["crates/rockstream-types/src/frontier.rs::has_committed_through"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::completes_before"]
+production_callers = ["crates/rockstream-types/src/frontier.rs::watermark_ms"]
+regression_tests = ["crates/rockstream-types/src/frontier.rs::freshness_token_hash_is_diagnostic_not_lattice_progress"]
+evidence = [
+    "cargo test --locked -p rockstream-types --lib frontier",
+]
+
+[[claims]]
+id = "VS4-06"
+status = "adapter-qualified"
+domain = "The public worker envelope carries the membership-aware report and the control service routes it through the guarded aggregator path after checking the current shard lease."
+assumptions = ["Multi-process authority, storage latency, and lost-lease qualification remain runtime/FizzBee evidence beyond this local kernel."]
+implementation = ["crates/rockstream-types/src/frontier.rs::new", "crates/rockstream-control/src/service.rs::handle_connection_stream"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::stale_incarnation_is_rejected"]
+production_callers = ["crates/rockstream-control/src/service.rs::handle_connection_stream"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::membership_publication_never_overstates_a_new_member"]
+evidence = [
+    "cargo test --locked -p rockstream-control --lib frontier::tests",
+    "cargo test --locked -p rockstream-types --lib frontier",
+]

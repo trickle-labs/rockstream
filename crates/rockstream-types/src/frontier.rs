@@ -11,7 +11,7 @@
 //! - `CompleteThroughToken` — emitted by monotone (semilattice) laws to signal
 //!   partial progress ahead of the cluster frontier.
 
-use crate::ids::{OperatorId, ShardId, SourceId, WorkerId};
+use crate::ids::{LeaseToken, OperatorId, ShardId, SourceId, WorkerId};
 use crate::merge_law::MergeLawId;
 use crate::timestamp::Epoch;
 use bytes::Bytes;
@@ -195,6 +195,19 @@ mod tests {
             tok_b.join(&tok_a).source_progress
         );
     }
+
+    #[test]
+    fn freshness_token_hash_is_diagnostic_not_lattice_progress() {
+        let token = FreshnessToken::new(BTreeMap::new(), 7);
+        let meet = token.meet(&token);
+        let join = token.join(&token);
+        assert_eq!(meet.source_progress, token.source_progress);
+        assert_eq!(join.source_progress, token.source_progress);
+        assert_eq!(meet.cluster_frontier_hash, 0);
+        assert_eq!(join.cluster_frontier_hash, 0);
+        assert_ne!(meet, token);
+        assert_ne!(join, token);
+    }
 }
 
 // ─── Three-layer frontier protocol (v0.32) ───────────────────────────────────
@@ -210,6 +223,76 @@ pub struct ShardFrontierReport {
     pub shard_id: ShardId,
     /// The current committed frontier epoch on this shard.
     pub epoch: Epoch,
+}
+
+/// Version of the membership-aware frontier report envelope.
+pub const FRONTIER_REPORT_VERSION: u16 = 1;
+
+/// Configuration generation for a frontier scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FrontierGeneration(pub u64);
+
+/// Incarnation of a shard assignment. A restart or replacement must mint a
+/// new incarnation before its reports can affect publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ShardIncarnation(pub u64);
+
+/// Versioned, membership-aware frontier report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipFrontierReport {
+    pub version: u16,
+    pub scope: String,
+    pub generation: FrontierGeneration,
+    pub shard_id: ShardId,
+    pub incarnation: ShardIncarnation,
+    /// Fencing token proving the reporter currently owns the shard lease.
+    pub lease_token: LeaseToken,
+    /// Exclusive next epoch: all epochs strictly below this value are durable.
+    pub epoch: Epoch,
+}
+
+impl MembershipFrontierReport {
+    pub fn new(
+        scope: impl Into<String>,
+        generation: FrontierGeneration,
+        shard_id: ShardId,
+        incarnation: ShardIncarnation,
+        lease_token: LeaseToken,
+        epoch: Epoch,
+    ) -> Self {
+        Self {
+            version: FRONTIER_REPORT_VERSION,
+            scope: scope.into(),
+            generation,
+            shard_id,
+            incarnation,
+            lease_token,
+            epoch,
+        }
+    }
+}
+
+/// Authoritative active membership for one frontier/query scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontierMembership {
+    pub scope: String,
+    pub generation: FrontierGeneration,
+    pub active: BTreeMap<ShardId, ShardIncarnation>,
+}
+
+impl FrontierMembership {
+    pub fn new(scope: impl Into<String>, generation: FrontierGeneration) -> Self {
+        Self {
+            scope: scope.into(),
+            generation,
+            active: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_active(mut self, shard_id: ShardId, incarnation: ShardIncarnation) -> Self {
+        self.active.insert(shard_id, incarnation);
+        self
+    }
 }
 
 /// A worker's summary of its per-shard frontiers.
@@ -428,6 +511,22 @@ mod protocol_tests {
         };
         assert_eq!(r.shard_id, ShardId(7));
         assert_eq!(r.epoch, 42);
+    }
+
+    #[test]
+    fn membership_report_roundtrip_preserves_scope_and_authority() {
+        let report = MembershipFrontierReport::new(
+            "view-7",
+            FrontierGeneration(3),
+            ShardId(7),
+            ShardIncarnation(9),
+            LeaseToken(11),
+            42,
+        );
+        let json = serde_json::to_vec(&report).unwrap();
+        let decoded: MembershipFrontierReport = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded, report);
+        assert_eq!(decoded.version, FRONTIER_REPORT_VERSION);
     }
 
     #[test]

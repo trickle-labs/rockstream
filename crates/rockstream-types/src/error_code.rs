@@ -686,6 +686,8 @@ pub const RS_8001: ErrorCode = ErrorCode::new(8001);
 pub const RS_8002: ErrorCode = ErrorCode::new(8002);
 /// Sync-flush-before-lease-handoff-read violation on frontier publication.
 pub const RS_8003: ErrorCode = ErrorCode::new(8003);
+/// Membership-aware frontier report or configuration transition was rejected.
+pub const RS_8004: ErrorCode = ErrorCode::new(8004);
 /// Admission control rejected the capacity request.
 pub const RS_9001: ErrorCode = ErrorCode::new(9001);
 
