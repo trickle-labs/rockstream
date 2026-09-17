@@ -1,0 +1,15 @@
+schema = 1
+
+[[claims]]
+id = "VS0-02"
+status = "kernel-verified"
+domain = "Every u16 bucket count. Results are powers of two in 1..=32768."
+assumptions = ["The Rust u16 value domain and the pinned Verus/vstd specifications."]
+implementation = ["crates/rockstream-verified/src/lib.rs::normalize_power_of_two_bucket_count"]
+theorems = ["crates/rockstream-verified/src/lib.rs::is_power_of_two"]
+production_callers = ["crates/rockstream-plan/src/virtual_bucket.rs::normalize_power_of_two_bucket_count"]
+regression_tests = ["crates/rockstream-plan/tests/virtual_bucket_routing_tests.rs::normalizes_power_of_two_bucket_counts_at_all_boundaries"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests",
+]

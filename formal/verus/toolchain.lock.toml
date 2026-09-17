@@ -1,0 +1,19 @@
+schema = 1
+verus_version = "0.2026.09.13.671956e"
+verus_release = "release/0.2026.09.13.671956e"
+verus_git_sha = "671956ec527d3b7164779f767bdbfe769bedce6c"
+production_rust = "1.88"
+verification_rust = "1.98.1"
+solver_name = "z3"
+solver_source = "bundled in the pinned Verus archive"
+solver_version = "4.16.0"
+vstd_version = "0.0.0-2026-09-06-0133"
+verus_builtin_version = "0.0.0-2026-09-06-0133"
+verus_builtin_macros_version = "0.0.0-2026-09-06-0133"
+verus_state_machines_macros_version = "0.0.0-2026-09-06-0133"
+
+[archives]
+linux_x86_64 = { asset = "verus-0.2026.09.13.671956e-x86-linux.zip", sha256 = "08c85b96e0fbbbdcb1b3a9fa8943dce7598c3e7b343680820f649b4e1efda4b4" }
+macos_x86_64 = { asset = "verus-0.2026.09.13.671956e-x86-macos.zip", sha256 = "cbb1e7f933264c152c165e560bc27c49c821d031288a198643fc7a857baf0595" }
+macos_arm64 = { asset = "verus-0.2026.09.13.671956e-arm64-macos.zip", sha256 = "ab2293a469edfa8a1a28ba4a5bc9aa61205d15930f32d007444e6c848540b534" }
+windows_x86_64 = { asset = "verus-0.2026.09.13.671956e-x86-win.zip", sha256 = "8203e7f4cc024aecc695b14ba6bdac27595d1c92571d5d3410c9c18f2b457fab" }
