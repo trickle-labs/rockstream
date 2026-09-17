@@ -33,3 +33,15 @@ VS3 covers the Z-set adapter and aggregate transition boundary.
 | `crates/rockstream-ops/src/zset.rs::{try_new,validate,select_rows}` | Row and weight lengths align; ordered selection preserves requested order/repetition, rejects invalid indices, and carries the frontier. | Arrow row equality and decoding remain adapter responsibilities; zero filtering does not imply duplicate consolidation. |
 | `crates/rockstream-verified/src/aggregate.rs::transition` | A valid absent or positive-count state plus a consolidated delta yields an exact present/deleted state or a checked rejection; zero-count nonzero-sum states are invalid. | `AggregateOp` validates/casts Arrow input and supplies valid-retraction semantics. |
 | `crates/rockstream-ops/src/aggregate.rs::{StagedEpochAggregator::ingest_delta,AggregateOp::process_delta_with_result}` | Candidate arithmetic, output, and touched-key mutations are ready before authoritative state installation. | Durable write atomicity, restart, and storage outcomes remain VS5 obligations. |
+
+VS4 covers membership-aware frontier admission and the local publication
+boundary. The FizzBee M2 model remains the bounded interleaving model for
+lease/failover behavior; the executable Rust transition owns configuration
+generation and incarnation admission.
+
+| Production code | Verus contract | Caller obligation |
+|---|---|---|
+| `crates/rockstream-verified/src/frontier.rs::admit_frontier_report` | A report is admitted only for the supported envelope version, active member, matching generation, and matching incarnation; accepted epochs are monotone. | `rockstream-control::frontier::FrontierAggregator` validates scope and authority before calling the kernel. |
+| `crates/rockstream-verified/src/frontier.rs::fixed_membership_transition` | A fixed-membership report transition never lowers the admitted epoch. | The control adapter computes the meet only across the configured active set and treats missing reports as no completeness. |
+| `crates/rockstream-verified/src/frontier.rs::activation_preserves_publication` | A new member's durable bootstrap is at least the currently published frontier, or no publication exists. | Membership activation/replacement supplies the durable catch-up evidence and rejects generation overflow. |
+| `crates/rockstream-verified/src/frontier.rs::completes_before` | Frontier `F` completes epochs strictly less than `F`. | Reporters, readers, and cleanup consumers use the exclusive comparison. |

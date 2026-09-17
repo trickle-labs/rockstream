@@ -36,11 +36,14 @@
 //! (`frontier/leader`, `frontier/published`) — it is not a queue or buffer
 //! and cannot grow unboundedly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rockstream_types::frontier::{ClusterFrontier, ShardFrontierReport};
+use rockstream_types::frontier::{
+    ClusterFrontier, FrontierGeneration, FrontierMembership, MembershipFrontierReport,
+    ShardFrontierReport, ShardIncarnation, FRONTIER_REPORT_VERSION,
+};
 use rockstream_types::ids::{AggregatorId, LeaseToken, ShardId};
 use rockstream_types::timestamp::Epoch;
 use slatedb::config::WriteOptions;
@@ -62,6 +65,39 @@ pub enum AggregatorError {
          next_steps: scale out aggregators or reduce shard count"
     )]
     RegistryFull,
+    /// The compatibility scalar report cannot establish membership authority.
+    #[error(
+        "RS-8004 frontier report rejected: configured aggregators require the versioned membership envelope"
+    )]
+    LegacyReportRejected,
+    /// A membership-aware report was sent to an aggregator without a configured scope.
+    #[error("RS-8004 frontier report rejected: membership is not configured")]
+    MembershipNotConfigured,
+    /// The report envelope version is not supported.
+    #[error("RS-8004 frontier report rejected: unsupported report version {0}")]
+    UnsupportedReportVersion(u16),
+    /// The report belongs to another query/deployment scope.
+    #[error("RS-8004 frontier report rejected: scope mismatch")]
+    ScopeMismatch,
+    /// The report belongs to another membership generation.
+    #[error(
+        "RS-8004 frontier report rejected: stale membership generation; expected {expected}, got {actual}"
+    )]
+    GenerationMismatch { expected: u64, actual: u64 },
+    /// The report's shard is not active in the configured membership.
+    #[error("RS-8004 frontier report rejected: shard {0} is not active")]
+    InactiveShard(ShardId),
+    /// A report from an older shard incarnation cannot affect the active member.
+    #[error("RS-8004 frontier report rejected: stale incarnation for shard {0}")]
+    IncarnationMismatch(ShardId),
+    /// A new member must be durably caught up before activation.
+    #[error(
+        "RS-8004 frontier membership change rejected: bootstrap epoch {bootstrap} is below published frontier {published}"
+    )]
+    ActivationNotCaughtUp { bootstrap: Epoch, published: Epoch },
+    /// Membership generations must not wrap.
+    #[error("RS-8004 frontier membership generation exhausted")]
+    GenerationExhausted,
 }
 
 /// The cluster-wide frontier fill level.
@@ -103,6 +139,10 @@ struct Inner {
     shard_epochs: HashMap<ShardId, Epoch>,
     /// The last published cluster frontier (monotonically non-decreasing).
     published: Option<Epoch>,
+    /// Configured membership. `None` retains the pre-VS4 compatibility path.
+    membership: Option<FrontierMembership>,
+    /// Last durable frontier observed for each active member in the current scope.
+    membership_epochs: BTreeMap<ShardId, Option<Epoch>>,
     /// v0.45.6 (M2-S3): publisher-lease wiring; `None` for aggregators
     /// constructed without a `FrontierLeaseStore` (pre-v0.45.6 behavior).
     lease: Option<LeaseWiring>,
@@ -113,6 +153,8 @@ impl Inner {
         Self {
             shard_epochs: HashMap::new(),
             published: None,
+            membership: None,
+            membership_epochs: BTreeMap::new(),
             lease: None,
         }
     }
@@ -122,6 +164,37 @@ impl Inner {
     /// Returns `None` if no shards have reported yet.
     fn compute_meet(&self) -> Option<Epoch> {
         self.shard_epochs.values().copied().min()
+    }
+
+    fn compute_membership_meet(&self) -> Option<Epoch> {
+        let membership = self.membership.as_ref()?;
+        if membership.active.is_empty() {
+            return None;
+        }
+        let mut epochs = membership
+            .active
+            .keys()
+            .map(|shard_id| self.membership_epochs.get(shard_id).copied().flatten());
+        let first = epochs.next()??;
+        epochs.try_fold(first, |minimum, epoch| {
+            epoch.map(|value| minimum.min(value))
+        })
+    }
+
+    fn recompute_membership_publication(&mut self) {
+        let Some(meet) = self.compute_membership_meet() else {
+            if self
+                .membership
+                .as_ref()
+                .is_some_and(|membership| membership.active.is_empty())
+            {
+                self.published = None;
+            }
+            return;
+        };
+        if self.published.map(|old| meet > old).unwrap_or(true) {
+            self.published = Some(meet);
+        }
     }
 }
 
@@ -147,6 +220,220 @@ impl FrontierAggregator {
         Self {
             inner: Arc::new(Mutex::new(Inner::new())),
         }
+    }
+
+    /// Create an aggregator whose reports are scoped to authoritative active
+    /// membership and configuration generation.
+    pub fn with_membership(membership: FrontierMembership) -> Self {
+        let membership_epochs = membership
+            .active
+            .keys()
+            .copied()
+            .map(|shard_id| (shard_id, None))
+            .collect();
+        let mut inner = Inner::new();
+        inner.membership = Some(membership);
+        inner.membership_epochs = membership_epochs;
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    /// Create a membership-aware aggregator with durable publisher election.
+    pub fn with_membership_and_lease_store(
+        membership: FrontierMembership,
+        aggregator_id: AggregatorId,
+        store: Arc<FrontierLeaseStore>,
+    ) -> Self {
+        let membership_epochs = membership
+            .active
+            .keys()
+            .copied()
+            .map(|shard_id| (shard_id, None))
+            .collect();
+        let mut inner = Inner::new();
+        inner.membership = Some(membership);
+        inner.membership_epochs = membership_epochs;
+        inner.lease = Some(LeaseWiring {
+            store,
+            aggregator_id,
+            is_publisher: false,
+            lease_token: 0,
+        });
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    /// Return the active membership snapshot, if this aggregator uses the VS4
+    /// membership-aware path.
+    pub fn membership(&self) -> Option<FrontierMembership> {
+        self.inner.lock().membership.clone()
+    }
+
+    /// Activate a caught-up shard in the next configuration generation.
+    pub fn activate_shard(
+        &self,
+        shard_id: ShardId,
+        incarnation: ShardIncarnation,
+        bootstrap_epoch: Epoch,
+    ) -> Result<FrontierGeneration, AggregatorError> {
+        let mut inner = self.inner.lock();
+        let membership = inner
+            .membership
+            .as_ref()
+            .ok_or(AggregatorError::MembershipNotConfigured)?;
+        if membership.active.contains_key(&shard_id) {
+            return Err(AggregatorError::InactiveShard(shard_id));
+        }
+        if let Some(published) = inner.published {
+            if !rockstream_verified::frontier::activation_preserves_publication(
+                Some(published),
+                bootstrap_epoch,
+            ) {
+                return Err(AggregatorError::ActivationNotCaughtUp {
+                    bootstrap: bootstrap_epoch,
+                    published,
+                });
+            }
+        }
+        let generation = membership
+            .generation
+            .0
+            .checked_add(1)
+            .ok_or(AggregatorError::GenerationExhausted)?;
+        let mut next = membership.clone();
+        next.generation = FrontierGeneration(generation);
+        next.active.insert(shard_id, incarnation);
+        inner.membership = Some(next);
+        inner
+            .membership_epochs
+            .insert(shard_id, Some(bootstrap_epoch));
+        inner.recompute_membership_publication();
+        Ok(FrontierGeneration(generation))
+    }
+
+    /// Retire an active shard. Removing a member cannot make a safe
+    /// publication unsafe; an empty active set publishes no completeness.
+    pub fn retire_shard(&self, shard_id: ShardId) -> Result<FrontierGeneration, AggregatorError> {
+        let mut inner = self.inner.lock();
+        let membership = inner
+            .membership
+            .as_ref()
+            .ok_or(AggregatorError::MembershipNotConfigured)?;
+        if !membership.active.contains_key(&shard_id) {
+            return Err(AggregatorError::InactiveShard(shard_id));
+        }
+        let generation = membership
+            .generation
+            .0
+            .checked_add(1)
+            .ok_or(AggregatorError::GenerationExhausted)?;
+        let mut next = membership.clone();
+        next.generation = FrontierGeneration(generation);
+        next.active.remove(&shard_id);
+        inner.membership = Some(next);
+        inner.membership_epochs.remove(&shard_id);
+        inner.recompute_membership_publication();
+        Ok(FrontierGeneration(generation))
+    }
+
+    /// Replace one active incarnation without opening a publication gap.
+    pub fn replace_shard(
+        &self,
+        old_shard_id: ShardId,
+        new_shard_id: ShardId,
+        new_incarnation: ShardIncarnation,
+        bootstrap_epoch: Epoch,
+    ) -> Result<FrontierGeneration, AggregatorError> {
+        let mut inner = self.inner.lock();
+        let membership = inner
+            .membership
+            .as_ref()
+            .ok_or(AggregatorError::MembershipNotConfigured)?;
+        if !membership.active.contains_key(&old_shard_id)
+            || (new_shard_id != old_shard_id && membership.active.contains_key(&new_shard_id))
+        {
+            return Err(AggregatorError::InactiveShard(old_shard_id));
+        }
+        if let Some(published) = inner.published {
+            if !rockstream_verified::frontier::activation_preserves_publication(
+                Some(published),
+                bootstrap_epoch,
+            ) {
+                return Err(AggregatorError::ActivationNotCaughtUp {
+                    bootstrap: bootstrap_epoch,
+                    published,
+                });
+            }
+        }
+        let generation = membership
+            .generation
+            .0
+            .checked_add(1)
+            .ok_or(AggregatorError::GenerationExhausted)?;
+        let mut next = membership.clone();
+        next.generation = FrontierGeneration(generation);
+        next.active.remove(&old_shard_id);
+        next.active.insert(new_shard_id, new_incarnation);
+        inner.membership = Some(next);
+        inner.membership_epochs.remove(&old_shard_id);
+        inner
+            .membership_epochs
+            .insert(new_shard_id, Some(bootstrap_epoch));
+        inner.recompute_membership_publication();
+        Ok(FrontierGeneration(generation))
+    }
+
+    /// Admit a report only when its scope, generation, incarnation, and
+    /// version match the active configuration.
+    pub fn ingest_membership_report(
+        &self,
+        report: MembershipFrontierReport,
+    ) -> Result<(), AggregatorError> {
+        let mut inner = self.inner.lock();
+        let membership = inner
+            .membership
+            .as_ref()
+            .ok_or(AggregatorError::MembershipNotConfigured)?;
+        if report.version != FRONTIER_REPORT_VERSION {
+            return Err(AggregatorError::UnsupportedReportVersion(report.version));
+        }
+        if report.scope != membership.scope {
+            return Err(AggregatorError::ScopeMismatch);
+        }
+        if report.generation.0 != membership.generation.0 {
+            return Err(AggregatorError::GenerationMismatch {
+                expected: membership.generation.0,
+                actual: report.generation.0,
+            });
+        }
+        let Some(expected_incarnation) = membership.active.get(&report.shard_id) else {
+            return Err(AggregatorError::InactiveShard(report.shard_id));
+        };
+        if *expected_incarnation != report.incarnation {
+            return Err(AggregatorError::IncarnationMismatch(report.shard_id));
+        }
+        let current_epoch = inner
+            .membership_epochs
+            .get(&report.shard_id)
+            .copied()
+            .flatten()
+            .unwrap_or(0);
+        let next_epoch = rockstream_verified::frontier::admit_frontier_report(
+            report.version,
+            true,
+            true,
+            true,
+            current_epoch,
+            report.epoch,
+        )
+        .expect("validated membership report must be admitted");
+        inner
+            .membership_epochs
+            .insert(report.shard_id, Some(next_epoch));
+        inner.recompute_membership_publication();
+        Ok(())
     }
 
     /// Create an aggregator wired to a durable [`FrontierLeaseStore`] for
@@ -205,13 +492,17 @@ impl FrontierAggregator {
     /// Panics if this aggregator was constructed with
     /// [`FrontierAggregator::new`] (no lease store wired).
     pub async fn acquire_lease(&self) -> Result<bool, FrontierLeaseError> {
-        let (store, aggregator_id) = {
+        let (store, aggregator_id, generation) = {
             let inner = self.inner.lock();
             let lease = inner
                 .lease
                 .as_ref()
                 .expect("acquire_lease called without a lease store; use with_lease_store()");
-            (lease.store.clone(), lease.aggregator_id)
+            (
+                lease.store.clone(),
+                lease.aggregator_id,
+                inner.membership.as_ref().map(|m| m.generation.0),
+            )
         };
 
         let current_fence_token = store.current_fence_token().await;
@@ -223,12 +514,21 @@ impl FrontierAggregator {
                 // S5: lease-handoff read — must observe a synchronously
                 // flushed value (panics via assert_flush_before_lease_handoff_read
                 // otherwise).
-                let published = store.read_published_frontier_after_handoff().await;
+                let published = match generation {
+                    Some(generation) => {
+                        store
+                            .read_published_frontier_after_handoff_for_generation(generation)
+                            .await?
+                    }
+                    None => store.read_published_frontier_after_handoff().await,
+                };
 
                 let mut inner = self.inner.lock();
-                if let Some(epoch) = published {
-                    if inner.published.map(|p| epoch > p).unwrap_or(true) {
-                        inner.published = Some(epoch);
+                if inner.membership.as_ref().map(|m| m.generation.0) == generation {
+                    if let Some(epoch) = published {
+                        if inner.published.map(|p| epoch > p).unwrap_or(true) {
+                            inner.published = Some(epoch);
+                        }
                     }
                 }
                 let lease = inner.lease.as_mut().expect("checked above");
@@ -263,7 +563,7 @@ impl FrontierAggregator {
     /// Panics if this aggregator was constructed with
     /// [`FrontierAggregator::new`] (no lease store wired).
     pub async fn try_publish(&self) -> Result<bool, FrontierLeaseError> {
-        let (store, held_token, meet) = {
+        let (store, held_token, generation, meet) = {
             let inner = self.inner.lock();
             let lease = inner
                 .lease
@@ -272,7 +572,16 @@ impl FrontierAggregator {
             if !lease.is_publisher {
                 return Ok(false);
             }
-            (lease.store.clone(), lease.lease_token, inner.compute_meet())
+            (
+                lease.store.clone(),
+                lease.lease_token,
+                inner.membership.as_ref().map(|m| m.generation.0),
+                if inner.membership.is_some() {
+                    inner.compute_membership_meet()
+                } else {
+                    inner.compute_meet()
+                },
+            )
         };
         let Some(meet) = meet else {
             return Ok(false); // No shard reports yet — nothing to publish.
@@ -288,9 +597,18 @@ impl FrontierAggregator {
             return Ok(false);
         }
 
-        store.publish_frontier(LeaseToken(held_token), meet).await?;
+        match generation {
+            Some(generation) => {
+                store
+                    .publish_frontier_for_generation(LeaseToken(held_token), generation, meet)
+                    .await?
+            }
+            None => store.publish_frontier(LeaseToken(held_token), meet).await?,
+        }
         let mut inner = self.inner.lock();
-        if inner.published.map(|p| meet > p).unwrap_or(true) {
+        if inner.membership.as_ref().map(|m| m.generation.0) == generation
+            && inner.published.map(|p| meet > p).unwrap_or(true)
+        {
             inner.published = Some(meet);
         }
         Ok(true)
@@ -312,6 +630,10 @@ impl FrontierAggregator {
     /// `MAX_REGISTERED_SHARDS` is exceeded.
     pub fn ingest(&self, report: ShardFrontierReport) -> Result<(), AggregatorError> {
         let mut inner = self.inner.lock();
+
+        if inner.membership.is_some() {
+            return Err(AggregatorError::LegacyReportRejected);
+        }
 
         // Enforce registry capacity bound.
         if !inner.shard_epochs.contains_key(&report.shard_id)
@@ -418,11 +740,12 @@ pub enum FrontierLeaseError {
 /// by [`FrontierLeaseStore`]'s async mutex so CAS decisions and their
 /// durable writes are serialized within one process (the single
 /// control-plane leader — see M7).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct LeaseState {
     fence_token: u64,
     holder: Option<AggregatorId>,
     published: Option<Epoch>,
+    published_by_generation: HashMap<u64, Epoch>,
     /// v0.45.6 (M2-S3/S4 pair): `true` once `published` has been confirmed
     /// durably flushed (`WriteOptions { await_durable: true }`) — checked by
     /// [`assert_flush_before_lease_handoff_read`] on every lease handoff.
@@ -460,6 +783,7 @@ impl FrontierLeaseStore {
 
         let (fence_token, holder) = read_lease_record(&db).await?;
         let published = read_published(&db).await?;
+        let published_by_generation = HashMap::new();
 
         Ok(Self {
             db,
@@ -467,6 +791,7 @@ impl FrontierLeaseStore {
                 fence_token,
                 holder,
                 published,
+                published_by_generation,
                 // A value recovered from a prior run was, by construction,
                 // written with await_durable: true (every write path does
                 // so) — it is therefore already sync-flushed.
@@ -567,12 +892,41 @@ impl FrontierLeaseStore {
         token: LeaseToken,
         frontier: Epoch,
     ) -> Result<(), FrontierLeaseError> {
+        self.publish_frontier_inner(token, None, frontier, PUBLISHED_FRONTIER_KEY)
+            .await
+    }
+
+    /// Publish a frontier under a configuration generation. Generation-scoped
+    /// keys prevent a restarted publisher from treating an older membership's
+    /// publication as progress for a new active set.
+    pub async fn publish_frontier_for_generation(
+        &self,
+        token: LeaseToken,
+        generation: u64,
+        frontier: Epoch,
+    ) -> Result<(), FrontierLeaseError> {
+        let key = published_frontier_generation_key(generation);
+        self.publish_frontier_inner(token, Some(generation), frontier, &key)
+            .await
+    }
+
+    async fn publish_frontier_inner(
+        &self,
+        token: LeaseToken,
+        generation: Option<u64>,
+        frontier: Epoch,
+        key: &[u8],
+    ) -> Result<(), FrontierLeaseError> {
         let mut state = self.state.lock().await;
 
         // M2-S3 paired assertion (S4): hard invariant, not a graceful error.
         assert_valid_publisher(state.holder, token.0, state.fence_token);
 
-        if let Some(current) = state.published {
+        let current = match generation {
+            Some(generation) => state.published_by_generation.get(&generation).copied(),
+            None => state.published,
+        };
+        if let Some(current) = current {
             if frontier < current {
                 // M2-S4: stale write silently rejected; frontier never retreats.
                 return Ok(());
@@ -580,7 +934,7 @@ impl FrontierLeaseStore {
         }
 
         let mut batch = WriteBatch::new();
-        batch.put(PUBLISHED_FRONTIER_KEY, frontier.to_be_bytes());
+        batch.put(key, frontier.to_be_bytes());
         self.db
             .write_with_options(
                 batch,
@@ -592,14 +946,18 @@ impl FrontierLeaseStore {
             .await
             .map_err(|e| FrontierLeaseError::Storage(e.to_string()))?;
 
-        state.published = Some(frontier);
+        if let Some(generation) = generation {
+            state.published_by_generation.insert(generation, frontier);
+        } else {
+            state.published = Some(frontier);
+        }
         state.last_write_synced = true;
 
         if let Some(audit) = &self.audit {
             let _ = audit.append(&AuditEvent::now(
                 "frontier-aggregator",
                 "frontier.published",
-                frontier.to_string(),
+                format!("generation={generation:?},frontier={frontier}"),
             ));
         }
 
@@ -618,6 +976,32 @@ impl FrontierLeaseStore {
         assert_flush_before_lease_handoff_read(state.published.is_some(), state.last_write_synced);
         state.published
     }
+
+    /// Read the synchronously persisted frontier for one membership generation.
+    pub async fn read_published_frontier_after_handoff_for_generation(
+        &self,
+        generation: u64,
+    ) -> Result<Option<Epoch>, FrontierLeaseError> {
+        let mut state = self.state.lock().await;
+        if let Some(frontier) = state.published_by_generation.get(&generation).copied() {
+            assert_flush_before_lease_handoff_read(true, state.last_write_synced);
+            return Ok(Some(frontier));
+        }
+        let frontier =
+            read_published_key(&self.db, &published_frontier_generation_key(generation)).await?;
+        if let Some(frontier) = frontier {
+            state.published_by_generation.insert(generation, frontier);
+            state.last_write_synced = true;
+            assert_flush_before_lease_handoff_read(true, state.last_write_synced);
+        } else {
+            assert_flush_before_lease_handoff_read(false, state.last_write_synced);
+        }
+        Ok(frontier)
+    }
+}
+
+fn published_frontier_generation_key(generation: u64) -> Vec<u8> {
+    format!("frontier/published/{generation}").into_bytes()
 }
 
 async fn read_lease_record(db: &Db) -> Result<(u64, Option<AggregatorId>), FrontierLeaseError> {
@@ -636,8 +1020,12 @@ async fn read_lease_record(db: &Db) -> Result<(u64, Option<AggregatorId>), Front
 }
 
 async fn read_published(db: &Db) -> Result<Option<Epoch>, FrontierLeaseError> {
+    read_published_key(db, PUBLISHED_FRONTIER_KEY).await
+}
+
+async fn read_published_key(db: &Db, key: &[u8]) -> Result<Option<Epoch>, FrontierLeaseError> {
     match db
-        .get(PUBLISHED_FRONTIER_KEY)
+        .get(key)
         .await
         .map_err(|e| FrontierLeaseError::Storage(e.to_string()))?
     {
@@ -701,7 +1089,6 @@ pub fn assert_flush_before_lease_handoff_read(has_published_value: bool, last_wr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rockstream_types::frontier::ShardFrontierReport;
     use rockstream_types::ids::ShardId;
 
     /// Slice 6: basic single-shard report advances cluster frontier.
@@ -1062,5 +1449,134 @@ mod lease_tests {
         })
         .unwrap();
         assert!(!agg.try_publish().await.unwrap());
+    }
+
+    fn membership_report(
+        generation: u64,
+        shard_id: u64,
+        incarnation: u64,
+        epoch: Epoch,
+    ) -> MembershipFrontierReport {
+        MembershipFrontierReport::new(
+            "view-1",
+            FrontierGeneration(generation),
+            ShardId(shard_id),
+            ShardIncarnation(incarnation),
+            rockstream_types::ids::LeaseToken(1),
+            epoch,
+        )
+    }
+
+    #[test]
+    fn membership_publication_never_overstates_a_new_member() {
+        let membership = FrontierMembership::new("view-1", FrontierGeneration(0))
+            .with_active(ShardId(1), ShardIncarnation(1));
+        let agg = FrontierAggregator::with_membership(membership);
+        agg.ingest_membership_report(membership_report(0, 1, 1, 10))
+            .unwrap();
+        assert_eq!(agg.cluster_frontier().epoch, Some(10));
+
+        assert!(matches!(
+            agg.activate_shard(ShardId(2), ShardIncarnation(1), 5),
+            Err(AggregatorError::ActivationNotCaughtUp { .. })
+        ));
+        assert_eq!(agg.cluster_frontier().epoch, Some(10));
+
+        let generation = agg
+            .activate_shard(ShardId(2), ShardIncarnation(1), 10)
+            .unwrap();
+        assert_eq!(generation, FrontierGeneration(1));
+        assert_eq!(agg.cluster_frontier().epoch, Some(10));
+    }
+
+    #[test]
+    fn stale_generation_and_incarnation_reports_leave_state_unchanged() {
+        let membership = FrontierMembership::new("view-1", FrontierGeneration(3))
+            .with_active(ShardId(1), ShardIncarnation(7))
+            .with_active(ShardId(2), ShardIncarnation(2));
+        let agg = FrontierAggregator::with_membership(membership);
+        agg.ingest_membership_report(membership_report(3, 1, 7, 5))
+            .unwrap();
+        agg.ingest_membership_report(membership_report(3, 2, 2, 5))
+            .unwrap();
+        assert_eq!(agg.cluster_frontier().epoch, Some(5));
+
+        assert!(matches!(
+            agg.ingest_membership_report(membership_report(2, 1, 7, 99)),
+            Err(AggregatorError::GenerationMismatch { .. })
+        ));
+        assert!(matches!(
+            agg.ingest_membership_report(membership_report(3, 1, 6, 99)),
+            Err(AggregatorError::IncarnationMismatch(_))
+        ));
+        assert_eq!(agg.cluster_frontier().epoch, Some(5));
+    }
+
+    #[test]
+    fn membership_changes_reset_empty_scope_and_advance_generation() {
+        let membership = FrontierMembership::new("view-1", FrontierGeneration(0))
+            .with_active(ShardId(1), ShardIncarnation(1));
+        let agg = FrontierAggregator::with_membership(membership);
+        agg.ingest_membership_report(membership_report(0, 1, 1, 10))
+            .unwrap();
+
+        assert_eq!(agg.retire_shard(ShardId(1)).unwrap(), FrontierGeneration(1));
+        assert_eq!(agg.cluster_frontier().epoch, None);
+
+        assert_eq!(
+            agg.activate_shard(ShardId(2), ShardIncarnation(2), 0)
+                .unwrap(),
+            FrontierGeneration(2)
+        );
+        assert_eq!(agg.cluster_frontier().epoch, Some(0));
+
+        assert_eq!(
+            agg.replace_shard(ShardId(2), ShardId(3), ShardIncarnation(3), 0)
+                .unwrap(),
+            FrontierGeneration(3)
+        );
+        assert_eq!(agg.cluster_frontier().epoch, Some(0));
+        assert!(matches!(
+            agg.ingest_membership_report(membership_report(2, 2, 2, 99)),
+            Err(AggregatorError::GenerationMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn configured_aggregators_reject_legacy_scalar_reports() {
+        let membership = FrontierMembership::new("view-1", FrontierGeneration(0));
+        let agg = FrontierAggregator::with_membership(membership);
+        assert_eq!(
+            agg.ingest(ShardFrontierReport {
+                shard_id: ShardId(1),
+                epoch: 10,
+            }),
+            Err(AggregatorError::LegacyReportRejected)
+        );
+        assert_eq!(agg.cluster_frontier().epoch, None);
+    }
+
+    #[tokio::test]
+    async fn membership_publication_uses_a_generation_scoped_durable_key() {
+        let store = Arc::new(new_test_store().await);
+        let membership = FrontierMembership::new("view-1", FrontierGeneration(0))
+            .with_active(ShardId(1), ShardIncarnation(1));
+        let agg = FrontierAggregator::with_membership_and_lease_store(
+            membership,
+            AggregatorId(1),
+            store.clone(),
+        );
+        assert!(agg.acquire_lease().await.unwrap());
+        agg.ingest_membership_report(membership_report(0, 1, 1, 10))
+            .unwrap();
+        assert!(agg.try_publish().await.unwrap());
+        assert_eq!(
+            store
+                .read_published_frontier_after_handoff_for_generation(0)
+                .await
+                .unwrap(),
+            Some(10)
+        );
+        assert_eq!(store.read_published_frontier_after_handoff().await, None);
     }
 }
