@@ -38,6 +38,9 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,7 +62,7 @@ jobs:
             --tag rockstream-tc-test:latest \
             --load \
             --cache-from type=gha,scope=rockstream-tc-test-check \
-            --cache-to type=gha,mode=max,ignore-error=true,scope=rockstream-tc-test-check \
+            --cache-to type=gha,mode=max,scope=rockstream-tc-test-check \
             .
       - name: cargo fmt
         run: cargo fmt --all --check
