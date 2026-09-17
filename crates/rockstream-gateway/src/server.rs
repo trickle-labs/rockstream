@@ -1683,6 +1683,19 @@ fn encode_typed_field(
     datatype: &Type,
     val: Option<&str>,
 ) -> PgWireResult<()> {
+    encode_typed_field_with_format(encoder, datatype, val, None)
+}
+
+fn encode_typed_field_with_format(
+    encoder: &mut DataRowEncoder,
+    datatype: &Type,
+    val: Option<&str>,
+    format: Option<FieldFormat>,
+) -> PgWireResult<()> {
+    if *datatype == Type::NUMERIC && format == Some(FieldFormat::Text) {
+        return encoder.encode_field_with_type_and_format(&val, datatype, FieldFormat::Text);
+    }
+
     let encode_res = match *datatype {
         Type::INT2 => {
             let parsed = val.and_then(|s| s.parse::<i16>().ok());
@@ -1791,9 +1804,10 @@ fn encode_arrow_cell(
     datatype: &Type,
     array: &arrow::array::ArrayRef,
     row_idx: usize,
+    format: FieldFormat,
 ) -> PgWireResult<()> {
     if array.is_null(row_idx) {
-        return encode_typed_field(encoder, datatype, None);
+        return encode_typed_field_with_format(encoder, datatype, None, Some(format));
     }
     use arrow::array::*;
     if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
@@ -1865,14 +1879,24 @@ fn encode_arrow_cell(
         return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
     }
     if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-        return encode_typed_field(encoder, datatype, Some(arr.value(row_idx)));
+        return encode_typed_field_with_format(
+            encoder,
+            datatype,
+            Some(arr.value(row_idx)),
+            Some(format),
+        );
     }
     if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return encode_typed_field(encoder, datatype, Some(arr.value(row_idx)));
+        return encode_typed_field_with_format(
+            encoder,
+            datatype,
+            Some(arr.value(row_idx)),
+            Some(format),
+        );
     }
     let s = datafusion::arrow::util::display::array_value_to_string(array.as_ref(), row_idx)
         .unwrap_or_default();
-    encode_typed_field(encoder, datatype, Some(&s))
+    encode_typed_field_with_format(encoder, datatype, Some(&s), Some(format))
 }
 
 #[derive(Debug, Clone)]
@@ -7553,8 +7577,7 @@ impl GatewayHandler {
             if let Some(n) = limit {
                 rows.truncate(n);
             }
-            crate::view_reader::tsv_rows_to_record_batches(&rows)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            stored_rows_to_batches(&self.catalog, view_name, &rows)?
         } else if let Some(shard_db) = &self.shard_db {
             let mut rows: Vec<Vec<u8>> = if let Some(view) = self.catalog.get_view(view_name) {
                 if view.op_id.is_some() {
@@ -7613,8 +7636,7 @@ impl GatewayHandler {
             if let Some(n) = limit {
                 rows.truncate(n);
             }
-            crate::view_reader::tsv_rows_to_record_batches(&rows)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            stored_rows_to_batches(&self.catalog, view_name, &rows)?
         } else {
             let mut batches = self
                 .view_reader
@@ -7651,7 +7673,13 @@ impl GatewayHandler {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
                 for c in 0..col_count {
                     let datatype = schema_ref[c].datatype();
-                    encode_arrow_cell(&mut encoder, datatype, batch.column(c), row_idx)?;
+                    encode_arrow_cell(
+                        &mut encoder,
+                        datatype,
+                        batch.column(c),
+                        row_idx,
+                        schema_ref[c].format(),
+                    )?;
                 }
                 row_results.push(encoder.finish());
             }
@@ -14758,14 +14786,13 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                                     .collect::<String>()
                             }
                         }),
-                    ArrowDataType::Decimal128(_precision, scale) => col
-                        .as_any()
-                        .downcast_ref::<datafusion::arrow::array::Decimal128Array>()
-                        .map(|a| {
-                            let val = a.value(row_idx);
-                            rust_decimal::Decimal::from_i128_with_scale(val, *scale as u32)
-                                .to_string()
-                        }),
+                    ArrowDataType::Decimal128(_, _) | ArrowDataType::Decimal256(_, _) => {
+                        datafusion::arrow::util::display::array_value_to_string(
+                            col.as_ref(),
+                            row_idx,
+                        )
+                        .ok()
+                    }
                     ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => col
                         .as_any()
                         .downcast_ref::<StringArray>()
@@ -14786,7 +14813,12 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
         let mut encoder = DataRowEncoder::new(schema_ref.clone());
         for (col_idx, val) in row_vals.iter().enumerate() {
             let datatype = schema_ref[col_idx].datatype();
-            encode_typed_field(&mut encoder, datatype, val.as_deref())?;
+            encode_typed_field_with_format(
+                &mut encoder,
+                datatype,
+                val.as_deref(),
+                Some(schema_ref[col_idx].format()),
+            )?;
         }
         encoder.finish()
     });
@@ -14830,6 +14862,57 @@ fn query_time_relation_schema(catalog: &CatalogStubs, relation_name: &str) -> Sc
         datafusion::arrow::datatypes::DataType::Utf8,
         true,
     )]))
+}
+
+fn stored_rows_to_batches(
+    catalog: &CatalogStubs,
+    relation_name: &str,
+    rows: &[Vec<u8>],
+) -> PgWireResult<Vec<RecordBatch>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let columns = catalog
+        .get_table(relation_name)
+        .map(|table| table.columns)
+        .or_else(|| catalog.get_view(relation_name).map(|view| view.columns))
+        .unwrap_or_default();
+    let has_decimal = columns
+        .iter()
+        .any(|column| column.data_type.to_ascii_lowercase().starts_with("decimal"));
+    if !has_decimal {
+        return crate::view_reader::tsv_rows_to_record_batches(rows)
+            .map_err(|error| PgWireError::ApiError(Box::new(error)));
+    }
+    let relation_schema = query_time_relation_schema(catalog, relation_name);
+    let schema = if columns
+        .iter()
+        .any(|column| column.data_type.eq_ignore_ascii_case("decimal"))
+    {
+        Arc::new(Schema::new(
+            relation_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let data_type = columns
+                        .get(index)
+                        .filter(|column| column.data_type.eq_ignore_ascii_case("decimal"))
+                        .map(|_| datafusion::arrow::datatypes::DataType::Utf8)
+                        .unwrap_or_else(|| field.data_type().clone());
+                    Field::new(field.name(), data_type, field.is_nullable())
+                })
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        relation_schema
+    };
+    let batch = tsv_to_record_batch(schema, rows).map_err(|error| {
+        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+            detail: format!("decode stored rows for '{relation_name}': {error}"),
+        }))
+    })?;
+    Ok(vec![batch])
 }
 
 fn full_row_pk(column_count: usize) -> Vec<usize> {
