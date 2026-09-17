@@ -151,3 +151,177 @@ evidence = [
     "docs/adr/0004-merge-law-arithmetic.md",
     "docs/ivm-operators.md",
 ]
+
+[[claims]]
+id = "VS2-01"
+status = "adapter-qualified"
+domain = "Versioned shard-local and catalog layouts with the recorded discriminator and namespace allocation assumptions."
+assumptions = ["Operator IDs and catalog IDs use their existing fixed-width big-endian domains; variable-length arrangement fields remain outside the selected codec claim unless explicitly framed."]
+implementation = [
+    "crates/rockstream-storage/src/keys.rs::encode",
+    "crates/rockstream-storage/src/keys.rs::decode",
+    "crates/rockstream-storage/src/keys.rs::namespace_prefix",
+]
+theorems = [
+    "crates/rockstream-verified/src/codecs.rs::encode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::encode_u128_be",
+]
+production_callers = [
+    "crates/rockstream-storage/src/reader.rs::scan_op_state_prefix",
+    "crates/rockstream-storage/src/tests.rs::catalog_keys_store_and_retrieve_with_namespace",
+]
+regression_tests = [
+    "crates/rockstream-storage/src/keys.rs::shard_key_prefix_is_proper_prefix",
+    "crates/rockstream-storage/src/keys.rs::catalog_namespace_prefix_filters_correctly",
+]
+evidence = [
+    "formal/verus/key-layouts.toml",
+    "cargo test --locked -p rockstream-storage keys --lib",
+]
+
+[[claims]]
+id = "VS2-02"
+status = "kernel-verified"
+domain = "All i64 values encoded as ascending or descending fixed-width big-endian signed-order keys."
+assumptions = ["Lexicographic byte order is the storage engine's scan order and the surrounding encoder preserves the eight-byte width."]
+implementation = [
+    "crates/rockstream-verified/src/keys.rs::signed_order_key",
+    "crates/rockstream-verified/src/keys.rs::signed_order_key_decode",
+]
+theorems = [
+    "crates/rockstream-verified/src/keys.rs::signed_order_key_round_trips",
+    "crates/rockstream-verified/src/keys.rs::signed_order_key_preserves_order",
+]
+production_callers = [
+    "crates/rockstream-storage/src/keys.rs::minmax_sort_key",
+    "crates/rockstream-storage/src/keys.rs::minmax_sort_key_decode",
+    "crates/rockstream-storage/src/keys.rs::window_sort_key",
+    "crates/rockstream-storage/src/keys.rs::window_sort_key_decode",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::signed_order_kernel_matches_persisted_extremes",
+    "crates/rockstream-storage/src/keys.rs::signed_sort_keys_round_trip_and_order_at_i64_extremes",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-storage keys --lib",
+]
+
+[[claims]]
+id = "VS2-03"
+status = "adapter-qualified"
+domain = "Fixed-width u64/u128 fields, exact-width decoding, checked usize-to-u32 framing, and the selected generic/catalog/factor-payload key layouts."
+assumptions = ["Allocation failure is a process/recovery concern; malformed widths and arithmetic overflow are returned as decode failure before slicing."]
+implementation = [
+    "crates/rockstream-verified/src/codecs.rs::encode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::encode_u128_be",
+    "crates/rockstream-verified/src/codecs.rs::decode_u128_be",
+    "crates/rockstream-verified/src/codecs.rs::checked_usize_to_u32",
+    "crates/rockstream-storage/src/keys.rs::decode_factor_payload_key",
+    "crates/rockstream-storage/src/keys.rs::try_factor_payload_key",
+]
+theorems = [
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::decode_u128_be",
+    "crates/rockstream-verified/src/codecs.rs::checked_usize_to_u32",
+]
+production_callers = [
+    "crates/rockstream-storage/src/keys.rs::encode",
+    "crates/rockstream-storage/src/keys.rs::decode",
+    "crates/rockstream-storage/src/keys.rs::factor_payload_key",
+    "crates/rockstream-storage/src/keys.rs::try_factor_payload_key",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths",
+    "crates/rockstream-storage/src/keys.rs::factor_payload_codec_rejects_wrong_capsule_lengths",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-storage keys --lib",
+]
+
+[[claims]]
+id = "VS2-04"
+status = "adapter-qualified"
+domain = "Existing persisted bytes and prefix scans for generic shard and namespaced catalog keys; no unversioned format migration."
+assumptions = ["Supported LFS and MinIO adapters preserve bytewise key ordering and prefix-scan semantics; the storage backend itself is not formally verified."]
+implementation = [
+    "crates/rockstream-storage/src/keys.rs::encode",
+    "crates/rockstream-storage/src/keys.rs::decode",
+    "crates/rockstream-storage/src/keys.rs::encode_with_suffix",
+]
+theorems = [
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::decode_u128_be",
+]
+production_callers = [
+    "crates/rockstream-storage/src/reader.rs::scan_op_state_prefix",
+    "crates/rockstream-storage/src/tests.rs::catalog_keys_store_and_retrieve_with_namespace",
+]
+regression_tests = [
+    "crates/rockstream-storage/src/keys.rs::shard_key_encode_decode_roundtrip",
+    "crates/rockstream-storage/src/keys.rs::catalog_namespace_prefix_filters_correctly",
+]
+evidence = [
+    "cargo test --locked -p rockstream-storage keys --lib",
+    "cargo test --locked -p rockstream-storage --test lfs_backend",
+    "cargo test --locked -p rockstream-storage --test minio_backend",
+    "cargo test --locked -p rockstream-ops --test lfs_time_window",
+]
+
+[[claims]]
+id = "VS2-05"
+status = "kernel-verified"
+domain = "Nonzero power-of-two u16 bucket counts, clamped key-prefix lengths, and mask routes bounded below the configured count."
+assumptions = ["FNV-1a supplies the deterministic u64 hash; balance, collision freedom, and minimal movement are not claimed."]
+implementation = [
+    "crates/rockstream-verified/src/routing.rs::clamp_prefix_len",
+    "crates/rockstream-verified/src/routing.rs::route_power_of_two_hash",
+]
+theorems = [
+    "crates/rockstream-verified/src/routing.rs::route_power_of_two_hash",
+]
+production_callers = [
+    "crates/rockstream-plan/src/virtual_bucket.rs::route_power_of_two_bucket",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::routing_kernel_rejects_invalid_counts_and_bounds_valid_routes",
+    "crates/rockstream-plan/tests/virtual_bucket_routing_tests.rs::power_of_two_routing_is_deterministic_and_bounded",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests",
+]
+
+[[claims]]
+id = "VS2-06"
+status = "adapter-qualified"
+domain = "Designated sign-bit, endian, discriminator, length, and bucket-mask mutations are rejected by exact-output tests."
+assumptions = ["The mutation fixtures exercise the selected kernel and adapter seams; backend scan behavior remains an external qualification obligation."]
+implementation = [
+    "crates/rockstream-verified/src/keys.rs::signed_order_key",
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+    "crates/rockstream-verified/src/routing.rs::route_power_of_two_hash",
+]
+theorems = [
+    "crates/rockstream-verified/src/keys.rs::signed_order_key_preserves_order",
+    "crates/rockstream-verified/src/routing.rs::route_power_of_two_hash",
+]
+production_callers = [
+    "crates/rockstream-storage/src/keys.rs::minmax_sort_key",
+    "crates/rockstream-plan/src/virtual_bucket.rs::route_power_of_two_bucket",
+]
+regression_tests = [
+    "crates/rockstream-storage/src/keys.rs::signed_sort_keys_round_trip_and_order_at_i64_extremes",
+    "crates/rockstream-storage/src/keys.rs::factor_payload_codec_rejects_wrong_capsule_lengths",
+    "crates/rockstream-verified/src/lib.rs::routing_kernel_rejects_invalid_counts_and_bounds_valid_routes",
+]
+evidence = [
+    "formal/verus/vs2-mutation-matrix.toml",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-storage keys --lib",
+    "cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests",
+]

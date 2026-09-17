@@ -5406,6 +5406,7 @@ dependencies = [
  "rockstream-sim",
  "rockstream-test-support",
  "rockstream-types",
+ "rockstream-verified",
  "serde",
  "serde_json",
  "serial_test",
