@@ -51,7 +51,7 @@ fn make_cluster_samples() -> Vec<ShardLoadSample> {
 }
 
 #[test]
-fn skew_control_loop_waits_thirty_seconds_then_triggers_split() {
+fn skew_control_loop_waits_thirty_seconds_then_spills_without_domain_admission() {
     let mut controller = AdaptiveSkewSplitter::new(SkewSplitConfig {
         enabled: true,
         hot_key_factor: 10.0,
@@ -95,11 +95,8 @@ fn skew_control_loop_waits_thirty_seconds_then_triggers_split() {
     assert!(decision.load_factor > 10.0);
     assert!(matches!(
         decision.plan,
-        HotKeyMitigationPlan::Split {
-            bucket_count,
-            source,
-            ..
-        } if bucket_count == 8 && source == operator
+        HotKeyMitigationPlan::Spill { shard_id, code, .. }
+            if shard_id == ShardId(99) && code == rockstream_types::error_code::RS_5036
     ));
 }
 
@@ -162,7 +159,7 @@ fn skew_control_loop_audits_non_composable_spill_decision() {
 }
 
 #[test]
-fn routing_decision_tracks_composable_flag_end_to_end() {
+fn routing_decision_requires_executable_domain_admission() {
     let composable = plan_hot_key_mitigation(
         &LawDescriptor::from_bundle(&SumCountV1),
         OperatorId(5),
@@ -176,7 +173,10 @@ fn routing_decision_tracks_composable_flag_end_to_end() {
         ShardId(8),
     );
 
-    assert!(matches!(composable, HotKeyMitigationPlan::Split { .. }));
+    assert!(matches!(
+        composable,
+        HotKeyMitigationPlan::Spill { code, .. } if code == rockstream_types::error_code::RS_5036
+    ));
     assert!(matches!(
         non_composable,
         HotKeyMitigationPlan::Spill { code, .. } if code == rockstream_types::error_code::RS_5036

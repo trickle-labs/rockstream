@@ -1,5 +1,8 @@
 use vstd::prelude::*;
 
+pub mod arithmetic;
+pub mod laws;
+
 verus! {
     // verus-claim: VS0-02
     pub open spec fn is_power_of_two(value: u16) -> bool {

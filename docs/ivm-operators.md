@@ -121,14 +121,22 @@ weight passthrough.
 | Idempotent | false |
 | Duplicate policy | `Merge` |
 | Compaction | `TombstoneGc` |
-| Frontier policy | `AnyAdvancement` |
+| Frontier policy | `ExactOnly` for complete query-visible results |
 | Arrangement | Per-group-key → 16-byte `(sum: i64, count: i64)` |
-| RMW required | **No** (blind merge — abelian group) |
+| RMW required | **No** within the checked operand domain |
 | `EXPLAIN` indicator | ✓ (merge-safe) |
 
 **Description**: Maintains one 16-byte accumulator per group key. Each delta
 row contributes `(sum_contribution × weight, count_contribution × weight)` via
-`SumCount/v1::merge`. The output is a `(group_key → avg/sum/count)` delta.
+`SumCount/v1::merge`; both multiplication and addition are checked. The output
+is a `(group_key → avg/sum/count)` delta. Partial deltas may be signed, but a
+materialized group has a positive count. Complete query-visible output waits
+for an exact frontier; partial advancement is not a complete-result guarantee.
+
+`COUNT(*)` counts rows, while `COUNT(expr)` counts only non-NULL expressions.
+Empty groups have no materialized accumulator, decimal values must fit the
+admitted integer scale, and floating-point AVG finalization is outside the VS1
+proof frontier.
 
 Within one logical epoch, repeated inputs for a group are consolidated before
 the transition is emitted. A changed group produces at most one old-state

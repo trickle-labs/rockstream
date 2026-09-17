@@ -12,7 +12,7 @@ use object_store::ObjectStore;
 use rockstream_types::compatibility::SupportedStorageFormatRange;
 use rockstream_types::frontier::ShardFrontierReport;
 use rockstream_types::ids::ShardId;
-use rockstream_types::merge_law::{ArrangementHeader, MergeLawId};
+use rockstream_types::merge_law::{ArrangementHeader, MergeLawId, MergeLawVersion};
 use slatedb::config::{CheckpointOptions, CheckpointScope, Settings};
 use slatedb::Db;
 
@@ -107,13 +107,6 @@ use crate::merge_registry::SumCountMergeOperator;
 /// identity (uncommon). For the identity element itself, `is_identity` short-
 /// circuits.
 fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes: &[u8]) -> bool {
-    let mut bytes = bytes;
-    if !bytes.is_empty() {
-        let tag = bytes[0];
-        if tag == 0x01 || tag == 0x02 || tag == 0x03 || tag == 0x04 || tag == 0x22 || tag == 0x30 {
-            bytes = &bytes[1..];
-        }
-    }
     if law.is_identity(bytes) {
         return true;
     }
@@ -934,8 +927,10 @@ impl ShardDb {
         let prefix = ShardKeyEncoder::meta_key(b"law_catalog/");
         let entries = self.scan_prefix(&prefix).await?;
         for (_, value) in entries {
-            if value.len() < ArrangementHeader::WIRE_SIZE {
-                continue; // malformed entry — skip (not a law catalog entry)
+            if value.len() != ArrangementHeader::WIRE_SIZE {
+                return Err(StorageError::MalformedArrangementHeader {
+                    length: value.len(),
+                });
             }
             let buf: [u8; 4] = match value[..4].try_into() {
                 Ok(b) => b,
@@ -943,6 +938,34 @@ impl ShardDb {
             };
             let header = ArrangementHeader::decode(&buf);
             if !known_law_ids.contains(&header.law_id) {
+                return Err(StorageError::UnknownMergeLaw {
+                    law_id: header.law_id.0,
+                    law_version: header.law_version.0,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate both law IDs and versions in the shard law catalog.
+    pub async fn validate_law_catalog_versions(
+        &self,
+        known_law_versions: &HashMap<MergeLawId, MergeLawVersion>,
+    ) -> Result<(), StorageError> {
+        let prefix = ShardKeyEncoder::meta_key(b"law_catalog/");
+        let entries = self.scan_prefix(&prefix).await?;
+        for (_, value) in entries {
+            if value.len() != ArrangementHeader::WIRE_SIZE {
+                return Err(StorageError::MalformedArrangementHeader {
+                    length: value.len(),
+                });
+            }
+            let header = ArrangementHeader::decode(
+                &value[..ArrangementHeader::WIRE_SIZE]
+                    .try_into()
+                    .expect("validated arrangement header width"),
+            );
+            if known_law_versions.get(&header.law_id) != Some(&header.law_version) {
                 return Err(StorageError::UnknownMergeLaw {
                     law_id: header.law_id.0,
                     law_version: header.law_version.0,
@@ -1118,7 +1141,11 @@ impl ShardDb {
         let raw = self.get(key).await?;
         match raw {
             None => Ok(None),
-            Some(bytes) if bytes.len() < ArrangementHeader::WIRE_SIZE => Ok(None),
+            Some(bytes) if bytes.len() < ArrangementHeader::WIRE_SIZE => {
+                Err(StorageError::MalformedArrangementHeader {
+                    length: bytes.len(),
+                })
+            }
             Some(bytes) => {
                 let buf: [u8; 4] = match bytes[..4].try_into() {
                     Ok(b) => b,
