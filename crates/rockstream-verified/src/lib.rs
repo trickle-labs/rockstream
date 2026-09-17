@@ -6,13 +6,14 @@ pub mod codecs;
 pub mod frontier;
 pub mod keys;
 pub mod laws;
+pub mod persistence;
 pub mod routing;
 pub mod zset;
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{aggregate, codecs, frontier, keys, routing, zset};
+    use super::{aggregate, codecs, frontier, keys, persistence, routing, zset};
 
     #[test]
     fn fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths() {
@@ -100,6 +101,76 @@ mod tests {
         assert!(frontier::completes_before(5, 4));
         assert!(!frontier::completes_before(5, 5));
         assert!(frontier::stale_incarnation_is_rejected(1, 2));
+    }
+
+    #[test]
+    fn vs5_kernels_reject_replay_and_protect_boundaries() {
+        assert_eq!(persistence::next_epoch(41), Some(42));
+        assert_eq!(persistence::next_epoch(u64::MAX), None);
+        assert_eq!(
+            persistence::commit_outcome(true, true),
+            persistence::COMMIT_COMMITTED
+        );
+        assert_eq!(
+            persistence::commit_outcome(true, false),
+            persistence::COMMIT_UNKNOWN
+        );
+        assert_eq!(
+            persistence::commit_outcome(false, true),
+            persistence::COMMIT_FAILED
+        );
+        assert!(persistence::coupled_commit_is_durable(
+            true, true, true, true, true, true
+        ));
+        assert!(!persistence::coupled_commit_is_durable(
+            true, true, true, false, true, true
+        ));
+        assert!(persistence::epoch_is_admissible(4, 5, true, true, false));
+        assert!(!persistence::epoch_is_admissible(4, 6, true, true, false));
+        assert!(!persistence::epoch_is_admissible(4, 5, false, true, true));
+        assert_eq!(
+            persistence::replay_decision(persistence::COMMIT_COMMITTED, true, true, false),
+            persistence::REPLAY_APPLY
+        );
+        assert_eq!(
+            persistence::replay_decision(persistence::COMMIT_COMMITTED, true, true, true),
+            persistence::REPLAY_NOOP
+        );
+        assert_eq!(
+            persistence::replay_decision(persistence::COMMIT_UNKNOWN, true, true, false),
+            persistence::REPLAY_UNKNOWN
+        );
+        assert_eq!(
+            persistence::replay_decision(persistence::COMMIT_FAILED, true, true, false),
+            persistence::REPLAY_REJECT
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(0, 3, 2, 2, false, false),
+            persistence::SCAN_MORE
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(2, 3, 2, 2, false, false),
+            persistence::SCAN_COMPLETE
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(0, 3, 0, 2, false, false),
+            persistence::SCAN_QUOTA
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(4, 3, 2, 2, false, false),
+            persistence::SCAN_CORRUPT
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(0, 3, 2, 2, true, false),
+            persistence::SCAN_CANCELLED
+        );
+        assert!(persistence::compaction_is_eligible(10, 8, 9, false, false));
+        assert!(!persistence::compaction_is_eligible(
+            10, 8, 11, false, false
+        ));
+        assert!(!persistence::compaction_is_eligible(10, 8, 9, true, false));
+        assert!(persistence::recovery_is_ready(true, true, true, true));
+        assert!(!persistence::recovery_is_ready(true, true, false, true));
     }
 }
 

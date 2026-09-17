@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use rockstream_runtime::recovery::{RecoveryDriver, RecoveryError};
+use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
 use rockstream_types::error_code::*;
 use rockstream_types::lifecycle::{LifecycleState, LifecycleTracker, RecoveryPhase};
 
@@ -14,6 +15,7 @@ use rockstream_types::lifecycle::{LifecycleState, LifecycleTracker, RecoveryPhas
 fn test_recovery_state_machine_traversal_and_readiness_gate() {
     let lifecycle = Arc::new(LifecycleTracker::new("worker"));
     let driver = RecoveryDriver::with_lifecycle(lifecycle.clone());
+    driver.load_checkpoint(ClusterCheckpoint::new(CheckpointId(1)));
 
     // 1. Initial state must be OpeningStorage, is_ready must be false.
     assert_eq!(driver.phase(), RecoveryPhase::OpeningStorage);
@@ -183,6 +185,7 @@ fn test_validating_state_failure_blocks_readiness() {
 fn test_recovery_state_machine_full_transition_to_ready() {
     let lifecycle = Arc::new(LifecycleTracker::new("standalone"));
     let driver = RecoveryDriver::with_lifecycle(lifecycle.clone());
+    driver.load_checkpoint(ClusterCheckpoint::new(CheckpointId(1)));
 
     let phases = [
         RecoveryPhase::OpeningStorage,

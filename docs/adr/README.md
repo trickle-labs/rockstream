@@ -5,3 +5,4 @@
 - [ADR 0003: Transcript ownership](0003-transcript-ownership.md)
 - [ADR 0004: Checked arithmetic and merge-law admission](0004-merge-law-arithmetic.md)
 - [ADR 0005: Membership-aware frontier publication](0005-frontier-membership.md)
+- [ADR 0006: Persistence, replay, and compaction contracts](0006-persistence-replay-compaction.md)
