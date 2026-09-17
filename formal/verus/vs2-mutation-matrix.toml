@@ -1,0 +1,36 @@
+schema = 1
+
+[[mutations]]
+id = "VS2-M01"
+claim = "VS2-02"
+mutation = "Remove the sign-bit transform or reverse the descending transform."
+fixture = "crates/rockstream-storage/src/keys.rs::signed_sort_keys_round_trip_and_order_at_i64_extremes"
+expected = "Signed extremes or strict ascending/descending order assertion fails."
+
+[[mutations]]
+id = "VS2-M02"
+claim = "VS2-03"
+mutation = "Change fixed-width encoding from big-endian to another byte order."
+fixture = "crates/rockstream-verified/src/lib.rs::fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths"
+expected = "The literal encoded byte sequence assertion fails."
+
+[[mutations]]
+id = "VS2-M03"
+claim = "VS2-03"
+mutation = "Skip one capsule-length or trailing-byte validation."
+fixture = "crates/rockstream-storage/src/keys.rs::factor_payload_codec_rejects_wrong_capsule_lengths"
+expected = "Truncation, overlong, or trailing-key assertion fails."
+
+[[mutations]]
+id = "VS2-M04"
+claim = "VS2-03"
+mutation = "Change the factor-payload discriminator or join-side discriminator."
+fixture = "crates/rockstream-storage/src/keys.rs::factor_payload_codec_rejects_wrong_capsule_lengths"
+expected = "Wrong-discriminator or wrong-side assertion fails."
+
+[[mutations]]
+id = "VS2-M05"
+claim = "VS2-05"
+mutation = "Change the power-of-two bucket mask or permit an invalid count."
+fixture = "crates/rockstream-verified/src/lib.rs::routing_kernel_rejects_invalid_counts_and_bounds_valid_routes"
+expected = "Invalid-count rejection or exact mask-boundary assertion fails."

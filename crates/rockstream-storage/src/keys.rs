@@ -138,19 +138,12 @@ pub fn join_arrangement_bloom_filter_policy(bits_per_key: u32) -> Arc<dyn Filter
 ///
 /// This lets `scan_prefix(group_prefix).next()` return the extremum in O(1).
 pub fn minmax_sort_key(v: i64, invert: bool) -> [u8; 8] {
-    let raw = (v as u64) ^ 0x8000_0000_0000_0000_u64;
-    if invert {
-        (!raw).to_be_bytes()
-    } else {
-        raw.to_be_bytes()
-    }
+    rockstream_verified::keys::signed_order_key(v, invert).to_be_bytes()
 }
 
 /// Decode a value from a sort key (inverse of [`minmax_sort_key`]).
 pub fn minmax_sort_key_decode(sort_key: [u8; 8], invert: bool) -> i64 {
-    let raw = u64::from_be_bytes(sort_key);
-    let xored = if invert { !raw } else { raw };
-    (xored ^ 0x8000_0000_0000_0000_u64) as i64
+    rockstream_verified::keys::signed_order_key_decode(u64::from_be_bytes(sort_key), invert)
 }
 
 /// Encode an i64 sort key for window ordering.
@@ -160,12 +153,12 @@ pub fn minmax_sort_key_decode(sort_key: [u8; 8], invert: bool) -> i64 {
 /// value → largest bytes.  A prefix scan over `[OpState][WN][op_id][part_key]`
 /// returns rows in ascending order_key order.
 pub fn window_sort_key(v: i64) -> [u8; 8] {
-    ((v as u64) ^ 0x8000_0000_0000_0000_u64).to_be_bytes()
+    rockstream_verified::keys::signed_order_key(v, false).to_be_bytes()
 }
 
 /// Decode a value from a window sort key (inverse of [`window_sort_key`]).
 pub fn window_sort_key_decode(sort_key: [u8; 8]) -> i64 {
-    (u64::from_be_bytes(sort_key) ^ 0x8000_0000_0000_0000_u64) as i64
+    rockstream_verified::keys::signed_order_key_decode(u64::from_be_bytes(sort_key), false)
 }
 
 /// Encoder for shard-local keys.
@@ -183,7 +176,7 @@ impl ShardKeyEncoder {
     pub fn encode(prefix: ShardPrefix, operator_id: u64, suffix: &[u8]) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + 8 + suffix.len());
         key.push(prefix.as_byte());
-        key.extend_from_slice(&operator_id.to_be_bytes());
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u64_be(operator_id));
         key.extend_from_slice(suffix);
         key
     }
@@ -195,7 +188,7 @@ impl ShardKeyEncoder {
             return None;
         }
         let prefix = key[0];
-        let operator_id = u64::from_be_bytes(key[1..9].try_into().ok()?);
+        let operator_id = rockstream_verified::codecs::decode_u64_be(&key[1..9])?;
         let suffix = &key[9..];
         Some((prefix, operator_id, suffix))
     }
@@ -205,9 +198,9 @@ impl ShardKeyEncoder {
         let mut key = Vec::with_capacity(1 + 2 + 8 + join_key.len() + 16);
         key.push(ShardPrefix::OpState.as_byte());
         key.extend_from_slice(&side.disc_bytes());
-        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u64_be(op_id));
         key.extend_from_slice(join_key);
-        key.extend_from_slice(&row_id.to_be_bytes());
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u128_be(row_id));
         key
     }
 
@@ -268,15 +261,54 @@ impl ShardKeyEncoder {
         capsule_bytes: &[u8],
         row_id: u128,
     ) -> Vec<u8> {
+        Self::try_factor_payload_key(side, op_id, capsule_bytes, row_id)
+            .expect("factor payload capsule length exceeds u32")
+    }
+
+    /// Fallible factorized payload encoder for untrusted or externally sized capsules.
+    pub fn try_factor_payload_key(
+        side: JoinSide,
+        op_id: u64,
+        capsule_bytes: &[u8],
+        row_id: u128,
+    ) -> Option<Vec<u8>> {
         let mut key = Vec::with_capacity(1 + 2 + 2 + 8 + 4 + capsule_bytes.len() + 16);
         key.push(ShardPrefix::OpState.as_byte());
         key.extend_from_slice(&FACTOR_PAYLOAD_DISCRIMINATOR);
         key.extend_from_slice(&side.disc_bytes());
-        key.extend_from_slice(&op_id.to_be_bytes());
-        key.extend_from_slice(&(capsule_bytes.len() as u32).to_be_bytes());
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u64_be(op_id));
+        let capsule_len = rockstream_verified::codecs::checked_usize_to_u32(capsule_bytes.len())?;
+        key.extend_from_slice(&capsule_len.to_be_bytes());
         key.extend_from_slice(capsule_bytes);
-        key.extend_from_slice(&row_id.to_be_bytes());
-        key
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u128_be(row_id));
+        Some(key)
+    }
+
+    /// Decode a factorized payload key and reject truncated, overlong, or
+    /// length-mismatched capsules.
+    pub fn decode_factor_payload_key(key: &[u8]) -> Option<(JoinSide, u64, &[u8], u128)> {
+        const HEADER_LEN: usize = 1 + 2 + 2 + 8 + 4;
+        if key.len() < HEADER_LEN + 16
+            || key[0] != ShardPrefix::OpState.as_byte()
+            || key[1..3] != FACTOR_PAYLOAD_DISCRIMINATOR
+        {
+            return None;
+        }
+        let side = match key[3..5] {
+            [0x4A, 0x4C] => JoinSide::Left,
+            [0x4A, 0x52] => JoinSide::Right,
+            _ => return None,
+        };
+        let op_id = rockstream_verified::codecs::decode_u64_be(&key[5..13])?;
+        let capsule_len = usize::try_from(u32::from_be_bytes(key[13..17].try_into().ok()?)).ok()?;
+        let capsule_end = 17usize.checked_add(capsule_len)?;
+        let row_end = capsule_end.checked_add(16)?;
+        if row_end != key.len() {
+            return None;
+        }
+        let capsule = &key[17..capsule_end];
+        let row_id = rockstream_verified::codecs::decode_u128_be(&key[capsule_end..row_end])?;
+        Some((side, op_id, capsule, row_id))
     }
 
     /// Prefix for point/scan cleanup of factorized payload nodes.
@@ -302,7 +334,7 @@ impl ShardKeyEncoder {
     pub fn operator_prefix(prefix: ShardPrefix, operator_id: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(9);
         key.push(prefix.as_byte());
-        key.extend_from_slice(&operator_id.to_be_bytes());
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u64_be(operator_id));
         key
     }
 
@@ -670,8 +702,8 @@ impl CatalogKeyEncoder {
     pub fn encode(catalog_type: CatalogType, namespace_id: u128, object_id: u128) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + 16 + 16);
         key.push(catalog_type as u8);
-        key.extend_from_slice(&namespace_id.to_be_bytes());
-        key.extend_from_slice(&object_id.to_be_bytes());
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u128_be(namespace_id));
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u128_be(object_id));
         key
     }
 
@@ -684,8 +716,8 @@ impl CatalogKeyEncoder {
     ) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + 16 + 16 + suffix.len());
         key.push(catalog_type as u8);
-        key.extend_from_slice(&namespace_id.to_be_bytes());
-        key.extend_from_slice(&object_id.to_be_bytes());
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u128_be(namespace_id));
+        key.extend_from_slice(&rockstream_verified::codecs::encode_u128_be(object_id));
         key.extend_from_slice(suffix);
         key
     }
@@ -696,8 +728,8 @@ impl CatalogKeyEncoder {
             return None;
         }
         let type_byte = key[0];
-        let namespace_id = u128::from_be_bytes(key[1..17].try_into().ok()?);
-        let object_id = u128::from_be_bytes(key[17..33].try_into().ok()?);
+        let namespace_id = rockstream_verified::codecs::decode_u128_be(&key[1..17])?;
+        let object_id = rockstream_verified::codecs::decode_u128_be(&key[17..33])?;
         let suffix = &key[33..];
         Some((type_byte, namespace_id, object_id, suffix))
     }
@@ -734,6 +766,7 @@ mod tests {
         let key = ShardKeyEncoder::encode(ShardPrefix::OpIndex, 99, b"data");
         let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpIndex, 99);
         assert!(key.starts_with(&prefix));
+        assert!(!key.starts_with(&ShardKeyEncoder::operator_prefix(ShardPrefix::OpIndex, 100,)));
     }
 
     #[test]
@@ -777,6 +810,58 @@ mod tests {
         let prefix = CatalogKeyEncoder::namespace_prefix(CatalogType::View, 1);
         assert!(key1.starts_with(&prefix));
         assert!(!key2.starts_with(&prefix));
+    }
+
+    #[test]
+    fn signed_sort_keys_round_trip_and_order_at_i64_extremes() {
+        let values = [i64::MIN, -1, 0, 1, i64::MAX];
+        for value in values {
+            for invert in [false, true] {
+                assert_eq!(
+                    minmax_sort_key_decode(minmax_sort_key(value, invert), invert),
+                    value
+                );
+            }
+        }
+        for pair in values.windows(2) {
+            assert!(minmax_sort_key(pair[0], false) < minmax_sort_key(pair[1], false));
+            assert!(minmax_sort_key(pair[1], true) < minmax_sort_key(pair[0], true));
+        }
+    }
+
+    #[test]
+    fn factor_payload_codec_rejects_wrong_capsule_lengths() {
+        let key = ShardKeyEncoder::factor_payload_key(JoinSide::Right, 7, b"capsule", 42);
+        assert_eq!(
+            ShardKeyEncoder::decode_factor_payload_key(&key),
+            Some((JoinSide::Right, 7, b"capsule".as_slice(), 42))
+        );
+
+        let mut truncated = key.clone();
+        truncated.truncate(truncated.len() - 1);
+        assert_eq!(ShardKeyEncoder::decode_factor_payload_key(&truncated), None);
+
+        let mut overlong = key.clone();
+        overlong[16] += 1;
+        assert_eq!(ShardKeyEncoder::decode_factor_payload_key(&overlong), None);
+
+        let mut wrong_discriminator = key.clone();
+        wrong_discriminator[1] = 0;
+        assert_eq!(
+            ShardKeyEncoder::decode_factor_payload_key(&wrong_discriminator),
+            None
+        );
+
+        let mut wrong_side = key.clone();
+        wrong_side[3] = 0;
+        assert_eq!(
+            ShardKeyEncoder::decode_factor_payload_key(&wrong_side),
+            None
+        );
+
+        let mut trailing = key;
+        trailing.push(0);
+        assert_eq!(ShardKeyEncoder::decode_factor_payload_key(&trailing), None);
     }
 
     #[test]

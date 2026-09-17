@@ -1,7 +1,58 @@
 use vstd::prelude::*;
 
 pub mod arithmetic;
+pub mod codecs;
+pub mod keys;
 pub mod laws;
+pub mod routing;
+
+#[cfg(test)]
+mod tests {
+    use super::{codecs, keys, routing};
+
+    #[test]
+    fn fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths() {
+        assert_eq!(
+            codecs::encode_u64_be(0x0102_0304_0506_0708),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            codecs::decode_u64_be(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            Some(0x0102_0304_0506_0708)
+        );
+        assert_eq!(codecs::decode_u64_be(&[1, 2, 3]), None);
+        assert_eq!(codecs::decode_u64_be(&[1, 2, 3, 4, 5, 6, 7, 8, 9]), None);
+        assert_eq!(
+            codecs::encode_u128_be(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(codecs::checked_usize_to_u32(65_535), Some(65_535));
+    }
+
+    #[test]
+    fn signed_order_kernel_matches_persisted_extremes() {
+        assert_eq!(keys::signed_order_key(i64::MIN, false), 0);
+        assert_eq!(keys::signed_order_key(-1, false), 0x7fff_ffff_ffff_ffff);
+        assert_eq!(keys::signed_order_key(0, false), 0x8000_0000_0000_0000);
+        assert_eq!(keys::signed_order_key(i64::MAX, false), u64::MAX);
+        assert_eq!(keys::signed_order_key(i64::MIN, true), u64::MAX);
+        assert_eq!(keys::signed_order_key(i64::MAX, true), 0);
+        assert_eq!(
+            keys::signed_order_key_decode(0x8000_0000_0000_0000, false),
+            0
+        );
+        assert_eq!(keys::signed_order_key_decode(0, true), i64::MAX);
+    }
+
+    #[test]
+    fn routing_kernel_rejects_invalid_counts_and_bounds_valid_routes() {
+        assert_eq!(routing::route_power_of_two_hash(42, 0), None);
+        assert_eq!(routing::route_power_of_two_hash(42, 3), None);
+        assert_eq!(routing::route_power_of_two_hash(42, 1), Some(0));
+        assert_eq!(routing::route_power_of_two_hash(u64::MAX, 8), Some(7));
+        assert_eq!(routing::route_power_of_two_hash(0, 32), Some(0));
+    }
+}
 
 verus! {
     // verus-claim: VS0-02
