@@ -151,6 +151,37 @@ jobs:
         run: bash scripts/check-operator-state-bytes.test.sh
       - name: path-coupling check
         run: bash scripts/check-path-coupling.sh
+      - name: path-coupling checker self-test
+        run: bash scripts/check-path-coupling.test.sh
+
+  verus-verify:
+    name: Verus verify (VS0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - name: Cache pinned Verus
+        uses: actions/cache@v4
+        with:
+          path: .cache/verus
+          key: verus-${{ runner.os }}-${{ runner.arch }}-0.2026.09.13.671956e
+      - name: Install pinned Verus
+        run: echo "$(bash scripts/install-verus.sh)" >> "$GITHUB_PATH"
+      - name: Verify Rust kernels
+        run: make verify-rust
+      - name: Verify proof contracts
+        run: make verify-proof-contracts
+      - name: Exercise production wrapper
+        run: cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests
+      - name: Build ordinary Cargo consumer
+        run: cargo build --locked --release -p rockstream-cli
 
   formal-verify:
     name: Formal verify (M1–M4, M6–M7)
@@ -167,7 +198,11 @@ jobs:
             git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=50
             base_sha=$(git merge-base "origin/${{ github.event.pull_request.base.ref }}" HEAD)
             changed=$(git diff --name-only "$base_sha"...HEAD)
-            if echo "$changed" | grep -qE '^(formal/|DESIGN\.md|crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types|plan|oracle|cli|diff|test-support)/)'; then
+            protocol_model_changed=false
+            if echo "$changed" | grep -E '^formal/' | grep -qv '^formal/verus/'; then
+              protocol_model_changed=true
+            fi
+            if echo "$changed" | grep -qE '^(DESIGN\.md|crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types|plan|oracle|cli|diff|test-support)/)' || [ "$protocol_model_changed" = true ]; then
               echo "run=true" >> "$GITHUB_OUTPUT"
             else
               echo "run=false" >> "$GITHUB_OUTPUT"

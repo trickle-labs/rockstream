@@ -10,12 +10,7 @@ pub fn validate_power_of_two_bucket_count(bucket_count: u16) -> Result<(), &'sta
 }
 
 pub fn normalize_power_of_two_bucket_count(bucket_count: u16) -> u16 {
-    match bucket_count {
-        0 | 1 => 1,
-        count if count.is_power_of_two() => count,
-        count if count <= 32_768 => count.next_power_of_two(),
-        _ => 32_768,
-    }
+    rockstream_verified::normalize_power_of_two_bucket_count(bucket_count)
 }
 
 /// Route using a stable hash mask. This is the v0.59.8 routing path; the
