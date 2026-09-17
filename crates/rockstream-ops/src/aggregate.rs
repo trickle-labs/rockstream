@@ -358,46 +358,46 @@ impl AggState {
     pub fn decode_from_entries(
         raw_entries: &[(bytes::Bytes, bytes::Bytes)],
         op_id: OperatorId,
-    ) -> Self {
+    ) -> Result<Self, OpError> {
         let op_prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
+        let invalid_key = || {
+            OpError::internal(format!(
+                "corrupt persisted aggregate state for operator {}: invalid key",
+                op_id.0
+            ))
+        };
+        let invalid_value = || {
+            OpError::internal(format!(
+                "corrupt persisted aggregate state for operator {}: invalid value",
+                op_id.0
+            ))
+        };
         let mut state = AggState::new();
         for (key, value) in raw_entries {
             // Strip the operator prefix to get the group key bytes.
             if key.len() != op_prefix.len() + 8 || !key.starts_with(&op_prefix) {
-                continue;
+                return Err(invalid_key());
             }
-            let k_bytes: [u8; 8] = match key[op_prefix.len()..op_prefix.len() + 8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+            let k_bytes: [u8; 8] = key[op_prefix.len()..op_prefix.len() + 8]
+                .try_into()
+                .map_err(|_| invalid_key())?;
             if value.len() != 16 {
-                continue;
+                return Err(invalid_value());
             }
-            let sum_bytes: [u8; 8] = match value[..8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let count_bytes: [u8; 8] = match value[8..16].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let k = match decode_i64(&k_bytes) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let sum = match decode_i64(&sum_bytes) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let count = match decode_i64(&count_bytes) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            if count > 0 {
-                state.entries.insert(k, (sum, count));
+            let sum_bytes: [u8; 8] = value[..8].try_into().map_err(|_| invalid_value())?;
+            let count_bytes: [u8; 8] = value[8..16].try_into().map_err(|_| invalid_value())?;
+            let k = decode_i64(&k_bytes).map_err(|_| invalid_key())?;
+            let sum = decode_i64(&sum_bytes).map_err(|_| invalid_value())?;
+            let count = decode_i64(&count_bytes).map_err(|_| invalid_value())?;
+            if count <= 0 {
+                return Err(OpError::internal(format!(
+                    "corrupt persisted aggregate state for operator {}: non-positive count",
+                    op_id.0
+                )));
             }
+            state.entries.insert(k, (sum, count));
         }
-        state
+        Ok(state)
     }
 }
 
@@ -640,7 +640,7 @@ impl AggregateOp {
                 "aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
             )));
         }
-        let state = AggState::decode_from_entries(&entries, op_id);
+        let state = AggState::decode_from_entries(&entries, op_id)?;
         Ok(Self::with_state(op_id, state))
     }
 
@@ -661,7 +661,7 @@ impl AggregateOp {
                 "aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
             )));
         }
-        let state = AggState::decode_from_entries(&entries, self.op_id);
+        let state = AggState::decode_from_entries(&entries, self.op_id)?;
         *self.state.lock().expect("AggregateOp mutex poisoned") = state;
         Ok(())
     }
@@ -1052,10 +1052,15 @@ impl BucketedAggregateOp {
         bucket_count: u16,
     ) -> Result<Self, OpError> {
         let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
-        let (entries, _truncated) = db
-            .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
+        let (entries, truncated) = db
+            .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
             .await
             .map_err(OpError::storage)?;
+        if truncated {
+            return Err(OpError::internal(format!(
+                "bucketed aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
+            )));
+        }
         let op = Self::new(op_id, hot_key, bucket_count);
         let mut combined = op
             .combined
@@ -1356,10 +1361,15 @@ pub async fn persist_bucketed_agg_state(
     op: &BucketedAggregateOp,
 ) -> Result<(), OpError> {
     let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op.op_id.0);
-    let (existing, _truncated) = db
-        .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
+    let (existing, truncated) = db
+        .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
         .await
         .map_err(OpError::storage)?;
+    if truncated {
+        return Err(OpError::internal(format!(
+            "bucketed aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
+        )));
+    }
 
     let wb = {
         let combined = op
@@ -1687,6 +1697,22 @@ mod tests {
         assert_eq!(staged.entries, before);
         assert_eq!(staged.order, vec![7]);
         assert_eq!(staged.estimated_bytes(), 64);
+    }
+
+    #[test]
+    fn persisted_aggregate_corruption_fails_closed() {
+        let op_id = OperatorId(9);
+        let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &1i64.to_be_bytes());
+        let error = AggState::decode_from_entries(
+            &[(bytes::Bytes::from(key), bytes::Bytes::from_static(b"short"))],
+            op_id,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[RS-0001] Internal error: corrupt persisted aggregate state for operator 9: invalid value; next_steps: report this issue"
+        );
     }
 
     #[test]

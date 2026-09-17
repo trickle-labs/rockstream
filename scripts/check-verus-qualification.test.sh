@@ -41,6 +41,14 @@ expected="verus qualification: 30 claims classified; 6 builds and 7 mutation con
 actual="$(bash "$CHECKER" "$ROOT")"
 [[ "$actual" == "$expected" ]] || fail "positive checker output changed: $actual"
 
+printf 'verifier\t0\t1\tverus smoke\n' >"$TMP_ROOT/steps.tsv"
+missing_runtime="$TMP_ROOT/missing-runtime"
+missing_runtime_output="$(python3 "$TMP_ROOT/scripts/record-verus-qualification.py" \
+  --root "$TMP_ROOT" --run-id test --status passed --steps "$TMP_ROOT/steps.tsv" \
+  --runtime-artifact "$missing_runtime" --output "$TMP_ROOT/record.json" 2>&1 || true)"
+[[ "$missing_runtime_output" == "RS-0906: missing runtime artifact: $missing_runtime" ]] || \
+  fail "missing runtime artifact was accepted: $missing_runtime_output"
+
 sed -i.bak 's/^id = "VS0-02"$/id = "VS9-99"/' "$TMP_ROOT/formal/verus/qualification.toml"
 unknown_output="$(python3 "$TMP_ROOT/scripts/check-verus-qualification.py" --root "$TMP_ROOT" 2>&1 || true)"
 if [[ "$unknown_output" != *"RS-0906: claim evidence references unknown claim: VS9-99"* ]]; then
