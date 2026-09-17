@@ -1804,6 +1804,34 @@ pub fn read_exchange_flow_control_channels_size() -> u64 {
     })
 }
 
+pub fn update_flow_control_metrics(rows: u64, channels: u64) {
+    with_registry(|reg| {
+        reg.shuffle_rows_in_flight.store(rows, Ordering::Relaxed);
+        reg.exchange_flow_control_channels_size
+            .store(channels, Ordering::Relaxed);
+    });
+}
+
+pub fn update_flow_batch_metrics(
+    rows: u64,
+    channels: u64,
+    aggregate_bytes: u64,
+    batches_in_flight: u64,
+    pending: u64,
+) {
+    with_registry(|reg| {
+        reg.shuffle_rows_in_flight.store(rows, Ordering::Relaxed);
+        reg.exchange_flow_control_channels_size
+            .store(channels, Ordering::Relaxed);
+        reg.exchange_inflight_bytes
+            .store(aggregate_bytes, Ordering::Relaxed);
+        reg.exchange_inflight_batches
+            .store(batches_in_flight, Ordering::Relaxed);
+        reg.exchange_pending_requests
+            .store(pending, Ordering::Relaxed);
+    });
+}
+
 pub fn set_exchange_inflight_bytes(bytes: u64) {
     with_registry(|reg| {
         reg.exchange_inflight_bytes.store(bytes, Ordering::Relaxed);

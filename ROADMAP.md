@@ -250,7 +250,7 @@ Changes to persistent formats or public protocols require:
 | v0.65.0 | Standalone Recovery | Complete standalone crash recovery, backup, and restore ✅ Done |
 | v0.65.1 | Concurrent maintenance and group commit | Independent work overlaps without weakening durable visibility ✅ Done |
 | v0.66.0 | Management Plane | Real typed management API and truthful operational CLI ✅ Done |
-| **v0.67** | Distributed Data Plane ✅ Done | Row traffic leaves the control plane |
+| v0.67.0 | Distributed Data Plane | Row traffic leaves the control plane ✅ Done |
 | v0.67.1 | State beyond RAM | Maintained state and recovery operate within worker budgets |
 | **v0.68** | Distributed Lifecycle | Migration, drain, and failover become durable sagas |
 | **v0.69** | PostgreSQL CDC | First complete external ingestion golden path |

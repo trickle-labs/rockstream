@@ -206,7 +206,18 @@ impl FlowController {
         self.pending_requests() as f64 / self.max_pending_requests as f64
     }
 
-    fn update_metric(
+    fn update_credit_metrics(channels: &HashMap<CreditKey, ChannelCreditState>) {
+        let rows_in_flight = channels
+            .values()
+            .map(|state| state.rows_in_flight as u64)
+            .sum::<u64>();
+        rockstream_types::metrics::update_flow_control_metrics(
+            rows_in_flight,
+            channels.len() as u64,
+        );
+    }
+
+    fn update_batch_metrics(
         channels: &HashMap<CreditKey, ChannelCreditState>,
         aggregate_bytes: u64,
         pending: u64,
@@ -220,11 +231,13 @@ impl FlowController {
             .map(|state| state.batches_in_flight as u64)
             .sum::<u64>();
 
-        rockstream_types::metrics::set_shuffle_rows_in_flight(rows_in_flight);
-        rockstream_types::metrics::set_exchange_flow_control_channels_size(channels.len() as u64);
-        rockstream_types::metrics::set_exchange_inflight_bytes(aggregate_bytes);
-        rockstream_types::metrics::set_exchange_inflight_batches(batches_in_flight);
-        rockstream_types::metrics::set_exchange_pending_requests(pending);
+        rockstream_types::metrics::update_flow_batch_metrics(
+            rows_in_flight,
+            channels.len() as u64,
+            aggregate_bytes,
+            batches_in_flight,
+            pending,
+        );
     }
 
     /// Check if frame size exceeds max_batch_bytes without mutating state.
@@ -306,7 +319,7 @@ impl FlowController {
             + batch_bytes as u64;
         let new_pending = self.pending_requests.fetch_add(1, Ordering::Relaxed) + 1;
 
-        Self::update_metric(&channels, new_bytes, new_pending);
+        Self::update_batch_metrics(&channels, new_bytes, new_pending);
 
         Ok(FlowPermit {
             controller: self.clone(),
@@ -378,7 +391,7 @@ impl FlowController {
                 .fetch_sub(1, Ordering::Relaxed)
                 .saturating_sub(1);
 
-            Self::update_metric(&channels, new_bytes, new_pending);
+            Self::update_batch_metrics(&channels, new_bytes, new_pending);
         }
 
         self.global_notify.notify_waiters();
@@ -396,7 +409,7 @@ impl FlowController {
             channels.retain(|k, _| k.0 != exchange_id);
             let cur_bytes = self.aggregate_bytes.load(Ordering::Relaxed);
             let cur_pending = self.pending_requests.load(Ordering::Relaxed);
-            Self::update_metric(&channels, cur_bytes, cur_pending);
+            Self::update_batch_metrics(&channels, cur_bytes, cur_pending);
         }
         let notified: Vec<Arc<Notify>> = {
             let mut notifiers = self.notifiers.lock();
@@ -454,12 +467,14 @@ impl FlowController {
             state.rows_in_flight -= released;
             state.available_rows =
                 (state.available_rows.saturating_add(row_count)).min(state.max_rows);
-            let cur_bytes = self.aggregate_bytes.load(Ordering::Relaxed);
-            let cur_pending = self.pending_requests.load(Ordering::Relaxed);
-            Self::update_metric(&channels, cur_bytes, cur_pending);
+            Self::update_credit_metrics(&channels);
         }
 
-        self.global_notify.notify_waiters();
+        if self.aggregate_bytes.load(Ordering::Relaxed) > 0
+            || self.pending_requests.load(Ordering::Relaxed) > 0
+        {
+            self.global_notify.notify_waiters();
+        }
         let notifiers = self.notifiers.lock();
         if let Some(notify) = notifiers.get(&key) {
             notify.notify_waiters();
@@ -500,9 +515,7 @@ impl FlowController {
                 bytes_in_flight: 0,
             },
         );
-        let cur_bytes = self.aggregate_bytes.load(Ordering::Relaxed);
-        let cur_pending = self.pending_requests.load(Ordering::Relaxed);
-        Self::update_metric(&channels, cur_bytes, cur_pending);
+        Self::update_credit_metrics(&channels);
     }
 
     /// Acquire row credit for the specified channel, suspending the caller if none are available.
@@ -537,9 +550,7 @@ impl FlowController {
                 if state.available_rows >= row_count {
                     state.available_rows -= row_count;
                     state.rows_in_flight = state.rows_in_flight.saturating_add(row_count);
-                    let cur_bytes = self.aggregate_bytes.load(Ordering::Relaxed);
-                    let cur_pending = self.pending_requests.load(Ordering::Relaxed);
-                    Self::update_metric(&channels, cur_bytes, cur_pending);
+                    Self::update_credit_metrics(&channels);
                     return Ok(());
                 }
             }
