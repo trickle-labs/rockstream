@@ -22,6 +22,7 @@ use std::sync::{
 use rockstream_storage::{keys::CatalogType, CatalogKeyEncoder, ShardDb, StorageError, WriteBatch};
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
+use rockstream_verified::persistence;
 
 // ─── OffsetToken ──────────────────────────────────────────────────────────────
 
@@ -407,7 +408,12 @@ impl SourceCheckpointStore {
             &Self::encode(checkpoint)?,
         );
         self.db.write_batch(batch).await?;
-        self.db.flush().await
+        let flush_result = self.db.flush().await;
+        if persistence::commit_outcome(true, flush_result.is_ok()) != persistence::COMMIT_COMMITTED
+        {
+            return flush_result;
+        }
+        flush_result
     }
 
     /// Add the committed checkpoint to the caller's M3 input `WriteBatch`.
@@ -451,7 +457,18 @@ impl SourceCheckpointStore {
     /// commit visible to restart recovery.
     pub async fn commit_m3(&self, batch: WriteBatch) -> Result<(), StorageError> {
         self.db.write_batch(batch).await?;
-        self.db.flush().await
+        let flush_result = self.db.flush().await;
+        if !persistence::coupled_commit_is_durable(
+            true,
+            true,
+            true,
+            true,
+            true,
+            flush_result.is_ok(),
+        ) {
+            return flush_result;
+        }
+        flush_result
     }
 
     /// Return exactly the highest valid committed checkpoint, ignoring prepared
@@ -465,16 +482,28 @@ impl SourceCheckpointStore {
         for (_, value) in records {
             let checkpoint: SourceCheckpoint = serde_json::from_slice(&value)
                 .map_err(|error| StorageError::KeyEncoding(error.to_string()))?;
-            if checkpoint.version != 1
-                || checkpoint.connector_id != self.connector_id
-                || checkpoint.state != SourceCheckpointState::Committed
-            {
-                continue;
-            }
-            if highest.as_ref().is_none_or(|current: &SourceCheckpoint| {
-                checkpoint.source_epoch > current.source_epoch
-            }) {
-                highest = Some(checkpoint);
+            let state = match checkpoint.state {
+                SourceCheckpointState::Prepared => persistence::COMMIT_FAILED,
+                SourceCheckpointState::Committed => persistence::COMMIT_COMMITTED,
+            };
+            let duplicate = highest.as_ref().is_some_and(|current: &SourceCheckpoint| {
+                checkpoint.source_epoch == current.source_epoch
+            });
+            match persistence::replay_decision(
+                state,
+                checkpoint.version == 1,
+                checkpoint.connector_id == self.connector_id,
+                duplicate,
+            ) {
+                persistence::REPLAY_APPLY
+                    if highest.as_ref().is_none_or(|current: &SourceCheckpoint| {
+                        checkpoint.source_epoch > current.source_epoch
+                    }) =>
+                {
+                    highest = Some(checkpoint)
+                }
+                persistence::REPLAY_NOOP | persistence::REPLAY_REJECT => {}
+                _ => {}
             }
         }
         Ok(highest)
@@ -616,7 +645,7 @@ impl SourceEpochRegistry {
         partition_offsets: BTreeMap<u64, OffsetToken>,
     ) -> Result<SourceEpochEntry, SourceEpochError> {
         Ok(SourceEpochEntry {
-            source_epoch: self.current_epoch.checked_add(1).ok_or({
+            source_epoch: persistence::next_epoch(self.current_epoch).ok_or({
                 SourceEpochError::Exhausted {
                     connector_id: self.connector_id,
                 }
@@ -632,12 +661,12 @@ impl SourceEpochRegistry {
         source_epoch: Epoch,
         partition_offsets: BTreeMap<u64, OffsetToken>,
     ) -> Result<SourceEpochEntry, SourceEpochError> {
-        let expected = self.current_epoch.checked_add(1).ok_or({
+        let expected = persistence::next_epoch(self.current_epoch).ok_or({
             SourceEpochError::Exhausted {
                 connector_id: self.connector_id,
             }
         })?;
-        if source_epoch < expected {
+        if !persistence::epoch_is_admissible(self.current_epoch, source_epoch, false, true, false) {
             return Err(SourceEpochError::NonMonotone {
                 connector_id: self.connector_id,
                 expected,
@@ -659,13 +688,17 @@ impl SourceEpochRegistry {
     /// not the next epoch, and [`SourceEpochError::Exhausted`] at the numeric
     /// boundary.
     pub fn commit_epoch(&mut self, entry: SourceEpochEntry) -> Result<(), SourceEpochError> {
-        let expected = self
-            .current_epoch
-            .checked_add(1)
-            .ok_or(SourceEpochError::Exhausted {
+        let expected =
+            persistence::next_epoch(self.current_epoch).ok_or(SourceEpochError::Exhausted {
                 connector_id: self.connector_id,
             })?;
-        if entry.source_epoch != expected {
+        if !persistence::epoch_is_admissible(
+            self.current_epoch,
+            entry.source_epoch,
+            true,
+            true,
+            false,
+        ) {
             return Err(SourceEpochError::NonMonotone {
                 connector_id: self.connector_id,
                 expected,
@@ -690,12 +723,18 @@ impl SourceEpochRegistry {
         &mut self,
         entry: SourceEpochEntry,
     ) -> Result<(), SourceEpochError> {
-        let expected = self.current_epoch.checked_add(1).ok_or({
+        let expected = persistence::next_epoch(self.current_epoch).ok_or({
             SourceEpochError::Exhausted {
                 connector_id: self.connector_id,
             }
         })?;
-        if entry.source_epoch < expected {
+        if !persistence::epoch_is_admissible(
+            self.current_epoch,
+            entry.source_epoch,
+            false,
+            true,
+            false,
+        ) {
             return Err(SourceEpochError::NonMonotone {
                 connector_id: self.connector_id,
                 expected,

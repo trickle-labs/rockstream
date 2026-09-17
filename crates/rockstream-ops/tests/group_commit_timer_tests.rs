@@ -151,9 +151,13 @@ async fn test_flush_failure_withholds_acknowledgment() {
         "commit_epoch must return error on flush failure"
     );
     assert_eq!(group.last_committed(), 0, "frontier must not advance");
+    assert!(group.outcome_unknown());
 
     // Clear fault injection
     db.set_fail_flushes(false);
+    assert_eq!(group.flush().await.unwrap(), vec![1]);
+    assert!(!group.outcome_unknown());
+    assert_eq!(group.last_committed(), 1);
 }
 
 #[tokio::test]

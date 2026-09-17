@@ -91,3 +91,31 @@ async fn test_last_consumer_drop_triggers_reclamation() {
     assert_eq!(reclaimed, vec![arr_id]);
     assert_eq!(catalog.physical_arrangements_count().await, 0);
 }
+
+#[tokio::test]
+async fn test_duplicate_consumer_registration_and_drop_are_idempotent() {
+    let catalog = ArrangementCatalog::new();
+    let spec = create_spec(1, "events");
+
+    let (arr_id, created) = catalog.register_consumer(ViewId(1), spec.clone()).await;
+    let (same_id, reused) = catalog.register_consumer(ViewId(1), spec).await;
+    assert_eq!(same_id, arr_id);
+    assert!(created);
+    assert!(!reused);
+    assert_eq!(catalog.consumer_count(arr_id).await, 1);
+
+    catalog.update_compaction_frontier(arr_id, 10).await;
+    assert!(catalog
+        .deregister_consumer(ViewId(1), arr_id)
+        .await
+        .expect("first deregister"));
+    assert!(!catalog
+        .deregister_consumer(ViewId(1), arr_id)
+        .await
+        .expect("duplicate deregister"));
+    assert_eq!(catalog.consumer_count(arr_id).await, 0);
+    assert_eq!(
+        catalog.reclaim_unreferenced_arrangements(10).await,
+        vec![arr_id]
+    );
+}
