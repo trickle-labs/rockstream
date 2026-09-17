@@ -253,9 +253,9 @@ fn test_all_gated_crates_present_in_ci_coverage_job() {
     let floors = coverage_floors();
     let crates = workspace_crates();
     for crate_name in &crates {
-        let (lines, regions) = floors
-            .get(crate_name)
-            .unwrap_or_else(|| panic!("coverage.yml coverage job is missing a gate for `{crate_name}`"));
+        let (lines, regions) = floors.get(crate_name).unwrap_or_else(|| {
+            panic!("coverage.yml coverage job is missing a gate for `{crate_name}`")
+        });
         let (minimum_lines, minimum_regions) = if crate_name == "rockstream-sim" {
             (63, 66)
         } else {
