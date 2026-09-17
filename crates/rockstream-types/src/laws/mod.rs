@@ -11,6 +11,7 @@
 //! v0.37 adds `OrSet/v1` — semilattice CRDT set law for split/merge proof tests;
 //!       full user-visible OR-Set column types ship in v0.44.
 
+pub mod arithmetic;
 pub mod registry;
 pub mod sum_count;
 pub mod weight_add;
