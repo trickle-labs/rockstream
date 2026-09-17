@@ -3,6 +3,7 @@ use vstd::prelude::*;
 pub mod aggregate;
 pub mod arithmetic;
 pub mod codecs;
+pub mod frontier;
 pub mod keys;
 pub mod laws;
 pub mod routing;
@@ -11,7 +12,7 @@ pub mod zset;
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{aggregate, codecs, keys, routing, zset};
+    use super::{aggregate, codecs, frontier, keys, routing, zset};
 
     #[test]
     fn fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths() {
@@ -70,6 +71,35 @@ mod tests {
         assert_eq!(aggregate::transition(10, 1, -9, -1), None);
         assert_eq!(aggregate::transition(i64::MAX, 1, 1, 1), None);
         assert_eq!(aggregate::transition(1, 0, 0, 1), None);
+    }
+
+    #[test]
+    fn vs4_kernels_reject_bad_reports_and_preserve_frontier_boundaries() {
+        assert_eq!(
+            frontier::admit_frontier_report(1, true, true, true, 5, 3),
+            Some(5)
+        );
+        assert_eq!(
+            frontier::admit_frontier_report(1, true, true, true, 5, 8),
+            Some(8)
+        );
+        assert_eq!(
+            frontier::admit_frontier_report(1, true, false, true, 5, 8),
+            None
+        );
+        assert_eq!(
+            frontier::admit_frontier_report(2, true, true, true, 5, 8),
+            None
+        );
+        assert_eq!(
+            frontier::admit_frontier_report(1, true, true, true, u64::MAX, u64::MAX),
+            Some(u64::MAX)
+        );
+        assert!(frontier::activation_preserves_publication(Some(5), 5));
+        assert!(!frontier::activation_preserves_publication(Some(5), 4));
+        assert!(frontier::completes_before(5, 4));
+        assert!(!frontier::completes_before(5, 5));
+        assert!(frontier::stale_incarnation_is_rejected(1, 2));
     }
 }
 

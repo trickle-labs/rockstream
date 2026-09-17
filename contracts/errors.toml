@@ -2005,6 +2005,16 @@ default_next_steps = "Verify every publish_frontier write path uses WriteOptions
 doc_anchor = "rs-8003"
 
 [[error]]
+code = "RS-8004"
+key = "frontier.membership_report_rejected"
+title = "Membership-aware frontier report or configuration transition was rejected"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Refresh the active membership generation and shard incarnation, then retry with a versioned report after durable catch-up."
+doc_anchor = "rs-8004"
+
+[[error]]
 code = "RS-9001"
 key = "admission.capacity_request_rejected"
 title = "Admission control rejected the capacity request"

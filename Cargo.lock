@@ -5045,6 +5045,7 @@ dependencies = [
  "rockstream-storage",
  "rockstream-test-support",
  "rockstream-types",
+ "rockstream-verified",
  "rustls",
  "rustls-pemfile",
  "serde",

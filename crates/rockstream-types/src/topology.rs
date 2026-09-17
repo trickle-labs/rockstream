@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::compatibility::{
     ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
 };
+use crate::frontier::MembershipFrontierReport;
 use crate::ids::{ShardId, WorkerId};
 use crate::lease::{ShardLease, ShardRevokeReason};
 
@@ -884,6 +885,10 @@ pub enum WorkerMessage {
     ReportShardFrontier {
         shard_id: ShardId,
         epoch: crate::timestamp::Epoch,
+    },
+    /// Versioned membership-aware frontier report (VS4).
+    ReportShardFrontierV2 {
+        report: MembershipFrontierReport,
     },
     /// Operator-initiated request to begin draining a worker (v0.46).
     RequestDrain {
