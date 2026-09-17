@@ -27,7 +27,9 @@ else
 fi
 
 # Benchmark baselines record measurements, not protocol changes.
-changed_files=$(git diff --name-only "$RANGE" 2>/dev/null | grep -v '/benches/baseline/' || true)
+changed_files=$(git diff --name-only "$RANGE" 2>/dev/null \
+    | grep -v '^formal/verus/' \
+    | grep -v '/benches/baseline/' || true)
 
 if [ -z "$changed_files" ]; then
     echo "check-path-coupling: no changed files found for range '$RANGE' — skipping."

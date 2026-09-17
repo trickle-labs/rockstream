@@ -8,6 +8,7 @@ description = "PlanNode IR and physical OpNode graph for RockStream"
 
 [dependencies]
 rockstream-types = { workspace = true }
+rockstream-verified = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
