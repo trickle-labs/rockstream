@@ -35,11 +35,10 @@ jobs:
           RS_TC_DEBUG: "1"
         run: cargo test -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1 --nocapture
 
-  check:
-    name: Check
+  check-quality:
+    name: Check quality
     runs-on: ubuntu-latest
     permissions:
-      actions: write
       contents: read
     steps:
       - uses: actions/checkout@v4
@@ -53,47 +52,10 @@ jobs:
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-      - name: Require Docker
-        run: docker info
-      - uses: docker/setup-buildx-action@v3
-      - name: Build unified-binary test image
-        run: |
-          docker buildx build \
-            --tag rockstream-tc-test:latest \
-            --load \
-            --cache-from type=gha,scope=rockstream-tc-test-check \
-            --cache-to type=gha,mode=max,scope=rockstream-tc-test-check \
-            .
       - name: cargo fmt
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::uninlined_format_args
-      - name: cargo test
-        env:
-          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER: "1"
-          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "60"
-          ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS: "10"
-        run: |
-          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql
-          cargo test -p rockstream-connectors --lib --tests -- --test-threads=1
-          cargo test -p rockstream-control --lib --tests -- --test-threads=1
-          cargo test -p rockstream-gateway --lib --tests -- --test-threads=1
-          cargo test -p rockstream-ops --lib --tests -- --test-threads=1
-          cargo test -p rockstream-runtime --lib --tests -- --test-threads=1
-          cargo test -p rockstream-storage --lib --tests -- --test-threads=1
-          cargo test -p rockstream-sql --lib --tests -- --test-threads=1
-          cargo test -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
-          cargo test -p rockstream-sim --features simulation --lib -- --test-threads=1
-          cargo test -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
-          cargo test -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1
-          cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
-      - name: pgwire conformance test-result report
-        run: |
-          rm -f target/pgwire-test-results.json
-          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
-          cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
-      - name: Remove Docker test image
-        run: docker image rm rockstream-tc-test:latest || true
       - name: install cargo-deny
         uses: taiki-e/install-action@cargo-deny
       - name: cargo deny
@@ -154,6 +116,95 @@ jobs:
         run: bash scripts/check-operator-state-bytes.test.sh
       - name: path-coupling check
         run: bash scripts/check-path-coupling.sh
+
+  check-tests:
+    name: Check tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - workspace
+          - crates
+          - gateway
+          - sim-unit
+          - sim-integration
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-tests-${{ matrix.shard }}
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Require Docker
+        if: matrix.shard == 'gateway'
+        run: docker info
+      - uses: docker/setup-buildx-action@v3
+        if: matrix.shard == 'gateway'
+      - name: Build unified-binary test image
+        if: matrix.shard == 'gateway'
+        run: |
+          docker buildx build \
+            --tag rockstream-tc-test:latest \
+            --load \
+            --cache-from type=gha,scope=rockstream-tc-test-check \
+            --cache-to type=gha,mode=max,scope=rockstream-tc-test-check \
+            .
+      - name: Workspace tests
+        if: matrix.shard == 'workspace'
+        run: cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql
+      - name: Crate tests
+        if: matrix.shard == 'crates'
+        run: |
+          cargo test -p rockstream-connectors --lib --tests -- --test-threads=1
+          cargo test -p rockstream-control --lib --tests -- --test-threads=1
+          cargo test -p rockstream-ops --lib --tests -- --test-threads=1
+          cargo test -p rockstream-runtime --lib --tests -- --test-threads=1
+          cargo test -p rockstream-storage --lib --tests -- --test-threads=1
+          cargo test -p rockstream-sql --lib --tests -- --test-threads=1
+      - name: Gateway tests
+        if: matrix.shard == 'gateway'
+        run: |
+          cargo test -p rockstream-gateway --lib --tests -- --test-threads=1
+          cargo test -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
+          rm -f target/pgwire-test-results.json
+          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
+          cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
+      - name: Simulation unit tests
+        if: matrix.shard == 'sim-unit'
+        run: cargo test -p rockstream-sim --features simulation --lib -- --test-threads=1
+      - name: Simulation integration tests
+        if: matrix.shard == 'sim-integration'
+        run: cargo test -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
+      - name: Remove Docker test image
+        if: always() && matrix.shard == 'gateway'
+        run: docker image rm rockstream-tc-test:latest || true
+
+  check:
+    name: Check
+    if: always()
+    needs:
+      - check-quality
+      - check-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any Check shard failed
+        if: needs.check-quality.result != 'success' || needs.check-tests.result != 'success'
+        run: |
+          echo "A Check shard did not pass."
+          exit 1
+      - name: Check shards passed
+        run: echo "All Check shards passed."
 
   formal-verify:
     name: Formal verify (M1–M4, M6–M7)
