@@ -6,7 +6,7 @@ TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
 fail() {
-	echo "test-verus-gates: $1" >&2
+	echo "test-verus-gates: RS-0906: $1" >&2
 	exit 1
 }
 
@@ -32,6 +32,19 @@ grep -q "assume(" "$ROOT/formal/verus/negative/unchecked_assumption.rs" ||
 	fail "unchecked-assumption fixture no longer exercises assume"
 grep -q "cfg(verus_only)" "$ROOT/formal/verus/negative/verus_only_substitution.rs" ||
 	fail "verus-only fixture no longer exercises executable substitution"
+
+for fixture in invalid_arithmetic invalid_sign_encoding invalid_validation \
+	invalid_publication_guard invalid_durable_marker; do
+	mutation_log="$TMP_ROOT/$fixture.log"
+	if verus "$ROOT/formal/verus/negative/$fixture.rs" >"$mutation_log" 2>&1; then
+		cat "$mutation_log" >&2
+		fail "$fixture unexpectedly passed"
+	fi
+	grep -Fq "assertion failed" "$mutation_log" && grep -Fq "$fixture.rs" "$mutation_log" || {
+		cat "$mutation_log" >&2
+		fail "$fixture failed for an unexpected reason"
+	}
+done
 
 policy_root="$TMP_ROOT/policy"
 mkdir -p "$policy_root/formal/verus" "$policy_root/crates/rockstream-verified/src" \

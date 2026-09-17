@@ -1,0 +1,441 @@
+schema = 1
+plan = "docs/implementation-plans/rockstream-verus-implementation-plan.md"
+manifest = "formal/verus/manifest.toml"
+sign_off = "sign-offs/verus/VS6.md"
+maintenance = "formal/verus/MAINTENANCE.md"
+runner = "scripts/run-verus-qualification.sh"
+recorder = "scripts/record-verus-qualification.py"
+evidence_root = "evidence/verus"
+source_revision_command = "git rev-parse HEAD"
+artifact_digest_algorithm = "sha256"
+artifact_digest_paths = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "formal/verus/manifest.toml",
+    "formal/verus/toolchain.lock.toml",
+    "formal/verus/qualification.toml",
+]
+
+[ownership]
+release = "release-owner"
+specification = "verification-reviewer"
+covered_components = ["rockstream-verified", "covered production callers"]
+
+[supported_backends]
+required = ["local", "LFS", "MinIO"]
+
+[[builds]]
+id = "production-debug-linux-x86_64"
+required = true
+kind = "production"
+toolchain = "1.88"
+profile = "debug"
+target = "x86_64-unknown-linux-gnu"
+features = ["default"]
+command = "cargo check --workspace --locked"
+artifacts = ["Cargo.lock", "target/debug/rockstream"]
+
+[[builds]]
+id = "production-release-linux-x86_64"
+required = true
+kind = "production"
+toolchain = "1.88"
+profile = "release"
+target = "x86_64-unknown-linux-gnu"
+features = ["default"]
+command = "cargo build --workspace --locked --release"
+artifacts = ["Cargo.lock", "target/release/rockstream"]
+
+[[builds]]
+id = "production-all-features-linux-x86_64"
+required = true
+kind = "production"
+toolchain = "1.88"
+profile = "debug"
+target = "x86_64-unknown-linux-gnu"
+features = ["all-features"]
+command = "cargo check --workspace --all-features --locked"
+artifacts = ["Cargo.lock"]
+
+[[builds]]
+id = "production-release-macos-arm64"
+required = true
+kind = "production"
+toolchain = "1.88"
+profile = "release"
+target = "aarch64-apple-darwin"
+features = ["default"]
+command = "cargo build --workspace --locked --release"
+artifacts = ["Cargo.lock"]
+
+[[builds]]
+id = "verifier-linux-x86_64"
+required = true
+kind = "verifier"
+toolchain = "1.98.1"
+profile = "verification"
+target = "x86_64-unknown-linux-gnu"
+features = ["default"]
+command = "cargo verus verify -p rockstream-verified --locked"
+artifacts = ["formal/verus/toolchain.lock.toml", "Cargo.lock"]
+
+[[builds]]
+id = "verifier-macos-arm64"
+required = true
+kind = "verifier"
+toolchain = "1.98.1"
+profile = "verification"
+target = "aarch64-apple-darwin"
+features = ["default"]
+command = "cargo verus verify -p rockstream-verified --locked"
+artifacts = ["formal/verus/toolchain.lock.toml", "Cargo.lock"]
+
+[budgets]
+r1_profile = "benchmarks/r1-local/profile-v0611.toml"
+r1_thresholds = "benchmarks/r1-local/thresholds-v0611.toml"
+tolerances_frozen = true
+cold_verification_seconds = 900
+incremental_verification_seconds = 300
+production_compile_seconds = 900
+runtime_regression_percent = 15
+rss_regression_percent = 15
+proof_maintenance_hours = 4
+solver_resource_settings = "Pinned Verus defaults; exact solver output is retained in the raw run log."
+
+[[mutations]]
+id = "VS6-M01"
+required = true
+kind = "bad-arithmetic"
+target = "crates/rockstream-verified/src/arithmetic.rs::checked_i64_add"
+fixture = "formal/verus/negative/invalid_arithmetic.rs"
+expected = "assertion failed"
+
+[[mutations]]
+id = "VS6-M02"
+required = true
+kind = "sign-encoding"
+target = "crates/rockstream-verified/src/keys.rs::signed_order_key"
+fixture = "formal/verus/negative/invalid_sign_encoding.rs"
+expected = "assertion failed"
+
+[[mutations]]
+id = "VS6-M03"
+required = true
+kind = "skipped-validation"
+target = "crates/rockstream-storage/src/keys.rs::decode_factor_payload_key"
+fixture = "formal/verus/negative/invalid_validation.rs"
+expected = "assertion failed"
+
+[[mutations]]
+id = "VS6-M04"
+required = true
+kind = "weakened-publication-guard"
+target = "crates/rockstream-verified/src/frontier.rs::admit_frontier_report"
+fixture = "formal/verus/negative/invalid_publication_guard.rs"
+expected = "assertion failed"
+
+[[mutations]]
+id = "VS6-M05"
+required = true
+kind = "missing-durable-marker"
+target = "crates/rockstream-verified/src/persistence.rs::coupled_commit_is_durable"
+fixture = "formal/verus/negative/invalid_durable_marker.rs"
+expected = "assertion failed"
+
+[[mutations]]
+id = "VS6-M06"
+required = true
+kind = "undeclared-assumption"
+target = "formal/verus/assumptions.toml"
+fixture = "formal/verus/negative/unchecked_assumption.rs"
+expected = "unchecked proof construct found"
+
+[[mutations]]
+id = "VS6-M07"
+required = true
+kind = "missing-proof-target"
+target = "crates/rockstream-verified/src/lib.rs::missing_proof_target"
+fixture = "formal/verus/manifest.toml"
+expected = "references missing symbol"
+
+[mutation_policy]
+required_kinds = [
+    "bad-arithmetic",
+    "sign-encoding",
+    "skipped-validation",
+    "weakened-publication-guard",
+    "missing-durable-marker",
+    "undeclared-assumption",
+    "missing-proof-target",
+]
+
+[[claim_evidence]]
+id = "VS0-02"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: scalar kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS0.md"
+qualification_evidence = "blocked: pinned clean-run output is not present in this checkout"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS1-02"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: scalar kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS1.md"
+qualification_evidence = "blocked: pinned clean-run output is not present in this checkout"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS1-03"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: law-admission adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS1.md"
+qualification_evidence = "blocked: pinned clean-run output is not present in this checkout"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS1-04"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: storage adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS1.md"
+qualification_evidence = "blocked: backend qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS1-05"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: admission adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS1.md"
+qualification_evidence = "blocked: workload qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS1-06"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: SQL adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS1.md"
+qualification_evidence = "blocked: public-query qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS2-01"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: layout adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS2.md"
+qualification_evidence = "blocked: external backend qualification remains open"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS2-02"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: scalar key kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS2.md"
+qualification_evidence = "blocked: pinned clean-run output is not present in this checkout"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS2-03"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: codec kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS2.md"
+qualification_evidence = "blocked: pinned clean-run output is not present in this checkout"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS2-04"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: storage adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS2.md"
+qualification_evidence = "blocked: external backend qualification remains open"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS2-05"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: routing kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS2.md"
+qualification_evidence = "blocked: pinned clean-run output is not present in this checkout"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS2-06"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: mutation matrix"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS2.md"
+qualification_evidence = "blocked: mutation run is a release-qualification artifact"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS3-01"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: z-set adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS3.md"
+qualification_evidence = "blocked: public-path qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS3-02"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: primitive kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS3.md"
+qualification_evidence = "blocked: pinned clean-run output is not present in this checkout"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS3-03"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: staging adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS3.md"
+qualification_evidence = "blocked: public-path qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS3-04"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: aggregate kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS3.md"
+qualification_evidence = "blocked: public-path qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS3-05"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: operator adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS3.md"
+qualification_evidence = "blocked: durable epoch qualification remains VS5-owned"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS3-06"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: SQL adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS3.md"
+qualification_evidence = "blocked: large-state qualification remains v0.67.1-owned"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS4-01"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "recorded: formal/m2_frontier_agg.fizz"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS4.md"
+qualification_evidence = "blocked: multi-process authority qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS4-02"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "recorded: formal/m2_frontier_agg.fizz"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS4.md"
+qualification_evidence = "blocked: multi-process authority qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS4-03"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "recorded: formal/m2_frontier_agg.fizz"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS4.md"
+qualification_evidence = "blocked: multi-process authority qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS4-04"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "recorded: formal/verus/model-map.md"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS4.md"
+qualification_evidence = "blocked: bounded model run is a release-qualification artifact"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS4-05"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "recorded: formal/m2_frontier_agg.fizz"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS4.md"
+qualification_evidence = "blocked: multi-process authority qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS4-06"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "recorded: formal/m2_frontier_agg.fizz"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS4.md"
+qualification_evidence = "blocked: multi-process authority qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS5-01"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: persistence kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS5.md"
+qualification_evidence = "blocked: backend durability qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS5-02"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: replay kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS5.md"
+qualification_evidence = "blocked: backend durability qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS5-03"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: commit adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS5.md"
+qualification_evidence = "blocked: backend durability qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS5-04"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: recovery kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS5.md"
+qualification_evidence = "blocked: backend durability qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS5-05"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: compaction kernel"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS5.md"
+qualification_evidence = "blocked: backend durability qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
+
+[[claim_evidence]]
+id = "VS5-06"
+theorem_evidence = "recorded: manifest.theorems"
+model_evidence = "not-applicable: recovery adapter"
+test_evidence = "recorded: manifest.regression_tests"
+review_evidence = "recorded: sign-offs/verus/VS5.md"
+qualification_evidence = "blocked: backend durability qualification remains external"
+verifier_output = "blocked: generated by the pinned verifier during release qualification"
