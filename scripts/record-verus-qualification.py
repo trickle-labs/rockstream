@@ -55,6 +55,11 @@ def main() -> int:
         if not path.is_file():
             raise SystemExit(f"RS-0906: missing artifact for digest: {relative}")
         artifacts[relative] = sha256(path)
+    if args.status == "passed":
+        missing_runtime = [path for path in args.runtime_artifact if not path.is_file()]
+        if not args.runtime_artifact or missing_runtime:
+            missing = missing_runtime[0] if missing_runtime else "<none supplied>"
+            raise SystemExit(f"RS-0906: missing runtime artifact: {missing}")
     runtime_artifacts = {
         path.name: sha256(path) for path in args.runtime_artifact if path.is_file()
     }

@@ -60,9 +60,15 @@ if [ -n "$QUALIFY_TARGET" ]; then
 fi
 if [ -f "$TARGET_ROOT/${TARGET_SUFFIX}release/rockstream" ]; then
   cp "$TARGET_ROOT/${TARGET_SUFFIX}release/rockstream" "$RUNTIME_ARTIFACT"
+else
+  echo "verus qualification: RS-0906: release runtime artifact was not produced" >&2
+  OVERALL=1
 fi
 if [ -f "$TARGET_ROOT/${TARGET_SUFFIX}debug/rockstream" ]; then
   cp "$TARGET_ROOT/${TARGET_SUFFIX}debug/rockstream" "$DEBUG_ARTIFACT"
+else
+  echo "verus qualification: RS-0906: debug runtime artifact was not produced" >&2
+  OVERALL=1
 fi
 
 if [ "$OVERALL" -eq 0 ]; then
