@@ -25,3 +25,11 @@ VS2 covers the selected persistent encoding and routing kernels.
 The selected layout inventory and allocation assumptions are recorded in
 [`key-layouts.toml`](key-layouts.toml). This milestone has no protocol-state
 correspondence. FizzBee remains the owner of the existing protocol models.
+
+VS3 covers the Z-set adapter and aggregate transition boundary.
+
+| Production code | Verus contract | Caller obligation |
+|---|---|---|
+| `crates/rockstream-ops/src/zset.rs::{try_new,validate,select_rows}` | Row and weight lengths align; ordered selection preserves requested order/repetition, rejects invalid indices, and carries the frontier. | Arrow row equality and decoding remain adapter responsibilities; zero filtering does not imply duplicate consolidation. |
+| `crates/rockstream-verified/src/aggregate.rs::transition` | A valid absent or positive-count state plus a consolidated delta yields an exact present/deleted state or a checked rejection; zero-count nonzero-sum states are invalid. | `AggregateOp` validates/casts Arrow input and supplies valid-retraction semantics. |
+| `crates/rockstream-ops/src/aggregate.rs::{StagedEpochAggregator::ingest_delta,AggregateOp::process_delta_with_result}` | Candidate arithmetic, output, and touched-key mutations are ready before authoritative state installation. | Durable write atomicity, restart, and storage outcomes remain VS5 obligations. |
