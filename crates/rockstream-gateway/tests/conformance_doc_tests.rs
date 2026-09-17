@@ -88,13 +88,13 @@ fn documented_stub_is_rejected_without_a_passing_result() {
 
 fn coverage_floors() -> HashMap<String, (u32, u32)> {
     let workflow: serde_yaml::Value = serde_yaml::from_str(
-        &std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
-            .expect("failed to read ci.yml"),
+        &std::fs::read_to_string(repo_root().join(".github/workflows/coverage.yml"))
+            .expect("failed to read coverage.yml"),
     )
-    .expect("ci.yml must be valid YAML");
+    .expect("coverage.yml must be valid YAML");
     let steps = workflow["jobs"]["coverage"]["steps"]
         .as_sequence()
-        .expect("ci.yml coverage job must have steps");
+        .expect("coverage.yml coverage job must have steps");
     let mut floors = HashMap::new();
     for run in steps.iter().filter_map(|step| step["run"].as_str()) {
         let fields = run.split_whitespace().collect::<Vec<_>>();
@@ -187,13 +187,13 @@ fn test_coverage_gate_config_is_present() {
 fn test_coverage_gates_reuse_complete_workspace_report() {
     let root = repo_root();
     let workflow: serde_yaml::Value = serde_yaml::from_str(
-        &std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
-            .expect("failed to read ci.yml"),
+        &std::fs::read_to_string(root.join(".github/workflows/coverage.yml"))
+            .expect("failed to read coverage.yml"),
     )
-    .expect("ci.yml must be valid YAML");
+    .expect("coverage.yml must be valid YAML");
     let steps = workflow["jobs"]["coverage"]["steps"]
         .as_sequence()
-        .expect("ci.yml coverage job must have steps");
+        .expect("coverage.yml coverage job must have steps");
     let runs = steps
         .iter()
         .filter_map(|step| step["run"].as_str())
@@ -255,7 +255,7 @@ fn test_all_gated_crates_present_in_ci_coverage_job() {
     for crate_name in &crates {
         let (lines, regions) = floors
             .get(crate_name)
-            .unwrap_or_else(|| panic!("ci.yml coverage job is missing a gate for `{crate_name}`"));
+            .unwrap_or_else(|| panic!("coverage.yml coverage job is missing a gate for `{crate_name}`"));
         let (minimum_lines, minimum_regions) = if crate_name == "rockstream-sim" {
             (63, 66)
         } else {
@@ -263,17 +263,17 @@ fn test_all_gated_crates_present_in_ci_coverage_job() {
         };
         assert!(
             *lines >= minimum_lines,
-            "ci.yml `{crate_name}` --fail-under-lines must be >= {minimum_lines}, got {lines}"
+            "coverage.yml `{crate_name}` --fail-under-lines must be >= {minimum_lines}, got {lines}"
         );
         assert!(
             *regions >= minimum_regions,
-            "ci.yml `{crate_name}` --fail-under-regions must be >= {minimum_regions}, got {regions}"
+            "coverage.yml `{crate_name}` --fail-under-regions must be >= {minimum_regions}, got {regions}"
         );
     }
     assert_eq!(
         floors.len(),
         crates.len(),
-        "ci.yml coverage job must gate every workspace crate, found: {:?}",
+        "coverage.yml coverage job must gate every workspace crate, found: {:?}",
         floors.keys().collect::<Vec<_>>()
     );
 }
