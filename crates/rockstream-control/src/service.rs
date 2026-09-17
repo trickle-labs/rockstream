@@ -3455,6 +3455,17 @@ async fn handle_connection_stream<R, W>(
                 if let Some(agg) = &frontier {
                     if let Err(e) = agg.ingest_membership_report(report) {
                         tracing::warn!(%shard_id, epoch, error = %e, "control: membership frontier ingest failed");
+                        send_message(
+                            &sender,
+                            &ControlMessage::OperationFailed {
+                                code: RS_8004.to_string(),
+                                message: e.to_string(),
+                                next_steps: rockstream_types::error_code::next_steps(RS_8004)
+                                    .to_string(),
+                            },
+                        )
+                        .await;
+                        continue;
                     }
                 }
                 let is_leader = match &raft {
@@ -4372,6 +4383,36 @@ mod tests {
             reply,
             ControlMessage::OperationFailed { ref code, .. } if code == "RS-8004"
         ));
+        assert_eq!(frontier.cluster_frontier().epoch, None);
+
+        let invalid_membership = WorkerMessage::ReportShardFrontierV2 {
+            report: MembershipFrontierReport::new(
+                "other-view",
+                FrontierGeneration(0),
+                ShardId(42),
+                ShardIncarnation(1),
+                lease.lease_token,
+                42,
+            ),
+        };
+        let reply: ControlMessage =
+            serde_json::from_str(send_and_recv(&mut stream, &invalid_membership).await.trim())
+                .unwrap();
+        match reply {
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => {
+                assert_eq!(code, RS_8004.to_string());
+                assert_eq!(message, "RS-8004 frontier report rejected: scope mismatch");
+                assert_eq!(
+                    next_steps,
+                    rockstream_types::error_code::next_steps(RS_8004).to_string()
+                );
+            }
+            reply => panic!("expected OperationFailed, got: {reply:?}"),
+        }
         assert_eq!(frontier.cluster_frontier().epoch, None);
 
         let valid = WorkerMessage::ReportShardFrontierV2 {
