@@ -469,7 +469,10 @@ impl FactorizedJoinAggregateOp {
                 let row_bytes = encode_row(values, *weight);
                 let row_id = stable_row_id(self.op_id.0, key, &row_bytes);
                 let storage_key =
-                    ShardKeyEncoder::factor_payload_key(side, self.op_id.0, key, row_id);
+                    ShardKeyEncoder::try_factor_payload_key(side, self.op_id.0, key, row_id)
+                        .ok_or_else(|| {
+                            OpError::storage_error("factor payload key exceeds u32 length")
+                        })?;
                 target.put(&storage_key, &row_bytes);
             }
         }
@@ -511,12 +514,12 @@ impl FactorizedJoinAggregateOp {
                         *entries.get(&(key.clone(), values.clone())).unwrap(),
                     );
                     let row_id = stable_row_id(self.op_id.0, key, &row_bytes);
-                    current.insert(ShardKeyEncoder::factor_payload_key(
-                        side,
-                        self.op_id.0,
-                        key,
-                        row_id,
-                    ));
+                    let storage_key =
+                        ShardKeyEncoder::try_factor_payload_key(side, self.op_id.0, key, row_id)
+                            .ok_or_else(|| {
+                                OpError::storage_error("factor payload key exceeds u32 length")
+                            })?;
+                    current.insert(storage_key);
                 }
             }
         }

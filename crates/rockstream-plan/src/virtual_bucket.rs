@@ -21,9 +21,9 @@ pub fn route_power_of_two_bucket(
     key_prefix_len: usize,
 ) -> Option<u16> {
     validate_power_of_two_bucket_count(bucket_count).ok()?;
-    let prefix_len = key_prefix_len.min(key.len());
+    let prefix_len = rockstream_verified::routing::clamp_prefix_len(key_prefix_len, key.len());
     let hash = fnv1a_64(&key[..prefix_len]);
-    Some((hash & u64::from(bucket_count - 1)) as u16)
+    rockstream_verified::routing::route_power_of_two_hash(hash, bucket_count)
 }
 
 /// Deterministically route a logical key prefix into one virtual bucket.

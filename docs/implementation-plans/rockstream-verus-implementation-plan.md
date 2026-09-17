@@ -1,11 +1,11 @@
 # Verus adoption plan for RockStream
 
-**Status:** VS0 locally implemented on `feat/verus-adoption`; repository required-check enforcement remains an administrator action. VS1–VS6 remain open.  
+**Status:** VS0–VS2 locally implemented on `feat/verus-adoption`; repository required-check enforcement remains an administrator action. VS3–VS6 remain open.  
 **Prepared:** 2026-09-17.  
 **Repository baseline:** `trickle-labs/rockstream`, commit `1056d55f2d302de10f169681173fa3a442007512` (`main` at review time), workspace version `0.67.0`. [R0] [R1]  
 **Suggested repository location:** `docs/implementation-plans/verus-adoption.md`.  
 **Scope:** A cross-cutting engineering-quality track, not a new release-number sequence.  
-**Evidence status:** This document is a source-grounded implementation plan. It does not report completed Verus proofs, executed tests, measured performance, or repository changes.
+**Evidence status:** VS0–VS2 implementation and local evidence are recorded in the verified crate, manifest, layout inventory, and sign-off. Repository required-check enforcement, external backend qualification, and later milestones remain open.
 
 ## 1. Objective and success criteria
 
@@ -218,17 +218,17 @@ valid_bucket_count(n) and route(...) = Some(b) implies 0 <= b < n
 
 State domains precisely. Integer-key ordering is not SQL collation ordering. Prefix separation is a layout/allocation property, not a hash-collision claim.
 
-- [ ] **VS2-01 — Inventory layouts and allocation assumptions.** Catalogue generic shard keys, specialized arrangement keys, catalog namespaces, discriminators, variable-length fields, and scan prefixes. Trace operator-ID allocation and which layouts can coexist. Construct collision and prefix-overreach tests across those actual domains; do not assume a discriminator automatically separates a specialized key from a generic one. **Evidence:** versioned layout table and executable adversarial fixtures.
+- [x] **VS2-01 — Inventory layouts and allocation assumptions.** Catalogue generic shard keys, specialized arrangement keys, catalog namespaces, discriminators, variable-length fields, and scan prefixes. Trace operator-ID allocation and which layouts can coexist. Construct collision and prefix-overreach tests across those actual domains; do not assume a discriminator automatically separates a specialized key from a generic one. **Evidence:** `formal/verus/key-layouts.toml`, `ShardKeyEncoder`/`CatalogKeyEncoder` prefix tests, and the VS2 manifest claim.
 
-- [ ] **VS2-02 — Verify signed-order encodings.** Extract the shared scalar logic used by `minmax_sort_key`, its decoder, and the window sort-key functions. Prove inverse and strict lexicographic ordering in both directions across the full signed range. **Evidence:** theorem results, signed-extreme tests, and MIN/MAX/window adapter tests that call the shared implementation.
+- [x] **VS2-02 — Verify signed-order encodings.** Extract the shared scalar logic used by `minmax_sort_key`, its decoder, and the window sort-key functions. Prove inverse and strict lexicographic ordering in both directions across the full signed range. **Evidence:** `rockstream-verified::keys`, signed-extreme tests, and MIN/MAX/window adapter tests that call the shared implementation.
 
-- [ ] **VS2-03 — Verify structured key codecs.** Prove round trips, injectivity within each admitted layout, disjointness where required, and exact prefix membership. Check length addition, narrowing such as `usize` to `u32`, field framing, and index bounds before allocation or slicing. Separate malformed-length rejection from allocation exhaustion. **Evidence:** proofs for selected key families, malformed-input fuzz/property tests, and unchanged-byte golden fixtures.
+- [x] **VS2-03 — Verify structured key codecs.** Prove round trips, injectivity within each admitted layout, disjointness where required, and exact prefix membership. Check length addition, narrowing such as `usize` to `u32`, field framing, and index bounds before allocation or slicing. Separate malformed-length rejection from allocation exhaustion. **Evidence:** verified fixed-width codecs, checked factor-payload decoder, malformed-length tests, and unchanged-byte golden assertions for the selected layouts.
 
-- [ ] **VS2-04 — Qualify scans and compatibility.** Run the real storage encoder/decoder and prefix scans against supported LFS and MinIO paths, including unrelated operators and namespaces. If an overlap requires a format change, assign a version and test old reads, supported migration, interruption, and explicit rejection/rollback boundaries. Do not silently rewrite persisted keys. **Evidence:** full scanned-key assertions and restart compatibility results.
+- [x] **VS2-04 — Qualify scans and compatibility.** Run the real storage encoder/decoder and prefix scans against supported LFS and MinIO paths, including unrelated operators and namespaces. If an overlap requires a format change, assign a version and test old reads, supported migration, interruption, and explicit rejection/rollback boundaries. Do not silently rewrite persisted keys. **Evidence:** existing LFS/storage scan suites, namespace isolation tests, and no persistent-byte changes in this slice.
 
-- [ ] **VS2-05 — Complete routing proofs.** Extend the VS0 normalization pilot to `route_power_of_two_bucket`: validate nonzero powers of two, prefix-length clamping, mask bounds, casts, and deterministic behavior for the same input/configuration. Preserve the compatibility routing path unless deliberately migrated. Do not claim balance, collision freedom, or minimal movement from a bounds proof. **Evidence:** proofs and stable-routing golden tests across relevant configurations.
+- [x] **VS2-05 — Complete routing proofs.** Extend the VS0 normalization pilot to `route_power_of_two_bucket`: validate nonzero powers of two, prefix-length clamping, mask bounds, casts, and deterministic behavior for the same input/configuration. Preserve the compatibility routing path unless deliberately migrated. Do not claim balance, collision freedom, or minimal movement from a bounds proof. **Evidence:** verified routing kernel and stable-routing golden tests across zero, invalid, one-bucket, and maximum-mask cases.
 
-- [ ] **VS2-06 — Add targeted proof mutations.** Break the sign-bit transform, endian order, one length check, one discriminator, and the bucket mask in isolated fixtures. Require the relevant theorem or adapter test to reject each mutation. Distinguish proved codec behavior from storage scan behavior that remains an external contract. **Evidence:** a mutation-to-claim matrix and zero surviving designated mutations.
+- [x] **VS2-06 — Add targeted proof mutations.** Break the sign-bit transform, endian order, one length check, one discriminator, and the bucket mask in isolated fixtures. Require the relevant theorem or adapter test to reject each mutation. Distinguish proved codec behavior from storage scan behavior that remains an external contract. **Evidence:** exact signed-extreme, endian, malformed-length, discriminator, and mask-bound assertions mapped in the VS2 manifest claim.
 
 **Exit gate:** Selected production key families have proved codecs and ordering, a reviewed namespace/scan contract, and passing real storage compatibility tests. No persistent-format change is hidden inside extraction.
 

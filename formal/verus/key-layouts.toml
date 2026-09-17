@@ -1,0 +1,42 @@
+schema = 1
+format_policy = "Existing persisted bytes remain unchanged; a future layout change requires a storage-format version and migration evidence."
+
+[[layouts]]
+id = "shard.operator"
+version = 1
+shape = "[namespace:1][operator_id:u64-be][suffix:opaque]"
+prefixes = ["0x01..0x06"]
+verified = true
+assumptions = ["Operator IDs are allocated in one u64 domain; scans use the complete namespace and operator prefix."]
+
+[[layouts]]
+id = "catalog.object"
+version = 1
+shape = "[catalog_type:1][namespace_id:u128-be][object_id:u128-be][suffix:opaque]"
+prefixes = ["0x10..0x17"]
+verified = true
+assumptions = ["Catalog type bytes are unique and namespace prefixes are the tenant isolation boundary."]
+
+[[layouts]]
+id = "arrangement.discriminators"
+version = 1
+shape = "[shard_namespace][discriminator][operator_id][layout-specific fields]"
+prefixes = ["OpState", "OpIndex", "ShardMeta"]
+verified = true
+assumptions = ["Discriminator allocations are reviewed as one namespace table; a discriminator alone is not treated as a hash-collision proof."]
+
+[[layouts]]
+id = "factorized.payload"
+version = 1
+shape = "[OpState][FP][side:2][operator_id:u64-be][capsule_len:u32-be][capsule][row_id:u128-be]"
+prefixes = ["OpState/FP/JL", "OpState/FP/JR"]
+verified = true
+assumptions = ["The capsule length is checked before slicing and trailing bytes are rejected."]
+
+[[layouts]]
+id = "variable.arrangements"
+version = 1
+shape = "Existing join, window, tumbling-window, Top-K, recursion, and MIN/MAX layouts"
+prefixes = ["OpState", "OpIndex"]
+verified = false
+assumptions = ["Their variable fields remain owner-specific; this VS2 slice does not claim global injectivity for arbitrary unframed field boundaries."]
