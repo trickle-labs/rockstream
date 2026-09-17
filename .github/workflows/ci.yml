@@ -120,18 +120,30 @@ jobs:
         run: bash scripts/check-path-coupling.test.sh
 
   verus-verify:
-    name: Verus verify (VS0)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: Verus verify and qualify (VS6)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      VERUS_QUALIFICATION_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
           components: rustfmt, clippy
+          targets: ${{ matrix.target }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
       - name: Cache pinned Verus
         uses: actions/cache@v4
         with:
@@ -143,6 +155,16 @@ jobs:
         run: make verify-rust
       - name: Verify proof contracts
         run: make verify-proof-contracts
+      - name: Run clean VS6 qualification matrix
+        run: make qualify-verus
+      - name: Upload VS6 qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verus-qualification-${{ matrix.target }}
+          path: evidence/verus/
+          if-no-files-found: warn
+          retention-days: 14
       - name: Exercise production wrapper
         run: cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests
       - name: Build ordinary Cargo consumer
