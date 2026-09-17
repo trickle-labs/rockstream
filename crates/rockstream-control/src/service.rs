@@ -33,8 +33,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::data_plane::{
-    DeploymentDescriptor, DeploymentRequest, RuntimeExchangeMessage, RuntimeOutputDelta,
-    ShardOutput, WorkerExecutionStatus, WorkloadSnapshot,
+    DeploymentDescriptor, DeploymentRequest, ShardOutput, WorkerExecutionStatus, WorkloadSnapshot,
 };
 use rockstream_types::error_code::{RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612};
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
@@ -166,7 +165,6 @@ struct DataPlaneState {
 struct DeploymentState {
     request: DeploymentRequest,
     descriptors: HashMap<ShardId, DeploymentDescriptor>,
-    outputs: HashMap<ShardId, Vec<RuntimeOutputDelta>>,
     workers: HashMap<WorkerId, WorkerExecutionStatus>,
     ready_shards: HashSet<ShardId>,
     ready_waiter: Option<mpsc::Sender<ControlMessage>>,
@@ -1979,6 +1977,7 @@ fn data_plane_failure(message: impl Into<String>) -> ControlMessage {
     }
 }
 
+#[allow(dead_code)]
 fn stable_route(value: &str, shard_count: usize) -> usize {
     let hash = value
         .as_bytes()
@@ -2039,7 +2038,6 @@ async fn deploy_workload(
         DeploymentState {
             request,
             descriptors: descriptors.clone(),
-            outputs: HashMap::new(),
             workers: HashMap::new(),
             ready_shards: HashSet::new(),
             ready_waiter: Some(sender.clone()),
@@ -2063,78 +2061,29 @@ async fn deploy_workload(
 async fn submit_source_delta(
     request: rockstream_types::data_plane::SourceDeltaRequest,
     sender: &mpsc::Sender<ControlMessage>,
-    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
-    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    _worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    _data_plane: &Arc<AsyncMutex<DataPlaneState>>,
 ) {
-    let (routing_column, operator_id, descriptors) = {
-        let state = data_plane.lock().await;
-        let Some(deployment) = state.deployments.get(&request.workload_id) else {
-            send_message(sender, &data_plane_failure("workload is not deployed")).await;
-            return;
-        };
-        let Some(column) = deployment.request.routing_columns.get(&request.source) else {
-            send_message(sender, &data_plane_failure("source has no routing column")).await;
-            return;
-        };
-        let mut descriptors: Vec<_> = deployment.descriptors.values().cloned().collect();
-        descriptors.sort_by_key(|descriptor| descriptor.shard.shard_id);
-        (*column, deployment.request.sink_operator_id, descriptors)
-    };
-
-    let mut routed: HashMap<usize, Vec<_>> = HashMap::new();
-    for row in request.rows {
-        let Some(value) = row.values_tsv.split('\t').nth(routing_column) else {
-            send_message(
-                sender,
-                &data_plane_failure("row is missing its routing field"),
-            )
-            .await;
-            return;
-        };
-        routed
-            .entry(stable_route(value, descriptors.len()))
-            .or_default()
-            .push(row);
-    }
-    if routed.is_empty() {
+    if !request.rows.is_empty() {
         send_message(
             sender,
-            &ControlMessage::SourceDeltaCommitted {
-                request_id: request.request_id,
-                epoch: request.epoch,
+            &ControlMessage::OperationFailed {
+                code: rockstream_types::error_code::RS_3001.to_string(),
+                message: "control plane does not route data plane row payloads; stream directly to worker shard owner".into(),
+                next_steps: "Resolve shard placement from control metadata and send record batches directly via data plane gRPC".into(),
             },
-        )
-        .await;
+        ).await;
         return;
     }
 
-    data_plane.lock().await.source_waiters.insert(
-        request.request_id.clone(),
-        SourceWaiter {
-            sender: sender.clone(),
-            expected: routed.len(),
-            received: 0,
+    send_message(
+        sender,
+        &ControlMessage::SourceDeltaCommitted {
+            request_id: request.request_id,
             epoch: request.epoch,
         },
-    );
-    let senders = worker_senders.lock().await.clone();
-    for (index, rows) in routed {
-        let descriptor = &descriptors[index];
-        let frame = RuntimeExchangeMessage {
-            version: request.version,
-            request_id: request.request_id.clone(),
-            workload_id: request.workload_id,
-            shard_id: descriptor.shard.shard_id,
-            epoch: request.epoch,
-            operator_id,
-            lease_token: descriptor.shard.lease_token,
-            source: request.source.clone(),
-            rows,
-        };
-        if let Some(target) = senders.get(&descriptor.shard.worker_id) {
-            send_message(target, &ControlMessage::Execute { frame }).await;
-        }
-    }
+    )
+    .await;
 }
 
 fn drain_failure_message(err: DrainFailure) -> ControlMessage {
@@ -2933,11 +2882,6 @@ async fn handle_connection_stream<R, W>(
                     let mut state = data_plane.lock().await;
                     let deployment = state.deployments.get_mut(&output.workload_id).unwrap();
                     let worker_id = deployment.descriptors[&output.shard_id].shard.worker_id;
-                    deployment
-                        .outputs
-                        .entry(output.shard_id)
-                        .or_default()
-                        .push(output.clone());
                     if let Some(status) = deployment.workers.get_mut(&worker_id) {
                         status.input_rows += input_rows;
                         status.output_rows += output_rows;
@@ -2973,11 +2917,7 @@ async fn handle_connection_stream<R, W>(
                             .keys()
                             .map(|shard_id| ShardOutput {
                                 shard_id: *shard_id,
-                                deltas: deployment
-                                    .outputs
-                                    .get(shard_id)
-                                    .cloned()
-                                    .unwrap_or_default(),
+                                deltas: Vec::new(),
                             })
                             .collect();
                         shards.sort_by_key(|shard| shard.shard_id);

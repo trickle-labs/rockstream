@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "2f65e688ef9b98aeebbf367b0c57202f3901090bc87079d63af12f7115930940",
+    "candidate_identity_digest": "b87d9beb593d532fdf90920062c2d414ee4aa5279c0f065f61a3dddc76cd3fa3",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -7188,6 +7188,16 @@
         "doc_anchor": "rs-3003"
       },
       {
+        "code": "RS-3004",
+        "key": "exchange.stale_lease_token",
+        "title": "Exchange frame lease token stale or superseded",
+        "severity": "ERROR",
+        "sqlstate": "55000",
+        "retry_class": "AfterLeaderElection",
+        "default_next_steps": "Refresh worker shard lease from control plane before retrying exchange.",
+        "doc_anchor": "rs-3004"
+      },
+      {
         "code": "RS-3005",
         "key": "config.self_fencing_invalid",
         "title": "Self-fencing configuration invalid: self_fence_after constraint violated",
@@ -7196,6 +7206,26 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.",
         "doc_anchor": "rs-3005"
+      },
+      {
+        "code": "RS-3006",
+        "key": "exchange.frame_oversized",
+        "title": "Exchange frame exceeds max_batch_bytes limit",
+        "severity": "ERROR",
+        "sqlstate": "53200",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Split large record batches into smaller chunks within configured transport budget.",
+        "doc_anchor": "rs-3006"
+      },
+      {
+        "code": "RS-3008",
+        "key": "exchange.conflicting_payload_digest",
+        "title": "Exchange request ID reused with conflicting payload digest",
+        "severity": "ERROR",
+        "sqlstate": "42710",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Ensure idempotent retry uses identical request payload and request ID, or generate a fresh request ID.",
+        "doc_anchor": "rs-3008"
       },
       {
         "code": "RS-3009",

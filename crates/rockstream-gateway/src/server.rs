@@ -1784,6 +1784,97 @@ fn encode_typed_field(
     encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)))
 }
 
+/// Encode a single cell from an Arrow Array directly into a `DataRowEncoder`
+/// without allocating or splitting strings on the hot path (v0.67 Slice 3).
+fn encode_arrow_cell(
+    encoder: &mut DataRowEncoder,
+    datatype: &Type,
+    array: &arrow::array::ArrayRef,
+    row_idx: usize,
+) -> PgWireResult<()> {
+    if array.is_null(row_idx) {
+        return encode_typed_field(encoder, datatype, None);
+    }
+    use arrow::array::*;
+    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::INT2 => encoder.encode_field(&(v as i16)),
+            Type::INT4 => encoder.encode_field(&(v as i32)),
+            Type::INT8 => encoder.encode_field(&v),
+            Type::FLOAT4 => encoder.encode_field(&(v as f32)),
+            Type::FLOAT8 => encoder.encode_field(&(v as f64)),
+            Type::BOOL => encoder.encode_field(&(v != 0)),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::INT2 => encoder.encode_field(&(v as i16)),
+            Type::INT4 => encoder.encode_field(&v),
+            Type::INT8 => encoder.encode_field(&(v as i64)),
+            Type::FLOAT4 => encoder.encode_field(&(v as f32)),
+            Type::FLOAT8 => encoder.encode_field(&(v as f64)),
+            Type::BOOL => encoder.encode_field(&(v != 0)),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::FLOAT4 => encoder.encode_field(&(v as f32)),
+            Type::FLOAT8 => encoder.encode_field(&v),
+            Type::INT8 => encoder.encode_field(&(v as i64)),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::FLOAT4 => encoder.encode_field(&v),
+            Type::FLOAT8 => encoder.encode_field(&(v as f64)),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::BOOL => encoder.encode_field(&v),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        return encode_typed_field(encoder, datatype, Some(arr.value(row_idx)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return encode_typed_field(encoder, datatype, Some(arr.value(row_idx)));
+    }
+    let s = datafusion::arrow::util::display::array_value_to_string(array.as_ref(), row_idx)
+        .unwrap_or_default();
+    encode_typed_field(encoder, datatype, Some(&s))
+}
+
 #[derive(Debug, Clone)]
 pub struct PortalState {
     pub rows: Vec<pgwire::messages::data::DataRow>,
@@ -7417,7 +7508,8 @@ impl GatewayHandler {
             .distributed_data_plane
             .as_ref()
             .filter(|_| self.catalog.get_view(view_name).is_some());
-        let raw_rows: Vec<Vec<u8>> = if let Some(distributed_data_plane) = distributed_data_plane {
+        let batches: Vec<RecordBatch> = if let Some(distributed_data_plane) = distributed_data_plane
+        {
             let snapshot = distributed_data_plane
                 .read_workload(WorkloadId(stable_name_id("workload", view_name)))
                 .await
@@ -7461,7 +7553,8 @@ impl GatewayHandler {
             if let Some(n) = limit {
                 rows.truncate(n);
             }
-            rows
+            crate::view_reader::tsv_rows_to_record_batches(&rows)
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?
         } else if let Some(shard_db) = &self.shard_db {
             let mut rows: Vec<Vec<u8>> = if let Some(view) = self.catalog.get_view(view_name) {
                 if view.op_id.is_some() {
@@ -7520,28 +7613,50 @@ impl GatewayHandler {
             if let Some(n) = limit {
                 rows.truncate(n);
             }
-            rows
-        } else {
-            self.view_reader
-                .read_view(view_name, limit, ViewReadStrategy::HotOnly)
-                .await
+            crate::view_reader::tsv_rows_to_record_batches(&rows)
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+        } else {
+            let mut batches = self
+                .view_reader
+                .read_view_batches(view_name, ViewReadStrategy::HotOnly)
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            if let Some(n) = limit {
+                let mut remaining = n;
+                let mut truncated = Vec::new();
+                for b in batches {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if b.num_rows() <= remaining {
+                        remaining -= b.num_rows();
+                        truncated.push(b);
+                    } else {
+                        truncated.push(b.slice(0, remaining));
+                        remaining = 0;
+                    }
+                }
+                batches = truncated;
+            }
+            batches
         };
 
         let schema = Arc::new(schema_fields);
         let schema_ref = schema.clone();
-        let data_stream = stream::iter(raw_rows).map(move |raw: Vec<u8>| {
-            let mut encoder = DataRowEncoder::new(schema_ref.clone());
-            let row_str = String::from_utf8_lossy(&raw).into_owned();
-            let col_count = schema_ref.len();
-            let fields: Vec<&str> = row_str.split('\t').collect();
-            for i in 0..col_count {
-                let val = fields.get(i).copied().filter(|value| *value != r"\N");
-                let datatype = schema_ref[i].datatype();
-                encode_typed_field(&mut encoder, datatype, val)?;
+        let mut row_results = Vec::new();
+        for batch in &batches {
+            let num_rows = batch.num_rows();
+            let col_count = schema_ref.len().min(batch.num_columns());
+            for row_idx in 0..num_rows {
+                let mut encoder = DataRowEncoder::new(schema_ref.clone());
+                for c in 0..col_count {
+                    let datatype = schema_ref[c].datatype();
+                    encode_arrow_cell(&mut encoder, datatype, batch.column(c), row_idx)?;
+                }
+                row_results.push(encoder.finish());
             }
-            encoder.finish()
-        });
+        }
+        let data_stream = stream::iter(row_results);
 
         Ok(vec![Response::Query(QueryResponse::new(
             schema,

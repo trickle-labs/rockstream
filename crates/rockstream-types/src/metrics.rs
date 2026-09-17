@@ -420,6 +420,9 @@ struct MetricRegistry {
     shuffle_compression_disabled_total: AtomicU64,
     shuffle_compression_state_entries: AtomicU64,
     exchange_flow_control_channels_size: AtomicU64,
+    exchange_inflight_bytes: AtomicU64,
+    exchange_inflight_batches: AtomicU64,
+    exchange_pending_requests: AtomicU64,
     exchange_multiplexer_streams_size: AtomicU64,
     exchange_pool_clients_size: AtomicU64,
     webhook_pending_size: AtomicU64,
@@ -532,6 +535,9 @@ impl MetricRegistry {
             shuffle_compression_disabled_total: AtomicU64::new(0),
             shuffle_compression_state_entries: AtomicU64::new(0),
             exchange_flow_control_channels_size: AtomicU64::new(0),
+            exchange_inflight_bytes: AtomicU64::new(0),
+            exchange_inflight_batches: AtomicU64::new(0),
+            exchange_pending_requests: AtomicU64::new(0),
             exchange_multiplexer_streams_size: AtomicU64::new(0),
             exchange_pool_clients_size: AtomicU64::new(0),
             webhook_pending_size: AtomicU64::new(0),
@@ -1153,6 +1159,9 @@ pub fn reset_all() {
             .store(0, Ordering::Relaxed);
         reg.exchange_flow_control_channels_size
             .store(0, Ordering::Relaxed);
+        reg.exchange_inflight_bytes.store(0, Ordering::Relaxed);
+        reg.exchange_inflight_batches.store(0, Ordering::Relaxed);
+        reg.exchange_pending_requests.store(0, Ordering::Relaxed);
         reg.exchange_multiplexer_streams_size
             .store(0, Ordering::Relaxed);
         reg.exchange_pool_clients_size.store(0, Ordering::Relaxed);
@@ -1795,6 +1804,38 @@ pub fn read_exchange_flow_control_channels_size() -> u64 {
     })
 }
 
+pub fn set_exchange_inflight_bytes(bytes: u64) {
+    with_registry(|reg| {
+        reg.exchange_inflight_bytes.store(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn read_exchange_inflight_bytes() -> u64 {
+    with_registry(|reg| reg.exchange_inflight_bytes.load(Ordering::Relaxed))
+}
+
+pub fn set_exchange_inflight_batches(batches: u64) {
+    with_registry(|reg| {
+        reg.exchange_inflight_batches
+            .store(batches, Ordering::Relaxed);
+    });
+}
+
+pub fn read_exchange_inflight_batches() -> u64 {
+    with_registry(|reg| reg.exchange_inflight_batches.load(Ordering::Relaxed))
+}
+
+pub fn set_exchange_pending_requests(count: u64) {
+    with_registry(|reg| {
+        reg.exchange_pending_requests
+            .store(count, Ordering::Relaxed);
+    });
+}
+
+pub fn read_exchange_pending_requests() -> u64 {
+    with_registry(|reg| reg.exchange_pending_requests.load(Ordering::Relaxed))
+}
+
 pub fn set_exchange_multiplexer_streams_size(size: u64) {
     with_registry(|reg| {
         reg.exchange_multiplexer_streams_size
@@ -2416,6 +2457,31 @@ pub fn generate_prometheus_metrics() -> String {
             "exchange_flow_control_channels_size {}\n\n",
             reg.exchange_flow_control_channels_size
                 .load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP exchange_inflight_bytes Gauge showing aggregate exchange inflight bytes.\n",
+        );
+        out.push_str("# TYPE exchange_inflight_bytes gauge\n");
+        out.push_str(&format!(
+            "exchange_inflight_bytes {}\n\n",
+            reg.exchange_inflight_bytes.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP exchange_inflight_batches Gauge showing aggregate exchange inflight batches.\n",
+        );
+        out.push_str("# TYPE exchange_inflight_batches gauge\n");
+        out.push_str(&format!(
+            "exchange_inflight_batches {}\n\n",
+            reg.exchange_inflight_batches.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP exchange_pending_requests Gauge showing concurrent pending exchange requests.\n");
+        out.push_str("# TYPE exchange_pending_requests gauge\n");
+        out.push_str(&format!(
+            "exchange_pending_requests {}\n\n",
+            reg.exchange_pending_requests.load(Ordering::Relaxed)
         ));
 
         out.push_str("# HELP exchange_multiplexer_streams_size Gauge showing active multiplexer outgoing streams count.\n");

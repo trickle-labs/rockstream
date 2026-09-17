@@ -490,8 +490,14 @@ pub const RS_2601: ErrorCode = ErrorCode::new(2601);
 pub const RS_3001: ErrorCode = ErrorCode::new(3001);
 /// Pipeline blocked: object store brownout, local buffer exhausted.
 pub const RS_3003: ErrorCode = ErrorCode::new(3003);
+/// Exchange frame lease token stale or superseded.
+pub const RS_3004: ErrorCode = ErrorCode::new(3004);
 /// Self-fencing configuration invalid: self_fence_after constraint violated.
 pub const RS_3005: ErrorCode = ErrorCode::new(3005);
+/// Exchange frame exceeds max_batch_bytes limit.
+pub const RS_3006: ErrorCode = ErrorCode::new(3006);
+/// Exchange request ID reused with conflicting payload digest.
+pub const RS_3008: ErrorCode = ErrorCode::new(3008);
 /// Merge operand malformed.
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
 /// Legacy durable shuffle error (retired, use RS-3011..3016).

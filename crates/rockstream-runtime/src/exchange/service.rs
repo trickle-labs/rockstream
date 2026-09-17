@@ -461,6 +461,45 @@ impl ShuffleService for ShuffleServer {
 
         Ok(Response::new(Box::pin(RxStream { rx })))
     }
+
+    type ExchangeStreamStream =
+        Pin<Box<dyn Stream<Item = Result<crate::exchange::proto::ExchangeAck, Status>> + Send>>;
+
+    async fn exchange_stream(
+        &self,
+        request: Request<Streaming<crate::exchange::proto::ExchangeFrame>>,
+    ) -> Result<Response<Self::ExchangeStreamStream>, Status> {
+        self.validate_protocol_version(request.metadata())?;
+        let mut stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(frame) => {
+                        let ack = crate::exchange::proto::ExchangeAck {
+                            protocol_version: frame.protocol_version,
+                            workload_id: frame.workload_id,
+                            shard_id: frame.shard_id,
+                            operator_id: frame.operator_id,
+                            epoch: frame.epoch,
+                            lease_token: frame.lease_token,
+                            success: true,
+                            error_code: String::new(),
+                            error_message: String::new(),
+                        };
+                        if tx.send(Ok(ack)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(RxStream { rx })))
+    }
 }
 
 pub fn register_shared_memory_endpoint(
@@ -664,6 +703,17 @@ mod tests {
             Ok(Response::new(
                 Box::pin(RxStream { rx }) as Self::ShuffleStreamStream
             ))
+        }
+
+        type ExchangeStreamStream =
+            Pin<Box<dyn Stream<Item = Result<crate::exchange::proto::ExchangeAck, Status>> + Send>>;
+
+        async fn exchange_stream(
+            &self,
+            _request: Request<Streaming<crate::exchange::proto::ExchangeFrame>>,
+        ) -> Result<Response<Self::ExchangeStreamStream>, Status> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(Response::new(Box::pin(RxStream { rx })))
         }
     }
 

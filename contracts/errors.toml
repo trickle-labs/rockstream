@@ -1024,6 +1024,16 @@ default_next_steps = "Reduce input rate or increase local_buffer_max_epochs; che
 doc_anchor = "rs-3003"
 
 [[error]]
+code = "RS-3004"
+key = "exchange.stale_lease_token"
+title = "Exchange frame lease token stale or superseded"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterLeaderElection"
+default_next_steps = "Refresh worker shard lease from control plane before retrying exchange."
+doc_anchor = "rs-3004"
+
+[[error]]
 code = "RS-3005"
 key = "config.self_fencing_invalid"
 title = "Self-fencing configuration invalid: self_fence_after constraint violated"
@@ -1032,6 +1042,26 @@ sqlstate = "22023"
 retry_class = "NonRetryable"
 default_next_steps = "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget."
 doc_anchor = "rs-3005"
+
+[[error]]
+code = "RS-3006"
+key = "exchange.frame_oversized"
+title = "Exchange frame exceeds max_batch_bytes limit"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "NonRetryable"
+default_next_steps = "Split large record batches into smaller chunks within configured transport budget."
+doc_anchor = "rs-3006"
+
+[[error]]
+code = "RS-3008"
+key = "exchange.conflicting_payload_digest"
+title = "Exchange request ID reused with conflicting payload digest"
+severity = "Error"
+sqlstate = "42710"
+retry_class = "NonRetryable"
+default_next_steps = "Ensure idempotent retry uses identical request payload and request ID, or generate a fresh request ID."
+doc_anchor = "rs-3008"
 
 [[error]]
 code = "RS-3009"

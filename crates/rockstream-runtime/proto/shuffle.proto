@@ -6,6 +6,8 @@ service ShuffleService {
   // A bidirectional stream to send and receive shuffle batches.
   // Multiplexes batches for all active exchanges and shards.
   rpc ShuffleStream(stream ShuffleFrame) returns (stream ShuffleAck);
+  // v0.67 Direct data plane exchange frame stream.
+  rpc ExchangeStream(stream ExchangeFrame) returns (stream ExchangeAck);
 }
 
 message ShuffleFrame {
@@ -25,4 +27,28 @@ message ShuffleAck {
   uint64 epoch = 4;
   uint64 seq = 5;
   uint32 credit_grant = 6; // Additional credit granted to the sender
+}
+
+message ExchangeFrame {
+  uint32 protocol_version = 1;
+  uint64 workload_id = 2;
+  uint64 shard_id = 3;
+  uint64 operator_id = 4;
+  uint64 epoch = 5;
+  uint64 lease_token = 6;
+  bytes schema_fingerprint = 7;
+  bytes payload = 8;
+  bytes checksum = 9;
+}
+
+message ExchangeAck {
+  uint32 protocol_version = 1;
+  uint64 workload_id = 2;
+  uint64 shard_id = 3;
+  uint64 operator_id = 4;
+  uint64 epoch = 5;
+  uint64 lease_token = 6;
+  bool success = 7;
+  string error_code = 8;
+  string error_message = 9;
 }

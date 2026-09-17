@@ -3,11 +3,14 @@ use crate::exchange::shared_memory::SharedMemoryClient;
 use parking_lot::RwLock;
 use rockstream_types::compatibility::ProtocolVersion;
 use rockstream_types::config::ExchangeConfig;
+use rockstream_types::error_code::{RS_3004, RS_3006, RS_5003};
 use rockstream_types::ids::WorkerId;
 use rockstream_types::topology::WorkerInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::transport::Channel;
+
+pub const DEFAULT_MAX_PENDING_REQUESTS: usize = 256;
 
 /// A client pool that caches connection clients and peer metadata,
 /// governed by network policy timeouts, retries, and peer circuit breaking.
@@ -21,6 +24,10 @@ pub struct ShuffleClientPool {
     config: ExchangeConfig,
     consecutive_failures: Arc<RwLock<HashMap<WorkerId, u32>>>,
     internal_tls: Option<rockstream_types::identity::InternalTlsConfig>,
+    generations: Arc<RwLock<HashMap<WorkerId, u64>>>,
+    active_permits: Arc<RwLock<HashMap<WorkerId, usize>>>,
+    last_heartbeat: Arc<RwLock<HashMap<WorkerId, std::time::Instant>>>,
+    max_pending_requests: usize,
 }
 
 impl Default for ShuffleClientPool {
@@ -41,6 +48,10 @@ impl ShuffleClientPool {
             config: ExchangeConfig::default(),
             consecutive_failures: Arc::new(RwLock::new(HashMap::new())),
             internal_tls: None,
+            generations: Arc::new(RwLock::new(HashMap::new())),
+            active_permits: Arc::new(RwLock::new(HashMap::new())),
+            last_heartbeat: Arc::new(RwLock::new(HashMap::new())),
+            max_pending_requests: DEFAULT_MAX_PENDING_REQUESTS,
         }
     }
 
@@ -115,6 +126,123 @@ impl ShuffleClientPool {
         rockstream_types::metrics::set_exchange_pool_clients_size(count as u64);
     }
 
+    pub fn with_max_pending_requests(mut self, max: usize) -> Self {
+        self.max_pending_requests = max;
+        self
+    }
+
+    pub fn max_pending_requests(&self) -> usize {
+        self.max_pending_requests
+    }
+
+    /// Return the active connection generation for `worker_id` (starts at 1).
+    pub fn current_generation(&self, worker_id: WorkerId) -> u64 {
+        let mut gens = self.generations.write();
+        *gens.entry(worker_id).or_insert(1)
+    }
+
+    /// Advance connection generation ID for `worker_id` upon reconnect or failure.
+    pub fn advance_generation(&self, worker_id: WorkerId) -> u64 {
+        let mut gens = self.generations.write();
+        let entry = gens.entry(worker_id).or_insert(1);
+        *entry += 1;
+        *entry
+    }
+
+    /// Check whether `generation` matches the currently active generation.
+    pub fn is_generation_valid(&self, worker_id: WorkerId, generation: u64) -> bool {
+        self.current_generation(worker_id) == generation
+    }
+
+    /// Acquire an in-flight request permit for `worker_id` at `generation`.
+    /// Returns error if generation is stale or if max_pending_requests is exceeded.
+    pub fn acquire_permit(&self, worker_id: WorkerId, generation: u64) -> Result<(), String> {
+        let current_gen = self.current_generation(worker_id);
+        if generation != current_gen {
+            return Err(format!(
+                "[{RS_3004}] stale generation {generation}; active generation is {current_gen}"
+            ));
+        }
+        let mut permits = self.active_permits.write();
+        let current = permits.entry(worker_id).or_insert(0);
+        if *current >= self.max_pending_requests {
+            return Err(format!(
+                "[{RS_3006}] RESOURCE_EXHAUSTED: exceeded max pending requests {} for worker {:?}",
+                self.max_pending_requests, worker_id
+            ));
+        }
+        *current += 1;
+        Ok(())
+    }
+
+    /// Release one active request permit for `worker_id`.
+    pub fn release_permit(&self, worker_id: WorkerId) {
+        let mut permits = self.active_permits.write();
+        if let Some(p) = permits.get_mut(&worker_id) {
+            *p = p.saturating_sub(1);
+        }
+    }
+
+    /// Return count of active permits for `worker_id`.
+    pub fn active_permits(&self, worker_id: WorkerId) -> usize {
+        self.active_permits
+            .read()
+            .get(&worker_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Reclaim all active permits for `worker_id` upon disconnection or failure.
+    pub fn reclaim_permits_on_disconnect(&self, worker_id: WorkerId) -> usize {
+        let mut permits = self.active_permits.write();
+        permits.remove(&worker_id).unwrap_or(0)
+    }
+
+    /// Fence late responses or ACKs from obsolete generation IDs.
+    /// If obsolete, permits are released and an error is returned.
+    pub fn fence_response(&self, worker_id: WorkerId, response_gen: u64) -> Result<(), String> {
+        let current_gen = self.current_generation(worker_id);
+        self.release_permit(worker_id);
+        if response_gen < current_gen {
+            return Err(format!(
+                "[{RS_3004}] obsolete generation response fenced: received gen {response_gen} < current gen {current_gen}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record a heartbeat timestamp for `worker_id`.
+    pub fn record_heartbeat(&self, worker_id: WorkerId) {
+        self.last_heartbeat
+            .write()
+            .insert(worker_id, std::time::Instant::now());
+    }
+
+    /// Check whether `worker_id` has communicated within `deadline`.
+    pub fn is_peer_alive(&self, worker_id: WorkerId, deadline: std::time::Duration) -> bool {
+        if let Some(last) = self.last_heartbeat.read().get(&worker_id) {
+            last.elapsed() <= deadline
+        } else {
+            true
+        }
+    }
+
+    /// Enforce heartbeat deadline, triggering circuit breaker and generation advance on timeout.
+    pub fn check_heartbeat_deadline(
+        &self,
+        worker_id: WorkerId,
+        deadline: std::time::Duration,
+    ) -> Result<(), String> {
+        if !self.is_peer_alive(worker_id, deadline) {
+            self.record_failure(worker_id);
+            return Err(format!(
+                "[{RS_5003}] peer worker {:?} silent for > {:?}; channel marked unhealthy",
+                worker_id, deadline
+            ));
+        }
+        Ok(())
+    }
+
     /// Evict cached gRPC and SHM clients, peer address, peer info, and failure count for a dead or drained worker.
     pub fn evict_worker(&self, worker_id: WorkerId) {
         self.peers.write().remove(&worker_id);
@@ -122,12 +250,17 @@ impl ShuffleClientPool {
         self.clients.write().remove(&worker_id);
         self.shm_clients.write().remove(&worker_id);
         self.consecutive_failures.write().remove(&worker_id);
+        self.generations.write().remove(&worker_id);
+        self.active_permits.write().remove(&worker_id);
+        self.last_heartbeat.write().remove(&worker_id);
         self.update_metric();
     }
 
     pub fn reset_circuit_breaker(&self, worker_id: WorkerId) {
         self.consecutive_failures.write().remove(&worker_id);
         self.clients.write().remove(&worker_id);
+        self.advance_generation(worker_id);
+        self.reclaim_permits_on_disconnect(worker_id);
         self.update_metric();
     }
 
@@ -135,11 +268,14 @@ impl ShuffleClientPool {
         let mut failures = self.consecutive_failures.write();
         *failures.entry(worker_id).or_insert(0) += 1;
         self.clients.write().remove(&worker_id);
+        self.advance_generation(worker_id);
+        self.reclaim_permits_on_disconnect(worker_id);
         self.update_metric();
     }
 
     pub fn record_success(&self, worker_id: WorkerId) {
         self.consecutive_failures.write().remove(&worker_id);
+        self.record_heartbeat(worker_id);
     }
 
     /// Retrieve or establish a gRPC client connection to the specified worker.

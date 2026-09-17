@@ -502,6 +502,7 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+    Median,
     /// Approximate distinct-value count using `HyperLogLog/v1` (v0.25).
     ///
     /// Returns a probabilistic estimate of the number of distinct values in
@@ -516,6 +517,77 @@ pub enum AggregateFunc {
     /// The merge law is `BloomUnion/v1` (semilattice, non-invertible);
     /// retraction-aware correctness requires `ExtremumRequiresRmw`.
     ApproxMembership,
+}
+
+impl AggregateFunc {
+    /// Returns whether this aggregate function is algebraically distributive.
+    ///
+    /// Distributive aggregates (SUM, COUNT, MIN, MAX) permit pre-aggregation and
+    /// factorized join-to-aggregate pushdown without full state accumulation.
+    pub fn is_distributive(&self) -> bool {
+        matches!(
+            self,
+            AggregateFunc::Sum | AggregateFunc::Count | AggregateFunc::Min | AggregateFunc::Max
+        )
+    }
+}
+
+/// Classification of a plan for pre-aggregation and factorized execution (v0.67 Slice 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreAggregationEligibility {
+    /// Plan contains only algebraically distributive aggregates. Admitted for pre-aggregation.
+    Admitted {
+        distributive_aggregates: Vec<AggregateFunc>,
+    },
+    /// Plan contains non-distributive or non-linear expressions. Rejected; falls back to standard execution.
+    Rejected { reason: String },
+}
+
+impl PreAggregationEligibility {
+    pub fn is_admitted(&self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
+}
+
+/// Validates whether a plan node is eligible for distributive pre-aggregation.
+pub fn validate_pre_aggregation_algebra(plan: &PlanNode) -> PreAggregationEligibility {
+    match plan {
+        PlanNode::Aggregate { aggregates, .. } => {
+            if aggregates.is_empty() {
+                return PreAggregationEligibility::Rejected {
+                    reason: "aggregate node has no aggregate expressions".to_string(),
+                };
+            }
+            let mut distributive = Vec::new();
+            for agg in aggregates {
+                if agg.distinct {
+                    return PreAggregationEligibility::Rejected {
+                        reason:
+                            "DISTINCT aggregates are non-distributive and cannot be pre-aggregated"
+                                .to_string(),
+                    };
+                }
+                if !agg.func.is_distributive() {
+                    return PreAggregationEligibility::Rejected {
+                        reason: format!(
+                            "non-distributive aggregate {:?} rejected for pre-aggregation; falls back to standard incremental execution",
+                            agg.func
+                        ),
+                    };
+                }
+                distributive.push(agg.func);
+            }
+            PreAggregationEligibility::Admitted {
+                distributive_aggregates: distributive,
+            }
+        }
+        PlanNode::Project { input, .. } | PlanNode::Filter { input, .. } => {
+            validate_pre_aggregation_algebra(input)
+        }
+        _ => PreAggregationEligibility::Rejected {
+            reason: "plan does not contain an aggregation operator".to_string(),
+        },
+    }
 }
 
 /// Set-returning function (SRF) for the `Lateral` plan node (v0.25).

@@ -17,7 +17,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (38 codes)
 - [24xx: Authentication, mTLS & Secrets](#24xx-authentication-mtls--secrets) (18 codes)
 - [25xx-26xx: Extended Query, Cursors & Transactions](#25xx-26xx-extended-query-cursors--transactions) (9 codes)
-- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (53 codes)
+- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (55 codes)
 - [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (23 codes)
 - [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (16 codes)
 - [6xxx: Connector Schema Evolution](#6xxx-connector-schema-evolution) (1 codes)
@@ -974,7 +974,10 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 |---|---|---|---|---|---|
 | [`RS-3001`](#rs-3001) | `storage.writer_fenced` | Shard writer fenced out: lease lost | `Error` | `55000` | `AfterLeaderElection` |
 | [`RS-3003`](#rs-3003) | `storage.object_store_brownout` | Pipeline blocked: object store brownout, local buffer exhausted | `Error` | `53100` | `ExponentialBackoff` |
+| [`RS-3004`](#rs-3004) | `exchange.stale_lease_token` | Exchange frame lease token stale or superseded | `Error` | `55000` | `AfterLeaderElection` |
 | [`RS-3005`](#rs-3005) | `config.self_fencing_invalid` | Self-fencing configuration invalid: self_fence_after constraint violated | `Error` | `22023` | `NonRetryable` |
+| [`RS-3006`](#rs-3006) | `exchange.frame_oversized` | Exchange frame exceeds max_batch_bytes limit | `Error` | `53200` | `NonRetryable` |
+| [`RS-3008`](#rs-3008) | `exchange.conflicting_payload_digest` | Exchange request ID reused with conflicting payload digest | `Error` | `42710` | `NonRetryable` |
 | [`RS-3009`](#rs-3009) | `storage.merge_operand_malformed` | Merge operand malformed | `Error` | `XX000` | `NonRetryable` |
 | [`RS-3010`](#rs-3010) | `storage.shuffle_io_retired` | Legacy durable shuffle error (retired, use RS-3011..3016) | `Error` | `XX000` | `ExponentialBackoff` |
 | [`RS-3011`](#rs-3011) | `storage.durable_shuffle_rate_limit` | Durable shuffle rate-limit retry budget exhausted | `Error` | `53100` | `ExponentialBackoff` |
@@ -1042,6 +1045,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **Retry Class**: `ExponentialBackoff`
 - **Default Next Steps**: Reduce input rate or increase local_buffer_max_epochs; check object store availability.
 
+### <a id="rs-3004"></a> `RS-3004` — Exchange frame lease token stale or superseded
+
+- **Key**: `exchange.stale_lease_token`
+- **Severity**: `Error`
+- **SQLSTATE**: `55000`
+- **Retry Class**: `AfterLeaderElection`
+- **Default Next Steps**: Refresh worker shard lease from control plane before retrying exchange.
+
 ### <a id="rs-3005"></a> `RS-3005` — Self-fencing configuration invalid: self_fence_after constraint violated
 
 - **Key**: `config.self_fencing_invalid`
@@ -1049,6 +1060,22 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `22023`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.
+
+### <a id="rs-3006"></a> `RS-3006` — Exchange frame exceeds max_batch_bytes limit
+
+- **Key**: `exchange.frame_oversized`
+- **Severity**: `Error`
+- **SQLSTATE**: `53200`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Split large record batches into smaller chunks within configured transport budget.
+
+### <a id="rs-3008"></a> `RS-3008` — Exchange request ID reused with conflicting payload digest
+
+- **Key**: `exchange.conflicting_payload_digest`
+- **Severity**: `Error`
+- **SQLSTATE**: `42710`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Ensure idempotent retry uses identical request payload and request ID, or generate a fresh request ID.
 
 ### <a id="rs-3009"></a> `RS-3009` — Merge operand malformed
 

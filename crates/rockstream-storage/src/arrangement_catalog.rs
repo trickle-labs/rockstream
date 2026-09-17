@@ -205,4 +205,18 @@ impl ArrangementCatalog {
             .map(|e| e.consumer_count)
             .unwrap_or(0)
     }
+
+    /// Snapshot all catalog arrangement entries for durable checkpointing.
+    pub async fn snapshot(&self) -> Vec<ArrangementEntry> {
+        let guard = self.inner.read().await;
+        guard.arrangements.values().cloned().collect()
+    }
+
+    /// Restore arrangement entries into the catalog post restart.
+    pub async fn restore(&self, entries: Vec<ArrangementEntry>) {
+        let mut guard = self.inner.write().await;
+        for entry in entries {
+            guard.arrangements.insert(entry.id, entry);
+        }
+    }
 }

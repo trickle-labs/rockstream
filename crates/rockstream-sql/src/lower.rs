@@ -794,6 +794,7 @@ pub fn lower_agg_expr(expr: &DfExpr, input_schema: &DFSchema) -> Result<Aggregat
                 "avg" => AggregateFunc::Avg,
                 "min" => AggregateFunc::Min,
                 "max" => AggregateFunc::Max,
+                "median" => AggregateFunc::Median,
                 other => {
                     return Err(SqlError::UnsupportedPlanNode {
                         node_type: format!("aggregate_function:{other}"),

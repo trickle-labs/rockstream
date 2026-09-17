@@ -5,11 +5,298 @@ use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::arrow_batch::{append_weight_column, split_weight_column};
-use rockstream_types::error_code::{RS_3017, RS_3020};
+use rockstream_types::error_code::{
+    ErrorCode, RS_3001, RS_3004, RS_3006, RS_3017, RS_3018, RS_3019, RS_3020,
+};
 use rockstream_types::exchange::ShuffleCompression;
+
+use crate::exchange::proto::ExchangeFrame;
+
+pub const CURRENT_EXCHANGE_PROTOCOL_VERSION: u32 = 1;
+pub const DEFAULT_MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 const FRAME_MAGIC: &[u8; 4] = b"RSF1";
 const FRAME_HEADER_LEN: usize = 4 + 1 + 1 + 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameValidationError {
+    IncompatibleProtocolVersion {
+        received: u32,
+        supported: u32,
+    },
+    CorruptChecksum {
+        expected: u32,
+        actual: u32,
+    },
+    SchemaFingerprintMismatch {
+        received: Vec<u8>,
+        expected: Vec<u8>,
+    },
+    StaleLeaseToken {
+        received: u64,
+        active: u64,
+    },
+    OversizedPayload {
+        size: usize,
+        max: usize,
+    },
+    TruncatedPayload {
+        detail: String,
+    },
+    MalformedIpcPayload {
+        detail: String,
+    },
+}
+
+impl FrameValidationError {
+    pub fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::IncompatibleProtocolVersion { .. } => RS_3001,
+            Self::CorruptChecksum { .. } => RS_3019,
+            Self::SchemaFingerprintMismatch { .. } => RS_3018,
+            Self::StaleLeaseToken { .. } => RS_3004,
+            Self::OversizedPayload { .. } => RS_3006,
+            Self::TruncatedPayload { .. } => RS_3017,
+            Self::MalformedIpcPayload { .. } => RS_3020,
+        }
+    }
+}
+
+impl std::fmt::Display for FrameValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = self.error_code();
+        match self {
+            Self::IncompatibleProtocolVersion {
+                received,
+                supported,
+            } => {
+                write!(
+                    f,
+                    "[{code}] unsupported exchange protocol version {received}; supported is {supported}"
+                )
+            }
+            Self::CorruptChecksum { expected, actual } => {
+                write!(
+                    f,
+                    "[{code}] corrupt frame checksum: expected {expected:#010x}, calculated {actual:#010x}"
+                )
+            }
+            Self::SchemaFingerprintMismatch { received, expected } => {
+                let rec_hex: String = received.iter().map(|b| format!("{b:02x}")).collect();
+                let exp_hex: String = expected.iter().map(|b| format!("{b:02x}")).collect();
+                write!(
+                    f,
+                    "[{code}] schema fingerprint mismatch: received {rec_hex}, expected {exp_hex}"
+                )
+            }
+            Self::StaleLeaseToken { received, active } => {
+                write!(
+                    f,
+                    "[{code}] stale lease token {received} < active worker lease {active}"
+                )
+            }
+            Self::OversizedPayload { size, max } => {
+                write!(
+                    f,
+                    "[{code}] frame payload size {size} exceeds max_batch_bytes {max}"
+                )
+            }
+            Self::TruncatedPayload { detail } => {
+                write!(f, "[{code}] truncated frame payload: {detail}")
+            }
+            Self::MalformedIpcPayload { detail } => {
+                write!(f, "[{code}] malformed Arrow IPC payload: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FrameValidationError {}
+
+pub fn compute_schema_fingerprint(schema: &arrow::datatypes::Schema) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for field in schema.fields() {
+        hasher.update(field.name().as_bytes());
+        hasher.update(b":");
+        hasher.update(format!("{:?}", field.data_type()).as_bytes());
+        hasher.update(if field.is_nullable() { b":1" } else { b":0" });
+        hasher.update(b";");
+    }
+    *hasher.finalize().as_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compute_frame_checksum(
+    protocol_version: u32,
+    workload_id: u64,
+    shard_id: u64,
+    operator_id: u64,
+    epoch: u64,
+    lease_token: u64,
+    schema_fingerprint: &[u8],
+    payload: &[u8],
+) -> [u8; 4] {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&protocol_version.to_be_bytes());
+    hasher.update(&workload_id.to_be_bytes());
+    hasher.update(&shard_id.to_be_bytes());
+    hasher.update(&operator_id.to_be_bytes());
+    hasher.update(&epoch.to_be_bytes());
+    hasher.update(&lease_token.to_be_bytes());
+    hasher.update(&(schema_fingerprint.len() as u32).to_be_bytes());
+    hasher.update(schema_fingerprint);
+    hasher.update(&(payload.len() as u32).to_be_bytes());
+    hasher.update(payload);
+    hasher.finalize().to_be_bytes()
+}
+
+pub fn build_exchange_frame(
+    workload_id: u64,
+    shard_id: u64,
+    operator_id: u64,
+    epoch: u64,
+    lease_token: u64,
+    schema: &arrow::datatypes::Schema,
+    zset: &ArrowZSet,
+) -> Result<ExchangeFrame, String> {
+    let fingerprint = compute_schema_fingerprint(schema);
+    let payload = serialize_zset(zset)?;
+    let checksum = compute_frame_checksum(
+        CURRENT_EXCHANGE_PROTOCOL_VERSION,
+        workload_id,
+        shard_id,
+        operator_id,
+        epoch,
+        lease_token,
+        &fingerprint,
+        &payload,
+    );
+    Ok(ExchangeFrame {
+        protocol_version: CURRENT_EXCHANGE_PROTOCOL_VERSION,
+        workload_id,
+        shard_id,
+        operator_id,
+        epoch,
+        lease_token,
+        schema_fingerprint: fingerprint.to_vec(),
+        payload: payload.to_vec(),
+        checksum: checksum.to_vec(),
+    })
+}
+
+pub fn validate_exchange_frame(
+    frame: &ExchangeFrame,
+    active_lease: u64,
+    expected_schema_fingerprint: Option<&[u8]>,
+    max_batch_bytes: usize,
+) -> Result<(), FrameValidationError> {
+    if frame.protocol_version != CURRENT_EXCHANGE_PROTOCOL_VERSION {
+        return Err(FrameValidationError::IncompatibleProtocolVersion {
+            received: frame.protocol_version,
+            supported: CURRENT_EXCHANGE_PROTOCOL_VERSION,
+        });
+    }
+
+    if frame.checksum.len() != 4 {
+        return Err(FrameValidationError::CorruptChecksum {
+            expected: 0,
+            actual: 0,
+        });
+    }
+    let expected_checksum = u32::from_be_bytes(frame.checksum[..4].try_into().unwrap());
+    let calculated_checksum_bytes = compute_frame_checksum(
+        frame.protocol_version,
+        frame.workload_id,
+        frame.shard_id,
+        frame.operator_id,
+        frame.epoch,
+        frame.lease_token,
+        &frame.schema_fingerprint,
+        &frame.payload,
+    );
+    let calculated_checksum = u32::from_be_bytes(calculated_checksum_bytes);
+    if expected_checksum != calculated_checksum {
+        return Err(FrameValidationError::CorruptChecksum {
+            expected: expected_checksum,
+            actual: calculated_checksum,
+        });
+    }
+
+    if frame.payload.len() > max_batch_bytes {
+        return Err(FrameValidationError::OversizedPayload {
+            size: frame.payload.len(),
+            max: max_batch_bytes,
+        });
+    }
+
+    if frame.lease_token < active_lease {
+        return Err(FrameValidationError::StaleLeaseToken {
+            received: frame.lease_token,
+            active: active_lease,
+        });
+    }
+
+    if let Some(expected) = expected_schema_fingerprint {
+        if frame.schema_fingerprint.as_slice() != expected {
+            return Err(FrameValidationError::SchemaFingerprintMismatch {
+                received: frame.schema_fingerprint.clone(),
+                expected: expected.to_vec(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+pub fn decode_exchange_frame(
+    frame: &ExchangeFrame,
+    schema: arrow::datatypes::SchemaRef,
+) -> Result<ArrowZSet, FrameValidationError> {
+    if frame.payload.is_empty() {
+        return Ok(ArrowZSet::empty(schema));
+    }
+    let is_truncated = |msg: &str| {
+        let lower = msg.to_lowercase();
+        lower.contains("unexpected end")
+            || lower.contains("truncated")
+            || lower.contains("eof")
+            || lower.contains("fill whole buffer")
+            || lower.contains("end of file")
+            || lower.contains("incomplete")
+            || lower.contains("unexpected")
+    };
+
+    let cursor = Cursor::new(&frame.payload);
+    let mut reader = match StreamReader::try_new(cursor, None) {
+        Ok(r) => r,
+        Err(e) => {
+            let err_msg = format!("{e}");
+            if is_truncated(&err_msg) || frame.payload.len() < 16 {
+                return Err(FrameValidationError::TruncatedPayload { detail: err_msg });
+            }
+            return Err(FrameValidationError::MalformedIpcPayload { detail: err_msg });
+        }
+    };
+    match reader.next() {
+        Some(Ok(batch)) => {
+            let (unweighted_batch, weights) = split_weight_column(&batch).ok_or_else(|| {
+                FrameValidationError::MalformedIpcPayload {
+                    detail: "failed to split weight column: weight column missing".into(),
+                }
+            })?;
+            Ok(ArrowZSet::new(unweighted_batch, weights))
+        }
+        Some(Err(e)) => {
+            let err_msg = format!("{e}");
+            if is_truncated(&err_msg) {
+                Err(FrameValidationError::TruncatedPayload { detail: err_msg })
+            } else {
+                Err(FrameValidationError::MalformedIpcPayload { detail: err_msg })
+            }
+        }
+        None => Ok(ArrowZSet::empty(schema)),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PayloadHeader {

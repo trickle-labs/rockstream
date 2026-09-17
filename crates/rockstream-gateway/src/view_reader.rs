@@ -6,6 +6,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::Stream;
 
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use rockstream_ops::sink::ColumnValue;
+
 use crate::error::GatewayError;
 
 /// Batch size for streaming row delivery (Slice 4).
@@ -62,6 +66,16 @@ pub trait ViewReader: Send + Sync {
             .map(|chunk| Ok(chunk.to_vec()))
             .collect();
         Ok(Box::pin(futures::stream::iter(batches)))
+    }
+
+    /// Read view output rows directly as Arrow RecordBatches (v0.67 Slice 3).
+    async fn read_view_batches(
+        &self,
+        view_name: &str,
+        strategy: ViewReadStrategy,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, GatewayError> {
+        let rows = self.read_view(view_name, None, strategy).await?;
+        tsv_rows_to_record_batches(&rows)
     }
 
     /// The current published frontier epoch (None if no data written yet).
@@ -155,6 +169,34 @@ impl HotOnlyViewReader {
             })
             .collect())
     }
+
+    /// Resolve `view_name` to current materialized Arrow RecordBatches directly (v0.67 Slice 3).
+    async fn materialized_batches(
+        &self,
+        view_name: &str,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, GatewayError> {
+        let Some((op_id, num_cols, pk)) =
+            rockstream_ops::sink::read_view_directory_entry_via_reader(
+                &self.shard_reader,
+                view_name,
+            )
+            .await
+            .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("read_view_directory_entry({view_name}): {e}"),
+            })?
+        else {
+            let rows = self.materialized_rows(view_name).await?;
+            return tsv_rows_to_record_batches(&rows);
+        };
+        let stored =
+            rockstream_ops::sink::read_view_output_via_reader(&self.shard_reader, op_id, num_cols)
+                .await
+                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("read_view_output({view_name}): {e}"),
+                })?;
+        let state = rockstream_ops::sink::materialize_view_state(stored, &pk);
+        materialized_state_to_record_batches(state, num_cols)
+    }
 }
 
 #[async_trait]
@@ -176,6 +218,19 @@ impl ViewReader for HotOnlyViewReader {
             None => rows,
         };
         Ok(rows)
+    }
+
+    async fn read_view_batches(
+        &self,
+        view_name: &str,
+        strategy: ViewReadStrategy,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, GatewayError> {
+        if strategy == ViewReadStrategy::TwoTier {
+            return Err(GatewayError::NotSupported(
+                "TwoTier strategy reserved for Phase 9".to_string(),
+            ));
+        }
+        self.materialized_batches(view_name).await
     }
 
     /// Streaming implementation: chunks the materialized rows into
@@ -251,6 +306,253 @@ impl ViewReader for HotOnlyViewReader {
             Ok(None)
         }
     }
+}
+
+/// Convert a `MaterializedViewState` into Arrow `RecordBatch`es directly (v0.67 Slice 3).
+pub fn materialized_state_to_record_batches(
+    state: rockstream_ops::sink::MaterializedViewState,
+    mut num_cols: usize,
+) -> Result<Vec<RecordBatch>, GatewayError> {
+    let mut all_rows: Vec<&Vec<ColumnValue>> = Vec::new();
+    for (row, count) in state.values() {
+        let cnt = (*count).max(0) as usize;
+        for _ in 0..cnt {
+            all_rows.push(row);
+        }
+    }
+    if all_rows.is_empty() {
+        if num_cols == 0 {
+            return Ok(Vec::new());
+        }
+        let fields = (0..num_cols)
+            .map(|c| Field::new(format!("col_{c}"), DataType::Utf8, true))
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::new_empty(schema);
+        return Ok(vec![batch]);
+    }
+    if num_cols == 0 {
+        num_cols = all_rows[0].len();
+    }
+    let mut col_types = Vec::with_capacity(num_cols);
+    for col_idx in 0..num_cols {
+        let mut dt = DataType::Utf8;
+        for row in &all_rows {
+            if let Some(val) = row.get(col_idx) {
+                match val {
+                    ColumnValue::Int64(_) => {
+                        dt = DataType::Int64;
+                        break;
+                    }
+                    ColumnValue::Float64(_) => {
+                        dt = DataType::Float64;
+                        break;
+                    }
+                    ColumnValue::Boolean(_) => {
+                        dt = DataType::Boolean;
+                        break;
+                    }
+                    ColumnValue::Utf8(_) => {
+                        dt = DataType::Utf8;
+                        break;
+                    }
+                    ColumnValue::Null => {}
+                }
+            }
+        }
+        col_types.push(dt);
+    }
+
+    let mut arrays: Vec<arrow::array::ArrayRef> = Vec::with_capacity(num_cols);
+    for (col_idx, dt) in col_types.iter().enumerate() {
+        match dt {
+            DataType::Int64 => {
+                let mut b = arrow::array::Int64Builder::with_capacity(all_rows.len());
+                for row in &all_rows {
+                    match row.get(col_idx) {
+                        Some(ColumnValue::Int64(v)) => b.append_value(*v),
+                        _ => b.append_null(),
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            DataType::Float64 => {
+                let mut b = arrow::array::Float64Builder::with_capacity(all_rows.len());
+                for row in &all_rows {
+                    match row.get(col_idx) {
+                        Some(ColumnValue::Float64(v)) => b.append_value(*v),
+                        _ => b.append_null(),
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            DataType::Boolean => {
+                let mut b = arrow::array::BooleanBuilder::with_capacity(all_rows.len());
+                for row in &all_rows {
+                    match row.get(col_idx) {
+                        Some(ColumnValue::Boolean(v)) => b.append_value(*v),
+                        _ => b.append_null(),
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            _ => {
+                let mut b =
+                    arrow::array::StringBuilder::with_capacity(all_rows.len(), all_rows.len() * 16);
+                for row in &all_rows {
+                    match row.get(col_idx) {
+                        Some(ColumnValue::Utf8(s)) => b.append_value(s),
+                        Some(ColumnValue::Int64(v)) => b.append_value(v.to_string()),
+                        Some(ColumnValue::Float64(v)) => b.append_value(v.to_string()),
+                        Some(ColumnValue::Boolean(v)) => b.append_value(v.to_string()),
+                        _ => b.append_null(),
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+        }
+    }
+
+    let fields = (0..num_cols)
+        .map(|c| Field::new(format!("col_{c}"), col_types[c].clone(), true))
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema, arrays).map_err(|e| {
+        GatewayError::QueryTimeExecutionFailed {
+            detail: format!("build record batch from materialized state: {e}"),
+        }
+    })?;
+    Ok(vec![batch])
+}
+
+/// Fallback conversion of tab-separated byte rows into Arrow `RecordBatch`es (v0.67 Slice 3).
+pub fn tsv_rows_to_record_batches(rows: &[Vec<u8>]) -> Result<Vec<RecordBatch>, GatewayError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed_rows: Vec<Vec<&str>> = rows
+        .iter()
+        .map(|r| std::str::from_utf8(r).unwrap_or("").split('\t').collect())
+        .collect();
+    let num_cols = parsed_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if num_cols == 0 {
+        return Ok(Vec::new());
+    }
+    let mut col_types = Vec::with_capacity(num_cols);
+    for col_idx in 0..num_cols {
+        let mut all_i64 = true;
+        let mut all_f64 = true;
+        let mut all_bool = true;
+        let mut has_non_null = false;
+
+        for row in &parsed_rows {
+            if let Some(&val) = row.get(col_idx) {
+                if val == r"\N" || val.is_empty() {
+                    continue;
+                }
+                has_non_null = true;
+                if all_i64 && val.parse::<i64>().is_err() {
+                    all_i64 = false;
+                }
+                if all_f64 && val.parse::<f64>().is_err() {
+                    all_f64 = false;
+                }
+                if all_bool
+                    && !val.eq_ignore_ascii_case("true")
+                    && !val.eq_ignore_ascii_case("false")
+                {
+                    all_bool = false;
+                }
+            }
+        }
+
+        let dt = if has_non_null && all_i64 {
+            DataType::Int64
+        } else if has_non_null && all_f64 {
+            DataType::Float64
+        } else if has_non_null && all_bool {
+            DataType::Boolean
+        } else {
+            DataType::Utf8
+        };
+        col_types.push(dt);
+    }
+
+    let mut arrays: Vec<arrow::array::ArrayRef> = Vec::with_capacity(num_cols);
+    for (col_idx, dt) in col_types.iter().enumerate() {
+        match dt {
+            DataType::Int64 => {
+                let mut b = arrow::array::Int64Builder::with_capacity(parsed_rows.len());
+                for row in &parsed_rows {
+                    let val = row.get(col_idx).copied().unwrap_or(r"\N");
+                    if val == r"\N" || val.is_empty() {
+                        b.append_null();
+                    } else if let Ok(n) = val.parse::<i64>() {
+                        b.append_value(n);
+                    } else {
+                        b.append_null();
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            DataType::Float64 => {
+                let mut b = arrow::array::Float64Builder::with_capacity(parsed_rows.len());
+                for row in &parsed_rows {
+                    let val = row.get(col_idx).copied().unwrap_or(r"\N");
+                    if val == r"\N" || val.is_empty() {
+                        b.append_null();
+                    } else if let Ok(f) = val.parse::<f64>() {
+                        b.append_value(f);
+                    } else {
+                        b.append_null();
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            DataType::Boolean => {
+                let mut b = arrow::array::BooleanBuilder::with_capacity(parsed_rows.len());
+                for row in &parsed_rows {
+                    let val = row.get(col_idx).copied().unwrap_or(r"\N");
+                    if val == r"\N" || val.is_empty() {
+                        b.append_null();
+                    } else if val.eq_ignore_ascii_case("true") {
+                        b.append_value(true);
+                    } else if val.eq_ignore_ascii_case("false") {
+                        b.append_value(false);
+                    } else {
+                        b.append_null();
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+            _ => {
+                let mut b = arrow::array::StringBuilder::with_capacity(
+                    parsed_rows.len(),
+                    parsed_rows.len() * 16,
+                );
+                for row in &parsed_rows {
+                    let val = row.get(col_idx).copied().unwrap_or(r"\N");
+                    if val == r"\N" {
+                        b.append_null();
+                    } else {
+                        b.append_value(val);
+                    }
+                }
+                arrays.push(Arc::new(b.finish()));
+            }
+        }
+    }
+
+    let fields = (0..num_cols)
+        .map(|c| Field::new(format!("col_{c}"), col_types[c].clone(), true))
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema, arrays).map_err(|e| {
+        GatewayError::QueryTimeExecutionFailed {
+            detail: format!("build record batch from tsv rows: {e}"),
+        }
+    })?;
+    Ok(vec![batch])
 }
 
 #[cfg(test)]

@@ -51,6 +51,7 @@ rockstream-connectors.workspace = true
 
 
 [dev-dependencies]
+tonic = { workspace = true }
 rockstream-test-support.workspace = true
 tokio-postgres.workspace = true
 tempfile.workspace = true

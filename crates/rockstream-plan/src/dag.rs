@@ -191,6 +191,67 @@ fn dfs(
     false
 }
 
+// ─── Compatible View Analysis (v0.67 Slice 7) ───────────────────────────────
+
+/// Specification of a shared arrangement opportunity detected across multiple views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompatibleViewGroup {
+    pub source_name: String,
+    pub arrangement_key: String,
+    pub view_names: Vec<String>,
+}
+
+/// Extract underlying source and arrangement signature for a plan node.
+pub fn extract_source_and_arrangement_key(plan: &PlanNode) -> Option<(String, String)> {
+    match plan {
+        PlanNode::Source { name } => Some((name.to_lowercase(), "all".to_string())),
+        PlanNode::Filter { input, predicate } => {
+            let (src, _) = extract_source_and_arrangement_key(input)?;
+            Some((src, format!("filter:{:?}", predicate)))
+        }
+        PlanNode::Project { input, .. } => extract_source_and_arrangement_key(input),
+        PlanNode::Aggregate {
+            input, group_by, ..
+        } => {
+            let (src, _) = extract_source_and_arrangement_key(input)?;
+            Some((src, format!("group_by:{:?}", group_by)))
+        }
+        PlanNode::IndexArrange {
+            input, index_cols, ..
+        } => {
+            let (src, _) = extract_source_and_arrangement_key(input)?;
+            Some((src, format!("index:{:?}", index_cols)))
+        }
+        _ => None,
+    }
+}
+
+/// Detect groups of compatible views in a view catalog that can share an arrangement.
+pub fn find_compatible_view_groups(views: &HashMap<String, PlanNode>) -> Vec<CompatibleViewGroup> {
+    let mut groups: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (name, plan) in views {
+        if let Some((src, key)) = extract_source_and_arrangement_key(plan) {
+            groups.entry((src, key)).or_default().push(name.clone());
+        }
+    }
+
+    let mut result = Vec::new();
+    for ((source_name, arrangement_key), mut view_names) in groups {
+        view_names.sort();
+        result.push(CompatibleViewGroup {
+            source_name,
+            arrangement_key,
+            view_names,
+        });
+    }
+    result.sort_by(|a, b| {
+        a.source_name
+            .cmp(&b.source_name)
+            .then_with(|| a.arrangement_key.cmp(&b.arrangement_key))
+    });
+    result
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
