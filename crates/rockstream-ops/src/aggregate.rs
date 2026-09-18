@@ -644,21 +644,28 @@ impl AggregateOp {
             .entry_count()
     }
 
-    /// Encode current state as a `WriteBatch` for persistence.
+    /// Encode dirty state mutations as a `WriteBatch` for persistence.
     ///
+    /// Persists only keys that changed (put) or were removed (delete) during the
+    /// current epoch, ensuring O(|Δ|) write amplification instead of O(|state|).
     /// The caller (usually `ViewSinkOp` or group commit) merges this batch
     /// into the epoch's group-commit `WriteBatch`.
     pub fn state_write_batch(&self) -> WriteBatch {
         let state = self.state.lock().expect("AggregateOp mutex poisoned");
-        let mut wb = state.encode_as_write_batch(self.op_id);
         let dirty = self
             .dirty_keys
             .lock()
             .expect("AggregateOp dirty_keys mutex poisoned");
+        let mut wb = WriteBatch::new();
         for &k in dirty.iter() {
-            if !state.entries.contains_key(&k) {
-                let key =
-                    ShardKeyEncoder::encode(ShardPrefix::OpState, self.op_id.0, &k.to_be_bytes());
+            let key =
+                ShardKeyEncoder::encode(ShardPrefix::OpState, self.op_id.0, &k.to_be_bytes());
+            if let Some(&(sum, count)) = state.entries.get(&k) {
+                let mut value = [0u8; 16];
+                value[..8].copy_from_slice(&sum.to_be_bytes());
+                value[8..].copy_from_slice(&count.to_be_bytes());
+                wb.put(&key, &value);
+            } else {
                 wb.delete(&key);
             }
         }
