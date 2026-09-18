@@ -11,12 +11,26 @@ fail() {
   exit 1
 }
 
+expect_failure() {
+  local output_path="$1"
+  shift
+  set +e
+  "$@" >"$output_path" 2>&1
+  local status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    cat "$output_path" >&2
+    fail "command unexpectedly succeeded: $*"
+  fi
+}
+
 mkdir -p "$TMP_ROOT/formal/verus/negative" "$TMP_ROOT/docs/implementation-plans" \
   "$TMP_ROOT/sign-offs/verus" "$TMP_ROOT/.github/workflows" "$TMP_ROOT/scripts" \
   "$TMP_ROOT/benchmarks/r1-local"
 cp "$ROOT/formal/verus/qualification.toml" "$ROOT/formal/verus/manifest.toml" \
   "$ROOT/formal/verus/toolchain.lock.toml" "$ROOT/formal/verus/MAINTENANCE.md" \
   "$TMP_ROOT/formal/verus/"
+cp "$ROOT/formal/verus/assumptions.toml" "$TMP_ROOT/formal/verus/"
 cp "$ROOT/formal/verus/negative/invalid_arithmetic.rs" \
   "$ROOT/formal/verus/negative/invalid_sign_encoding.rs" \
   "$ROOT/formal/verus/negative/invalid_validation.rs" \
@@ -34,6 +48,14 @@ cp "$ROOT/scripts/check-verus-qualification.py" "$TMP_ROOT/scripts/"
 cp "$ROOT/scripts/run-verus-qualification.sh" "$ROOT/scripts/record-verus-qualification.py" "$TMP_ROOT/scripts/"
 cp "$ROOT/benchmarks/r1-local/profile-v0611.toml" "$ROOT/benchmarks/r1-local/thresholds-v0611.toml" \
   "$TMP_ROOT/benchmarks/r1-local/"
+mkdir -p "$TMP_ROOT/crates/rockstream-verified/src" "$TMP_ROOT/crates/rockstream-storage/src"
+cp "$ROOT/crates/rockstream-verified/src/arithmetic.rs" \
+  "$ROOT/crates/rockstream-verified/src/keys.rs" \
+  "$ROOT/crates/rockstream-verified/src/frontier.rs" \
+  "$ROOT/crates/rockstream-verified/src/persistence.rs" \
+  "$ROOT/crates/rockstream-verified/src/lib.rs" \
+  "$TMP_ROOT/crates/rockstream-verified/src/"
+cp "$ROOT/crates/rockstream-storage/src/keys.rs" "$TMP_ROOT/crates/rockstream-storage/src/"
 
 bash "$CHECKER" "$ROOT" >/dev/null || fail "real qualification contract did not pass"
 
@@ -43,32 +65,37 @@ actual="$(bash "$CHECKER" "$ROOT")"
 
 printf 'verifier\t0\t1\tverus smoke\n' >"$TMP_ROOT/steps.tsv"
 missing_runtime="$TMP_ROOT/missing-runtime"
-missing_runtime_output="$(python3 "$TMP_ROOT/scripts/record-verus-qualification.py" \
+expect_failure "$TMP_ROOT/missing-runtime.log" python3 "$TMP_ROOT/scripts/record-verus-qualification.py" \
   --root "$TMP_ROOT" --run-id test --status passed --steps "$TMP_ROOT/steps.tsv" \
-  --runtime-artifact "$missing_runtime" --output "$TMP_ROOT/record.json" 2>&1 || true)"
+  --runtime-artifact "$missing_runtime" --output "$TMP_ROOT/record.json"
+missing_runtime_output="$(<"$TMP_ROOT/missing-runtime.log")"
 [[ "$missing_runtime_output" == "RS-0906: missing runtime artifact: $missing_runtime" ]] || \
   fail "missing runtime artifact was accepted: $missing_runtime_output"
 
 sed -i.bak 's/^id = "VS0-02"$/id = "VS9-99"/' "$TMP_ROOT/formal/verus/qualification.toml"
-unknown_output="$(python3 "$TMP_ROOT/scripts/check-verus-qualification.py" --root "$TMP_ROOT" 2>&1 || true)"
-if [[ "$unknown_output" != *"RS-0906: claim evidence references unknown claim: VS9-99"* ]]; then
+expect_failure "$TMP_ROOT/unknown.log" python3 "$TMP_ROOT/scripts/check-verus-qualification.py" --root "$TMP_ROOT"
+unknown_output="$(<"$TMP_ROOT/unknown.log")"
+expected_unknown=$'verus qualification: RS-0906: claim evidence references unknown claim: VS9-99\nverus qualification: RS-0906: claim has no VS6 evidence record: VS0-02'
+if [[ "$unknown_output" != "$expected_unknown" ]]; then
   fail "unknown claim evidence was accepted"
 fi
 
 cp "$ROOT/formal/verus/qualification.toml" "$TMP_ROOT/formal/verus/qualification.toml"
-sed -i.bak 's/^qualification_evidence = "blocked:/qualification_evidence = "skipped:/' \
+sed -i.bak '/id = "VS0-02"/,/qualification_evidence =/ s/^qualification_evidence = "blocked:/qualification_evidence = "skipped:/' \
   "$TMP_ROOT/formal/verus/qualification.toml"
-skipped_output="$(python3 "$TMP_ROOT/scripts/check-verus-qualification.py" --root "$TMP_ROOT" 2>&1 || true)"
-if [[ "$skipped_output" != *"RS-0906: VS0-02 marks qualification_evidence as skipped; use blocked"* ]]; then
+expect_failure "$TMP_ROOT/skipped.log" python3 "$TMP_ROOT/scripts/check-verus-qualification.py" --root "$TMP_ROOT"
+skipped_output="$(<"$TMP_ROOT/skipped.log")"
+if [[ "$skipped_output" != "verus qualification: RS-0906: VS0-02 marks qualification_evidence as skipped; use blocked" ]]; then
   fail "skipped evidence was accepted"
 fi
 
 cp "$ROOT/formal/verus/qualification.toml" "$TMP_ROOT/formal/verus/qualification.toml"
 cp "$ROOT/formal/verus/manifest.toml" "$TMP_ROOT/formal/verus/manifest.toml"
-sed -i.bak 's/status = "kernel-verified"/status = "release-qualified"/' \
+sed -i.bak '/id = "VS0-02"/,/status =/ s/status = "kernel-verified"/status = "release-qualified"/' \
   "$TMP_ROOT/formal/verus/manifest.toml"
-release_output="$(python3 "$TMP_ROOT/scripts/check-verus-qualification.py" --root "$TMP_ROOT" 2>&1 || true)"
-if [[ "$release_output" != *"RS-0906: release-qualified claim VS0-02 has blocked qualification evidence"* ]]; then
+expect_failure "$TMP_ROOT/release.log" python3 "$TMP_ROOT/scripts/check-verus-qualification.py" --root "$TMP_ROOT"
+release_output="$(<"$TMP_ROOT/release.log")"
+if [[ "$release_output" != "verus qualification: RS-0906: release-qualified claim VS0-02 has blocked qualification evidence" ]]; then
   fail "release-qualified blocked evidence was accepted"
 fi
 

@@ -195,6 +195,7 @@ verus! {
             || value == 32_768
     }
 
+    // verus-claim: VS0-02
     pub fn normalize_power_of_two_bucket_count(bucket_count: u16) -> (result: u16)
         ensures
             1 <= result <= 32_768,

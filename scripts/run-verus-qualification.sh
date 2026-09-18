@@ -15,6 +15,11 @@ OVERALL=0
 trap 'rm -rf "$TARGET_ROOT"' EXIT
 mkdir -p "$OUTPUT_ROOT"
 
+QUALIFICATION_TOML="$ROOT/formal/verus/qualification.toml"
+COLD_VERIFICATION_BUDGET="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["budgets"]["cold_verification_seconds"])' "$QUALIFICATION_TOML")"
+INCREMENTAL_VERIFICATION_BUDGET="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["budgets"]["incremental_verification_seconds"])' "$QUALIFICATION_TOML")"
+PRODUCTION_COMPILE_BUDGET="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["budgets"]["production_compile_seconds"])' "$QUALIFICATION_TOML")"
+
 run_step() {
   local id="$1"
   shift
@@ -27,7 +32,22 @@ run_step() {
     OVERALL=1
   fi
   end="$(date +%s)"
-  printf '%s\t%s\t%s\t%s\n' "$id" "$status" "$((end - start))" "$*" >>"$STEPS"
+  local elapsed=$((end - start))
+  local budget=0
+  case "$id" in
+    verifier) budget="$COLD_VERIFICATION_BUDGET" ;;
+    verifier-incremental) budget="$INCREMENTAL_VERIFICATION_BUDGET" ;;
+    cargo-*) budget="$PRODUCTION_COMPILE_BUDGET" ;;
+  esac
+  if [ "$status" -eq 0 ] && [ "$budget" -gt 0 ] && [ "$elapsed" -gt "$budget" ]; then
+    printf 'verus qualification: RS-0906: %s exceeded budget (%ss > %ss)\n' \
+      "$id" "$elapsed" "$budget" >>"$OUTPUT_ROOT/$id.log"
+    printf 'verus qualification: RS-0906: %s exceeded budget (%ss > %ss)\n' \
+      "$id" "$elapsed" "$budget" >&2
+    status=1
+    OVERALL=1
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$id" "$status" "$elapsed" "$*" >>"$STEPS"
 }
 
 if ! python3 "$ROOT/scripts/check-verus-qualification.py" --root "$ROOT"; then
