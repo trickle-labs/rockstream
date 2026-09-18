@@ -1012,6 +1012,7 @@ impl Operator for AggregateOp {
 
 /// Aggregate operator that splits one designated hot key into virtual buckets
 /// and combines the partial states back into the unsalted aggregate output.
+#[derive(Debug)]
 pub struct BucketedAggregateOp {
     combined: Mutex<HashMap<i64, (i64, i64)>>,
     partials: Mutex<HashMap<(i64, u16), (i64, i64)>>,
@@ -1038,11 +1039,142 @@ impl BucketedAggregateOp {
         route_power_of_two_bucket(&key, self.bucket_count, key.len()).unwrap_or(0)
     }
 
+    pub fn live_groups(&self) -> usize {
+        self.combined
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned")
+            .len()
+    }
+
     pub fn live_partials(&self) -> usize {
         self.partials
             .lock()
             .expect("BucketedAggregateOp mutex poisoned")
             .len()
+    }
+
+    pub fn restore_from_entries(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes)],
+    ) -> Result<(), OpError> {
+        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, self.op_id.0);
+        let mut local_combined = HashMap::new();
+        let mut local_partials = HashMap::new();
+
+        for (key, value) in entries {
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            if key.len() != prefix.len() + 8 && key.len() != prefix.len() + 10 {
+                return Err(OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid key length",
+                    self.op_id.0
+                )));
+            }
+            let group_key_bytes: [u8; 8] = key[prefix.len()..prefix.len() + 8]
+                .try_into()
+                .map_err(|_| {
+                    OpError::internal(format!(
+                        "corrupt persisted bucketed aggregate state for operator {}: invalid group key",
+                        self.op_id.0
+                    ))
+                })?;
+            let group_key = decode_i64(&group_key_bytes).map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid group key",
+                    self.op_id.0
+                ))
+            })?;
+            if value.len() != 16 {
+                return Err(OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid value length",
+                    self.op_id.0
+                )));
+            }
+            let sum_bytes: [u8; 8] = value[..8].try_into().map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid sum",
+                    self.op_id.0
+                ))
+            })?;
+            let count_bytes: [u8; 8] = value[8..16].try_into().map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid count",
+                    self.op_id.0
+                ))
+            })?;
+            let sum = decode_i64(&sum_bytes).map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid sum",
+                    self.op_id.0
+                ))
+            })?;
+            let count = decode_i64(&count_bytes).map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid count",
+                    self.op_id.0
+                ))
+            })?;
+            if count <= 0 {
+                return Err(OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: non-positive count",
+                    self.op_id.0
+                )));
+            }
+            if key.len() == prefix.len() + 10 {
+                let bucket_bytes: [u8; 2] = key[prefix.len() + 8..prefix.len() + 10]
+                    .try_into()
+                    .map_err(|_| {
+                        OpError::internal(format!(
+                            "corrupt persisted bucketed aggregate state for operator {}: invalid key length",
+                            self.op_id.0
+                        ))
+                    })?;
+                let bucket = u16::from_be_bytes(bucket_bytes);
+                local_partials.insert((group_key, bucket), (sum, count));
+            } else {
+                local_combined.insert(group_key, (sum, count));
+            }
+        }
+
+        for (&(group_key, _bucket), &(sum, count)) in local_partials.iter() {
+            if let Some((combined_sum, combined_count)) = local_combined.get_mut(&group_key) {
+                if *combined_count == 0 {
+                    *combined_sum = checked_add_i64(*combined_sum, sum)
+                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                    *combined_count = checked_add_i64(*combined_count, count)
+                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                    if *combined_count < 0 {
+                        return Err(OpError::invalid_multiplicity(group_key, *combined_count));
+                    }
+                }
+            } else {
+                let entry = local_combined.entry(group_key).or_insert((0, 0));
+                entry.0 = checked_add_i64(entry.0, sum)
+                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                entry.1 = checked_add_i64(entry.1, count)
+                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                if entry.1 < 0 {
+                    return Err(OpError::invalid_multiplicity(group_key, entry.1));
+                }
+            }
+        }
+
+        let mut combined = self
+            .combined
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+        let mut partials = self
+            .partials
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+        *combined = local_combined;
+        *partials = local_partials;
+        Ok(())
+    }
+
+    pub fn restore(&self, entries: &[(bytes::Bytes, bytes::Bytes)]) -> Result<(), OpError> {
+        self.restore_from_entries(entries)
     }
 
     pub async fn load_from_storage(
@@ -1062,75 +1194,7 @@ impl BucketedAggregateOp {
             )));
         }
         let op = Self::new(op_id, hot_key, bucket_count);
-        let mut combined = op
-            .combined
-            .lock()
-            .expect("BucketedAggregateOp mutex poisoned");
-        let mut partials = op
-            .partials
-            .lock()
-            .expect("BucketedAggregateOp mutex poisoned");
-        for (key, value) in &entries {
-            if !key.starts_with(&prefix)
-                || (key.len() != prefix.len() + 8 && key.len() != prefix.len() + 10)
-                || value.len() != 16
-            {
-                continue;
-            }
-            let Ok(group_key_bytes): Result<[u8; 8], _> =
-                key[prefix.len()..prefix.len() + 8].try_into()
-            else {
-                continue;
-            };
-            let Ok(sum_bytes): Result<[u8; 8], _> = value[..8].try_into() else {
-                continue;
-            };
-            let Ok(count_bytes): Result<[u8; 8], _> = value[8..16].try_into() else {
-                continue;
-            };
-            let Ok(group_key) = decode_i64(&group_key_bytes) else {
-                continue;
-            };
-            let Ok(sum) = decode_i64(&sum_bytes) else {
-                continue;
-            };
-            let Ok(count) = decode_i64(&count_bytes) else {
-                continue;
-            };
-            if key.len() == prefix.len() + 10 {
-                let Ok(bucket_bytes) = key[prefix.len() + 8..prefix.len() + 10].try_into() else {
-                    continue;
-                };
-                let bucket = u16::from_be_bytes(bucket_bytes);
-                partials.insert((group_key, bucket), (sum, count));
-            } else {
-                combined.insert(group_key, (sum, count));
-            }
-        }
-        for (&(group_key, _bucket), &(sum, count)) in partials.iter() {
-            if let Some((combined_sum, combined_count)) = combined.get_mut(&group_key) {
-                if *combined_count == 0 {
-                    *combined_sum = checked_add_i64(*combined_sum, sum)
-                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                    *combined_count = checked_add_i64(*combined_count, count)
-                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                    if *combined_count < 0 {
-                        return Err(OpError::invalid_multiplicity(group_key, *combined_count));
-                    }
-                }
-            } else {
-                let entry = combined.entry(group_key).or_insert((0, 0));
-                entry.0 = checked_add_i64(entry.0, sum)
-                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                entry.1 = checked_add_i64(entry.1, count)
-                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                if entry.1 < 0 {
-                    return Err(OpError::invalid_multiplicity(group_key, entry.1));
-                }
-            }
-        }
-        drop(partials);
-        drop(combined);
+        op.restore_from_entries(&entries)?;
         Ok(op)
     }
 }
@@ -1418,11 +1482,11 @@ pub async fn persist_bucketed_agg_state(
     Ok(())
 }
 
-fn bucketed_combined_key(op_id: OperatorId, group_key: i64) -> Vec<u8> {
+pub fn bucketed_combined_key(op_id: OperatorId, group_key: i64) -> Vec<u8> {
     ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &group_key.to_be_bytes())
 }
 
-fn bucketed_partial_key(op_id: OperatorId, group_key: i64, bucket: u16) -> Vec<u8> {
+pub fn bucketed_partial_key(op_id: OperatorId, group_key: i64, bucket: u16) -> Vec<u8> {
     let mut suffix = Vec::with_capacity(10);
     suffix.extend_from_slice(&group_key.to_be_bytes());
     suffix.extend_from_slice(&bucket.to_be_bytes());
@@ -1732,6 +1796,158 @@ mod tests {
         assert_eq!(
             extract_rows(&output),
             vec![(1, 1, 1, 1.0, -1), (1, 2, 2, 1.0, 1)]
+        );
+    }
+
+    fn encode_bucketed_value(sum: i64, count: i64) -> bytes::Bytes {
+        let mut val = [0u8; 16];
+        val[..8].copy_from_slice(&encode_i64(sum));
+        val[8..16].copy_from_slice(&encode_i64(count));
+        bytes::Bytes::copy_from_slice(&val)
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_valid_entry_succeeds() {
+        let op_id = OperatorId(10);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let combined_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let combined_v = encode_bucketed_value(100, 5);
+        let partial_k = bytes::Bytes::from(bucketed_partial_key(op_id, 2, 1));
+        let partial_v = encode_bucketed_value(50, 2);
+
+        let entries = vec![(combined_k, combined_v), (partial_k, partial_v)];
+        op.restore_from_entries(&entries).unwrap();
+
+        assert_eq!(op.live_groups(), 2);
+        assert_eq!(op.live_partials(), 1);
+
+        // Alias check
+        let op2 = BucketedAggregateOp::new(op_id, 2, 4);
+        op2.restore(&entries).unwrap();
+        assert_eq!(op2.live_groups(), 2);
+        assert_eq!(op2.live_partials(), 1);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_one_valid_one_malformed_value_fails_closed() {
+        let op_id = OperatorId(11);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let valid_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let valid_v = encode_bucketed_value(100, 5);
+        let malformed_k = bytes::Bytes::from(bucketed_combined_key(op_id, 2));
+        let malformed_v = bytes::Bytes::from_static(b"short_val");
+
+        let entries = vec![(valid_k, valid_v), (malformed_k, malformed_v)];
+        let error = op.restore_from_entries(&entries).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 11: invalid value length; next_steps: report this issue"
+        );
+        assert_eq!(op.live_groups(), 0);
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_one_valid_one_malformed_key_fails_closed() {
+        let op_id = OperatorId(12);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let valid_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let valid_v = encode_bucketed_value(100, 5);
+
+        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
+        let malformed_k = bytes::Bytes::from([prefix.as_slice(), b"short"].concat());
+        let malformed_v = encode_bucketed_value(50, 2);
+
+        let entries = vec![(valid_k, valid_v), (malformed_k, malformed_v)];
+        let error = op.restore_from_entries(&entries).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 12: invalid key length; next_steps: report this issue"
+        );
+        assert_eq!(op.live_groups(), 0);
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_non_positive_count_fails_closed() {
+        let op_id = OperatorId(13);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let valid_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let valid_v = encode_bucketed_value(100, 5);
+        let zero_count_k = bytes::Bytes::from(bucketed_combined_key(op_id, 2));
+        let zero_count_v = encode_bucketed_value(0, 0);
+
+        let entries = vec![
+            (valid_k.clone(), valid_v.clone()),
+            (zero_count_k.clone(), zero_count_v),
+        ];
+        let error = op.restore_from_entries(&entries).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 13: non-positive count; next_steps: report this issue"
+        );
+        assert_eq!(op.live_groups(), 0);
+        assert_eq!(op.live_partials(), 0);
+
+        // Negative count test
+        let neg_count_v = encode_bucketed_value(10, -3);
+        let entries_neg = vec![(valid_k, valid_v), (zero_count_k, neg_count_v)];
+        let error_neg = op.restore_from_entries(&entries_neg).unwrap_err();
+        assert_eq!(
+            error_neg.to_string(),
+            "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 13: non-positive count; next_steps: report this issue"
+        );
+        assert_eq!(op.live_groups(), 0);
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_unrelated_out_of_namespace_key_ignored() {
+        let op_id = OperatorId(14);
+        let other_op_id = OperatorId(999);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let valid_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let valid_v = encode_bucketed_value(100, 5);
+        let unrelated_k = bytes::Bytes::from(bucketed_combined_key(other_op_id, 99));
+        let unrelated_v = bytes::Bytes::from_static(b"completely_random_foreign_value");
+
+        let entries = vec![(valid_k, valid_v), (unrelated_k, unrelated_v)];
+        op.restore_from_entries(&entries).unwrap();
+
+        assert_eq!(op.live_groups(), 1);
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_failure_leaves_prior_state_untouched() {
+        let op_id = OperatorId(15);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        // Initial valid state via process_delta
+        op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)])).unwrap();
+        assert_eq!(op.live_groups(), 2);
+
+        // Attempt restore with corrupted entry
+        let bad_k = bytes::Bytes::from(bucketed_combined_key(op_id, 3));
+        let bad_v = bytes::Bytes::from_static(b"bad_len");
+        let entries = vec![(bad_k, bad_v)];
+
+        assert!(op.restore_from_entries(&entries).is_err());
+
+        // Prior state must remain untouched
+        assert_eq!(op.live_groups(), 2);
+        let output = op.process_delta(make_batch(&[(1, 10, -1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 10, 1, 10.0, -1)]
         );
     }
 }
