@@ -182,7 +182,7 @@ jobs:
           cargo test -p rockstream-gateway --lib --tests -- --test-threads=1
           cargo test -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
           cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
-          cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
+          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS=60 ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS=10 cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
       - name: Simulation unit tests
         if: matrix.shard == 'sim-unit'
         run: cargo test -p rockstream-sim --features simulation --lib -- --test-threads=1
