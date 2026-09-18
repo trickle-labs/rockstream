@@ -7,6 +7,7 @@ use bytes::Bytes;
 use rockstream_types::laws::arithmetic::{
     checked_add_i64, checked_add_u64, decode_i64, decode_u64, encode_i64, encode_u64,
 };
+use rockstream_types::merge_law::LawBundle;
 use slatedb::{MergeOperator, MergeOperatorError};
 
 /// Tag byte prepended to values indicating the merge strategy.
@@ -25,6 +26,159 @@ pub enum MergeTag {
     LWWRegister = 0x22,
     /// PNCounter: positive-negative counter, values are i64 (big-endian).
     PNCounter = 0x30,
+}
+
+impl MergeTag {
+    /// Decode a byte into a known `MergeTag`.
+    pub const fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            0x01 => Some(Self::Sum),
+            0x02 => Some(Self::Count),
+            0x03 => Some(Self::MaxRegister),
+            0x04 => Some(Self::MinRegister),
+            0x22 => Some(Self::LWWRegister),
+            0x30 => Some(Self::PNCounter),
+            _ => None,
+        }
+    }
+
+    /// Expected total wire length (1 byte tag + payload).
+    pub const fn expected_len(self) -> usize {
+        1 + self.payload_len()
+    }
+
+    /// Expected payload length without the tag byte.
+    pub const fn payload_len(self) -> usize {
+        match self {
+            Self::Sum | Self::Count | Self::MaxRegister | Self::MinRegister | Self::PNCounter => 8,
+            Self::LWWRegister => 16,
+        }
+    }
+
+    /// Check whether this storage merge tag is compatible with the given merge law.
+    pub fn is_compatible_with_law(self, law: &dyn LawBundle) -> bool {
+        let id = law.id().0;
+        let name = law.name();
+        let base_name = name.split('/').next().unwrap_or(name);
+        match self {
+            Self::Sum => {
+                id == 0x0001
+                    || base_name.eq_ignore_ascii_case("WeightAdd")
+                    || base_name.eq_ignore_ascii_case("Sum")
+            }
+            Self::PNCounter => {
+                id == 0x0001
+                    || id == 10
+                    || id == 0x0030
+                    || base_name.eq_ignore_ascii_case("WeightAdd")
+                    || base_name.eq_ignore_ascii_case("Sum")
+                    || base_name.eq_ignore_ascii_case("PNCounter")
+                    || base_name.eq_ignore_ascii_case("PN-Counter")
+            }
+            Self::Count => {
+                id == 0x0002
+                    || base_name.eq_ignore_ascii_case("Count")
+                    || base_name.eq_ignore_ascii_case("SumCount")
+            }
+            Self::MaxRegister => {
+                id == 0x0003
+                    || id == 11
+                    || id == 0x1001
+                    || base_name.eq_ignore_ascii_case("MaxRegister")
+                    || base_name.eq_ignore_ascii_case("Max")
+            }
+            Self::MinRegister => {
+                id == 0x0004
+                    || base_name.eq_ignore_ascii_case("MinRegister")
+                    || base_name.eq_ignore_ascii_case("Min")
+            }
+            Self::LWWRegister => {
+                id == 0x0022
+                    || base_name.eq_ignore_ascii_case("LWWRegister")
+                    || base_name.eq_ignore_ascii_case("LWW")
+            }
+        }
+    }
+}
+
+/// A view of a law operand, either raw or extracted from a tagged storage value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LawOperandView<'a> {
+    /// Raw un-tagged operand bytes.
+    Raw(&'a [u8]),
+    /// Tagged storage merge operand with the tag stripped.
+    Tagged {
+        tag: MergeTag,
+        payload: &'a [u8],
+    },
+}
+
+/// Error returned when resolving a storage law operand fails.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LawOperandError {
+    #[error("RS-3009: incompatible merge tag {tag:?} for law {law_name} ({law_id})")]
+    IncompatibleTag {
+        tag: MergeTag,
+        law_name: String,
+        law_id: u16,
+    },
+    #[error("RS-3009: malformed tagged {tag:?} payload length: expected {expected}, got {actual}")]
+    MalformedTaggedLength {
+        tag: MergeTag,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+/// Resolves a stored byte slice against a merge law into either a raw operand view
+/// or a validated tagged operand view with the tag stripped.
+pub fn resolve_law_operand<'a>(
+    law: &dyn LawBundle,
+    bytes: &'a [u8],
+) -> Result<LawOperandView<'a>, LawOperandError> {
+    let Some(&first) = bytes.first() else {
+        return Ok(LawOperandView::Raw(bytes));
+    };
+
+    let Some(tag) = MergeTag::from_u8(first) else {
+        return Ok(LawOperandView::Raw(bytes));
+    };
+
+    if bytes.len() == tag.expected_len() {
+        if tag.is_compatible_with_law(law) {
+            Ok(LawOperandView::Tagged {
+                tag,
+                payload: &bytes[1..],
+            })
+        } else {
+            Err(LawOperandError::IncompatibleTag {
+                tag,
+                law_name: law.name().to_string(),
+                law_id: law.id().0,
+            })
+        }
+    } else if tag.is_compatible_with_law(law) {
+        if bytes.len() == tag.payload_len() {
+            Ok(LawOperandView::Raw(bytes))
+        } else {
+            Err(LawOperandError::MalformedTaggedLength {
+                tag,
+                expected: tag.expected_len(),
+                actual: bytes.len(),
+            })
+        }
+    } else {
+        let expected_raw = law.identity().map(|id| id.len());
+        if expected_raw == Some(bytes.len()) {
+            Ok(LawOperandView::Raw(bytes))
+        } else {
+            Err(LawOperandError::IncompatibleTag {
+                tag,
+                law_name: law.name().to_string(),
+                law_id: law.id().0,
+            })
+        }
+    }
 }
 
 /// A merge operator that performs associative sum and count operations.
@@ -134,18 +288,7 @@ impl MergeOperator for SumCountMergeOperator {
 }
 
 fn expected_len(tag: u8) -> Option<usize> {
-    match tag {
-        t if t == MergeTag::Sum as u8
-            || t == MergeTag::Count as u8
-            || t == MergeTag::MaxRegister as u8
-            || t == MergeTag::MinRegister as u8
-            || t == MergeTag::PNCounter as u8 =>
-        {
-            Some(9)
-        }
-        t if t == MergeTag::LWWRegister as u8 => Some(17),
-        _ => None,
-    }
+    MergeTag::from_u8(tag).map(|t| t.expected_len())
 }
 
 fn validate_operand(value: &[u8]) -> Result<u8, MergeOperatorError> {
@@ -414,5 +557,144 @@ mod tests {
 
         assert_eq!(abc_left, abc_right);
         assert_eq!(MergeOperatorRegistry::decode_count(&abc_left), Some(60));
+    }
+
+    #[test]
+    fn merge_tag_from_u8_and_lengths() {
+        assert_eq!(MergeTag::from_u8(0x01), Some(MergeTag::Sum));
+        assert_eq!(MergeTag::from_u8(0x02), Some(MergeTag::Count));
+        assert_eq!(MergeTag::from_u8(0x03), Some(MergeTag::MaxRegister));
+        assert_eq!(MergeTag::from_u8(0x04), Some(MergeTag::MinRegister));
+        assert_eq!(MergeTag::from_u8(0x22), Some(MergeTag::LWWRegister));
+        assert_eq!(MergeTag::from_u8(0x30), Some(MergeTag::PNCounter));
+        assert_eq!(MergeTag::from_u8(0x00), None);
+        assert_eq!(MergeTag::from_u8(0x99), None);
+
+        for tag in [
+            MergeTag::Sum,
+            MergeTag::Count,
+            MergeTag::MaxRegister,
+            MergeTag::MinRegister,
+            MergeTag::PNCounter,
+        ] {
+            assert_eq!(tag.expected_len(), 9);
+            assert_eq!(tag.payload_len(), 8);
+        }
+
+        assert_eq!(MergeTag::LWWRegister.expected_len(), 17);
+        assert_eq!(MergeTag::LWWRegister.payload_len(), 16);
+    }
+
+    #[test]
+    fn merge_tag_law_compatibility() {
+        use rockstream_types::laws::weight_add::WeightAddV1;
+        use rockstream_types::laws::sum_count::SumCountV1;
+
+        let weight_law = WeightAddV1;
+        let sum_count_law = SumCountV1;
+
+        // Sum and PNCounter are compatible with WeightAdd
+        assert!(MergeTag::Sum.is_compatible_with_law(&weight_law));
+        assert!(MergeTag::PNCounter.is_compatible_with_law(&weight_law));
+
+        // Count is compatible with SumCount
+        assert!(MergeTag::Count.is_compatible_with_law(&sum_count_law));
+
+        // Incompatible mappings
+        assert!(!MergeTag::Sum.is_compatible_with_law(&sum_count_law));
+        assert!(!MergeTag::Count.is_compatible_with_law(&weight_law));
+        assert!(!MergeTag::MaxRegister.is_compatible_with_law(&weight_law));
+        assert!(!MergeTag::MinRegister.is_compatible_with_law(&weight_law));
+        assert!(!MergeTag::LWWRegister.is_compatible_with_law(&weight_law));
+    }
+
+    #[test]
+    fn resolve_law_operand_tagged_sum() {
+        use rockstream_types::laws::weight_add::WeightAddV1;
+        let law = WeightAddV1;
+
+        let tagged = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07];
+        let view = resolve_law_operand(&law, &tagged).unwrap();
+        match view {
+            LawOperandView::Tagged { tag, payload } => {
+                assert_eq!(tag, MergeTag::Sum);
+                assert_eq!(payload, &[0, 0, 0, 0, 0, 0, 0, 7]);
+            }
+            LawOperandView::Raw(_) => panic!("expected tagged view"),
+        }
+    }
+
+    #[test]
+    fn resolve_law_operand_raw_starting_with_tag_byte() {
+        use rockstream_types::laws::weight_add::WeightAddV1;
+        let law = WeightAddV1;
+
+        // Raw 8-byte operand beginning with 0x01
+        let raw = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05];
+        let view = resolve_law_operand(&law, &raw).unwrap();
+        match view {
+            LawOperandView::Raw(bytes) => {
+                assert_eq!(bytes, &raw);
+            }
+            LawOperandView::Tagged { .. } => panic!("expected raw view"),
+        }
+
+        // Raw 8-byte operand beginning with 0x02 (Count tag)
+        let raw2 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05];
+        let view2 = resolve_law_operand(&law, &raw2).unwrap();
+        match view2 {
+            LawOperandView::Raw(bytes) => {
+                assert_eq!(bytes, &raw2);
+            }
+            LawOperandView::Tagged { .. } => panic!("expected raw view"),
+        }
+    }
+
+    #[test]
+    fn resolve_law_operand_malformed_tagged_length() {
+        use rockstream_types::laws::weight_add::WeightAddV1;
+        let law = WeightAddV1;
+
+        // Too short for tagged (and not 8 bytes)
+        let short = [0x01, 0x00, 0x00];
+        let err = resolve_law_operand(&law, &short).unwrap_err();
+        assert_eq!(
+            err,
+            LawOperandError::MalformedTaggedLength {
+                tag: MergeTag::Sum,
+                expected: 9,
+                actual: 3,
+            }
+        );
+
+        // Too long (10 bytes)
+        let long = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x99];
+        let err_long = resolve_law_operand(&law, &long).unwrap_err();
+        assert_eq!(
+            err_long,
+            LawOperandError::MalformedTaggedLength {
+                tag: MergeTag::Sum,
+                expected: 9,
+                actual: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_law_operand_incompatible_tag() {
+        use rockstream_types::laws::weight_add::WeightAddV1;
+        let law = WeightAddV1;
+
+        // Tagged Count (9 bytes) passed to WeightAdd
+        let tagged_count = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05];
+        let err = resolve_law_operand(&law, &tagged_count).unwrap_err();
+        assert_eq!(
+            err,
+            LawOperandError::IncompatibleTag {
+                tag: MergeTag::Count,
+                law_name: "WeightAdd".into(),
+                law_id: 1,
+            }
+        );
     }
 }
