@@ -8,9 +8,6 @@ verus! {
         delta_sum: i128,
         delta_count: i64,
     ) -> (result: Option<(i64, i64)>)
-        requires
-            old_count >= 0,
-            old_count == 0 ==> old_sum == 0,
         ensures
             result.is_some() ==> {
                 let state = result.unwrap();

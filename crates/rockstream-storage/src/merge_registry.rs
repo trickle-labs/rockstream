@@ -359,7 +359,10 @@ mod tests {
         let op = SumCountMergeOperator;
         let result = op.merge(&key(), None, Bytes::from_static(&[MergeTag::Sum as u8]));
         let error = result.unwrap_err();
-        assert!(format!("{error:?}").contains("RS-3009"));
+        assert_eq!(
+            error.to_string(),
+            "RS-3009: merge operand width mismatch: expected 9, got 1"
+        );
     }
 
     #[test]
@@ -369,7 +372,10 @@ mod tests {
         value.push(0);
         let result = op.merge(&key(), None, Bytes::from(value));
         let error = result.unwrap_err();
-        assert!(format!("{error:?}").contains("width mismatch"));
+        assert_eq!(
+            error.to_string(),
+            "RS-3009: merge operand width mismatch: expected 9, got 10"
+        );
     }
 
     #[test]

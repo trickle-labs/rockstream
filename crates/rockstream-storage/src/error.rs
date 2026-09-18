@@ -43,8 +43,8 @@ pub enum StorageError {
     )]
     UnknownMergeLaw { law_id: u16, law_version: u16 },
 
-    /// RS-3009: an arrangement catalog value is not exactly one header.
-    #[error("RS-3009: malformed arrangement header length={length}")]
+    /// RS-5037: an arrangement catalog value is not exactly one header.
+    #[error("RS-5037: malformed arrangement header length={length}")]
     MalformedArrangementHeader { length: usize },
 
     /// RS-5001: the stored format is outside the binary's inclusive range.
