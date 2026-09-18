@@ -33,20 +33,28 @@ use rockstream_types::topology::{
     WorkerMessage, WorkerRegistration,
 };
 
+use crate::epoch_compaction::{EpochCompactor, EpochCompactionConfig};
 use crate::secrets::WorkerSecretManager;
 use crate::shard_actor::{FrameExecutor, ShardActorRegistry};
 use rockstream_ops::PhysicalCommitGroup;
 use rockstream_storage::{ShardDb, WriteBatch};
 
-struct WorkerDeployment {
-    descriptor: DeploymentDescriptor,
-    schemas: HashMap<String, SchemaRef>,
-    db: Arc<ShardDb>,
-    compiled: rockstream_ops::compile::CompiledView,
-    commit_group: Arc<PhysicalCommitGroup>,
+pub struct WorkerDeployment {
+    pub descriptor: DeploymentDescriptor,
+    pub schemas: HashMap<String, SchemaRef>,
+    pub db: Arc<ShardDb>,
+    pub compiled: rockstream_ops::compile::CompiledView,
+    pub commit_group: Arc<PhysicalCommitGroup>,
+    pub compactor: Arc<EpochCompactor>,
 }
 
-type WorkerDeployments = Arc<RwLock<HashMap<(WorkloadId, ShardId), Arc<WorkerDeployment>>>>;
+impl WorkerDeployment {
+    pub fn compactor(&self) -> &Arc<EpochCompactor> {
+        &self.compactor
+    }
+}
+
+pub type WorkerDeployments = Arc<RwLock<HashMap<(WorkloadId, ShardId), Arc<WorkerDeployment>>>>;
 
 fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<String, SchemaRef>> {
     descriptor
@@ -253,7 +261,36 @@ async fn execute_frame(
     frame
         .record_encoded_exchange(worker_id, strategy)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let input = rows_to_zset(&frame.rows, schema)?;
+    let compacted_input_rows = deployment.compactor.compact_slice(&frame.rows);
+    if compacted_input_rows.is_empty() {
+        rockstream_types::metrics::add_r1_worker_rows(
+            worker_id,
+            frame.rows.len() as u64,
+            0,
+        );
+        client
+            .msg_tx
+            .send(WorkerMessage::ExecutionProgress {
+                output: RuntimeOutputDelta {
+                    version: frame.version,
+                    request_id: frame.request_id,
+                    workload_id: frame.workload_id,
+                    shard_id: frame.shard_id,
+                    epoch: frame.epoch,
+                    operator_id: frame.operator_id,
+                    lease_token: frame.lease_token,
+                    source: frame.source,
+                    rows: Vec::new(),
+                },
+                input_rows: frame.rows.len() as u64,
+                output_rows: 0,
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "client channel closed"))?;
+        return Ok(());
+    }
+
+    let input = rows_to_zset(&compacted_input_rows, schema)?;
     let output = rockstream_types::metrics::with_r1_execution_context(
         rockstream_types::metrics::R1ExecutionContext {
             worker_id,
@@ -298,11 +335,18 @@ async fn execute_frame(
             "lease fence rejected persistence",
         ));
     }
+    let raw_output_rows = zset_to_rows(&output)?;
+    let output_rows = deployment.compactor.compact_slice(&raw_output_rows);
+    let output_for_sink = if output_rows.len() != raw_output_rows.len() {
+        rows_to_zset(&output_rows, output.data.schema())?
+    } else {
+        output
+    };
     let mut writes = WriteBatch::new();
     deployment
         .compiled
         .sink
-        .append_epoch(&mut writes, &output, frame.epoch);
+        .append_epoch(&mut writes, &output_for_sink, frame.epoch);
     if let Some(join) = &deployment.compiled.join {
         join.pipeline
             .append_state(&deployment.db, &mut writes)
@@ -321,7 +365,6 @@ async fn execute_frame(
         .commit_epoch(frame.epoch, writes)
         .await
         .map_err(io::Error::other)?;
-    let output_rows = zset_to_rows(&output)?;
     rockstream_types::metrics::add_r1_worker_rows(
         worker_id,
         frame.rows.len() as u64,
@@ -351,6 +394,7 @@ async fn execute_frame(
 #[cfg(test)]
 mod data_plane_tests {
     use super::*;
+    use rockstream_types::ids::OperatorId;
 
     #[test]
     fn runtime_rows_convert_exactly() {
@@ -384,6 +428,364 @@ mod data_plane_tests {
             ]
         );
     }
+
+    async fn setup_test_deployment(
+        storage_dir: &Path,
+        compaction_config: EpochCompactionConfig,
+    ) -> (
+        WorkerClientHandle,
+        WorkerDeployments,
+        Arc<ShardDb>,
+        Arc<EpochCompactor>,
+        mpsc::Receiver<WorkerMessage>,
+    ) {
+        let (msg_tx, mut msg_rx) = mpsc::channel(32);
+        let worker_id = Arc::new(RwLock::new(Some(WorkerId(42))));
+        let active_shards = Arc::new(RwLock::new(HashMap::new()));
+        let topology_workers = Arc::new(RwLock::new(HashMap::new()));
+        let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let secret_manager = Arc::new(WorkerSecretManager::new("worker-42".to_string()));
+        let storage_context = Arc::new(
+            rockstream_storage::storage_context::WorkerStorageContext::new_with_worker_id(
+                "worker-42",
+                536_870_912,
+            ),
+        );
+        let deployments = Arc::new(RwLock::new(HashMap::new()));
+        let comp_config_lock = Arc::new(RwLock::new(compaction_config.clone()));
+
+        let client = WorkerClientHandle {
+            worker_id,
+            active_shards,
+            topology_workers,
+            msg_tx,
+            fence_waiters: fence_waiters.clone(),
+            secret_manager,
+            storage_context: storage_context.clone(),
+            compaction_config: comp_config_lock,
+            deployments: deployments.clone(),
+        };
+
+        let store =
+            rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
+        let db = Arc::new(
+            ShardDb::builder("db", store)
+                .with_storage_context(storage_context)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let plan = rockstream_plan::PlanNode::ViewSink {
+            view_name: "items_view".to_string(),
+            pk: vec![0],
+            child: Box::new(rockstream_plan::PlanNode::Source {
+                name: "items".to_string(),
+            }),
+        };
+
+        let descriptor = DeploymentDescriptor {
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            workload_id: WorkloadId(1),
+            plan_json: serde_json::to_string(&plan).unwrap(),
+            join_strategy: rockstream_types::config::JoinStrategy::Auto,
+            schemas: vec![rockstream_types::data_plane::DeploymentSchema {
+                relation: "items".to_string(),
+                columns: vec![
+                    rockstream_types::data_plane::DeploymentColumn {
+                        name: "id".to_string(),
+                        data_type: "i64".to_string(),
+                    },
+                    rockstream_types::data_plane::DeploymentColumn {
+                        name: "name".to_string(),
+                        data_type: "utf8".to_string(),
+                    },
+                ],
+            }],
+            frontier: 0,
+            storage_root: "test_root".to_string(),
+            sink_operator_id: OperatorId(10),
+            output_columns: vec!["id".to_string(), "name".to_string()],
+            primary_key: vec![0],
+            merge_key_columns: vec![],
+            routing_columns: std::collections::BTreeMap::new(),
+            shard: ShardLease::new(ShardId(100), WorkerId(42), LeaseToken(777)),
+            storage_identity: format!("lfs:{}", storage_dir.display()),
+        };
+
+        let schemas = deployment_schema(&descriptor).unwrap();
+        let compiled = rockstream_ops::compile_plan_with_sink_id_and_strategy(
+            &plan,
+            db.clone(),
+            &schemas,
+            descriptor.sink_operator_id,
+            descriptor.join_strategy,
+        )
+        .unwrap();
+
+        let commit_group = Arc::new(PhysicalCommitGroup::new(db.clone()));
+        let compactor = Arc::new(EpochCompactor::new(compaction_config));
+
+        let deployment = Arc::new(WorkerDeployment {
+            descriptor: descriptor.clone(),
+            schemas,
+            db: db.clone(),
+            compiled,
+            commit_group,
+            compactor: compactor.clone(),
+        });
+
+        deployments
+            .write()
+            .insert((descriptor.workload_id, descriptor.shard.shard_id), deployment);
+
+        let fence_waiters_task = fence_waiters.clone();
+        let (progress_tx, progress_rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            while let Some(msg) = msg_rx.recv().await {
+                match msg {
+                    WorkerMessage::FenceWrite { shard_id, .. } => {
+                        if let Some(waiters) = fence_waiters_task.lock().remove(&shard_id) {
+                            for tx in waiters {
+                                let _ = tx.send(true);
+                            }
+                        }
+                    }
+                    WorkerMessage::ExecutionProgress { .. } => {
+                        let _ = progress_tx.send(msg).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        (client, deployments, db, compactor, progress_rx)
+    }
+
+    #[tokio::test]
+    async fn test_zero_weight_omission_prior_to_pipeline_and_storage() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, compactor, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+
+        // Frame with offsetting updates (+1 and -1) on key "10\talice"
+        // and a non-zero row (+1) on key "20\tbob"
+        let frame = RuntimeExchangeMessage {
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "req-1".to_string(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "items".to_string(),
+            rows: vec![
+                RuntimeRow {
+                    values_tsv: "10\talice".to_string(),
+                    weight: 1,
+                },
+                RuntimeRow {
+                    values_tsv: "10\talice".to_string(),
+                    weight: -1,
+                },
+                RuntimeRow {
+                    values_tsv: "20\tbob".to_string(),
+                    weight: 1,
+                },
+            ],
+        };
+
+        execute_frame(&client, &deployments, frame).await.unwrap();
+
+        // 1. Check emitted progress delta: only key 20 survived
+        let msg = progress_rx.recv().await.expect("progress message expected");
+        match msg {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => {
+                assert_eq!(input_rows, 3);
+                assert_eq!(output_rows, 1);
+                assert_eq!(
+                    output.rows,
+                    vec![RuntimeRow {
+                        values_tsv: "20\tbob".to_string(),
+                        weight: 1,
+                    }]
+                );
+            }
+            other => panic!("unexpected worker message: {other:?}"),
+        }
+
+        // 2. Check compaction metrics: 1 zero-weight cancelled update
+        let metrics = compactor.metrics_snapshot();
+        // 3 input updates + 1 output update = 4 total updates evaluated
+        assert_eq!(metrics.input_updates, 4);
+        assert_eq!(metrics.cancelled_zero_weight_updates, 1);
+        assert_eq!(metrics.collapsed_updates, 1);
+        assert_eq!(metrics.emitted_updates, 2);
+
+        // 3. Check storage: only key 20 was written, key 10 was omitted completely
+        use rockstream_ops::sink::{read_view_output, ColumnValue};
+        let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0, 1); // epoch 1
+        assert_eq!(
+            stored[0].2,
+            vec![
+                ColumnValue::Int64(20),
+                ColumnValue::Utf8("bob".to_string()),
+            ]
+        );
+        assert_eq!(stored[0].3, 1); // weight 1
+    }
+
+    #[tokio::test]
+    async fn test_all_rows_net_zero_omits_pipeline_and_storage_flush() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, compactor, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+
+        // Frame where all rows offset to net-zero (+1 and -1 on same key)
+        let frame = RuntimeExchangeMessage {
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "req-net-zero".to_string(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "items".to_string(),
+            rows: vec![
+                RuntimeRow {
+                    values_tsv: "99\tghost".to_string(),
+                    weight: 1,
+                },
+                RuntimeRow {
+                    values_tsv: "99\tghost".to_string(),
+                    weight: -1,
+                },
+            ],
+        };
+
+        execute_frame(&client, &deployments, frame).await.unwrap();
+
+        // 1. Check emitted progress delta: empty rows, output_rows == 0
+        let msg = progress_rx.recv().await.expect("progress message expected");
+        match msg {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => {
+                assert_eq!(input_rows, 2);
+                assert_eq!(output_rows, 0);
+                assert!(output.rows.is_empty());
+            }
+            other => panic!("unexpected worker message: {other:?}"),
+        }
+
+        // 2. Check compaction metrics: cancelled = 1, emitted = 0
+        let metrics = compactor.metrics_snapshot();
+        assert_eq!(metrics.input_updates, 2);
+        assert_eq!(metrics.cancelled_zero_weight_updates, 1);
+        assert_eq!(metrics.emitted_updates, 0);
+
+        // 3. Check storage: no rows written at all!
+        use rockstream_ops::sink::read_view_output;
+        let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
+        assert!(
+            stored.is_empty(),
+            "storage flush must be omitted when all rows offset to net-zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collapsing_multiple_updates_into_net_weight() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, compactor, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+
+        // Multiple updates on key 42: +3 and -1 -> net weight +2
+        let frame = RuntimeExchangeMessage {
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "req-collapse".to_string(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "items".to_string(),
+            rows: vec![
+                RuntimeRow {
+                    values_tsv: "42\tcollapsed".to_string(),
+                    weight: 3,
+                },
+                RuntimeRow {
+                    values_tsv: "42\tcollapsed".to_string(),
+                    weight: -1,
+                },
+            ],
+        };
+
+        execute_frame(&client, &deployments, frame).await.unwrap();
+
+        let msg = progress_rx.recv().await.expect("progress message expected");
+        match msg {
+            WorkerMessage::ExecutionProgress {
+                output,
+                output_rows,
+                ..
+            } => {
+                assert_eq!(output_rows, 1);
+                assert_eq!(
+                    output.rows,
+                    vec![RuntimeRow {
+                        values_tsv: "42\tcollapsed".to_string(),
+                        weight: 2,
+                    }]
+                );
+            }
+            other => panic!("unexpected worker message: {other:?}"),
+        }
+
+        assert_eq!(compactor.metrics().collapsed_updates(), 1);
+        assert_eq!(compactor.metrics().cancelled_zero_weight_updates(), 0);
+
+        use rockstream_ops::sink::{read_view_output, ColumnValue};
+        let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].2,
+            vec![
+                ColumnValue::Int64(42),
+                ColumnValue::Utf8("collapsed".to_string()),
+            ]
+        );
+        assert_eq!(stored[0].3, 2);
+    }
+
+    #[tokio::test]
+    async fn test_client_compaction_config_and_handle_accessors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let custom_window = Duration::from_millis(250);
+        let custom_config = EpochCompactionConfig::new(custom_window).unwrap();
+        let (client, _deployments, _db, compactor, _rx) =
+            setup_test_deployment(temp_dir.path(), custom_config.clone()).await;
+
+        assert_eq!(client.compaction_config().window_duration, custom_window);
+        assert_eq!(compactor.config().window_duration, custom_window);
+
+        let new_config = EpochCompactionConfig::new(Duration::from_millis(150)).unwrap();
+        client.set_compaction_config(new_config.clone());
+        assert_eq!(client.compaction_config().window_duration, Duration::from_millis(150));
+
+        let retrieved_compactor = client
+            .compactor(WorkloadId(1), ShardId(100))
+            .expect("deployment exists");
+        assert_eq!(retrieved_compactor.config().window_duration, custom_window);
+    }
 }
 
 /// Tracks a shard lease and its local active database instance.
@@ -403,9 +805,40 @@ pub struct WorkerClientHandle {
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
     secret_manager: Arc<WorkerSecretManager>,
     storage_context: Arc<rockstream_storage::storage_context::WorkerStorageContext>,
+    compaction_config: Arc<RwLock<EpochCompactionConfig>>,
+    deployments: WorkerDeployments,
 }
 
 impl WorkerClientHandle {
+    /// Returns the worker-wide epoch compaction config.
+    pub fn compaction_config(&self) -> EpochCompactionConfig {
+        self.compaction_config.read().clone()
+    }
+
+    /// Set the worker-wide epoch compaction config.
+    pub fn set_compaction_config(&self, config: EpochCompactionConfig) {
+        *self.compaction_config.write() = config;
+    }
+
+    /// Get active deployment for a workload and shard.
+    pub fn get_deployment(
+        &self,
+        workload_id: WorkloadId,
+        shard_id: ShardId,
+    ) -> Option<Arc<WorkerDeployment>> {
+        self.deployments.read().get(&(workload_id, shard_id)).cloned()
+    }
+
+    /// Get the compactor for a workload and shard deployment.
+    pub fn compactor(
+        &self,
+        workload_id: WorkloadId,
+        shard_id: ShardId,
+    ) -> Option<Arc<EpochCompactor>> {
+        self.get_deployment(workload_id, shard_id)
+            .map(|d| d.compactor.clone())
+    }
+
     /// Returns the worker storage context.
     pub fn storage_context(
         &self,
@@ -578,6 +1011,47 @@ pub async fn start_worker_client_with_tls_and_metadata(
     capabilities: WorkerCapabilities,
     tls_config: InternalTlsConfig,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_tls_metadata_and_compaction(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        tls_config,
+        EpochCompactionConfig::default(),
+    )
+    .await
+}
+
+/// Connect to the control plane and start the worker client daemon loop with custom compaction config.
+pub async fn start_worker_client_with_compaction_config(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    compaction_config: EpochCompactionConfig,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_tls_metadata_and_compaction(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        WorkerLocation::default(),
+        WorkerCapabilities::default(),
+        InternalTlsConfig::default(),
+        compaction_config,
+    )
+    .await
+}
+
+/// Connect to the control plane over mTLS with explicit locality, capability metadata, and compaction config.
+pub async fn start_worker_client_with_tls_metadata_and_compaction(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+    compaction_config: EpochCompactionConfig,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
     let initial_headroom = system_memory_headroom()?;
     let clean_url = control_url
         .trim_start_matches("https://")
@@ -609,6 +1083,7 @@ pub async fn start_worker_client_with_tls_and_metadata(
             location,
             capabilities,
             initial_headroom,
+            compaction_config,
             reader,
             writer,
         )
@@ -621,6 +1096,7 @@ pub async fn start_worker_client_with_tls_and_metadata(
             location,
             capabilities,
             initial_headroom,
+            compaction_config,
             reader,
             writer,
         )
@@ -675,12 +1151,14 @@ fn system_memory_headroom() -> io::Result<CapacityHeadroom> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker_client<R, W>(
     proposed_worker_id: u64,
     storage_dir: &Path,
     location: WorkerLocation,
     capabilities: WorkerCapabilities,
     initial_headroom: CapacityHeadroom,
+    compaction_config: EpochCompactionConfig,
     reader: R,
     mut writer: W,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)>
@@ -704,6 +1182,12 @@ where
             536_870_912,
         ),
     );
+    let compaction_config = Arc::new(RwLock::new(compaction_config));
+
+    let deployments = Arc::new(RwLock::new(HashMap::<
+        (WorkloadId, ShardId),
+        Arc<WorkerDeployment>,
+    >::new()));
 
     let handle = WorkerClientHandle {
         worker_id: worker_id.clone(),
@@ -713,12 +1197,10 @@ where
         fence_waiters: fence_waiters.clone(),
         secret_manager: secret_manager.clone(),
         storage_context: storage_context.clone(),
+        compaction_config: compaction_config.clone(),
+        deployments: deployments.clone(),
     };
 
-    let deployments = Arc::new(RwLock::new(HashMap::<
-        (WorkloadId, ShardId),
-        Arc<WorkerDeployment>,
-    >::new()));
     let actor_registry = ShardActorRegistry::new();
     let executor_client = handle.clone();
     let executor_deployments = deployments.clone();
@@ -745,6 +1227,7 @@ where
     let actor_registry_clone = actor_registry.clone();
     let execute_clone = execute.clone();
     let storage_context_clone = storage_context.clone();
+    let compaction_config_clone = compaction_config.clone();
 
     let join_handle = tokio::spawn(async move {
         // 1. Send Registration message.
@@ -964,12 +1447,19 @@ where
                                 .await
                                 .map_err(io::Error::other)?;
                         }
+                        let mut comp_cfg = compaction_config_clone.read().clone();
+                        if !descriptor.primary_key.is_empty() {
+                            comp_cfg = comp_cfg
+                                .with_primary_key_columns(descriptor.primary_key.clone());
+                        }
+                        let compactor = Arc::new(EpochCompactor::new(comp_cfg));
                         Ok(Arc::new(WorkerDeployment {
                             descriptor,
                             schemas,
                             commit_group: Arc::new(PhysicalCommitGroup::new(db.clone())),
                             db,
                             compiled,
+                            compactor,
                         }))
                     }
                     .await;
