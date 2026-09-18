@@ -164,7 +164,11 @@ impl ArrowZSet {
     pub fn compact(self) -> Self {
         self.validate()
             .expect("ArrowZSet: invalid row/weight alignment");
-        let mask: Vec<bool> = self.weights.iter().map(|&w| w != 0).collect();
+        let mask: Vec<bool> = self
+            .weights
+            .iter()
+            .map(|&w| !rockstream_verified::zset::weight_cancels(w))
+            .collect();
         if mask.iter().all(|&b| b) {
             return self; // nothing to remove
         }
@@ -232,9 +236,9 @@ impl ArrowZSet {
             for i in 0..self.num_rows() {
                 let key = (a.value(i), b.value(i));
                 let current = acc.get(&key).copied().unwrap_or(0);
-                let next = rockstream_verified::zset::checked_weight_add(current, self.weights[i])
+                let next = rockstream_verified::zset::consolidate_weight(current, self.weights[i])
                     .ok_or_else(|| OpError::numeric_overflow("Z-set weight consolidation"))?;
-                if next == 0 {
+                if rockstream_verified::zset::weight_cancels(next) {
                     acc.remove(&key);
                 } else {
                     acc.insert(key, next);

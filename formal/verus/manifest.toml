@@ -26,12 +26,16 @@ implementation = [
     "crates/rockstream-verified/src/arithmetic.rs::checked_i64_neg",
     "crates/rockstream-verified/src/arithmetic.rs::checked_i128_to_i64",
     "crates/rockstream-verified/src/arithmetic.rs::decode_i64",
-    "crates/rockstream-verified/src/arithmetic.rs::decode_u64",
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
 ]
 theorems = [
-    "crates/rockstream-types/src/laws/arithmetic.rs::checked_add_i64",
-    "crates/rockstream-types/src/laws/arithmetic.rs::checked_mul_i64",
-    "crates/rockstream-types/src/laws/arithmetic.rs::checked_i128_to_i64",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_add",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_mul",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_u64_add",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_neg",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i128_to_i64",
+    "crates/rockstream-verified/src/arithmetic.rs::decode_i64",
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
 ]
 production_callers = [
     "crates/rockstream-types/src/laws/weight_add.rs::merge",
@@ -64,7 +68,8 @@ theorems = [
     "crates/rockstream-verified/src/laws.rs::i64_add_commutative",
     "crates/rockstream-verified/src/laws.rs::i64_add_associative",
     "crates/rockstream-verified/src/laws.rs::i64_add_inverse",
-    "crates/rockstream-types/src/laws/arithmetic.rs::admit_i64_reassociation",
+    "crates/rockstream-verified/src/laws.rs::checked_add_refines_int_add",
+    "crates/rockstream-verified/src/laws.rs::regrouping_budget_admissible",
 ]
 production_callers = [
     "crates/rockstream-control/src/skew.rs::plan_hot_key_mitigation",
@@ -88,8 +93,7 @@ implementation = [
     "crates/rockstream-storage/src/merge_registry.rs::validate_operand",
 ]
 theorems = [
-    "crates/rockstream-types/src/laws/weight_add.rs::merge",
-    "crates/rockstream-types/src/laws/sum_count.rs::merge",
+    "crates/rockstream-verified/src/laws.rs::checked_merge_preserves_addition",
 ]
 production_callers = [
     "crates/rockstream-storage/src/shard_db.rs::merge",
@@ -113,7 +117,7 @@ implementation = [
     "crates/rockstream-control/src/skew.rs::plan_hot_key_mitigation",
 ]
 theorems = [
-    "crates/rockstream-types/src/laws/arithmetic.rs::admit_i64_reassociation",
+    "crates/rockstream-verified/src/laws.rs::regrouping_budget_admissible",
 ]
 production_callers = [
     "crates/rockstream-control/src/skew.rs::observe",
@@ -362,11 +366,17 @@ implementation = [
     "crates/rockstream-verified/src/zset.rs::validate_aligned_lengths",
     "crates/rockstream-verified/src/zset.rs::validate_index",
     "crates/rockstream-verified/src/zset.rs::checked_weight_add",
+    "crates/rockstream-verified/src/zset.rs::consolidate_weight",
+    "crates/rockstream-verified/src/zset.rs::weight_cancels",
 ]
 theorems = [
     "crates/rockstream-verified/src/zset.rs::validate_aligned_lengths",
     "crates/rockstream-verified/src/zset.rs::validate_index",
     "crates/rockstream-verified/src/zset.rs::checked_weight_add",
+    "crates/rockstream-verified/src/zset.rs::consolidate_weight",
+    "crates/rockstream-verified/src/zset.rs::weight_cancels",
+    "crates/rockstream-verified/src/zset.rs::cancellation_annihilates_weight",
+    "crates/rockstream-verified/src/zset.rs::repeated_rows_additive",
 ]
 production_callers = [
     "crates/rockstream-ops/src/zset.rs::try_accumulate_ab",
@@ -502,8 +512,16 @@ id = "VS4-02"
 status = "adapter-qualified"
 domain = "Fixed-membership report transitions are monotone, reject stale authority, and preserve state on rejection."
 assumptions = ["The unverified adapter checks report scope, active membership, and the current shard lease before the kernel call."]
-implementation = ["crates/rockstream-control/src/frontier.rs::ingest_membership_report"]
-theorems = ["crates/rockstream-verified/src/frontier.rs::fixed_membership_transition"]
+implementation = [
+    "crates/rockstream-control/src/frontier.rs::ingest_membership_report",
+    "crates/rockstream-control/src/frontier.rs::compute_membership_meet",
+    "crates/rockstream-control/src/frontier.rs::recompute_membership_publication",
+]
+theorems = [
+    "crates/rockstream-verified/src/frontier.rs::fixed_membership_meet",
+    "crates/rockstream-verified/src/frontier.rs::advance_publication",
+    "crates/rockstream-verified/src/frontier.rs::fixed_membership_transition",
+]
 production_callers = ["crates/rockstream-control/src/service.rs::handle_connection_stream"]
 regression_tests = ["crates/rockstream-control/src/frontier.rs::stale_generation_and_incarnation_reports_leave_state_unchanged"]
 evidence = [

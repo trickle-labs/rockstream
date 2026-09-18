@@ -456,17 +456,20 @@ impl SourceCheckpointStore {
     /// Commit source input and its checkpoint atomically, then make the durable
     /// commit visible to restart recovery.
     pub async fn commit_m3(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        let has_writes = !batch.is_empty();
         self.db.write_batch(batch).await?;
         let flush_result = self.db.flush().await;
         if !persistence::coupled_commit_is_durable(
-            true,
-            true,
-            true,
-            true,
+            has_writes,
+            has_writes,
+            has_writes,
+            has_writes,
             true,
             flush_result.is_ok(),
         ) {
-            return flush_result;
+            return flush_result.and(Err(StorageError::Unsupported(
+                "commit_m3: empty write batch cannot satisfy durable commit coupling".into(),
+            )));
         }
         flush_result
     }

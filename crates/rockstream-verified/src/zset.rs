@@ -22,4 +22,32 @@ verus! {
     {
         current.checked_add(delta)
     }
+
+    // verus-claim: VS3-02
+    pub fn consolidate_weight(current: i64, delta: i64) -> (result: Option<i64>)
+        ensures
+            result.is_some() ==> result.unwrap() as int == current as int + delta as int,
+    {
+        current.checked_add(delta)
+    }
+
+    // verus-claim: VS3-02
+    pub fn weight_cancels(weight: i64) -> (result: bool)
+        ensures
+            result == (weight == 0),
+    {
+        weight == 0
+    }
+
+    // verus-claim: VS3-02
+    pub proof fn cancellation_annihilates_weight(weight: int)
+        ensures weight + (-weight) == 0,
+    {
+    }
+
+    // verus-claim: VS3-02
+    pub proof fn repeated_rows_additive(current: int, delta1: int, delta2: int)
+        ensures (current + delta1) + delta2 == current + (delta1 + delta2),
+    {
+    }
 }

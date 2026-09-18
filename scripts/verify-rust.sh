@@ -11,13 +11,8 @@ if ! command -v cargo-verus >/dev/null 2>&1 || ! command -v verus >/dev/null 2>&
 fi
 
 if ! command -v cargo-verus >/dev/null 2>&1 || ! command -v verus >/dev/null 2>&1; then
-	if [ -n "${CI:-}" ] || [ "${VERUS_REQUIRED:-0}" = "1" ]; then
-		echo "verify-rust: cargo-verus/verus is required; run scripts/install-verus.sh first." >&2
-		exit 1
-	else
-		echo "verify-rust: warning: cargo-verus/verus is not installed; skipping Verus proof verification locally (run scripts/install-verus.sh)" >&2
-		exit 0
-	fi
+	echo "verify-rust: RS-0906: cargo-verus/verus is required; run scripts/install-verus.sh first." >&2
+	exit 1
 fi
 
 cd "$ROOT"

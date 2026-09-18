@@ -177,7 +177,7 @@ impl Inner {
             .map(|shard_id| self.membership_epochs.get(shard_id).copied().flatten());
         let first = epochs.next()??;
         epochs.try_fold(first, |minimum, epoch| {
-            epoch.map(|value| minimum.min(value))
+            epoch.map(|value| rockstream_verified::frontier::fixed_membership_meet(minimum, value))
         })
     }
 
@@ -196,9 +196,8 @@ impl Inner {
         };
         // INVARIANT-BY-CONSTRUCTION: M2-S8 — publication advances only from the
         // meet of the currently configured active membership.
-        if self.published.map(|old| meet > old).unwrap_or(true) {
-            self.published = Some(meet);
-        }
+        let advanced = rockstream_verified::frontier::advance_publication(self.published, meet);
+        self.published = Some(advanced);
     }
 }
 
