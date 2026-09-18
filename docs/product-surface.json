@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "b87d9beb593d532fdf90920062c2d414ee4aa5279c0f065f61a3dddc76cd3fa3",
+    "candidate_identity_digest": "548f7ed642f3ae50753d11db822b4628bd4e502274e7e4d8f6de890056e40c62",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -8156,6 +8156,16 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Verify every publish_frontier write path uses WriteOptions { await_durable: true }; this indicates a durability regression in FrontierLeaseStore.",
         "doc_anchor": "rs-8003"
+      },
+      {
+        "code": "RS-8004",
+        "key": "frontier.membership_report_rejected",
+        "title": "Membership-aware frontier report or configuration transition was rejected",
+        "severity": "ERROR",
+        "sqlstate": "55000",
+        "retry_class": "Immediate",
+        "default_next_steps": "Refresh the active membership generation and shard incarnation, then retry with a versioned report after durable catch-up.",
+        "doc_anchor": "rs-8004"
       },
       {
         "code": "RS-9001",

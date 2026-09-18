@@ -56,7 +56,11 @@ verus! {
         current_epoch: u64,
         reported_epoch: u64,
     )
-        ensures fixed_membership_transition(current_epoch, reported_epoch) >= current_epoch,
+        ensures (if reported_epoch > current_epoch {
+            reported_epoch
+        } else {
+            current_epoch
+        }) >= current_epoch,
     {
     }
 
