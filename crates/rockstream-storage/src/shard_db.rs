@@ -115,18 +115,25 @@ use crate::merge_registry::SumCountMergeOperator;
 
 /// Check whether `bytes` is a valid operand for `law`.
 ///
-/// Uses the law's identity element to probe validity: `merge(bytes, identity)`
-/// must succeed. Falls back to `merge(bytes, bytes)` if the law has no
-/// identity (uncommon). For the identity element itself, `is_identity` short-
-/// circuits.
+/// Resolves the operand representation via `resolve_law_operand`.
+/// If raw, validates raw bytes without truncation. If tagged, passes only
+/// the payload to `law`. Rejects incompatible or malformed operands.
 fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes: &[u8]) -> bool {
-    if law.is_identity(bytes) {
+    let operand_view = match crate::merge_registry::resolve_law_operand(law, bytes) {
+        Ok(view) => view,
+        Err(_) => return false,
+    };
+    let payload = match operand_view {
+        crate::merge_registry::LawOperandView::Raw(raw) => raw,
+        crate::merge_registry::LawOperandView::Tagged { payload, .. } => payload,
+    };
+    if law.is_identity(payload) {
         return true;
     }
     if let Some(identity) = law.identity() {
-        law.merge(bytes, &identity).is_ok()
+        law.merge(payload, &identity).is_ok()
     } else {
-        law.merge(bytes, bytes).is_ok()
+        law.merge(payload, payload).is_ok()
     }
 }
 
