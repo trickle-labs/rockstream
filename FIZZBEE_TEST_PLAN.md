@@ -681,6 +681,16 @@ filtered from the returned batch. The exact boundary is covered by
 `cdc_poll_credits_count_filtered_records_exactly` in
 `crates/rockstream-connectors/tests/cdc_transaction_atomicity_tests.rs`.
 
+The v0.67.1 state beyond RAM architecture bounds memory through spill governors,
+streaming paged scans, and demand-loaded state restoration in
+`crates/rockstream-runtime` and `crates/rockstream-storage`. Bounded write buffering
+and disk occupancy limits fail closed with RS-5003 and RS-2021, verified by
+`crates/rockstream-runtime/tests/spill_budget_governor_tests.rs`,
+`crates/rockstream-runtime/tests/paged_recovery_tests.rs`, and
+`crates/rockstream-storage/tests/paged_scan_tests.rs`. While outside the core
+M1–M7 FizzBee models, the storage and recovery paging protocols conform to the
+recovery driver invariants.
+
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
 
