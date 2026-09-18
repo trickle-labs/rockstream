@@ -65,6 +65,40 @@ for fixture in unchecked_assumption verus_only_substitution; do
 	}
 done
 
+unmarked_root="$TMP_ROOT/unmarked"
+mkdir -p "$unmarked_root/formal/verus" "$unmarked_root/crates"
+cp "$ROOT/formal/verus/manifest.toml" "$unmarked_root/formal/verus/manifest.toml"
+cp "$ROOT/formal/verus/assumptions.toml" "$unmarked_root/formal/verus/assumptions.toml"
+cp -R "$ROOT/crates/." "$unmarked_root/crates/"
+printf '\npub fn unregistered_runtime_only() -> u64 { 0 }\n' \
+  >>"$unmarked_root/crates/rockstream-verified/src/routing.rs"
+unmarked_log="$TMP_ROOT/unmarked.log"
+if python3 "$ROOT/scripts/check-verus-manifest.py" --root "$unmarked_root" >"$unmarked_log" 2>&1; then
+	cat "$unmarked_log" >&2
+	fail "manifest checker accepted unmarked covered code"
+fi
+grep -q "missing verus claim marker" "$unmarked_log" || {
+	cat "$unmarked_log" >&2
+	fail "unmarked code was rejected for an unexpected reason"
+}
+
+conditional_root="$TMP_ROOT/conditional"
+mkdir -p "$conditional_root/formal/verus" "$conditional_root/crates"
+cp "$ROOT/formal/verus/manifest.toml" "$conditional_root/formal/verus/manifest.toml"
+cp "$ROOT/formal/verus/assumptions.toml" "$conditional_root/formal/verus/assumptions.toml"
+cp -R "$ROOT/crates/." "$conditional_root/crates/"
+printf '\n#[cfg(not(verus_only))]\npub fn runtime_only_branch() -> u64 { 0 }\n' \
+  >>"$conditional_root/crates/rockstream-verified/src/routing.rs"
+conditional_log="$TMP_ROOT/conditional.log"
+if python3 "$ROOT/scripts/check-verus-manifest.py" --root "$conditional_root" >"$conditional_log" 2>&1; then
+	cat "$conditional_log" >&2
+	fail "manifest checker accepted conditional executable substitution"
+fi
+grep -q "unchecked proof construct found" "$conditional_log" || {
+	cat "$conditional_log" >&2
+	fail "conditional substitution was rejected for an unexpected reason"
+}
+
 fixture_root="$TMP_ROOT/mutated"
 mkdir -p "$fixture_root/formal/verus" "$fixture_root/crates"
 cp "$ROOT/formal/verus/manifest.toml" "$fixture_root/formal/verus/manifest.toml"

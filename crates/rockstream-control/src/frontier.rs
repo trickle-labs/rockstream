@@ -496,7 +496,7 @@ impl FrontierAggregator {
     /// Panics if this aggregator was constructed with
     /// [`FrontierAggregator::new`] (no lease store wired).
     pub async fn acquire_lease(&self) -> Result<bool, FrontierLeaseError> {
-        let (store, aggregator_id, generation) = {
+        let (store, aggregator_id, membership) = {
             let inner = self.inner.lock();
             let lease = inner
                 .lease
@@ -505,7 +505,10 @@ impl FrontierAggregator {
             (
                 lease.store.clone(),
                 lease.aggregator_id,
-                inner.membership.as_ref().map(|m| m.generation.0),
+                inner
+                    .membership
+                    .as_ref()
+                    .map(|m| (m.scope.clone(), m.generation.0)),
             )
         };
 
@@ -518,17 +521,24 @@ impl FrontierAggregator {
                 // S5: lease-handoff read — must observe a synchronously
                 // flushed value (panics via assert_flush_before_lease_handoff_read
                 // otherwise).
-                let published = match generation {
-                    Some(generation) => {
+                let published = match membership.as_ref() {
+                    Some((scope, generation)) => {
                         store
-                            .read_published_frontier_after_handoff_for_generation(generation)
+                            .read_published_frontier_after_handoff_for_generation(
+                                scope,
+                                *generation,
+                            )
                             .await?
                     }
                     None => store.read_published_frontier_after_handoff().await,
                 };
 
                 let mut inner = self.inner.lock();
-                if inner.membership.as_ref().map(|m| m.generation.0) == generation {
+                let current_membership = inner
+                    .membership
+                    .as_ref()
+                    .map(|m| (m.scope.clone(), m.generation.0));
+                if current_membership == membership {
                     if let Some(epoch) = published {
                         if inner.published.map(|p| epoch > p).unwrap_or(true) {
                             inner.published = Some(epoch);
@@ -567,7 +577,7 @@ impl FrontierAggregator {
     /// Panics if this aggregator was constructed with
     /// [`FrontierAggregator::new`] (no lease store wired).
     pub async fn try_publish(&self) -> Result<bool, FrontierLeaseError> {
-        let (store, held_token, generation, meet) = {
+        let (store, held_token, membership, meet) = {
             let inner = self.inner.lock();
             let lease = inner
                 .lease
@@ -579,7 +589,10 @@ impl FrontierAggregator {
             (
                 lease.store.clone(),
                 lease.lease_token,
-                inner.membership.as_ref().map(|m| m.generation.0),
+                inner
+                    .membership
+                    .as_ref()
+                    .map(|m| (m.scope.clone(), m.generation.0)),
                 if inner.membership.is_some() {
                     inner.compute_membership_meet()
                 } else {
@@ -601,18 +614,25 @@ impl FrontierAggregator {
             return Ok(false);
         }
 
-        match generation {
-            Some(generation) => {
+        match membership.as_ref() {
+            Some((scope, generation)) => {
                 store
-                    .publish_frontier_for_generation(LeaseToken(held_token), generation, meet)
+                    .publish_frontier_for_generation(
+                        scope,
+                        LeaseToken(held_token),
+                        *generation,
+                        meet,
+                    )
                     .await?
             }
             None => store.publish_frontier(LeaseToken(held_token), meet).await?,
         }
         let mut inner = self.inner.lock();
-        if inner.membership.as_ref().map(|m| m.generation.0) == generation
-            && inner.published.map(|p| meet > p).unwrap_or(true)
-        {
+        let current_membership = inner
+            .membership
+            .as_ref()
+            .map(|m| (m.scope.clone(), m.generation.0));
+        if current_membership == membership && inner.published.map(|p| meet > p).unwrap_or(true) {
             inner.published = Some(meet);
         }
         Ok(true)
@@ -749,7 +769,7 @@ struct LeaseState {
     fence_token: u64,
     holder: Option<AggregatorId>,
     published: Option<Epoch>,
-    published_by_generation: HashMap<u64, Epoch>,
+    published_by_generation: HashMap<(String, u64), Epoch>,
     /// v0.45.6 (M2-S3/S4 pair): `true` once `published` has been confirmed
     /// durably flushed (`WriteOptions { await_durable: true }`) — checked by
     /// [`assert_flush_before_lease_handoff_read`] on every lease handoff.
@@ -905,19 +925,20 @@ impl FrontierLeaseStore {
     /// publication as progress for a new active set.
     pub async fn publish_frontier_for_generation(
         &self,
+        scope: &str,
         token: LeaseToken,
         generation: u64,
         frontier: Epoch,
     ) -> Result<(), FrontierLeaseError> {
-        let key = published_frontier_generation_key(generation);
-        self.publish_frontier_inner(token, Some(generation), frontier, &key)
+        let key = published_frontier_generation_key(scope, generation);
+        self.publish_frontier_inner(token, Some((scope.to_owned(), generation)), frontier, &key)
             .await
     }
 
     async fn publish_frontier_inner(
         &self,
         token: LeaseToken,
-        generation: Option<u64>,
+        membership: Option<(String, u64)>,
         frontier: Epoch,
         key: &[u8],
     ) -> Result<(), FrontierLeaseError> {
@@ -926,8 +947,8 @@ impl FrontierLeaseStore {
         // M2-S3 paired assertion (S4): hard invariant, not a graceful error.
         assert_valid_publisher(state.holder, token.0, state.fence_token);
 
-        let current = match generation {
-            Some(generation) => state.published_by_generation.get(&generation).copied(),
+        let current = match membership.as_ref() {
+            Some(membership) => state.published_by_generation.get(membership).copied(),
             None => state.published,
         };
         if let Some(current) = current {
@@ -950,8 +971,10 @@ impl FrontierLeaseStore {
             .await
             .map_err(|e| FrontierLeaseError::Storage(e.to_string()))?;
 
-        if let Some(generation) = generation {
-            state.published_by_generation.insert(generation, frontier);
+        if let Some(membership) = membership.as_ref() {
+            state
+                .published_by_generation
+                .insert(membership.clone(), frontier);
         } else {
             state.published = Some(frontier);
         }
@@ -961,7 +984,7 @@ impl FrontierLeaseStore {
             let _ = audit.append(&AuditEvent::now(
                 "frontier-aggregator",
                 "frontier.published",
-                format!("generation={generation:?},frontier={frontier}"),
+                format!("membership={membership:?},frontier={frontier}"),
             ));
         }
 
@@ -984,17 +1007,22 @@ impl FrontierLeaseStore {
     /// Read the synchronously persisted frontier for one membership generation.
     pub async fn read_published_frontier_after_handoff_for_generation(
         &self,
+        scope: &str,
         generation: u64,
     ) -> Result<Option<Epoch>, FrontierLeaseError> {
         let mut state = self.state.lock().await;
-        if let Some(frontier) = state.published_by_generation.get(&generation).copied() {
+        let membership = (scope.to_owned(), generation);
+        if let Some(frontier) = state.published_by_generation.get(&membership).copied() {
             assert_flush_before_lease_handoff_read(true, state.last_write_synced);
             return Ok(Some(frontier));
         }
-        let frontier =
-            read_published_key(&self.db, &published_frontier_generation_key(generation)).await?;
+        let frontier = read_published_key(
+            &self.db,
+            &published_frontier_generation_key(scope, generation),
+        )
+        .await?;
         if let Some(frontier) = frontier {
-            state.published_by_generation.insert(generation, frontier);
+            state.published_by_generation.insert(membership, frontier);
             state.last_write_synced = true;
             assert_flush_before_lease_handoff_read(true, state.last_write_synced);
         } else {
@@ -1004,8 +1032,13 @@ impl FrontierLeaseStore {
     }
 }
 
-fn published_frontier_generation_key(generation: u64) -> Vec<u8> {
-    format!("frontier/published/{generation}").into_bytes()
+fn published_frontier_generation_key(scope: &str, generation: u64) -> Vec<u8> {
+    let scope_hex: String = scope
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("frontier/published/{scope_hex}/{generation}").into_bytes()
 }
 
 async fn read_lease_record(db: &Db) -> Result<(u64, Option<AggregatorId>), FrontierLeaseError> {
@@ -1576,11 +1609,20 @@ mod lease_tests {
         assert!(agg.try_publish().await.unwrap());
         assert_eq!(
             store
-                .read_published_frontier_after_handoff_for_generation(0)
+                .read_published_frontier_after_handoff_for_generation("view-1", 0)
                 .await
                 .unwrap(),
             Some(10)
         );
         assert_eq!(store.read_published_frontier_after_handoff().await, None);
+
+        let other = FrontierAggregator::with_membership_and_lease_store(
+            FrontierMembership::new("view-2", FrontierGeneration(0))
+                .with_active(ShardId(1), ShardIncarnation(1)),
+            AggregatorId(2),
+            store,
+        );
+        assert!(other.acquire_lease().await.unwrap());
+        assert_eq!(other.cluster_frontier().epoch, None);
     }
 }

@@ -228,6 +228,7 @@ pub struct PhysicalCommitGroup {
     notify: Arc<tokio::sync::Notify>,
     timer_started: Arc<AtomicBool>,
     outcome_unknown: Arc<AtomicBool>,
+    unknown_entries: Arc<Mutex<BTreeMap<rockstream_types::timestamp::Epoch, PendingEpochEntry>>>,
 }
 
 impl PhysicalCommitGroup {
@@ -261,6 +262,7 @@ impl PhysicalCommitGroup {
             notify: Arc::new(tokio::sync::Notify::new()),
             timer_started: Arc::new(AtomicBool::new(false)),
             outcome_unknown: Arc::new(AtomicBool::new(false)),
+            unknown_entries: Arc::new(Mutex::new(BTreeMap::new())),
         };
         group.ensure_timer_running();
         group
@@ -311,6 +313,7 @@ impl PhysicalCommitGroup {
                 let active_waiters = self.active_waiters.clone();
                 let flush_lock = self.flush_lock.clone();
                 let outcome_unknown = self.outcome_unknown.clone();
+                let unknown_entries = self.unknown_entries.clone();
 
                 handle.spawn(async move {
                     loop {
@@ -338,6 +341,7 @@ impl PhysicalCommitGroup {
                                 &active_waiters,
                                 &flush_lock,
                                 &outcome_unknown,
+                                &unknown_entries,
                             )
                             .await;
                         } else {
@@ -353,6 +357,7 @@ impl PhysicalCommitGroup {
                                         &active_waiters,
                                         &flush_lock,
                                         &outcome_unknown,
+                                        &unknown_entries,
                                     )
                                     .await;
                                 }
@@ -449,6 +454,7 @@ impl PhysicalCommitGroup {
             &self.active_waiters,
             &self.flush_lock,
             &self.outcome_unknown,
+            &self.unknown_entries,
         )
         .await
     }
@@ -463,6 +469,9 @@ impl PhysicalCommitGroup {
         active_waiters: &Arc<AtomicUsize>,
         flush_lock: &Arc<tokio::sync::Mutex<()>>,
         outcome_unknown: &Arc<AtomicBool>,
+        unknown_entries: &Arc<
+            Mutex<BTreeMap<rockstream_types::timestamp::Epoch, PendingEpochEntry>>,
+        >,
     ) -> Result<Vec<rockstream_types::timestamp::Epoch>, OpError> {
         let _guard = flush_lock.lock().await;
 
@@ -472,10 +481,11 @@ impl PhysicalCommitGroup {
                 return Err(OpError::storage(error));
             }
             let (entries, epochs) = {
-                let mut lock = pending.lock().expect("PhysicalCommitGroup mutex poisoned");
+                let mut lock = unknown_entries
+                    .lock()
+                    .expect("PhysicalCommitGroup mutex poisoned");
                 let epochs = lock.keys().copied().collect::<Vec<_>>();
                 let entries = std::mem::take(&mut *lock);
-                pending_bytes.store(0, Ordering::SeqCst);
                 (entries, epochs)
             };
             if let Some(last) = epochs.last().copied() {
@@ -559,8 +569,28 @@ impl PhysicalCommitGroup {
         if let Some(error) = flush_err {
             if persistence::commit_outcome(true, false) == persistence::COMMIT_UNKNOWN {
                 outcome_unknown.store(true, Ordering::Release);
+                let mut uncertain = entries;
+                for entry in uncertain.values_mut() {
+                    for waiter in entry.waiters.drain(..) {
+                        active_waiters.fetch_sub(1, Ordering::SeqCst);
+                        let _ = waiter.send(Err(OpError::internal(format!(
+                            "group commit flush outcome is unknown: {error}"
+                        ))));
+                    }
+                }
+                unknown_entries
+                    .lock()
+                    .expect("PhysicalCommitGroup mutex poisoned")
+                    .extend(uncertain);
+            } else {
+                Self::restore_pending_static(
+                    pending,
+                    pending_bytes,
+                    active_waiters,
+                    entries,
+                    &error,
+                );
             }
-            Self::restore_pending_static(pending, pending_bytes, active_waiters, entries, &error);
             return Err(error);
         }
 

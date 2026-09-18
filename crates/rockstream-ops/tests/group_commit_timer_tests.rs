@@ -161,6 +161,37 @@ async fn test_flush_failure_withholds_acknowledgment() {
 }
 
 #[tokio::test]
+async fn test_flush_recovery_does_not_ack_epoch_queued_during_unknown_flush() {
+    let (_dir, db) = make_db("unknown_flush_race").await;
+    let group = Arc::new(PhysicalCommitGroup::with_config(
+        db.clone(),
+        5000,
+        10 * 1024 * 1024,
+        64,
+    ));
+
+    db.set_fail_flushes(true);
+    group.add_epoch(1, make_batch("first", 128)).unwrap();
+    let flushing = {
+        let group = group.clone();
+        tokio::spawn(async move { group.flush().await })
+    };
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    group.add_epoch(2, make_batch("second", 128)).unwrap();
+    assert!(flushing.await.unwrap().is_err());
+    assert!(group.outcome_unknown());
+
+    db.set_fail_flushes(false);
+    assert_eq!(group.flush().await.unwrap(), vec![1]);
+    assert_eq!(group.last_committed(), 1);
+    assert_eq!(group.fill_level(), 1);
+
+    assert_eq!(group.flush().await.unwrap(), vec![2]);
+    assert_eq!(group.last_committed(), 2);
+    assert!(db.get(b"second_k").await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn test_byte_limit_triggers_immediate_flush() {
     let (_dir, db) = make_db("byte_limit").await;
     // Set low byte limit: 500 bytes, long timer: 5000ms
