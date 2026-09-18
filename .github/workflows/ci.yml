@@ -130,7 +130,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       VERUS_QUALIFICATION_TARGET: ${{ matrix.target }}
     steps:
