@@ -12,7 +12,7 @@ use object_store::ObjectStore;
 use rockstream_types::compatibility::SupportedStorageFormatRange;
 use rockstream_types::frontier::ShardFrontierReport;
 use rockstream_types::ids::ShardId;
-use rockstream_types::merge_law::{ArrangementHeader, MergeLawId, MergeLawVersion};
+use rockstream_types::merge_law::{ArrangementHeader, MergeLawId};
 use slatedb::config::{CheckpointOptions, CheckpointScope, Settings};
 use slatedb::Db;
 
@@ -1184,34 +1184,6 @@ impl ShardDb {
             };
             let header = ArrangementHeader::decode(&buf);
             if !known_law_ids.contains(&header.law_id) {
-                return Err(StorageError::UnknownMergeLaw {
-                    law_id: header.law_id.0,
-                    law_version: header.law_version.0,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Validate both law IDs and versions in the shard law catalog.
-    pub async fn validate_law_catalog_versions(
-        &self,
-        known_law_versions: &HashMap<MergeLawId, MergeLawVersion>,
-    ) -> Result<(), StorageError> {
-        let prefix = ShardKeyEncoder::meta_key(b"law_catalog/");
-        let entries = self.scan_prefix(&prefix).await?;
-        for (_, value) in entries {
-            if value.len() != ArrangementHeader::WIRE_SIZE {
-                return Err(StorageError::MalformedArrangementHeader {
-                    length: value.len(),
-                });
-            }
-            let header = ArrangementHeader::decode(
-                &value[..ArrangementHeader::WIRE_SIZE]
-                    .try_into()
-                    .expect("validated arrangement header width"),
-            );
-            if known_law_versions.get(&header.law_id) != Some(&header.law_version) {
                 return Err(StorageError::UnknownMergeLaw {
                     law_id: header.law_id.0,
                     law_version: header.law_version.0,

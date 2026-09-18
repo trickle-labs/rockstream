@@ -18,12 +18,7 @@ if ! command -v verus >/dev/null 2>&1; then
 fi
 
 if ! command -v verus >/dev/null 2>&1; then
-	if [ -n "${CI:-}" ] || [ "${VERUS_REQUIRED:-0}" = "1" ]; then
-		fail "verus is required; run scripts/install-verus.sh first"
-	else
-		echo "test-verus-gates: warning: verus is not installed; skipping Verus negative gates locally (run scripts/install-verus.sh)" >&2
-		exit 0
-	fi
+	fail "verus is required; run scripts/install-verus.sh first"
 fi
 
 valid_log="$TMP_ROOT/valid.log"

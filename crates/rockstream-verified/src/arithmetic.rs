@@ -50,6 +50,7 @@ verus! {
     }
 
     // verus-claim: VS1-02
+    #[allow(clippy::manual_map)]
     pub fn decode_i64(bytes: &[u8]) -> (result: Option<i64>)
         ensures
             bytes.len() != 8 ==> result.is_none(),
@@ -65,37 +66,9 @@ verus! {
                     | bytes[7] as u64) as i64
             ),
     {
-        if bytes.len() != 8 {
-            None
-        } else {
-            let bits = ((bytes[0] as u64) << 56)
-                | ((bytes[1] as u64) << 48)
-                | ((bytes[2] as u64) << 40)
-                | ((bytes[3] as u64) << 32)
-                | ((bytes[4] as u64) << 24)
-                | ((bytes[5] as u64) << 16)
-                | ((bytes[6] as u64) << 8)
-                | bytes[7] as u64;
-            Some(bits as i64)
+        match crate::codecs::decode_u64_be(bytes) {
+            Some(bits) => Some(bits as i64),
+            None => None,
         }
-    }
-
-    // verus-claim: VS1-02
-    pub fn decode_u64(bytes: &[u8]) -> (result: Option<u64>)
-        ensures
-            bytes.len() != 8 ==> result.is_none(),
-            bytes.len() == 8 ==> result.is_some(),
-            bytes.len() == 8 ==> result.unwrap() == (
-                ((bytes[0] as u64) << 56)
-                    | ((bytes[1] as u64) << 48)
-                    | ((bytes[2] as u64) << 40)
-                    | ((bytes[3] as u64) << 32)
-                    | ((bytes[4] as u64) << 24)
-                    | ((bytes[5] as u64) << 16)
-                    | ((bytes[6] as u64) << 8)
-                    | bytes[7] as u64
-            ),
-    {
-        crate::codecs::decode_u64_be(bytes)
     }
 }

@@ -10,8 +10,8 @@ use super::arithmetic::{
     admit_i64_reassociation, checked_add_i64, checked_neg_i64, decode_i64, encode_i64,
 };
 use crate::merge_law::{
-    CompactionPolicy, DuplicatePolicy, FrontierPolicy, LawBundle, LawProperties, MergeLawClass,
-    MergeLawId, MergeLawVersion,
+    CompactionPolicy, DuplicatePolicy, FrontierPolicy, GatewayAggCombinerDesc, LawBundle,
+    LawProperties, MergeLawClass, MergeLawId, MergeLawVersion,
 };
 
 /// Well-known ID for `WeightAdd/v1`.
@@ -84,6 +84,15 @@ impl LawBundle for WeightAddV1 {
 
     fn is_identity(&self, value: &[u8]) -> bool {
         parse_weight(value).map(|w| w == 0).unwrap_or(false)
+    }
+
+    fn gateway_combiner(&self) -> Option<GatewayAggCombinerDesc> {
+        Some(GatewayAggCombinerDesc {
+            law_id: WEIGHT_ADD_ID,
+            law_name: "WeightAdd",
+            is_associative: true,
+            is_commutative: true,
+        })
     }
 
     fn inverse(&self, value: &[u8]) -> Result<Vec<u8>, String> {

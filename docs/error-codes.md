@@ -11,7 +11,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 
 ## Subsystem Index
 
-- [0xxx: Internal & General System](#0xxx-internal--general-system) (5 codes)
+- [0xxx: Internal & General System](#0xxx-internal--general-system) (6 codes)
 - [1xxx: Pipeline, Plan & Optimization](#1xxx-pipeline-plan--optimization) (27 codes)
 - [17xx: Lease Management & Raft Leadership](#17xx-lease-management--raft-leadership) (4 codes)
 - [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (38 codes)
@@ -35,6 +35,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-0003`](#rs-0003) | `storage.unavailable` | Storage unavailable | `Error` | `53100` | `ExponentialBackoff` |
 | [`RS-0004`](#rs-0004) | `cluster.unreachable` | Cluster control plane unreachable | `Error` | `08006` | `ExponentialBackoff` |
 | [`RS-0005`](#rs-0005) | `cli.confirmation_required` | Destructive command confirmation required | `Error` | `55000` | `NonRetryable` |
+| [`RS-0906`](#rs-0906) | `formal.verus_qualification_failed` | Formal Verus qualification failed | `Error` | `XX000` | `NonRetryable` |
 
 ### <a id="rs-0001"></a> `RS-0001` — Internal error
 
@@ -75,6 +76,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `55000`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Pass --yes for script execution or answer y at the prompt.
+
+### <a id="rs-0906"></a> `RS-0906` — Formal Verus qualification failed
+
+- **Key**: `formal.verus_qualification_failed`
+- **Severity**: `Error`
+- **SQLSTATE**: `XX000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Inspect the formal verification and qualification evidence; ensure all required proofs and release artifacts pass.
 
 ---
 

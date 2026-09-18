@@ -26,6 +26,35 @@ verus! {
     }
 
     // verus-claim: VS4-02
+    pub fn fixed_membership_meet(left: u64, right: u64) -> (result: u64)
+        ensures
+            result <= left,
+            result <= right,
+            result == (if left <= right { left } else { right }),
+    {
+        if left <= right {
+            left
+        } else {
+            right
+        }
+    }
+
+    // verus-claim: VS4-02
+    pub fn advance_publication(published: Option<u64>, meet: u64) -> (result: u64)
+        ensures
+            published.is_some() ==> result >= published.unwrap(),
+            result == (match published {
+                None => meet,
+                Some(p) => if meet > p { meet } else { p },
+            }),
+    {
+        match published {
+            None => meet,
+            Some(p) => if meet > p { meet } else { p },
+        }
+    }
+
+    // verus-claim: VS4-02
     pub fn fixed_membership_transition(current_epoch: u64, reported_epoch: u64) -> (result: u64)
         ensures result >= current_epoch,
     {

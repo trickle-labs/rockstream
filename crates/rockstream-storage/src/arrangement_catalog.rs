@@ -35,6 +35,12 @@ pub struct ArrangementEntry {
     pub compaction_frontier: u64,
     /// Whether this arrangement has 0 active consumers and is awaiting GC.
     pub marked_for_reclamation: bool,
+    /// Whether any retained snapshot references this arrangement.
+    #[serde(default)]
+    pub retained_snapshot: bool,
+    /// Whether any in-flight delta batches are writing to this arrangement.
+    #[serde(default)]
+    pub in_flight_delta: bool,
 }
 
 /// Catalog tracking all registered arrangements and consumer references.
@@ -104,6 +110,8 @@ impl ArrangementCatalog {
                 created_at: now,
                 compaction_frontier: 0,
                 marked_for_reclamation: false,
+                retained_snapshot: false,
+                in_flight_delta: false,
                 spec,
             };
 
@@ -148,6 +156,22 @@ impl ArrangementCatalog {
         }
     }
 
+    /// Set whether retained snapshots reference this arrangement.
+    pub async fn set_retained_snapshot(&self, id: ArrangementId, retained: bool) {
+        let mut guard = self.inner.write().await;
+        if let Some(entry) = guard.arrangements.get_mut(&id) {
+            entry.retained_snapshot = retained;
+        }
+    }
+
+    /// Set whether in-flight deltas reference this arrangement.
+    pub async fn set_in_flight_delta(&self, id: ArrangementId, in_flight: bool) {
+        let mut guard = self.inner.write().await;
+        if let Some(entry) = guard.arrangements.get_mut(&id) {
+            entry.in_flight_delta = in_flight;
+        }
+    }
+
     /// Reclaim unreferenced arrangements whose reference count is 0 and
     /// whose compaction / reader horizon is safe to clear.
     ///
@@ -163,8 +187,8 @@ impl ArrangementCatalog {
                     entry.compaction_frontier,
                     safe_horizon,
                     safe_horizon,
-                    false,
-                    false,
+                    entry.retained_snapshot,
+                    entry.in_flight_delta,
                 )
             {
                 assert!(
