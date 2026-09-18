@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "548f7ed642f3ae50753d11db822b4628bd4e502274e7e4d8f6de890056e40c62",
+    "candidate_identity_digest": "c253069e4bde48152667c013b2785e8a4dc4ceea373d98a20cbd596b34f9ecfd",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -8116,6 +8116,16 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Keep the hot key on a single spill shard, watch that shard's pressure, and switch to a composable law before enabling virtual-bucket splitting for this workload.",
         "doc_anchor": "rs-5036"
+      },
+      {
+        "code": "RS-5037",
+        "key": "storage.malformed_arrangement_header",
+        "title": "Malformed arrangement catalog header",
+        "severity": "FATAL",
+        "sqlstate": "XX000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Inspect the stored arrangement catalog value; the header length does not match the expected wire size.",
+        "doc_anchor": "rs-5037"
       },
       {
         "code": "RS-6001",
