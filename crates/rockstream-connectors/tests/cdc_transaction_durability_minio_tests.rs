@@ -6,7 +6,10 @@ use rockstream_connectors::{
     BackfillCursor, BackfillLifecycle, BackfillPhase, OffsetToken, SnapshotDeltaFence,
     SourceCheckpoint, SourceCheckpointStore,
 };
-use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, WriteBatch};
+use rockstream_storage::{
+    keys::{ShardKeyEncoder, ShardPrefix},
+    ShardDb, WriteBatch,
+};
 use rockstream_types::ids::ConnectorId;
 const BUCKET: &str = "cdc-transaction-v0522";
 
@@ -53,6 +56,8 @@ async fn recover_exactly(connector_id: ConnectorId, payload: &[u8]) {
     );
     store.prepare(&checkpoint).await.unwrap();
     let mut batch = WriteBatch::new();
+    batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+    batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
     batch.put(b"source_input/orders/0001", payload);
     batch.put(&ShardKeyEncoder::frontier_key(), &1_u64.to_be_bytes());
     store.append_committed(&mut batch, &checkpoint).unwrap();

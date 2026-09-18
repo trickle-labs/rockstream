@@ -459,22 +459,56 @@ impl SourceCheckpointStore {
     /// Commit source input and its checkpoint atomically, then make the durable
     /// commit visible to restart recovery.
     pub async fn commit_m3(&self, batch: WriteBatch) -> Result<(), StorageError> {
-        let has_writes = !batch.is_empty();
-        self.db.write_batch(batch).await?;
-        let flush_result = self.db.flush().await;
+        let descriptor = CoupledBatchDescriptor::inspect(&batch);
+        let state_written = descriptor.has_state;
+        let outputs_written = descriptor.has_outputs;
+        let source_marker_written = descriptor.has_source_marker;
+        let frontier_written = descriptor.has_frontier;
+
+        descriptor.validate(false)?;
+
+        let write_result = self.db.write_batch(batch).await;
+        let write_succeeded = write_result.is_ok();
+        let flush_result = if write_succeeded {
+            self.db.flush().await
+        } else {
+            write_result
+        };
+        let flush_succeeded = flush_result.is_ok();
+
         if !persistence::coupled_commit_is_durable(
-            has_writes,
-            has_writes,
-            has_writes,
-            has_writes,
-            true,
-            flush_result.is_ok(),
+            state_written,
+            outputs_written,
+            source_marker_written,
+            frontier_written,
+            write_succeeded,
+            flush_succeeded,
         ) {
             return flush_result.and(Err(StorageError::Unsupported(
-                "commit_m3: empty write batch cannot satisfy durable commit coupling".into(),
+                "commit_m3: coupled commit durability conditions not satisfied".into(),
             )));
         }
         flush_result
+    }
+
+    /// Durably commit a raw batch without coupled-commit component validation.
+    ///
+    /// Intended for isolated or administrative metadata writes (such as
+    /// pre-M3 backfill intent records) that do not advance state/output frontiers.
+    pub async fn commit_raw_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.db.write_batch(batch).await?;
+        self.db.flush().await
+    }
+
+    /// Commit a coupled transaction, validating required components and
+    /// committing atomically via M3.
+    pub async fn commit_coupled_transaction(
+        &self,
+        tx: CoupledTransactionBuilder,
+        require_metadata: bool,
+    ) -> Result<(), StorageError> {
+        let batch = tx.build(require_metadata)?;
+        self.commit_m3(batch).await
     }
 
     /// Return exactly the highest valid committed checkpoint, ignoring prepared
@@ -1362,5 +1396,101 @@ mod tests {
         builder.add_op_state(&[ShardPrefix::OpState.as_byte(), 1], b"state");
         let err = builder.build(false).unwrap_err();
         assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation")));
+    }
+
+    #[tokio::test]
+    async fn commit_m3_rejects_incomplete_batch() {
+        let store = make_test_store(ConnectorId(20)).await;
+
+        // Empty batch fails
+        let empty = WriteBatch::new();
+        let err = store.commit_m3(empty).await.unwrap_err();
+        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing state mutation")));
+
+        // Batch with only state fails
+        let mut b1 = WriteBatch::new();
+        b1.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        let err = store.commit_m3(b1).await.unwrap_err();
+        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation")));
+
+        // Batch with state and output fails (missing source marker)
+        let mut b2 = WriteBatch::new();
+        b2.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        b2.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+        let err = store.commit_m3(b2).await.unwrap_err();
+        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing source marker mutation")));
+
+        // Batch with state, output, and source marker fails (missing frontier)
+        let mut b3 = WriteBatch::new();
+        b3.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        b3.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+        let source_key = CatalogKeyEncoder::encode_with_suffix(
+            CatalogType::Connector,
+            0,
+            20,
+            b"source_checkpoint/committed/1",
+        );
+        b3.put(&source_key, b"cp");
+        let err = store.commit_m3(b3).await.unwrap_err();
+        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing frontier mutation")));
+    }
+
+    #[tokio::test]
+    async fn commit_m3_accepts_complete_batch() {
+        let store = make_test_store(ConnectorId(21)).await;
+        let mut batch = WriteBatch::new();
+        batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+        let source_key = CatalogKeyEncoder::encode_with_suffix(
+            CatalogType::Connector,
+            0,
+            21,
+            b"source_checkpoint/committed/1",
+        );
+        batch.put(&source_key, b"cp");
+        batch.put(&ShardKeyEncoder::frontier_key(), &1u64.to_be_bytes());
+
+        assert!(store.commit_m3(batch).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn commit_raw_batch_allows_isolated_writes() {
+        let store = make_test_store(ConnectorId(22)).await;
+        let mut batch = WriteBatch::new();
+        batch.put(b"connector/conn22/backfill_intent", b"pre_m3_intent");
+        assert!(store.commit_raw_batch(batch).await.is_ok());
+
+        let val = store.db.get(b"connector/conn22/backfill_intent").await.unwrap();
+        assert_eq!(val.as_deref(), Some(b"pre_m3_intent".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn commit_coupled_transaction_validates_and_commits() {
+        let store = make_test_store(ConnectorId(23)).await;
+        let checkpoint = SourceCheckpoint::prepared(
+            ConnectorId(23),
+            5,
+            OffsetToken::new(b"token5".to_vec()),
+        );
+
+        // Incomplete transaction fails
+        let mut invalid_builder = CoupledTransactionBuilder::new();
+        invalid_builder.add_op_state(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        let err = store
+            .commit_coupled_transaction(invalid_builder, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation")));
+
+        // Complete transaction succeeds
+        let mut valid_builder = CoupledTransactionBuilder::new();
+        valid_builder
+            .add_op_state(&[ShardPrefix::OpState.as_byte(), 1], b"state")
+            .add_view_output(&[ShardPrefix::ViewOutput.as_byte(), 1], b"out")
+            .add_source_marker(&store, &checkpoint)
+            .unwrap()
+            .add_frontier(5);
+
+        assert!(store.commit_coupled_transaction(valid_builder, false).await.is_ok());
     }
 }

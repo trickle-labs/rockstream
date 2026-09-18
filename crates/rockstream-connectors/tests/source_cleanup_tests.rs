@@ -7,7 +7,10 @@ use rockstream_connectors::{
     OffsetToken, PollDeltaResult, SnapshotDeltaFence, SnapshotStream, SourceCheckpoint,
     SourceCheckpointStore, SourceConnector, SourceError, SourceRuntimeCoordinator,
 };
-use rockstream_storage::{ShardDb, WriteBatch};
+use rockstream_storage::{
+    keys::{ShardKeyEncoder, ShardPrefix},
+    ShardDb, WriteBatch,
+};
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
@@ -68,6 +71,12 @@ impl SourceConnector for PausableSource {
 async fn commit(store: &SourceCheckpointStore, checkpoint: &SourceCheckpoint) {
     store.prepare(checkpoint).await.unwrap();
     let mut batch = WriteBatch::new();
+    batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+    batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+    batch.put(
+        &ShardKeyEncoder::frontier_key(),
+        &checkpoint.source_epoch.to_be_bytes(),
+    );
     store.append_committed(&mut batch, checkpoint).unwrap();
     store.commit_m3(batch).await.unwrap();
 }
