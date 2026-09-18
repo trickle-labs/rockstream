@@ -737,6 +737,277 @@ async fn scan_merged_fallback_increments_fallback_metric() {
     crate::set_allow_law_operand_fallback(false);
 }
 
+/// Tagged Sum value is accepted by `get_merged` and increments applied counter.
+#[serial_test::serial]
+#[tokio::test]
+async fn tagged_sum_get_merged_succeeds() {
+    use rockstream_types::laws::weight_add::WeightAddV1;
+    use rockstream_types::merge_law::MergeLawId;
+    use rockstream_types::metrics::{read_applied, LawMetricKey};
+
+    let (db, _) = test_shard_db("test/tagged_sum_get_merged").await;
+    let law = WeightAddV1;
+
+    let metric_key = LawMetricKey {
+        law_id: MergeLawId(0x0001),
+        law_name: "WeightAdd",
+        law_version: 1,
+        operator_id: None,
+    };
+    let applied_before = read_applied(&metric_key);
+
+    let key = b"tagged_sum_k1";
+    let value = crate::merge_registry::MergeOperatorRegistry::encode_sum(42);
+    db.put(key, &value).await.unwrap();
+
+    let result = db.get_merged(key, &law).await.unwrap();
+    assert_eq!(result, Some(value));
+
+    let applied_after = read_applied(&metric_key);
+    assert!(
+        applied_after > applied_before,
+        "applied counter must have incremented for tagged Sum"
+    );
+
+    db.close().await.unwrap();
+}
+
+/// Tagged Sum value is accepted by `scan_merged` and increments applied counter.
+#[serial_test::serial]
+#[tokio::test]
+async fn tagged_sum_scan_merged_succeeds() {
+    use rockstream_types::laws::weight_add::WeightAddV1;
+    use rockstream_types::merge_law::MergeLawId;
+    use rockstream_types::metrics::{read_applied, LawMetricKey};
+
+    let (db, _) = test_shard_db("test/tagged_sum_scan_merged").await;
+    let law = WeightAddV1;
+
+    let metric_key = LawMetricKey {
+        law_id: MergeLawId(0x0001),
+        law_name: "WeightAdd",
+        law_version: 1,
+        operator_id: None,
+    };
+    let applied_before = read_applied(&metric_key);
+
+    let v1 = crate::merge_registry::MergeOperatorRegistry::encode_sum(10);
+    let v2 = crate::merge_registry::MergeOperatorRegistry::encode_sum(20);
+    db.put(b"ts/k1", &v1).await.unwrap();
+    db.put(b"ts/k2", &v2).await.unwrap();
+
+    let results = db.scan_merged(b"ts/", &law).await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].1, v1);
+    assert_eq!(results[1].1, v2);
+
+    let applied_after = read_applied(&metric_key);
+    assert_eq!(
+        applied_after - applied_before,
+        2,
+        "each tagged Sum entry must increment applied"
+    );
+
+    db.close().await.unwrap();
+}
+
+/// A raw 8-byte operand beginning with 0x01 remains intact without truncation.
+#[serial_test::serial]
+#[tokio::test]
+async fn raw_operand_beginning_with_tag_byte_remains_intact() {
+    use rockstream_types::laws::weight_add::WeightAddV1;
+    use rockstream_types::merge_law::MergeLawId;
+    use rockstream_types::metrics::{read_applied, LawMetricKey};
+
+    let (db, _) = test_shard_db("test/raw_starting_with_0x01").await;
+    let law = WeightAddV1;
+
+    let metric_key = LawMetricKey {
+        law_id: MergeLawId(0x0001),
+        law_name: "WeightAdd",
+        law_version: 1,
+        operator_id: None,
+    };
+    let applied_before = read_applied(&metric_key);
+
+    // Raw 8-byte operand starting with 0x01 (not 9 bytes!)
+    let mut raw = [0u8; 8];
+    raw[0] = 0x01;
+    raw[7] = 0x07;
+
+    let key = b"raw_0x01_key";
+    db.put(key, &raw).await.unwrap();
+
+    let result = db.get_merged(key, &law).await.unwrap();
+    assert_eq!(
+        result.as_deref(),
+        Some(&raw[..]),
+        "raw 8-byte operand must remain intact"
+    );
+
+    let scan_results = db.scan_merged(b"raw_0x01", &law).await.unwrap();
+    assert_eq!(scan_results.len(), 1);
+    assert_eq!(scan_results[0].1, raw);
+
+    let applied_after = read_applied(&metric_key);
+    assert!(applied_after > applied_before);
+
+    db.close().await.unwrap();
+}
+
+/// Malformed tagged Sum payload (e.g. wrong length) is rejected fail-closed.
+#[serial_test::serial]
+#[tokio::test]
+async fn malformed_tagged_sum_is_rejected() {
+    use rockstream_types::laws::weight_add::WeightAddV1;
+
+    let (db, _) = test_shard_db("test/malformed_tagged_sum").await;
+    let law = WeightAddV1;
+
+    // Too short for tagged Sum (3 bytes starting with 0x01)
+    let malformed_short = vec![0x01, 0x00, 0x00];
+    db.put(b"bad/short", &malformed_short).await.unwrap();
+
+    // Too long for tagged Sum (10 bytes starting with 0x01)
+    let malformed_long = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x99];
+    db.put(b"bad/long", &malformed_long).await.unwrap();
+
+    // With fallback disabled (default), get_merged returns OperandCorruption
+    let err_short = db.get_merged(b"bad/short", &law).await.unwrap_err();
+    assert!(matches!(err_short, crate::StorageError::OperandCorruption { .. }));
+
+    let err_long = db.get_merged(b"bad/long", &law).await.unwrap_err();
+    assert!(matches!(err_long, crate::StorageError::OperandCorruption { .. }));
+
+    // scan_merged also returns OperandCorruption
+    let scan_err = db.scan_merged(b"bad/", &law).await.unwrap_err();
+    assert!(matches!(scan_err, crate::StorageError::OperandCorruption { .. }));
+
+    db.close().await.unwrap();
+}
+
+/// Incompatible tag/law combination (e.g. Count tag 0x02 with WeightAdd) is rejected.
+#[serial_test::serial]
+#[tokio::test]
+async fn incompatible_tag_law_combination_rejected() {
+    use rockstream_types::laws::weight_add::WeightAddV1;
+
+    let (db, _) = test_shard_db("test/incompatible_tag_law").await;
+    let law = WeightAddV1;
+
+    // Stored 9-byte tagged Count value
+    let count_val = crate::merge_registry::MergeOperatorRegistry::encode_count(99);
+    db.put(b"incompat/count", &count_val).await.unwrap();
+
+    let err = db.get_merged(b"incompat/count", &law).await.unwrap_err();
+    assert!(matches!(err, crate::StorageError::OperandCorruption { .. }));
+
+    let scan_err = db.scan_merged(b"incompat/", &law).await.unwrap_err();
+    assert!(matches!(scan_err, crate::StorageError::OperandCorruption { .. }));
+
+    db.close().await.unwrap();
+}
+
+/// Fallback behavior: identical with fallback disabled (default), returns raw on fallback enabled.
+#[serial_test::serial]
+#[tokio::test]
+async fn fallback_behavior_disabled_and_enabled_for_tagged() {
+    use rockstream_types::laws::weight_add::WeightAddV1;
+    use rockstream_types::merge_law::MergeLawId;
+    use rockstream_types::metrics::{read_fallback, LawMetricKey};
+
+    let (db, _) = test_shard_db("test/fallback_tagged").await;
+    let law = WeightAddV1;
+
+    let metric_key = LawMetricKey {
+        law_id: MergeLawId(0x0001),
+        law_name: "WeightAdd",
+        law_version: 1,
+        operator_id: None,
+    };
+
+    let malformed = vec![0x01, 0x00, 0x00];
+    db.put(b"fb/bad", &malformed).await.unwrap();
+
+    // 1. Fallback disabled (default): fail-closed
+    crate::set_allow_law_operand_fallback(false);
+    let err = db.get_merged(b"fb/bad", &law).await.unwrap_err();
+    assert!(matches!(err, crate::StorageError::OperandCorruption { .. }));
+
+    // 2. Fallback enabled: returns raw bytes and increments fallback metric
+    let fallback_before = read_fallback(&metric_key);
+    crate::set_allow_law_operand_fallback(true);
+
+    let res = db.get_merged(b"fb/bad", &law).await.unwrap();
+    assert_eq!(res, Some(malformed.clone()));
+
+    let scan_res = db.scan_merged(b"fb/", &law).await.unwrap();
+    assert_eq!(scan_res.len(), 1);
+    assert_eq!(scan_res[0].1, malformed);
+
+    let fallback_after = read_fallback(&metric_key);
+    assert!(fallback_after > fallback_before);
+
+    crate::set_allow_law_operand_fallback(false);
+    db.close().await.unwrap();
+}
+
+/// Concrete regression fixture: `01 00 00 00 00 00 00 00 07` reaches WeightAddV1
+/// with the 8-byte payload representing `7`.
+#[serial_test::serial]
+#[tokio::test]
+async fn concrete_regression_fixture_reaches_weight_add() {
+    use rockstream_types::laws::arithmetic::decode_i64;
+    use rockstream_types::laws::weight_add::WeightAddV1;
+    use crate::merge_registry::{resolve_law_operand, LawOperandView, MergeTag};
+
+    let law = WeightAddV1;
+    let fixture: [u8; 9] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07];
+
+    // Verify resolve_law_operand extracts exactly the 8-byte payload representing 7
+    let view = resolve_law_operand(&law, &fixture).unwrap();
+    match view {
+        LawOperandView::Tagged { tag, payload } => {
+            assert_eq!(tag, MergeTag::Sum);
+            assert_eq!(payload.len(), 8);
+            assert_eq!(decode_i64(payload).unwrap(), 7);
+        }
+        LawOperandView::Raw(_) => panic!("expected Tagged view"),
+    }
+
+    // Verify storage get_merged and scan_merged succeed with this fixture
+    let (db, _) = test_shard_db("test/concrete_fixture_7").await;
+    let key = b"fixture_k1";
+    db.put(key, &fixture).await.unwrap();
+
+    let result = db.get_merged(key, &law).await.unwrap();
+    assert_eq!(result.as_deref(), Some(&fixture[..]));
+
+    let scan_result = db.scan_merged(b"fixture_", &law).await.unwrap();
+    assert_eq!(scan_result.len(), 1);
+    assert_eq!(scan_result[0].1, fixture);
+
+    db.close().await.unwrap();
+}
+
+/// Tagged PNCounter value is compatible with WeightAdd and succeeds.
+#[serial_test::serial]
+#[tokio::test]
+async fn tagged_pn_counter_reaches_weight_add() {
+    use rockstream_types::laws::weight_add::WeightAddV1;
+
+    let (db, _) = test_shard_db("test/tagged_pn_counter").await;
+    let law = WeightAddV1;
+
+    let val = crate::merge_registry::MergeOperatorRegistry::encode_pn_counter(55);
+    db.put(b"pn/k1", &val).await.unwrap();
+
+    let result = db.get_merged(b"pn/k1", &law).await.unwrap();
+    assert_eq!(result, Some(val));
+
+    db.close().await.unwrap();
+}
+
 // === Arrangement Header Tests ===
 
 /// Verifies that `put_with_arrangement_header` stores the header prefix and
