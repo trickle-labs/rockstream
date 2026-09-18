@@ -12,7 +12,15 @@ from pathlib import Path
 
 STATUSES = {"planned", "kernel-verified", "adapter-qualified", "release-qualified"}
 SYMBOL_FIELDS = ("implementation", "theorems", "production_callers", "regression_tests")
-FORBIDDEN = re.compile(r"\b(?:assume|admit)\s*\(|external_(?:body|fn_specification)|cfg\(verus_only\)")
+FORBIDDEN = re.compile(
+    r"\b(?:assume|admit)\s*\(|external_(?:body|fn_specification)|"
+    r"\bcfg\s*\([^)]*\bverus_only\b",
+    re.DOTALL,
+)
+PUBLIC_FUNCTION = re.compile(
+    r"^\s*pub\s+(?:(?:open|proof|spec)\s+)*fn\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+CLAIM_MARKER = re.compile(r"verus-claim:\s*([A-Za-z0-9._-]+)")
 
 
 def fail(message: str) -> None:
@@ -92,7 +100,17 @@ def main() -> int:
         source = source_path.read_text()
         if FORBIDDEN.search(source):
             fail(f"unchecked proof construct found in {source_path.relative_to(root)}")
-        registered_markers.update(re.findall(r"verus-claim:\s*([A-Za-z0-9._-]+)", source))
+        lines = source.splitlines()
+        for line_number, line in enumerate(lines):
+            function = PUBLIC_FUNCTION.match(line)
+            if function:
+                context = "\n".join(lines[max(0, line_number - 4) : line_number])
+                if not CLAIM_MARKER.search(context):
+                    fail(
+                        f"missing verus claim marker for public function "
+                        f"{source_path.relative_to(root)}::{function.group(1)}"
+                    )
+        registered_markers.update(CLAIM_MARKER.findall(source))
 
     unregistered = registered_markers - claim_ids
     if unregistered:
