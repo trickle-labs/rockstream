@@ -100,3 +100,195 @@ if [[ "$release_output" != "verus qualification: RS-0906: release-qualified clai
 fi
 
 echo "OK: VS6 qualification checker rejects unknown, skipped, and blocked release evidence."
+
+# Setup temporary shims for runner regression tests
+SHIM_BIN="$TMP_ROOT/bin"
+mkdir -p "$SHIM_BIN"
+
+REAL_CP="$(command -v cp)"
+
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM_BIN/cargo-verus"
+chmod +x "$SHIM_BIN/cargo-verus"
+
+printf '#!/usr/bin/env bash\nif [ "${1:-}" = "--version" ]; then\n  echo "verus 0.2026.09.13"\n  exit 0\nfi\nexit 0\n' > "$SHIM_BIN/verus"
+chmod +x "$SHIM_BIN/verus"
+
+printf '#!/usr/bin/env bash\n' > "$SHIM_BIN/cargo"
+printf 'if [ "${1:-}" = "--version" ]; then\n' >> "$SHIM_BIN/cargo"
+printf '  echo "cargo 1.88.0"\n' >> "$SHIM_BIN/cargo"
+printf '  exit 0\n' >> "$SHIM_BIN/cargo"
+printf 'fi\n' >> "$SHIM_BIN/cargo"
+printf 'for arg in "$@"; do\n' >> "$SHIM_BIN/cargo"
+printf '  if [ "$arg" = "--release" ]; then\n' >> "$SHIM_BIN/cargo"
+printf '    mkdir -p "${CARGO_TARGET_DIR:-target}/release"\n' >> "$SHIM_BIN/cargo"
+printf '    printf "mock-release-binary\\n" > "${CARGO_TARGET_DIR:-target}/release/rockstream"\n' >> "$SHIM_BIN/cargo"
+printf '    chmod +x "${CARGO_TARGET_DIR:-target}/release/rockstream"\n' >> "$SHIM_BIN/cargo"
+printf '    exit 0\n' >> "$SHIM_BIN/cargo"
+printf '  fi\n' >> "$SHIM_BIN/cargo"
+printf 'done\n' >> "$SHIM_BIN/cargo"
+printf 'if [ "${1:-}" = "build" ]; then\n' >> "$SHIM_BIN/cargo"
+printf '  mkdir -p "${CARGO_TARGET_DIR:-target}/debug"\n' >> "$SHIM_BIN/cargo"
+printf '  printf "mock-debug-binary\\n" > "${CARGO_TARGET_DIR:-target}/debug/rockstream"\n' >> "$SHIM_BIN/cargo"
+printf '  chmod +x "${CARGO_TARGET_DIR:-target}/debug/rockstream"\n' >> "$SHIM_BIN/cargo"
+printf '  exit 0\n' >> "$SHIM_BIN/cargo"
+printf 'fi\n' >> "$SHIM_BIN/cargo"
+printf 'exit 0\n' >> "$SHIM_BIN/cargo"
+chmod +x "$SHIM_BIN/cargo"
+
+printf '#!/usr/bin/env bash\n' > "$SHIM_BIN/cp"
+printf 'case "${MOCK_CP_MODE:-normal}" in\n' >> "$SHIM_BIN/cp"
+printf '  fail)\n' >> "$SHIM_BIN/cp"
+printf '    echo "cp: simulated copy failure" >&2\n' >> "$SHIM_BIN/cp"
+printf '    exit 1\n' >> "$SHIM_BIN/cp"
+printf '    ;;\n' >> "$SHIM_BIN/cp"
+printf '  fail_release)\n' >> "$SHIM_BIN/cp"
+printf '    for arg in "$@"; do\n' >> "$SHIM_BIN/cp"
+printf '      if [[ "$arg" == *release* ]]; then\n' >> "$SHIM_BIN/cp"
+printf '        echo "cp: simulated release copy failure" >&2\n' >> "$SHIM_BIN/cp"
+printf '        exit 1\n' >> "$SHIM_BIN/cp"
+printf '      fi\n' >> "$SHIM_BIN/cp"
+printf '    done\n' >> "$SHIM_BIN/cp"
+printf '    exec "%s" "$@"\n' "$REAL_CP" >> "$SHIM_BIN/cp"
+printf '    ;;\n' >> "$SHIM_BIN/cp"
+printf '  fail_debug)\n' >> "$SHIM_BIN/cp"
+printf '    for arg in "$@"; do\n' >> "$SHIM_BIN/cp"
+printf '      if [[ "$arg" == *debug* ]]; then\n' >> "$SHIM_BIN/cp"
+printf '        echo "cp: simulated debug copy failure" >&2\n' >> "$SHIM_BIN/cp"
+printf '        exit 1\n' >> "$SHIM_BIN/cp"
+printf '      fi\n' >> "$SHIM_BIN/cp"
+printf '    done\n' >> "$SHIM_BIN/cp"
+printf '    exec "%s" "$@"\n' "$REAL_CP" >> "$SHIM_BIN/cp"
+printf '    ;;\n' >> "$SHIM_BIN/cp"
+printf '  partial)\n' >> "$SHIM_BIN/cp"
+printf '    target="${!#}"\n' >> "$SHIM_BIN/cp"
+printf '    printf "partial-corrupted-content\\n" > "$target"\n' >> "$SHIM_BIN/cp"
+printf '    echo "cp: simulated partial copy failure" >&2\n' >> "$SHIM_BIN/cp"
+printf '    exit 1\n' >> "$SHIM_BIN/cp"
+printf '    ;;\n' >> "$SHIM_BIN/cp"
+printf '  *)\n' >> "$SHIM_BIN/cp"
+printf '    exec "%s" "$@"\n' "$REAL_CP" >> "$SHIM_BIN/cp"
+printf '    ;;\n' >> "$SHIM_BIN/cp"
+printf 'esac\n' >> "$SHIM_BIN/cp"
+chmod +x "$SHIM_BIN/cp"
+
+# Case A — stale destination
+CASE_A_OUT="$TMP_ROOT/case-a-out"
+mkdir -p "$CASE_A_OUT"
+printf 'stale-release-data\n' > "$CASE_A_OUT/rockstream-release"
+printf 'stale-debug-data\n' > "$CASE_A_OUT/rockstream-debug"
+
+set +e
+PATH="$SHIM_BIN:$PATH" MOCK_CP_MODE="fail" VERUS_QUALIFICATION_OUTPUT="$CASE_A_OUT" \
+  bash "$ROOT/scripts/run-verus-qualification.sh" >"$CASE_A_OUT/run.log" 2>&1
+case_a_status=$?
+set -e
+
+[[ "$case_a_status" -ne 0 ]] || fail "Case A: runner unexpectedly succeeded when cp failed"
+python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+if data.get("status") == "passed":
+    sys.exit(1)
+if "rockstream-release" in data.get("runtime_artifacts", {}) or "rockstream-debug" in data.get("runtime_artifacts", {}):
+    sys.exit(2)
+sys.exit(0)
+' "$CASE_A_OUT/qualification.json" || fail "Case A: stale destination accepted or status recorded as passed"
+[[ ! -f "$CASE_A_OUT/rockstream-release" ]] || fail "Case A: stale release file was not cleared"
+[[ ! -f "$CASE_A_OUT/rockstream-debug" ]] || fail "Case A: stale debug file was not cleared"
+
+# Case B — partial destination
+CASE_B_OUT="$TMP_ROOT/case-b-out"
+mkdir -p "$CASE_B_OUT"
+
+set +e
+PATH="$SHIM_BIN:$PATH" MOCK_CP_MODE="partial" VERUS_QUALIFICATION_OUTPUT="$CASE_B_OUT" \
+  bash "$ROOT/scripts/run-verus-qualification.sh" >"$CASE_B_OUT/run.log" 2>&1
+case_b_status=$?
+set -e
+
+[[ "$case_b_status" -ne 0 ]] || fail "Case B: runner unexpectedly succeeded on partial copy"
+python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+if data.get("status") == "passed":
+    sys.exit(1)
+if "rockstream-release" in data.get("runtime_artifacts", {}) or "rockstream-debug" in data.get("runtime_artifacts", {}):
+    sys.exit(2)
+sys.exit(0)
+' "$CASE_B_OUT/qualification.json" || fail "Case B: partial destination accepted or status recorded as passed"
+[[ ! -f "$CASE_B_OUT/rockstream-release" ]] || fail "Case B: partial release file was staged"
+[[ ! -f "$CASE_B_OUT/rockstream-debug" ]] || fail "Case B: partial debug file was staged"
+leftover_case_b=$(find "$CASE_B_OUT" -name "rockstream-*.tmp.*" | wc -l)
+[[ "$leftover_case_b" -eq 0 ]] || fail "Case B: temporary file was not cleaned up on failure"
+
+# Failure to copy release artifact causes non-zero exit and status != passed
+CASE_FAIL_REL_OUT="$TMP_ROOT/case-fail-rel-out"
+mkdir -p "$CASE_FAIL_REL_OUT"
+set +e
+PATH="$SHIM_BIN:$PATH" MOCK_CP_MODE="fail_release" VERUS_QUALIFICATION_OUTPUT="$CASE_FAIL_REL_OUT" \
+  bash "$ROOT/scripts/run-verus-qualification.sh" >"$CASE_FAIL_REL_OUT/run.log" 2>&1
+case_fail_rel_status=$?
+set -e
+[[ "$case_fail_rel_status" -ne 0 ]] || fail "Failure to copy release artifact did not cause non-zero exit"
+python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+if data.get("status") == "passed":
+    sys.exit(1)
+if "rockstream-release" in data.get("runtime_artifacts", {}):
+    sys.exit(2)
+if "rockstream-debug" not in data.get("runtime_artifacts", {}):
+    sys.exit(3)
+sys.exit(0)
+' "$CASE_FAIL_REL_OUT/qualification.json" || fail "Release failure did not record proper failed status or staged debug artifact"
+
+# Failure to copy debug artifact causes non-zero exit and status != passed
+CASE_FAIL_DBG_OUT="$TMP_ROOT/case-fail-dbg-out"
+mkdir -p "$CASE_FAIL_DBG_OUT"
+set +e
+PATH="$SHIM_BIN:$PATH" MOCK_CP_MODE="fail_debug" VERUS_QUALIFICATION_OUTPUT="$CASE_FAIL_DBG_OUT" \
+  bash "$ROOT/scripts/run-verus-qualification.sh" >"$CASE_FAIL_DBG_OUT/run.log" 2>&1
+case_fail_dbg_status=$?
+set -e
+[[ "$case_fail_dbg_status" -ne 0 ]] || fail "Failure to copy debug artifact did not cause non-zero exit"
+python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+if data.get("status") == "passed":
+    sys.exit(1)
+if "rockstream-debug" in data.get("runtime_artifacts", {}):
+    sys.exit(2)
+if "rockstream-release" not in data.get("runtime_artifacts", {}):
+    sys.exit(3)
+sys.exit(0)
+' "$CASE_FAIL_DBG_OUT/qualification.json" || fail "Debug failure did not record proper failed status or staged release artifact"
+
+# Case C — normal success
+CASE_C_OUT="$TMP_ROOT/case-c-out"
+mkdir -p "$CASE_C_OUT"
+
+set +e
+PATH="$SHIM_BIN:$PATH" MOCK_CP_MODE="normal" VERUS_QUALIFICATION_OUTPUT="$CASE_C_OUT" \
+  bash "$ROOT/scripts/run-verus-qualification.sh" >"$CASE_C_OUT/run.log" 2>&1
+case_c_status=$?
+set -e
+
+[[ "$case_c_status" -eq 0 ]] || fail "Case C: runner unexpectedly failed: $(<"$CASE_C_OUT/run.log")"
+[[ -f "$CASE_C_OUT/rockstream-release" ]] || fail "Case C: rockstream-release missing"
+[[ -f "$CASE_C_OUT/rockstream-debug" ]] || fail "Case C: rockstream-debug missing"
+python3 -c '
+import hashlib, json, sys
+data = json.load(open(sys.argv[1]))
+if data.get("status") != "passed":
+    sys.exit(1)
+for name in ("rockstream-release", "rockstream-debug"):
+    with open(f"{sys.argv[2]}/{name}", "rb") as f:
+        expected = hashlib.sha256(f.read()).hexdigest()
+    actual = data.get("runtime_artifacts", {}).get(name)
+    if actual != expected:
+        sys.exit(2)
+sys.exit(0)
+' "$CASE_C_OUT/qualification.json" "$CASE_C_OUT" || fail "Case C: recorded digests do not match staged files"
+
+echo "OK: VS6 qualification runner enforces atomic fail-closed artifact staging."
+
