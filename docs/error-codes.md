@@ -19,7 +19,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - [25xx-26xx: Extended Query, Cursors & Transactions](#25xx-26xx-extended-query-cursors--transactions) (9 codes)
 - [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (56 codes)
 - [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (23 codes)
-- [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (16 codes)
+- [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (17 codes)
 - [6xxx: Connector Schema Evolution](#6xxx-connector-schema-evolution) (1 codes)
 - [8xxx: Frontier Aggregation](#8xxx-frontier-aggregation) (4 codes)
 - [9xxx: Admission Control](#9xxx-admission-control) (1 codes)
@@ -1713,6 +1713,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-5034`](#rs-5034) | `migration.verification_divergence` | Migration verification divergence detected for key | `Error` | `XX000` | `AfterClusterRecovery` |
 | [`RS-5035`](#rs-5035) | `skew.slo_cannot_be_met` | Skew-bound SLO cannot be met without composable partial-state splitting | `Error` | `54000` | `NonRetryable` |
 | [`RS-5036`](#rs-5036) | `skew.non_composable_hot_key` | Non-composable hot key routed to a single spill shard | `Warning` | `01000` | `NonRetryable` |
+| [`RS-5037`](#rs-5037) | `storage.malformed_arrangement_header` | Malformed arrangement catalog header | `Fatal` | `XX000` | `NonRetryable` |
 
 ### <a id="rs-5001"></a> `RS-5001` — Incompatible storage format
 
@@ -1841,6 +1842,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `01000`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Keep the hot key on a single spill shard, watch that shard's pressure, and switch to a composable law before enabling virtual-bucket splitting for this workload.
+
+### <a id="rs-5037"></a> `RS-5037` — Malformed arrangement catalog header
+
+- **Key**: `storage.malformed_arrangement_header`
+- **Severity**: `Fatal`
+- **SQLSTATE**: `XX000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Inspect the stored arrangement catalog value; the header length does not match the expected wire size.
 
 ---
 

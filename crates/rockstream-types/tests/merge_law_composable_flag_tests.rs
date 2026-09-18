@@ -13,8 +13,14 @@ fn registered_laws_expose_expected_composable_flags() {
             "SumCount" => {
                 assert!(descriptor.composable());
                 assert!(!descriptor.can_reassociate());
-                assert!(descriptor.domain().contains("checked i64"));
-                assert!(descriptor.evidence_ref().contains("VS1"));
+                assert_eq!(
+                    descriptor.domain(),
+                    "checked i64 sum/count partials; materialized count > 0; regrouping requires an absolute-sum budget"
+                );
+                assert_eq!(
+                    descriptor.evidence_ref(),
+                    "VS1-02/VS1-03/VS1-06: arithmetic kernel, law tests, and VS1 ADR"
+                );
             }
             other => panic!("unexpected law descriptor: {other}"),
         }

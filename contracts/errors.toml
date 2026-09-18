@@ -1955,6 +1955,16 @@ default_next_steps = "Keep the hot key on a single spill shard, watch that shard
 doc_anchor = "rs-5036"
 
 [[error]]
+code = "RS-5037"
+key = "storage.malformed_arrangement_header"
+title = "Malformed arrangement catalog header"
+severity = "Fatal"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Inspect the stored arrangement catalog value; the header length does not match the expected wire size."
+doc_anchor = "rs-5037"
+
+[[error]]
 code = "RS-6001"
 key = "schema.upstream_evolution_detected"
 title = "Incompatible upstream schema evolution detected"

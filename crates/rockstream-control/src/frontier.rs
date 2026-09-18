@@ -406,33 +406,40 @@ impl FrontierAggregator {
         if report.scope != membership.scope {
             return Err(AggregatorError::ScopeMismatch);
         }
-        if report.generation.0 != membership.generation.0 {
-            return Err(AggregatorError::GenerationMismatch {
-                expected: membership.generation.0,
-                actual: report.generation.0,
-            });
-        }
-        let Some(expected_incarnation) = membership.active.get(&report.shard_id) else {
-            return Err(AggregatorError::InactiveShard(report.shard_id));
-        };
-        if *expected_incarnation != report.incarnation {
-            return Err(AggregatorError::IncarnationMismatch(report.shard_id));
-        }
+        let generation_matches = report.generation == membership.generation;
+        let expected_incarnation = membership.active.get(&report.shard_id);
+        let active = expected_incarnation.is_some();
+        let incarnation_matches = expected_incarnation == Some(&report.incarnation);
         let current_epoch = inner
             .membership_epochs
             .get(&report.shard_id)
             .copied()
             .flatten()
             .unwrap_or(0);
-        let next_epoch = rockstream_verified::frontier::admit_frontier_report(
+        let next_epoch = match rockstream_verified::frontier::admit_frontier_report(
             report.version,
-            true,
-            true,
-            true,
+            active,
+            generation_matches,
+            incarnation_matches,
             current_epoch,
             report.epoch,
-        )
-        .expect("validated membership report must be admitted");
+        ) {
+            Some(epoch) => epoch,
+            None => {
+                return Err(if report.version != 1 {
+                    AggregatorError::UnsupportedReportVersion(report.version)
+                } else if !generation_matches {
+                    AggregatorError::GenerationMismatch {
+                        expected: membership.generation.0,
+                        actual: report.generation.0,
+                    }
+                } else if !active {
+                    AggregatorError::InactiveShard(report.shard_id)
+                } else {
+                    AggregatorError::IncarnationMismatch(report.shard_id)
+                });
+            }
+        };
         inner
             .membership_epochs
             .insert(report.shard_id, Some(next_epoch));
