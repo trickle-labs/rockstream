@@ -11,13 +11,15 @@ verus! {
     // verus-claim: VS2-05
     pub fn route_power_of_two_hash(hash: u64, bucket_count: u16) -> (result: Option<u16>)
         ensures
-            result.is_none() <==> bucket_count == 0 || (bucket_count & (bucket_count - 1)) != 0,
+            result.is_none()
+                <==> bucket_count == 0
+                    || (bucket_count & bucket_count.wrapping_sub(1u16)) != 0,
             result.is_some() ==> result.unwrap() < bucket_count,
     {
-        if bucket_count == 0 || (bucket_count & (bucket_count - 1)) != 0 {
+        if bucket_count == 0 || (bucket_count & (bucket_count - 1u16)) != 0 {
             None
         } else {
-            Some((hash & u64::from(bucket_count - 1)) as u16)
+            Some((hash % u64::from(bucket_count)) as u16)
         }
     }
 }

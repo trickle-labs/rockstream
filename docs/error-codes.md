@@ -21,7 +21,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (23 codes)
 - [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (16 codes)
 - [6xxx: Connector Schema Evolution](#6xxx-connector-schema-evolution) (1 codes)
-- [8xxx: Frontier Aggregation](#8xxx-frontier-aggregation) (3 codes)
+- [8xxx: Frontier Aggregation](#8xxx-frontier-aggregation) (4 codes)
 - [9xxx: Admission Control](#9xxx-admission-control) (1 codes)
 
 ---
@@ -1876,6 +1876,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-8001`](#rs-8001) | `frontier.aggregator_registry_full` | Frontier aggregator shard registry is full; new shard reports rejected | `Error` | `53200` | `ExponentialBackoff` |
 | [`RS-8002`](#rs-8002) | `frontier.stale_fence_token` | Stale fencing token on frontier-aggregator publisher-lease CAS or publish | `Error` | `55000` | `AfterLeaderElection` |
 | [`RS-8003`](#rs-8003) | `frontier.sync_flush_violation` | Sync-flush-before-lease-handoff-read violation on frontier publication | `Error` | `XX000` | `NonRetryable` |
+| [`RS-8004`](#rs-8004) | `frontier.membership_report_rejected` | Membership-aware frontier report or configuration transition was rejected | `Error` | `55000` | `Immediate` |
 
 ### <a id="rs-8001"></a> `RS-8001` — Frontier aggregator shard registry is full; new shard reports rejected
 
@@ -1900,6 +1901,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `XX000`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Verify every publish_frontier write path uses WriteOptions { await_durable: true }; this indicates a durability regression in FrontierLeaseStore.
+
+### <a id="rs-8004"></a> `RS-8004` — Membership-aware frontier report or configuration transition was rejected
+
+- **Key**: `frontier.membership_report_rejected`
+- **Severity**: `Error`
+- **SQLSTATE**: `55000`
+- **Retry Class**: `Immediate`
+- **Default Next Steps**: Refresh the active membership generation and shard incarnation, then retry with a versioned report after durable catch-up.
 
 ---
 
