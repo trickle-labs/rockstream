@@ -15,7 +15,7 @@ repository gates.
   progress is advanced; `coupled_commit_is_durable` states the required
   state/output/marker/frontier boundary.
 - [x] VS5-04: bounded catalog replay advances even for a zero requested page
-  size, and recovery validates checkpoint identity before declaring a restored
+  size (clamped to 1 by catalog/log.rs while recovery_scan_status enforces SCAN_QUOTA for raw zero-page quotas), and recovery validates checkpoint identity before declaring a restored
   shard ready.
 - [x] VS5-05: compaction eligibility requires both reader and replay horizons;
   arrangement consumer registration and removal are idempotent.

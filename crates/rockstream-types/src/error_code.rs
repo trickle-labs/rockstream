@@ -678,6 +678,8 @@ pub const RS_5034: ErrorCode = ErrorCode::new(5034);
 pub const RS_5035: ErrorCode = ErrorCode::new(5035);
 /// Non-composable hot key routed to a single spill shard.
 pub const RS_5036: ErrorCode = ErrorCode::new(5036);
+/// Malformed arrangement catalog header length.
+pub const RS_5037: ErrorCode = ErrorCode::new(5037);
 /// Incompatible upstream schema evolution detected.
 pub const RS_6001: ErrorCode = ErrorCode::new(6001);
 /// Frontier aggregator shard registry is full; new shard reports rejected.

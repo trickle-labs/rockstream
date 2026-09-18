@@ -96,17 +96,6 @@ verus! {
                     | bytes[7] as u64
             ),
     {
-        if bytes.len() != 8 {
-            None
-        } else {
-            Some(((bytes[0] as u64) << 56)
-                | ((bytes[1] as u64) << 48)
-                | ((bytes[2] as u64) << 40)
-                | ((bytes[3] as u64) << 32)
-                | ((bytes[4] as u64) << 24)
-                | ((bytes[5] as u64) << 16)
-                | ((bytes[6] as u64) << 8)
-                | bytes[7] as u64)
-        }
+        crate::codecs::decode_u64_be(bytes)
     }
 }
