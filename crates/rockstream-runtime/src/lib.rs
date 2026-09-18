@@ -14,6 +14,12 @@ pub mod arrangement_attach;
 pub mod client;
 pub mod compaction;
 pub mod data_plane;
+pub mod epoch_compaction;
+pub use epoch_compaction::{
+    EpochCompactionConfig, EpochCompactionError, EpochCompactionFilter, EpochCompactionMetrics,
+    EpochCompactionMetricsSnapshot, EpochCompactor, InFlightZSetAccumulator, KeyExtractionStrategy,
+    DEFAULT_EPOCH_WINDOW, MAX_EPOCH_WINDOW, MIN_EPOCH_WINDOW,
+};
 pub mod secrets;
 pub mod shard_actor;
 pub mod tls;
