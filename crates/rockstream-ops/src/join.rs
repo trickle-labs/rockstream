@@ -36,7 +36,7 @@
 //! arrangement is bounded by the number of distinct live (join_key, row_id)
 //! pairs on each side of the join.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -280,6 +280,8 @@ pub struct JoinOp {
     left_staged: Mutex<StagedDelta>,
     /// Staged right delta for the current epoch.
     right_staged: Mutex<StagedDelta>,
+    dirty_left: Mutex<HashSet<(Vec<u8>, u128)>>,
+    dirty_right: Mutex<HashSet<(Vec<u8>, u128)>>,
 }
 
 impl JoinOp {
@@ -307,6 +309,8 @@ impl JoinOp {
             state: Mutex::new(JoinState::new()),
             left_staged: Mutex::new(StagedDelta::default()),
             right_staged: Mutex::new(StagedDelta::default()),
+            dirty_left: Mutex::new(HashSet::new()),
+            dirty_right: Mutex::new(HashSet::new()),
         }
     }
 
@@ -505,11 +509,15 @@ impl JoinOp {
             }
         }
 
-        // Apply staged deltas to arrangements.
+        // Apply staged deltas to arrangements and track modified rows.
+        let mut dirty_left = self.dirty_left.lock().unwrap();
+        let mut dirty_right = self.dirty_right.lock().unwrap();
         for (join_key, row_id, row_bytes, w) in left_s.rows.drain(..) {
+            dirty_left.insert((join_key.clone(), row_id));
             state.update_left(join_key, row_id, row_bytes, w);
         }
         for (join_key, row_id, row_bytes, w) in right_s.rows.drain(..) {
+            dirty_right.insert((join_key.clone(), row_id));
             state.update_right(join_key, row_id, row_bytes, w);
         }
         left_s.staged_bytes = 0;
@@ -582,39 +590,52 @@ impl JoinOp {
         state.state_bytes() + left_s.staged_bytes + right_s.staged_bytes
     }
 
-    /// Persist the arrangement state to a `ShardDb` using only point puts.
+    /// Persist dirty arrangement state deltas to a `ShardDb` using only point puts/deletes.
     ///
-    /// No range deletion is used.  Keys are `join_arr_key(side, op_id, ...)`.
+    /// Persists only keys that changed or were removed during the epoch, ensuring
+    /// O(|Δ|) write amplification instead of O(|arrangement|).
+    /// No range deletion is used. Keys are `join_arr_key(side, op_id, ...)`.
     pub fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
         let mut batch = WriteBatch::new();
 
         {
             let state = self.state.lock().unwrap();
-            for (join_key, entries) in &state.left_arr {
-                for (row_id, arr_row) in entries {
-                    // Only persist positive-weight rows.
+            let mut dirty_left = self.dirty_left.lock().unwrap();
+            let mut dirty_right = self.dirty_right.lock().unwrap();
+
+            for (join_key, row_id) in dirty_left.drain() {
+                let key = ShardKeyEncoder::join_arr_key(
+                    JoinSide::Left,
+                    self.op_id.0,
+                    &join_key,
+                    row_id,
+                );
+                if let Some(arr_row) = state.left_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
                     if arr_row.weight > 0 {
-                        let key = ShardKeyEncoder::join_arr_key(
-                            JoinSide::Left,
-                            self.op_id.0,
-                            join_key,
-                            *row_id,
-                        );
                         batch.put(&key, &arr_row.row_bytes);
+                    } else {
+                        batch.delete(&key);
                     }
+                } else {
+                    batch.delete(&key);
                 }
             }
-            for (join_key, entries) in &state.right_arr {
-                for (row_id, arr_row) in entries {
+
+            for (join_key, row_id) in dirty_right.drain() {
+                let key = ShardKeyEncoder::join_arr_key(
+                    JoinSide::Right,
+                    self.op_id.0,
+                    &join_key,
+                    row_id,
+                );
+                if let Some(arr_row) = state.right_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
                     if arr_row.weight > 0 {
-                        let key = ShardKeyEncoder::join_arr_key(
-                            JoinSide::Right,
-                            self.op_id.0,
-                            join_key,
-                            *row_id,
-                        );
                         batch.put(&key, &arr_row.row_bytes);
+                    } else {
+                        batch.delete(&key);
                     }
+                } else {
+                    batch.delete(&key);
                 }
             }
         }
@@ -697,6 +718,8 @@ impl JoinOp {
             state: Mutex::new(st),
             left_staged: Mutex::new(StagedDelta::default()),
             right_staged: Mutex::new(StagedDelta::default()),
+            dirty_left: Mutex::new(HashSet::new()),
+            dirty_right: Mutex::new(HashSet::new()),
         })
     }
 

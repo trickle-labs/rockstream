@@ -18,7 +18,7 @@
 //!
 //! Only point puts/deletes are used — no range deletion.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -208,6 +208,10 @@ pub struct OuterJoinOp {
     state: Mutex<OuterJoinState>,
     left_staged: Mutex<StagedDelta>,
     right_staged: Mutex<StagedDelta>,
+    dirty_left: Mutex<HashSet<(Vec<u8>, u128)>>,
+    dirty_right: Mutex<HashSet<(Vec<u8>, u128)>>,
+    dirty_rw: Mutex<HashSet<Vec<u8>>>,
+    dirty_lw: Mutex<HashSet<Vec<u8>>>,
 }
 
 impl OuterJoinOp {
@@ -240,6 +244,10 @@ impl OuterJoinOp {
             state: Mutex::new(OuterJoinState::new()),
             left_staged: Mutex::new(StagedDelta::default()),
             right_staged: Mutex::new(StagedDelta::default()),
+            dirty_left: Mutex::new(HashSet::new()),
+            dirty_right: Mutex::new(HashSet::new()),
+            dirty_rw: Mutex::new(HashSet::new()),
+            dirty_lw: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1039,13 +1047,20 @@ impl OuterJoinOp {
         let mut left_s = self.left_staged.lock().unwrap();
         let mut right_s = self.right_staged.lock().unwrap();
 
+        let mut dirty_left = self.dirty_left.lock().unwrap();
+        let mut dirty_right = self.dirty_right.lock().unwrap();
+        let mut dirty_rw = self.dirty_rw.lock().unwrap();
+        let mut dirty_lw = self.dirty_lw.lock().unwrap();
+
         // Apply staged left rows.
         for (join_key, row_id, row_bytes, w) in left_s.rows.drain(..) {
+            dirty_left.insert((join_key.clone(), row_id));
             state.update_left(join_key, row_id, row_bytes, w);
         }
 
         // Apply staged right rows.
         for (join_key, row_id, row_bytes, w) in right_s.rows.drain(..) {
+            dirty_right.insert((join_key.clone(), row_id));
             state.update_right(join_key, row_id, row_bytes, w);
         }
 
@@ -1054,6 +1069,7 @@ impl OuterJoinOp {
 
         // Update right_key_weight.
         for (key, delta) in delta_rw {
+            dirty_rw.insert(key.clone());
             let is_new = !state.right_key_weight.contains_key(key);
             let key_len = key.len() as u64;
             if is_new {
@@ -1070,6 +1086,7 @@ impl OuterJoinOp {
         // Update left_key_weight (for RIGHT and FULL joins).
         if let Some(dlw) = delta_lw {
             for (key, delta) in dlw {
+                dirty_lw.insert(key.clone());
                 let is_new = !state.left_key_weight.contains_key(key);
                 let key_len = key.len() as u64;
                 if is_new {
@@ -1117,66 +1134,92 @@ impl OuterJoinOp {
 
     // ─── State persistence ────────────────────────────────────────────────────
 
-    /// Persist the arrangement state and match-count state to a `ShardDb`.
+    /// Persist dirty arrangement state and match-count state deltas to a `ShardDb`.
     ///
-    /// Uses only point puts — no range deletion.
+    /// Persists only keys that changed or were removed during the epoch, ensuring
+    /// O(|Δ|) write amplification instead of O(|state|).
+    /// Uses only point puts/deletes — no range deletion.
     pub fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
         let mut batch = WriteBatch::new();
 
         {
             let state = self.state.lock().unwrap();
+            let mut dirty_left = self.dirty_left.lock().unwrap();
+            let mut dirty_right = self.dirty_right.lock().unwrap();
+            let mut dirty_rw = self.dirty_rw.lock().unwrap();
+            let mut dirty_lw = self.dirty_lw.lock().unwrap();
 
             // Left arrangement (same key format as JoinOp).
-            for (join_key, entries) in &state.left_arr {
-                for (row_id, arr_row) in entries {
+            for (join_key, row_id) in dirty_left.drain() {
+                let key = ShardKeyEncoder::join_arr_key(
+                    JoinSide::Left,
+                    self.op_id.0,
+                    &join_key,
+                    row_id,
+                );
+                if let Some(arr_row) = state.left_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
                     if arr_row.weight > 0 {
-                        let key = ShardKeyEncoder::join_arr_key(
-                            JoinSide::Left,
-                            self.op_id.0,
-                            join_key,
-                            *row_id,
-                        );
                         batch.put(&key, &arr_row.row_bytes);
+                    } else {
+                        batch.delete(&key);
                     }
+                } else {
+                    batch.delete(&key);
                 }
             }
 
             // Right arrangement.
-            for (join_key, entries) in &state.right_arr {
-                for (row_id, arr_row) in entries {
+            for (join_key, row_id) in dirty_right.drain() {
+                let key = ShardKeyEncoder::join_arr_key(
+                    JoinSide::Right,
+                    self.op_id.0,
+                    &join_key,
+                    row_id,
+                );
+                if let Some(arr_row) = state.right_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
                     if arr_row.weight > 0 {
-                        let key = ShardKeyEncoder::join_arr_key(
-                            JoinSide::Right,
-                            self.op_id.0,
-                            join_key,
-                            *row_id,
-                        );
                         batch.put(&key, &arr_row.row_bytes);
+                    } else {
+                        batch.delete(&key);
                     }
+                } else {
+                    batch.delete(&key);
                 }
             }
 
             // right_key_weight: prefix [0x01, 0x4F, 0x52] + op_id:8 + key_bytes → weight:8
             let rw_prefix: &[u8] = &[0x01, 0x4F, 0x52];
-            for (key_bytes, &weight) in &state.right_key_weight {
-                if weight != 0 {
-                    let mut storage_key = Vec::with_capacity(3 + 8 + key_bytes.len());
-                    storage_key.extend_from_slice(rw_prefix);
-                    storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
-                    storage_key.extend_from_slice(key_bytes);
-                    batch.put(&storage_key, &weight.to_be_bytes());
+            for key_bytes in dirty_rw.drain() {
+                let mut storage_key = Vec::with_capacity(3 + 8 + key_bytes.len());
+                storage_key.extend_from_slice(rw_prefix);
+                storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
+                storage_key.extend_from_slice(&key_bytes);
+                if let Some(&weight) = state.right_key_weight.get(&key_bytes) {
+                    if weight != 0 {
+                        batch.put(&storage_key, &weight.to_be_bytes());
+                    } else {
+                        batch.delete(&storage_key);
+                    }
+                } else {
+                    batch.delete(&storage_key);
                 }
             }
 
             // left_key_weight: prefix [0x01, 0x4F, 0x4C] + op_id:8 + key_bytes → weight:8
             let lw_prefix: &[u8] = &[0x01, 0x4F, 0x4C];
-            for (key_bytes, &weight) in &state.left_key_weight {
-                if weight != 0 {
-                    let mut storage_key = Vec::with_capacity(3 + 8 + key_bytes.len());
-                    storage_key.extend_from_slice(lw_prefix);
-                    storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
-                    storage_key.extend_from_slice(key_bytes);
-                    batch.put(&storage_key, &weight.to_be_bytes());
+            for key_bytes in dirty_lw.drain() {
+                let mut storage_key = Vec::with_capacity(3 + 8 + key_bytes.len());
+                storage_key.extend_from_slice(lw_prefix);
+                storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
+                storage_key.extend_from_slice(&key_bytes);
+                if let Some(&weight) = state.left_key_weight.get(&key_bytes) {
+                    if weight != 0 {
+                        batch.put(&storage_key, &weight.to_be_bytes());
+                    } else {
+                        batch.delete(&storage_key);
+                    }
+                } else {
+                    batch.delete(&storage_key);
                 }
             }
         }
@@ -1281,6 +1324,10 @@ impl OuterJoinOp {
             state: Mutex::new(st),
             left_staged: Mutex::new(StagedDelta::default()),
             right_staged: Mutex::new(StagedDelta::default()),
+            dirty_left: Mutex::new(HashSet::new()),
+            dirty_right: Mutex::new(HashSet::new()),
+            dirty_rw: Mutex::new(HashSet::new()),
+            dirty_lw: Mutex::new(HashSet::new()),
         })
     }
 

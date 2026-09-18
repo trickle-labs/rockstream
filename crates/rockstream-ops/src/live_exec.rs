@@ -111,12 +111,12 @@ const GROUP_KEY_PACKER_PREFIX: &[u8] = &[0x01, 0x4B, 0x50];
 const UTF8_PACKER_PREFIX: &[u8] = &[0x01, 0x55, 0x50];
 
 fn append_utf8_packer_state(
-    forward: &Mutex<HashMap<String, i64>>,
+    dirty: &Mutex<Vec<(String, i64)>>,
     op_id: OperatorId,
     target: &mut WriteBatch,
 ) {
-    let forward = forward.lock().unwrap();
-    for (value, surrogate) in forward.iter() {
+    let mut dirty = dirty.lock().unwrap();
+    for (value, surrogate) in dirty.drain(..) {
         let mut key = Vec::with_capacity(UTF8_PACKER_PREFIX.len() + 8 + value.len());
         key.extend_from_slice(UTF8_PACKER_PREFIX);
         key.extend_from_slice(&op_id.0.to_be_bytes());
@@ -431,6 +431,7 @@ pub struct GroupKeyPacker {
     reverse: Mutex<HashMap<i64, Vec<i64>>>,
     reverse_slices: Mutex<HashMap<i64, Vec<ArrayRef>>>,
     next_id: Mutex<i64>,
+    dirty: Mutex<Vec<(Vec<u8>, i64)>>,
 }
 
 impl GroupKeyPacker {
@@ -441,6 +442,7 @@ impl GroupKeyPacker {
             reverse: Mutex::new(HashMap::new()),
             reverse_slices: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
+            dirty: Mutex::new(Vec::new()),
         }
     }
 
@@ -488,7 +490,8 @@ impl GroupKeyPacker {
         let mut next_id = self.next_id.lock().unwrap();
         let id = *next_id;
         *next_id += 1;
-        forward.insert(encoded, id);
+        forward.insert(encoded.clone(), id);
+        self.dirty.lock().unwrap().push((encoded, id));
         self.reverse.lock().unwrap().insert(id, vals.to_vec());
         id
     }
@@ -507,14 +510,14 @@ impl GroupKeyPacker {
         db.write_batch(batch).await.map_err(OpError::storage)
     }
 
-    /// Add the surrogate-key intern table to a caller-owned M3 write.
+    /// Add dirty surrogate-key intern entries to a caller-owned M3 write.
     pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
-        let forward = self.forward.lock().unwrap();
-        for (encoded_key, &surrogate) in forward.iter() {
+        let mut dirty = self.dirty.lock().unwrap();
+        for (encoded_key, surrogate) in dirty.drain(..) {
             let mut key = Vec::with_capacity(3 + 8 + encoded_key.len());
             key.extend_from_slice(GROUP_KEY_PACKER_PREFIX);
             key.extend_from_slice(&op_id.0.to_be_bytes());
-            key.extend_from_slice(encoded_key);
+            key.extend_from_slice(&encoded_key);
             target.put(&key, &surrogate.to_be_bytes());
         }
     }
@@ -795,6 +798,7 @@ pub struct Utf8KeyPacker {
     forward: Mutex<HashMap<String, i64>>,
     reverse: Mutex<HashMap<i64, String>>,
     next_id: Mutex<i64>,
+    dirty: Mutex<Vec<(String, i64)>>,
 }
 
 impl Utf8KeyPacker {
@@ -803,6 +807,7 @@ impl Utf8KeyPacker {
             forward: Mutex::new(HashMap::new()),
             reverse: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
+            dirty: Mutex::new(Vec::new()),
         }
     }
 
@@ -821,7 +826,7 @@ impl Utf8KeyPacker {
     }
 
     pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
-        append_utf8_packer_state(&self.forward, op_id, target);
+        append_utf8_packer_state(&self.dirty, op_id, target);
     }
 
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
@@ -838,6 +843,7 @@ impl Utf8KeyPacker {
         *next_id += 1;
         drop(next_id);
         forward.insert(key.to_string(), id);
+        self.dirty.lock().unwrap().push((key.to_string(), id));
         self.reverse.lock().unwrap().insert(id, key.to_string());
         id
     }
@@ -952,6 +958,7 @@ pub struct Utf8ColumnPacker {
     forward: Mutex<HashMap<String, i64>>,
     reverse: Mutex<HashMap<i64, String>>,
     next_id: Mutex<i64>,
+    dirty: Mutex<Vec<(String, i64)>>,
 }
 
 impl Utf8ColumnPacker {
@@ -960,6 +967,7 @@ impl Utf8ColumnPacker {
             forward: Mutex::new(HashMap::new()),
             reverse: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
+            dirty: Mutex::new(Vec::new()),
         }
     }
 
@@ -973,7 +981,7 @@ impl Utf8ColumnPacker {
     }
 
     pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
-        append_utf8_packer_state(&self.forward, op_id, target);
+        append_utf8_packer_state(&self.dirty, op_id, target);
     }
 
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
@@ -990,6 +998,7 @@ impl Utf8ColumnPacker {
         *next_id += 1;
         drop(next_id);
         forward.insert(key.to_string(), id);
+        self.dirty.lock().unwrap().push((key.to_string(), id));
         self.reverse.lock().unwrap().insert(id, key.to_string());
         id
     }
