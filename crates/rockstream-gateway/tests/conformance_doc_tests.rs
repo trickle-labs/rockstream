@@ -168,6 +168,8 @@ fn workspace_crates() -> BTreeSet<String> {
                 .is_some_and(|id| members.contains(id))
         })
         .filter(|package| package["metadata"].get("cargo-fuzz").is_none())
+        // Verus crates use proof and qualification gates instead of line coverage floors.
+        .filter(|package| package["metadata"].get("verus").is_none())
         .filter_map(|package| package["name"].as_str())
         .filter(|name| name.starts_with("rockstream-"))
         .map(ToOwned::to_owned)

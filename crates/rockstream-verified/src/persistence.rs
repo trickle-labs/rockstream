@@ -1,21 +1,21 @@
 use vstd::prelude::*;
 
-pub const COMMIT_FAILED: u8 = 0;
-pub const COMMIT_COMMITTED: u8 = 1;
-pub const COMMIT_UNKNOWN: u8 = 2;
-
-pub const REPLAY_REJECT: u8 = 0;
-pub const REPLAY_APPLY: u8 = 1;
-pub const REPLAY_NOOP: u8 = 2;
-pub const REPLAY_UNKNOWN: u8 = 3;
-
-pub const SCAN_COMPLETE: u8 = 0;
-pub const SCAN_MORE: u8 = 1;
-pub const SCAN_QUOTA: u8 = 2;
-pub const SCAN_CANCELLED: u8 = 3;
-pub const SCAN_CORRUPT: u8 = 4;
-
 verus! {
+    pub const COMMIT_FAILED: u8 = 0;
+    pub const COMMIT_COMMITTED: u8 = 1;
+    pub const COMMIT_UNKNOWN: u8 = 2;
+
+    pub const REPLAY_REJECT: u8 = 0;
+    pub const REPLAY_APPLY: u8 = 1;
+    pub const REPLAY_NOOP: u8 = 2;
+    pub const REPLAY_UNKNOWN: u8 = 3;
+
+    pub const SCAN_COMPLETE: u8 = 0;
+    pub const SCAN_MORE: u8 = 1;
+    pub const SCAN_QUOTA: u8 = 2;
+    pub const SCAN_CANCELLED: u8 = 3;
+    pub const SCAN_CORRUPT: u8 = 4;
+
     // verus-claim: VS5-02
     pub fn next_epoch(current_epoch: u64) -> (result: Option<u64>)
         ensures
@@ -124,7 +124,10 @@ verus! {
         ensures
             cancelled ==> result == SCAN_CANCELLED,
             !cancelled && corrupt ==> result == SCAN_CORRUPT,
-            !cancelled && !corrupt && (requested_page_size == 0 || max_page_size == 0)
+            !cancelled
+                && !corrupt
+                && cursor <= total_rows
+                && (requested_page_size == 0 || max_page_size == 0)
                 ==> result == SCAN_QUOTA,
             !cancelled && !corrupt && cursor > total_rows ==> result == SCAN_CORRUPT,
     {

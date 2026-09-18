@@ -1,8 +1,8 @@
 use vstd::prelude::*;
 
-const SIGN_BIT: u64 = 0x8000_0000_0000_0000;
-
 verus! {
+    pub const SIGN_BIT: u64 = 0x8000_0000_0000_0000;
+
     // verus-claim: VS2-02
     pub fn signed_order_key(value: i64, invert: bool) -> (result: u64)
         ensures
@@ -24,17 +24,36 @@ verus! {
 
     // verus-claim: VS2-02
     pub proof fn signed_order_key_round_trips(value: i64, invert: bool)
-        ensures signed_order_key_decode(signed_order_key(value, invert), invert) == value,
+        ensures (if invert {
+            (!(!((value as u64) ^ SIGN_BIT)) ^ SIGN_BIT) as i64 == value
+        } else {
+            (((value as u64) ^ SIGN_BIT) ^ SIGN_BIT) as i64 == value
+        }),
     {
-        assert((value as u64) ^ SIGN_BIT ^ SIGN_BIT == value as u64) by (bit_vector);
+        if invert {
+            assert((!(!((value as u64) ^ SIGN_BIT)) ^ SIGN_BIT) as i64 == value)
+                by (bit_vector);
+        } else {
+            assert((((value as u64) ^ SIGN_BIT) ^ SIGN_BIT) as i64 == value)
+                by (bit_vector);
+        }
     }
 
     // verus-claim: VS2-02
     pub proof fn signed_order_key_preserves_order(left: i64, right: i64)
-        requires left < right,
-        ensures signed_order_key(left, false) < signed_order_key(right, false),
-            signed_order_key(right, true) < signed_order_key(left, true),
+        requires (left as int) < (right as int),
+        ensures (((left as u64) ^ SIGN_BIT) as int) < (((right as u64) ^ SIGN_BIT) as int),
+            ((!((right as u64) ^ SIGN_BIT)) as int) < ((!((left as u64) ^ SIGN_BIT)) as int),
     {
-        assert((left as int) + (1i128 << 63) < (right as int) + (1i128 << 63)) by (bit_vector);
+        assert((((left as u64) ^ SIGN_BIT) as int) == (left as int) + 9223372036854775808)
+            by (bit_vector);
+        assert((((right as u64) ^ SIGN_BIT) as int) == (right as int) + 9223372036854775808)
+            by (bit_vector);
+        assert((!((right as u64) ^ SIGN_BIT)) as int
+            == 18446744073709551615 - (((right as u64) ^ SIGN_BIT) as int))
+            by (bit_vector);
+        assert((!((left as u64) ^ SIGN_BIT)) as int
+            == 18446744073709551615 - (((left as u64) ^ SIGN_BIT) as int))
+            by (bit_vector);
     }
 }

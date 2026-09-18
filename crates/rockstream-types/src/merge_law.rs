@@ -163,7 +163,10 @@ pub trait LawBundle: Send + Sync + 'static {
 
     /// Merge-law inverse in the executable representation, when supported.
     fn inverse(&self, _value: &[u8]) -> Result<Vec<u8>, String> {
-        Err(format!("{} has no executable inverse", self.name()))
+        Err(format!(
+            "RS-1013: {} has no executable inverse",
+            self.name()
+        ))
     }
 
     /// Return whether these concrete operands are safe to regroup freely.
