@@ -183,6 +183,8 @@ impl Inner {
 
     fn recompute_membership_publication(&mut self) {
         let Some(meet) = self.compute_membership_meet() else {
+            // INVARIANT-BY-CONSTRUCTION: M2-S9 — an empty active membership or a missing
+            // member epoch leaves publication unset, so no completeness claim is published.
             if self
                 .membership
                 .as_ref()
@@ -192,6 +194,8 @@ impl Inner {
             }
             return;
         };
+        // INVARIANT-BY-CONSTRUCTION: M2-S8 — publication advances only from the
+        // meet of the currently configured active membership.
         if self.published.map(|old| meet > old).unwrap_or(true) {
             self.published = Some(meet);
         }
