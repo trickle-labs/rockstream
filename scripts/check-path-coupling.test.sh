@@ -16,7 +16,7 @@ git -C "$TMP_ROOT" commit -q -m baseline
 assert_output() {
 	local expected="$1"
 	local actual
-	actual="$(cd "$TMP_ROOT" && BASE=HEAD~1 "$ROOT/scripts/check-path-coupling.sh" 2>&1)"
+	actual="$(cd "$TMP_ROOT" && GITHUB_BASE_REF= BASE=HEAD~1 "$ROOT/scripts/check-path-coupling.sh" 2>&1)"
 	if [[ "$actual" != "$expected" ]]; then
 		echo "$actual"
 		echo "expected: $expected" >&2
@@ -32,7 +32,7 @@ assert_output "check-path-coupling: no changed files found for range 'HEAD~1..HE
 touch "$TMP_ROOT/crates/rockstream-control/src.rs"
 git -C "$TMP_ROOT" add .
 git -C "$TMP_ROOT" commit -q -m coordination-without-model
-if (cd "$TMP_ROOT" && BASE=HEAD~1 "$ROOT/scripts/check-path-coupling.sh") >/dev/null 2>&1; then
+if (cd "$TMP_ROOT" && GITHUB_BASE_REF= BASE=HEAD~1 "$ROOT/scripts/check-path-coupling.sh") >/dev/null 2>&1; then
 	echo "coordination-only change unexpectedly passed" >&2
 	exit 1
 fi
