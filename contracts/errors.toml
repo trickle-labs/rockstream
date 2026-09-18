@@ -54,6 +54,16 @@ default_next_steps = "Pass --yes for script execution or answer y at the prompt.
 doc_anchor = "rs-0005"
 
 [[error]]
+code = "RS-0906"
+key = "formal.verus_qualification_failed"
+title = "Formal Verus qualification failed"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Inspect the formal verification and qualification evidence; ensure all required proofs and release artifacts pass."
+doc_anchor = "rs-0906"
+
+[[error]]
 code = "RS-1001"
 key = "pipeline.not_found"
 title = "Pipeline not found"

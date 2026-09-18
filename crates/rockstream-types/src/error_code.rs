@@ -296,6 +296,8 @@ pub const RS_0003: ErrorCode = ErrorCode::new(3);
 pub const RS_0004: ErrorCode = ErrorCode::new(4);
 /// Destructive command confirmation required.
 pub const RS_0005: ErrorCode = ErrorCode::new(5);
+/// Formal Verus qualification or verification gate failed.
+pub const RS_0906: ErrorCode = ErrorCode::new(906);
 /// Pipeline not found.
 pub const RS_1001: ErrorCode = ErrorCode::new(1001);
 /// Incompatible schema change.

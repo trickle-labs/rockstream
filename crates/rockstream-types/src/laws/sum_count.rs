@@ -17,8 +17,8 @@ use super::arithmetic::{
     admit_i64_reassociation, checked_add_i64, checked_neg_i64, decode_i64, encode_i64,
 };
 use crate::merge_law::{
-    CompactionPolicy, DuplicatePolicy, FrontierPolicy, LawBundle, LawProperties, MergeLawClass,
-    MergeLawId, MergeLawVersion,
+    CompactionPolicy, DuplicatePolicy, FrontierPolicy, GatewayAggCombinerDesc, LawBundle,
+    LawProperties, MergeLawClass, MergeLawId, MergeLawVersion,
 };
 
 /// Well-known ID for `SumCount/v1`.
@@ -102,6 +102,15 @@ impl LawBundle for SumCountV1 {
         parse_sum_count(value)
             .map(|(s, c)| s == 0 && c == 0)
             .unwrap_or(false)
+    }
+
+    fn gateway_combiner(&self) -> Option<GatewayAggCombinerDesc> {
+        Some(GatewayAggCombinerDesc {
+            law_id: SUM_COUNT_ID,
+            law_name: "SumCount",
+            is_associative: true,
+            is_commutative: true,
+        })
     }
 
     fn inverse(&self, value: &[u8]) -> Result<Vec<u8>, String> {

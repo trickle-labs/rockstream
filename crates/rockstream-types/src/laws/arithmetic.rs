@@ -53,7 +53,7 @@ pub fn decode_i64(bytes: &[u8]) -> Result<i64, ArithmeticError> {
 }
 
 pub fn decode_u64(bytes: &[u8]) -> Result<u64, ArithmeticError> {
-    rockstream_verified::arithmetic::decode_u64(bytes).ok_or(ArithmeticError::InvalidLength {
+    rockstream_verified::codecs::decode_u64_be(bytes).ok_or(ArithmeticError::InvalidLength {
         expected: 8,
         actual: bytes.len(),
     })

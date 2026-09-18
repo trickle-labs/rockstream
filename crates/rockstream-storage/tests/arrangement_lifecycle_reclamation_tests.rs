@@ -119,3 +119,38 @@ async fn test_duplicate_consumer_registration_and_drop_are_idempotent() {
         vec![arr_id]
     );
 }
+
+#[tokio::test]
+async fn test_retained_snapshot_or_in_flight_delta_blocks_reclamation() {
+    let catalog = ArrangementCatalog::new();
+    let spec = create_spec(1, "events");
+
+    let (arr_id, _) = catalog.register_consumer(ViewId(1), spec).await;
+    catalog.update_compaction_frontier(arr_id, 30).await;
+    assert!(catalog
+        .deregister_consumer(ViewId(1), arr_id)
+        .await
+        .expect("deregister"));
+
+    // Set retained snapshot
+    catalog.set_retained_snapshot(arr_id, true).await;
+    assert!(catalog
+        .reclaim_unreferenced_arrangements(20)
+        .await
+        .is_empty());
+
+    // Clear retained snapshot, set in-flight delta
+    catalog.set_retained_snapshot(arr_id, false).await;
+    catalog.set_in_flight_delta(arr_id, true).await;
+    assert!(catalog
+        .reclaim_unreferenced_arrangements(20)
+        .await
+        .is_empty());
+
+    // Clear in-flight delta -> now eligible for reclamation
+    catalog.set_in_flight_delta(arr_id, false).await;
+    assert_eq!(
+        catalog.reclaim_unreferenced_arrangements(20).await,
+        vec![arr_id]
+    );
+}
