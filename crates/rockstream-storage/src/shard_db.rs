@@ -1254,6 +1254,17 @@ pub enum BatchOp {
     Merge { key: Vec<u8>, value: Vec<u8> },
 }
 
+impl BatchOp {
+    /// Return the key affected by this operation.
+    pub fn key(&self) -> &[u8] {
+        match self {
+            BatchOp::Put { key, .. } => key,
+            BatchOp::Delete { key } => key,
+            BatchOp::Merge { key, .. } => key,
+        }
+    }
+}
+
 /// Atomic write batch for multiple operations.
 ///
 /// All operations in a batch are committed atomically.
@@ -1310,6 +1321,11 @@ impl WriteBatch {
     /// Returns true if the batch has no operations.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+
+    /// Returns the operations in the batch.
+    pub fn ops(&self) -> &[BatchOp] {
+        &self.ops
     }
 
     /// Returns the total byte size of keys and values in this batch.
