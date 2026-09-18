@@ -78,18 +78,43 @@ TARGET_SUFFIX=""
 if [ -n "$QUALIFY_TARGET" ]; then
   TARGET_SUFFIX="$QUALIFY_TARGET/"
 fi
-if [ -f "$TARGET_ROOT/${TARGET_SUFFIX}release/rockstream" ]; then
-  cp "$TARGET_ROOT/${TARGET_SUFFIX}release/rockstream" "$RUNTIME_ARTIFACT"
-else
-  echo "verus qualification: RS-0906: release runtime artifact was not produced" >&2
-  OVERALL=1
-fi
-if [ -f "$TARGET_ROOT/${TARGET_SUFFIX}debug/rockstream" ]; then
-  cp "$TARGET_ROOT/${TARGET_SUFFIX}debug/rockstream" "$DEBUG_ARTIFACT"
-else
-  echo "verus qualification: RS-0906: debug runtime artifact was not produced" >&2
-  OVERALL=1
-fi
+
+# Ensure any pre-existing final destination files are removed so stale files
+# from earlier runs cannot count as evidence.
+rm -f "$RUNTIME_ARTIFACT" "$DEBUG_ARTIFACT"
+
+RUNTIME_ARGS=()
+
+stage_runtime_artifact() {
+  local label="$1"
+  local src="$2"
+  local dest="$3"
+  local tmp="${dest}.tmp.$$"
+
+  rm -f "$tmp"
+  if [ ! -f "$src" ]; then
+    echo "verus qualification: RS-0906: $label runtime artifact was not produced" >&2
+    OVERALL=1
+    return 1
+  fi
+  if ! cp "$src" "$tmp"; then
+    echo "verus qualification: RS-0906: $label runtime artifact copy failed" >&2
+    rm -f "$tmp"
+    OVERALL=1
+    return 1
+  fi
+  if ! mv "$tmp" "$dest"; then
+    echo "verus qualification: RS-0906: $label runtime artifact move failed" >&2
+    rm -f "$tmp"
+    OVERALL=1
+    return 1
+  fi
+  RUNTIME_ARGS+=(--runtime-artifact "$dest")
+  return 0
+}
+
+stage_runtime_artifact "release" "$TARGET_ROOT/${TARGET_SUFFIX}release/rockstream" "$RUNTIME_ARTIFACT"
+stage_runtime_artifact "debug" "$TARGET_ROOT/${TARGET_SUFFIX}debug/rockstream" "$DEBUG_ARTIFACT"
 
 if [ "$OVERALL" -eq 0 ]; then
   STATUS=passed
@@ -99,6 +124,7 @@ fi
 python3 "$ROOT/scripts/record-verus-qualification.py" \
   --root "$ROOT" --run-id "$RUN_ID" --status "$STATUS" \
   --steps "$STEPS" --target "$QUALIFY_TARGET" \
-  --runtime-artifact "$RUNTIME_ARTIFACT" --runtime-artifact "$DEBUG_ARTIFACT" \
+  ${RUNTIME_ARGS[@]+"${RUNTIME_ARGS[@]}"} \
   --output "$OUTPUT_ROOT/qualification.json" || OVERALL=1
 exit "$OVERALL"
+
