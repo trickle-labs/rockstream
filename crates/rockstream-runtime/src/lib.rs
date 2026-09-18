@@ -52,6 +52,9 @@ pub use quota::WorkerQuotaManager;
 pub mod source_pressure;
 pub use source_pressure::{SourcePressureController, SourcePressureState};
 
+pub mod spill_governor;
+pub use spill_governor::{SpillGovernor, SpillGovernorConfig};
+
 #[cfg(test)]
 mod tests {
     use super::*;

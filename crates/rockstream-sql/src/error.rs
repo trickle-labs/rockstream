@@ -5,7 +5,7 @@
 
 use rockstream_types::error_code::{
     ErrorCode, RS_0001, RS_0003, RS_1002, RS_1011, RS_1012, RS_1013, RS_1016, RS_1019, RS_1731,
-    RS_2016, RS_2022,
+    RS_2016, RS_2022, RS_4022, RS_5003,
 };
 use thiserror::Error;
 
@@ -111,6 +111,31 @@ pub enum SqlError {
         "[RS-1731] Workload-catalog write rejected: this node is not the control-plane leader"
     )]
     NotLeader,
+
+    /// Operator estimated state exceeds worker memory budget and cannot spill.
+    ///
+    /// RS-5003: reduce state size, add windowing, or increase worker memory budget.
+    #[error(
+        "[RS-5003] state_budget_exceeded: operator '{operator}' estimated state ({estimated_bytes} bytes) exceeds worker budget ({budget_bytes} bytes). Next steps: {next_steps}"
+    )]
+    StateBudgetExceeded {
+        operator: String,
+        estimated_bytes: u64,
+        budget_bytes: u64,
+        next_steps: String,
+    },
+
+    /// Operator is unsupported for state beyond RAM.
+    ///
+    /// RS-4022: use distributive aggregates (SUM, COUNT, MIN, MAX, AVG) or bounded windows.
+    #[error(
+        "[RS-4022] unsupported_large_state_operator: operator '{operator}' is not supported for state beyond RAM (budget: {budget_bytes} bytes). Next steps: {next_steps}"
+    )]
+    UnsupportedLargeStateOperator {
+        operator: String,
+        budget_bytes: u64,
+        next_steps: String,
+    },
 }
 
 impl SqlError {
@@ -131,6 +156,8 @@ impl SqlError {
             Self::DdlParseError { .. } => RS_1012,
             Self::MalformedReturningClause => RS_2022,
             Self::NotLeader => RS_1731,
+            Self::StateBudgetExceeded { .. } => RS_5003,
+            Self::UnsupportedLargeStateOperator { .. } => RS_4022,
         }
     }
 }

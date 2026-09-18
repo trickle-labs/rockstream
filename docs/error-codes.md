@@ -12,12 +12,12 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 ## Subsystem Index
 
 - [0xxx: Internal & General System](#0xxx-internal--general-system) (5 codes)
-- [1xxx: Pipeline, Plan & Optimization](#1xxx-pipeline-plan--optimization) (26 codes)
+- [1xxx: Pipeline, Plan & Optimization](#1xxx-pipeline-plan--optimization) (27 codes)
 - [17xx: Lease Management & Raft Leadership](#17xx-lease-management--raft-leadership) (4 codes)
 - [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (38 codes)
 - [24xx: Authentication, mTLS & Secrets](#24xx-authentication-mtls--secrets) (18 codes)
 - [25xx-26xx: Extended Query, Cursors & Transactions](#25xx-26xx-extended-query-cursors--transactions) (9 codes)
-- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (55 codes)
+- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (56 codes)
 - [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (23 codes)
 - [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (16 codes)
 - [6xxx: Connector Schema Evolution](#6xxx-connector-schema-evolution) (1 codes)
@@ -104,6 +104,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-1020`](#rs-1020) | `operator.not_found` | Operator not found in pipeline | `Error` | `42P01` | `NonRetryable` |
 | [`RS-1021`](#rs-1021) | `arrangement.key_decode_failed` | Arrangement key decoding failed or unsupported | `Error` | `22000` | `NonRetryable` |
 | [`RS-1030`](#rs-1030) | `migration.timeout_exceeded` | Migration state exceeded its configured timeout budget | `Error` | `57014` | `ExponentialBackoff` |
+| [`RS-1201`](#rs-1201) | `numeric.value_out_of_range` | Numeric value out of range or arithmetic overflow | `Error` | `22003` | `NonRetryable` |
 | [`RS-1512`](#rs-1512) | `recursion.inner_frontier_stall` | Inner-frontier stall in distributed recursion; per-shard recompute triggered | `Warning` | `55000` | `AfterClusterRecovery` |
 | [`RS-1513`](#rs-1513) | `recursion.max_iteration_exceeded` | Distributed recursion max-iteration cap exceeded without convergence | `Error` | `54000` | `NonRetryable` |
 | [`RS-1601`](#rs-1601) | `lease.rejected` | Lease acquisition rejected: shard already leased or fence token invalid | `Error` | `55000` | `AfterLeaderElection` |
@@ -284,6 +285,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `57014`
 - **Retry Class**: `ExponentialBackoff`
 - **Default Next Steps**: Check donor/recipient shard health, then retry or abort the migration; increase the specific migration timeout only if the cluster is healthy but the workload is larger than expected.
+
+### <a id="rs-1201"></a> `RS-1201` — Numeric value out of range or arithmetic overflow
+
+- **Key**: `numeric.value_out_of_range`
+- **Severity**: `Error`
+- **SQLSTATE**: `22003`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Check for numeric overflow in arithmetic operations and ensure input values stay within valid ranges.
 
 ### <a id="rs-1512"></a> `RS-1512` — Inner-frontier stall in distributed recursion; per-shard recompute triggered
 

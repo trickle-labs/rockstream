@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "b87d9beb593d532fdf90920062c2d414ee4aa5279c0f065f61a3dddc76cd3fa3",
+    "candidate_identity_digest": "016631451a995af9790e25c960e63ace01b03b606309ab54e8565c2394940952",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -6436,6 +6436,16 @@
         "retry_class": "ExponentialBackoff",
         "default_next_steps": "Check donor/recipient shard health, then retry or abort the migration; increase the specific migration timeout only if the cluster is healthy but the workload is larger than expected.",
         "doc_anchor": "rs-1030"
+      },
+      {
+        "code": "RS-1201",
+        "key": "numeric.value_out_of_range",
+        "title": "Numeric value out of range or arithmetic overflow",
+        "severity": "ERROR",
+        "sqlstate": "22003",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Check for numeric overflow in arithmetic operations and ensure input values stay within valid ranges.",
+        "doc_anchor": "rs-1201"
       },
       {
         "code": "RS-1512",

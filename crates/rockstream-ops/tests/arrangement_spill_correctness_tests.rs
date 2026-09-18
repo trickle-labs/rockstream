@@ -206,3 +206,193 @@ async fn test_window_spill_correctness() {
         res.err()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_aggregate_demand_loading_and_eviction_under_budget() {
+    let _guard = METRICS_TEST_LOCK.lock().unwrap();
+    reset_all();
+
+    let db = open_test_db("agg-spill-demand-test").await;
+    let schema = int64_schema(2);
+
+    // Budget of 240 bytes (approx 10 groups of 24 bytes in AggState)
+    let agg_op = AggregateOp::new(OperatorId(42))
+        .with_db(db.clone())
+        .with_memory_limit(240);
+
+    // ── Epoch 1: Ingest 50 distinct groups (0..50) ──────────────────────────
+    let keys: Vec<i64> = (0..50).collect();
+    let vals: Vec<i64> = vec![100; 50];
+    let batch1 = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(Int64Array::from(vals)),
+        ],
+    )
+    .unwrap();
+    let zset1 = ArrowZSet::new(batch1, vec![1; 50]);
+
+    let out1 = agg_op
+        .process_delta(zset1)
+        .expect("epoch 1 delta should succeed");
+    assert_eq!(out1.num_rows(), 50);
+
+    // Persist epoch 1 to ShardDb and clear dirty keys
+    rockstream_ops::aggregate::persist_agg_state(&db, &agg_op)
+        .await
+        .unwrap();
+
+    // After commit and eviction, in-memory cached entries must be bounded under budget (<= 10)
+    assert!(
+        agg_op.in_memory_groups() <= 10,
+        "in-memory entries {} must be <= 10 under 240-byte budget",
+        agg_op.in_memory_groups()
+    );
+
+    // ── Epoch 2: Update evicted key, retract group to 0, add new group ──────
+    // Key 5: was 100, add 50 -> new (150, count 2)
+    // Key 10: was 100, retract 100 (w = -1) -> retracted to 0
+    // Key 100: new group, add 50 (w = 1) -> new (50, count 1)
+    let batch2 = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![5, 10, 100])),
+            Arc::new(Int64Array::from(vec![50, 100, 50])),
+        ],
+    )
+    .unwrap();
+    let zset2 = ArrowZSet::new(batch2, vec![1, -1, 1]);
+
+    let out2 = agg_op
+        .process_delta(zset2)
+        .expect("epoch 2 delta should succeed");
+
+    // Output delta verification:
+    // Key 5: retract (5, 100, 1, 100.0, -1), insert (5, 150, 2, 75.0, +1)
+    // Key 10: retract (10, 100, 1, 100.0, -1)
+    // Key 100: insert (100, 50, 1, 50.0, +1)
+    // Total 4 rows emitted!
+    assert_eq!(
+        out2.num_rows(),
+        4,
+        "expected 4 delta rows in epoch 2 output"
+    );
+
+    let out_k = out2
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let out_sum = out2
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let out_count = out2
+        .data
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    let mut rows: Vec<(i64, i64, i64, i64)> = (0..out2.num_rows())
+        .map(|r| {
+            (
+                out_k.value(r),
+                out_sum.value(r),
+                out_count.value(r),
+                out2.weights[r],
+            )
+        })
+        .collect();
+    rows.sort_unstable();
+
+    assert_eq!(
+        rows,
+        vec![
+            (5, 100, 1, -1),
+            (5, 150, 2, 1),
+            (10, 100, 1, -1),
+            (100, 50, 1, 1),
+        ]
+    );
+
+    // Persist epoch 2
+    rockstream_ops::aggregate::persist_agg_state(&db, &agg_op)
+        .await
+        .unwrap();
+
+    // Verify key 10 was deleted from ShardDb
+    let key10_storage = rockstream_storage::ShardKeyEncoder::encode(
+        rockstream_storage::ShardPrefix::OpState,
+        42,
+        &10_i64.to_be_bytes(),
+    );
+    assert_eq!(
+        db.get(&key10_storage).await.unwrap(),
+        None,
+        "key 10 must be deleted from storage after count reaches 0"
+    );
+
+    // ── Epoch 3: Checked arithmetic overflow atomic rollback (RS-1201) ──────
+    let overflow_batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![5])),
+            Arc::new(Int64Array::from(vec![i64::MAX])),
+        ],
+    )
+    .unwrap();
+    let overflow_zset = ArrowZSet::new(overflow_batch, vec![1]);
+
+    let overflow_res = agg_op.process_delta(overflow_zset);
+    assert!(
+        overflow_res.is_err(),
+        "arithmetic overflow must return error"
+    );
+    let err_msg = format!("{}", overflow_res.err().unwrap());
+    assert!(
+        err_msg.contains("RS-1016") || err_msg.contains("RS-1201"),
+        "error must carry RS-1016 or RS-1201 code, got: {err_msg}"
+    );
+
+    // Atomic rollback check: state was not corrupted by failed delta.
+    // Key 5 still has sum 150, count 2. An update with value 10 should produce sum 160.
+    let resume_batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![5])),
+            Arc::new(Int64Array::from(vec![10])),
+        ],
+    )
+    .unwrap();
+    let resume_zset = ArrowZSet::new(resume_batch, vec![1]);
+    let resume_out = agg_op
+        .process_delta(resume_zset)
+        .expect("recovery delta must succeed");
+    assert_eq!(resume_out.num_rows(), 2);
+    let r_sum = resume_out
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let r_cnt = resume_out
+        .data
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    // Retract (150, 2) and emit (160, 3)
+    assert_eq!(
+        (r_sum.value(0), r_cnt.value(0), resume_out.weights[0]),
+        (150, 2, -1)
+    );
+    assert_eq!(
+        (r_sum.value(1), r_cnt.value(1), resume_out.weights[1]),
+        (160, 3, 1)
+    );
+}

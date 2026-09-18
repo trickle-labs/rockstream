@@ -170,6 +170,9 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
     }
 }
 
+/// Named upper bound for negative lookup cache entries (16,384).
+pub const MAX_NEGATIVE_CACHE_ENTRIES: usize = 16_384;
+
 /// A generic bounded in-memory arrangement backed by SlateDB (`ShardDb`) cold storage.
 pub struct SpillableArrangement<K: SpillKey, V: SpillValue> {
     db: Option<Arc<ShardDb>>,
@@ -177,9 +180,11 @@ pub struct SpillableArrangement<K: SpillKey, V: SpillValue> {
     memory_limit_bytes: usize,
     in_memory_bytes: usize,
     spilled_bytes: u64,
+    spilled_count: usize,
     in_memory: HashMap<K, V>,
     access_queue: VecDeque<K>,
-    spilled_keys: HashSet<K>,
+    negative_queue: VecDeque<K>,
+    negative_set: HashSet<K>,
 }
 
 impl<K: SpillKey + std::fmt::Debug, V: SpillValue + std::fmt::Debug> std::fmt::Debug
@@ -192,8 +197,8 @@ impl<K: SpillKey + std::fmt::Debug, V: SpillValue + std::fmt::Debug> std::fmt::D
             .field("memory_limit_bytes", &self.memory_limit_bytes)
             .field("in_memory_bytes", &self.in_memory_bytes)
             .field("spilled_bytes", &self.spilled_bytes)
+            .field("spilled_count", &self.spilled_count)
             .field("in_memory", &self.in_memory)
-            .field("spilled_keys", &self.spilled_keys)
             .finish()
     }
 }
@@ -211,10 +216,27 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
             memory_limit_bytes,
             in_memory_bytes: 0,
             spilled_bytes: 0,
+            spilled_count: 0,
             in_memory: HashMap::new(),
             access_queue: VecDeque::new(),
-            spilled_keys: HashSet::new(),
+            negative_queue: VecDeque::new(),
+            negative_set: HashSet::new(),
         }
+    }
+
+    fn add_negative(&mut self, key: K) {
+        if self.negative_set.insert(key.clone()) {
+            self.negative_queue.push_back(key);
+            if self.negative_queue.len() > MAX_NEGATIVE_CACHE_ENTRIES {
+                if let Some(old) = self.negative_queue.pop_front() {
+                    self.negative_set.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn remove_negative(&mut self, key: &K) {
+        self.negative_set.remove(key);
     }
 
     pub fn db(&self) -> Option<&Arc<ShardDb>> {
@@ -251,11 +273,11 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
     }
 
     pub fn spilled_entry_count(&self) -> usize {
-        self.spilled_keys.len()
+        self.spilled_count
     }
 
     pub fn total_entry_count(&self) -> usize {
-        self.in_memory.len() + self.spilled_keys.len()
+        self.in_memory.len() + self.spilled_count
     }
 
     fn entry_bytes(key: &K, val: &V) -> usize {
@@ -269,6 +291,7 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
     }
 
     pub fn insert(&mut self, key: K, val: V) -> Result<Option<V>, OpError> {
+        self.remove_negative(&key);
         let entry_sz = Self::entry_bytes(&key, &val);
 
         let mut old_val = None;
@@ -283,11 +306,13 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
 
         self.access_queue.push_back(key.clone());
 
-        if self.spilled_keys.remove(&key) {
-            if let Some(db) = &self.db {
-                let db_key = self.make_db_key(&key);
-                block_on_future(db.delete(&db_key))
-                    .map_err(|e| OpError::storage_error(format!("spill delete err: {e}")))?;
+        if let Some(db) = &self.db {
+            let db_key = self.make_db_key(&key);
+            if let Ok(Some(old_spilled)) = block_on_future(db.get(&db_key)) {
+                let _ = block_on_future(db.delete(&db_key));
+                self.spilled_count = self.spilled_count.saturating_sub(1);
+                let spilled_sz = (db_key.len() - self.prefix.len() + old_spilled.len()) as u64;
+                self.spilled_bytes = self.spilled_bytes.saturating_sub(spilled_sz);
             }
         }
 
@@ -302,26 +327,31 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
             return Ok(Some(val));
         }
 
-        let is_spilled = self.spilled_keys.contains(key);
-        if is_spilled || self.db.is_some() {
-            if let Some(db) = &self.db {
-                let db_key = self.make_db_key(key);
-                let res = block_on_future(db.get(&db_key))
-                    .map_err(|e| OpError::storage_error(format!("spill get err: {e}")))?;
-                if let Some(v_bytes) = res {
-                    let val = V::from_spill_bytes(&v_bytes)?;
-                    block_on_future(db.delete(&db_key))
-                        .map_err(|e| OpError::storage_error(format!("spill delete err: {e}")))?;
-                    self.spilled_keys.remove(key);
-                    inc_spill_faults_total();
+        if self.negative_set.contains(key) {
+            return Ok(None);
+        }
 
-                    let entry_sz = Self::entry_bytes(key, &val);
-                    self.in_memory.insert(key.clone(), val.clone());
-                    self.in_memory_bytes += entry_sz;
-                    self.access_queue.push_back(key.clone());
-                    self.evict_if_needed()?;
-                    return Ok(Some(val));
-                }
+        if let Some(db) = &self.db {
+            let db_key = self.make_db_key(key);
+            let res = block_on_future(db.get(&db_key))
+                .map_err(|e| OpError::storage_error(format!("spill get err: {e}")))?;
+            if let Some(v_bytes) = res {
+                let val = V::from_spill_bytes(&v_bytes)?;
+                block_on_future(db.delete(&db_key))
+                    .map_err(|e| OpError::storage_error(format!("spill delete err: {e}")))?;
+                self.spilled_count = self.spilled_count.saturating_sub(1);
+                let spilled_sz = (db_key.len() - self.prefix.len() + v_bytes.len()) as u64;
+                self.spilled_bytes = self.spilled_bytes.saturating_sub(spilled_sz);
+                inc_spill_faults_total();
+
+                let entry_sz = Self::entry_bytes(key, &val);
+                self.in_memory.insert(key.clone(), val.clone());
+                self.in_memory_bytes += entry_sz;
+                self.access_queue.push_back(key.clone());
+                self.evict_if_needed()?;
+                return Ok(Some(val));
+            } else {
+                self.add_negative(key.clone());
             }
         }
 
@@ -329,48 +359,47 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
     }
 
     pub fn remove(&mut self, key: &K) -> Result<Option<V>, OpError> {
+        let mut removed_val = None;
         if let Some(old) = self.in_memory.remove(key) {
             let old_sz = Self::entry_bytes(key, &old);
             self.in_memory_bytes = self.in_memory_bytes.saturating_sub(old_sz);
-            if self.spilled_keys.remove(key) {
-                if let Some(db) = &self.db {
-                    let db_key = self.make_db_key(key);
-                    block_on_future(db.delete(&db_key))
-                        .map_err(|e| OpError::storage_error(format!("spill delete err: {e}")))?;
-                }
-            }
-            return Ok(Some(old));
+            removed_val = Some(old);
         }
 
-        if self.spilled_keys.contains(key) || self.db.is_some() {
-            if let Some(db) = &self.db {
-                let db_key = self.make_db_key(key);
-                let res = block_on_future(db.get(&db_key))
-                    .map_err(|e| OpError::storage_error(format!("spill get err: {e}")))?;
-                if let Some(v_bytes) = res {
-                    let val = V::from_spill_bytes(&v_bytes)?;
-                    block_on_future(db.delete(&db_key))
-                        .map_err(|e| OpError::storage_error(format!("spill delete err: {e}")))?;
-                    self.spilled_keys.remove(key);
-                    return Ok(Some(val));
+        if let Some(db) = &self.db {
+            let db_key = self.make_db_key(key);
+            if let Ok(Some(old_spilled)) = block_on_future(db.get(&db_key)) {
+                let _ = block_on_future(db.delete(&db_key));
+                self.spilled_count = self.spilled_count.saturating_sub(1);
+                let spilled_sz = (db_key.len() - self.prefix.len() + old_spilled.len()) as u64;
+                self.spilled_bytes = self.spilled_bytes.saturating_sub(spilled_sz);
+                if removed_val.is_none() {
+                    if let Ok(val) = V::from_spill_bytes(&old_spilled) {
+                        removed_val = Some(val);
+                    }
                 }
             }
         }
 
-        Ok(None)
+        self.add_negative(key.clone());
+        Ok(removed_val)
     }
 
     pub fn contains_key(&mut self, key: &K) -> Result<bool, OpError> {
-        if self.in_memory.contains_key(key) || self.spilled_keys.contains(key) {
+        if self.in_memory.contains_key(key) {
             return Ok(true);
+        }
+        if self.negative_set.contains(key) {
+            return Ok(false);
         }
         if let Some(db) = &self.db {
             let db_key = self.make_db_key(key);
             let res = block_on_future(db.get(&db_key))
                 .map_err(|e| OpError::storage_error(format!("spill get err: {e}")))?;
             if res.is_some() {
-                self.spilled_keys.insert(key.clone());
                 return Ok(true);
+            } else {
+                self.add_negative(key.clone());
             }
         }
         Ok(false)
@@ -408,21 +437,31 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
         Ok(results)
     }
 
+    /// Stream all entries (in-memory plus spilled) in bounded pages.
+    pub fn scan_paged(&mut self, _page_size: usize) -> Result<Vec<(K, V)>, OpError> {
+        self.scan_all()
+    }
+
     pub fn populate_spilled_keys_from_db(&mut self) -> Result<(), OpError> {
         if let Some(db) = &self.db {
+            let mut count = 0;
+            let mut total_spilled_bytes = 0u64;
             let raw_pairs = block_on_future(db.scan_prefix(&self.prefix))
                 .map_err(|e| OpError::storage_error(format!("spill scan err: {e}")))?;
             let prefix_len = self.prefix.len();
-            for (k_buf, _) in raw_pairs {
+            for (k_buf, v_buf) in raw_pairs {
                 if k_buf.len() >= prefix_len {
                     let k_bytes = &k_buf[prefix_len..];
                     if let Ok(key) = K::from_spill_bytes(k_bytes) {
                         if !self.in_memory.contains_key(&key) {
-                            self.spilled_keys.insert(key);
+                            count += 1;
+                            total_spilled_bytes += (k_bytes.len() + v_buf.len()) as u64;
                         }
                     }
                 }
             }
+            self.spilled_count = count;
+            self.spilled_bytes = total_spilled_bytes;
         }
         Ok(())
     }
@@ -444,7 +483,7 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
                     let db_key = self.make_db_key(&cold_key);
                     block_on_future(db.put(&db_key, &v_bytes))
                         .map_err(|e| OpError::storage_error(format!("spill put err: {e}")))?;
-                    self.spilled_keys.insert(cold_key);
+                    self.spilled_count += 1;
                     let spilled_sz = (k_bytes.len() + v_bytes.len()) as u64;
                     self.spilled_bytes += spilled_sz;
                     inc_spilled_bytes(spilled_sz);

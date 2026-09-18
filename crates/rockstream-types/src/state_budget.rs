@@ -57,6 +57,13 @@ impl fmt::Display for StateBudgetError {
                 self.max_bytes
             );
         }
+        if self.operator_name == "disk-occupancy" || self.operator_name.starts_with("disk-") {
+            return write!(
+                f,
+                "RS-2021: disk space exhausted: disk occupancy ceiling exceeded for '{}': current={} bytes, requested={} bytes, limit={} bytes; next_steps: compact storage or expand disk volume",
+                self.operator_name, self.current_bytes, self.requested_bytes, self.max_bytes
+            );
+        }
         if self.operator_name.starts_with("waiter-timeout-") {
             return write!(
                 f,

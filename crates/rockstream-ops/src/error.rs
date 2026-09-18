@@ -85,6 +85,12 @@ pub enum OpError {
     )]
     NumericOverflow { detail: String, code: ErrorCode },
 
+    /// Numeric value out of range or arithmetic overflow (RS-1201).
+    #[error(
+        "[{code}] Numeric value out of range: {detail}; next_steps: check for numeric overflow in arithmetic operations and ensure input values stay within valid ranges"
+    )]
+    NumericValueOutOfRange { detail: String, code: ErrorCode },
+
     /// MIN/MAX multiset retraction underflow.
     #[error(
         "[{code}] MIN/MAX retraction underflow for group key {group_key}, value {value}: next_steps: ensure every retraction is matched by a prior insertion; check source event ordering"
@@ -327,6 +333,14 @@ impl OpError {
         Self::NumericOverflow {
             detail: detail.into(),
             code: RS_1016,
+        }
+    }
+
+    pub fn numeric_value_out_of_range(detail: impl Into<String>) -> Self {
+        use rockstream_types::error_code::RS_1201;
+        Self::NumericValueOutOfRange {
+            detail: detail.into(),
+            code: RS_1201,
         }
     }
 

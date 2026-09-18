@@ -18,6 +18,7 @@
 
 pub mod canonicalize;
 pub mod catalog;
+pub mod compile;
 pub mod distribution;
 pub mod dml;
 pub mod error;

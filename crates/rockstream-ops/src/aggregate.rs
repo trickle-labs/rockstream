@@ -32,7 +32,7 @@
 //! arrangement.  Call `AggregateOp::load_from_storage(db, op_id)` on restart
 //! to restore state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -379,7 +379,8 @@ impl AggState {
 pub const MAX_EPOCH_CONSOLIDATION_GROUPS: usize = 1_000_000;
 /// Named upper bound for epoch consolidation staging memory (64 MiB).
 pub const MAX_EPOCH_CONSOLIDATION_BYTES: usize = 64 * 1024 * 1024;
-const MAX_AGGREGATE_RESTORE_BYTES: usize = 64 * 1024 * 1024;
+#[allow(dead_code)]
+pub const MAX_AGGREGATE_RESTORE_BYTES: usize = 64 * 1024 * 1024;
 
 /// In-memory staged accumulator for epoch group input consolidation.
 /// Consolidates inputs per group key `k`, computes net sum/count in i128/i64,
@@ -487,6 +488,9 @@ impl Default for StagedEpochAggregator {
 
 // ─── AggregateOp ─────────────────────────────────────────────────────────────
 
+/// Named upper bound for clean LRU capacity in AggregateOp.
+pub const MAX_CLEAN_LRU_CAPACITY: usize = 262_144;
+
 /// Stateful incremental aggregate operator.
 ///
 /// Input:  two Int64 columns `(k, v)`.
@@ -494,11 +498,14 @@ impl Default for StagedEpochAggregator {
 ///
 /// Uses interior mutability (`Mutex`) so it satisfies `Operator: &self`.
 pub struct AggregateOp {
+    db: Mutex<Option<Arc<ShardDb>>>,
     state: Mutex<AggState>,
-    dirty_keys: Mutex<std::collections::HashSet<i64>>,
+    dirty_keys: Mutex<HashSet<i64>>,
+    clean_lru: Mutex<VecDeque<i64>>,
     pub op_id: OperatorId,
     max_groups: AtomicUsize,
     max_bytes: AtomicUsize,
+    max_state_bytes: AtomicUsize,
     last_consolidation_groups: AtomicUsize,
     last_consolidation_bytes: AtomicUsize,
 }
@@ -515,12 +522,16 @@ impl AggregateOp {
 
     /// Create from pre-loaded state (used after loading from storage).
     pub fn with_state(op_id: OperatorId, state: AggState) -> Self {
+        let clean_keys: VecDeque<i64> = state.entries.keys().copied().collect();
         AggregateOp {
+            db: Mutex::new(None),
             state: Mutex::new(state),
-            dirty_keys: Mutex::new(std::collections::HashSet::new()),
+            dirty_keys: Mutex::new(HashSet::new()),
+            clean_lru: Mutex::new(clean_keys),
             op_id,
             max_groups: AtomicUsize::new(MAX_EPOCH_CONSOLIDATION_GROUPS),
             max_bytes: AtomicUsize::new(MAX_EPOCH_CONSOLIDATION_BYTES),
+            max_state_bytes: AtomicUsize::new(0),
             last_consolidation_groups: AtomicUsize::new(0),
             last_consolidation_bytes: AtomicUsize::new(0),
         }
@@ -529,14 +540,47 @@ impl AggregateOp {
     /// Create with custom consolidation limits.
     pub fn with_limits(op_id: OperatorId, max_groups: usize, max_bytes: usize) -> Self {
         AggregateOp {
+            db: Mutex::new(None),
             state: Mutex::new(AggState::new()),
-            dirty_keys: Mutex::new(std::collections::HashSet::new()),
+            dirty_keys: Mutex::new(HashSet::new()),
+            clean_lru: Mutex::new(VecDeque::new()),
             op_id,
             max_groups: AtomicUsize::new(max_groups),
             max_bytes: AtomicUsize::new(max_bytes),
+            max_state_bytes: AtomicUsize::new(0),
             last_consolidation_groups: AtomicUsize::new(0),
             last_consolidation_bytes: AtomicUsize::new(0),
         }
+    }
+
+    /// Attach a ShardDb for transparent spill-to-disk and demand-loading.
+    pub fn with_db(self, db: Arc<ShardDb>) -> Self {
+        *self.db.lock().unwrap() = Some(db);
+        self
+    }
+
+    /// Set a ShardDb for transparent spill-to-disk and demand-loading.
+    pub fn set_db(&self, db: Arc<ShardDb>) {
+        *self.db.lock().unwrap() = Some(db);
+    }
+
+    /// Set in-memory state capacity budget in bytes.
+    pub fn with_memory_limit(self, max_bytes: usize) -> Self {
+        self.max_state_bytes.store(max_bytes, Ordering::Relaxed);
+        self
+    }
+
+    /// Set in-memory state capacity budget in bytes dynamically.
+    pub fn set_memory_limit(&self, max_bytes: usize) {
+        self.max_state_bytes.store(max_bytes, Ordering::Relaxed);
+    }
+
+    /// Number of in-memory cached groups.
+    pub fn in_memory_groups(&self) -> usize {
+        self.state
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .entry_count()
     }
 
     /// Set consolidation limits dynamically.
@@ -557,10 +601,39 @@ impl AggregateOp {
 
     /// Mark the current dirty-key set durable after its caller's batch commits.
     pub fn clear_dirty_keys(&self) {
-        self.dirty_keys
+        let mut dirty = self
+            .dirty_keys
             .lock()
-            .expect("AggregateOp dirty-key mutex poisoned")
-            .clear();
+            .expect("AggregateOp dirty-key mutex poisoned");
+        let mut clean_lru = self
+            .clean_lru
+            .lock()
+            .expect("AggregateOp clean_lru mutex poisoned");
+        let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
+
+        for &k in dirty.iter() {
+            if state.entries.contains_key(&k) {
+                clean_lru.push_back(k);
+                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                    clean_lru.pop_front();
+                }
+            }
+        }
+        dirty.clear();
+
+        let limit = self.max_state_bytes.load(Ordering::Relaxed);
+        let has_db = self
+            .db
+            .lock()
+            .expect("AggregateOp db mutex poisoned")
+            .is_some();
+        if limit > 0 && has_db {
+            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
+                if let Some(cold_k) = clean_lru.pop_front() {
+                    state.entries.remove(&cold_k);
+                }
+            }
+        }
     }
 
     /// Number of live groups (fill-level metric).
@@ -576,26 +649,78 @@ impl AggregateOp {
     /// The caller (usually `ViewSinkOp` or group commit) merges this batch
     /// into the epoch's group-commit `WriteBatch`.
     pub fn state_write_batch(&self) -> WriteBatch {
-        self.state
+        let state = self.state.lock().expect("AggregateOp mutex poisoned");
+        let mut wb = state.encode_as_write_batch(self.op_id);
+        let dirty = self
+            .dirty_keys
             .lock()
-            .expect("AggregateOp mutex poisoned")
-            .encode_as_write_batch(self.op_id)
+            .expect("AggregateOp dirty_keys mutex poisoned");
+        for &k in dirty.iter() {
+            if !state.entries.contains_key(&k) {
+                let key =
+                    ShardKeyEncoder::encode(ShardPrefix::OpState, self.op_id.0, &k.to_be_bytes());
+                wb.delete(&key);
+            }
+        }
+        wb
     }
 
     /// Restore an `AggregateOp` from a `ShardDb` (called at shard startup).
     pub async fn load_from_storage(db: &ShardDb, op_id: OperatorId) -> Result<Self, OpError> {
         let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
-        let (entries, truncated) = db
-            .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
-            .await
-            .map_err(OpError::storage)?;
-        if truncated {
-            return Err(OpError::internal(format!(
-                "aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
-            )));
+        let mut state = AggState::new();
+        let mut next_token: Option<bytes::Bytes> = None;
+        let mut clean_lru = VecDeque::new();
+
+        loop {
+            let page = db
+                .scan_prefix_page(&prefix, next_token.as_deref(), 1024, 1024 * 1024)
+                .await
+                .map_err(OpError::storage)?;
+
+            for (key, value) in &page.rows {
+                if key.len() < prefix.len() + 8 || !key.starts_with(&prefix) {
+                    return Err(OpError::storage_error(format!(
+                        "RS-3616: corrupted recovery record: key prefix mismatch or undersized key length {}",
+                        key.len()
+                    )));
+                }
+                let k_bytes: [u8; 8] =
+                    key[prefix.len()..prefix.len() + 8]
+                        .try_into()
+                        .map_err(|_| {
+                            OpError::storage_error("RS-3616: corrupted group key".to_string())
+                        })?;
+                if value.len() < 16 {
+                    return Err(OpError::storage_error(format!(
+                        "RS-3616: corrupted recovery record: value length {} < 16",
+                        value.len()
+                    )));
+                }
+                let sum = i64::from_be_bytes(value[..8].try_into().unwrap());
+                let count = i64::from_be_bytes(value[8..16].try_into().unwrap());
+                if count != 0 {
+                    let k = i64::from_be_bytes(k_bytes);
+                    state.entries.insert(k, (sum, count));
+                    clean_lru.push_back(k);
+                    if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                        clean_lru.pop_front();
+                    }
+                }
+            }
+
+            if page.is_last_page {
+                break;
+            }
+            next_token = page.next_token;
         }
-        let state = AggState::decode_from_entries(&entries, op_id);
-        Ok(Self::with_state(op_id, state))
+
+        let op = Self::with_state(op_id, state);
+        *op.db.lock().expect("AggregateOp db mutex poisoned") = Some(Arc::new(db.clone()));
+        *op.clean_lru
+            .lock()
+            .expect("AggregateOp clean_lru mutex poisoned") = clean_lru;
+        Ok(op)
     }
 
     /// Load persisted state from `db` into this already-constructed
@@ -606,17 +731,68 @@ impl AggregateOp {
     /// to rebuild the pipeline around a freshly-returned instance).
     pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
         let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, self.op_id.0);
-        let (entries, truncated) = db
-            .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
-            .await
-            .map_err(OpError::storage)?;
-        if truncated {
-            return Err(OpError::internal(format!(
-                "aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
-            )));
+        let mut state = AggState::new();
+        let mut next_token: Option<bytes::Bytes> = None;
+        let mut clean_lru = VecDeque::new();
+
+        loop {
+            let page = db
+                .scan_prefix_page(&prefix, next_token.as_deref(), 1024, 1024 * 1024)
+                .await
+                .map_err(OpError::storage)?;
+
+            for (key, value) in &page.rows {
+                if key.len() < prefix.len() + 8 || !key.starts_with(&prefix) {
+                    return Err(OpError::storage_error(format!(
+                        "RS-3616: corrupted recovery record: key prefix mismatch or undersized key length {}",
+                        key.len()
+                    )));
+                }
+                let k_bytes: [u8; 8] =
+                    key[prefix.len()..prefix.len() + 8]
+                        .try_into()
+                        .map_err(|_| {
+                            OpError::storage_error("RS-3616: corrupted group key".to_string())
+                        })?;
+                if value.len() < 16 {
+                    return Err(OpError::storage_error(format!(
+                        "RS-3616: corrupted recovery record: value length {} < 16",
+                        value.len()
+                    )));
+                }
+                let sum = i64::from_be_bytes(value[..8].try_into().unwrap());
+                let count = i64::from_be_bytes(value[8..16].try_into().unwrap());
+                if count != 0 {
+                    let k = i64::from_be_bytes(k_bytes);
+                    state.entries.insert(k, (sum, count));
+                    clean_lru.push_back(k);
+                    if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                        clean_lru.pop_front();
+                    }
+                }
+            }
+
+            if page.is_last_page {
+                break;
+            }
+            next_token = page.next_token;
         }
-        let state = AggState::decode_from_entries(&entries, self.op_id);
+
+        let limit = self.max_state_bytes.load(Ordering::Relaxed);
+        if limit > 0 {
+            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
+                if let Some(cold_k) = clean_lru.pop_front() {
+                    state.entries.remove(&cold_k);
+                }
+            }
+        }
+
         *self.state.lock().expect("AggregateOp mutex poisoned") = state;
+        *self.db.lock().expect("AggregateOp db mutex poisoned") = Some(Arc::new(db.clone()));
+        *self
+            .clean_lru
+            .lock()
+            .expect("AggregateOp clean_lru mutex poisoned") = clean_lru;
         Ok(())
     }
 
@@ -743,10 +919,53 @@ impl AggregateOp {
 
         let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
         let mut transitions = Vec::with_capacity(staged.order.len());
+        let db_opt = self
+            .db
+            .lock()
+            .expect("AggregateOp db mutex poisoned")
+            .clone();
+        let current_dirty = self
+            .dirty_keys
+            .lock()
+            .expect("AggregateOp dirty-key mutex poisoned")
+            .clone();
+
+        let mut demand_loaded: HashMap<i64, (i64, i64)> = HashMap::new();
 
         for &k in &staged.order {
             let (delta_sum, delta_count) = staged.entries[&k];
-            let old = state.entries.get(&k).copied();
+            let mut old = state.entries.get(&k).copied();
+
+            if old.is_none() {
+                // If the key was deleted in the current uncommitted epoch, old is None
+                if !current_dirty.contains(&k) {
+                    if let Some(db) = &db_opt {
+                        let key_bytes = ShardKeyEncoder::encode(
+                            ShardPrefix::OpState,
+                            self.op_id.0,
+                            &k.to_be_bytes(),
+                        );
+                        let opt_bytes =
+                            crate::spill::block_on_future(db.get(&key_bytes)).map_err(|e| {
+                                OpError::storage_error(format!(
+                                    "AggregateOp demand load failed: {e}"
+                                ))
+                            })?;
+                        if let Some(bytes) = opt_bytes {
+                            if bytes.len() >= 16 {
+                                let sum = i64::from_be_bytes(bytes[..8].try_into().unwrap());
+                                let count = i64::from_be_bytes(bytes[8..16].try_into().unwrap());
+                                if count > 0 {
+                                    rockstream_types::metrics::inc_spill_faults_total();
+                                    old = Some((sum, count));
+                                    demand_loaded.insert(k, (sum, count));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let (old_sum, old_count) = old.unwrap_or((0, 0));
             let old_state = if old_count > 0 {
                 Some((old_sum, old_count))
@@ -792,19 +1011,34 @@ impl AggregateOp {
             });
         }
 
+        // If we reached here, no overflow occurred! Commit changes atomically.
+        {
+            let mut clean_lru = self
+                .clean_lru
+                .lock()
+                .expect("AggregateOp clean_lru mutex poisoned");
+            for (dk, dv) in demand_loaded {
+                state.entries.insert(dk, dv);
+                clean_lru.push_back(dk);
+                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                    clean_lru.pop_front();
+                }
+            }
+        }
+
         let mut out_k: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_sum: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_count: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_avg: Vec<f64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_weights: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
-        let mut dirty_keys = std::collections::HashSet::new();
+        let mut newly_dirtied = std::collections::HashSet::new();
 
         for t in transitions {
             if !t.changed {
                 continue;
             }
 
-            dirty_keys.insert(t.key);
+            newly_dirtied.insert(t.key);
 
             // Retract old aggregate row
             if let Some((old_sum, old_count)) = t.old_state {
@@ -830,17 +1064,35 @@ impl AggregateOp {
             }
         }
 
-        let mut dirty_keys_vec: Vec<i64> = dirty_keys.into_iter().collect();
+        let mut dirty_keys_vec: Vec<i64> = newly_dirtied.into_iter().collect();
         dirty_keys_vec.sort_unstable();
         let mutations = state.encode_mutations_for_keys(self.op_id, &dirty_keys_vec);
         let logical_mutation_bytes = mutations.iter().map(|mutation| mutation.size_bytes()).sum();
         let state_bytes = state.state_bytes() as usize;
 
-        self.dirty_keys
+        let mut dirty_guard = self
+            .dirty_keys
             .lock()
-            .expect("AggregateOp dirty-key mutex poisoned")
-            .extend(dirty_keys_vec.iter().copied());
+            .expect("AggregateOp dirty-key mutex poisoned");
+        dirty_guard.extend(dirty_keys_vec.iter().copied());
 
+        // Evict cold clean entries if over max_state_bytes
+        let limit = self.max_state_bytes.load(Ordering::Relaxed);
+        if limit > 0 && db_opt.is_some() {
+            let mut clean_lru = self
+                .clean_lru
+                .lock()
+                .expect("AggregateOp clean_lru mutex poisoned");
+            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
+                if let Some(cold_k) = clean_lru.pop_front() {
+                    if !dirty_guard.contains(&cold_k) {
+                        state.entries.remove(&cold_k);
+                    }
+                }
+            }
+        }
+
+        drop(dirty_guard);
         drop(state);
         debug!(
             op_id = self.op_id.0,

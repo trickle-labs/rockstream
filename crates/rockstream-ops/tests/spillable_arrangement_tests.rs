@@ -79,3 +79,47 @@ async fn sole_oversized_entry_spills_and_scans_exactly() {
         )]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_spillable_arrangement_zero_unbounded_key_metadata() {
+    let db = open_test_db("spill-test-zero-metadata").await;
+    // Limit memory to 200 bytes so that only a tiny fraction of 2,000 entries can stay in memory
+    let mut arr: SpillableArrangement<Vec<u8>, Vec<u8>> =
+        SpillableArrangement::new(Some(db.clone()), b"spill:bounded:".to_vec(), 200);
+
+    let count = 2000;
+    for i in 0..count {
+        let key = format!("k{:06}", i).into_bytes();
+        let val = format!("v{:06}", i).into_bytes();
+        arr.insert(key, val).unwrap();
+    }
+
+    // In-memory count must be strictly bounded by memory limit (each entry ~14 bytes + overhead, so <= 15 entries)
+    assert!(arr.in_memory_entry_count() <= 15);
+    // Almost all entries should have spilled
+    assert_eq!(
+        arr.spilled_entry_count(),
+        count - arr.in_memory_entry_count()
+    );
+
+    // Verify negative cache works: non-existent keys return None
+    assert_eq!(arr.get(&b"nonexistent_key".to_vec()).unwrap(), None);
+
+    // Verify all keys can still be retrieved (demand-loaded / faulted from disk)
+    for i in [0, 500, 1000, 1500, 1999] {
+        let key = format!("k{:06}", i).into_bytes();
+        let expected_val = format!("v{:06}", i).into_bytes();
+        assert_eq!(arr.get(&key).unwrap(), Some(expected_val));
+    }
+
+    // Memory usage remains bounded after lookups
+    assert!(arr.in_memory_entry_count() <= 15);
+
+    // Remove some keys and verify removal
+    let del_key = format!("k{:06}", 500).into_bytes();
+    assert_eq!(
+        arr.remove(&del_key).unwrap(),
+        Some(format!("v{:06}", 500).into_bytes())
+    );
+    assert_eq!(arr.get(&del_key).unwrap(), None);
+}

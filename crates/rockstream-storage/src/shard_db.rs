@@ -77,6 +77,19 @@ impl ScanProgressHandle {
     }
 }
 
+/// A single row- and byte-bounded page of key-value pairs (v0.67.1 Slice 2 / V0671-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanPage {
+    /// Key-value pairs in this page.
+    pub rows: Vec<(Bytes, Bytes)>,
+    /// Continuation token (last logical key of this page) to resume scanning, or `None` if EOF.
+    pub next_token: Option<Bytes>,
+    /// True if this is the final page of the scan.
+    pub is_last_page: bool,
+    /// Total serialized bytes in this page.
+    pub page_bytes: usize,
+}
+
 /// Fill-level metric: number of rows in the last partial_query call.
 /// Gauge: updated atomically per call to partial_query.
 pub static PARTIAL_AGG_RESULT_ROWS: std::sync::atomic::AtomicUsize =
@@ -862,14 +875,39 @@ impl ShardDb {
         let mut current_page_rows = 0usize;
         let mut pages = 0u64;
 
-        let all_entries = self.scan_prefix(prefix).await?;
-        for (key, val) in all_entries {
+        let strip_version_prefix = (self.format_version == 2 || self.format_version == 3)
+            && prefix.first().copied() != Some(0x06);
+        let physical_prefix = if strip_version_prefix {
+            if self.format_version == 3 {
+                format_v3_prefix(prefix)
+            } else {
+                format_v2_prefix(prefix)
+            }
+        } else {
+            prefix.to_vec()
+        };
+
+        let mut iter = self.db.scan_prefix(&physical_prefix).await?;
+        while let Some(entry) = iter.next().await? {
             if progress.is_cancelled() {
                 return Err(StorageError::Unsupported(
                     "scan cancelled by caller".to_string(),
                 ));
             }
-            let entry_bytes = key.len() + val.len();
+            let key = if strip_version_prefix {
+                let logical = if self.format_version == 3 {
+                    logical_key_from_format_v3(&entry.key)
+                } else {
+                    logical_key_from_format_v2(&entry.key)
+                };
+                Bytes::copy_from_slice(logical.ok_or_else(|| {
+                    StorageError::Unsupported("invalid versioned storage key".to_string())
+                })?)
+            } else {
+                entry.key
+            };
+
+            let entry_bytes = key.len() + entry.value.len();
             if total_bytes + entry_bytes > max_buffer_bytes {
                 return Err(StorageError::ScanBufferLimitExceeded {
                     bytes: total_bytes + entry_bytes,
@@ -878,7 +916,7 @@ impl ShardDb {
             }
             total_bytes += entry_bytes;
             current_page_rows += 1;
-            results.push((key, val));
+            results.push((key, entry.value));
 
             progress.rows_scanned.fetch_add(1, Ordering::SeqCst);
             progress
@@ -897,6 +935,94 @@ impl ShardDb {
         }
 
         Ok(results)
+    }
+
+    /// Scan a single bounded page with continuation support (v0.67.1 Slice 2 / V0671-03).
+    ///
+    /// Reads at most `page_size` rows and `max_buffer_bytes`. If more entries
+    /// exist under `prefix`, returns `next_token` with the continuation key
+    /// and `is_last_page = false`.
+    pub async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        continuation_token: Option<&[u8]>,
+        page_size: usize,
+        max_buffer_bytes: usize,
+    ) -> Result<ScanPage, StorageError> {
+        let strip_version_prefix = (self.format_version == 2 || self.format_version == 3)
+            && prefix.first().copied() != Some(0x06);
+        let physical_prefix = if strip_version_prefix {
+            if self.format_version == 3 {
+                format_v3_prefix(prefix)
+            } else {
+                format_v2_prefix(prefix)
+            }
+        } else {
+            prefix.to_vec()
+        };
+
+        let mut iter = self.db.scan_prefix(&physical_prefix).await?;
+        let mut rows = Vec::new();
+        let mut page_bytes = 0usize;
+        let mut is_last_page = true;
+
+        let resume_after: Option<Vec<u8>> = continuation_token.map(|tok| {
+            if strip_version_prefix {
+                if self.format_version == 3 {
+                    format_v3_key(tok)
+                } else {
+                    format_v2_key(tok)
+                }
+            } else {
+                tok.to_vec()
+            }
+        });
+
+        while let Some(entry) = iter.next().await? {
+            if let Some(ref resume) = resume_after {
+                if entry.key.as_ref() <= resume.as_slice() {
+                    continue;
+                }
+            }
+
+            let logical_key = if strip_version_prefix {
+                let logical = if self.format_version == 3 {
+                    logical_key_from_format_v3(&entry.key)
+                } else {
+                    logical_key_from_format_v2(&entry.key)
+                };
+                Bytes::copy_from_slice(logical.ok_or_else(|| {
+                    StorageError::Unsupported("invalid versioned storage key".to_string())
+                })?)
+            } else {
+                entry.key
+            };
+
+            let entry_bytes = logical_key.len() + entry.value.len();
+
+            if rows.len() >= page_size
+                || (page_bytes + entry_bytes > max_buffer_bytes && !rows.is_empty())
+            {
+                is_last_page = false;
+                break;
+            }
+
+            page_bytes += entry_bytes;
+            rows.push((logical_key, entry.value));
+        }
+
+        let next_token = if !is_last_page {
+            rows.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+
+        Ok(ScanPage {
+            rows,
+            next_token,
+            is_last_page,
+            page_bytes,
+        })
     }
 
     /// Flush the WAL to durable storage.

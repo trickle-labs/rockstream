@@ -340,6 +340,8 @@ pub const RS_1020: ErrorCode = ErrorCode::new(1020);
 pub const RS_1021: ErrorCode = ErrorCode::new(1021);
 /// Migration state exceeded its configured timeout budget.
 pub const RS_1030: ErrorCode = ErrorCode::new(1030);
+/// Numeric value out of range or arithmetic overflow.
+pub const RS_1201: ErrorCode = ErrorCode::new(1201);
 /// Inner-frontier stall in distributed recursion; per-shard recompute triggered.
 pub const RS_1512: ErrorCode = ErrorCode::new(1512);
 /// Distributed recursion max-iteration cap exceeded without convergence.
