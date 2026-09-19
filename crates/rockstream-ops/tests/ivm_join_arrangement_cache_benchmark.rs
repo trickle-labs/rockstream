@@ -24,12 +24,14 @@ use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
+use rockstream_ops::join::stable_row_id;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_ops::{JoinKind, JoinOp, JoinPipeline};
 use rockstream_storage::shard_db::ShardDb;
 use rockstream_storage::storage_context::WorkerStorageContext;
 use rockstream_storage::{JoinSide, ShardKeyEncoder, WriteBatch};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::{KeyCapsule, KeyValue};
 
 #[derive(Debug)]
 struct CountingObjectStore {
@@ -325,6 +327,19 @@ async fn test_ivm_join_differentiation_with_arrangement_lookups() {
         vec![(2, 200, 1), (3, 300, 1),],
         "Joined tuples must exactly match expected pairs and weights"
     );
+    let gets_before_absent_probes = get_counter.load(Ordering::SeqCst);
+    for absent_key in [30i64, 40] {
+        assert!(join_op
+            .probe_arrangement(JoinSide::Right, &absent_key.to_be_bytes())
+            .await
+            .expect("absent prefix probe")
+            .is_empty());
+    }
+    assert_eq!(
+        get_counter.load(Ordering::SeqCst) - gets_before_absent_probes,
+        0,
+        "absent arrangement prefix probes must not issue remote GETs"
+    );
 
     // Differentiation duration must be fast (< 50ms)
     assert!(
@@ -387,4 +402,127 @@ async fn test_join_pipeline_rehydrates_persisted_arrangement_before_differentiat
         })
         .collect();
     assert_eq!(values, vec![vec![2], vec![20], vec![2], vec![200]]);
+}
+
+#[tokio::test]
+async fn test_storage_backed_join_pipeline_processes_persisted_arrangement() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = Arc::new(
+        ShardDb::builder("pipeline-storage-backed-db", store)
+            .with_bloom_filter(14, 0)
+            .build()
+            .await
+            .expect("build shard"),
+    );
+    let op_id = OperatorId(779);
+    let join_key = KeyCapsule::from_values(&[KeyValue::Int64(2)])
+        .expect("encode join key")
+        .typed_bytes()
+        .to_vec();
+    let row_bytes = [2i64.to_be_bytes(), 200i64.to_be_bytes()].concat();
+    let row_id = stable_row_id(op_id.0, &join_key, &row_bytes);
+    let key = ShardKeyEncoder::join_arr_key(JoinSide::Right, op_id.0, &join_key, row_id);
+    shard
+        .put(&key, &row_bytes)
+        .await
+        .expect("persist right row");
+    shard.flush().await.expect("flush right row");
+
+    let pipeline = JoinPipeline::new(
+        vec![],
+        vec![],
+        JoinKind::Inner(Arc::new(
+            JoinOp::new(op_id, vec![0], vec![0]).with_db(shard),
+        )),
+        vec![],
+    );
+    let output = pipeline
+        .process_async(
+            make_test_zset(&[2], &[20], &[1]),
+            make_test_zset(&[], &[], &[]),
+        )
+        .await
+        .expect("process storage-backed join");
+
+    assert_eq!(output.weights, vec![1]);
+    let values: Vec<Vec<i64>> = (0..4)
+        .map(|column| {
+            output
+                .data
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 join output")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(values, vec![vec![2], vec![20], vec![2], vec![200]]);
+}
+
+#[tokio::test]
+async fn test_arrangement_probe_overlay_honors_local_rows_and_deletes() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = Arc::new(
+        ShardDb::builder("arrangement-overlay-db", store)
+            .with_bloom_filter(14, 0)
+            .build()
+            .await
+            .expect("build shard"),
+    );
+    let op_id = OperatorId(780);
+    let join_key = KeyCapsule::from_values(&[KeyValue::Int64(7)])
+        .expect("encode join key")
+        .typed_bytes()
+        .to_vec();
+    let persisted_row = [7i64.to_be_bytes(), 700i64.to_be_bytes()].concat();
+    let persisted_id = stable_row_id(op_id.0, &join_key, &persisted_row);
+    let key = ShardKeyEncoder::join_arr_key(JoinSide::Right, op_id.0, &join_key, persisted_id);
+    shard
+        .put(&key, &persisted_row)
+        .await
+        .expect("persist arrangement row");
+    shard.flush().await.expect("flush arrangement row");
+
+    let deleting_op = JoinOp::new(op_id, vec![0], vec![0]).with_db(shard.clone());
+    assert_eq!(
+        deleting_op
+            .probe_arrangement(JoinSide::Right, &join_key)
+            .await
+            .expect("load persisted arrangement"),
+        vec![(persisted_row.clone(), 1)]
+    );
+    deleting_op
+        .process_epoch(
+            make_test_zset(&[], &[], &[]),
+            make_test_zset(&[7], &[700], &[-1]),
+        )
+        .expect("delete persisted arrangement row");
+    assert_eq!(
+        deleting_op
+            .point_lookup_arrangement(JoinSide::Right, &join_key, persisted_id)
+            .await
+            .expect("lookup deleted arrangement row"),
+        None
+    );
+
+    let local_op = JoinOp::new(op_id, vec![0], vec![0]).with_db(shard);
+    local_op
+        .process_epoch(
+            make_test_zset(&[], &[], &[]),
+            make_test_zset(&[7], &[701], &[1]),
+        )
+        .expect("stage local arrangement row");
+    let mut rows = local_op
+        .probe_arrangement(JoinSide::Right, &join_key)
+        .await
+        .expect("merge persisted and local arrangement rows");
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (persisted_row, 1),
+            ([7i64.to_be_bytes(), 701i64.to_be_bytes()].concat(), 1),
+        ]
+    );
 }

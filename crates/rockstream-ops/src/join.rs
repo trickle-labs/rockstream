@@ -37,6 +37,7 @@
 //! pairs on each side of the join.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -200,6 +201,40 @@ impl JoinState {
         }
     }
 
+    fn insert_persisted(
+        &mut self,
+        side: JoinSide,
+        join_key: Vec<u8>,
+        row_id: u128,
+        row_bytes: Vec<u8>,
+    ) {
+        let arr = match side {
+            JoinSide::Left => &mut self.left_arr,
+            JoinSide::Right => &mut self.right_arr,
+        };
+        let is_new_key = !arr.contains_key(&join_key);
+        let row_len = row_bytes.len() as u64;
+        let inserted = {
+            let bucket = arr.entry(join_key.clone()).or_default();
+            if let std::collections::hash_map::Entry::Vacant(entry) = bucket.entry(row_id) {
+                entry.insert(ArrRow {
+                    row_bytes,
+                    weight: 1,
+                });
+                true
+            } else {
+                false
+            }
+        };
+        if !inserted {
+            return;
+        }
+        if is_new_key {
+            self.state_bytes += join_key.len() as u64;
+        }
+        self.state_bytes += 16 + 8 + row_len;
+    }
+
     /// Iterate over all right rows matching a join key, as (row_bytes, weight) pairs.
     ///
     /// Only rows with weight != 0 are present (weight 0 rows are removed at update time).
@@ -283,6 +318,9 @@ pub struct JoinOp {
     dirty_left: Mutex<HashSet<(Vec<u8>, u128)>>,
     dirty_right: Mutex<HashSet<(Vec<u8>, u128)>>,
     db: Mutex<Option<Arc<ShardDb>>>,
+    state_loaded: AtomicBool,
+    loaded_left_keys: Mutex<HashSet<Vec<u8>>>,
+    loaded_right_keys: Mutex<HashSet<Vec<u8>>>,
 }
 
 impl JoinOp {
@@ -313,23 +351,94 @@ impl JoinOp {
             dirty_left: Mutex::new(HashSet::new()),
             dirty_right: Mutex::new(HashSet::new()),
             db: Mutex::new(None),
+            state_loaded: AtomicBool::new(false),
+            loaded_left_keys: Mutex::new(HashSet::new()),
+            loaded_right_keys: Mutex::new(HashSet::new()),
         }
     }
 
     /// Attach a ShardDb for arrangement lookups and tiered caching.
     pub fn with_db(self, db: Arc<ShardDb>) -> Self {
-        *self.db.lock().unwrap() = Some(db);
+        self.set_db(db);
         self
     }
 
     /// Set a ShardDb for arrangement lookups and tiered caching.
     pub fn set_db(&self, db: Arc<ShardDb>) {
         *self.db.lock().unwrap() = Some(db);
+        self.state_loaded.store(false, Ordering::Release);
+        self.loaded_left_keys.lock().unwrap().clear();
+        self.loaded_right_keys.lock().unwrap().clear();
     }
 
     /// Access the attached ShardDb if configured.
     pub fn db(&self) -> Option<Arc<ShardDb>> {
         self.db.lock().unwrap().clone()
+    }
+
+    async fn ensure_arrangement_key_loaded(
+        &self,
+        side: JoinSide,
+        join_key: &[u8],
+    ) -> Result<(), OpError> {
+        if self.state_loaded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(db) = self.db.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        let loaded_keys = match side {
+            JoinSide::Left => &self.loaded_left_keys,
+            JoinSide::Right => &self.loaded_right_keys,
+        };
+        if loaded_keys.lock().unwrap().contains(join_key) {
+            return Ok(());
+        }
+
+        let prefix = ShardKeyEncoder::join_arr_key_prefix(side, self.op_id.0, join_key);
+        let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+        let dirty = match side {
+            JoinSide::Left => self.dirty_left.lock().unwrap(),
+            JoinSide::Right => self.dirty_right.lock().unwrap(),
+        };
+        let mut state = self.state.lock().unwrap();
+        for (key, value) in entries {
+            if key.len() < 11 + 16 {
+                continue;
+            }
+            let row_id = u128::from_be_bytes(
+                key[key.len() - 16..]
+                    .try_into()
+                    .map_err(|_| OpError::storage_error("invalid join arrangement row id"))?,
+            );
+            if dirty.contains(&(join_key.to_vec(), row_id)) {
+                continue;
+            }
+            state.insert_persisted(side, join_key.to_vec(), row_id, value.to_vec());
+        }
+        loaded_keys.lock().unwrap().insert(join_key.to_vec());
+        Ok(())
+    }
+
+    async fn load_arrangement_keys(
+        &self,
+        side: JoinSide,
+        delta: &ArrowZSet,
+        key_cols: &[usize],
+    ) -> Result<(), OpError> {
+        if self.state_loaded.load(Ordering::Acquire) || self.db().is_none() {
+            return Ok(());
+        }
+        let mut keys = HashSet::new();
+        for row_idx in 0..delta.num_rows() {
+            if let Some(join_key) = Self::extract_key(&delta.data, row_idx, key_cols)? {
+                keys.insert(join_key);
+            }
+        }
+        for join_key in keys {
+            self.ensure_arrangement_key_loaded(side, &join_key).await?;
+        }
+        Ok(())
     }
 
     /// Look up matching arrangement rows for a given join key against an arrangement.
@@ -341,6 +450,7 @@ impl JoinOp {
         side: JoinSide,
         join_key: &[u8],
     ) -> Result<Vec<(Vec<u8>, i64)>, OpError> {
+        self.ensure_arrangement_key_loaded(side, join_key).await?;
         let in_mem: Vec<(Vec<u8>, i64)> = {
             let state = self.state.lock().unwrap();
             match side {
@@ -354,24 +464,7 @@ impl JoinOp {
                     .collect(),
             }
         };
-        if !in_mem.is_empty() {
-            return Ok(in_mem);
-        }
-
-        let db_opt = self.db.lock().unwrap().clone();
-        if let Some(db) = db_opt {
-            let prefix = ShardKeyEncoder::join_arr_key_prefix(side, self.op_id.0, join_key);
-            let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
-            let mut results = Vec::with_capacity(entries.len());
-            for (key, val) in entries {
-                if key.len() >= 11 + 16 {
-                    results.push((val.to_vec(), 1));
-                }
-            }
-            return Ok(results);
-        }
-
-        Ok(Vec::new())
+        Ok(in_mem)
     }
 
     /// Point lookup a single row in an arrangement by exact join key and row ID.
@@ -401,6 +494,25 @@ impl JoinOp {
             }
         }
 
+        if self.state_loaded.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let is_dirty = match side {
+            JoinSide::Left => self
+                .dirty_left
+                .lock()
+                .unwrap()
+                .contains(&(join_key.to_vec(), row_id)),
+            JoinSide::Right => self
+                .dirty_right
+                .lock()
+                .unwrap()
+                .contains(&(join_key.to_vec(), row_id)),
+        };
+        if is_dirty {
+            return Ok(None);
+        }
+
         let db_opt = self.db.lock().unwrap().clone();
         if let Some(db) = db_opt {
             let key = ShardKeyEncoder::join_arr_key(side, self.op_id.0, join_key, row_id);
@@ -409,6 +521,21 @@ impl JoinOp {
         }
 
         Ok(None)
+    }
+
+    /// Process an epoch after loading any arrangement keys that are missing from
+    /// the in-memory cache. The synchronous API remains the fast path for fully
+    /// restored joins; this method is used by storage-backed live pipelines.
+    pub async fn process_epoch_with_storage(
+        &self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
+        self.load_arrangement_keys(JoinSide::Right, &left, &self.left_key_cols)
+            .await?;
+        self.load_arrangement_keys(JoinSide::Left, &right, &self.right_key_cols)
+            .await?;
+        self.process_epoch_with_counters(left, right)
     }
 
     /// Extract the join key bytes from a row (as big-endian i64 bytes concatenated).
@@ -809,7 +936,10 @@ impl JoinOp {
             right_staged: Mutex::new(StagedDelta::default()),
             dirty_left: Mutex::new(HashSet::new()),
             dirty_right: Mutex::new(HashSet::new()),
-            db: Mutex::new(None),
+            db: Mutex::new(Some(Arc::new(db.clone()))),
+            state_loaded: AtomicBool::new(true),
+            loaded_left_keys: Mutex::new(HashSet::new()),
+            loaded_right_keys: Mutex::new(HashSet::new()),
         })
     }
 
@@ -865,6 +995,10 @@ impl JoinOp {
         }
 
         *self.state.lock().expect("JoinOp mutex poisoned") = st;
+        self.set_db(Arc::new(db.clone()));
+        self.state_loaded.store(true, Ordering::Release);
+        self.loaded_left_keys.lock().unwrap().clear();
+        self.loaded_right_keys.lock().unwrap().clear();
         Ok(())
     }
 

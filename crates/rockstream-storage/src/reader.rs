@@ -99,9 +99,9 @@ impl ShardReader {
         }
         let mut builder = DbReader::builder(path.clone(), object_store).with_options(options);
         if let Some(bits) = filter_bits_per_key {
-            builder = builder.with_filter_policies(vec![Arc::new(
-                slatedb::filter_policy::BloomFilterPolicy::new(bits),
-            )]);
+            builder = builder.with_filter_policies(vec![
+                crate::keys::join_arrangement_bloom_filter_policy(bits),
+            ]);
         }
         let reader = builder.build().await?;
         Self::from_reader(path, reader, SupportedStorageFormatRange::v1_through_v2()).await

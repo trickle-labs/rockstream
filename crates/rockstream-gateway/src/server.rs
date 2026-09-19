@@ -2904,7 +2904,8 @@ impl GatewayHandler {
             );
             let output = join
                 .pipeline
-                .process(left_delta, right_delta)
+                .process_async(left_delta, right_delta)
+                .await
                 .map_err(|e| GatewayError::QueryTimeExecutionFailed {
                     detail: format!("compiled join pipeline process({view_name}): {e}"),
                 })?;
@@ -4598,7 +4599,7 @@ impl GatewayHandler {
                         &join.right_source,
                     ))
                 });
-                join.pipeline.process(left, right)
+                join.pipeline.process_async(left, right).await
             } else {
                 let deps = self.catalog.get_view_deps(view_name);
                 let schema = deps
@@ -4929,11 +4930,12 @@ impl GatewayHandler {
                     &join.right_source,
                 ))
             };
-            join.pipeline.process(left, right).map_err(|error| {
-                GatewayError::QueryTimeExecutionFailed {
+            join.pipeline
+                .process_async(left, right)
+                .await
+                .map_err(|error| GatewayError::QueryTimeExecutionFailed {
                     detail: format!("compiled join pipeline process({view_name}): {error}"),
-                }
-            })?
+                })?
         } else {
             compiled.pipeline.process(input).map_err(|error| {
                 GatewayError::QueryTimeExecutionFailed {

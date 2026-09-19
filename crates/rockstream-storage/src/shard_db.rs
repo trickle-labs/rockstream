@@ -421,9 +421,9 @@ impl ShardDbBuilder {
         if let Some(policies) = self.filter_policies {
             builder = builder.with_filter_policies(policies);
         } else if let Some(bits) = self.filter_bits_per_key {
-            builder = builder.with_filter_policies(vec![Arc::new(
-                slatedb::filter_policy::BloomFilterPolicy::new(bits),
-            )]);
+            builder = builder.with_filter_policies(vec![
+                crate::keys::join_arrangement_bloom_filter_policy(bits),
+            ]);
         }
 
         if let Some(shard_id) = self.metrics_shard_id {

@@ -1442,6 +1442,17 @@ impl JoinKind {
         }
     }
 
+    async fn process_epoch_with_storage(
+        &self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
+        match self {
+            JoinKind::Inner(op) => op.process_epoch_with_storage(left, right).await,
+            JoinKind::Outer(_) | JoinKind::Factorized(_) => self.process_epoch(left, right),
+        }
+    }
+
     fn op_id(&self) -> OperatorId {
         match self {
             JoinKind::Inner(op) => op.op_id(),
@@ -1528,6 +1539,12 @@ impl JoinPipeline {
         }
     }
 
+    pub fn set_db(&self, db: Arc<ShardDb>) {
+        if let JoinKind::Inner(op) = &self.join {
+            op.set_db(db);
+        }
+    }
+
     pub fn selection_rule_version(&self) -> u32 {
         crate::governor::FACTORIZED_SELECTION_RULE_VERSION
     }
@@ -1544,6 +1561,16 @@ impl JoinPipeline {
         left_delta: ArrowZSet,
         right_delta: ArrowZSet,
     ) -> Result<ArrowZSet, OpError> {
+        let (left, right) = self.process_pre_deltas(left_delta, right_delta)?;
+        let (out, work) = self.join.process_epoch(left, right)?;
+        self.finish_process(out, work)
+    }
+
+    fn process_pre_deltas(
+        &self,
+        left_delta: ArrowZSet,
+        right_delta: ArrowZSet,
+    ) -> Result<(ArrowZSet, ArrowZSet), OpError> {
         let mut left = left_delta;
         for stage in &self.left_pre {
             left = stage.process(left, 0)?;
@@ -1552,7 +1579,14 @@ impl JoinPipeline {
         for stage in &self.right_pre {
             right = stage.process(right, 0)?;
         }
-        let (mut out, work) = self.join.process_epoch(left, right)?;
+        Ok((left, right))
+    }
+
+    fn finish_process(
+        &self,
+        mut out: ArrowZSet,
+        work: crate::governor::DeltaAmplificationCounters,
+    ) -> Result<ArrowZSet, OpError> {
         let classic = !matches!(self.join, JoinKind::Factorized(_));
         let mut flattened_intermediate_tuples = 0;
         let mut counted_intermediates = false;
@@ -1596,6 +1630,16 @@ impl JoinPipeline {
             },
         );
         Ok(out)
+    }
+
+    pub async fn process_async(
+        &self,
+        left_delta: ArrowZSet,
+        right_delta: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        let (left, right) = self.process_pre_deltas(left_delta, right_delta)?;
+        let (out, work) = self.join.process_epoch_with_storage(left, right).await?;
+        self.finish_process(out, work)
     }
 
     /// Persist the join's arrangement(s) to `db`. `left_pre`/`right_pre`/

@@ -11,6 +11,11 @@
 //! - `0x05` → shuffle_outbox
 //! - `0x06` → shard_meta
 
+use std::sync::Arc;
+
+use slatedb::filter_policy::{BloomFilterPolicy, FilterPolicy};
+use slatedb::prefix_extractor::{PrefixExtractor, PrefixTarget};
+
 /// Shard-local key namespace prefixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -83,6 +88,45 @@ impl JoinSide {
             JoinSide::Right => [0x4A, 0x52], // "JR"
         }
     }
+}
+
+struct JoinArrangementPrefixExtractor;
+
+impl PrefixExtractor for JoinArrangementPrefixExtractor {
+    fn name(&self) -> &str {
+        "join-arrangement-v1"
+    }
+
+    fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+        let key = match target {
+            PrefixTarget::Point(key) | PrefixTarget::Prefix(key) => key.as_ref(),
+        };
+        let logical = key
+            .strip_prefix(b"\xffV2")
+            .or_else(|| key.strip_prefix(b"\xffV3"))
+            .unwrap_or(key);
+        let is_join_arrangement = logical.len() >= 3
+            && logical[0] == ShardPrefix::OpState.as_byte()
+            && (logical[1..3] == JoinSide::Left.disc_bytes()[..]
+                || logical[1..3] == JoinSide::Right.disc_bytes()[..]);
+
+        match target {
+            PrefixTarget::Point(_) if is_join_arrangement && logical.len() >= 27 => {
+                Some(key.len() - 16)
+            }
+            PrefixTarget::Prefix(_) if is_join_arrangement && logical.len() > 11 => Some(key.len()),
+            PrefixTarget::Point(_) => Some(key.len()),
+            PrefixTarget::Prefix(_) => None,
+        }
+    }
+}
+
+/// Bloom policy that can reject absent join-arrangement prefix scans.
+pub fn join_arrangement_bloom_filter_policy(bits_per_key: u32) -> Arc<dyn FilterPolicy> {
+    Arc::new(
+        BloomFilterPolicy::new(bits_per_key)
+            .with_prefix_extractor(Arc::new(JoinArrangementPrefixExtractor)),
+    )
 }
 
 /// Compute the sort key for a value in the MIN/MAX multiset.
