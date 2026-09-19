@@ -623,10 +623,7 @@ fn storage_error(error: rockstream_storage::StorageError) -> SourceError {
 
 impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
     fn add_progress_state(&self, batch: &mut WriteBatch, epoch: Epoch) {
-        let key = format!(
-            "op_state/source_runtime/{}/{}",
-            self.connector_id.0, epoch
-        );
+        let key = format!("op_state/source_runtime/{}/{}", self.connector_id.0, epoch);
         if !CoupledBatchDescriptor::inspect(batch).has_state {
             batch.put(key.as_bytes(), &epoch.to_be_bytes());
         }
