@@ -405,6 +405,7 @@ pub fn generate_random_query(seed: u64) -> String {
 
 // ─── Extended Physical Executor ──────────────────────────────────────────────
 
+#[allow(clippy::large_enum_variant)]
 pub enum ExecNode {
     Source {
         name: String,

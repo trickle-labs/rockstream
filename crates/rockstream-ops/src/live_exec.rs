@@ -662,7 +662,8 @@ impl GroupKeyPacker {
             } else {
                 let id = *next_id;
                 *next_id += 1;
-                forward.insert(encoded, id);
+                forward.insert(encoded.clone(), id);
+                self.dirty.lock().unwrap().push((encoded, id));
 
                 let key_slices: Vec<ArrayRef> =
                     (0..n).map(|i| delta.data.column(i).slice(row, 1)).collect();

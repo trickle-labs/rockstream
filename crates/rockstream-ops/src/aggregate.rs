@@ -658,8 +658,7 @@ impl AggregateOp {
             .expect("AggregateOp dirty_keys mutex poisoned");
         let mut wb = WriteBatch::new();
         for &k in dirty.iter() {
-            let key =
-                ShardKeyEncoder::encode(ShardPrefix::OpState, self.op_id.0, &k.to_be_bytes());
+            let key = ShardKeyEncoder::encode(ShardPrefix::OpState, self.op_id.0, &k.to_be_bytes());
             if let Some(&(sum, count)) = state.entries.get(&k) {
                 let mut value = [0u8; 16];
                 value[..8].copy_from_slice(&sum.to_be_bytes());

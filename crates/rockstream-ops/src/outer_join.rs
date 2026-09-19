@@ -1151,12 +1151,8 @@ impl OuterJoinOp {
 
             // Left arrangement (same key format as JoinOp).
             for (join_key, row_id) in dirty_left.drain() {
-                let key = ShardKeyEncoder::join_arr_key(
-                    JoinSide::Left,
-                    self.op_id.0,
-                    &join_key,
-                    row_id,
-                );
+                let key =
+                    ShardKeyEncoder::join_arr_key(JoinSide::Left, self.op_id.0, &join_key, row_id);
                 if let Some(arr_row) = state.left_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
                     if arr_row.weight > 0 {
                         batch.put(&key, &arr_row.row_bytes);
@@ -1170,12 +1166,8 @@ impl OuterJoinOp {
 
             // Right arrangement.
             for (join_key, row_id) in dirty_right.drain() {
-                let key = ShardKeyEncoder::join_arr_key(
-                    JoinSide::Right,
-                    self.op_id.0,
-                    &join_key,
-                    row_id,
-                );
+                let key =
+                    ShardKeyEncoder::join_arr_key(JoinSide::Right, self.op_id.0, &join_key, row_id);
                 if let Some(arr_row) = state.right_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
                     if arr_row.weight > 0 {
                         batch.put(&key, &arr_row.row_bytes);

@@ -691,6 +691,16 @@ and disk occupancy limits fail closed with RS-5003 and RS-2021, verified by
 M1–M7 FizzBee models, the storage and recovery paging protocols conform to the
 recovery driver invariants.
 
+In-flight Z-set epoch compaction accumulates signed row delta weights within active
+100–300ms micro-batch epoch windows prior to persistence or network exchange in
+`crates/rockstream-runtime`. Offsetting modifications collapsing to zero net weight
+(`weight == 0`) are omitted from downstream arrangement lookups, storage flushes, and
+shuffle frames, while surviving non-zero weights collapse into a single emitted update.
+This in-memory compaction is outside the core M1–M7 FizzBee coordination state machines
+(operating entirely within single-epoch micro-batch buffers), verified by
+`crates/rockstream-runtime/tests/in_flight_zset_epoch_compaction_tests.rs` with exact
+output assertions covering net-zero omission and window boundary drains.
+
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
 

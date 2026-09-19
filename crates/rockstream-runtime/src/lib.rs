@@ -14,12 +14,21 @@ pub mod arrangement_attach;
 pub mod client;
 pub mod compaction;
 pub mod data_plane;
+pub mod epoch_compaction;
+pub use epoch_compaction::{
+    EpochCompactionConfig, EpochCompactionError, EpochCompactionFilter, EpochCompactionMetrics,
+    EpochCompactionMetricsSnapshot, EpochCompactor, InFlightZSetAccumulator, KeyExtractionStrategy,
+    DEFAULT_EPOCH_WINDOW, MAX_EPOCH_WINDOW, MIN_EPOCH_WINDOW,
+};
 pub mod secrets;
 pub mod shard_actor;
 pub mod tls;
 pub use client::{
-    start_worker_client, start_worker_client_with_metadata, start_worker_client_with_tls,
-    start_worker_client_with_tls_and_metadata, ShardState, WorkerClientHandle,
+    execute_frame, setup_test_deployment, start_worker_client,
+    start_worker_client_with_compaction_config, start_worker_client_with_metadata,
+    start_worker_client_with_tls, start_worker_client_with_tls_and_metadata,
+    start_worker_client_with_tls_metadata_and_compaction, ShardState, WorkerClientHandle,
+    WorkerDeployment, WorkerDeployments,
 };
 pub use compaction::{CompactionBudget, CompactionPermit, CompactionWorker};
 pub use data_plane::DataPlaneClient;

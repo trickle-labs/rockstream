@@ -104,6 +104,7 @@ fn apply_delta_physically(current: &ArrowZSet, delta: &ArrowZSet) -> ArrowZSet {
 
 // ─── Physical ExecNode Interpreter ──────────────────────────────────────────
 
+#[allow(clippy::large_enum_variant)]
 enum ExecNode {
     Source {
         name: String,
