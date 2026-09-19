@@ -7,7 +7,10 @@ use rockstream_connectors::{
     BackfillCursor, BackfillLifecycle, BackfillPhase, OffsetToken, SnapshotDeltaFence,
     SourceCheckpoint, SourceCheckpointStore,
 };
-use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, WriteBatch};
+use rockstream_storage::{
+    keys::{ShardKeyEncoder, ShardPrefix},
+    ShardDb, WriteBatch,
+};
 use rockstream_types::ids::ConnectorId;
 
 const BUCKET: &str = "source-durability-v05115";
@@ -55,6 +58,12 @@ fn prepared(connector_id: ConnectorId, epoch: u64, token: &[u8]) -> SourceCheckp
 async fn commit(store: &SourceCheckpointStore, checkpoint: &SourceCheckpoint) {
     store.prepare(checkpoint).await.unwrap();
     let mut m3_input = WriteBatch::new();
+    m3_input.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+    m3_input.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+    m3_input.put(
+        &ShardKeyEncoder::frontier_key(),
+        &checkpoint.source_epoch.to_be_bytes(),
+    );
     let expected = store.append_committed(&mut m3_input, checkpoint).unwrap();
     store.commit_m3(m3_input).await.unwrap();
     assert_eq!(store.highest_committed().await.unwrap(), Some(expected));
@@ -122,6 +131,12 @@ async fn backfill_cursor_m3_atomicity_minio() {
         None
     );
     let mut batch = WriteBatch::new();
+    batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+    batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+    batch.put(
+        &ShardKeyEncoder::frontier_key(),
+        &checkpoint.source_epoch.to_be_bytes(),
+    );
     store.append_committed(&mut batch, &checkpoint).unwrap();
     store.append_backfill_cursor(&mut batch, &cursor).unwrap();
     store.commit_m3(batch).await.unwrap();
@@ -160,6 +175,7 @@ async fn backfill_m3_commits_output_cursor_checkpoint_and_frontier_minio() {
     let lifecycle = BackfillLifecycle::new(BackfillPhase::Running, cursor, 0, 42, 0, Some(7));
     store.prepare(&checkpoint).await.unwrap();
     let mut batch = WriteBatch::new();
+    batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
     batch.put(b"view_output/orders_by_customer/key-42", b"42\talice");
     batch.put(&ShardKeyEncoder::frontier_key(), &7_u64.to_be_bytes());
     store.append_committed(&mut batch, &checkpoint).unwrap();
@@ -218,6 +234,11 @@ async fn fence_restart_has_no_gap_or_overlap_minio() {
     let lifecycle = BackfillLifecycle::new(BackfillPhase::Running, cursor, 0, 3, 6, Some(3));
     store.prepare(&checkpoint).await.unwrap();
     let mut batch = WriteBatch::new();
+    batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+    batch.put(
+        &ShardKeyEncoder::frontier_key(),
+        &checkpoint.source_epoch.to_be_bytes(),
+    );
     for (key, value) in [
         (
             b"view_output/orders_mv/1".as_slice(),
@@ -298,10 +319,12 @@ async fn resume_all_three_kill_points_from_committed_cursor_minio() {
                 None,
             );
             let mut batch = WriteBatch::new();
+            batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
             batch.put(
                 format!("view_output/orders_mv/{epoch}").as_bytes(),
                 format!("row-{epoch}").as_bytes(),
             );
+            batch.put(&ShardKeyEncoder::frontier_key(), &epoch.to_be_bytes());
             store.append_committed(&mut batch, &checkpoint).unwrap();
             store
                 .append_backfill_lifecycle(&mut batch, &lifecycle)
@@ -345,12 +368,15 @@ async fn resume_all_three_kill_points_from_committed_cursor_minio() {
                 (epoch == 4).then_some(epoch),
             );
             let mut batch = WriteBatch::new();
+            batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+            batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
             if epoch <= 3 {
                 batch.put(
                     format!("view_output/orders_mv/{epoch}").as_bytes(),
                     format!("row-{epoch}").as_bytes(),
                 );
             }
+            batch.put(&ShardKeyEncoder::frontier_key(), &epoch.to_be_bytes());
             store.append_committed(&mut batch, &checkpoint).unwrap();
             store
                 .append_backfill_lifecycle(&mut batch, &lifecycle)
@@ -427,6 +453,12 @@ async fn verify_webhook_returns_202_only_after_durable_m3_commit() {
     store.prepare(&checkpoint).await.unwrap();
     assert_eq!(store.highest_committed().await.unwrap(), None);
     let mut m3_input = WriteBatch::new();
+    m3_input.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+    m3_input.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+    m3_input.put(
+        &ShardKeyEncoder::frontier_key(),
+        &checkpoint.source_epoch.to_be_bytes(),
+    );
     store.append_committed(&mut m3_input, &checkpoint).unwrap();
     store.commit_m3(m3_input).await.unwrap();
 
