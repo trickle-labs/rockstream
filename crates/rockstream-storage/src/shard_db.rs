@@ -175,6 +175,8 @@ pub struct ShardDbBuilder {
     concurrency_governor: Option<Arc<crate::concurrency_governor::ConcurrencyGovernor>>,
     disk_cache_dir: Option<std::path::PathBuf>,
     cleanup_on_drop: bool,
+    filter_bits_per_key: Option<u32>,
+    filter_policies: Option<Vec<Arc<dyn slatedb::filter_policy::FilterPolicy>>>,
 }
 
 /// Specification for a partial aggregation query.
@@ -203,6 +205,8 @@ impl ShardDbBuilder {
             concurrency_governor: None,
             disk_cache_dir: None,
             cleanup_on_drop: false,
+            filter_bits_per_key: None,
+            filter_policies: None,
         }
     }
 
@@ -287,16 +291,118 @@ impl ShardDbBuilder {
         self
     }
 
+    /// Configure local NVMe block caching tier for hot SSTable blocks.
+    pub fn with_nvme_cache(self, dir: impl Into<std::path::PathBuf>, max_bytes: usize) -> Self {
+        self.with_nvme_block_cache(dir, max_bytes, 4 * 1024 * 1024)
+    }
+
+    /// Configure local NVMe block caching tier with custom part/block size.
+    pub fn with_nvme_block_cache(
+        mut self,
+        dir: impl Into<std::path::PathBuf>,
+        max_bytes: usize,
+        part_size_bytes: usize,
+    ) -> Self {
+        let dir_path = dir.into();
+        self.settings.object_store_cache_options.root_folder = Some(dir_path.clone());
+        self.settings
+            .object_store_cache_options
+            .max_cache_size_bytes = Some(max_bytes);
+        self.settings.object_store_cache_options.part_size_bytes = part_size_bytes;
+        self.settings.object_store_cache_options.scan_interval =
+            Some(std::time::Duration::from_secs(3600));
+        self.settings
+            .object_store_cache_options
+            .max_open_file_handles = 1000;
+        self.settings.object_store_cache_options.cache_puts = true;
+        self.disk_cache_dir = Some(dir_path);
+        self
+    }
+
+    /// Return whether NVMe / disk cache is configured on this builder.
+    pub fn is_nvme_cache_configured(&self) -> bool {
+        self.settings.object_store_cache_options.root_folder.is_some()
+    }
+
+    /// Configure Bloom filter bits per key for SSTable arrangements.
+    pub fn with_filter_bits_per_key(mut self, bits_per_key: u32) -> Self {
+        self.filter_bits_per_key = Some(bits_per_key);
+        self
+    }
+
+    /// Configure minimum number of keys in an SSTable before a Bloom filter is written.
+    /// Setting this to 0 or 1 ensures even small SSTables generate Bloom filters.
+    pub fn with_min_filter_keys(mut self, min_keys: u32) -> Self {
+        self.settings.min_filter_keys = min_keys;
+        self
+    }
+
+    /// Enable and tune Bloom filter sizing and activation threshold for SlateDB SSTable arrangements.
+    pub fn with_bloom_filter(mut self, bits_per_key: u32, min_filter_keys: u32) -> Self {
+        self.filter_bits_per_key = Some(bits_per_key);
+        self.settings.min_filter_keys = min_filter_keys;
+        self
+    }
+
+    /// Set explicit filter policies for SSTable construction and evaluation.
+    pub fn with_filter_policies(
+        mut self,
+        policies: Vec<Arc<dyn slatedb::filter_policy::FilterPolicy>>,
+    ) -> Self {
+        self.filter_policies = Some(policies);
+        self
+    }
+
+    /// Access the configured Bloom filter bits per key, if any.
+    pub fn bloom_filter_bits(&self) -> Option<u32> {
+        self.filter_bits_per_key
+    }
+
+    /// Access the configured min_filter_keys threshold.
+    pub fn min_filter_keys(&self) -> u32 {
+        self.settings.min_filter_keys
+    }
+
     /// Access the SlateDB object store cache options.
     pub fn object_store_cache_options(&self) -> &slatedb::config::ObjectStoreCacheOptions {
         &self.settings.object_store_cache_options
     }
 
     /// Build and open the shard database.
-    pub async fn build(self) -> Result<ShardDb, StorageError> {
+    pub async fn build(mut self) -> Result<ShardDb, StorageError> {
         let worker_id = self
             .worker_id
+            .clone()
             .unwrap_or_else(|| "worker-unknown".to_string());
+
+        // Inherit NVMe cache from WorkerStorageContext if not explicitly configured
+        if self.disk_cache_dir.is_none() {
+            if let Some(ref ctx) = self.storage_context {
+                if let Some(nvme) = ctx.nvme_config() {
+                    self.settings.object_store_cache_options.root_folder =
+                        Some(nvme.root_folder.clone());
+                    self.settings.object_store_cache_options.max_cache_size_bytes =
+                        Some(nvme.max_cache_size_bytes);
+                    self.settings.object_store_cache_options.part_size_bytes =
+                        nvme.part_size_bytes;
+                    self.settings.object_store_cache_options.scan_interval =
+                        Some(std::time::Duration::from_secs(3600));
+                    self.settings.object_store_cache_options.max_open_file_handles = 1000;
+                    self.settings.object_store_cache_options.cache_puts = nvme.cache_puts;
+                    self.disk_cache_dir = Some(nvme.root_folder.clone());
+                }
+            }
+        }
+
+        // Inherit Bloom filter sizing from WorkerStorageContext if not explicitly set
+        if self.filter_bits_per_key.is_none() {
+            if let Some(ref ctx) = self.storage_context {
+                if let Some(bits) = ctx.filter_bits_per_key() {
+                    self.filter_bits_per_key = Some(bits);
+                }
+            }
+        }
+
         let db_cache = if let Some(ref ctx) = self.storage_context {
             ctx.db_cache()
         } else {
@@ -306,6 +412,15 @@ impl ShardDbBuilder {
             .with_settings(self.settings)
             .with_merge_operator(Arc::new(SumCountMergeOperator))
             .with_db_cache(db_cache);
+
+        if let Some(policies) = self.filter_policies {
+            builder = builder.with_filter_policies(policies);
+        } else if let Some(bits) = self.filter_bits_per_key {
+            builder = builder.with_filter_policies(vec![Arc::new(
+                slatedb::filter_policy::BloomFilterPolicy::new(bits),
+            )]);
+        }
+
         if let Some(shard_id) = self.metrics_shard_id {
             builder = builder.with_metrics_recorder(
                 crate::slatedb_metrics::instrumented_metrics_recorder(shard_id),

@@ -126,7 +126,17 @@ impl LruStore {
     }
 }
 
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Configuration for a tiered local NVMe block caching layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvmeCacheConfig {
+    pub root_folder: PathBuf,
+    pub max_cache_size_bytes: usize,
+    pub part_size_bytes: usize,
+    pub cache_puts: bool,
+}
 
 /// Worker-wide shared storage context managing unified block & index caches.
 pub struct WorkerStorageContext {
@@ -137,6 +147,8 @@ pub struct WorkerStorageContext {
     misses: AtomicU64,
     evictions: AtomicU64,
     db_cache: Arc<dyn slatedb::db_cache::DbCache>,
+    nvme_config: Option<NvmeCacheConfig>,
+    filter_bits_per_key: Option<u32>,
 }
 
 impl std::fmt::Debug for WorkerStorageContext {
@@ -170,6 +182,15 @@ impl WorkerStorageContext {
             index_budget as u64,
         );
 
+        let nvme_config = std::env::var_os("ROCKSTREAM_NVME_CACHE_DIR")
+            .or_else(|| std::env::var_os("ROCKSTREAM_DISK_CACHE_DIR"))
+            .map(|dir| NvmeCacheConfig {
+                root_folder: PathBuf::from(dir),
+                max_cache_size_bytes: 16 * 1024 * 1024 * 1024,
+                part_size_bytes: 4 * 1024 * 1024,
+                cache_puts: true,
+            });
+
         Self {
             budget_bytes,
             blocks: Mutex::new(LruStore::new(block_budget)),
@@ -178,7 +199,52 @@ impl WorkerStorageContext {
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             db_cache,
+            nvme_config,
+            filter_bits_per_key: None,
         }
+    }
+
+    /// Configure local NVMe block caching tier for hot SSTable blocks.
+    pub fn with_nvme_cache(mut self, dir: impl Into<PathBuf>, max_bytes: usize) -> Self {
+        self.nvme_config = Some(NvmeCacheConfig {
+            root_folder: dir.into(),
+            max_cache_size_bytes: max_bytes,
+            part_size_bytes: 4 * 1024 * 1024,
+            cache_puts: true,
+        });
+        self
+    }
+
+    /// Configure local NVMe block caching tier with explicit part/block size.
+    pub fn with_nvme_block_cache(
+        mut self,
+        dir: impl Into<PathBuf>,
+        max_bytes: usize,
+        part_size_bytes: usize,
+    ) -> Self {
+        self.nvme_config = Some(NvmeCacheConfig {
+            root_folder: dir.into(),
+            max_cache_size_bytes: max_bytes,
+            part_size_bytes,
+            cache_puts: true,
+        });
+        self
+    }
+
+    /// Configure default Bloom filter bits per key for arrangements managed under this context.
+    pub fn with_filter_bits_per_key(mut self, bits_per_key: u32) -> Self {
+        self.filter_bits_per_key = Some(bits_per_key);
+        self
+    }
+
+    /// Retrieve the configured NVMe block cache config, if any.
+    pub fn nvme_config(&self) -> Option<&NvmeCacheConfig> {
+        self.nvme_config.as_ref()
+    }
+
+    /// Retrieve the configured Bloom filter bits per key, if any.
+    pub fn filter_bits_per_key(&self) -> Option<u32> {
+        self.filter_bits_per_key
     }
 
     /// Retrieve the shared SlateDB database cache.
