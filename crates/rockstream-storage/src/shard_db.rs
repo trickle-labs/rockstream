@@ -321,7 +321,10 @@ impl ShardDbBuilder {
 
     /// Return whether NVMe / disk cache is configured on this builder.
     pub fn is_nvme_cache_configured(&self) -> bool {
-        self.settings.object_store_cache_options.root_folder.is_some()
+        self.settings
+            .object_store_cache_options
+            .root_folder
+            .is_some()
     }
 
     /// Configure Bloom filter bits per key for SSTable arrangements.
@@ -381,13 +384,15 @@ impl ShardDbBuilder {
                 if let Some(nvme) = ctx.nvme_config() {
                     self.settings.object_store_cache_options.root_folder =
                         Some(nvme.root_folder.clone());
-                    self.settings.object_store_cache_options.max_cache_size_bytes =
-                        Some(nvme.max_cache_size_bytes);
-                    self.settings.object_store_cache_options.part_size_bytes =
-                        nvme.part_size_bytes;
+                    self.settings
+                        .object_store_cache_options
+                        .max_cache_size_bytes = Some(nvme.max_cache_size_bytes);
+                    self.settings.object_store_cache_options.part_size_bytes = nvme.part_size_bytes;
                     self.settings.object_store_cache_options.scan_interval =
                         Some(std::time::Duration::from_secs(3600));
-                    self.settings.object_store_cache_options.max_open_file_handles = 1000;
+                    self.settings
+                        .object_store_cache_options
+                        .max_open_file_handles = 1000;
                     self.settings.object_store_cache_options.cache_puts = nvme.cache_puts;
                     self.disk_cache_dir = Some(nvme.root_folder.clone());
                 }

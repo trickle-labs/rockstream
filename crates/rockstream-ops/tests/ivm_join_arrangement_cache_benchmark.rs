@@ -322,10 +322,7 @@ async fn test_ivm_join_differentiation_with_arrangement_lookups() {
     assert_eq!(total_misses, 2);
     assert_eq!(
         joined_rows,
-        vec![
-            (2, 200, 1),
-            (3, 300, 1),
-        ],
+        vec![(2, 200, 1), (3, 300, 1),],
         "Joined tuples must exactly match expected pairs and weights"
     );
 

@@ -344,8 +344,14 @@ impl JoinOp {
         let in_mem: Vec<(Vec<u8>, i64)> = {
             let state = self.state.lock().unwrap();
             match side {
-                JoinSide::Left => state.probe_left(join_key).map(|(r, w)| (r.clone(), w)).collect(),
-                JoinSide::Right => state.probe_right(join_key).map(|(r, w)| (r.clone(), w)).collect(),
+                JoinSide::Left => state
+                    .probe_left(join_key)
+                    .map(|(r, w)| (r.clone(), w))
+                    .collect(),
+                JoinSide::Right => state
+                    .probe_right(join_key)
+                    .map(|(r, w)| (r.clone(), w))
+                    .collect(),
             }
         };
         if !in_mem.is_empty() {

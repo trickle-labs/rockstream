@@ -34,7 +34,8 @@ fn bench_join_arrangement_lookups(c: &mut Criterion) {
 
         // Seed 1,000 arrangement keys
         for i in 0..1000u64 {
-            let key = ShardKeyEncoder::join_arr_key(JoinSide::Right, 10, &i.to_be_bytes(), i as u128);
+            let key =
+                ShardKeyEncoder::join_arr_key(JoinSide::Right, 10, &i.to_be_bytes(), i as u128);
             let val = format!("val_{i}").into_bytes();
             shard.put(&key, &val).await.unwrap();
         }
@@ -59,19 +60,23 @@ fn bench_join_arrangement_lookups(c: &mut Criterion) {
             });
         });
 
-        group.bench_with_input(BenchmarkId::new("absent_key_bloom_filtered", scale), scale, |b, &s| {
-            b.to_async(&rt).iter(|| async {
-                for i in 0..s as u64 {
-                    let absent_id = 10_000 + i;
-                    let key = absent_id.to_be_bytes();
-                    let res = join_op
-                        .point_lookup_arrangement(JoinSide::Right, &key, absent_id as u128)
-                        .await
-                        .unwrap();
-                    assert!(res.is_none());
-                }
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("absent_key_bloom_filtered", scale),
+            scale,
+            |b, &s| {
+                b.to_async(&rt).iter(|| async {
+                    for i in 0..s as u64 {
+                        let absent_id = 10_000 + i;
+                        let key = absent_id.to_be_bytes();
+                        let res = join_op
+                            .point_lookup_arrangement(JoinSide::Right, &key, absent_id as u128)
+                            .await
+                            .unwrap();
+                        assert!(res.is_none());
+                    }
+                });
+            },
+        );
     }
     group.finish();
 }
