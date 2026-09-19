@@ -482,7 +482,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             .map_err(storage_error)?;
         self.add_progress_state(&mut m3_input, lifecycle.cursor.committed_epoch);
         self.checkpoint_store
-            .commit_m3(m3_input)
+            .commit_raw_batch(m3_input)
             .await
             .map_err(storage_error)
     }
