@@ -5,11 +5,13 @@ use std::collections::{BTreeMap, HashSet};
 use rockstream_storage::WriteBatch;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
+use rockstream_verified::persistence;
 
 use crate::source_connector::{PollDeltaResult, SnapshotStream, SourceConnector, SourceError};
 use crate::source_epoch::SnapshotDeltaFence;
 use crate::source_epoch::{
-    BackfillLifecycle, OffsetToken, SourceCheckpoint, SourceCheckpointStore, SourceEpochRegistry,
+    BackfillLifecycle, CoupledBatchDescriptor, OffsetToken, SourceCheckpoint,
+    SourceCheckpointStore, SourceEpochRegistry,
 };
 use crate::{PgOutputEvent, PostgresCdcSource};
 
@@ -113,7 +115,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
 
     /// The next source epoch that can be committed under the active lease.
     pub fn next_epoch(&self) -> Result<Epoch, SourceError> {
-        self.source_epochs.current_epoch().checked_add(1).ok_or_else(|| {
+        persistence::next_epoch(self.source_epochs.current_epoch()).ok_or_else(|| {
             SourceError::Io(
                 "RS-4018: source epoch exhausted; next_steps: create a new connector before retrying"
                     .to_string(),
@@ -164,7 +166,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             .append_backfill_lifecycle(&mut batch, lifecycle)
             .map_err(storage_error)?;
         self.checkpoint_store
-            .commit_m3(batch)
+            .commit_raw_batch(batch)
             .await
             .map_err(storage_error)
     }
@@ -250,10 +252,16 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
                 "RS-4014: source_runtime_in_flight_epochs reached SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS; next steps: wait for upstream acknowledgements before polling more input",
             );
         }
-        let Some(next_epoch) = self.source_epochs.current_epoch().checked_add(1) else {
+        let Some(next_epoch) = persistence::next_epoch(self.source_epochs.current_epoch()) else {
             return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying");
         };
-        if epoch < next_epoch {
+        if !persistence::epoch_is_admissible(
+            self.source_epochs.current_epoch(),
+            epoch,
+            false,
+            true,
+            false,
+        ) {
             return self.block(&format!(
                 "RS-4015: source epoch {epoch} is not the next fenced epoch {}; next steps: recover the committed checkpoint and retry",
                 next_epoch
@@ -277,6 +285,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
                 return self.block(&storage_error(error).to_string());
             }
         };
+        self.add_progress_state(&mut m3_input, epoch);
         if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
             self.in_flight_epochs -= 1;
             return self.block(&storage_error(error).to_string());
@@ -328,10 +337,16 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
                 "RS-4014: source_runtime_in_flight_epochs reached SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS; next_steps: wait for upstream acknowledgements before polling more input",
             );
         }
-        let Some(next_epoch) = self.source_epochs.current_epoch().checked_add(1) else {
+        let Some(next_epoch) = persistence::next_epoch(self.source_epochs.current_epoch()) else {
             return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying");
         };
-        if epoch < next_epoch {
+        if !persistence::epoch_is_admissible(
+            self.source_epochs.current_epoch(),
+            epoch,
+            false,
+            true,
+            false,
+        ) {
             return self.block(&format!(
                 "RS-4015: source epoch {epoch} is not the next fenced epoch {}; next steps: recover the committed checkpoint and retry",
                 next_epoch
@@ -361,6 +376,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             self.in_flight_epochs -= 1;
             return self.block(&storage_error(error).to_string());
         }
+        self.add_progress_state(&mut m3_input, epoch);
         if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
             self.in_flight_epochs -= 1;
             return self.block(&storage_error(error).to_string());
@@ -424,6 +440,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             .checkpoint_store
             .append_replayable_committed(&mut m3_input, epoch, offset)
             .map_err(storage_error)?;
+        self.add_progress_state(&mut m3_input, epoch);
         self.in_flight_epochs = 1;
         if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
             self.in_flight_epochs = 0;
@@ -463,6 +480,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         self.checkpoint_store
             .append_backfill_lifecycle(&mut m3_input, lifecycle)
             .map_err(storage_error)?;
+        self.add_progress_state(&mut m3_input, lifecycle.cursor.committed_epoch);
         self.checkpoint_store
             .commit_m3(m3_input)
             .await
@@ -601,4 +619,13 @@ fn storage_error(error: rockstream_storage::StorageError) -> SourceError {
     SourceError::Io(format!(
         "RS-4010: durable source checkpoint operation failed: {error}; next steps: keep the source paused, recover the highest committed checkpoint, then retry"
     ))
+}
+
+impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
+    fn add_progress_state(&self, batch: &mut WriteBatch, epoch: Epoch) {
+        let key = format!("op_state/source_runtime/{}/{}", self.connector_id.0, epoch);
+        if !CoupledBatchDescriptor::inspect(batch).has_state {
+            batch.put(key.as_bytes(), &epoch.to_be_bytes());
+        }
+    }
 }

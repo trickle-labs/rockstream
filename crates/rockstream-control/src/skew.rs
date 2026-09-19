@@ -750,7 +750,7 @@ pub fn plan_hot_key_mitigation(
     bucket_count: u16,
     spill_shard: ShardId,
 ) -> HotKeyMitigationPlan {
-    if law.composable() {
+    if law.can_reassociate() {
         let bucket_count = normalize_power_of_two_bucket_count(bucket_count);
         HotKeyMitigationPlan::Split {
             bucket_count,
@@ -765,7 +765,7 @@ pub fn plan_hot_key_mitigation(
         HotKeyMitigationPlan::Spill {
             shard_id: spill_shard,
             code: RS_5036,
-            next_steps: "Keep the hot key on a single spill shard and switch to a composable law before enabling virtual-bucket splitting.",
+            next_steps: "Keep the hot key on a single spill shard until the checked operand domain is admitted before enabling virtual-bucket splitting.",
         }
     }
 }

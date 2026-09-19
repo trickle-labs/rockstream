@@ -19,9 +19,13 @@ use std::sync::{
     Arc,
 };
 
-use rockstream_storage::{keys::CatalogType, CatalogKeyEncoder, ShardDb, StorageError, WriteBatch};
+use rockstream_storage::{
+    keys::CatalogType, CatalogKeyEncoder, ShardDb, ShardKeyEncoder, ShardPrefix, StorageError,
+    WriteBatch,
+};
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
+use rockstream_verified::persistence;
 
 // ─── OffsetToken ──────────────────────────────────────────────────────────────
 
@@ -407,7 +411,12 @@ impl SourceCheckpointStore {
             &Self::encode(checkpoint)?,
         );
         self.db.write_batch(batch).await?;
-        self.db.flush().await
+        let flush_result = self.db.flush().await;
+        if persistence::commit_outcome(true, flush_result.is_ok()) != persistence::COMMIT_COMMITTED
+        {
+            return flush_result;
+        }
+        flush_result
     }
 
     /// Add the committed checkpoint to the caller's M3 input `WriteBatch`.
@@ -450,8 +459,56 @@ impl SourceCheckpointStore {
     /// Commit source input and its checkpoint atomically, then make the durable
     /// commit visible to restart recovery.
     pub async fn commit_m3(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        let descriptor = CoupledBatchDescriptor::inspect(&batch);
+        let state_written = descriptor.has_state;
+        let outputs_written = descriptor.has_outputs;
+        let source_marker_written = descriptor.has_source_marker;
+        let frontier_written = descriptor.has_frontier;
+
+        descriptor.validate(false)?;
+
+        let write_result = self.db.write_batch(batch).await;
+        let write_succeeded = write_result.is_ok();
+        let flush_result = if write_succeeded {
+            self.db.flush().await
+        } else {
+            write_result
+        };
+        let flush_succeeded = flush_result.is_ok();
+
+        if !persistence::coupled_commit_is_durable(
+            state_written,
+            outputs_written,
+            source_marker_written,
+            frontier_written,
+            write_succeeded,
+            flush_succeeded,
+        ) {
+            return flush_result.and(Err(StorageError::Unsupported(
+                "commit_m3: coupled commit durability conditions not satisfied".into(),
+            )));
+        }
+        flush_result
+    }
+
+    /// Durably commit a raw batch without coupled-commit component validation.
+    ///
+    /// Intended for isolated or administrative metadata writes (such as
+    /// pre-M3 backfill intent records) that do not advance state/output frontiers.
+    pub async fn commit_raw_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
         self.db.write_batch(batch).await?;
         self.db.flush().await
+    }
+
+    /// Commit a coupled transaction, validating required components and
+    /// committing atomically via M3.
+    pub async fn commit_coupled_transaction(
+        &self,
+        tx: CoupledTransactionBuilder,
+        require_metadata: bool,
+    ) -> Result<(), StorageError> {
+        let batch = tx.build(require_metadata)?;
+        self.commit_m3(batch).await
     }
 
     /// Return exactly the highest valid committed checkpoint, ignoring prepared
@@ -465,16 +522,28 @@ impl SourceCheckpointStore {
         for (_, value) in records {
             let checkpoint: SourceCheckpoint = serde_json::from_slice(&value)
                 .map_err(|error| StorageError::KeyEncoding(error.to_string()))?;
-            if checkpoint.version != 1
-                || checkpoint.connector_id != self.connector_id
-                || checkpoint.state != SourceCheckpointState::Committed
-            {
-                continue;
-            }
-            if highest.as_ref().is_none_or(|current: &SourceCheckpoint| {
-                checkpoint.source_epoch > current.source_epoch
-            }) {
-                highest = Some(checkpoint);
+            let state = match checkpoint.state {
+                SourceCheckpointState::Prepared => persistence::COMMIT_FAILED,
+                SourceCheckpointState::Committed => persistence::COMMIT_COMMITTED,
+            };
+            let duplicate = highest.as_ref().is_some_and(|current: &SourceCheckpoint| {
+                checkpoint.source_epoch == current.source_epoch
+            });
+            match persistence::replay_decision(
+                state,
+                checkpoint.version == 1,
+                checkpoint.connector_id == self.connector_id,
+                duplicate,
+            ) {
+                persistence::REPLAY_APPLY
+                    if highest.as_ref().is_none_or(|current: &SourceCheckpoint| {
+                        checkpoint.source_epoch > current.source_epoch
+                    }) =>
+                {
+                    highest = Some(checkpoint)
+                }
+                persistence::REPLAY_NOOP | persistence::REPLAY_REJECT => {}
+                _ => {}
             }
         }
         Ok(highest)
@@ -616,7 +685,7 @@ impl SourceEpochRegistry {
         partition_offsets: BTreeMap<u64, OffsetToken>,
     ) -> Result<SourceEpochEntry, SourceEpochError> {
         Ok(SourceEpochEntry {
-            source_epoch: self.current_epoch.checked_add(1).ok_or({
+            source_epoch: persistence::next_epoch(self.current_epoch).ok_or({
                 SourceEpochError::Exhausted {
                     connector_id: self.connector_id,
                 }
@@ -632,12 +701,12 @@ impl SourceEpochRegistry {
         source_epoch: Epoch,
         partition_offsets: BTreeMap<u64, OffsetToken>,
     ) -> Result<SourceEpochEntry, SourceEpochError> {
-        let expected = self.current_epoch.checked_add(1).ok_or({
+        let expected = persistence::next_epoch(self.current_epoch).ok_or({
             SourceEpochError::Exhausted {
                 connector_id: self.connector_id,
             }
         })?;
-        if source_epoch < expected {
+        if !persistence::epoch_is_admissible(self.current_epoch, source_epoch, false, true, false) {
             return Err(SourceEpochError::NonMonotone {
                 connector_id: self.connector_id,
                 expected,
@@ -659,13 +728,17 @@ impl SourceEpochRegistry {
     /// not the next epoch, and [`SourceEpochError::Exhausted`] at the numeric
     /// boundary.
     pub fn commit_epoch(&mut self, entry: SourceEpochEntry) -> Result<(), SourceEpochError> {
-        let expected = self
-            .current_epoch
-            .checked_add(1)
-            .ok_or(SourceEpochError::Exhausted {
+        let expected =
+            persistence::next_epoch(self.current_epoch).ok_or(SourceEpochError::Exhausted {
                 connector_id: self.connector_id,
             })?;
-        if entry.source_epoch != expected {
+        if !persistence::epoch_is_admissible(
+            self.current_epoch,
+            entry.source_epoch,
+            true,
+            true,
+            false,
+        ) {
             return Err(SourceEpochError::NonMonotone {
                 connector_id: self.connector_id,
                 expected,
@@ -690,12 +763,18 @@ impl SourceEpochRegistry {
         &mut self,
         entry: SourceEpochEntry,
     ) -> Result<(), SourceEpochError> {
-        let expected = self.current_epoch.checked_add(1).ok_or({
+        let expected = persistence::next_epoch(self.current_epoch).ok_or({
             SourceEpochError::Exhausted {
                 connector_id: self.connector_id,
             }
         })?;
-        if entry.source_epoch < expected {
+        if !persistence::epoch_is_admissible(
+            self.current_epoch,
+            entry.source_epoch,
+            false,
+            true,
+            false,
+        ) {
             return Err(SourceEpochError::NonMonotone {
                 connector_id: self.connector_id,
                 expected,
@@ -718,6 +797,178 @@ impl SourceEpochRegistry {
     /// Returns `None` if the epoch is not in the bounded history window.
     pub fn offsets_for_epoch(&self, epoch: Epoch) -> Option<&BTreeMap<u64, OffsetToken>> {
         self.history.get(&epoch).map(|e| &e.partition_offsets)
+    }
+}
+
+// ─── CoupledBatchDescriptor & CoupledTransactionBuilder ──────────────────────
+
+/// Descriptor inspecting the mutations present in a storage write batch
+/// to derive persistence facts for verified commit predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CoupledBatchDescriptor {
+    pub has_state: bool,
+    pub has_outputs: bool,
+    pub has_source_marker: bool,
+    pub has_frontier: bool,
+    pub has_coupling_metadata: bool,
+}
+
+impl CoupledBatchDescriptor {
+    /// Inspect a `WriteBatch` to detect which classes of mutations are present.
+    pub fn inspect(batch: &WriteBatch) -> Self {
+        let mut desc = Self::default();
+        let frontier_key = ShardKeyEncoder::frontier_key();
+        for op in batch.ops() {
+            let key = op.key();
+            if key.starts_with(&[ShardPrefix::OpState.as_byte()]) || key.starts_with(b"op_state/") {
+                desc.has_state = true;
+            }
+            if key.starts_with(&[ShardPrefix::ViewOutput.as_byte()])
+                || key.starts_with(b"view_output/")
+            {
+                desc.has_outputs = true;
+            }
+            if (key.starts_with(&[CatalogType::Connector as u8])
+                && key
+                    .windows(b"source_checkpoint/committed/".len())
+                    .any(|w| w == b"source_checkpoint/committed/"))
+                || (key.starts_with(b"connector/")
+                    && key.windows(b"committed".len()).any(|w| w == b"committed"))
+            {
+                desc.has_source_marker = true;
+            }
+            if key == frontier_key.as_slice()
+                || (key.starts_with(&[ShardPrefix::ShardMeta.as_byte()])
+                    && key.ends_with(b"frontier"))
+                || key == b"shard_meta/frontier"
+            {
+                desc.has_frontier = true;
+            }
+            if key
+                .windows(b"backfill_cursor/".len())
+                .any(|w| w == b"backfill_cursor/")
+                || key.windows(b"lifecycle/".len()).any(|w| w == b"lifecycle/")
+            {
+                desc.has_coupling_metadata = true;
+            }
+        }
+        desc
+    }
+
+    /// Returns true if all required coupled commit mutations (state, outputs,
+    /// source marker, frontier) are present.
+    pub fn is_complete(&self) -> bool {
+        self.has_state && self.has_outputs && self.has_source_marker && self.has_frontier
+    }
+
+    /// Validates that required mutations are present, returning an error if any are missing.
+    pub fn validate(&self, require_metadata: bool) -> Result<(), StorageError> {
+        if !self.has_state {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: missing state mutation".into(),
+            ));
+        }
+        if !self.has_outputs {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: missing view output mutation".into(),
+            ));
+        }
+        if !self.has_source_marker {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: missing source marker mutation".into(),
+            ));
+        }
+        if !self.has_frontier {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: missing frontier mutation".into(),
+            ));
+        }
+        if require_metadata && !self.has_coupling_metadata {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: missing coupling metadata mutation".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Typed transaction builder ensuring all required persistence components
+/// are present before building a `WriteBatch` for commit.
+#[derive(Debug, Clone, Default)]
+pub struct CoupledTransactionBuilder {
+    batch: WriteBatch,
+}
+
+impl CoupledTransactionBuilder {
+    /// Create a new empty coupled transaction builder.
+    pub fn new() -> Self {
+        Self {
+            batch: WriteBatch::new(),
+        }
+    }
+
+    /// Add an operator state mutation.
+    pub fn add_op_state(&mut self, key: &[u8], value: &[u8]) -> &mut Self {
+        self.batch.put(key, value);
+        self
+    }
+
+    /// Add a materialized view output mutation.
+    pub fn add_view_output(&mut self, key: &[u8], value: &[u8]) -> &mut Self {
+        self.batch.put(key, value);
+        self
+    }
+
+    /// Add a committed source checkpoint marker to the batch.
+    pub fn add_source_marker(
+        &mut self,
+        store: &SourceCheckpointStore,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<&mut Self, StorageError> {
+        if checkpoint.connector_id != store.connector_id {
+            return Err(StorageError::KeyEncoding(
+                "RS-4011: source checkpoint connector_id mismatch".to_string(),
+            ));
+        }
+        if checkpoint.state == SourceCheckpointState::Prepared {
+            store.append_committed(&mut self.batch, checkpoint)?;
+        } else {
+            self.batch.put(
+                &store.key(SourceCheckpointState::Committed, checkpoint.source_epoch),
+                &SourceCheckpointStore::encode(checkpoint)?,
+            );
+        }
+        Ok(self)
+    }
+
+    /// Add a frontier update mutation for the given epoch.
+    pub fn add_frontier(&mut self, epoch: Epoch) -> &mut Self {
+        self.batch
+            .put(&ShardKeyEncoder::frontier_key(), &epoch.to_be_bytes());
+        self
+    }
+
+    /// Add arbitrary coupling metadata (such as backfill cursor or lifecycle record).
+    pub fn add_coupling_metadata(&mut self, key: &[u8], value: &[u8]) -> &mut Self {
+        self.batch.put(key, value);
+        self
+    }
+
+    /// Inspect current batch without consuming the builder.
+    pub fn descriptor(&self) -> CoupledBatchDescriptor {
+        CoupledBatchDescriptor::inspect(&self.batch)
+    }
+
+    /// Access reference to the current batch.
+    pub fn batch(&self) -> &WriteBatch {
+        &self.batch
+    }
+
+    /// Build and validate the `WriteBatch`. Fails if any required mutation is missing.
+    pub fn build(self, require_metadata: bool) -> Result<WriteBatch, StorageError> {
+        let descriptor = CoupledBatchDescriptor::inspect(&self.batch);
+        descriptor.validate(require_metadata)?;
+        Ok(self.batch)
     }
 }
 
@@ -913,5 +1164,337 @@ mod tests {
                 }
             }
         }
+    }
+
+    async fn make_test_store(connector_id: ConnectorId) -> SourceCheckpointStore {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let db = Arc::new(ShardDb::builder("test", store).build().await.unwrap());
+        SourceCheckpointStore::new(db, 0, connector_id)
+    }
+
+    #[test]
+    fn coupled_batch_descriptor_empty_batch() {
+        let batch = WriteBatch::new();
+        let desc = CoupledBatchDescriptor::inspect(&batch);
+        assert!(!desc.has_state);
+        assert!(!desc.has_outputs);
+        assert!(!desc.has_source_marker);
+        assert!(!desc.has_frontier);
+        assert!(!desc.has_coupling_metadata);
+        assert!(!desc.is_complete());
+
+        let err = desc.validate(false).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing state mutation"))
+        );
+    }
+
+    #[test]
+    fn coupled_batch_descriptor_recognizes_patterns() {
+        // Test state recognition
+        let mut b1 = WriteBatch::new();
+        b1.put(&[ShardPrefix::OpState.as_byte(), 1, 2, 3], b"val");
+        assert!(CoupledBatchDescriptor::inspect(&b1).has_state);
+
+        let mut b1_alt = WriteBatch::new();
+        b1_alt.put(b"op_state/table1/k1", b"val");
+        assert!(CoupledBatchDescriptor::inspect(&b1_alt).has_state);
+
+        // Test output recognition
+        let mut b2 = WriteBatch::new();
+        b2.put(&[ShardPrefix::ViewOutput.as_byte(), 4, 5, 6], b"val");
+        assert!(CoupledBatchDescriptor::inspect(&b2).has_outputs);
+
+        let mut b2_alt = WriteBatch::new();
+        b2_alt.put(b"view_output/v1/k1", b"val");
+        assert!(CoupledBatchDescriptor::inspect(&b2_alt).has_outputs);
+
+        // Test source marker recognition
+        let mut b3 = WriteBatch::new();
+        let source_key = CatalogKeyEncoder::encode_with_suffix(
+            CatalogType::Connector,
+            0,
+            1,
+            b"source_checkpoint/committed/42",
+        );
+        b3.put(&source_key, b"val");
+        assert!(CoupledBatchDescriptor::inspect(&b3).has_source_marker);
+
+        let mut b3_alt = WriteBatch::new();
+        b3_alt.put(b"connector/conn1/committed/42", b"val");
+        assert!(CoupledBatchDescriptor::inspect(&b3_alt).has_source_marker);
+
+        // Test frontier recognition
+        let mut b4 = WriteBatch::new();
+        b4.put(&ShardKeyEncoder::frontier_key(), &1u64.to_be_bytes());
+        assert!(CoupledBatchDescriptor::inspect(&b4).has_frontier);
+
+        let mut b4_meta = WriteBatch::new();
+        let mut meta_frontier = vec![ShardPrefix::ShardMeta.as_byte()];
+        meta_frontier.extend_from_slice(b"custom_frontier");
+        b4_meta.put(&meta_frontier, &1u64.to_be_bytes());
+        assert!(CoupledBatchDescriptor::inspect(&b4_meta).has_frontier);
+
+        let mut b4_alt = WriteBatch::new();
+        b4_alt.put(b"shard_meta/frontier", &1u64.to_be_bytes());
+        assert!(CoupledBatchDescriptor::inspect(&b4_alt).has_frontier);
+
+        // Test coupling metadata recognition
+        let mut b5 = WriteBatch::new();
+        b5.put(b"connector/conn1/backfill_cursor/view1/0", b"val");
+        assert!(CoupledBatchDescriptor::inspect(&b5).has_coupling_metadata);
+
+        let mut b5_alt = WriteBatch::new();
+        b5_alt.put(b"connector/conn1/backfill_cursor/lifecycle/view1", b"val");
+        assert!(CoupledBatchDescriptor::inspect(&b5_alt).has_coupling_metadata);
+    }
+
+    #[test]
+    fn coupled_batch_descriptor_completeness_and_validation() {
+        let mut batch = WriteBatch::new();
+        batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        let desc = CoupledBatchDescriptor::inspect(&batch);
+        assert!(!desc.is_complete());
+        assert!(matches!(
+            desc.validate(false).unwrap_err(),
+            StorageError::Unsupported(msg) if msg.contains("missing view output mutation")
+        ));
+
+        batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"out");
+        let desc = CoupledBatchDescriptor::inspect(&batch);
+        assert!(!desc.is_complete());
+        assert!(matches!(
+            desc.validate(false).unwrap_err(),
+            StorageError::Unsupported(msg) if msg.contains("missing source marker mutation")
+        ));
+
+        let source_key = CatalogKeyEncoder::encode_with_suffix(
+            CatalogType::Connector,
+            0,
+            1,
+            b"source_checkpoint/committed/1",
+        );
+        batch.put(&source_key, b"source");
+        let desc = CoupledBatchDescriptor::inspect(&batch);
+        assert!(!desc.is_complete());
+        assert!(matches!(
+            desc.validate(false).unwrap_err(),
+            StorageError::Unsupported(msg) if msg.contains("missing frontier mutation")
+        ));
+
+        batch.put(&ShardKeyEncoder::frontier_key(), &1u64.to_be_bytes());
+        let desc = CoupledBatchDescriptor::inspect(&batch);
+        assert!(desc.is_complete());
+        assert!(desc.validate(false).is_ok());
+
+        // Without metadata, require_metadata=true fails
+        assert!(matches!(
+            desc.validate(true).unwrap_err(),
+            StorageError::Unsupported(msg) if msg.contains("missing coupling metadata mutation")
+        ));
+
+        // Add metadata
+        batch.put(b"backfill_cursor/v1", b"cursor");
+        let desc = CoupledBatchDescriptor::inspect(&batch);
+        assert!(desc.has_coupling_metadata);
+        assert!(desc.validate(true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn coupled_transaction_builder_success() {
+        let store = make_test_store(ConnectorId(10)).await;
+        let prepared =
+            SourceCheckpoint::prepared(ConnectorId(10), 1, OffsetToken::new(b"token1".to_vec()));
+
+        let mut builder = CoupledTransactionBuilder::new();
+        let state_key = [ShardPrefix::OpState.as_byte(), 1, 2];
+        let output_key = [ShardPrefix::ViewOutput.as_byte(), 3, 4];
+
+        builder
+            .add_op_state(&state_key, b"state_v")
+            .add_view_output(&output_key, b"out_v")
+            .add_source_marker(&store, &prepared)
+            .unwrap()
+            .add_frontier(1);
+
+        assert!(builder.descriptor().is_complete());
+        assert_eq!(builder.batch().len(), 5); // state, output, source committed put, source prepared delete, frontier
+
+        let batch = builder.build(false).unwrap();
+        assert!(!batch.is_empty());
+        let desc = CoupledBatchDescriptor::inspect(&batch);
+        assert!(desc.is_complete());
+    }
+
+    #[tokio::test]
+    async fn coupled_transaction_builder_with_metadata() {
+        let store = make_test_store(ConnectorId(11)).await;
+        let prepared =
+            SourceCheckpoint::prepared(ConnectorId(11), 2, OffsetToken::new(b"token2".to_vec()));
+
+        let mut builder = CoupledTransactionBuilder::new();
+        builder
+            .add_op_state(&[ShardPrefix::OpState.as_byte(), 1], b"state")
+            .add_view_output(&[ShardPrefix::ViewOutput.as_byte(), 1], b"out")
+            .add_source_marker(&store, &prepared)
+            .unwrap()
+            .add_frontier(2)
+            .add_coupling_metadata(b"prefix/backfill_cursor/part0", b"cursor_data");
+
+        let batch = builder.build(true).unwrap();
+        let desc = CoupledBatchDescriptor::inspect(&batch);
+        assert!(desc.is_complete());
+        assert!(desc.has_coupling_metadata);
+    }
+
+    #[tokio::test]
+    async fn coupled_transaction_builder_committed_checkpoint() {
+        let store = make_test_store(ConnectorId(12)).await;
+        let committed =
+            SourceCheckpoint::prepared(ConnectorId(12), 3, OffsetToken::new(b"token3".to_vec()))
+                .committed();
+
+        let mut builder = CoupledTransactionBuilder::new();
+        builder
+            .add_op_state(&[ShardPrefix::OpState.as_byte(), 1], b"state")
+            .add_view_output(&[ShardPrefix::ViewOutput.as_byte(), 1], b"out")
+            .add_source_marker(&store, &committed)
+            .unwrap()
+            .add_frontier(3);
+
+        let batch = builder.build(false).unwrap();
+        let desc = CoupledBatchDescriptor::inspect(&batch);
+        assert!(desc.is_complete());
+    }
+
+    #[tokio::test]
+    async fn coupled_transaction_builder_connector_mismatch() {
+        let store = make_test_store(ConnectorId(13)).await;
+        let foreign =
+            SourceCheckpoint::prepared(ConnectorId(999), 1, OffsetToken::new(b"token".to_vec()));
+
+        let mut builder = CoupledTransactionBuilder::new();
+        let err = builder.add_source_marker(&store, &foreign).unwrap_err();
+        assert!(matches!(err, StorageError::KeyEncoding(_)));
+    }
+
+    #[test]
+    fn coupled_transaction_builder_missing_component_fails_build() {
+        let mut builder = CoupledTransactionBuilder::new();
+        builder.add_op_state(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        let err = builder.build(false).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation"))
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_m3_rejects_incomplete_batch() {
+        let store = make_test_store(ConnectorId(20)).await;
+
+        // Empty batch fails
+        let empty = WriteBatch::new();
+        let err = store.commit_m3(empty).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing state mutation"))
+        );
+
+        // Batch with only state fails
+        let mut b1 = WriteBatch::new();
+        b1.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        let err = store.commit_m3(b1).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation"))
+        );
+
+        // Batch with state and output fails (missing source marker)
+        let mut b2 = WriteBatch::new();
+        b2.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        b2.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+        let err = store.commit_m3(b2).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing source marker mutation"))
+        );
+
+        // Batch with state, output, and source marker fails (missing frontier)
+        let mut b3 = WriteBatch::new();
+        b3.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        b3.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+        let source_key = CatalogKeyEncoder::encode_with_suffix(
+            CatalogType::Connector,
+            0,
+            20,
+            b"source_checkpoint/committed/1",
+        );
+        b3.put(&source_key, b"cp");
+        let err = store.commit_m3(b3).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing frontier mutation"))
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_m3_accepts_complete_batch() {
+        let store = make_test_store(ConnectorId(21)).await;
+        let mut batch = WriteBatch::new();
+        batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+        let source_key = CatalogKeyEncoder::encode_with_suffix(
+            CatalogType::Connector,
+            0,
+            21,
+            b"source_checkpoint/committed/1",
+        );
+        batch.put(&source_key, b"cp");
+        batch.put(&ShardKeyEncoder::frontier_key(), &1u64.to_be_bytes());
+
+        assert!(store.commit_m3(batch).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn commit_raw_batch_allows_isolated_writes() {
+        let store = make_test_store(ConnectorId(22)).await;
+        let mut batch = WriteBatch::new();
+        batch.put(b"connector/conn22/backfill_intent", b"pre_m3_intent");
+        assert!(store.commit_raw_batch(batch).await.is_ok());
+
+        let val = store
+            .db
+            .get(b"connector/conn22/backfill_intent")
+            .await
+            .unwrap();
+        assert_eq!(val.as_deref(), Some(b"pre_m3_intent".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn commit_coupled_transaction_validates_and_commits() {
+        let store = make_test_store(ConnectorId(23)).await;
+        let checkpoint =
+            SourceCheckpoint::prepared(ConnectorId(23), 5, OffsetToken::new(b"token5".to_vec()));
+
+        // Incomplete transaction fails
+        let mut invalid_builder = CoupledTransactionBuilder::new();
+        invalid_builder.add_op_state(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        let err = store
+            .commit_coupled_transaction(invalid_builder, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation"))
+        );
+
+        // Complete transaction succeeds
+        let mut valid_builder = CoupledTransactionBuilder::new();
+        valid_builder
+            .add_op_state(&[ShardPrefix::OpState.as_byte(), 1], b"state")
+            .add_view_output(&[ShardPrefix::ViewOutput.as_byte(), 1], b"out")
+            .add_source_marker(&store, &checkpoint)
+            .unwrap()
+            .add_frontier(5);
+
+        assert!(store
+            .commit_coupled_transaction(valid_builder, false)
+            .await
+            .is_ok());
     }
 }

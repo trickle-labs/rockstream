@@ -12,6 +12,8 @@ $ make error-codes
 $ make exit-criteria
 $ make documentation
 $ make check
+$ make verify-proof-contracts
+$ bash scripts/check-verus-qualification.test.sh
 $ cargo deny check
 $ cargo audit
 $ bash scripts/check-documentation.test.sh

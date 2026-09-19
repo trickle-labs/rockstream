@@ -38,6 +38,7 @@ on:
       - "crates/rockstream-storage/**"
       - "crates/rockstream-plan/**"
       - "crates/rockstream-types/**"
+      - "crates/rockstream-verified/**"
       - "crates/rockstream-oracle/**"
       - "crates/rockstream-cli/**"
       - "crates/rockstream-diff/**"

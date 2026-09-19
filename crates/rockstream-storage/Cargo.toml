@@ -12,6 +12,7 @@ harness = false
 
 [dependencies]
 rockstream-types = { workspace = true }
+rockstream-verified = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 slatedb = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "rockstream-verified"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Small Verus-verified RockStream production kernels"
+
+[dependencies]
+vstd = { workspace = true }
+
+[package.metadata.verus]
+verify = true
+release = "0.2026.09.13.671956e"
+
+[lints]
+workspace = true

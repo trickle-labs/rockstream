@@ -59,8 +59,8 @@ pub use view_attach::{AttachedView, AttachmentDeltaBuffer, ViewAttachmentMetrics
 pub use spill::{SerdeSpill, SpillKey, SpillValue, SpillableArrangement};
 
 pub use aggregate::{
-    load_frontier, persist_agg_state, persist_bucketed_agg_state, persist_frontier, AggState,
-    AggregateOp, BucketedAggregateOp,
+    bucketed_combined_key, bucketed_partial_key, load_frontier, persist_agg_state,
+    persist_bucketed_agg_state, persist_frontier, AggState, AggregateOp, BucketedAggregateOp,
 };
 pub use branch_scheduler::{
     BranchScheduler, FnExecutor, ViewBranchExecutor, ViewDependencyGraph,

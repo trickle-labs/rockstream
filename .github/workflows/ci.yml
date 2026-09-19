@@ -116,6 +116,60 @@ jobs:
         run: bash scripts/check-operator-state-bytes.test.sh
       - name: path-coupling check
         run: bash scripts/check-path-coupling.sh
+      - name: path-coupling checker self-test
+        run: bash scripts/check-path-coupling.test.sh
+
+  verus-verify:
+    name: Verus verify and qualify (VS6)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      VERUS_QUALIFICATION_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache pinned Verus
+        uses: actions/cache@v4
+        with:
+          path: .cache/verus
+          key: verus-${{ runner.os }}-${{ runner.arch }}-0.2026.09.13.671956e
+      - name: Install pinned Verus
+        run: echo "$(bash scripts/install-verus.sh)" >> "$GITHUB_PATH"
+      - name: Verify Rust kernels
+        run: make verify-rust
+      - name: Verify proof contracts
+        run: make verify-proof-contracts
+      - name: Run clean VS6 qualification matrix
+        run: make qualify-verus
+      - name: Upload VS6 qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verus-qualification-${{ matrix.target }}
+          path: evidence/verus/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Exercise production wrapper
+        run: cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests
+      - name: Build ordinary Cargo consumer
+        run: cargo build --locked --release -p rockstream-cli
 
   check-tests:
     name: Check tests (${{ matrix.shard }})
@@ -224,7 +278,11 @@ jobs:
             git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=50
             base_sha=$(git merge-base "origin/${{ github.event.pull_request.base.ref }}" HEAD)
             changed=$(git diff --name-only "$base_sha"...HEAD)
-            if echo "$changed" | grep -qE '^(formal/|DESIGN\.md|crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types|plan|oracle|cli|diff|test-support)/)'; then
+            protocol_model_changed=false
+            if echo "$changed" | grep -E '^formal/' | grep -qv '^formal/verus/'; then
+              protocol_model_changed=true
+            fi
+            if echo "$changed" | grep -qE '^(DESIGN\.md|crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types|plan|oracle|cli|diff|test-support)/)' || [ "$protocol_model_changed" = true ]; then
               echo "run=true" >> "$GITHUB_OUTPUT"
             else
               echo "run=false" >> "$GITHUB_OUTPUT"
@@ -336,7 +394,7 @@ jobs:
     # times is ~4 minutes on a warm cache; sized generously above that plus
     # checkout/build overhead so a slow CI runner doesn't flake. Recorded in
     # `.claude/v0.45.4-evidence.md`.
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

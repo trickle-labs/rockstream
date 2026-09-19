@@ -651,6 +651,7 @@ impl GroupKeyPacker {
         let mut reverse = self.reverse.lock().unwrap();
         let mut reverse_slices = self.reverse_slices.lock().unwrap();
         let mut next_id = self.next_id.lock().unwrap();
+        let mut dirty = self.dirty.lock().unwrap();
 
         for row in 0..delta.num_rows() {
             let mut encoded = Vec::new();
@@ -662,8 +663,8 @@ impl GroupKeyPacker {
             } else {
                 let id = *next_id;
                 *next_id += 1;
-                forward.insert(encoded.clone(), id);
-                self.dirty.lock().unwrap().push((encoded, id));
+                dirty.push((encoded.clone(), id));
+                forward.insert(encoded, id);
 
                 let key_slices: Vec<ArrayRef> =
                     (0..n).map(|i| delta.data.column(i).slice(row, 1)).collect();

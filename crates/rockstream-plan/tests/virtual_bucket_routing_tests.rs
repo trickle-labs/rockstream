@@ -90,3 +90,48 @@ fn power_of_two_routing_is_deterministic_and_bounded() {
     );
     assert!(route_power_of_two_bucket(key, 8, key.len()).unwrap() < 8);
 }
+
+#[test]
+fn normalizes_power_of_two_bucket_counts_at_all_boundaries() {
+    for (input, expected) in [
+        (0, 1),
+        (1, 1),
+        (2, 2),
+        (3, 4),
+        (4, 4),
+        (5, 8),
+        (8, 8),
+        (9, 16),
+        (16, 16),
+        (17, 32),
+        (32, 32),
+        (33, 64),
+        (64, 64),
+        (65, 128),
+        (128, 128),
+        (129, 256),
+        (256, 256),
+        (257, 512),
+        (512, 512),
+        (513, 1024),
+        (1024, 1024),
+        (1025, 2048),
+        (2048, 2048),
+        (2049, 4096),
+        (4096, 4096),
+        (4097, 8192),
+        (8192, 8192),
+        (8193, 16_384),
+        (16_384, 16_384),
+        (16_385, 32_768),
+        (32_768, 32_768),
+        (32_769, 32_768),
+        (u16::MAX, 32_768),
+    ] {
+        assert_eq!(
+            normalize_power_of_two_bucket_count(input),
+            expected,
+            "unexpected normalized bucket count for {input}"
+        );
+    }
+}

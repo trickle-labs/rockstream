@@ -35,9 +35,10 @@ pub use source_connector::{
     SourcePollLifecycle, WatermarkCapability, WindowWatermarkPolicy,
 };
 pub use source_epoch::{
-    BackfillCursor, BackfillLifecycle, BackfillPhase, OffsetToken, SnapshotDeltaFence,
-    SourceCheckpoint, SourceCheckpointState, SourceCheckpointStore, SourceEpochEntry,
-    SourceEpochRegistry, SOURCE_CHECKPOINT_HISTORY_MAX_ENTRIES,
+    BackfillCursor, BackfillLifecycle, BackfillPhase, CoupledBatchDescriptor,
+    CoupledTransactionBuilder, OffsetToken, SnapshotDeltaFence, SourceCheckpoint,
+    SourceCheckpointState, SourceCheckpointStore, SourceEpochEntry, SourceEpochRegistry,
+    SOURCE_CHECKPOINT_HISTORY_MAX_ENTRIES,
 };
 pub use source_runtime::{
     SourceOwnerLease, SourceRuntimeCoordinator, SourceRuntimeMetrics,

@@ -8,6 +8,7 @@ description = "Shared types for RockStream (timestamps, frontiers, Z-set rows, s
 
 [dependencies]
 antichain = { workspace = true }
+rockstream-verified = { workspace = true }
 arrow = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 serde = { workspace = true }

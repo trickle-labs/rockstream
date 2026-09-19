@@ -1,0 +1,677 @@
+schema = 1
+
+[[claims]]
+id = "VS0-02"
+status = "kernel-verified"
+domain = "Every u16 bucket count. Results are powers of two in 1..=32768."
+assumptions = ["The Rust u16 value domain and the pinned Verus/vstd specifications."]
+implementation = ["crates/rockstream-verified/src/lib.rs::normalize_power_of_two_bucket_count"]
+theorems = ["crates/rockstream-verified/src/lib.rs::is_power_of_two"]
+production_callers = ["crates/rockstream-plan/src/virtual_bucket.rs::normalize_power_of_two_bucket_count"]
+regression_tests = ["crates/rockstream-plan/tests/virtual_bucket_routing_tests.rs::normalizes_power_of_two_bucket_counts_at_all_boundaries"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests",
+]
+
+[[claims]]
+id = "VS1-02"
+status = "kernel-verified"
+domain = "Checked i64/u64 arithmetic and exact-width big-endian scalar decoding."
+assumptions = ["Rust primitive integer semantics and the pinned Verus/vstd specifications."]
+implementation = [
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_add",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_mul",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_u64_add",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_neg",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i128_to_i64",
+    "crates/rockstream-verified/src/arithmetic.rs::decode_i64",
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+]
+theorems = [
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_add",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_mul",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_u64_add",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_neg",
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i128_to_i64",
+    "crates/rockstream-verified/src/arithmetic.rs::decode_i64",
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+]
+production_callers = [
+    "crates/rockstream-types/src/laws/weight_add.rs::merge",
+    "crates/rockstream-types/src/laws/sum_count.rs::merge",
+    "crates/rockstream-storage/src/merge_registry.rs::merge",
+    "crates/rockstream-ops/src/aggregate.rs::apply_delta",
+]
+regression_tests = [
+    "crates/rockstream-types/src/laws/arithmetic.rs::checked_arithmetic_has_exact_i64_boundaries",
+    "crates/rockstream-types/src/laws/arithmetic.rs::fixed_width_codecs_reject_truncation_and_trailing_bytes",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-types laws::arithmetic --lib",
+    "cargo test --locked -p rockstream-storage merge_registry --lib",
+]
+
+[[claims]]
+id = "VS1-03"
+status = "adapter-qualified"
+domain = "WeightAdd and SumCount mathematical laws over their checked i64 representation; regrouping requires an absolute-sum admission."
+assumptions = ["The law descriptor is consumed only after its executable domain and evidence reference are inspected."]
+implementation = [
+    "crates/rockstream-types/src/laws/weight_add.rs::inverse",
+    "crates/rockstream-types/src/laws/sum_count.rs::inverse",
+    "crates/rockstream-types/src/merge_law.rs::can_reassociate",
+]
+theorems = [
+    "crates/rockstream-verified/src/laws.rs::i64_add_identity",
+    "crates/rockstream-verified/src/laws.rs::i64_add_commutative",
+    "crates/rockstream-verified/src/laws.rs::i64_add_associative",
+    "crates/rockstream-verified/src/laws.rs::i64_add_inverse",
+    "crates/rockstream-verified/src/laws.rs::checked_add_refines_int_add",
+    "crates/rockstream-verified/src/laws.rs::regrouping_budget_admissible",
+]
+production_callers = [
+    "crates/rockstream-control/src/skew.rs::plan_hot_key_mitigation",
+    "crates/rockstream-types/src/laws/registry.rs::descriptors",
+]
+regression_tests = [
+    "crates/rockstream-types/tests/merge_law_composable_flag_tests.rs::registered_laws_expose_expected_composable_flags",
+]
+evidence = [
+    "cargo test --locked -p rockstream-types --tests",
+    "cargo test --locked -p rockstream-control --test hot_key_planning_tests --test skew_split_control_tests",
+]
+
+[[claims]]
+id = "VS1-04"
+status = "adapter-qualified"
+domain = "Existing tagged storage formats: one tag byte followed by exactly 8 or 16 payload bytes."
+assumptions = ["Persisted tags remain the existing external format; no unversioned migration is performed."]
+implementation = [
+    "crates/rockstream-storage/src/merge_registry.rs::merge",
+    "crates/rockstream-storage/src/merge_registry.rs::validate_operand",
+]
+theorems = [
+    "crates/rockstream-verified/src/laws.rs::checked_merge_preserves_addition",
+]
+production_callers = [
+    "crates/rockstream-storage/src/shard_db.rs::merge",
+    "crates/rockstream-storage/src/shard_db.rs::get_merged",
+]
+regression_tests = [
+    "crates/rockstream-storage/src/merge_registry.rs::malformed_first_operand_returns_error",
+    "crates/rockstream-storage/src/merge_registry.rs::trailing_bytes_are_rejected",
+]
+evidence = [
+    "cargo test --locked -p rockstream-storage merge_registry --lib",
+]
+
+[[claims]]
+id = "VS1-05"
+status = "adapter-qualified"
+domain = "Reordering is disabled unless a descriptor carries executable concrete-operand admission."
+assumptions = ["The spill fallback preserves single-shard merge semantics for unadmitted laws."]
+implementation = [
+    "crates/rockstream-types/src/merge_law.rs::can_reassociate",
+    "crates/rockstream-control/src/skew.rs::plan_hot_key_mitigation",
+]
+theorems = [
+    "crates/rockstream-verified/src/laws.rs::regrouping_budget_admissible",
+]
+production_callers = [
+    "crates/rockstream-control/src/skew.rs::observe",
+]
+regression_tests = [
+    "crates/rockstream-control/tests/hot_key_planning_tests.rs::composable_laws_without_operand_admission_use_spill_fallback",
+    "crates/rockstream-sim/tests/hot_key_detection_sim_tests.rs::hot_key_split_during_concurrent_migration_sim",
+]
+evidence = [
+    "cargo test --locked -p rockstream-control --test hot_key_planning_tests --test skew_split_control_tests",
+]
+
+[[claims]]
+id = "VS1-06"
+status = "adapter-qualified"
+domain = "Complete SumCount output requires an exact frontier; integer accumulator semantics are in scope, floating-point finalization is not."
+assumptions = ["SQL NULL and decimal boundary behavior is documented at the current public-query frontier."]
+implementation = [
+    "crates/rockstream-types/src/laws/sum_count.rs::frontier_policy",
+    "crates/rockstream-types/src/laws/sum_count.rs::avg_from_sum_count",
+]
+theorems = [
+    "crates/rockstream-types/src/laws/sum_count.rs::decode_sum_count",
+]
+production_callers = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta",
+    "crates/rockstream-types/src/frontier.rs::has_committed_through",
+]
+regression_tests = [
+    "crates/rockstream-types/src/laws/sum_count.rs::avg_undefined_when_count_zero",
+    "crates/rockstream-types/src/laws/sum_count.rs::properties_are_abelian_group",
+]
+evidence = [
+    "cargo test --locked -p rockstream-types laws::sum_count --lib",
+    "docs/adr/0004-merge-law-arithmetic.md",
+    "docs/ivm-operators.md",
+]
+
+[[claims]]
+id = "VS2-01"
+status = "adapter-qualified"
+domain = "Versioned shard-local and catalog layouts with the recorded discriminator and namespace allocation assumptions."
+assumptions = ["Operator IDs and catalog IDs use their existing fixed-width big-endian domains; variable-length arrangement fields remain outside the selected codec claim unless explicitly framed."]
+implementation = [
+    "crates/rockstream-storage/src/keys.rs::encode",
+    "crates/rockstream-storage/src/keys.rs::decode",
+    "crates/rockstream-storage/src/keys.rs::namespace_prefix",
+]
+theorems = [
+    "crates/rockstream-verified/src/codecs.rs::encode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::encode_u128_be",
+]
+production_callers = [
+    "crates/rockstream-storage/src/reader.rs::scan_op_state_prefix",
+    "crates/rockstream-storage/src/tests.rs::catalog_keys_store_and_retrieve_with_namespace",
+]
+regression_tests = [
+    "crates/rockstream-storage/src/keys.rs::shard_key_prefix_is_proper_prefix",
+    "crates/rockstream-storage/src/keys.rs::catalog_namespace_prefix_filters_correctly",
+]
+evidence = [
+    "formal/verus/key-layouts.toml",
+    "cargo test --locked -p rockstream-storage keys --lib",
+]
+
+[[claims]]
+id = "VS2-02"
+status = "kernel-verified"
+domain = "All i64 values encoded as ascending or descending fixed-width big-endian signed-order keys."
+assumptions = ["Lexicographic byte order is the storage engine's scan order and the surrounding encoder preserves the eight-byte width."]
+implementation = [
+    "crates/rockstream-verified/src/keys.rs::signed_order_key",
+    "crates/rockstream-verified/src/keys.rs::signed_order_key_decode",
+]
+theorems = [
+    "crates/rockstream-verified/src/keys.rs::signed_order_key_round_trips",
+    "crates/rockstream-verified/src/keys.rs::signed_order_key_preserves_order",
+]
+production_callers = [
+    "crates/rockstream-storage/src/keys.rs::minmax_sort_key",
+    "crates/rockstream-storage/src/keys.rs::minmax_sort_key_decode",
+    "crates/rockstream-storage/src/keys.rs::window_sort_key",
+    "crates/rockstream-storage/src/keys.rs::window_sort_key_decode",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::signed_order_kernel_matches_persisted_extremes",
+    "crates/rockstream-storage/src/keys.rs::signed_sort_keys_round_trip_and_order_at_i64_extremes",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-storage keys --lib",
+]
+
+[[claims]]
+id = "VS2-03"
+status = "adapter-qualified"
+domain = "Fixed-width u64/u128 fields, exact-width decoding, checked usize-to-u32 framing, and the selected generic/catalog/factor-payload key layouts."
+assumptions = ["Allocation failure is a process/recovery concern; malformed widths and arithmetic overflow are returned as decode failure before slicing."]
+implementation = [
+    "crates/rockstream-verified/src/codecs.rs::encode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::encode_u128_be",
+    "crates/rockstream-verified/src/codecs.rs::decode_u128_be",
+    "crates/rockstream-verified/src/codecs.rs::checked_usize_to_u32",
+    "crates/rockstream-storage/src/keys.rs::decode_factor_payload_key",
+    "crates/rockstream-storage/src/keys.rs::try_factor_payload_key",
+]
+theorems = [
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::decode_u128_be",
+    "crates/rockstream-verified/src/codecs.rs::checked_usize_to_u32",
+]
+production_callers = [
+    "crates/rockstream-storage/src/keys.rs::encode",
+    "crates/rockstream-storage/src/keys.rs::decode",
+    "crates/rockstream-storage/src/keys.rs::factor_payload_key",
+    "crates/rockstream-storage/src/keys.rs::try_factor_payload_key",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths",
+    "crates/rockstream-storage/src/keys.rs::factor_payload_codec_rejects_wrong_capsule_lengths",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-storage keys --lib",
+]
+
+[[claims]]
+id = "VS2-04"
+status = "adapter-qualified"
+domain = "Existing persisted bytes and prefix scans for generic shard and namespaced catalog keys; no unversioned format migration."
+assumptions = ["Supported LFS and MinIO adapters preserve bytewise key ordering and prefix-scan semantics; the storage backend itself is not formally verified."]
+implementation = [
+    "crates/rockstream-storage/src/keys.rs::encode",
+    "crates/rockstream-storage/src/keys.rs::decode",
+    "crates/rockstream-storage/src/keys.rs::encode_with_suffix",
+]
+theorems = [
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+    "crates/rockstream-verified/src/codecs.rs::decode_u128_be",
+]
+production_callers = [
+    "crates/rockstream-storage/src/reader.rs::scan_op_state_prefix",
+    "crates/rockstream-storage/src/tests.rs::catalog_keys_store_and_retrieve_with_namespace",
+]
+regression_tests = [
+    "crates/rockstream-storage/src/keys.rs::shard_key_encode_decode_roundtrip",
+    "crates/rockstream-storage/src/keys.rs::catalog_namespace_prefix_filters_correctly",
+]
+evidence = [
+    "cargo test --locked -p rockstream-storage keys --lib",
+    "cargo test --locked -p rockstream-storage --test lfs_backend",
+    "cargo test --locked -p rockstream-storage --test minio_backend",
+    "cargo test --locked -p rockstream-ops --test lfs_time_window",
+]
+
+[[claims]]
+id = "VS2-05"
+status = "kernel-verified"
+domain = "Nonzero power-of-two u16 bucket counts, clamped key-prefix lengths, and mask routes bounded below the configured count."
+assumptions = ["FNV-1a supplies the deterministic u64 hash; balance, collision freedom, and minimal movement are not claimed."]
+implementation = [
+    "crates/rockstream-verified/src/routing.rs::clamp_prefix_len",
+    "crates/rockstream-verified/src/routing.rs::route_power_of_two_hash",
+]
+theorems = [
+    "crates/rockstream-verified/src/routing.rs::route_power_of_two_hash",
+]
+production_callers = [
+    "crates/rockstream-plan/src/virtual_bucket.rs::route_power_of_two_bucket",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::routing_kernel_rejects_invalid_counts_and_bounds_valid_routes",
+    "crates/rockstream-plan/tests/virtual_bucket_routing_tests.rs::power_of_two_routing_is_deterministic_and_bounded",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests",
+]
+
+[[claims]]
+id = "VS2-06"
+status = "adapter-qualified"
+domain = "Designated sign-bit, endian, discriminator, length, and bucket-mask mutations are rejected by exact-output tests."
+assumptions = ["The mutation fixtures exercise the selected kernel and adapter seams; backend scan behavior remains an external qualification obligation."]
+implementation = [
+    "crates/rockstream-verified/src/keys.rs::signed_order_key",
+    "crates/rockstream-verified/src/codecs.rs::decode_u64_be",
+    "crates/rockstream-verified/src/routing.rs::route_power_of_two_hash",
+]
+theorems = [
+    "crates/rockstream-verified/src/keys.rs::signed_order_key_preserves_order",
+    "crates/rockstream-verified/src/routing.rs::route_power_of_two_hash",
+]
+production_callers = [
+    "crates/rockstream-storage/src/keys.rs::minmax_sort_key",
+    "crates/rockstream-plan/src/virtual_bucket.rs::route_power_of_two_bucket",
+]
+regression_tests = [
+    "crates/rockstream-storage/src/keys.rs::signed_sort_keys_round_trip_and_order_at_i64_extremes",
+    "crates/rockstream-storage/src/keys.rs::factor_payload_codec_rejects_wrong_capsule_lengths",
+    "crates/rockstream-verified/src/lib.rs::routing_kernel_rejects_invalid_counts_and_bounds_valid_routes",
+]
+evidence = [
+    "formal/verus/vs2-mutation-matrix.toml",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-storage keys --lib",
+    "cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests",
+]
+
+[[claims]]
+id = "VS3-01"
+status = "adapter-qualified"
+domain = "ArrowZSet row data and weights have aligned lengths; ordered index selection rejects out-of-range indices and preserves repeated indices and frontier metadata."
+assumptions = ["Arrow RecordBatch columns remain the row-equality and decoding adapter; duplicate consolidation is a separate operation."]
+implementation = [
+    "crates/rockstream-ops/src/zset.rs::try_new",
+    "crates/rockstream-ops/src/zset.rs::validate",
+    "crates/rockstream-ops/src/zset.rs::select_rows",
+]
+theorems = [
+    "crates/rockstream-verified/src/zset.rs::validate_aligned_lengths",
+    "crates/rockstream-verified/src/zset.rs::validate_index",
+]
+production_callers = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+    "crates/rockstream-ops/src/filter.rs::process_delta",
+]
+regression_tests = [
+    "crates/rockstream-ops/src/zset.rs::select_rows_subset",
+    "crates/rockstream-ops/src/zset.rs::select_rows_rejects_out_of_range_and_preserves_empty_frontier",
+]
+evidence = [
+    "cargo test --locked -p rockstream-ops --lib zset::tests",
+    "cargo test --locked -p rockstream-ops --test delta_native_aggregate_tests",
+]
+
+[[claims]]
+id = "VS3-02"
+status = "adapter-qualified"
+domain = "Primitive Z-set alignment, index bounds, and checked weight consolidation over i64 weights."
+assumptions = ["Arrow decoding, row equality, and allocation limits remain adapter obligations."]
+implementation = [
+    "crates/rockstream-verified/src/zset.rs::validate_aligned_lengths",
+    "crates/rockstream-verified/src/zset.rs::validate_index",
+    "crates/rockstream-verified/src/zset.rs::checked_weight_add",
+    "crates/rockstream-verified/src/zset.rs::consolidate_weight",
+    "crates/rockstream-verified/src/zset.rs::weight_cancels",
+]
+theorems = [
+    "crates/rockstream-verified/src/zset.rs::validate_aligned_lengths",
+    "crates/rockstream-verified/src/zset.rs::validate_index",
+    "crates/rockstream-verified/src/zset.rs::checked_weight_add",
+    "crates/rockstream-verified/src/zset.rs::consolidate_weight",
+    "crates/rockstream-verified/src/zset.rs::weight_cancels",
+    "crates/rockstream-verified/src/zset.rs::cancellation_annihilates_weight",
+    "crates/rockstream-verified/src/zset.rs::repeated_rows_additive",
+]
+production_callers = [
+    "crates/rockstream-ops/src/zset.rs::try_accumulate_ab",
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::vs3_kernels_return_exact_transition_and_boundary_results",
+    "crates/rockstream-ops/src/zset.rs::select_rows_subset",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-ops --lib zset::tests",
+]
+
+[[claims]]
+id = "VS3-03"
+status = "adapter-qualified"
+domain = "Epoch staging checks multiplication, count, and capacity candidates before changing an existing entry; rejected staging input leaves that entry unchanged."
+assumptions = ["Allocator aborts and process loss are crash/recovery cases owned by VS5; returned errors cover the reusable stager contract."]
+implementation = [
+    "crates/rockstream-ops/src/aggregate.rs::ingest_delta",
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+]
+theorems = [
+    "crates/rockstream-verified/src/arithmetic.rs::checked_i64_mul",
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+]
+production_callers = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+]
+regression_tests = [
+    "crates/rockstream-ops/src/aggregate.rs::staging_overflow_leaves_the_existing_entry_unchanged",
+    "crates/rockstream-ops/tests/delta_native_aggregate_tests.rs::test_v0612_consolidation_group_limit_enforced",
+]
+evidence = [
+    "cargo test --locked -p rockstream-ops --lib aggregate::tests",
+    "cargo test --locked -p rockstream-ops --test delta_native_aggregate_tests",
+]
+
+[[claims]]
+id = "VS3-04"
+status = "adapter-qualified"
+domain = "A valid positive-count aggregate state plus a consolidated integer delta produces an exact present or deleted state, rejects negative counts and zero-count nonzero-sum states, and suppresses unchanged results."
+assumptions = ["The caller supplies a valid absent state as (0, 0) or a positive-count state; valid-retraction semantics are an adapter obligation."]
+implementation = [
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+    "crates/rockstream-ops/src/aggregate.rs::apply_delta",
+]
+theorems = [
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+]
+production_callers = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+    "crates/rockstream-ops/src/aggregate.rs::apply_delta",
+]
+regression_tests = [
+    "crates/rockstream-verified/src/lib.rs::vs3_kernels_return_exact_transition_and_boundary_results",
+    "crates/rockstream-ops/tests/delta_native_aggregate_tests.rs::test_v0612_repeated_updates_emit_old_and_final_only",
+]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-ops --test delta_native_aggregate_tests",
+]
+
+[[claims]]
+id = "VS3-05"
+status = "adapter-qualified"
+domain = "Aggregate transitions and exact dirty-key mutations are planned before fallible output construction and state installation; unchanged keys emit no mutation."
+assumptions = ["RecordBatch construction and storage mutation application remain external adapters; VS5 owns durable epoch atomicity."]
+implementation = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+    "crates/rockstream-ops/src/aggregate.rs::encode_mutations_for_keys",
+]
+theorems = [
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+]
+production_callers = [
+    "crates/rockstream-ops/src/live_exec.rs::append_state",
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+]
+regression_tests = [
+    "crates/rockstream-ops/src/aggregate.rs::failed_later_transition_does_not_install_earlier_state",
+    "crates/rockstream-ops/tests/constant_write_amplification_scale_tests.rs::test_v0612_repeated_keys_intermediate_rows_reduction",
+]
+evidence = [
+    "cargo test --locked -p rockstream-ops --lib aggregate::tests",
+    "cargo test --locked -p rockstream-ops --test constant_write_amplification_scale_tests",
+]
+
+[[claims]]
+id = "VS3-06"
+status = "adapter-qualified"
+domain = "Supported integer aggregate ingestion preserves exact old/new deltas, duplicate consolidation, deletion, overflow rejection, and touched-key mutation complexity on the existing operator path."
+assumptions = ["NULL/cast behavior is defined by the existing Arrow adapter; large-state spill and demand loading remain owned by v0.67.1 and VS5."]
+implementation = [
+    "crates/rockstream-ops/src/aggregate.rs::process_delta_with_result",
+    "crates/rockstream-ops/src/compile.rs::compile_aggregate_body",
+]
+theorems = [
+    "crates/rockstream-verified/src/aggregate.rs::transition",
+]
+production_callers = [
+    "crates/rockstream-ops/src/compile.rs::compile_aggregate_body",
+    "crates/rockstream-ops/src/aggregate.rs::process_delta",
+]
+regression_tests = [
+    "crates/rockstream-ops/tests/delta_native_aggregate_tests.rs::test_delta_native_aggregate_incremental_emission_and_oracle_match",
+    "crates/rockstream-ops/tests/constant_write_amplification_scale_tests.rs::test_constant_write_amplification_across_scales",
+]
+evidence = [
+    "cargo test --locked -p rockstream-ops --test delta_native_aggregate_tests",
+    "cargo test --locked -p rockstream-ops --test constant_write_amplification_scale_tests",
+]
+
+[[claims]]
+id = "VS4-01"
+status = "adapter-qualified"
+domain = "Versioned frontier reports are scoped to a deployment/view, membership generation, active shard, and shard incarnation."
+assumptions = ["The control-plane membership authority supplies the active set and durable bootstrap evidence."]
+implementation = ["crates/rockstream-types/src/frontier.rs::new"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::admit_frontier_report"]
+production_callers = ["crates/rockstream-control/src/frontier.rs::ingest_membership_report"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::configured_aggregators_reject_legacy_scalar_reports"]
+evidence = [
+    "docs/adr/0005-frontier-membership.md",
+    "cargo test --locked -p rockstream-control --lib frontier::tests",
+]
+
+[[claims]]
+id = "VS4-02"
+status = "adapter-qualified"
+domain = "Fixed-membership report transitions are monotone, reject stale authority, and preserve state on rejection."
+assumptions = ["The unverified adapter checks report scope, active membership, and the current shard lease before the kernel call."]
+implementation = [
+    "crates/rockstream-control/src/frontier.rs::ingest_membership_report",
+    "crates/rockstream-control/src/frontier.rs::compute_membership_meet",
+    "crates/rockstream-control/src/frontier.rs::recompute_membership_publication",
+]
+theorems = [
+    "crates/rockstream-verified/src/frontier.rs::fixed_membership_meet",
+    "crates/rockstream-verified/src/frontier.rs::advance_publication",
+    "crates/rockstream-verified/src/frontier.rs::fixed_membership_transition",
+]
+production_callers = ["crates/rockstream-control/src/service.rs::handle_connection_stream"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::stale_generation_and_incarnation_reports_leave_state_unchanged"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-control --lib frontier::tests",
+]
+
+[[claims]]
+id = "VS4-03"
+status = "adapter-qualified"
+domain = "Activation and replacement require a bootstrap epoch at or above publication; retirement changes the active meet by generation."
+assumptions = ["Bootstrap epochs are supplied by the authority that established durable catch-up."]
+implementation = ["crates/rockstream-control/src/frontier.rs::activate_shard", "crates/rockstream-control/src/frontier.rs::replace_shard"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::activation_preserves_publication"]
+production_callers = ["crates/rockstream-control/src/frontier.rs::retire_shard"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::membership_publication_never_overstates_a_new_member"]
+evidence = [
+    "cargo test --locked -p rockstream-control --lib frontier::tests",
+    "formal/m2_frontier_agg.fizz",
+]
+
+[[claims]]
+id = "VS4-04"
+status = "adapter-qualified"
+domain = "The executable admission transition is mapped to the bounded M2 protocol model; rejected and no-op report steps do not mutate state."
+assumptions = ["FizzBee covers bounded interleavings and lease/failover; storage and network durability remain adapter assumptions."]
+implementation = ["crates/rockstream-verified/src/frontier.rs::admitted_transition_is_monotone"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::admitted_transition_is_monotone"]
+production_callers = ["crates/rockstream-control/src/frontier.rs::try_publish"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::membership_publication_uses_a_generation_scoped_durable_key"]
+evidence = [
+    "formal/verus/model-map.md",
+    "rtk fizz formal/m2_frontier_agg.fizz",
+]
+
+[[claims]]
+id = "VS4-05"
+status = "adapter-qualified"
+domain = "Exclusive frontier comparisons authorize epochs below the frontier; source progress, watermarks, publication, and diagnostic hashes remain distinct fields."
+assumptions = ["Consumers do not use FreshnessToken's XOR hash as an idempotent progress lattice."]
+implementation = ["crates/rockstream-types/src/frontier.rs::has_committed_through"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::completes_before"]
+production_callers = ["crates/rockstream-types/src/frontier.rs::watermark_ms"]
+regression_tests = ["crates/rockstream-types/src/frontier.rs::freshness_token_hash_is_diagnostic_not_lattice_progress"]
+evidence = [
+    "cargo test --locked -p rockstream-types --lib frontier",
+]
+
+[[claims]]
+id = "VS4-06"
+status = "adapter-qualified"
+domain = "The public worker envelope carries the membership-aware report and the control service routes it through the guarded aggregator path after checking the current shard lease."
+assumptions = ["Multi-process authority, storage latency, and lost-lease qualification remain runtime/FizzBee evidence beyond this local kernel."]
+implementation = ["crates/rockstream-types/src/frontier.rs::new", "crates/rockstream-control/src/service.rs::handle_connection_stream"]
+theorems = ["crates/rockstream-verified/src/frontier.rs::stale_incarnation_is_rejected"]
+production_callers = ["crates/rockstream-control/src/service.rs::handle_connection_stream"]
+regression_tests = ["crates/rockstream-control/src/frontier.rs::membership_publication_never_overstates_a_new_member"]
+evidence = [
+    "cargo test --locked -p rockstream-control --lib frontier::tests",
+    "cargo test --locked -p rockstream-types --lib frontier",
+]
+
+[[claims]]
+id = "VS5-01"
+status = "adapter-qualified"
+domain = "A logical commit is authoritative only after the complete batch succeeds at the write and flush boundary; a write-success/flush-failure result is unknown."
+assumptions = ["SlateDB and ObjectStore provide the documented atomic write, flush, and ambiguous-I/O behavior; cross-process fencing remains an adapter responsibility."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::commit_outcome"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::commit_outcome"]
+production_callers = ["crates/rockstream-connectors/src/source_epoch.rs::commit_m3", "crates/rockstream-ops/src/group_commit.rs::do_flush"]
+regression_tests = ["crates/rockstream-verified/src/lib.rs::vs5_kernels_reject_replay_and_protect_boundaries"]
+evidence = [
+    "docs/adr/0006-persistence-replay-compaction.md",
+    "cargo test --locked -p rockstream-verified --lib",
+    "cargo test --locked -p rockstream-connectors --lib source_epoch",
+]
+
+[[claims]]
+id = "VS5-02"
+status = "adapter-qualified"
+domain = "Source epochs are consecutive or globally allocated and strictly increasing; authority and duplicate checks reject a second logical application and numeric exhaustion."
+assumptions = ["The source/shard caller supplies the identity and scope checks represented by the kernel booleans."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::next_epoch", "crates/rockstream-verified/src/persistence.rs::epoch_is_admissible", "crates/rockstream-verified/src/persistence.rs::replay_decision"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::next_epoch", "crates/rockstream-verified/src/persistence.rs::epoch_is_admissible"]
+production_callers = ["crates/rockstream-connectors/src/source_epoch.rs::prepare_commit", "crates/rockstream-connectors/src/source_epoch.rs::prepare_commit_at", "crates/rockstream-connectors/src/source_epoch.rs::commit_epoch_monotonic", "crates/rockstream-connectors/src/source_runtime.rs::next_epoch", "crates/rockstream-connectors/src/source_runtime.rs::commit_epoch", "crates/rockstream-connectors/src/source_runtime.rs::commit_backfill_epoch"]
+regression_tests = ["crates/rockstream-connectors/src/source_epoch.rs::epoch_exhaustion_returns_rs4018_without_wrapping", "crates/rockstream-verified/src/lib.rs::vs5_kernels_reject_replay_and_protect_boundaries"]
+evidence = [
+    "cargo test --locked -p rockstream-connectors --lib source_epoch",
+    "cargo test --locked -p rockstream-verified --lib",
+]
+
+[[claims]]
+id = "VS5-03"
+status = "adapter-qualified"
+domain = "State, outputs, source markers, and frontier progress share one durable write/flush boundary before acknowledgement or in-memory advancement."
+assumptions = ["The adapter mechanically derives component presence from transaction keys and verifies write and flush outcomes from real storage results before invoking the verified kernel; storage flush success means the batch is durable under the selected backend contract."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::coupled_commit_is_durable", "crates/rockstream-connectors/src/source_epoch.rs::commit_m3"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::coupled_commit_is_durable"]
+production_callers = ["crates/rockstream-connectors/src/source_runtime.rs::commit_epoch", "crates/rockstream-connectors/src/source_epoch.rs::commit_m3"]
+regression_tests = [
+    "crates/rockstream-ops/tests/group_commit_timer_tests.rs::test_flush_failure_withholds_acknowledgment",
+    "crates/rockstream-ops/tests/group_commit_durability_lfs_tests.rs::test_group_commit_lfs_multi_epoch_durability",
+    "crates/rockstream-connectors/tests/persistence_verification_adapter_boundary_tests.rs::test_mutation_state_missing_refuses_durable_coupled_commit",
+]
+evidence = [
+    "docs/adr/0006-persistence-replay-compaction.md",
+    "cargo test --locked -p rockstream-ops --lib group_commit",
+    "cargo test --locked -p rockstream-connectors --lib source_epoch",
+    "cargo test --locked -p rockstream-connectors --test persistence_verification_adapter_boundary_tests",
+]
+
+[[claims]]
+id = "VS5-04"
+status = "adapter-qualified"
+domain = "Replay distinguishes completed scans from quota, cancellation, corruption, and continuation; recovery readiness requires complete restored state and matching metadata."
+assumptions = ["The storage adapter reports scan and object-store failures without converting them into successful empty pages."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::recovery_scan_status", "crates/rockstream-verified/src/persistence.rs::recovery_is_ready"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::recovery_scan_status", "crates/rockstream-verified/src/persistence.rs::recovery_is_ready"]
+production_callers = ["crates/rockstream-storage/src/catalog/log.rs::scan_page", "crates/rockstream-runtime/src/recovery.rs::is_ready"]
+regression_tests = ["crates/rockstream-storage/tests/catalog_storage_tests.rs::test_zero_page_size_still_advances_replay_cursor", "crates/rockstream-runtime/src/recovery.rs::ready_requires_complete_checkpoint"]
+evidence = [
+    "cargo test --locked -p rockstream-storage --test catalog_storage_tests",
+    "cargo test --locked -p rockstream-runtime --lib recovery",
+]
+
+[[claims]]
+id = "VS5-05"
+status = "adapter-qualified"
+domain = "Compaction is eligible only after the compaction frontier covers retained-reader and replay horizons and no retained snapshot or in-flight delta remains."
+assumptions = ["The arrangement/catalog adapter supplies conservative reader and replay horizons; external snapshot deletion remains a storage qualification obligation."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::compaction_is_eligible", "crates/rockstream-storage/src/arrangement_catalog.rs::reclaim_unreferenced_arrangements"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::compaction_is_eligible"]
+production_callers = ["crates/rockstream-storage/src/arrangement_catalog.rs::reclaim_unreferenced_arrangements"]
+regression_tests = ["crates/rockstream-storage/tests/arrangement_lifecycle_reclamation_tests.rs::test_duplicate_consumer_registration_and_drop_are_idempotent"]
+evidence = [
+    "cargo test --locked -p rockstream-storage --test arrangement_lifecycle_reclamation_tests",
+    "cargo test --locked -p rockstream-verified --lib",
+]
+
+[[claims]]
+id = "VS5-06"
+status = "adapter-qualified"
+domain = "A recovered shard cannot rejoin progress publication until its checkpoint metadata, fence, bounded scan, and restored state validate."
+assumptions = ["Process destruction, backend acknowledgement loss, and cross-process handoff are qualified by the LFS/MinIO and runtime release matrices."]
+implementation = ["crates/rockstream-verified/src/persistence.rs::recovery_is_ready", "crates/rockstream-runtime/src/recovery.rs::recover_shard"]
+theorems = ["crates/rockstream-verified/src/persistence.rs::recovery_is_ready"]
+production_callers = ["crates/rockstream-runtime/src/recovery.rs::is_ready"]
+regression_tests = ["crates/rockstream-runtime/src/recovery.rs::ready_requires_complete_checkpoint", "crates/rockstream-storage/tests/catalog_storage_tests.rs::test_interrupted_compaction_falls_back_safely"]
+evidence = [
+    "cargo test --locked -p rockstream-runtime --lib recovery",
+    "cargo test --locked -p rockstream-storage --test catalog_storage_tests",
+]
