@@ -169,7 +169,7 @@ verifying coordination logic.
 | Z-set algebra / `incremental == batch` equivalence | `rockstream-oracle` + DataFusion ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 1–3) |
 | Operator semantics (MIN/MAX, joins, windows, Top-K) | Oracle property tests |
 | Arrangement byte encodings, key schemes | `SimRuntime` paired assertions ([DESIGN.md §17.3](DESIGN.md)) |
-| SlateDB internal LSM/compaction behavior | SlateDB determinism gate ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 0) |
+| SlateDB internal LSM/compaction behavior, including arrangement Bloom filtering and NVMe tiered caching | SlateDB determinism gate ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 0) and arrangement lookup benchmarks |
 | pgwire protocol, SQL compilation, planner | Integration tests (Phase 7) |
 | Performance / throughput / latency budgets | `criterion` benchmarks, real-object-store integration |
 | Recursion fixed-point convergence (inner-time) | Deferred — model only if Phase 4 distributed recursion destabilizes |
