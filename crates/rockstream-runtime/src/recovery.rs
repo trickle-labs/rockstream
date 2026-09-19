@@ -542,6 +542,18 @@ impl RecoveryDriver {
             next_token = page.next_token;
         }
 
+        {
+            let mut guard = self.inner.lock();
+            if guard
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.shards.contains_key(&shard_id))
+                && guard.recovered_shards.insert(shard_id)
+            {
+                guard.recovered_count += 1;
+            }
+        }
+
         Ok(total_rows)
     }
 

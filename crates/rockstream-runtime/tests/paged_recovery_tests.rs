@@ -16,6 +16,7 @@ use rockstream_ops::zset::ArrowZSet;
 use rockstream_ops::AggregateOp;
 use rockstream_runtime::recovery::{RecoveryDriver, RecoveryError};
 use rockstream_storage::{ScanProgressHandle, ShardDb, WriteBatch};
+use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::error_code::*;
 use rockstream_types::ids::{OperatorId, ShardId};
 use rockstream_types::lifecycle::{LifecycleState, LifecycleTracker, RecoveryPhase};
@@ -47,6 +48,10 @@ async fn test_recovery_driver_pages_to_completion_without_truncation() {
 
     let lifecycle = Arc::new(LifecycleTracker::new("worker-1"));
     let driver = RecoveryDriver::with_lifecycle(lifecycle.clone());
+    let checkpoint_id = CheckpointId(1);
+    let mut checkpoint = ClusterCheckpoint::new(checkpoint_id);
+    checkpoint.record_shard(ShardId(1), PerShardCheckpoint::new(checkpoint_id, 1));
+    driver.load_checkpoint(checkpoint);
 
     driver
         .transition_phase(RecoveryPhase::RecoveringCatalog)
