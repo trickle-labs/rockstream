@@ -5,7 +5,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
-use rockstream_ops::{persist_bucketed_agg_state, BucketedAggregateOp, Operator};
+use rockstream_ops::{
+    bucketed_combined_key, persist_bucketed_agg_state, BucketedAggregateOp, Operator,
+};
 use rockstream_storage::{ShardDb, ShardKeyEncoder, ShardPrefix};
 use rockstream_types::ids::OperatorId;
 
@@ -160,4 +162,118 @@ async fn partial_state_is_bounded_with_fill_level_metric() {
     persist_bucketed_agg_state(&db, &op).await.unwrap();
     assert!(op.live_partials() > 0);
     assert!(op.live_partials() <= 3);
+}
+
+#[tokio::test]
+async fn corrupted_value_in_storage_fails_load_closed() {
+    let db = ShardDb::builder(
+        "virtual-bucket/corrupt-val".to_string(),
+        Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>,
+    )
+    .build()
+    .await
+    .unwrap();
+    let op_id = OperatorId(43);
+    let op = BucketedAggregateOp::new(op_id, 1, 4);
+    op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
+    persist_bucketed_agg_state(&db, &op).await.unwrap();
+
+    // Inject corrupted value under this operator's prefix
+    let corrupt_key = bucketed_combined_key(op_id, 3);
+    db.put(&corrupt_key, b"short_val").await.unwrap();
+
+    let err = BucketedAggregateOp::load_from_storage(&db, op_id, 1, 4)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 43: invalid value length; next_steps: report this issue"
+    );
+}
+
+#[tokio::test]
+async fn corrupted_key_in_storage_fails_load_closed() {
+    let db = ShardDb::builder(
+        "virtual-bucket/corrupt-key".to_string(),
+        Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>,
+    )
+    .build()
+    .await
+    .unwrap();
+    let op_id = OperatorId(44);
+    let op = BucketedAggregateOp::new(op_id, 1, 4);
+    op.process_delta(make_batch(&[(1, 10, 1)]))
+        .unwrap();
+    persist_bucketed_agg_state(&db, &op).await.unwrap();
+
+    // Inject corrupted key under this operator's prefix (bad length)
+    let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
+    let corrupt_key = [prefix.as_slice(), b"short"].concat();
+    db.put(&corrupt_key, &[0u8; 16]).await.unwrap();
+
+    let err = BucketedAggregateOp::load_from_storage(&db, op_id, 1, 4)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 44: invalid key length; next_steps: report this issue"
+    );
+}
+
+#[tokio::test]
+async fn non_positive_count_in_storage_fails_load_closed() {
+    let db = ShardDb::builder(
+        "virtual-bucket/zero-count".to_string(),
+        Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>,
+    )
+    .build()
+    .await
+    .unwrap();
+    let op_id = OperatorId(45);
+    let op = BucketedAggregateOp::new(op_id, 1, 4);
+    op.process_delta(make_batch(&[(1, 10, 1)]))
+        .unwrap();
+    persist_bucketed_agg_state(&db, &op).await.unwrap();
+
+    // Inject entry with zero count (16 bytes with count = 0)
+    let bad_key = bucketed_combined_key(op_id, 99);
+    let zero_count_val = [0u8; 16];
+    db.put(&bad_key, &zero_count_val).await.unwrap();
+
+    let err = BucketedAggregateOp::load_from_storage(&db, op_id, 1, 4)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 45: non-positive count; next_steps: report this issue"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_keys_in_storage_do_not_fail_load() {
+    let db = ShardDb::builder(
+        "virtual-bucket/unrelated".to_string(),
+        Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>,
+    )
+    .build()
+    .await
+    .unwrap();
+    let op_id = OperatorId(46);
+    let foreign_op_id = OperatorId(999);
+
+    // Foreign operator data
+    let foreign_key = bucketed_combined_key(foreign_op_id, 1);
+    db.put(&foreign_key, b"foreign_data_here").await.unwrap();
+
+    // Valid state for op_id
+    let op = BucketedAggregateOp::new(op_id, 1, 4);
+    op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
+    persist_bucketed_agg_state(&db, &op).await.unwrap();
+
+    let reloaded = BucketedAggregateOp::load_from_storage(&db, op_id, 1, 4)
+        .await
+        .unwrap();
+    assert_eq!(reloaded.live_groups(), 2);
 }
