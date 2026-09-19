@@ -2188,7 +2188,8 @@ mod tests {
         let op = BucketedAggregateOp::new(op_id, 2, 4);
 
         // Initial valid state via process_delta
-        op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)])).unwrap();
+        op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+            .unwrap();
         assert_eq!(op.live_groups(), 2);
 
         // Attempt restore with corrupted entry
@@ -2201,9 +2202,6 @@ mod tests {
         // Prior state must remain untouched
         assert_eq!(op.live_groups(), 2);
         let output = op.process_delta(make_batch(&[(1, 10, -1)])).unwrap();
-        assert_eq!(
-            extract_rows(&output),
-            vec![(1, 10, 1, 10.0, -1)]
-        );
+        assert_eq!(extract_rows(&output), vec![(1, 10, 1, 10.0, -1)]);
     }
 }

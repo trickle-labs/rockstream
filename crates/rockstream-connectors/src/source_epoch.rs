@@ -847,9 +847,7 @@ impl CoupledBatchDescriptor {
             if key
                 .windows(b"backfill_cursor/".len())
                 .any(|w| w == b"backfill_cursor/")
-                || key
-                    .windows(b"lifecycle/".len())
-                    .any(|w| w == b"lifecycle/")
+                || key.windows(b"lifecycle/".len()).any(|w| w == b"lifecycle/")
             {
                 desc.has_coupling_metadata = true;
             }
@@ -1186,7 +1184,9 @@ mod tests {
         assert!(!desc.is_complete());
 
         let err = desc.validate(false).unwrap_err();
-        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing state mutation")));
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing state mutation"))
+        );
     }
 
     #[test]
@@ -1303,11 +1303,8 @@ mod tests {
     #[tokio::test]
     async fn coupled_transaction_builder_success() {
         let store = make_test_store(ConnectorId(10)).await;
-        let prepared = SourceCheckpoint::prepared(
-            ConnectorId(10),
-            1,
-            OffsetToken::new(b"token1".to_vec()),
-        );
+        let prepared =
+            SourceCheckpoint::prepared(ConnectorId(10), 1, OffsetToken::new(b"token1".to_vec()));
 
         let mut builder = CoupledTransactionBuilder::new();
         let state_key = [ShardPrefix::OpState.as_byte(), 1, 2];
@@ -1332,11 +1329,8 @@ mod tests {
     #[tokio::test]
     async fn coupled_transaction_builder_with_metadata() {
         let store = make_test_store(ConnectorId(11)).await;
-        let prepared = SourceCheckpoint::prepared(
-            ConnectorId(11),
-            2,
-            OffsetToken::new(b"token2".to_vec()),
-        );
+        let prepared =
+            SourceCheckpoint::prepared(ConnectorId(11), 2, OffsetToken::new(b"token2".to_vec()));
 
         let mut builder = CoupledTransactionBuilder::new();
         builder
@@ -1356,12 +1350,9 @@ mod tests {
     #[tokio::test]
     async fn coupled_transaction_builder_committed_checkpoint() {
         let store = make_test_store(ConnectorId(12)).await;
-        let committed = SourceCheckpoint::prepared(
-            ConnectorId(12),
-            3,
-            OffsetToken::new(b"token3".to_vec()),
-        )
-        .committed();
+        let committed =
+            SourceCheckpoint::prepared(ConnectorId(12), 3, OffsetToken::new(b"token3".to_vec()))
+                .committed();
 
         let mut builder = CoupledTransactionBuilder::new();
         builder
@@ -1379,11 +1370,8 @@ mod tests {
     #[tokio::test]
     async fn coupled_transaction_builder_connector_mismatch() {
         let store = make_test_store(ConnectorId(13)).await;
-        let foreign = SourceCheckpoint::prepared(
-            ConnectorId(999),
-            1,
-            OffsetToken::new(b"token".to_vec()),
-        );
+        let foreign =
+            SourceCheckpoint::prepared(ConnectorId(999), 1, OffsetToken::new(b"token".to_vec()));
 
         let mut builder = CoupledTransactionBuilder::new();
         let err = builder.add_source_marker(&store, &foreign).unwrap_err();
@@ -1395,7 +1383,9 @@ mod tests {
         let mut builder = CoupledTransactionBuilder::new();
         builder.add_op_state(&[ShardPrefix::OpState.as_byte(), 1], b"state");
         let err = builder.build(false).unwrap_err();
-        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation")));
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation"))
+        );
     }
 
     #[tokio::test]
@@ -1405,20 +1395,26 @@ mod tests {
         // Empty batch fails
         let empty = WriteBatch::new();
         let err = store.commit_m3(empty).await.unwrap_err();
-        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing state mutation")));
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing state mutation"))
+        );
 
         // Batch with only state fails
         let mut b1 = WriteBatch::new();
         b1.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
         let err = store.commit_m3(b1).await.unwrap_err();
-        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation")));
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation"))
+        );
 
         // Batch with state and output fails (missing source marker)
         let mut b2 = WriteBatch::new();
         b2.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
         b2.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
         let err = store.commit_m3(b2).await.unwrap_err();
-        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing source marker mutation")));
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing source marker mutation"))
+        );
 
         // Batch with state, output, and source marker fails (missing frontier)
         let mut b3 = WriteBatch::new();
@@ -1432,7 +1428,9 @@ mod tests {
         );
         b3.put(&source_key, b"cp");
         let err = store.commit_m3(b3).await.unwrap_err();
-        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing frontier mutation")));
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing frontier mutation"))
+        );
     }
 
     #[tokio::test]
@@ -1460,18 +1458,19 @@ mod tests {
         batch.put(b"connector/conn22/backfill_intent", b"pre_m3_intent");
         assert!(store.commit_raw_batch(batch).await.is_ok());
 
-        let val = store.db.get(b"connector/conn22/backfill_intent").await.unwrap();
+        let val = store
+            .db
+            .get(b"connector/conn22/backfill_intent")
+            .await
+            .unwrap();
         assert_eq!(val.as_deref(), Some(b"pre_m3_intent".as_slice()));
     }
 
     #[tokio::test]
     async fn commit_coupled_transaction_validates_and_commits() {
         let store = make_test_store(ConnectorId(23)).await;
-        let checkpoint = SourceCheckpoint::prepared(
-            ConnectorId(23),
-            5,
-            OffsetToken::new(b"token5".to_vec()),
-        );
+        let checkpoint =
+            SourceCheckpoint::prepared(ConnectorId(23), 5, OffsetToken::new(b"token5".to_vec()));
 
         // Incomplete transaction fails
         let mut invalid_builder = CoupledTransactionBuilder::new();
@@ -1480,7 +1479,9 @@ mod tests {
             .commit_coupled_transaction(invalid_builder, false)
             .await
             .unwrap_err();
-        assert!(matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation")));
+        assert!(
+            matches!(err, StorageError::Unsupported(msg) if msg.contains("missing view output mutation"))
+        );
 
         // Complete transaction succeeds
         let mut valid_builder = CoupledTransactionBuilder::new();
@@ -1491,6 +1492,9 @@ mod tests {
             .unwrap()
             .add_frontier(5);
 
-        assert!(store.commit_coupled_transaction(valid_builder, false).await.is_ok());
+        assert!(store
+            .commit_coupled_transaction(valid_builder, false)
+            .await
+            .is_ok());
     }
 }

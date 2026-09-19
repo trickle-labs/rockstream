@@ -432,7 +432,10 @@ async fn test_positive_complete_coupled_commit_succeeds() {
     let read_state = store.db().get(&state_key).await.unwrap();
     assert_eq!(read_state.as_deref(), Some(b"state_payload_10".as_slice()));
     let read_output = store.db().get(&output_key).await.unwrap();
-    assert_eq!(read_output.as_deref(), Some(b"output_payload_10".as_slice()));
+    assert_eq!(
+        read_output.as_deref(),
+        Some(b"output_payload_10".as_slice())
+    );
 
     // Verify recovery across store restart / reopen from disk
     drop(store);
