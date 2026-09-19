@@ -4929,11 +4929,11 @@ impl GatewayHandler {
                     &join.right_source,
                 ))
             };
-            join.pipeline
-                .process(left, right)
-                .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+            join.pipeline.process(left, right).map_err(|error| {
+                GatewayError::QueryTimeExecutionFailed {
                     detail: format!("compiled join pipeline process({view_name}): {error}"),
-                })?
+                }
+            })?
         } else {
             compiled.pipeline.process(input).map_err(|error| {
                 GatewayError::QueryTimeExecutionFailed {
