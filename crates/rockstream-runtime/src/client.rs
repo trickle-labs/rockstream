@@ -33,7 +33,7 @@ use rockstream_types::topology::{
     WorkerMessage, WorkerRegistration,
 };
 
-use crate::epoch_compaction::{EpochCompactor, EpochCompactionConfig};
+use crate::epoch_compaction::{EpochCompactionConfig, EpochCompactor};
 use crate::secrets::WorkerSecretManager;
 use crate::shard_actor::{FrameExecutor, ShardActorRegistry};
 use rockstream_ops::PhysicalCommitGroup;
@@ -263,11 +263,7 @@ pub async fn execute_frame(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let compacted_input_rows = deployment.compactor.compact_slice(&frame.rows);
     if compacted_input_rows.is_empty() {
-        rockstream_types::metrics::add_r1_worker_rows(
-            worker_id,
-            frame.rows.len() as u64,
-            0,
-        );
+        rockstream_types::metrics::add_r1_worker_rows(worker_id, frame.rows.len() as u64, 0);
         client
             .msg_tx
             .send(WorkerMessage::ExecutionProgress {
@@ -286,7 +282,9 @@ pub async fn execute_frame(
                 output_rows: 0,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "client channel closed"))?;
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::ConnectionAborted, "client channel closed")
+            })?;
         return Ok(());
     }
 
@@ -429,8 +427,7 @@ pub async fn setup_test_deployment(
         deployments: deployments.clone(),
     };
 
-    let store =
-        rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
+    let store = rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
     let db = Arc::new(
         ShardDb::builder("db", store)
             .with_storage_context(storage_context)
@@ -498,9 +495,10 @@ pub async fn setup_test_deployment(
         compactor: compactor.clone(),
     });
 
-    deployments
-        .write()
-        .insert((descriptor.workload_id, descriptor.shard.shard_id), deployment);
+    deployments.write().insert(
+        (descriptor.workload_id, descriptor.shard.shard_id),
+        deployment,
+    );
 
     let fence_waiters_task = fence_waiters.clone();
     let (progress_tx, progress_rx) = mpsc::channel(32);
@@ -634,10 +632,7 @@ mod data_plane_tests {
         assert_eq!(stored[0].0, 1); // epoch 1
         assert_eq!(
             stored[0].2,
-            vec![
-                ColumnValue::Int64(20),
-                ColumnValue::Utf8("bob".to_string()),
-            ]
+            vec![ColumnValue::Int64(20), ColumnValue::Utf8("bob".to_string()),]
         );
         assert_eq!(stored[0].3, 1); // weight 1
     }
@@ -780,7 +775,10 @@ mod data_plane_tests {
 
         let new_config = EpochCompactionConfig::new(Duration::from_millis(150)).unwrap();
         client.set_compaction_config(new_config.clone());
-        assert_eq!(client.compaction_config().window_duration, Duration::from_millis(150));
+        assert_eq!(
+            client.compaction_config().window_duration,
+            Duration::from_millis(150)
+        );
 
         let retrieved_compactor = client
             .compactor(WorkloadId(1), ShardId(100))
@@ -827,7 +825,10 @@ impl WorkerClientHandle {
         workload_id: WorkloadId,
         shard_id: ShardId,
     ) -> Option<Arc<WorkerDeployment>> {
-        self.deployments.read().get(&(workload_id, shard_id)).cloned()
+        self.deployments
+            .read()
+            .get(&(workload_id, shard_id))
+            .cloned()
     }
 
     /// Execute a runtime exchange message frame against deployed workloads.
@@ -1455,8 +1456,8 @@ where
                         }
                         let mut comp_cfg = compaction_config_clone.read().clone();
                         if !descriptor.primary_key.is_empty() {
-                            comp_cfg = comp_cfg
-                                .with_primary_key_columns(descriptor.primary_key.clone());
+                            comp_cfg =
+                                comp_cfg.with_primary_key_columns(descriptor.primary_key.clone());
                         }
                         let compactor = Arc::new(EpochCompactor::new(comp_cfg));
                         Ok(Arc::new(WorkerDeployment {

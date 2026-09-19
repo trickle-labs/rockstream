@@ -137,7 +137,8 @@ impl EpochCompactionConfig {
 
     /// Set window duration clamped between `min_window_duration` and `max_window_duration`.
     pub fn with_window_duration_clamped(mut self, window_duration: Duration) -> Self {
-        self.window_duration = window_duration.clamp(self.min_window_duration, self.max_window_duration);
+        self.window_duration =
+            window_duration.clamp(self.min_window_duration, self.max_window_duration);
         self
     }
 
@@ -675,8 +676,14 @@ mod tests {
     fn test_config_bounds_and_defaults() {
         let default_config = EpochCompactionConfig::default();
         assert_eq!(default_config.window_duration, Duration::from_millis(100));
-        assert_eq!(default_config.min_window_duration, Duration::from_millis(100));
-        assert_eq!(default_config.max_window_duration, Duration::from_millis(300));
+        assert_eq!(
+            default_config.min_window_duration,
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            default_config.max_window_duration,
+            Duration::from_millis(300)
+        );
         assert!(default_config.validate().is_ok());
 
         // Valid boundary values
@@ -706,8 +713,7 @@ mod tests {
             .with_window_duration_clamped(Duration::from_millis(50));
         assert_eq!(clamped.window_duration, Duration::from_millis(100));
 
-        let clamped_high = default_config
-            .with_window_duration_clamped(Duration::from_millis(500));
+        let clamped_high = default_config.with_window_duration_clamped(Duration::from_millis(500));
         assert_eq!(clamped_high.window_duration, Duration::from_millis(300));
     }
 
@@ -963,9 +969,21 @@ mod tests {
         let all = compactor.drain_all();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].0, 1);
-        assert_eq!(all[0].1, vec![RuntimeRow { values_tsv: "item1".into(), weight: 1 }]);
+        assert_eq!(
+            all[0].1,
+            vec![RuntimeRow {
+                values_tsv: "item1".into(),
+                weight: 1
+            }]
+        );
         assert_eq!(all[1].0, 2);
-        assert_eq!(all[1].1, vec![RuntimeRow { values_tsv: "item2".into(), weight: 2 }]);
+        assert_eq!(
+            all[1].1,
+            vec![RuntimeRow {
+                values_tsv: "item2".into(),
+                weight: 2
+            }]
+        );
         assert_eq!(all[2].0, 3);
         assert!(all[2].1.is_empty()); // zero weight omitted
 

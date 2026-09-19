@@ -753,10 +753,7 @@ async fn test_runtime_pipeline_mixed_rows_exact_storage_and_progress_delta() {
     assert_eq!(stored[0].0, 1); // epoch 1
     assert_eq!(
         stored[0].2,
-        vec![
-            ColumnValue::Int64(20),
-            ColumnValue::Utf8("bob".to_string()),
-        ]
+        vec![ColumnValue::Int64(20), ColumnValue::Utf8("bob".to_string()),]
     );
     assert_eq!(stored[0].3, 2); // weight 2
 
