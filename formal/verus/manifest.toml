@@ -618,15 +618,20 @@ evidence = [
 id = "VS5-03"
 status = "adapter-qualified"
 domain = "State, outputs, source markers, and frontier progress share one durable write/flush boundary before acknowledgement or in-memory advancement."
-assumptions = ["The caller constructs the single batch with all required categories; storage flush success means the batch is durable under the selected backend contract."]
+assumptions = ["The adapter mechanically derives component presence from transaction keys and verifies write and flush outcomes from real storage results before invoking the verified kernel; storage flush success means the batch is durable under the selected backend contract."]
 implementation = ["crates/rockstream-verified/src/persistence.rs::coupled_commit_is_durable", "crates/rockstream-connectors/src/source_epoch.rs::commit_m3"]
 theorems = ["crates/rockstream-verified/src/persistence.rs::coupled_commit_is_durable"]
 production_callers = ["crates/rockstream-connectors/src/source_runtime.rs::commit_epoch", "crates/rockstream-connectors/src/source_epoch.rs::commit_m3"]
-regression_tests = ["crates/rockstream-ops/tests/group_commit_timer_tests.rs::test_flush_failure_withholds_acknowledgment", "crates/rockstream-ops/tests/group_commit_durability_lfs_tests.rs::test_group_commit_lfs_multi_epoch_durability"]
+regression_tests = [
+    "crates/rockstream-ops/tests/group_commit_timer_tests.rs::test_flush_failure_withholds_acknowledgment",
+    "crates/rockstream-ops/tests/group_commit_durability_lfs_tests.rs::test_group_commit_lfs_multi_epoch_durability",
+    "crates/rockstream-connectors/tests/persistence_verification_adapter_boundary_tests.rs::test_mutation_state_missing_refuses_durable_coupled_commit",
+]
 evidence = [
     "docs/adr/0006-persistence-replay-compaction.md",
     "cargo test --locked -p rockstream-ops --lib group_commit",
     "cargo test --locked -p rockstream-connectors --lib source_epoch",
+    "cargo test --locked -p rockstream-connectors --test persistence_verification_adapter_boundary_tests",
 ]
 
 [[claims]]

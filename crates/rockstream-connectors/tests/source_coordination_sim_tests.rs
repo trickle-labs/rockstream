@@ -8,12 +8,23 @@ use rockstream_connectors::{
     SnapshotDeltaFence, SnapshotStream, SourceCheckpoint, SourceCheckpointStore, SourceConnector,
     SourceError, SourceRuntimeCoordinator,
 };
-use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, WriteBatch};
+use rockstream_storage::{
+    keys::{ShardKeyEncoder, ShardPrefix},
+    ShardDb, WriteBatch,
+};
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
 
 const SEED: u64 = 0x5115_0003;
+
+fn m3_batch(epoch: u64) -> WriteBatch {
+    let mut batch = WriteBatch::new();
+    batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+    batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+    batch.put(&ShardKeyEncoder::frontier_key(), &epoch.to_be_bytes());
+    batch
+}
 
 struct RecordingSource {
     acknowledgements: Vec<(Epoch, OffsetToken)>,
@@ -98,7 +109,7 @@ async fn seeded_competing_owners_commit_one_fenced_token_per_epoch() {
             &stale_owner,
             1,
             OffsetToken::new(b"offset-01".to_vec()),
-            WriteBatch::new(),
+            m3_batch(1),
         )
         .await
         .unwrap_err();
@@ -107,7 +118,7 @@ async fn seeded_competing_owners_commit_one_fenced_token_per_epoch() {
             &current_owner,
             1,
             OffsetToken::new(b"offset-01".to_vec()),
-            WriteBatch::new(),
+            m3_batch(1),
         )
         .await
         .unwrap();
@@ -176,6 +187,7 @@ async fn backfill_fence_simruntime_restarts_preserve_exactly_once() {
                 (epoch == 3).then_some(epoch),
             );
             let mut batch = WriteBatch::new();
+            batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
             batch.put(format!("view_output/orders_mv/{epoch}").as_bytes(), record);
             batch.put(&ShardKeyEncoder::frontier_key(), &epoch.to_be_bytes());
             coordinator
@@ -292,7 +304,7 @@ async fn seeded_owner_crash_after_prepare_retries_from_last_committed_token() {
             &owner,
             1,
             OffsetToken::new(b"offset-01".to_vec()),
-            WriteBatch::new(),
+            m3_batch(1),
         )
         .await
         .unwrap();
@@ -325,7 +337,7 @@ async fn seeded_owner_crash_after_m3_commit_acks_once_after_recovery() {
     let prepared =
         SourceCheckpoint::prepared(connector_id, 1, OffsetToken::new(b"offset-01".to_vec()));
     store.prepare(&prepared).await.unwrap();
-    let mut m3_input = WriteBatch::new();
+    let mut m3_input = m3_batch(1);
     store.append_committed(&mut m3_input, &prepared).unwrap();
     store.commit_m3(m3_input).await.unwrap();
 
@@ -361,7 +373,7 @@ async fn seeded_webhook_retry_after_owner_failover_is_exactly_once() {
             &first_owner,
             1,
             OffsetToken::new(b"delivery-01".to_vec()),
-            WriteBatch::new(),
+            m3_batch(1),
         )
         .await
         .unwrap();
@@ -371,7 +383,7 @@ async fn seeded_webhook_retry_after_owner_failover_is_exactly_once() {
             &second_owner,
             1,
             OffsetToken::new(b"delivery-01".to_vec()),
-            WriteBatch::new(),
+            m3_batch(1),
         )
         .await
         .unwrap_err();
@@ -400,7 +412,7 @@ async fn seeded_lifecycle_race_never_revives_dropped_or_paused_source() {
             &owner,
             1,
             OffsetToken::new(b"offset-01".to_vec()),
-            WriteBatch::new(),
+            m3_batch(1),
         )
         .await
         .unwrap_err();
@@ -411,7 +423,7 @@ async fn seeded_lifecycle_race_never_revives_dropped_or_paused_source() {
             &owner,
             1,
             OffsetToken::new(b"offset-01".to_vec()),
-            WriteBatch::new(),
+            m3_batch(1),
         )
         .await
         .unwrap();
@@ -421,7 +433,7 @@ async fn seeded_lifecycle_race_never_revives_dropped_or_paused_source() {
             &owner,
             2,
             OffsetToken::new(b"offset-02".to_vec()),
-            WriteBatch::new(),
+            m3_batch(2),
         )
         .await
         .unwrap_err();
@@ -467,7 +479,7 @@ async fn recovery_uses_only_committed_checkpoint_and_fences_replaced_owner() {
     let committed =
         SourceCheckpoint::prepared(connector_id, 2, OffsetToken::new(b"committed-02".to_vec()));
     store.prepare(&committed).await.unwrap();
-    let mut batch = WriteBatch::new();
+    let mut batch = m3_batch(2);
     store.append_committed(&mut batch, &committed).unwrap();
     store.commit_m3(batch).await.unwrap();
 
@@ -527,7 +539,7 @@ async fn globally_allocated_epoch_gap_commits_exact_runtime_state() {
             &owner,
             2,
             OffsetToken::new(b"offset-02".to_vec()),
-            WriteBatch::new(),
+            m3_batch(2),
         )
         .await
         .unwrap();
@@ -589,7 +601,7 @@ async fn replayable_commit_writes_one_visibility_batch_then_acknowledges_exact_l
         0,
         Some(7),
     );
-    let mut batch = WriteBatch::new();
+    let mut batch = m3_batch(7);
     batch.put(b"visible/base-row", b"row-1");
     coordinator
         .commit_replayable_epoch(

@@ -165,7 +165,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             .append_backfill_lifecycle(&mut batch, lifecycle)
             .map_err(storage_error)?;
         self.checkpoint_store
-            .commit_m3(batch)
+            .commit_raw_batch(batch)
             .await
             .map_err(storage_error)
     }
