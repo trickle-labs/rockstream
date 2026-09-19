@@ -26,7 +26,7 @@ use rockstream_types::data_plane::{
     DEPLOYMENT_DESCRIPTOR_VERSION,
 };
 use rockstream_types::identity::InternalTlsConfig;
-use rockstream_types::ids::{LeaseToken, ShardId, WorkerId, WorkloadId};
+use rockstream_types::ids::{LeaseToken, OperatorId, ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardLease;
 use rockstream_types::topology::{
     CapacityHeadroom, ControlMessage, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLocation,
@@ -208,7 +208,7 @@ fn zset_to_rows(zset: &rockstream_ops::zset::ArrowZSet) -> io::Result<Vec<Runtim
         .collect()
 }
 
-async fn execute_frame(
+pub async fn execute_frame(
     client: &WorkerClientHandle,
     deployments: &WorkerDeployments,
     frame: RuntimeExchangeMessage,
@@ -391,6 +391,140 @@ async fn execute_frame(
         .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "client channel closed"))
 }
 
+/// Helper to construct a test worker deployment with in-memory / local storage and epoch compaction.
+pub async fn setup_test_deployment(
+    storage_dir: &Path,
+    compaction_config: EpochCompactionConfig,
+) -> (
+    WorkerClientHandle,
+    WorkerDeployments,
+    Arc<ShardDb>,
+    Arc<EpochCompactor>,
+    mpsc::Receiver<WorkerMessage>,
+) {
+    let (msg_tx, mut msg_rx) = mpsc::channel(32);
+    let worker_id = Arc::new(RwLock::new(Some(WorkerId(42))));
+    let active_shards = Arc::new(RwLock::new(HashMap::new()));
+    let topology_workers = Arc::new(RwLock::new(HashMap::new()));
+    let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let secret_manager = Arc::new(WorkerSecretManager::new("worker-42".to_string()));
+    let storage_context = Arc::new(
+        rockstream_storage::storage_context::WorkerStorageContext::new_with_worker_id(
+            "worker-42",
+            536_870_912,
+        ),
+    );
+    let deployments = Arc::new(RwLock::new(HashMap::new()));
+    let comp_config_lock = Arc::new(RwLock::new(compaction_config.clone()));
+
+    let client = WorkerClientHandle {
+        worker_id,
+        active_shards,
+        topology_workers,
+        msg_tx,
+        fence_waiters: fence_waiters.clone(),
+        secret_manager,
+        storage_context: storage_context.clone(),
+        compaction_config: comp_config_lock,
+        deployments: deployments.clone(),
+    };
+
+    let store =
+        rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
+    let db = Arc::new(
+        ShardDb::builder("db", store)
+            .with_storage_context(storage_context)
+            .build()
+            .await
+            .unwrap(),
+    );
+
+    let plan = rockstream_plan::PlanNode::ViewSink {
+        view_name: "items_view".to_string(),
+        pk: vec![0],
+        child: Box::new(rockstream_plan::PlanNode::Source {
+            name: "items".to_string(),
+        }),
+    };
+
+    let descriptor = DeploymentDescriptor {
+        version: DEPLOYMENT_DESCRIPTOR_VERSION,
+        workload_id: WorkloadId(1),
+        plan_json: serde_json::to_string(&plan).unwrap(),
+        join_strategy: rockstream_types::config::JoinStrategy::Auto,
+        schemas: vec![rockstream_types::data_plane::DeploymentSchema {
+            relation: "items".to_string(),
+            columns: vec![
+                rockstream_types::data_plane::DeploymentColumn {
+                    name: "id".to_string(),
+                    data_type: "i64".to_string(),
+                },
+                rockstream_types::data_plane::DeploymentColumn {
+                    name: "name".to_string(),
+                    data_type: "utf8".to_string(),
+                },
+            ],
+        }],
+        frontier: 0,
+        storage_root: "test_root".to_string(),
+        sink_operator_id: OperatorId(10),
+        output_columns: vec!["id".to_string(), "name".to_string()],
+        primary_key: vec![0],
+        merge_key_columns: vec![],
+        routing_columns: std::collections::BTreeMap::new(),
+        shard: ShardLease::new(ShardId(100), WorkerId(42), LeaseToken(777)),
+        storage_identity: format!("lfs:{}", storage_dir.display()),
+    };
+
+    let schemas = deployment_schema(&descriptor).unwrap();
+    let compiled = rockstream_ops::compile_plan_with_sink_id_and_strategy(
+        &plan,
+        db.clone(),
+        &schemas,
+        descriptor.sink_operator_id,
+        descriptor.join_strategy,
+    )
+    .unwrap();
+
+    let commit_group = Arc::new(PhysicalCommitGroup::new(db.clone()));
+    let compactor = Arc::new(EpochCompactor::new(compaction_config));
+
+    let deployment = Arc::new(WorkerDeployment {
+        descriptor: descriptor.clone(),
+        schemas,
+        db: db.clone(),
+        compiled,
+        commit_group,
+        compactor: compactor.clone(),
+    });
+
+    deployments
+        .write()
+        .insert((descriptor.workload_id, descriptor.shard.shard_id), deployment);
+
+    let fence_waiters_task = fence_waiters.clone();
+    let (progress_tx, progress_rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                WorkerMessage::FenceWrite { shard_id, .. } => {
+                    if let Some(waiters) = fence_waiters_task.lock().remove(&shard_id) {
+                        for tx in waiters {
+                            let _ = tx.send(true);
+                        }
+                    }
+                }
+                WorkerMessage::ExecutionProgress { .. } => {
+                    let _ = progress_tx.send(msg).await;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    (client, deployments, db, compactor, progress_rx)
+}
+
 #[cfg(test)]
 mod data_plane_tests {
     use super::*;
@@ -427,139 +561,6 @@ mod data_plane_tests {
                 },
             ]
         );
-    }
-
-    async fn setup_test_deployment(
-        storage_dir: &Path,
-        compaction_config: EpochCompactionConfig,
-    ) -> (
-        WorkerClientHandle,
-        WorkerDeployments,
-        Arc<ShardDb>,
-        Arc<EpochCompactor>,
-        mpsc::Receiver<WorkerMessage>,
-    ) {
-        let (msg_tx, mut msg_rx) = mpsc::channel(32);
-        let worker_id = Arc::new(RwLock::new(Some(WorkerId(42))));
-        let active_shards = Arc::new(RwLock::new(HashMap::new()));
-        let topology_workers = Arc::new(RwLock::new(HashMap::new()));
-        let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let secret_manager = Arc::new(WorkerSecretManager::new("worker-42".to_string()));
-        let storage_context = Arc::new(
-            rockstream_storage::storage_context::WorkerStorageContext::new_with_worker_id(
-                "worker-42",
-                536_870_912,
-            ),
-        );
-        let deployments = Arc::new(RwLock::new(HashMap::new()));
-        let comp_config_lock = Arc::new(RwLock::new(compaction_config.clone()));
-
-        let client = WorkerClientHandle {
-            worker_id,
-            active_shards,
-            topology_workers,
-            msg_tx,
-            fence_waiters: fence_waiters.clone(),
-            secret_manager,
-            storage_context: storage_context.clone(),
-            compaction_config: comp_config_lock,
-            deployments: deployments.clone(),
-        };
-
-        let store =
-            rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
-        let db = Arc::new(
-            ShardDb::builder("db", store)
-                .with_storage_context(storage_context)
-                .build()
-                .await
-                .unwrap(),
-        );
-
-        let plan = rockstream_plan::PlanNode::ViewSink {
-            view_name: "items_view".to_string(),
-            pk: vec![0],
-            child: Box::new(rockstream_plan::PlanNode::Source {
-                name: "items".to_string(),
-            }),
-        };
-
-        let descriptor = DeploymentDescriptor {
-            version: DEPLOYMENT_DESCRIPTOR_VERSION,
-            workload_id: WorkloadId(1),
-            plan_json: serde_json::to_string(&plan).unwrap(),
-            join_strategy: rockstream_types::config::JoinStrategy::Auto,
-            schemas: vec![rockstream_types::data_plane::DeploymentSchema {
-                relation: "items".to_string(),
-                columns: vec![
-                    rockstream_types::data_plane::DeploymentColumn {
-                        name: "id".to_string(),
-                        data_type: "i64".to_string(),
-                    },
-                    rockstream_types::data_plane::DeploymentColumn {
-                        name: "name".to_string(),
-                        data_type: "utf8".to_string(),
-                    },
-                ],
-            }],
-            frontier: 0,
-            storage_root: "test_root".to_string(),
-            sink_operator_id: OperatorId(10),
-            output_columns: vec!["id".to_string(), "name".to_string()],
-            primary_key: vec![0],
-            merge_key_columns: vec![],
-            routing_columns: std::collections::BTreeMap::new(),
-            shard: ShardLease::new(ShardId(100), WorkerId(42), LeaseToken(777)),
-            storage_identity: format!("lfs:{}", storage_dir.display()),
-        };
-
-        let schemas = deployment_schema(&descriptor).unwrap();
-        let compiled = rockstream_ops::compile_plan_with_sink_id_and_strategy(
-            &plan,
-            db.clone(),
-            &schemas,
-            descriptor.sink_operator_id,
-            descriptor.join_strategy,
-        )
-        .unwrap();
-
-        let commit_group = Arc::new(PhysicalCommitGroup::new(db.clone()));
-        let compactor = Arc::new(EpochCompactor::new(compaction_config));
-
-        let deployment = Arc::new(WorkerDeployment {
-            descriptor: descriptor.clone(),
-            schemas,
-            db: db.clone(),
-            compiled,
-            commit_group,
-            compactor: compactor.clone(),
-        });
-
-        deployments
-            .write()
-            .insert((descriptor.workload_id, descriptor.shard.shard_id), deployment);
-
-        let fence_waiters_task = fence_waiters.clone();
-        let (progress_tx, progress_rx) = mpsc::channel(32);
-        tokio::spawn(async move {
-            while let Some(msg) = msg_rx.recv().await {
-                match msg {
-                    WorkerMessage::FenceWrite { shard_id, .. } => {
-                        if let Some(waiters) = fence_waiters_task.lock().remove(&shard_id) {
-                            for tx in waiters {
-                                let _ = tx.send(true);
-                            }
-                        }
-                    }
-                    WorkerMessage::ExecutionProgress { .. } => {
-                        let _ = progress_tx.send(msg).await;
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        (client, deployments, db, compactor, progress_rx)
     }
 
     #[tokio::test]
@@ -827,6 +828,11 @@ impl WorkerClientHandle {
         shard_id: ShardId,
     ) -> Option<Arc<WorkerDeployment>> {
         self.deployments.read().get(&(workload_id, shard_id)).cloned()
+    }
+
+    /// Execute a runtime exchange message frame against deployed workloads.
+    pub async fn execute_frame(&self, frame: RuntimeExchangeMessage) -> io::Result<()> {
+        execute_frame(self, &self.deployments, frame).await
     }
 
     /// Get the compactor for a workload and shard deployment.
