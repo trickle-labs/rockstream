@@ -203,8 +203,7 @@ async fn corrupted_key_in_storage_fails_load_closed() {
     .unwrap();
     let op_id = OperatorId(44);
     let op = BucketedAggregateOp::new(op_id, 1, 4);
-    op.process_delta(make_batch(&[(1, 10, 1)]))
-        .unwrap();
+    op.process_delta(make_batch(&[(1, 10, 1)])).unwrap();
     persist_bucketed_agg_state(&db, &op).await.unwrap();
 
     // Inject corrupted key under this operator's prefix (bad length)
@@ -232,8 +231,7 @@ async fn non_positive_count_in_storage_fails_load_closed() {
     .unwrap();
     let op_id = OperatorId(45);
     let op = BucketedAggregateOp::new(op_id, 1, 4);
-    op.process_delta(make_batch(&[(1, 10, 1)]))
-        .unwrap();
+    op.process_delta(make_batch(&[(1, 10, 1)])).unwrap();
     persist_bucketed_agg_state(&db, &op).await.unwrap();
 
     // Inject entry with zero count (16 bytes with count = 0)

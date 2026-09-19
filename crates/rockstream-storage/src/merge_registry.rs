@@ -107,10 +107,7 @@ pub enum LawOperandView<'a> {
     /// Raw un-tagged operand bytes.
     Raw(&'a [u8]),
     /// Tagged storage merge operand with the tag stripped.
-    Tagged {
-        tag: MergeTag,
-        payload: &'a [u8],
-    },
+    Tagged { tag: MergeTag, payload: &'a [u8] },
 }
 
 /// Error returned when resolving a storage law operand fails.
@@ -587,8 +584,8 @@ mod tests {
 
     #[test]
     fn merge_tag_law_compatibility() {
-        use rockstream_types::laws::weight_add::WeightAddV1;
         use rockstream_types::laws::sum_count::SumCountV1;
+        use rockstream_types::laws::weight_add::WeightAddV1;
 
         let weight_law = WeightAddV1;
         let sum_count_law = SumCountV1;

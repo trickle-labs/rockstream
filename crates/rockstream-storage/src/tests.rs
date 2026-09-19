@@ -874,14 +874,23 @@ async fn malformed_tagged_sum_is_rejected() {
 
     // With fallback disabled (default), get_merged returns OperandCorruption
     let err_short = db.get_merged(b"bad/short", &law).await.unwrap_err();
-    assert!(matches!(err_short, crate::StorageError::OperandCorruption { .. }));
+    assert!(matches!(
+        err_short,
+        crate::StorageError::OperandCorruption { .. }
+    ));
 
     let err_long = db.get_merged(b"bad/long", &law).await.unwrap_err();
-    assert!(matches!(err_long, crate::StorageError::OperandCorruption { .. }));
+    assert!(matches!(
+        err_long,
+        crate::StorageError::OperandCorruption { .. }
+    ));
 
     // scan_merged also returns OperandCorruption
     let scan_err = db.scan_merged(b"bad/", &law).await.unwrap_err();
-    assert!(matches!(scan_err, crate::StorageError::OperandCorruption { .. }));
+    assert!(matches!(
+        scan_err,
+        crate::StorageError::OperandCorruption { .. }
+    ));
 
     db.close().await.unwrap();
 }
@@ -903,7 +912,10 @@ async fn incompatible_tag_law_combination_rejected() {
     assert!(matches!(err, crate::StorageError::OperandCorruption { .. }));
 
     let scan_err = db.scan_merged(b"incompat/", &law).await.unwrap_err();
-    assert!(matches!(scan_err, crate::StorageError::OperandCorruption { .. }));
+    assert!(matches!(
+        scan_err,
+        crate::StorageError::OperandCorruption { .. }
+    ));
 
     db.close().await.unwrap();
 }
@@ -957,9 +969,9 @@ async fn fallback_behavior_disabled_and_enabled_for_tagged() {
 #[serial_test::serial]
 #[tokio::test]
 async fn concrete_regression_fixture_reaches_weight_add() {
+    use crate::merge_registry::{resolve_law_operand, LawOperandView, MergeTag};
     use rockstream_types::laws::arithmetic::decode_i64;
     use rockstream_types::laws::weight_add::WeightAddV1;
-    use crate::merge_registry::{resolve_law_operand, LawOperandView, MergeTag};
 
     let law = WeightAddV1;
     let fixture: [u8; 9] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07];
