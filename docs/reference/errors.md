@@ -7,6 +7,7 @@
 | RS-0003 | storage.unavailable | Storage unavailable | ERROR | 53100 | ExponentialBackoff | Verify storage directory permissions and disk space. | rs-0003 |
 | RS-0004 | cluster.unreachable | Cluster control plane unreachable | ERROR | 08006 | ExponentialBackoff | Verify the control service URL and ensure the control node is running and reachable. | rs-0004 |
 | RS-0005 | cli.confirmation_required | Destructive command confirmation required | ERROR | 55000 | NonRetryable | Pass --yes for script execution or answer y at the prompt. | rs-0005 |
+| RS-0906 | formal.verus_qualification_failed | Formal Verus qualification failed | ERROR | XX000 | NonRetryable | Inspect the formal verification and qualification evidence; ensure all required proofs and release artifacts pass. | rs-0906 |
 | RS-1001 | pipeline.not_found | Pipeline not found | ERROR | 42P01 | NonRetryable | Check pipeline name and ensure it has been created. | rs-1001 |
 | RS-1002 | schema.incompatible_change | Incompatible schema change | ERROR | 42804 | NonRetryable | Review schema evolution rules; a new view may be required. | rs-1002 |
 | RS-1003 | record.decode_error | Record decode error | ERROR | 22000 | NonRetryable | Inspect the dead-letter queue for malformed records. | rs-1003 |

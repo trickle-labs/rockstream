@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "1ed99e7195621450a794b10e4af64e9475cd91e9e0f736fa80c96578b5884068",
+    "candidate_identity_digest": "135e556acb8f96f7cde100eb06edc07f7924287a0f0975c5768da4e7ddc1c05c",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -6216,6 +6216,16 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Pass --yes for script execution or answer y at the prompt.",
         "doc_anchor": "rs-0005"
+      },
+      {
+        "code": "RS-0906",
+        "key": "formal.verus_qualification_failed",
+        "title": "Formal Verus qualification failed",
+        "severity": "ERROR",
+        "sqlstate": "XX000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Inspect the formal verification and qualification evidence; ensure all required proofs and release artifacts pass.",
+        "doc_anchor": "rs-0906"
       },
       {
         "code": "RS-1001",
