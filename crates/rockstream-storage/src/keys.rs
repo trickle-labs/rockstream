@@ -206,6 +206,17 @@ impl ShardKeyEncoder {
         prefix
     }
 
+    /// Prefix for scanning or probing all join arrangement entries for a specific join key:
+    /// `[0x01][side_disc:2][op_id:8][join_key]`
+    pub fn join_arr_key_prefix(side: JoinSide, op_id: u64, join_key: &[u8]) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(1 + 2 + 8 + join_key.len());
+        prefix.push(ShardPrefix::OpState.as_byte());
+        prefix.extend_from_slice(&side.disc_bytes());
+        prefix.extend_from_slice(&op_id.to_be_bytes());
+        prefix.extend_from_slice(join_key);
+        prefix
+    }
+
     /// Encode a factorized payload node with one shared capsule key.
     pub fn factor_payload_key(
         side: JoinSide,

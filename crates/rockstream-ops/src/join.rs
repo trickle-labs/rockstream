@@ -282,6 +282,7 @@ pub struct JoinOp {
     right_staged: Mutex<StagedDelta>,
     dirty_left: Mutex<HashSet<(Vec<u8>, u128)>>,
     dirty_right: Mutex<HashSet<(Vec<u8>, u128)>>,
+    db: Mutex<Option<Arc<ShardDb>>>,
 }
 
 impl JoinOp {
@@ -311,7 +312,103 @@ impl JoinOp {
             right_staged: Mutex::new(StagedDelta::default()),
             dirty_left: Mutex::new(HashSet::new()),
             dirty_right: Mutex::new(HashSet::new()),
+            db: Mutex::new(None),
         }
+    }
+
+    /// Attach a ShardDb for arrangement lookups and tiered caching.
+    pub fn with_db(self, db: Arc<ShardDb>) -> Self {
+        *self.db.lock().unwrap() = Some(db);
+        self
+    }
+
+    /// Set a ShardDb for arrangement lookups and tiered caching.
+    pub fn set_db(&self, db: Arc<ShardDb>) {
+        *self.db.lock().unwrap() = Some(db);
+    }
+
+    /// Access the attached ShardDb if configured.
+    pub fn db(&self) -> Option<Arc<ShardDb>> {
+        self.db.lock().unwrap().clone()
+    }
+
+    /// Look up matching arrangement rows for a given join key against an arrangement.
+    /// Checks in-memory state first; if `db` is attached and no in-memory matches exist,
+    /// probes SlateDB arrangement using `join_arr_key_prefix`. SlateDB evaluates
+    /// Bloom filters and the local NVMe cache tier to minimize remote S3 GET amplification.
+    pub async fn probe_arrangement(
+        &self,
+        side: JoinSide,
+        join_key: &[u8],
+    ) -> Result<Vec<(Vec<u8>, i64)>, OpError> {
+        let in_mem: Vec<(Vec<u8>, i64)> = {
+            let state = self.state.lock().unwrap();
+            match side {
+                JoinSide::Left => state
+                    .probe_left(join_key)
+                    .map(|(r, w)| (r.clone(), w))
+                    .collect(),
+                JoinSide::Right => state
+                    .probe_right(join_key)
+                    .map(|(r, w)| (r.clone(), w))
+                    .collect(),
+            }
+        };
+        if !in_mem.is_empty() {
+            return Ok(in_mem);
+        }
+
+        let db_opt = self.db.lock().unwrap().clone();
+        if let Some(db) = db_opt {
+            let prefix = ShardKeyEncoder::join_arr_key_prefix(side, self.op_id.0, join_key);
+            let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+            let mut results = Vec::with_capacity(entries.len());
+            for (key, val) in entries {
+                if key.len() >= 11 + 16 {
+                    results.push((val.to_vec(), 1));
+                }
+            }
+            return Ok(results);
+        }
+
+        Ok(Vec::new())
+    }
+
+    /// Point lookup a single row in an arrangement by exact join key and row ID.
+    /// Returns the row bytes if present.
+    /// Uses SlateDB's `db.get(&key)` which directly leverages Bloom filters to reject
+    /// absent rows with 0 S3 GETs, and local NVMe block caching to read hot blocks locally.
+    pub async fn point_lookup_arrangement(
+        &self,
+        side: JoinSide,
+        join_key: &[u8],
+        row_id: u128,
+    ) -> Result<Option<Vec<u8>>, OpError> {
+        {
+            let state = self.state.lock().unwrap();
+            let arr = match side {
+                JoinSide::Left => &state.left_arr,
+                JoinSide::Right => &state.right_arr,
+            };
+            if let Some(bucket) = arr.get(join_key) {
+                if let Some(row) = bucket.get(&row_id) {
+                    if row.weight > 0 {
+                        return Ok(Some(row.row_bytes.clone()));
+                    } else {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        let db_opt = self.db.lock().unwrap().clone();
+        if let Some(db) = db_opt {
+            let key = ShardKeyEncoder::join_arr_key(side, self.op_id.0, join_key, row_id);
+            let opt = db.get(&key).await.map_err(OpError::storage)?;
+            return Ok(opt.map(|b| b.to_vec()));
+        }
+
+        Ok(None)
     }
 
     /// Extract the join key bytes from a row (as big-endian i64 bytes concatenated).
@@ -712,6 +809,7 @@ impl JoinOp {
             right_staged: Mutex::new(StagedDelta::default()),
             dirty_left: Mutex::new(HashSet::new()),
             dirty_right: Mutex::new(HashSet::new()),
+            db: Mutex::new(None),
         })
     }
 

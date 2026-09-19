@@ -26,6 +26,10 @@ harness = false
 name = "spill_latency"
 harness = false
 
+[[bench]]
+name = "join_arrangement_bench"
+harness = false
+
 [dependencies]
 rockstream-types = { workspace = true }
 rockstream-plan = { workspace = true }
@@ -47,6 +51,7 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 object_store = { workspace = true }
 rockstream-plan = { workspace = true }
 rockstream-gateway = { workspace = true }

@@ -5185,6 +5185,7 @@ dependencies = [
  "chrono",
  "criterion",
  "datafusion",
+ "futures",
  "hex",
  "hmac 0.12.1",
  "object_store 0.12.5",

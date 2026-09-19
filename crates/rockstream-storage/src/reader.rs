@@ -77,6 +77,36 @@ impl ShardReader {
         .await
     }
 
+    /// Open a reader configured with NVMe disk cache and Bloom filter policies.
+    pub async fn open_with_cache_and_filter(
+        path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        disk_cache_dir: Option<std::path::PathBuf>,
+        max_cache_bytes: Option<usize>,
+        filter_bits_per_key: Option<u32>,
+    ) -> Result<Self, StorageError> {
+        let path = path.into();
+        let mut options = DbReaderOptions::default();
+        if let Some(dir) = disk_cache_dir {
+            options.object_store_cache_options.root_folder = Some(dir);
+            if let Some(max) = max_cache_bytes {
+                options.object_store_cache_options.max_cache_size_bytes = Some(max);
+            }
+            options.object_store_cache_options.part_size_bytes = 4 * 1024 * 1024;
+            options.object_store_cache_options.scan_interval =
+                Some(std::time::Duration::from_secs(3600));
+            options.object_store_cache_options.max_open_file_handles = 1000;
+        }
+        let mut builder = DbReader::builder(path.clone(), object_store).with_options(options);
+        if let Some(bits) = filter_bits_per_key {
+            builder = builder.with_filter_policies(vec![Arc::new(
+                slatedb::filter_policy::BloomFilterPolicy::new(bits),
+            )]);
+        }
+        let reader = builder.build().await?;
+        Self::from_reader(path, reader, SupportedStorageFormatRange::v1_through_v2()).await
+    }
+
     /// Open a reader while enforcing an inclusive storage-format range.
     pub async fn open_with_supported_format_range(
         path: impl Into<String>,
