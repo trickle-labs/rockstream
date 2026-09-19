@@ -24,11 +24,11 @@ use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
-use rockstream_ops::join::JoinOp;
 use rockstream_ops::zset::ArrowZSet;
+use rockstream_ops::{JoinKind, JoinOp, JoinPipeline};
 use rockstream_storage::shard_db::ShardDb;
 use rockstream_storage::storage_context::WorkerStorageContext;
-use rockstream_storage::{JoinSide, ShardKeyEncoder};
+use rockstream_storage::{JoinSide, ShardKeyEncoder, WriteBatch};
 use rockstream_types::ids::OperatorId;
 
 #[derive(Debug)]
@@ -332,4 +332,59 @@ async fn test_ivm_join_differentiation_with_arrangement_lookups() {
         "IVM differentiation latency must be bounded (<50ms), took {}ms",
         diff_duration.as_millis()
     );
+}
+
+#[tokio::test]
+async fn test_join_pipeline_rehydrates_persisted_arrangement_before_differentiation() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = Arc::new(
+        ShardDb::builder("pipeline-arrangement-db", store)
+            .with_bloom_filter(14, 0)
+            .build()
+            .await
+            .expect("build shard"),
+    );
+    let op_id = OperatorId(778);
+    let seed_op = JoinOp::new(op_id, vec![0], vec![0]);
+    seed_op
+        .process_epoch(
+            make_test_zset(&[], &[], &[]),
+            make_test_zset(&[2], &[200], &[1]),
+        )
+        .expect("seed right arrangement");
+    let mut state = WriteBatch::new();
+    seed_op
+        .append_state(&mut state)
+        .expect("append right arrangement");
+    shard.write_batch(state).await.expect("persist right row");
+
+    let pipeline = JoinPipeline::new(
+        vec![],
+        vec![],
+        JoinKind::Inner(Arc::new(JoinOp::new(op_id, vec![0], vec![0]))),
+        vec![],
+    );
+    pipeline.restore(&shard).await.expect("restore join state");
+
+    let output = pipeline
+        .process(
+            make_test_zset(&[2], &[20], &[1]),
+            make_test_zset(&[], &[], &[]),
+        )
+        .expect("process restored join");
+
+    assert_eq!(output.weights, vec![1]);
+    let values: Vec<Vec<i64>> = (0..4)
+        .map(|column| {
+            output
+                .data
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 join output")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(values, vec![vec![2], vec![20], vec![2], vec![200]]);
 }

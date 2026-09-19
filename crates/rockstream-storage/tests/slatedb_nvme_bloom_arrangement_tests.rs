@@ -301,3 +301,74 @@ async fn test_shard_reader_with_nvme_cache_and_filter() {
     let absent = ShardKeyEncoder::join_arr_key(JoinSide::Left, 88, &999u64.to_be_bytes(), 999);
     assert_eq!(reader.get(&absent).await.expect("reader get absent"), None);
 }
+
+#[tokio::test]
+async fn test_arrangement_cache_reused_across_fresh_worker_contexts() {
+    let raw_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let get_counter = Arc::new(AtomicUsize::new(0));
+    let tracking_store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore::new(
+        raw_store.clone(),
+        get_counter.clone(),
+    ));
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let nvme_cache_dir = temp_dir.path().join("fresh-worker-nvme-cache");
+
+    {
+        let writer_context = Arc::new(
+            WorkerStorageContext::new_with_worker_id("arrangement-writer", 8 * 1024 * 1024)
+                .with_nvme_cache(&nvme_cache_dir, 32 * 1024 * 1024)
+                .with_filter_bits_per_key(14),
+        );
+        let builder = ShardDb::builder("fresh-worker-arrangement-db", tracking_store.clone())
+            .with_storage_context(writer_context)
+            .with_bloom_filter(14, 0)
+            .with_nvme_cache(&nvme_cache_dir, 32 * 1024 * 1024);
+        assert!(builder.object_store_cache_options().cache_puts);
+        let shard = builder.build().await.expect("build writer");
+
+        for i in 0..100u64 {
+            let key =
+                ShardKeyEncoder::join_arr_key(JoinSide::Right, 91, &i.to_be_bytes(), i as u128);
+            shard
+                .put(&key, format!("arrangement-row-{i}").as_bytes())
+                .await
+                .expect("put arrangement row");
+        }
+        shard.flush().await.expect("flush arrangement rows");
+    }
+
+    let reader_context = Arc::new(
+        WorkerStorageContext::new_with_worker_id("arrangement-reader", 8 * 1024 * 1024)
+            .with_nvme_cache(&nvme_cache_dir, 32 * 1024 * 1024)
+            .with_filter_bits_per_key(14),
+    );
+    let shard = ShardDb::builder("fresh-worker-arrangement-db", tracking_store)
+        .with_storage_context(reader_context)
+        .with_bloom_filter(14, 0)
+        .build()
+        .await
+        .expect("build fresh reader");
+    let gets_before_reads = get_counter.load(Ordering::SeqCst);
+
+    for i in 0..100u64 {
+        let key = ShardKeyEncoder::join_arr_key(JoinSide::Right, 91, &i.to_be_bytes(), i as u128);
+        assert_eq!(
+            shard.get(&key).await.expect("read cached arrangement row"),
+            Some(Bytes::from(format!("arrangement-row-{i}")))
+        );
+    }
+    for i in 1000..1050u64 {
+        let key = ShardKeyEncoder::join_arr_key(JoinSide::Right, 91, &i.to_be_bytes(), i as u128);
+        assert_eq!(
+            shard.get(&key).await.expect("read absent arrangement row"),
+            None
+        );
+    }
+
+    assert_eq!(
+        get_counter.load(Ordering::SeqCst),
+        gets_before_reads,
+        "fresh worker reads must use the NVMe cache and Bloom filters without remote GETs"
+    );
+}
