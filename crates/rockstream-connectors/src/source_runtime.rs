@@ -10,7 +10,8 @@ use rockstream_verified::persistence;
 use crate::source_connector::{PollDeltaResult, SnapshotStream, SourceConnector, SourceError};
 use crate::source_epoch::SnapshotDeltaFence;
 use crate::source_epoch::{
-    BackfillLifecycle, OffsetToken, SourceCheckpoint, SourceCheckpointStore, SourceEpochRegistry,
+    BackfillLifecycle, CoupledBatchDescriptor, OffsetToken, SourceCheckpoint,
+    SourceCheckpointStore, SourceEpochRegistry,
 };
 use crate::{PgOutputEvent, PostgresCdcSource};
 
@@ -284,6 +285,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
                 return self.block(&storage_error(error).to_string());
             }
         };
+        self.add_progress_state(&mut m3_input, epoch);
         if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
             self.in_flight_epochs -= 1;
             return self.block(&storage_error(error).to_string());
@@ -374,6 +376,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             self.in_flight_epochs -= 1;
             return self.block(&storage_error(error).to_string());
         }
+        self.add_progress_state(&mut m3_input, epoch);
         if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
             self.in_flight_epochs -= 1;
             return self.block(&storage_error(error).to_string());
@@ -437,6 +440,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             .checkpoint_store
             .append_replayable_committed(&mut m3_input, epoch, offset)
             .map_err(storage_error)?;
+        self.add_progress_state(&mut m3_input, epoch);
         self.in_flight_epochs = 1;
         if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
             self.in_flight_epochs = 0;
@@ -476,6 +480,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         self.checkpoint_store
             .append_backfill_lifecycle(&mut m3_input, lifecycle)
             .map_err(storage_error)?;
+        self.add_progress_state(&mut m3_input, lifecycle.cursor.committed_epoch);
         self.checkpoint_store
             .commit_m3(m3_input)
             .await
@@ -614,4 +619,16 @@ fn storage_error(error: rockstream_storage::StorageError) -> SourceError {
     SourceError::Io(format!(
         "RS-4010: durable source checkpoint operation failed: {error}; next steps: keep the source paused, recover the highest committed checkpoint, then retry"
     ))
+}
+
+impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
+    fn add_progress_state(&self, batch: &mut WriteBatch, epoch: Epoch) {
+        let key = format!(
+            "op_state/source_runtime/{}/{}",
+            self.connector_id.0, epoch
+        );
+        if !CoupledBatchDescriptor::inspect(batch).has_state {
+            batch.put(key.as_bytes(), &epoch.to_be_bytes());
+        }
+    }
 }
