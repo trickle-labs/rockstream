@@ -222,16 +222,14 @@ fn compile_plan_body(
                 "execution.join_strategy=factorized requires an eligible inner join aggregate",
             ));
         }
-        let sink = ViewSinkOp::new(db, sink_op_id);
+        let sink = ViewSinkOp::new(Arc::clone(&db), sink_op_id);
+        let join_pipeline =
+            JoinPipeline::new(shape.left_pre, shape.right_pre, shape.join, shape.post);
+        join_pipeline.set_db(db);
         return Ok(CompiledView {
             pipeline: StatefulPipeline::new(),
             join: Some(JoinCompiled {
-                pipeline: JoinPipeline::new(
-                    shape.left_pre,
-                    shape.right_pre,
-                    shape.join,
-                    shape.post,
-                ),
+                pipeline: join_pipeline,
                 left_source: shape.left_source,
                 right_source: shape.right_source,
             }),
