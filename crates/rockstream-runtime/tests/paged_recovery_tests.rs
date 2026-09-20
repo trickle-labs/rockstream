@@ -15,7 +15,7 @@ use rockstream_ops::int64_schema;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_ops::AggregateOp;
 use rockstream_runtime::recovery::{RecoveryDriver, RecoveryError};
-use rockstream_storage::{ScanProgressHandle, ShardDb, WriteBatch};
+use rockstream_storage::{ScanProgressHandle, ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::error_code::*;
 use rockstream_types::ids::{OperatorId, ShardId};
@@ -262,4 +262,78 @@ async fn test_paged_recovery_resumes_cleanly_across_process_restart() {
         assert!(!out_delta.is_empty());
         assert_eq!(restored_agg.live_groups(), 499);
     }
+}
+
+#[tokio::test]
+async fn aggregate_loaders_reject_noncanonical_persisted_records() {
+    let dir = tempdir().unwrap();
+    let op_id = OperatorId(43);
+    let db = open_test_db(&dir, "aggregate-corrupt-records").await;
+    let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &1i64.to_be_bytes());
+    let mut malformed_key = key.clone();
+    malformed_key.push(0);
+
+    let mut valid_value = [0u8; 16];
+    valid_value[8..].copy_from_slice(&1i64.to_be_bytes());
+    let mut batch = WriteBatch::new();
+    batch.put(&malformed_key, &valid_value);
+    db.write_batch(batch).await.unwrap();
+    db.flush().await.unwrap();
+
+    let expected_key_error = "[RS-0001] Storage error: key encoding error: RS-3616: corrupted recovery record: invalid aggregate key; next_steps: check disk space and object store connectivity";
+    let load_error = match AggregateOp::load_from_storage(&db, op_id).await {
+        Ok(_) => panic!("malformed aggregate key was accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert_eq!(load_error, expected_key_error);
+    let restored = AggregateOp::new(op_id);
+    assert_eq!(
+        restored
+            .restore_in_place(&db)
+            .await
+            .unwrap_err()
+            .to_string(),
+        expected_key_error
+    );
+    assert_eq!(restored.live_groups(), 0);
+
+    let mut trailing_value = valid_value.to_vec();
+    trailing_value.push(0);
+    let mut batch = WriteBatch::new();
+    batch.delete(&malformed_key);
+    batch.put(&key, &trailing_value);
+    db.write_batch(batch).await.unwrap();
+    db.flush().await.unwrap();
+
+    let expected_value_error = "[RS-0001] Storage error: key encoding error: RS-3616: corrupted recovery record: aggregate value must be exactly 16 bytes; next_steps: check disk space and object store connectivity";
+    let load_error = match AggregateOp::load_from_storage(&db, op_id).await {
+        Ok(_) => panic!("trailing aggregate value bytes were accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert_eq!(load_error, expected_value_error);
+
+    let mut negative_value = [0u8; 16];
+    negative_value[8..].copy_from_slice(&(-1i64).to_be_bytes());
+    let mut batch = WriteBatch::new();
+    batch.delete(&key);
+    batch.put(&key, &negative_value);
+    db.write_batch(batch).await.unwrap();
+    db.flush().await.unwrap();
+
+    let expected_count_error = "[RS-0001] Storage error: key encoding error: RS-3616: corrupted recovery record for operator 43: non-positive count; next_steps: check disk space and object store connectivity";
+    let load_error = match AggregateOp::load_from_storage(&db, op_id).await {
+        Ok(_) => panic!("non-positive aggregate count was accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert_eq!(load_error, expected_count_error);
+    let restored = AggregateOp::new(op_id);
+    assert_eq!(
+        restored
+            .restore_in_place(&db)
+            .await
+            .unwrap_err()
+            .to_string(),
+        expected_count_error
+    );
+    assert_eq!(restored.live_groups(), 0);
 }

@@ -20,8 +20,8 @@ use std::sync::{
 };
 
 use rockstream_storage::{
-    keys::CatalogType, CatalogKeyEncoder, ShardDb, ShardKeyEncoder, ShardPrefix, StorageError,
-    WriteBatch,
+    keys::CatalogType, BatchOp, CatalogKeyEncoder, ShardDb, ShardKeyEncoder, ShardPrefix,
+    StorageError, WriteBatch,
 };
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
@@ -465,7 +465,7 @@ impl SourceCheckpointStore {
         let source_marker_written = descriptor.has_source_marker;
         let frontier_written = descriptor.has_frontier;
 
-        descriptor.validate(false)?;
+        descriptor.validate_for(self.connector_id)?;
 
         let write_result = self.db.write_batch(batch).await;
         let write_succeeded = write_result.is_ok();
@@ -811,6 +811,9 @@ pub struct CoupledBatchDescriptor {
     pub has_source_marker: bool,
     pub has_frontier: bool,
     pub has_coupling_metadata: bool,
+    source_identity: Option<(ConnectorId, Epoch)>,
+    frontier_epoch: Option<Epoch>,
+    malformed_identity: bool,
 }
 
 impl CoupledBatchDescriptor {
@@ -820,6 +823,10 @@ impl CoupledBatchDescriptor {
         let frontier_key = ShardKeyEncoder::frontier_key();
         for op in batch.ops() {
             let key = op.key();
+            let value = match op {
+                BatchOp::Put { value, .. } | BatchOp::Merge { value, .. } => Some(value.as_slice()),
+                BatchOp::Delete { .. } => None,
+            };
             if key.starts_with(&[ShardPrefix::OpState.as_byte()]) || key.starts_with(b"op_state/") {
                 desc.has_state = true;
             }
@@ -835,6 +842,28 @@ impl CoupledBatchDescriptor {
                 || (key.starts_with(b"connector/")
                     && key.windows(b"committed".len()).any(|w| w == b"committed"))
             {
+                let identity = value.and_then(|value| {
+                    let (kind, _, object_id, suffix) = CatalogKeyEncoder::decode(key)?;
+                    let slot = suffix.strip_prefix(b"source_checkpoint/committed/")?;
+                    if kind != CatalogType::Connector as u8
+                        || slot.len() != std::mem::size_of::<u64>()
+                    {
+                        return None;
+                    }
+                    let connector_id = u64::try_from(object_id).ok().map(ConnectorId)?;
+                    let checkpoint: SourceCheckpoint = serde_json::from_slice(value).ok()?;
+                    (checkpoint.version == 1
+                        && checkpoint.connector_id == connector_id
+                        && checkpoint.state == SourceCheckpointState::Committed)
+                        .then_some((connector_id, checkpoint.source_epoch))
+                });
+                match identity {
+                    Some(identity) if desc.source_identity.is_none() => {
+                        desc.source_identity = Some(identity);
+                    }
+                    Some(identity) if desc.source_identity == Some(identity) => {}
+                    Some(_) | None => desc.malformed_identity = true,
+                }
                 desc.has_source_marker = true;
             }
             if key == frontier_key.as_slice()
@@ -843,6 +872,17 @@ impl CoupledBatchDescriptor {
                 || key == b"shard_meta/frontier"
             {
                 desc.has_frontier = true;
+                if key == frontier_key.as_slice() {
+                    let epoch =
+                        value.and_then(|value| value.try_into().ok().map(u64::from_be_bytes));
+                    match epoch {
+                        Some(epoch) if desc.frontier_epoch.is_none() => {
+                            desc.frontier_epoch = Some(epoch);
+                        }
+                        Some(epoch) if desc.frontier_epoch == Some(epoch) => {}
+                        Some(_) | None => desc.malformed_identity = true,
+                    }
+                }
             }
             if key
                 .windows(b"backfill_cursor/".len())
@@ -886,6 +926,37 @@ impl CoupledBatchDescriptor {
         if require_metadata && !self.has_coupling_metadata {
             return Err(StorageError::Unsupported(
                 "coupled batch validation failed: missing coupling metadata mutation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the source and frontier identities carried by a production M3 batch.
+    pub fn validate_for(&self, connector_id: ConnectorId) -> Result<(), StorageError> {
+        self.validate(false)?;
+        if self.malformed_identity {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: malformed source or frontier identity".into(),
+            ));
+        }
+        let Some((source_connector_id, source_epoch)) = self.source_identity else {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: missing source identity".into(),
+            ));
+        };
+        if source_connector_id != connector_id {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: source connector identity mismatch".into(),
+            ));
+        }
+        let Some(frontier_epoch) = self.frontier_epoch else {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: missing frontier identity".into(),
+            ));
+        };
+        if source_epoch != frontier_epoch {
+            return Err(StorageError::Unsupported(
+                "coupled batch validation failed: source and frontier epochs differ".into(),
             ));
         }
         Ok(())
@@ -1439,16 +1510,40 @@ mod tests {
         let mut batch = WriteBatch::new();
         batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
         batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
-        let source_key = CatalogKeyEncoder::encode_with_suffix(
-            CatalogType::Connector,
-            0,
-            21,
-            b"source_checkpoint/committed/1",
+        let source_key = store.key(SourceCheckpointState::Committed, 1);
+        let checkpoint =
+            SourceCheckpoint::prepared(ConnectorId(21), 1, OffsetToken::new(b"token-1".to_vec()))
+                .committed();
+        batch.put(
+            &source_key,
+            &SourceCheckpointStore::encode(&checkpoint).unwrap(),
         );
-        batch.put(&source_key, b"cp");
         batch.put(&ShardKeyEncoder::frontier_key(), &1u64.to_be_bytes());
 
         assert!(store.commit_m3(batch).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn commit_m3_rejects_mismatched_source_and_frontier_epochs() {
+        let store = make_test_store(ConnectorId(24)).await;
+        let checkpoint =
+            SourceCheckpoint::prepared(ConnectorId(24), 3, OffsetToken::new(b"token-3".to_vec()))
+                .committed();
+        let mut batch = WriteBatch::new();
+        batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"state");
+        batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"output");
+        batch.put(
+            &store.key(SourceCheckpointState::Committed, 3),
+            &SourceCheckpointStore::encode(&checkpoint).unwrap(),
+        );
+        batch.put(&ShardKeyEncoder::frontier_key(), &4u64.to_be_bytes());
+
+        let error = store.commit_m3(batch).await.unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Unsupported(message)
+                if message == "coupled batch validation failed: source and frontier epochs differ"
+        ));
     }
 
     #[tokio::test]

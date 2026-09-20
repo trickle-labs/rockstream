@@ -351,6 +351,37 @@ impl AggState {
             .collect()
     }
 
+    fn decode_persisted_entry(
+        key: &[u8],
+        value: &[u8],
+        op_id: OperatorId,
+        op_prefix: &[u8],
+    ) -> Result<(i64, i64, i64), OpError> {
+        if key.len() != op_prefix.len() + 8 || !key.starts_with(op_prefix) {
+            return Err(OpError::storage_error(
+                "RS-3616: corrupted recovery record: invalid aggregate key",
+            ));
+        }
+        if value.len() != 16 {
+            return Err(OpError::storage_error(
+                "RS-3616: corrupted recovery record: aggregate value must be exactly 16 bytes",
+            ));
+        }
+        let k = decode_i64(&key[op_prefix.len()..])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate group key"))?;
+        let sum = decode_i64(&value[..8])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate sum"))?;
+        let count = decode_i64(&value[8..])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate count"))?;
+        if count <= 0 {
+            return Err(OpError::storage_error(format!(
+                "RS-3616: corrupted recovery record for operator {}: non-positive count",
+                op_id.0
+            )));
+        }
+        Ok((k, sum, count))
+    }
+
     /// Decode from the raw entries stored by a previous `encode_as_write_batch`.
     ///
     /// `raw_entries` is the result of scanning the `op_state` namespace for
@@ -360,41 +391,9 @@ impl AggState {
         op_id: OperatorId,
     ) -> Result<Self, OpError> {
         let op_prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
-        let invalid_key = || {
-            OpError::internal(format!(
-                "corrupt persisted aggregate state for operator {}: invalid key",
-                op_id.0
-            ))
-        };
-        let invalid_value = || {
-            OpError::internal(format!(
-                "corrupt persisted aggregate state for operator {}: invalid value",
-                op_id.0
-            ))
-        };
         let mut state = AggState::new();
         for (key, value) in raw_entries {
-            // Strip the operator prefix to get the group key bytes.
-            if key.len() != op_prefix.len() + 8 || !key.starts_with(&op_prefix) {
-                return Err(invalid_key());
-            }
-            let k_bytes: [u8; 8] = key[op_prefix.len()..op_prefix.len() + 8]
-                .try_into()
-                .map_err(|_| invalid_key())?;
-            if value.len() != 16 {
-                return Err(invalid_value());
-            }
-            let sum_bytes: [u8; 8] = value[..8].try_into().map_err(|_| invalid_value())?;
-            let count_bytes: [u8; 8] = value[8..16].try_into().map_err(|_| invalid_value())?;
-            let k = decode_i64(&k_bytes).map_err(|_| invalid_key())?;
-            let sum = decode_i64(&sum_bytes).map_err(|_| invalid_value())?;
-            let count = decode_i64(&count_bytes).map_err(|_| invalid_value())?;
-            if count <= 0 {
-                return Err(OpError::internal(format!(
-                    "corrupt persisted aggregate state for operator {}: non-positive count",
-                    op_id.0
-                )));
-            }
+            let (k, sum, count) = Self::decode_persisted_entry(key, value, op_id, &op_prefix)?;
             state.entries.insert(k, (sum, count));
         }
         Ok(state)
@@ -731,33 +730,11 @@ impl AggregateOp {
                 .map_err(OpError::storage)?;
 
             for (key, value) in &page.rows {
-                if key.len() < prefix.len() + 8 || !key.starts_with(&prefix) {
-                    return Err(OpError::storage_error(format!(
-                        "RS-3616: corrupted recovery record: key prefix mismatch or undersized key length {}",
-                        key.len()
-                    )));
-                }
-                let k_bytes: [u8; 8] =
-                    key[prefix.len()..prefix.len() + 8]
-                        .try_into()
-                        .map_err(|_| {
-                            OpError::storage_error("RS-3616: corrupted group key".to_string())
-                        })?;
-                if value.len() < 16 {
-                    return Err(OpError::storage_error(format!(
-                        "RS-3616: corrupted recovery record: value length {} < 16",
-                        value.len()
-                    )));
-                }
-                let sum = i64::from_be_bytes(value[..8].try_into().unwrap());
-                let count = i64::from_be_bytes(value[8..16].try_into().unwrap());
-                if count != 0 {
-                    let k = i64::from_be_bytes(k_bytes);
-                    state.entries.insert(k, (sum, count));
-                    clean_lru.push_back(k);
-                    if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
-                        clean_lru.pop_front();
-                    }
+                let (k, sum, count) = AggState::decode_persisted_entry(key, value, op_id, &prefix)?;
+                state.entries.insert(k, (sum, count));
+                clean_lru.push_back(k);
+                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                    clean_lru.pop_front();
                 }
             }
 
@@ -793,33 +770,12 @@ impl AggregateOp {
                 .map_err(OpError::storage)?;
 
             for (key, value) in &page.rows {
-                if key.len() < prefix.len() + 8 || !key.starts_with(&prefix) {
-                    return Err(OpError::storage_error(format!(
-                        "RS-3616: corrupted recovery record: key prefix mismatch or undersized key length {}",
-                        key.len()
-                    )));
-                }
-                let k_bytes: [u8; 8] =
-                    key[prefix.len()..prefix.len() + 8]
-                        .try_into()
-                        .map_err(|_| {
-                            OpError::storage_error("RS-3616: corrupted group key".to_string())
-                        })?;
-                if value.len() < 16 {
-                    return Err(OpError::storage_error(format!(
-                        "RS-3616: corrupted recovery record: value length {} < 16",
-                        value.len()
-                    )));
-                }
-                let sum = i64::from_be_bytes(value[..8].try_into().unwrap());
-                let count = i64::from_be_bytes(value[8..16].try_into().unwrap());
-                if count != 0 {
-                    let k = i64::from_be_bytes(k_bytes);
-                    state.entries.insert(k, (sum, count));
-                    clean_lru.push_back(k);
-                    if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
-                        clean_lru.pop_front();
-                    }
+                let (k, sum, count) =
+                    AggState::decode_persisted_entry(key, value, self.op_id, &prefix)?;
+                state.entries.insert(k, (sum, count));
+                clean_lru.push_back(k);
+                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                    clean_lru.pop_front();
                 }
             }
 
@@ -2031,7 +1987,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "[RS-0001] Internal error: corrupt persisted aggregate state for operator 9: invalid value; next_steps: report this issue"
+            "[RS-0001] Storage error: key encoding error: RS-3616: corrupted recovery record: aggregate value must be exactly 16 bytes; next_steps: check disk space and object store connectivity"
         );
     }
 
