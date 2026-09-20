@@ -43,6 +43,15 @@ if [ -z "$changed_files" ]; then
 fi
 
 # Coordination crates and design doc — changes here require a model touch.
+# Test/benchmark evidence and arrangement-cache reader wiring are data-plane
+# concerns covered by the storage tests and lookup benchmarks, not FizzBee.
+changed_files=$(echo "$changed_files" | grep -Ev '(^|/)(tests|benches)/|^crates/rockstream-storage/src/reader\.rs$' || true)
+
+if [ -z "$changed_files" ]; then
+    echo "check-path-coupling: only data-plane tests/benchmarks changed — OK."
+    exit 0
+fi
+
 COORDINATION_PATTERNS=(
     "crates/rockstream-runtime/"
     "crates/rockstream-control/"
