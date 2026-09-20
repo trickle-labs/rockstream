@@ -37,7 +37,7 @@ use rockstream_types::data_plane::{
     SourceDeltaRequest, WorkerExecutionStatus, WorkloadSnapshot,
 };
 use rockstream_types::error_code::{
-    RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
+    RS_0001, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
 };
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
@@ -2094,7 +2094,7 @@ fn route_source_delta(
         .map(|descriptor| descriptor.shard.shard_id)
         .collect();
     if shard_ids.is_empty() {
-        return Err("workload has no active shard leases".to_string());
+        return Err(format!("{}: workload has no active shard leases", RS_0001));
     }
 
     let mut rows_by_shard = BTreeMap::<ShardId, Vec<RuntimeRow>>::new();
@@ -2162,11 +2162,11 @@ async fn submit_source_delta(
         let state = data_plane.lock().await;
         match state.deployments.get(&request.workload_id) {
             Some(deployment) if request.version != deployment.request.version => Err(format!(
-                "source delta version {} does not match deployment version {}",
-                request.version, deployment.request.version
+                "{}: source delta version {} does not match deployment version {}",
+                RS_0001, request.version, deployment.request.version
             )),
             Some(deployment) => route_source_delta(deployment, &request),
-            None => Err("workload is not deployed".to_string()),
+            None => Err(format!("{}: workload is not deployed", RS_0001)),
         }
     };
     let routed = match routed {
