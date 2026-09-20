@@ -316,7 +316,7 @@ async fn test_arrangement_cache_reused_across_fresh_worker_contexts() {
 
     {
         let writer_context = Arc::new(
-            WorkerStorageContext::new_with_worker_id("arrangement-writer", 8 * 1024 * 1024)
+            WorkerStorageContext::new_with_worker_id("arrangement-writer", 1)
                 .with_nvme_cache(&nvme_cache_dir, 32 * 1024 * 1024)
                 .with_filter_bits_per_key(14),
         );
@@ -338,8 +338,16 @@ async fn test_arrangement_cache_reused_across_fresh_worker_contexts() {
         shard.flush().await.expect("flush arrangement rows");
     }
 
+    assert!(
+        std::fs::read_dir(&nvme_cache_dir)
+            .expect("read populated NVMe cache")
+            .next()
+            .is_some(),
+        "writer must populate the shared local cache"
+    );
+
     let reader_context = Arc::new(
-        WorkerStorageContext::new_with_worker_id("arrangement-reader", 8 * 1024 * 1024)
+        WorkerStorageContext::new_with_worker_id("arrangement-reader", 1)
             .with_nvme_cache(&nvme_cache_dir, 32 * 1024 * 1024)
             .with_filter_bits_per_key(14),
     );

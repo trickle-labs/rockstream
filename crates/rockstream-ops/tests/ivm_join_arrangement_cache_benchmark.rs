@@ -252,6 +252,100 @@ async fn test_ivm_join_arrangement_scale_hit_rate_and_p99_latency() {
 }
 
 #[tokio::test]
+async fn test_ivm_join_differentiation_p99_across_arrangement_scales() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    for scale in [100usize, 500, 1000] {
+        let nvme_dir = temp_dir.path().join(format!("diff-scale-{scale}"));
+        let storage_ctx = Arc::new(
+            WorkerStorageContext::new_with_worker_id("ivm-diff-worker", 64 * 1024 * 1024)
+                .with_nvme_cache(&nvme_dir, 128 * 1024 * 1024)
+                .with_filter_bits_per_key(14),
+        );
+        let shard = Arc::new(
+            ShardDb::builder(format!("join-diff-scale-{scale}"), store.clone())
+                .with_storage_context(storage_ctx)
+                .with_bloom_filter(14, 0)
+                .with_nvme_cache(&nvme_dir, 128 * 1024 * 1024)
+                .build()
+                .await
+                .expect("build scale shard"),
+        );
+        let op_id = OperatorId(900 + scale as u64);
+
+        for i in 0..scale as i64 {
+            let join_key = KeyCapsule::from_values(&[KeyValue::Int64(i)])
+                .expect("encode join key")
+                .typed_bytes()
+                .to_vec();
+            let row_bytes = [i.to_be_bytes(), (i * 100).to_be_bytes()].concat();
+            let key = ShardKeyEncoder::join_arr_key(JoinSide::Right, op_id.0, &join_key, i as u128);
+            shard
+                .put(&key, &row_bytes)
+                .await
+                .expect("put arrangement row");
+        }
+        shard.flush().await.expect("flush arrangement rows");
+
+        let midpoint = (scale / 2) as i64;
+        let left = make_test_zset(
+            &[0, midpoint, scale as i64 + 1, scale as i64 + 2],
+            &[10, 20, 30, 40],
+            &[1, 1, 1, 1],
+        );
+        let right = make_test_zset(&[], &[], &[]);
+        let expected_values = vec![
+            vec![0, midpoint],
+            vec![10, 20],
+            vec![0, midpoint],
+            vec![0, midpoint * 100],
+        ];
+        let mut latencies_micros = Vec::with_capacity(20);
+
+        for _ in 0..20 {
+            let pipeline = JoinPipeline::new(
+                vec![],
+                vec![],
+                JoinKind::Inner(Arc::new(
+                    JoinOp::new(op_id, vec![0], vec![0]).with_db(shard.clone()),
+                )),
+                vec![],
+            );
+            let start = Instant::now();
+            let output = pipeline
+                .process_async(left.clone(), right.clone())
+                .await
+                .expect("process differentiation");
+            latencies_micros.push(start.elapsed().as_micros());
+
+            assert_eq!(output.weights, vec![1, 1]);
+            let values: Vec<Vec<i64>> = (0..4)
+                .map(|column| {
+                    output
+                        .data
+                        .column(column)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("Int64 join output")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(values, expected_values);
+        }
+
+        latencies_micros.sort_unstable();
+        let p99_micros = latencies_micros[(latencies_micros.len() * 99) / 100];
+        eprintln!("Issue #94 differentiation scale={scale} hit_rate=0.5 p99_us={p99_micros}");
+        assert!(
+            p99_micros < 50_000,
+            "p99 differentiation latency exceeded 50ms"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_ivm_join_differentiation_with_arrangement_lookups() {
     let raw_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let get_counter = Arc::new(AtomicUsize::new(0));

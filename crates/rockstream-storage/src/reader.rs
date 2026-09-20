@@ -93,6 +93,7 @@ impl ShardReader {
                 options.object_store_cache_options.max_cache_size_bytes = Some(max);
             }
             options.object_store_cache_options.part_size_bytes = 4 * 1024 * 1024;
+            options.object_store_cache_options.cache_puts = true;
             options.object_store_cache_options.scan_interval =
                 Some(std::time::Duration::from_secs(3600));
             options.object_store_cache_options.max_open_file_handles = 1000;
