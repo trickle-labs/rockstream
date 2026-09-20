@@ -14960,6 +14960,9 @@ fn join_routing_columns(plan: &rockstream_plan::PlanNode) -> Option<BTreeMap<Str
             right_keys,
             ..
         } => {
+            if left_keys.len() != 1 || right_keys.len() != 1 {
+                return None;
+            }
             let left = source_routing_column(left, *left_keys.first()?)?;
             let right = source_routing_column(right, *right_keys.first()?)?;
             Some(BTreeMap::from([left, right]))
@@ -14981,6 +14984,9 @@ fn aggregate_routing(
         PlanNode::Aggregate {
             input, group_by, ..
         } => {
+            if group_by.len() != 1 {
+                return None;
+            }
             let Expr::Column(column) = group_by.first()? else {
                 return None;
             };
@@ -14998,26 +15004,11 @@ fn aggregate_routing(
     }
 }
 
-fn aggregate_merge_keys(plan: &rockstream_plan::PlanNode) -> Option<Vec<usize>> {
-    use rockstream_plan::PlanNode;
-    match plan {
-        PlanNode::Aggregate { group_by, .. } => Some((0..group_by.len()).collect()),
-        PlanNode::Filter { input, .. }
-        | PlanNode::Project { input, .. }
-        | PlanNode::Map { input, .. } => aggregate_merge_keys(input),
-        PlanNode::ViewSink { child, .. } => aggregate_merge_keys(child),
-        _ => None,
-    }
-}
-
 fn deployment_routing(
     plan: &rockstream_plan::PlanNode,
 ) -> Option<(BTreeMap<String, usize>, Vec<usize>)> {
-    if let Some(routing) = join_routing_columns(plan) {
-        Some((routing, aggregate_merge_keys(plan)?))
-    } else {
-        aggregate_routing(plan)
-    }
+    aggregate_routing(plan)
+        .or_else(|| join_routing_columns(plan).map(|routing| (routing, Vec::new())))
 }
 
 fn runtime_rows_for_table(table: &str, ops: &[DmlOp]) -> Vec<RuntimeRow> {

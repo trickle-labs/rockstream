@@ -20,7 +20,7 @@
 //! Worker → Control:  {"type":"deregister","worker_id":1}\n
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,7 +33,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::data_plane::{
-    DeploymentDescriptor, DeploymentRequest, ShardOutput, WorkerExecutionStatus, WorkloadSnapshot,
+    DeploymentDescriptor, DeploymentRequest, RuntimeExchangeMessage, RuntimeRow, ShardOutput,
+    SourceDeltaRequest, WorkerExecutionStatus, WorkloadSnapshot,
 };
 use rockstream_types::error_code::{
     RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
@@ -41,6 +42,7 @@ use rockstream_types::error_code::{
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardRevokeReason;
+use rockstream_types::rendezvous::{fnv1a_64, rendezvous_hash};
 use rockstream_types::topology::{
     ControlMessage, DrainRequest, RaftRoleWire, WorkerLifecycleState, WorkerMessage,
 };
@@ -59,6 +61,7 @@ use crate::topology::{TopologyCatalog, TopologyPersistentStore};
 const DEFAULT_DRAIN_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_DECOMMISSION_GRACE_MS: u64 = 5_000;
 const MAX_DRAIN_QUEUE: usize = 1024;
+const DEFAULT_VIRTUAL_BUCKET_COUNT: u64 = 4096;
 pub(crate) const MAX_MANAGEMENT_ACK_WAITERS: usize = 64;
 
 pub(crate) type ManagementAckWaiters =
@@ -2060,32 +2063,191 @@ async fn deploy_workload(
     }
 }
 
+fn route_source_delta(
+    deployment: &DeploymentState,
+    request: &SourceDeltaRequest,
+) -> Result<Vec<(WorkerId, RuntimeExchangeMessage)>, String> {
+    let routing_column = deployment
+        .request
+        .routing_columns
+        .get(&request.source)
+        .copied()
+        .or_else(|| {
+            deployment
+                .request
+                .routing_columns
+                .iter()
+                .find(|(source, _)| source.eq_ignore_ascii_case(&request.source))
+                .map(|(_, column)| *column)
+        })
+        .ok_or_else(|| {
+            format!(
+                "no routing column is registered for source {}; refusing arbitrary placement",
+                request.source
+            )
+        })?;
+
+    let mut descriptors: Vec<_> = deployment.descriptors.values().collect();
+    descriptors.sort_by_key(|descriptor| descriptor.shard.shard_id);
+    let shard_ids: Vec<_> = descriptors
+        .iter()
+        .map(|descriptor| descriptor.shard.shard_id)
+        .collect();
+    if shard_ids.is_empty() {
+        return Err("workload has no active shard leases".to_string());
+    }
+
+    let mut rows_by_shard = BTreeMap::<ShardId, Vec<RuntimeRow>>::new();
+    for row in &request.rows {
+        let key = row
+            .values_tsv
+            .split('\t')
+            .nth(routing_column)
+            .ok_or_else(|| {
+                format!(
+                    "source {} row is missing routing column {}",
+                    request.source, routing_column
+                )
+            })?;
+        let bucket = fnv1a_64(key.as_bytes()) % DEFAULT_VIRTUAL_BUCKET_COUNT;
+        let shard_id = rendezvous_hash(bucket, &shard_ids, 1)
+            .ok_or_else(|| "workload has no active shard leases".to_string())?;
+        rows_by_shard.entry(shard_id).or_default().push(row.clone());
+    }
+
+    Ok(rows_by_shard
+        .into_iter()
+        .map(|(shard_id, rows)| {
+            let descriptor = deployment
+                .descriptors
+                .get(&shard_id)
+                .expect("routed shard must have a deployment descriptor");
+            (
+                descriptor.shard.worker_id,
+                RuntimeExchangeMessage {
+                    version: request.version,
+                    request_id: request.request_id.clone(),
+                    workload_id: request.workload_id,
+                    shard_id,
+                    epoch: request.epoch,
+                    operator_id: descriptor.sink_operator_id,
+                    lease_token: descriptor.shard.lease_token,
+                    source: request.source.clone(),
+                    rows,
+                },
+            )
+        })
+        .collect())
+}
+
 async fn submit_source_delta(
-    request: rockstream_types::data_plane::SourceDeltaRequest,
+    request: SourceDeltaRequest,
     sender: &mpsc::Sender<ControlMessage>,
-    _worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
-    _data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
 ) {
-    if !request.rows.is_empty() {
+    if request.rows.is_empty() {
         send_message(
             sender,
-            &ControlMessage::OperationFailed {
-                code: rockstream_types::error_code::RS_3001.to_string(),
-                message: "control plane does not route data plane row payloads; stream directly to worker shard owner".into(),
-                next_steps: "Resolve shard placement from control metadata and send record batches directly via data plane gRPC".into(),
+            &ControlMessage::SourceDeltaCommitted {
+                request_id: request.request_id,
+                epoch: request.epoch,
             },
-        ).await;
+        )
+        .await;
         return;
     }
 
-    send_message(
-        sender,
-        &ControlMessage::SourceDeltaCommitted {
-            request_id: request.request_id,
-            epoch: request.epoch,
-        },
-    )
-    .await;
+    let routed = {
+        let state = data_plane.lock().await;
+        match state.deployments.get(&request.workload_id) {
+            Some(deployment) if request.version != deployment.request.version => Err(format!(
+                "source delta version {} does not match deployment version {}",
+                request.version, deployment.request.version
+            )),
+            Some(deployment) => route_source_delta(deployment, &request),
+            None => Err("workload is not deployed".to_string()),
+        }
+    };
+    let routed = match routed {
+        Ok(routed) => routed,
+        Err(error) => {
+            send_message(sender, &data_plane_failure(error)).await;
+            return;
+        }
+    };
+
+    let senders = worker_senders.lock().await.clone();
+    if routed
+        .iter()
+        .any(|(worker_id, _)| !senders.contains_key(worker_id))
+    {
+        send_message(
+            sender,
+            &data_plane_failure("a routed shard owner has no active worker connection"),
+        )
+        .await;
+        return;
+    }
+
+    let duplicate_request = {
+        let mut state = data_plane.lock().await;
+        if state.source_waiters.contains_key(&request.request_id) {
+            true
+        } else {
+            state.source_waiters.insert(
+                request.request_id.clone(),
+                SourceWaiter {
+                    sender: sender.clone(),
+                    expected: routed.len(),
+                    received: 0,
+                    epoch: request.epoch,
+                },
+            );
+            false
+        }
+    };
+    if duplicate_request {
+        send_message(
+            sender,
+            &data_plane_failure("source delta request id is already in flight"),
+        )
+        .await;
+        return;
+    }
+
+    for (worker_id, frame) in routed {
+        let Some(target) = senders.get(&worker_id) else {
+            data_plane
+                .lock()
+                .await
+                .source_waiters
+                .remove(&request.request_id);
+            send_message(
+                sender,
+                &data_plane_failure("routed shard owner disconnected before ingest"),
+            )
+            .await;
+            return;
+        };
+        if target
+            .send(ControlMessage::Execute { frame })
+            .await
+            .is_err()
+        {
+            data_plane
+                .lock()
+                .await
+                .source_waiters
+                .remove(&request.request_id);
+            send_message(
+                sender,
+                &data_plane_failure("routed shard owner disconnected before ingest"),
+            )
+            .await;
+            return;
+        }
+    }
 }
 
 fn drain_failure_message(err: DrainFailure) -> ControlMessage {
