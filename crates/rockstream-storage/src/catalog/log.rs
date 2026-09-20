@@ -8,6 +8,7 @@
 
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use rockstream_verified::persistence;
 use std::sync::Arc;
 
 use super::txn::CatalogTxn;
@@ -66,10 +67,19 @@ impl CatalogLogManager {
         cursor: usize,
         page_size: usize,
     ) -> CatalogScanPage {
-        let page_size = page_size.min(MAX_SCAN_PAGE_SIZE);
-        let end = (cursor + page_size).min(all_txns.len());
+        let page_size = page_size.clamp(1, MAX_SCAN_PAGE_SIZE);
+        let cursor = cursor.min(all_txns.len());
+        let end = cursor.saturating_add(page_size).min(all_txns.len());
         let slice = all_txns[cursor..end].to_vec();
-        let has_more = end < all_txns.len();
+        let status = persistence::recovery_scan_status(
+            cursor as u64,
+            all_txns.len() as u64,
+            page_size as u64,
+            MAX_SCAN_PAGE_SIZE as u64,
+            false,
+            false,
+        );
+        let has_more = status == persistence::SCAN_MORE;
         let next_cursor = if has_more { Some(end) } else { None };
 
         CatalogScanPage {

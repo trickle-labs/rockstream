@@ -35,7 +35,9 @@ use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardChec
 use rockstream_types::data_plane::{
     DeploymentDescriptor, DeploymentRequest, ShardOutput, WorkerExecutionStatus, WorkloadSnapshot,
 };
-use rockstream_types::error_code::{RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612};
+use rockstream_types::error_code::{
+    RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
+};
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardRevokeReason;
@@ -3382,10 +3384,45 @@ async fn handle_connection_stream<R, W>(
             }
             WorkerMessage::ReportShardFrontier { shard_id, epoch } => {
                 if let Some(agg) = &frontier {
+                    let authorized = connected_worker_id.is_some_and(|worker_id| {
+                        shard_manager.get(shard_id).is_some_and(|lease| {
+                            lease.worker_id == worker_id
+                                && shard_manager.is_valid_writer(shard_id, lease.lease_token)
+                        })
+                    });
+                    if !authorized {
+                        tracing::warn!(
+                            %shard_id,
+                            epoch,
+                            "control: frontier report lacks the current shard lease"
+                        );
+                        send_message(
+                            &sender,
+                            &ControlMessage::OperationFailed {
+                                code: RS_8004.to_string(),
+                                message: "frontier report lacks the current shard lease".to_owned(),
+                                next_steps: rockstream_types::error_code::next_steps(RS_8004)
+                                    .to_string(),
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
                     if let Err(e) = agg
                         .ingest(rockstream_types::frontier::ShardFrontierReport { shard_id, epoch })
                     {
                         tracing::warn!(%shard_id, epoch, error = %e, "control: frontier ingest failed");
+                        send_message(
+                            &sender,
+                            &ControlMessage::OperationFailed {
+                                code: RS_8004.to_string(),
+                                message: e.to_string(),
+                                next_steps: rockstream_types::error_code::next_steps(RS_8004)
+                                    .to_string(),
+                            },
+                        )
+                        .await;
+                        continue;
                     }
                 }
                 // v0.45.2 M7-S4: only the current leader "publishes" — a
@@ -3407,6 +3444,79 @@ async fn handle_connection_stream<R, W>(
                                 shard_id.to_string(),
                             )
                             .with_detail(format!("epoch={epoch}"));
+                            let _ = aud.append(&event);
+                        }
+                        let reply = ControlMessage::ClusterFrontierAdvanced {
+                            epoch: published.unwrap_or(0),
+                        };
+                        send_message(&sender, &reply).await;
+                    }
+                } else if let Some(rft) = &raft {
+                    let reply = ControlMessage::NotLeader {
+                        current_leader: rft.current_leader(),
+                    };
+                    send_message(&sender, &reply).await;
+                }
+            }
+            WorkerMessage::ReportShardFrontierV2 { report } => {
+                let shard_id = report.shard_id;
+                let epoch = report.epoch;
+                let authorized = connected_worker_id.is_some_and(|worker_id| {
+                    shard_manager.get(shard_id).is_some_and(|lease| {
+                        lease.worker_id == worker_id
+                            && lease.lease_token == report.lease_token
+                            && shard_manager.is_valid_writer(shard_id, report.lease_token)
+                    })
+                });
+                if !authorized {
+                    tracing::warn!(
+                        %shard_id,
+                        epoch,
+                        "control: membership frontier report lacks the current shard lease"
+                    );
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: RS_8004.to_string(),
+                            message: "membership frontier report lacks the current shard lease"
+                                .to_owned(),
+                            next_steps: rockstream_types::error_code::next_steps(RS_8004)
+                                .to_string(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                if let Some(agg) = &frontier {
+                    if let Err(e) = agg.ingest_membership_report(report) {
+                        tracing::warn!(%shard_id, epoch, error = %e, "control: membership frontier ingest failed");
+                        send_message(
+                            &sender,
+                            &ControlMessage::OperationFailed {
+                                code: RS_8004.to_string(),
+                                message: e.to_string(),
+                                next_steps: rockstream_types::error_code::next_steps(RS_8004)
+                                    .to_string(),
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                let is_leader = match &raft {
+                    Some(rft) => rft.require_leader().is_ok(),
+                    None => true,
+                };
+                if is_leader {
+                    if let Some(agg) = &frontier {
+                        let published = agg.cluster_frontier().epoch;
+                        if let Some(aud) = &audit {
+                            let event = AuditEvent::now(
+                                "control",
+                                "frontier.published",
+                                shard_id.to_string(),
+                            )
+                            .with_detail(format!("epoch={epoch},membership_aware=true"));
                             let _ = aud.append(&event);
                         }
                         let reply = ControlMessage::ClusterFrontierAdvanced {
@@ -4237,11 +4347,33 @@ mod tests {
         use rockstream_types::ids::ShardId;
 
         let catalog = TopologyCatalog::new();
+        let manager = ShardManager::new();
         let frontier = Arc::new(FrontierAggregator::new());
-        let svc = ControlService::new(catalog).with_frontier(frontier.clone());
+        let svc = ControlService::new(catalog)
+            .with_shard_manager(manager)
+            .with_frontier(frontier.clone());
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let registration = WorkerRegistration::new(
+            WorkerId(1),
+            NodeRole::Worker,
+            "127.0.0.1:9001",
+            CapacityHeadroom::FULL,
+        );
+        let _ = send_and_recv(&mut stream, &WorkerMessage::Register(registration)).await;
+        let lease_reply = send_and_recv(
+            &mut stream,
+            &WorkerMessage::RequestShard {
+                worker_id: WorkerId(1),
+                shard_id: ShardId(1),
+            },
+        )
+        .await;
+        assert!(matches!(
+            serde_json::from_str::<ControlMessage>(lease_reply.trim()).unwrap(),
+            ControlMessage::ShardAssigned { .. }
+        ));
         let req = WorkerMessage::ReportShardFrontier {
             shard_id: ShardId(1),
             epoch: 42,
@@ -4253,6 +4385,151 @@ mod tests {
             _ => panic!("expected ClusterFrontierAdvanced, got: {reply:?}"),
         }
         assert_eq!(frontier.cluster_frontier().epoch, Some(42));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn legacy_frontier_report_requires_current_shard_lease() {
+        use rockstream_types::ids::ShardId;
+
+        let manager = ShardManager::new();
+        let frontier = Arc::new(FrontierAggregator::new());
+        let svc = ControlService::new(TopologyCatalog::new())
+            .with_shard_manager(manager)
+            .with_frontier(frontier.clone());
+        let handle = svc.start("127.0.0.1:0").await.unwrap();
+
+        let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let registration = WorkerRegistration::new(
+            WorkerId(1),
+            NodeRole::Worker,
+            "127.0.0.1:9001",
+            CapacityHeadroom::FULL,
+        );
+        let _ = send_and_recv(&mut stream, &WorkerMessage::Register(registration)).await;
+        let reply: ControlMessage = serde_json::from_str(
+            send_and_recv(
+                &mut stream,
+                &WorkerMessage::ReportShardFrontier {
+                    shard_id: ShardId(1),
+                    epoch: 42,
+                },
+            )
+            .await
+            .trim(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            reply,
+            ControlMessage::OperationFailed { ref code, .. } if code == "RS-8004"
+        ));
+        assert_eq!(frontier.cluster_frontier().epoch, None);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn membership_frontier_requires_current_shard_lease() {
+        use rockstream_types::frontier::{
+            FrontierGeneration, FrontierMembership, MembershipFrontierReport, ShardIncarnation,
+        };
+
+        let manager = ShardManager::new();
+        let membership = FrontierMembership::new("view-1", FrontierGeneration(0))
+            .with_active(ShardId(42), ShardIncarnation(1));
+        let frontier = Arc::new(FrontierAggregator::with_membership(membership));
+        let svc = ControlService::new(TopologyCatalog::new())
+            .with_shard_manager(manager.clone())
+            .with_frontier(frontier.clone());
+        let handle = svc.start("127.0.0.1:0").await.unwrap();
+
+        let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let registration = WorkerRegistration::new(
+            WorkerId(1),
+            NodeRole::Worker,
+            "127.0.0.1:9001",
+            CapacityHeadroom::FULL,
+        );
+        let _ = send_and_recv(&mut stream, &WorkerMessage::Register(registration)).await;
+        let lease_reply = send_and_recv(
+            &mut stream,
+            &WorkerMessage::RequestShard {
+                worker_id: WorkerId(1),
+                shard_id: ShardId(42),
+            },
+        )
+        .await;
+        let lease = match serde_json::from_str::<ControlMessage>(lease_reply.trim()).unwrap() {
+            ControlMessage::ShardAssigned { lease, .. } => lease,
+            reply => panic!("expected ShardAssigned, got: {reply:?}"),
+        };
+
+        let invalid = WorkerMessage::ReportShardFrontierV2 {
+            report: MembershipFrontierReport::new(
+                "view-1",
+                FrontierGeneration(0),
+                ShardId(42),
+                ShardIncarnation(1),
+                LeaseToken(lease.lease_token.0 + 1),
+                42,
+            ),
+        };
+        let reply: ControlMessage =
+            serde_json::from_str(send_and_recv(&mut stream, &invalid).await.trim()).unwrap();
+        assert!(matches!(
+            reply,
+            ControlMessage::OperationFailed { ref code, .. } if code == "RS-8004"
+        ));
+        assert_eq!(frontier.cluster_frontier().epoch, None);
+
+        let invalid_membership = WorkerMessage::ReportShardFrontierV2 {
+            report: MembershipFrontierReport::new(
+                "other-view",
+                FrontierGeneration(0),
+                ShardId(42),
+                ShardIncarnation(1),
+                lease.lease_token,
+                42,
+            ),
+        };
+        let reply: ControlMessage =
+            serde_json::from_str(send_and_recv(&mut stream, &invalid_membership).await.trim())
+                .unwrap();
+        match reply {
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => {
+                assert_eq!(code, RS_8004.to_string());
+                assert_eq!(message, "RS-8004 frontier report rejected: scope mismatch");
+                assert_eq!(
+                    next_steps,
+                    rockstream_types::error_code::next_steps(RS_8004).to_string()
+                );
+            }
+            reply => panic!("expected OperationFailed, got: {reply:?}"),
+        }
+        assert_eq!(frontier.cluster_frontier().epoch, None);
+
+        let valid = WorkerMessage::ReportShardFrontierV2 {
+            report: MembershipFrontierReport::new(
+                "view-1",
+                FrontierGeneration(0),
+                ShardId(42),
+                ShardIncarnation(1),
+                lease.lease_token,
+                42,
+            ),
+        };
+        let reply: ControlMessage =
+            serde_json::from_str(send_and_recv(&mut stream, &valid).await.trim()).unwrap();
+        assert!(matches!(
+            reply,
+            ControlMessage::ClusterFrontierAdvanced { epoch: 42 }
+        ));
+        assert_eq!(frontier.cluster_frontier().epoch, Some(42));
+        assert!(manager.is_valid_writer(ShardId(42), lease.lease_token));
         handle.shutdown();
     }
 
@@ -4269,13 +4546,23 @@ mod tests {
         assert!(!node.handle.is_leader());
 
         let catalog = TopologyCatalog::new();
+        let manager = ShardManager::new();
+        manager.acquire(ShardId(1), WorkerId(1)).unwrap();
         let frontier = Arc::new(FrontierAggregator::new());
         let svc = ControlService::new(catalog)
+            .with_shard_manager(manager)
             .with_raft(node.handle.clone())
             .with_frontier(frontier.clone());
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let registration = WorkerRegistration::new(
+            WorkerId(1),
+            NodeRole::Worker,
+            "127.0.0.1:9001",
+            CapacityHeadroom::FULL,
+        );
+        let _ = send_and_recv(&mut stream, &WorkerMessage::Register(registration)).await;
         let req = WorkerMessage::ReportShardFrontier {
             shard_id: ShardId(1),
             epoch: 7,

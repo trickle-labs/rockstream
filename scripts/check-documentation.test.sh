@@ -18,7 +18,7 @@ setup_tree() {
   cp "$ROOT"/*.md "$ROOT/Makefile" "$ROOT/deny.toml" "$ROOT/Cargo.lock" "$ROOT/capabilities.toml" "$TMP_ROOT/"
   cp -R "$ROOT/docs" "$ROOT/.claude" "$ROOT/sign-offs" "$ROOT/examples" "$TMP_ROOT/"
   mkdir -p "$TMP_ROOT/scripts" "$TMP_ROOT/crates/rockstream-cli/tests" "$TMP_ROOT/crates/rockstream-gateway/tests" "$TMP_ROOT/crates/rockstream-sql/tests"
-  cp "$ROOT/scripts/check-documentation.sh" "$ROOT/scripts/check-documentation.py" "$ROOT/scripts/check-documentation.test.sh" "$TMP_ROOT/scripts/"
+  cp "$ROOT/scripts/check-documentation.sh" "$ROOT/scripts/check-documentation.py" "$ROOT/scripts/check-documentation.test.sh" "$ROOT/scripts/check-verus-qualification.test.sh" "$TMP_ROOT/scripts/"
   cp "$ROOT/crates/rockstream-cli/tests/documentation_transcript_tests.rs" "$TMP_ROOT/crates/rockstream-cli/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/gateway_dml_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/gateway_proof_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"

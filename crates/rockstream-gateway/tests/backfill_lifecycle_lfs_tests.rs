@@ -91,7 +91,7 @@ async fn unpublished_view_never_reads_partial_lfs() {
     checkpoint_store
         .append_backfill_lifecycle(&mut batch, &lifecycle)
         .unwrap();
-    checkpoint_store.commit_m3(batch).await.unwrap();
+    checkpoint_store.commit_raw_batch(batch).await.unwrap();
     db.flush().await.unwrap();
     drop(checkpoint_store);
     drop(db);

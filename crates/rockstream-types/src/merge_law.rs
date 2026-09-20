@@ -53,8 +53,9 @@ pub struct LawProperties {
     pub has_inverse: bool,
     /// An identity element exists.
     pub has_identity: bool,
-    /// The law can be split into independently-computed partial states and
-    /// recombined without changing the final answer.
+    /// The mathematical law can be split into independently-computed partial
+    /// states and recombined under its admitted domain. This is not, by
+    /// itself, executable admission for a concrete workload.
     pub composable: bool,
 }
 
@@ -84,8 +85,8 @@ pub enum CompactionPolicy {
 /// emitting output for this law.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FrontierPolicy {
-    /// Any frontier advancement may trigger output (suitable for abelian groups
-    /// and commutative monoids where partial results are still correct).
+    /// Any frontier advancement may trigger provisional output. This does not
+    /// authorize publishing a complete query-visible result early.
     AnyAdvancement,
     /// Output may only be emitted when the frontier is exact (no in-flight
     /// retractions). Required for non-idempotent laws such as `SumCount/v1`.
@@ -160,6 +161,38 @@ pub trait LawBundle: Send + Sync + 'static {
     /// Used by `TombstoneGc` compaction to reclaim space.
     fn is_identity(&self, value: &[u8]) -> bool;
 
+    /// Merge-law inverse in the executable representation, when supported.
+    fn inverse(&self, _value: &[u8]) -> Result<Vec<u8>, String> {
+        Err(format!(
+            "RS-1013: {} has no executable inverse",
+            self.name()
+        ))
+    }
+
+    /// Return whether these concrete operands are safe to regroup freely.
+    /// Implementations must reject operands outside their checked domain.
+    fn admits_reassociation(&self, operands: &[i64]) -> bool {
+        let _ = operands;
+        false
+    }
+
+    /// Whether this descriptor may authorize a regrouping optimization without
+    /// concrete operands. Built-ins keep this false until a caller supplies
+    /// and validates its operand budget.
+    fn reassociation_admitted(&self) -> bool {
+        false
+    }
+
+    /// Human-readable executable domain and its finite-bound policy.
+    fn domain(&self) -> &'static str {
+        "unspecified"
+    }
+
+    /// Stable proof/evidence reference for the descriptor.
+    fn evidence_ref(&self) -> &'static str {
+        "unreviewed"
+    }
+
     /// A reason if this law does NOT support merge-safe reads
     /// (i.e., read-modify-write cannot be avoided). Returns `None` if it does.
     fn not_merge_safe_reason(&self) -> Option<crate::explain::NotMergeSafeReason> {
@@ -193,6 +226,12 @@ pub struct LawDescriptor {
     pub frontier_policy: FrontierPolicy,
     pub idempotent: bool,
     pub composable: bool,
+    /// The executable domain attached to the law's algebraic claims.
+    pub domain: String,
+    /// Stable reference to the proof and regression evidence.
+    pub evidence_ref: String,
+    /// Whether an optimizer has an executable admission for regrouping.
+    pub reassociation_admitted: bool,
 }
 
 impl LawDescriptor {
@@ -209,11 +248,26 @@ impl LawDescriptor {
             frontier_policy: bundle.frontier_policy(),
             idempotent: bundle.properties().idempotent,
             composable: bundle.properties().composable,
+            domain: bundle.domain().to_owned(),
+            evidence_ref: bundle.evidence_ref().to_owned(),
+            reassociation_admitted: bundle.reassociation_admitted(),
         }
     }
 
     pub fn composable(&self) -> bool {
         self.composable
+    }
+
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn evidence_ref(&self) -> &str {
+        &self.evidence_ref
+    }
+
+    pub fn can_reassociate(&self) -> bool {
+        self.composable && self.reassociation_admitted
     }
 }
 

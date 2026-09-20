@@ -14,6 +14,7 @@ simulation = ["rockstream-sim/simulation"]
 [dependencies]
 rockstream-types = { path = "../rockstream-types" }
 rockstream-storage = { path = "../rockstream-storage" }
+rockstream-verified = { workspace = true }
 rockstream-sim = { path = "../rockstream-sim" }
 arrow = { workspace = true }
 async-trait = { workspace = true }

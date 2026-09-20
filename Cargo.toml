@@ -11,6 +11,7 @@ members = [
     "crates/rockstream-ops",
     "crates/rockstream-oracle",
     "crates/rockstream-plan",
+    "crates/rockstream-verified",
     "crates/rockstream-runtime",
     "crates/rockstream-sim",
     "crates/rockstream-sql",
@@ -30,6 +31,9 @@ edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/trickle-labs/rockstream"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(verus_only)"] }
 
 [workspace.dependencies]
 libfuzzer-sys = "0.4"
@@ -92,6 +96,7 @@ rust_decimal = "1"
 postgres-types = { version = "0.2", features = ["with-uuid-1", "with-serde_json-1", "array-impls"] }
 rdkafka = "0.36"
 ring = { version = "0.17", default-features = false, features = ["std"] }
+vstd = "=0.0.0-2026-09-06-0133"
 
 
 # Workspace crate references
@@ -105,6 +110,7 @@ rockstream-management-proto = { path = "crates/rockstream-management-proto" }
 rockstream-ops = { path = "crates/rockstream-ops" }
 rockstream-oracle = { path = "crates/rockstream-oracle" }
 rockstream-plan = { path = "crates/rockstream-plan" }
+rockstream-verified = { path = "crates/rockstream-verified" }
 rockstream-runtime = { path = "crates/rockstream-runtime" }
 rockstream-sim = { path = "crates/rockstream-sim" }
 rockstream-sql = { path = "crates/rockstream-sql" }

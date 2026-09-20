@@ -24,7 +24,7 @@ fn non_composable_laws_route_hot_keys_to_single_spill_shard() {
 }
 
 #[test]
-fn composable_laws_use_virtual_bucket_split_and_combine() {
+fn composable_laws_without_operand_admission_use_spill_fallback() {
     let plan = plan_hot_key_mitigation(
         &LawDescriptor::from_bundle(&SumCountV1),
         OperatorId(11),
@@ -34,12 +34,13 @@ fn composable_laws_use_virtual_bucket_split_and_combine() {
 
     assert!(matches!(
         plan,
-        HotKeyMitigationPlan::Split { bucket_count, source, .. } if bucket_count == 8 && source == OperatorId(11)
+        HotKeyMitigationPlan::Spill { shard_id, code, .. }
+            if shard_id == ShardId(99) && code == RS_5036
     ));
 }
 
 #[test]
-fn composable_laws_use_power_of_two_virtual_bucket_split() {
+fn regrouping_fallback_does_not_normalize_unadmitted_bucket_count() {
     let plan = plan_hot_key_mitigation(
         &LawDescriptor::from_bundle(&SumCountV1),
         OperatorId(11),
@@ -49,7 +50,7 @@ fn composable_laws_use_power_of_two_virtual_bucket_split() {
 
     assert!(matches!(
         plan,
-        HotKeyMitigationPlan::Split { bucket_count, .. }
-            if bucket_count.is_power_of_two() && bucket_count >= 6
+        HotKeyMitigationPlan::Spill { shard_id, code, .. }
+            if shard_id == ShardId(99) && code == RS_5036
     ));
 }

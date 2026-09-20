@@ -1,0 +1,14 @@
+schema = 1
+
+[application]
+unchecked_assumptions = []
+excluded_items = []
+verification_only_executable_branches = []
+unsafe_code_added = false
+
+[trusted_components]
+verus = "formal/verus/toolchain.lock.toml"
+solver = "The bundled Z3 identified by the pinned Verus archive."
+support_library = "The exact vstd and builtin package versions in toolchain.lock.toml."
+compiler = "Rust 1.88, as pinned by rust-toolchain.toml."
+platform = "The declared Rust target and standard-library behavior."

@@ -22,7 +22,7 @@
 //! [`RecoveryError::BudgetExceeded`] (RS-3610), never panicking or looping
 //! unboundedly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,7 @@ use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardChec
 use rockstream_types::error_code::*;
 use rockstream_types::ids::{LeaseToken, ShardId};
 use rockstream_types::lifecycle::{HealthReason, LifecycleTracker, RecoveryPhase};
+use rockstream_verified::persistence;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -241,6 +242,7 @@ struct RecoveryDriverInner {
     shard_recovery_budget: Duration,
     /// Number of shards successfully recovered so far (metric fill-level).
     recovered_count: usize,
+    recovered_shards: BTreeSet<ShardId>,
 }
 
 impl RecoveryDriver {
@@ -258,6 +260,7 @@ impl RecoveryDriver {
                 checkpoint: None,
                 shard_recovery_budget: budget,
                 recovered_count: 0,
+                recovered_shards: BTreeSet::new(),
             })),
         }
     }
@@ -272,6 +275,7 @@ impl RecoveryDriver {
                 checkpoint: None,
                 shard_recovery_budget: DEFAULT_SHARD_RECOVERY_BUDGET,
                 recovered_count: 0,
+                recovered_shards: BTreeSet::new(),
             })),
         }
     }
@@ -284,11 +288,21 @@ impl RecoveryDriver {
     /// Whether recovery is complete and the node is ready.
     pub fn is_ready(&self) -> bool {
         let guard = self.inner.lock();
-        if let Some(ref lc) = guard.lifecycle {
-            lc.is_ready()
-        } else {
-            guard.phase.is_ready()
-        }
+        let total = guard
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.shards.len())
+            .unwrap_or(0);
+        let ready = persistence::recovery_is_ready(
+            guard.phase.is_ready(),
+            guard.checkpoint.is_some(),
+            guard.phase.is_ready(),
+            guard.recovered_count == total,
+        );
+        guard
+            .lifecycle
+            .as_ref()
+            .map_or(ready, |lifecycle| lifecycle.is_ready() && ready)
     }
 
     /// Transition recovery to the next declared phase.
@@ -332,6 +346,7 @@ impl RecoveryDriver {
         );
         guard.checkpoint = Some(checkpoint);
         guard.recovered_count = 0;
+        guard.recovered_shards.clear();
     }
 
     /// Returns the currently loaded checkpoint id, if any.
@@ -395,6 +410,12 @@ impl RecoveryDriver {
             RecoveryError::StorageError(format!("shard {shard_id} not in checkpoint"))
         })?;
 
+        if psc.checkpoint_id != checkpoint.checkpoint_id {
+            return Err(RecoveryError::StateValidationFailed(
+                "shard checkpoint belongs to a different cluster checkpoint".to_string(),
+            ));
+        }
+
         let started = Instant::now();
 
         // M4-S1/S3 paired assertion: lease re-election via fence-epoch CAS.
@@ -427,7 +448,9 @@ impl RecoveryDriver {
         // Record progress.
         {
             let mut guard = self.inner.lock();
-            guard.recovered_count += 1;
+            if guard.recovered_shards.insert(shard_id) {
+                guard.recovered_count += 1;
+            }
             let progress = guard.recovered_count as f64
                 / guard
                     .checkpoint
@@ -517,6 +540,18 @@ impl RecoveryDriver {
                 break;
             }
             next_token = page.next_token;
+        }
+
+        {
+            let mut guard = self.inner.lock();
+            if guard
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.shards.contains_key(&shard_id))
+                && guard.recovered_shards.insert(shard_id)
+            {
+                guard.recovered_count += 1;
+            }
         }
 
         Ok(total_rows)
@@ -644,6 +679,24 @@ mod tests {
             total: 0,
         };
         assert_eq!(p.fraction(), 1.0);
+    }
+
+    #[test]
+    fn ready_requires_complete_checkpoint() {
+        let driver = RecoveryDriver::new();
+        for phase in [
+            RecoveryPhase::RecoveringCatalog,
+            RecoveryPhase::RecoveringEpoch,
+            RecoveryPhase::RecoveringOperators,
+            RecoveryPhase::ValidatingState,
+            RecoveryPhase::Ready,
+        ] {
+            driver.transition_phase(phase).unwrap();
+        }
+        assert!(!driver.is_ready());
+
+        driver.load_checkpoint(make_checkpoint(&[(0, 100)]));
+        assert!(!driver.is_ready());
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt documentation check e2e e2e-lfs e2e-nextest qualify approve clean error-codes exit-criteria failure-matrix fixture-dispatch coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
+.PHONY: build test clippy fmt documentation check e2e e2e-lfs e2e-nextest qualify approve clean error-codes exit-criteria failure-matrix fixture-dispatch coverage coverage-gate release verify verify-rust verify-proof-contracts verify-protocol verify-relaxed qualify-verus path-coupling bench-baseline-update
 
 # Build the workspace
 build:
@@ -24,8 +24,24 @@ documentation:
 # Run all checks (what CI does)
 check: fmt clippy test documentation error-codes exit-criteria verify path-coupling failure-matrix fixture-dispatch
 
-# Run formal verification specs
-verify:
+# Verify the Rust kernels and proof-contract gates.
+verify: verify-rust verify-proof-contracts verify-protocol
+
+verify-rust:
+	bash scripts/verify-rust.sh
+
+verify-proof-contracts:
+	python3 scripts/check-verus-manifest.py
+	python3 scripts/check-verus-qualification.py
+	bash scripts/test-verus-gates.sh
+	bash scripts/check-verus-qualification.test.sh
+
+# Run the clean, digest-bound VS6 qualification matrix (requires pinned Verus).
+qualify-verus:
+	bash scripts/run-verus-qualification.sh
+
+# Run protocol-model verification specs.
+verify-protocol:
 	fizz formal/smoke.fizz
 	fizz formal/m1_epoch_commit.fizz
 	fizz formal/m2_frontier_agg.fizz

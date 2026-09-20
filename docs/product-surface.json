@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "016631451a995af9790e25c960e63ace01b03b606309ab54e8565c2394940952",
+    "candidate_identity_digest": "135e556acb8f96f7cde100eb06edc07f7924287a0f0975c5768da4e7ddc1c05c",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -6218,6 +6218,16 @@
         "doc_anchor": "rs-0005"
       },
       {
+        "code": "RS-0906",
+        "key": "formal.verus_qualification_failed",
+        "title": "Formal Verus qualification failed",
+        "severity": "ERROR",
+        "sqlstate": "XX000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Inspect the formal verification and qualification evidence; ensure all required proofs and release artifacts pass.",
+        "doc_anchor": "rs-0906"
+      },
+      {
         "code": "RS-1001",
         "key": "pipeline.not_found",
         "title": "Pipeline not found",
@@ -8128,6 +8138,16 @@
         "doc_anchor": "rs-5036"
       },
       {
+        "code": "RS-5037",
+        "key": "storage.malformed_arrangement_header",
+        "title": "Malformed arrangement catalog header",
+        "severity": "FATAL",
+        "sqlstate": "XX000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Inspect the stored arrangement catalog value; the header length does not match the expected wire size.",
+        "doc_anchor": "rs-5037"
+      },
+      {
         "code": "RS-6001",
         "key": "schema.upstream_evolution_detected",
         "title": "Incompatible upstream schema evolution detected",
@@ -8166,6 +8186,16 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Verify every publish_frontier write path uses WriteOptions { await_durable: true }; this indicates a durability regression in FrontierLeaseStore.",
         "doc_anchor": "rs-8003"
+      },
+      {
+        "code": "RS-8004",
+        "key": "frontier.membership_report_rejected",
+        "title": "Membership-aware frontier report or configuration transition was rejected",
+        "severity": "ERROR",
+        "sqlstate": "55000",
+        "retry_class": "Immediate",
+        "default_next_steps": "Refresh the active membership generation and shard incarnation, then retry with a versioned report after durable catch-up.",
+        "doc_anchor": "rs-8004"
       },
       {
         "code": "RS-9001",

@@ -719,8 +719,18 @@ mod tc {
         loop {
             let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
             let addr = cluster.nodes[leader_idx].control_addr;
-            let worker_stream = register_worker(addr, worker_id).await;
-            if let Some(lease) = request_shard(cluster, worker_id, shard_id).await {
+            let mut worker_stream = register_worker(addr, worker_id).await;
+            let response = send_and_recv(
+                &mut worker_stream,
+                &WorkerMessage::RequestShard {
+                    worker_id: WorkerId(worker_id),
+                    shard_id: ShardId(shard_id),
+                },
+            )
+            .await;
+            if let Ok(ControlMessage::ShardAssigned { lease, .. }) =
+                serde_json::from_str(response.trim())
+            {
                 return (leader_idx, lease, worker_stream);
             }
             assert!(
@@ -730,13 +740,15 @@ mod tc {
         }
     }
 
-    /// Report a shard's frontier; returns `true` if the reply was
-    /// `ClusterFrontierAdvanced` (published — this node is currently
-    /// leader), `false` for `NotLeader` or no reply within the timeout.
-    pub async fn report_shard_frontier(addr: SocketAddr, shard_id: u64, epoch: u64) -> bool {
-        let Ok(mut stream) = TcpStream::connect(addr).await else {
-            return false;
-        };
+    /// Report a shard's frontier on the registered worker connection; returns
+    /// `true` if the reply was `ClusterFrontierAdvanced` (published — this
+    /// node is currently leader), `false` for `NotLeader` or no reply within
+    /// the timeout.
+    pub async fn report_shard_frontier(
+        mut stream: &mut TcpStream,
+        shard_id: u64,
+        epoch: u64,
+    ) -> bool {
         let req = WorkerMessage::ReportShardFrontier {
             shard_id: ShardId(shard_id),
             epoch,
@@ -747,15 +759,22 @@ mod tc {
         }
         let mut reader = BufReader::new(&mut stream);
         let mut resp = String::new();
-        let Ok(Ok(_)) =
-            tokio::time::timeout(Duration::from_millis(800), reader.read_line(&mut resp)).await
-        else {
-            return false;
-        };
-        matches!(
-            serde_json::from_str(resp.trim()),
-            Ok(ControlMessage::ClusterFrontierAdvanced { .. })
-        )
+        let deadline = Instant::now() + Duration::from_millis(800);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let Ok(Ok(_)) = tokio::time::timeout(remaining, reader.read_line(&mut resp)).await
+            else {
+                return false;
+            };
+            match serde_json::from_str(resp.trim()) {
+                Ok(ControlMessage::ClusterFrontierAdvanced { .. }) => return true,
+                Ok(ControlMessage::TopologyChanged { .. }) => resp.clear(),
+                _ => return false,
+            }
+        }
     }
 
     async fn send_and_recv(stream: &mut TcpStream, msg: &WorkerMessage) -> String {
@@ -835,14 +854,13 @@ async fn leader_kill_recovers_within_budget_tc() {
     // Pre-kill: a worker acquires shard 7's lease against the original
     // leader — this is the "in-flight" state whose continuity the kill
     // must not corrupt.
-    let (leader_idx, lease_before, _worker_10_stream) =
+    let (leader_idx, lease_before, mut worker_10_stream) =
         tc::register_and_request_shard(&cluster, 10, 7).await;
-    let old_leader_addr = cluster.nodes[leader_idx].control_addr;
     assert_eq!(lease_before.worker_id, WorkerId(10));
 
     // Pre-kill: frontier publication succeeds against the original leader.
     assert!(
-        tc::report_shard_frontier(old_leader_addr, 7, 100).await,
+        tc::report_shard_frontier(&mut worker_10_stream, 7, 100).await,
         "pre-kill frontier report against the real leader must be published"
     );
 
@@ -885,9 +903,7 @@ async fn leader_kill_recovers_within_budget_tc() {
          worker 10's pre-kill lease (persisted to the shared control-plane \
          store) is still live: {conflicting:?}"
     );
-    let (fresh_leader_idx, fresh_lease, _worker_20_stream) =
-        tc::register_and_request_shard(&cluster, 20, 8).await;
-    let fresh_leader_addr = cluster.nodes[fresh_leader_idx].control_addr;
+    let (_, fresh_lease, _worker_20_stream) = tc::register_and_request_shard(&cluster, 20, 8).await;
     assert_eq!(fresh_lease.worker_id, WorkerId(20));
     let shard_recovery_elapsed = shard_recovery_start.elapsed();
     assert!(
@@ -898,9 +914,12 @@ async fn leader_kill_recovers_within_budget_tc() {
 
     // (c): frontier publication resumes against the new leader, within the
     // pipeline-freshness-recovery budget.
+    let (report_leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
+    let mut worker_10_reconnected =
+        tc::register_worker(cluster.nodes[report_leader_idx].control_addr, 10).await;
     let freshness_start = Instant::now();
     assert!(
-        tc::report_shard_frontier(fresh_leader_addr, 7, 101).await,
+        tc::report_shard_frontier(&mut worker_10_reconnected, 7, 101).await,
         "frontier publication must resume against the new leader"
     );
     let freshness_elapsed = freshness_start.elapsed();

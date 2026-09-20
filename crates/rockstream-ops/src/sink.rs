@@ -233,9 +233,6 @@ impl ViewSinkOp {
     ///
     /// Each row becomes one key-value entry in the `view_output` namespace.
     pub fn append_epoch(&self, wb: &mut WriteBatch, batch: &ArrowZSet, epoch: Epoch) {
-        if batch.is_empty() {
-            return;
-        }
         let op_id_raw = self.op_id.0;
         let epoch_bytes = epoch.to_be_bytes();
 
@@ -609,4 +606,41 @@ pub async fn read_view_directory_entry_via_reader(
     let key = view_directory_key(view_name);
     let value = reader.get(&key).await.map_err(OpError::storage)?;
     Ok(value.and_then(|bytes| decode_view_directory_entry(&bytes)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use object_store::memory::InMemory;
+    use rockstream_storage::BatchOp;
+
+    #[tokio::test]
+    async fn append_epoch_records_empty_epoch_marker() {
+        let db = Arc::new(
+            ShardDb::builder("empty-epoch", Arc::new(InMemory::new()))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let op_id = OperatorId(7);
+        let sink = ViewSinkOp::new(db, op_id);
+        let mut writes = WriteBatch::new();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        sink.append_epoch(&mut writes, &ArrowZSet::empty(schema), 3);
+
+        assert_eq!(writes.len(), 1);
+        match &writes.ops()[0] {
+            BatchOp::Put { key, value } => {
+                assert_eq!(key, &view_output_epoch_key(op_id));
+                assert_eq!(value, &4_u64.to_be_bytes());
+            }
+            other => panic!("expected epoch marker put, got {other:?}"),
+        }
+    }
 }

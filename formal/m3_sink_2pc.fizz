@@ -268,6 +268,14 @@ always assertion M3_S2_NoLostDelivery:
 # M3-S3: Checkpoint-coupled commit.
 # A sink epoch transitions to Committed only after cluster_committed >= that epoch.
 # Composed with M1's cluster_committed predicate.
+#
+# Runtime / Verification Adapter Boundary:
+# In the implementation, the verified adapter boundary (`CoupledBatchDescriptor`
+# and `CoupledTransactionBuilder` in `rockstream-connectors`, validated by
+# `commit_m3` and `coupled_commit_is_durable`) mechanically derives coupled
+# mutations (operator state, view output, source checkpoint marker, and
+# frontier advancement) from batch key inspection before invoking the verified
+# decision kernel and committing writes.
 always assertion M3_S3_CheckpointCoupledCommit:
     sk = sinkconnector
     cp = controlplane

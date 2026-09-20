@@ -43,6 +43,10 @@ pub enum StorageError {
     )]
     UnknownMergeLaw { law_id: u16, law_version: u16 },
 
+    /// RS-5037: an arrangement catalog value is not exactly one header.
+    #[error("RS-5037: malformed arrangement header length={length}")]
+    MalformedArrangementHeader { length: usize },
+
     /// RS-5001: the stored format is outside the binary's inclusive range.
     #[error(
         "RS-5001: incompatible storage format stored={stored}, supported={min}..={max}; run rockstream migrate --from=N --to=M --storage=<url>"

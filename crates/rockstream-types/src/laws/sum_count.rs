@@ -13,6 +13,9 @@
 //! - bytes [0..8]  — i64 sum value, big-endian
 //! - bytes [8..16] — i64 count value, big-endian
 
+use super::arithmetic::{
+    admit_i64_reassociation, checked_add_i64, checked_neg_i64, decode_i64, encode_i64,
+};
 use crate::merge_law::{
     CompactionPolicy, DuplicatePolicy, FrontierPolicy, GatewayAggCombinerDesc, LawBundle,
     LawProperties, MergeLawClass, MergeLawId, MergeLawVersion,
@@ -70,9 +73,7 @@ impl LawBundle for SumCountV1 {
     }
 
     fn frontier_policy(&self) -> FrontierPolicy {
-        // SumCount is an abelian group: partial aggregates are always valid,
-        // so any frontier advancement may trigger output.
-        FrontierPolicy::AnyAdvancement
+        FrontierPolicy::ExactOnly
     }
 
     fn identity(&self) -> Option<Vec<u8>> {
@@ -82,8 +83,18 @@ impl LawBundle for SumCountV1 {
     fn merge(&self, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
         let (ls, lc) = parse_sum_count(left)?;
         let (rs, rc) = parse_sum_count(right)?;
-        let sum = ls.checked_add(rs).ok_or("SumCount: sum overflow")?;
-        let count = lc.checked_add(rc).ok_or("SumCount: count overflow")?;
+        let sum = checked_add_i64(ls, rs).map_err(|_| {
+            format!(
+                "[{}] SumCount sum arithmetic overflow",
+                crate::error_code::RS_1016
+            )
+        })?;
+        let count = checked_add_i64(lc, rc).map_err(|_| {
+            format!(
+                "[{}] SumCount count arithmetic overflow",
+                crate::error_code::RS_1016
+            )
+        })?;
         Ok(encode_sum_count(sum, count))
     }
 
@@ -94,8 +105,6 @@ impl LawBundle for SumCountV1 {
     }
 
     fn gateway_combiner(&self) -> Option<GatewayAggCombinerDesc> {
-        // SumCount is an abelian group: associative + commutative, so partial
-        // aggregation can be safely pushed to individual shards.
         Some(GatewayAggCombinerDesc {
             law_id: SUM_COUNT_ID,
             law_name: "SumCount",
@@ -103,13 +112,42 @@ impl LawBundle for SumCountV1 {
             is_commutative: true,
         })
     }
+
+    fn inverse(&self, value: &[u8]) -> Result<Vec<u8>, String> {
+        let (sum, count) = parse_sum_count(value)?;
+        let inverse_sum = checked_neg_i64(sum).map_err(|_| {
+            format!(
+                "[{}] SumCount inverse sum overflow",
+                crate::error_code::RS_1016
+            )
+        })?;
+        let inverse_count = checked_neg_i64(count).map_err(|_| {
+            format!(
+                "[{}] SumCount inverse count overflow",
+                crate::error_code::RS_1016
+            )
+        })?;
+        Ok(encode_sum_count(inverse_sum, inverse_count))
+    }
+
+    fn admits_reassociation(&self, operands: &[i64]) -> bool {
+        admit_i64_reassociation(operands)
+    }
+
+    fn domain(&self) -> &'static str {
+        "checked i64 sum/count partials; materialized count > 0; regrouping requires an absolute-sum budget"
+    }
+
+    fn evidence_ref(&self) -> &'static str {
+        "VS1-02/VS1-03/VS1-06: arithmetic kernel, law tests, and VS1 ADR"
+    }
 }
 
 /// Encode `(sum, count)` to the `SumCount/v1` wire format (16 bytes).
 pub fn encode_sum_count(sum: i64, count: i64) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
-    out.extend_from_slice(&sum.to_be_bytes());
-    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(&encode_i64(sum));
+    out.extend_from_slice(&encode_i64(count));
     out
 }
 
@@ -148,8 +186,8 @@ fn parse_sum_count(bytes: &[u8]) -> Result<(i64, i64), String> {
             bytes.len()
         ));
     }
-    let sum = i64::from_be_bytes(bytes[0..8].try_into().unwrap());
-    let count = i64::from_be_bytes(bytes[8..16].try_into().unwrap());
+    let sum = decode_i64(&bytes[0..8]).map_err(|error| format!("SumCount: {error}"))?;
+    let count = decode_i64(&bytes[8..16]).map_err(|error| format!("SumCount: {error}"))?;
     Ok((sum, count))
 }
 
@@ -231,6 +269,22 @@ mod tests {
     }
 
     #[test]
+    fn inverse_rejects_unrepresentable_minimum() {
+        let law = SumCountV1;
+        assert!(law.inverse(&encode_sum_count(i64::MIN, 0)).is_err());
+        assert_eq!(
+            law.inverse(&encode_sum_count(i64::MAX, 1)).unwrap(),
+            encode_sum_count(i64::MIN + 1, -1)
+        );
+    }
+
+    #[test]
+    fn regrouping_is_not_claimed_without_an_admitted_domain() {
+        assert!(!SumCountV1.admits_reassociation(&[i64::MAX, 1, -1]));
+        assert!(SumCountV1.admits_reassociation(&[10, -3, 2]));
+    }
+
+    #[test]
     fn properties_are_abelian_group() {
         let law = SumCountV1;
         let props = law.properties();
@@ -239,6 +293,7 @@ mod tests {
         assert!(!props.idempotent);
         assert!(props.has_inverse);
         assert!(props.has_identity);
+        assert_eq!(law.frontier_policy(), FrontierPolicy::ExactOnly);
         assert_eq!(law.class(), MergeLawClass::AbelianGroup);
     }
 

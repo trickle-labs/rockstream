@@ -115,25 +115,25 @@ use crate::merge_registry::SumCountMergeOperator;
 
 /// Check whether `bytes` is a valid operand for `law`.
 ///
-/// Uses the law's identity element to probe validity: `merge(bytes, identity)`
-/// must succeed. Falls back to `merge(bytes, bytes)` if the law has no
-/// identity (uncommon). For the identity element itself, `is_identity` short-
-/// circuits.
+/// Resolves the operand representation via `resolve_law_operand`.
+/// If raw, validates raw bytes without truncation. If tagged, passes only
+/// the payload to `law`. Rejects incompatible or malformed operands.
 fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes: &[u8]) -> bool {
-    let mut bytes = bytes;
-    if !bytes.is_empty() {
-        let tag = bytes[0];
-        if tag == 0x01 || tag == 0x02 || tag == 0x03 || tag == 0x04 || tag == 0x22 || tag == 0x30 {
-            bytes = &bytes[1..];
-        }
-    }
-    if law.is_identity(bytes) {
+    let operand_view = match crate::merge_registry::resolve_law_operand(law, bytes) {
+        Ok(view) => view,
+        Err(_) => return false,
+    };
+    let payload = match operand_view {
+        crate::merge_registry::LawOperandView::Raw(raw) => raw,
+        crate::merge_registry::LawOperandView::Tagged { payload, .. } => payload,
+    };
+    if law.is_identity(payload) {
         return true;
     }
     if let Some(identity) = law.identity() {
-        law.merge(bytes, &identity).is_ok()
+        law.merge(payload, &identity).is_ok()
     } else {
-        law.merge(bytes, bytes).is_ok()
+        law.merge(payload, payload).is_ok()
     }
 }
 
@@ -1180,8 +1180,10 @@ impl ShardDb {
         let prefix = ShardKeyEncoder::meta_key(b"law_catalog/");
         let entries = self.scan_prefix(&prefix).await?;
         for (_, value) in entries {
-            if value.len() < ArrangementHeader::WIRE_SIZE {
-                continue; // malformed entry — skip (not a law catalog entry)
+            if value.len() != ArrangementHeader::WIRE_SIZE {
+                return Err(StorageError::MalformedArrangementHeader {
+                    length: value.len(),
+                });
             }
             let buf: [u8; 4] = match value[..4].try_into() {
                 Ok(b) => b,
@@ -1364,7 +1366,11 @@ impl ShardDb {
         let raw = self.get(key).await?;
         match raw {
             None => Ok(None),
-            Some(bytes) if bytes.len() < ArrangementHeader::WIRE_SIZE => Ok(None),
+            Some(bytes) if bytes.len() < ArrangementHeader::WIRE_SIZE => {
+                Err(StorageError::MalformedArrangementHeader {
+                    length: bytes.len(),
+                })
+            }
             Some(bytes) => {
                 let buf: [u8; 4] = match bytes[..4].try_into() {
                     Ok(b) => b,
@@ -1494,6 +1500,17 @@ pub enum BatchOp {
     Merge { key: Vec<u8>, value: Vec<u8> },
 }
 
+impl BatchOp {
+    /// Return the key affected by this operation.
+    pub fn key(&self) -> &[u8] {
+        match self {
+            BatchOp::Put { key, .. } => key,
+            BatchOp::Delete { key } => key,
+            BatchOp::Merge { key, .. } => key,
+        }
+    }
+}
+
 /// Atomic write batch for multiple operations.
 ///
 /// All operations in a batch are committed atomically.
@@ -1550,6 +1567,11 @@ impl WriteBatch {
     /// Returns true if the batch has no operations.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+
+    /// Returns the operations in the batch.
+    pub fn ops(&self) -> &[BatchOp] {
+        &self.ops
     }
 
     /// Returns the total byte size of keys and values in this batch.

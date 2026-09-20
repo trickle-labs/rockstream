@@ -91,3 +91,66 @@ async fn test_last_consumer_drop_triggers_reclamation() {
     assert_eq!(reclaimed, vec![arr_id]);
     assert_eq!(catalog.physical_arrangements_count().await, 0);
 }
+
+#[tokio::test]
+async fn test_duplicate_consumer_registration_and_drop_are_idempotent() {
+    let catalog = ArrangementCatalog::new();
+    let spec = create_spec(1, "events");
+
+    let (arr_id, created) = catalog.register_consumer(ViewId(1), spec.clone()).await;
+    let (same_id, reused) = catalog.register_consumer(ViewId(1), spec).await;
+    assert_eq!(same_id, arr_id);
+    assert!(created);
+    assert!(!reused);
+    assert_eq!(catalog.consumer_count(arr_id).await, 1);
+
+    catalog.update_compaction_frontier(arr_id, 10).await;
+    assert!(catalog
+        .deregister_consumer(ViewId(1), arr_id)
+        .await
+        .expect("first deregister"));
+    assert!(!catalog
+        .deregister_consumer(ViewId(1), arr_id)
+        .await
+        .expect("duplicate deregister"));
+    assert_eq!(catalog.consumer_count(arr_id).await, 0);
+    assert_eq!(
+        catalog.reclaim_unreferenced_arrangements(10).await,
+        vec![arr_id]
+    );
+}
+
+#[tokio::test]
+async fn test_retained_snapshot_or_in_flight_delta_blocks_reclamation() {
+    let catalog = ArrangementCatalog::new();
+    let spec = create_spec(1, "events");
+
+    let (arr_id, _) = catalog.register_consumer(ViewId(1), spec).await;
+    catalog.update_compaction_frontier(arr_id, 30).await;
+    assert!(catalog
+        .deregister_consumer(ViewId(1), arr_id)
+        .await
+        .expect("deregister"));
+
+    // Set retained snapshot
+    catalog.set_retained_snapshot(arr_id, true).await;
+    assert!(catalog
+        .reclaim_unreferenced_arrangements(20)
+        .await
+        .is_empty());
+
+    // Clear retained snapshot, set in-flight delta
+    catalog.set_retained_snapshot(arr_id, false).await;
+    catalog.set_in_flight_delta(arr_id, true).await;
+    assert!(catalog
+        .reclaim_unreferenced_arrangements(20)
+        .await
+        .is_empty());
+
+    // Clear in-flight delta -> now eligible for reclamation
+    catalog.set_in_flight_delta(arr_id, false).await;
+    assert_eq!(
+        catalog.reclaim_unreferenced_arrangements(20).await,
+        vec![arr_id]
+    );
+}

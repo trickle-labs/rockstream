@@ -127,6 +127,28 @@ async fn test_multi_page_catalog_scan_continues_to_completion() {
 }
 
 #[tokio::test]
+async fn test_zero_page_size_still_advances_replay_cursor() {
+    let all_txns = (1..=3)
+        .map(|revision| {
+            CatalogTxn::new(
+                revision,
+                revision,
+                vec![CatalogMutation::DeleteTable(TableId(revision))],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let page = CatalogLogManager::scan_page(&all_txns, 0, 0).await;
+    assert_eq!(page.transactions, all_txns[..1].to_vec());
+    assert_eq!(page.next_cursor, Some(1));
+    assert!(page.has_more);
+
+    let full_scan = CatalogLogManager::scan_all_continuing(&all_txns, 0).await;
+    assert_eq!(full_scan, all_txns);
+}
+
+#[tokio::test]
 async fn test_interrupted_compaction_falls_back_safely() {
     let store = Arc::new(InMemory::new());
     let catalog = DurableCatalogStore::new(store.clone(), "test");
