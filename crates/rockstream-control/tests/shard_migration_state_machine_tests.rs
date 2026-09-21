@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutOptions, PutPayload,
-    PutResult,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutOptions,
+    PutPayload, PutResult,
 };
 use rockstream_control::{
     BucketMapVersionTracker, CheckpointCoordinator, MigrationConsumerFrontierTracker,
@@ -135,8 +135,11 @@ impl object_store::ObjectStore for FailOnPutStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(
@@ -161,16 +164,13 @@ impl object_store::ObjectStore for FailOnPutStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: CopyOptions,
     ) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
