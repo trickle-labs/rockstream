@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 use crate::ids::ShardId;
 use crate::timestamp::Epoch;
 
+/// Current durable migration-record schema.
+pub const MIGRATION_RECORD_VERSION: u16 = 2;
+
+fn default_record_version() -> u16 {
+    1
+}
+
 /// The explicit migration state machine for online shard handoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +36,7 @@ pub enum MigrationState {
     GcEligible,
     Done,
     Aborted,
+    Failed,
 }
 
 impl std::fmt::Display for MigrationState {
@@ -45,6 +53,7 @@ impl std::fmt::Display for MigrationState {
             Self::GcEligible => "gc_eligible",
             Self::Done => "done",
             Self::Aborted => "aborted",
+            Self::Failed => "failed",
         };
         write!(f, "{name}")
     }
@@ -87,6 +96,9 @@ impl BucketSet {
 /// Durable record for one online shard migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationRecord {
+    /// Durable schema version for compatibility checks during recovery.
+    #[serde(default = "default_record_version")]
+    pub record_version: u16,
     /// Stable migration identifier.
     pub migration_id: String,
     /// Current state in the explicit migration state machine.
@@ -107,6 +119,18 @@ pub struct MigrationRecord {
     /// Snapshot UUIDs for copying the exact donor checkpoint.
     #[serde(default)]
     pub donor_checkpoint_snapshots: BTreeMap<ShardId, String>,
+    /// Durable count of completed copy pages per donor snapshot.
+    #[serde(default)]
+    pub copy_cursors: BTreeMap<ShardId, u64>,
+    /// Copy pages whose recipient write was intended but not yet completed.
+    #[serde(default)]
+    pub copy_intents: BTreeMap<ShardId, u64>,
+    /// Donor frontiers captured before the snapshot effect.
+    #[serde(default)]
+    pub donor_frontiers: BTreeMap<ShardId, Epoch>,
+    /// Recipient frontier captured before the snapshot effect.
+    #[serde(default)]
+    pub recipient_frontier: Option<Epoch>,
     /// Logical epoch at which writes enter the migration routing policy.
     #[serde(default)]
     pub migration_epoch: Epoch,
@@ -142,6 +166,7 @@ impl MigrationRecord {
     ) -> Self {
         let now = now_ms();
         Self {
+            record_version: MIGRATION_RECORD_VERSION,
             migration_id: migration_id.into(),
             state: MigrationState::Planned,
             donor_shards,
@@ -151,6 +176,10 @@ impl MigrationRecord {
             target_bucket_map_version,
             donor_checkpoints: BTreeMap::new(),
             donor_checkpoint_snapshots: BTreeMap::new(),
+            copy_cursors: BTreeMap::new(),
+            copy_intents: BTreeMap::new(),
+            donor_frontiers: BTreeMap::new(),
+            recipient_frontier: None,
             migration_epoch: planned_frontier,
             cutover_epoch: None,
             created_at_ms: now,
@@ -206,7 +235,7 @@ impl MigrationRecord {
             | MigrationState::Cutover
             | MigrationState::Verifying
             | MigrationState::GcEligible => Some(0),
-            MigrationState::Aborted => None,
+            MigrationState::Aborted | MigrationState::Failed => None,
             MigrationState::Planned | MigrationState::Snapshotting => self.total_bytes,
             MigrationState::Copying => match (self.total_bytes, self.copied_bytes) {
                 (Some(total), Some(copied)) => Some(total.saturating_sub(copied)),
@@ -226,7 +255,7 @@ impl MigrationRecord {
             | MigrationState::Cutover
             | MigrationState::Verifying
             | MigrationState::GcEligible => Some(0),
-            MigrationState::Aborted => None,
+            MigrationState::Aborted | MigrationState::Failed => None,
             MigrationState::Planned | MigrationState::Snapshotting => self.total_rows,
             MigrationState::Copying => match (self.total_rows, self.copied_rows) {
                 (Some(total), Some(copied)) => Some(total.saturating_sub(copied)),
@@ -245,7 +274,7 @@ impl MigrationRecord {
     pub fn estimated_remaining_ms(&self) -> Option<u64> {
         match self.state {
             MigrationState::Done => Some(0),
-            MigrationState::Aborted => None,
+            MigrationState::Aborted | MigrationState::Failed => None,
             MigrationState::DualWriting
             | MigrationState::CatchingUp
             | MigrationState::FencingOld
@@ -301,6 +330,15 @@ impl MigrationRecord {
                 | (Cutover, Aborted)
                 | (Verifying, Aborted)
                 | (GcEligible, Aborted)
+                | (Planned, Failed)
+                | (Snapshotting, Failed)
+                | (Copying, Failed)
+                | (DualWriting, Failed)
+                | (CatchingUp, Failed)
+                | (FencingOld, Failed)
+                | (Cutover, Failed)
+                | (Verifying, Failed)
+                | (GcEligible, Failed)
         )
     }
 
@@ -375,6 +413,7 @@ mod tests {
             MigrationState::GcEligible,
             MigrationState::Done,
             MigrationState::Aborted,
+            MigrationState::Failed,
         ];
         for state in states {
             let json = serde_json::to_string(&state).unwrap();

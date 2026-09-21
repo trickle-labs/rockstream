@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
-use rockstream_control::MigrationPersistentStore;
+use rockstream_control::{MigrationLoadError, MigrationPersistentStore};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{minio_object_store, start_minio};
 use rockstream_types::ids::ShardId;
-use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
+use rockstream_types::migration::{
+    BucketSet, MigrationRecord, MigrationState, MIGRATION_RECORD_VERSION,
+};
 
 fn make_record() -> MigrationRecord {
     let mut record = MigrationRecord::new(
@@ -28,6 +30,40 @@ fn make_record() -> MigrationRecord {
 }
 
 const MINIO_BUCKET: &str = "rockstream-migration-durability-test";
+
+#[tokio::test]
+async fn migration_record_load_distinguishes_missing_corrupt_and_unsupported() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let persistent = MigrationPersistentStore::new(store.clone());
+
+    assert_eq!(
+        persistent.load("missing").await,
+        Err(MigrationLoadError::Missing)
+    );
+
+    store
+        .put(
+            &object_store::path::Path::from("topology/migration/corrupt.json"),
+            b"not-json".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        persistent.load("corrupt").await,
+        Err(MigrationLoadError::Corrupt(_))
+    ));
+
+    let mut unsupported = make_record();
+    unsupported.record_version = 99;
+    persistent.save(&unsupported).await.unwrap();
+    assert_eq!(
+        persistent.load(&unsupported.migration_id).await,
+        Err(MigrationLoadError::UnsupportedVersion {
+            found: 99,
+            expected: MIGRATION_RECORD_VERSION,
+        })
+    );
+}
 
 #[tokio::test]
 async fn migration_record_survives_restart_lfs() {

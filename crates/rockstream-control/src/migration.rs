@@ -11,7 +11,9 @@ use rockstream_storage::{ShardDb, ShardReader, WriteBatch};
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::checkpoint::{ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::ids::ShardId;
-use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
+use rockstream_types::migration::{
+    BucketSet, MigrationRecord, MigrationState, MIGRATION_RECORD_VERSION,
+};
 use rockstream_types::timestamp::Epoch;
 use thiserror::Error;
 
@@ -141,6 +143,18 @@ pub enum MigrationError {
     Checkpoint(String),
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MigrationLoadError {
+    #[error("migration record is absent")]
+    Missing,
+    #[error("migration record is corrupt: {0}")]
+    Corrupt(String),
+    #[error("migration record storage is unavailable: {0}")]
+    Unavailable(String),
+    #[error("unsupported migration record version {found}, expected {expected}")]
+    UnsupportedVersion { found: u16, expected: u16 },
+}
+
 impl PartialEq for MigrationError {
     fn eq(&self, other: &Self) -> bool {
         self.to_string() == other.to_string()
@@ -179,6 +193,7 @@ pub struct MigrationShard {
 }
 
 /// Durable object-store-backed persistence for one migration record per key.
+#[derive(Clone)]
 pub struct MigrationPersistentStore {
     store: Arc<dyn ObjectStore>,
     active_prefix: Path,
@@ -202,26 +217,35 @@ impl MigrationPersistentStore {
         self.history_prefix.child(format!("{migration_id}.json"))
     }
 
-    pub async fn load(&self, migration_id: &str) -> Option<MigrationRecord> {
-        let path = self.active_path(migration_id);
-        match self.store.get(&path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.ok()?;
-                serde_json::from_slice(&bytes).ok()
-            }
-            Err(_) => None,
-        }
+    pub async fn load(&self, migration_id: &str) -> Result<MigrationRecord, MigrationLoadError> {
+        self.load_path(&self.active_path(migration_id)).await
     }
 
-    pub async fn load_history(&self, migration_id: &str) -> Option<MigrationRecord> {
-        let path = self.history_path(migration_id);
-        match self.store.get(&path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.ok()?;
-                serde_json::from_slice(&bytes).ok()
-            }
-            Err(_) => None,
+    pub async fn load_history(
+        &self,
+        migration_id: &str,
+    ) -> Result<MigrationRecord, MigrationLoadError> {
+        self.load_path(&self.history_path(migration_id)).await
+    }
+
+    async fn load_path(&self, path: &Path) -> Result<MigrationRecord, MigrationLoadError> {
+        let result = self.store.get(path).await.map_err(|error| match error {
+            object_store::Error::NotFound { .. } => MigrationLoadError::Missing,
+            error => MigrationLoadError::Unavailable(error.to_string()),
+        })?;
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| MigrationLoadError::Unavailable(error.to_string()))?;
+        let record: MigrationRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| MigrationLoadError::Corrupt(error.to_string()))?;
+        if record.record_version != MIGRATION_RECORD_VERSION {
+            return Err(MigrationLoadError::UnsupportedVersion {
+                found: record.record_version,
+                expected: MIGRATION_RECORD_VERSION,
+            });
         }
+        Ok(record)
     }
 
     pub async fn save(&self, record: &MigrationRecord) -> Result<(), MigrationError> {
@@ -240,11 +264,13 @@ impl MigrationPersistentStore {
         next: MigrationState,
         audit: Option<&FileAuditLog>,
     ) -> Result<bool, MigrationError> {
-        let changed = record
+        let mut next_record = record.clone();
+        let changed = next_record
             .apply_transition(next)
             .map_err(|_| illegal_transition(record.state, next))?;
-        assert_single_authoritative(record); // M6-S1
-        self.save(record).await?;
+        assert_single_authoritative(&next_record); // M6-S1
+        self.save(&next_record).await?;
+        *record = next_record;
         emit_transition_audit(audit, record, next, changed, None);
         Ok(changed)
     }
@@ -373,6 +399,7 @@ impl BucketMapVersionTracker {
 
 /// Coordinator implementing the v0.46 migration state machine.
 pub struct MigrationCoordinator {
+    migration_store: Option<Arc<MigrationPersistentStore>>,
     snapshotting_timeout: Duration,
     copying_timeout: Duration,
     cutover_timeout: Duration,
@@ -389,12 +416,18 @@ impl Default for MigrationCoordinator {
 impl MigrationCoordinator {
     pub fn new() -> Self {
         Self {
+            migration_store: None,
             snapshotting_timeout: DEFAULT_SNAPSHOTTING_TIMEOUT,
             copying_timeout: DEFAULT_COPYING_TIMEOUT,
             cutover_timeout: DEFAULT_CUTOVER_TIMEOUT,
             cutover_lag_budget: DEFAULT_CUTOVER_LAG_BUDGET,
             verify_sample_rate: DEFAULT_VERIFY_SAMPLE_RATE,
         }
+    }
+
+    pub fn with_migration_store(mut self, store: Arc<MigrationPersistentStore>) -> Self {
+        self.migration_store = Some(store);
+        self
     }
 
     pub fn with_timeouts(
@@ -426,6 +459,32 @@ impl MigrationCoordinator {
         }
     }
 
+    async fn save_record(
+        &self,
+        record: &mut MigrationRecord,
+        next_record: MigrationRecord,
+    ) -> Result<(), MigrationError> {
+        if let Some(store) = &self.migration_store {
+            store.save(&next_record).await?;
+        }
+        *record = next_record;
+        Ok(())
+    }
+
+    async fn transition_record_durable(
+        &self,
+        record: &mut MigrationRecord,
+        next: MigrationState,
+        audit: Option<&FileAuditLog>,
+    ) -> Result<(), MigrationError> {
+        if let Some(store) = &self.migration_store {
+            store.transition(record, next, audit).await?;
+        } else {
+            self.transition_record(record, next, audit)?;
+        }
+        Ok(())
+    }
+
     pub async fn drive_planned_to_copying(
         &self,
         record: &mut MigrationRecord,
@@ -435,14 +494,23 @@ impl MigrationCoordinator {
         clocks: PhaseClocks,
         audit: Option<&FileAuditLog>,
     ) -> Result<ClusterCheckpoint, MigrationError> {
-        self.transition_record(record, MigrationState::Snapshotting, audit)?;
+        let mut snapshot_record = record.clone();
+        snapshot_record.donor_frontiers = donors
+            .iter()
+            .map(|donor| (donor.shard_id, donor.frontier))
+            .collect();
+        snapshot_record.recipient_frontier = Some(recipient.frontier);
+        self.save_record(record, snapshot_record).await?;
+        self.transition_record_durable(record, MigrationState::Snapshotting, audit)
+            .await?;
         self.abort_on_timeout(
             record,
             MigrationState::Snapshotting,
             clocks.snapshotting_started_at,
             self.snapshotting_timeout,
             audit,
-        )?;
+        )
+        .await?;
 
         let checkpoint_id = checkpoint_coordinator
             .begin_checkpoint(|_, _| {})
@@ -472,14 +540,17 @@ impl MigrationCoordinator {
             .latest_committed()
             .ok_or_else(|| MigrationError::Checkpoint("missing committed checkpoint".into()))?;
 
-        self.transition_record(record, MigrationState::Copying, audit)?;
+        self.save_record(record, record.clone()).await?;
+        self.transition_record_durable(record, MigrationState::Copying, audit)
+            .await?;
         self.abort_on_timeout(
             record,
             MigrationState::Copying,
             clocks.copying_started_at,
             self.copying_timeout,
             audit,
-        )?;
+        )
+        .await?;
 
         self.copy_bounded_chunks(record, donors, recipient).await?;
         Ok(cluster_checkpoint)
@@ -497,6 +568,11 @@ impl MigrationCoordinator {
     ) -> Result<MigrationCopyStats, MigrationError> {
         let mut stats = MigrationCopyStats::default();
         for donor in donors {
+            let completed_pages = record
+                .copy_cursors
+                .get(&donor.shard_id)
+                .copied()
+                .unwrap_or(0);
             let snapshot_id = record
                 .donor_checkpoint_snapshots
                 .get(&donor.shard_id)
@@ -519,14 +595,22 @@ impl MigrationCoordinator {
                     .await;
             });
 
+            let mut page_index = 0;
             while let Some(page) = receiver.recv().await {
                 let entries =
                     page.map_err(|e| MigrationError::Storage(format!("scan donor page: {e}")))?;
+                if page_index < completed_pages {
+                    page_index += 1;
+                    continue;
+                }
                 let chunk_rows = entries.len();
                 let chunk_bytes: usize = entries
                     .iter()
                     .map(|(key, value)| key.len() + value.len())
                     .sum();
+                let mut intent = record.clone();
+                intent.copy_intents.insert(donor.shard_id, page_index);
+                self.save_record(record, intent).await?;
                 let mut batch = WriteBatch::new();
                 for (key, value) in &entries {
                     batch.put(key, value);
@@ -546,10 +630,17 @@ impl MigrationCoordinator {
                 stats.copied_bytes += chunk_bytes as u64;
                 stats.max_chunk_rows = stats.max_chunk_rows.max(chunk_rows);
                 stats.max_chunk_bytes = stats.max_chunk_bytes.max(chunk_bytes);
-                record.record_progress(
-                    record.copied_bytes.unwrap_or(0) + chunk_bytes as u64,
-                    record.copied_rows.unwrap_or(0) + chunk_rows as u64,
+                let mut completed = record.clone();
+                completed.copy_intents.remove(&donor.shard_id);
+                completed
+                    .copy_cursors
+                    .insert(donor.shard_id, page_index + 1);
+                completed.record_progress(
+                    completed.copied_bytes.unwrap_or(0) + chunk_bytes as u64,
+                    completed.copied_rows.unwrap_or(0) + chunk_rows as u64,
                 );
+                self.save_record(record, completed).await?;
+                page_index += 1;
             }
             producer
                 .await
@@ -558,23 +649,25 @@ impl MigrationCoordinator {
         Ok(stats)
     }
 
-    pub fn begin_dual_writing(
+    pub async fn begin_dual_writing(
         &self,
         record: &mut MigrationRecord,
         audit: Option<&FileAuditLog>,
     ) -> Result<(), MigrationError> {
-        self.transition_record(record, MigrationState::DualWriting, audit)
+        self.transition_record_durable(record, MigrationState::DualWriting, audit)
+            .await
     }
 
-    pub fn advance_to_catching_up(
+    pub async fn advance_to_catching_up(
         &self,
         record: &mut MigrationRecord,
         audit: Option<&FileAuditLog>,
     ) -> Result<(), MigrationError> {
-        self.transition_record(record, MigrationState::CatchingUp, audit)
+        self.transition_record_durable(record, MigrationState::CatchingUp, audit)
+            .await
     }
 
-    pub fn advance_to_fencing_old_if_caught_up(
+    pub async fn advance_to_fencing_old_if_caught_up(
         &self,
         record: &mut MigrationRecord,
         donor_frontier: Epoch,
@@ -586,11 +679,21 @@ impl MigrationCoordinator {
         if lag > lag_budget_epochs {
             return Ok(false);
         }
-        self.transition_record(record, MigrationState::FencingOld, audit)?;
+        let mut completed = record.clone();
+        completed.donor_frontiers = completed
+            .donor_shards
+            .iter()
+            .copied()
+            .map(|shard_id| (shard_id, donor_frontier))
+            .collect();
+        completed.recipient_frontier = Some(recipient_frontier);
+        self.save_record(record, completed).await?;
+        self.transition_record_durable(record, MigrationState::FencingOld, audit)
+            .await?;
         Ok(true)
     }
 
-    pub fn await_cutover_readiness(
+    pub async fn await_cutover_readiness(
         &self,
         record: &mut MigrationRecord,
         observed_versions: &BucketMapVersionTracker,
@@ -607,10 +710,11 @@ impl MigrationCoordinator {
             started_at,
             audit,
         )
+        .await
     }
 
     /// Require both observer convergence and a committed frontier before cutover.
-    pub fn await_cutover_readiness_at_frontier(
+    pub async fn await_cutover_readiness_at_frontier(
         &self,
         record: &mut MigrationRecord,
         observed_versions: &BucketMapVersionTracker,
@@ -623,13 +727,16 @@ impl MigrationCoordinator {
             return Ok(false);
         }
         if record.state == MigrationState::FencingOld {
-            self.transition_record(record, MigrationState::Cutover, audit)?;
+            self.transition_record_durable(record, MigrationState::Cutover, audit)
+                .await?;
         }
         match observed_versions
             .all_observed(record.target_bucket_map_version, required_components)?
         {
             true => {
-                record.cutover_epoch = Some(committed_frontier);
+                let mut completed = record.clone();
+                completed.cutover_epoch = Some(committed_frontier);
+                self.save_record(record, completed).await?;
                 Ok(true)
             }
             false => {
@@ -640,7 +747,8 @@ impl MigrationCoordinator {
                         started_at,
                         self.cutover_timeout,
                         audit,
-                    )?;
+                    )
+                    .await?;
                 }
                 Ok(false)
             }
@@ -655,7 +763,8 @@ impl MigrationCoordinator {
         audit: Option<&FileAuditLog>,
     ) -> Result<(), MigrationError> {
         if record.state == MigrationState::Cutover {
-            self.transition_record(record, MigrationState::Verifying, audit)?;
+            self.transition_record_durable(record, MigrationState::Verifying, audit)
+                .await?;
         }
         let donor_entries = filtered_entries(donor, &record.buckets).await?;
         let recipient_entries = filtered_entries(recipient, &record.buckets).await?;
@@ -670,7 +779,8 @@ impl MigrationCoordinator {
         }
         let _sample_rate = self.verify_sample_rate;
         if donor_entries != recipient_entries {
-            self.transition_record(record, MigrationState::DualWriting, audit)?;
+            self.transition_record_durable(record, MigrationState::DualWriting, audit)
+                .await?;
             let key_hex = donor_entries
                 .iter()
                 .zip(recipient_entries.iter())
@@ -689,7 +799,7 @@ impl MigrationCoordinator {
         Ok(())
     }
 
-    pub fn maybe_enter_gc_eligible(
+    pub async fn maybe_enter_gc_eligible(
         &self,
         record: &mut MigrationRecord,
         frontiers: &MigrationConsumerFrontierTracker,
@@ -704,7 +814,8 @@ impl MigrationCoordinator {
         if min_frontier < cutover_epoch {
             return Ok(false);
         }
-        self.transition_record(record, MigrationState::GcEligible, audit)?;
+        self.transition_record_durable(record, MigrationState::GcEligible, audit)
+            .await?;
         Ok(true)
     }
 
@@ -721,10 +832,14 @@ impl MigrationCoordinator {
             });
         }
         let stats = cleanup_donor_buckets(donor, &record.buckets).await?;
-        self.transition_record(record, MigrationState::Done, audit)?;
-        if let Some(store) = store {
-            store.save(record).await?;
+        let durable_store = store.or(self.migration_store.as_deref());
+        if let Some(store) = durable_store {
+            store
+                .transition(record, MigrationState::Done, audit)
+                .await?;
             store.archive(record, audit).await?;
+        } else {
+            self.transition_record(record, MigrationState::Done, audit)?;
         }
         Ok(stats)
     }
@@ -743,7 +858,7 @@ impl MigrationCoordinator {
         Ok(())
     }
 
-    fn abort_on_timeout(
+    async fn abort_on_timeout(
         &self,
         record: &mut MigrationRecord,
         state: MigrationState,
@@ -756,14 +871,8 @@ impl MigrationCoordinator {
             return Ok(());
         }
         let err = timeout_error(state, elapsed, budget);
-        let _ = record.apply_transition(MigrationState::Aborted);
-        emit_transition_audit(
-            audit,
-            record,
-            MigrationState::Aborted,
-            true,
-            Some("timeout"),
-        );
+        self.transition_record_durable(record, MigrationState::Aborted, audit)
+            .await?;
         Err(err)
     }
 }
@@ -814,6 +923,7 @@ fn assert_single_authoritative(record: &MigrationRecord) {
             | MigrationState::CatchingUp
             | MigrationState::FencingOld
             | MigrationState::Aborted
+            | MigrationState::Failed
     );
     let recipient_authoritative = matches!(
         record.state,

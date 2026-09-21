@@ -87,12 +87,17 @@ async fn migration_converges_under_buggify_seed() {
         )
         .await
         .unwrap();
-    coordinator.begin_dual_writing(&mut record, None).unwrap();
+    coordinator
+        .begin_dual_writing(&mut record, None)
+        .await
+        .unwrap();
     coordinator
         .advance_to_catching_up(&mut record, None)
+        .await
         .unwrap();
     assert!(coordinator
         .advance_to_fencing_old_if_caught_up(&mut record, 42, 42, None)
+        .await
         .unwrap());
     let versions = BucketMapVersionTracker::new();
     versions.observe("reader", 9).unwrap();
@@ -106,6 +111,7 @@ async fn migration_converges_under_buggify_seed() {
             Instant::now(),
             None
         )
+        .await
         .unwrap());
     coordinator
         .verify_or_rollback(&mut record, &donor, &recipient, None)
@@ -115,6 +121,7 @@ async fn migration_converges_under_buggify_seed() {
     frontiers.observe("reader", 42).unwrap();
     assert!(coordinator
         .maybe_enter_gc_eligible(&mut record, &frontiers, None)
+        .await
         .unwrap());
     coordinator
         .finish_done(&mut record, &donor, None, None)
