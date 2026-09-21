@@ -316,6 +316,9 @@ impl ShardDbBuilder {
             .max_open_file_handles = 1000;
         self.settings.object_store_cache_options.cache_on_flush = true;
         self.settings.object_store_cache_options.cache_on_compaction = true;
+        self.settings
+            .object_store_cache_options
+            .preload_disk_cache_on_startup = Some(slatedb::config::PreloadLevel::AllSst);
         self.disk_cache_dir = Some(dir_path);
         self
     }
