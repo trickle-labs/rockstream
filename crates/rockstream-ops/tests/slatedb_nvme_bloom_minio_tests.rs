@@ -168,8 +168,12 @@ async fn run_join(
     path: &str,
     store: Arc<dyn ObjectStore>,
     cache_dir: Option<&Path>,
+    reset_gets: Option<&AtomicUsize>,
 ) -> Vec<Vec<i64>> {
     let shard = Arc::new(open_shard(path, store, cache_dir).await);
+    if let Some(gets) = reset_gets {
+        gets.store(0, Ordering::SeqCst);
+    }
     let pipeline = JoinPipeline::new(
         vec![],
         vec![],
@@ -222,10 +226,14 @@ async fn optimized_arrangement_lookups_reduce_minio_gets_vs_uncached_baseline() 
     let baseline_store: Arc<dyn ObjectStore> =
         Arc::new(CountingObjectStore::new(raw_store, baseline_gets.clone()));
 
-    let _ = run_join("optimized", optimized_store.clone(), Some(&optimized_cache)).await;
-    optimized_gets.store(0, Ordering::SeqCst);
-    let optimized = run_join("optimized", optimized_store, Some(&optimized_cache)).await;
-    let baseline = run_join("baseline", baseline_store, None).await;
+    let optimized = run_join(
+        "optimized",
+        optimized_store,
+        Some(&optimized_cache),
+        Some(&optimized_gets),
+    )
+    .await;
+    let baseline = run_join("baseline", baseline_store, None, Some(&baseline_gets)).await;
 
     assert_eq!(optimized, baseline);
     assert!(
