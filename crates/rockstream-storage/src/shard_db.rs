@@ -719,7 +719,11 @@ impl ShardDb {
             );
             self.last_epoch.store(new_epoch, Ordering::SeqCst);
         }
-        self.db.put(self.physical_key(key), value).await?;
+        self.db
+            .put(self.physical_key(key), value)
+            .await?
+            .await_durable()
+            .await?;
         Ok(())
     }
 
@@ -728,7 +732,11 @@ impl ShardDb {
         if self.migration_pending {
             return Err(StorageError::MigrationInProgress);
         }
-        self.db.delete(self.physical_key(key)).await?;
+        self.db
+            .delete(self.physical_key(key))
+            .await?
+            .await_durable()
+            .await?;
         Ok(())
     }
 
@@ -739,7 +747,11 @@ impl ShardDb {
         if self.migration_pending {
             return Err(StorageError::MigrationInProgress);
         }
-        self.db.merge(self.physical_key(key), value).await?;
+        self.db
+            .merge(self.physical_key(key), value)
+            .await?
+            .await_durable()
+            .await?;
         Ok(())
     }
 
@@ -789,7 +801,7 @@ impl ShardDb {
                 BatchOp::Merge { key, value } => inner.merge(self.physical_key(&key), &value),
             }
         }
-        self.db.write(inner).await?;
+        self.db.write(inner).await?.await_durable().await?;
         Ok(())
     }
 
