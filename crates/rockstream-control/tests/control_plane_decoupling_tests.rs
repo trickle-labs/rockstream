@@ -1,7 +1,7 @@
 //! Control Plane Boundary Decoupling Tests (v0.67 Slice 1 / Phase 3a).
 //!
-//! Asserts that the control plane never buffers, routes, or stores row payloads
-//! or query output history, cleanly decoupling the control and data planes (Roadmap 13.1 & 13.7).
+//! Asserts that the control plane never buffers or stores row payloads or query
+//! output history; it forwards routed frames without retaining their contents.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -13,9 +13,8 @@ use rockstream_control::shard::ShardManager;
 use rockstream_control::topology::TopologyCatalog;
 use rockstream_types::config::JoinStrategy;
 use rockstream_types::data_plane::{
-    DeploymentRequest, RuntimeOutputDelta, RuntimeRow, SourceDeltaRequest,
+    DeploymentRequest, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow, SourceDeltaRequest,
 };
-use rockstream_types::error_code::RS_3001;
 use rockstream_types::ids::{OperatorId, WorkerId, WorkloadId};
 use rockstream_types::topology::{
     CapacityHeadroom, ControlMessage, NodeRole, WorkerMessage, WorkerRegistration,
@@ -81,7 +80,7 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
         output_columns: vec!["val".to_string()],
         primary_key: vec![0],
         merge_key_columns: vec![0],
-        routing_columns: BTreeMap::new(),
+        routing_columns: BTreeMap::from([("src".to_string(), 0)]),
     };
 
     let wire_deploy =
@@ -174,8 +173,8 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
         panic!("Expected WorkloadSnapshot, got {resp:?}");
     }
 
-    // 5. Send SubmitSourceDelta with row payloads to control plane:
-    // MUST FAIL with RS-3001 because control plane does NOT accept data plane row payloads
+    // 5. Send SubmitSourceDelta with row payloads: the control plane routes the
+    // payload directly to the owning worker without retaining it.
     let submit_with_rows = WorkerMessage::SubmitSourceDelta(SourceDeltaRequest {
         version: 1,
         request_id: "delta-1".to_string(),
@@ -193,19 +192,62 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
         .await
         .unwrap();
     line.clear();
+    worker_reader.read_line(&mut line).await.unwrap();
+    let resp: ControlMessage = serde_json::from_str(&line).unwrap();
+    let execute = match resp {
+        ControlMessage::Execute { frame } => frame,
+        other => panic!("Expected Execute, got {other:?}"),
+    };
+    assert_eq!(
+        execute,
+        RuntimeExchangeMessage {
+            version: 1,
+            request_id: "delta-1".to_string(),
+            workload_id,
+            shard_id: assigned_shard_id,
+            epoch: 2,
+            operator_id: OperatorId(10),
+            lease_token: assigned_lease_token,
+            source: "src".to_string(),
+            rows: vec![RuntimeRow {
+                values_tsv: "100\tbar".to_string(),
+                weight: 1,
+            }],
+        }
+    );
+
+    let progress_msg = WorkerMessage::ExecutionProgress {
+        output: RuntimeOutputDelta {
+            version: 1,
+            request_id: "delta-1".to_string(),
+            workload_id,
+            shard_id: assigned_shard_id,
+            epoch: 2,
+            operator_id: OperatorId(10),
+            lease_token: assigned_lease_token,
+            source: "src".to_string(),
+            rows: vec![RuntimeRow {
+                values_tsv: "100\tbar".to_string(),
+                weight: 1,
+            }],
+        },
+        input_rows: 1,
+        output_rows: 1,
+    };
+    let wire_progress = serde_json::to_string(&progress_msg).unwrap() + "\n";
+    worker_write
+        .write_all(wire_progress.as_bytes())
+        .await
+        .unwrap();
+    line.clear();
     client_reader.read_line(&mut line).await.unwrap();
     let resp: ControlMessage = serde_json::from_str(&line).unwrap();
     match resp {
-        ControlMessage::OperationFailed {
-            code,
-            message,
-            next_steps,
-        } => {
-            assert_eq!(code, RS_3001.to_string(), "Must fail with RS-3001");
-            assert!(message.contains("control plane does not route data plane row payloads"));
-            assert!(next_steps.contains("Resolve shard placement"));
+        ControlMessage::SourceDeltaCommitted { request_id, epoch } => {
+            assert_eq!(request_id, "delta-1");
+            assert_eq!(epoch, 2);
         }
-        other => panic!("Expected OperationFailed, got {other:?}"),
+        other => panic!("Expected SourceDeltaCommitted, got {other:?}"),
     }
 
     // 6. Send SubmitSourceDelta with EMPTY rows: control acknowledges frontier metadata

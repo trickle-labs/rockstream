@@ -685,6 +685,15 @@ filtered from the returned batch. The exact boundary is covered by
 `cdc_poll_credits_count_filtered_records_exactly` in
 `crates/rockstream-connectors/tests/cdc_transaction_atomicity_tests.rs`.
 
+Key-affinity source deltas route each row through the configured source routing
+column, an FNV virtual bucket, and rendezvous ownership before forwarding a
+`RuntimeExchangeMessage` to the owning worker. The control plane waits for
+per-request worker progress but does not retain row payloads; the exact wire,
+progress, and empty-delta behavior is covered by
+`test_control_plane_retains_zero_row_payloads_or_output_history` in
+`crates/rockstream-control/tests/control_plane_decoupling_tests.rs`. This
+data-plane routing path is outside the core M1–M7 FizzBee state machines.
+
 The v0.67.1 state beyond RAM architecture bounds memory through spill governors,
 streaming paged scans, and demand-loaded state restoration in
 `crates/rockstream-runtime` and `crates/rockstream-storage`. Bounded write buffering
