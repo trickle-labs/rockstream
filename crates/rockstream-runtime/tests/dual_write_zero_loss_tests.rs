@@ -118,7 +118,10 @@ async fn dual_write_zero_loss_tests() {
         )
         .await
         .unwrap();
-    coordinator.begin_dual_writing(&mut record, None).unwrap();
+    coordinator
+        .begin_dual_writing(&mut record, None)
+        .await
+        .unwrap();
     assert_eq!(record.state, MigrationState::DualWriting);
 
     let router = DualWriteRouter::new(record.clone());
@@ -140,9 +143,11 @@ async fn dual_write_zero_loss_tests() {
 
     coordinator
         .advance_to_catching_up(&mut record, None)
+        .await
         .unwrap();
     assert!(coordinator
         .advance_to_fencing_old_if_caught_up(&mut record, 42, 42, None)
+        .await
         .unwrap());
 
     assert_eq!(

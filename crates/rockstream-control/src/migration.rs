@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::Mutex;
@@ -11,12 +12,16 @@ use rockstream_storage::{ShardDb, ShardReader, WriteBatch};
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::checkpoint::{ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::ids::ShardId;
-use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
+use rockstream_types::lease::ShardLease;
+use rockstream_types::migration::{
+    BucketSet, MigrationRecord, MigrationState, MIGRATION_RECORD_VERSION,
+};
 use rockstream_types::timestamp::Epoch;
 use thiserror::Error;
 
 use crate::audit::FileAuditLog;
 use crate::checkpoint::{CheckpointCoordinator, CoordinatorError};
+use crate::shard::ShardManager;
 
 /// Default `SNAPSHOTTING` timeout.
 pub const DEFAULT_SNAPSHOTTING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,6 +39,8 @@ pub const MAX_VERIFY_SCAN_KEYS: usize = 1024;
 pub const MAX_CONSUMER_FRONTIERS: usize = 1024;
 /// Named upper bound for bucket-map-version observer tracking.
 pub const MAX_VERSION_OBSERVERS: usize = 64;
+/// Maximum active migration records loaded during control restart.
+pub const MAX_ACTIVE_MIGRATIONS: usize = 1024;
 /// Maximum rows in one migration copy chunk.
 pub const MAX_COPY_CHUNK_ROWS: usize = 256;
 /// Maximum key/value bytes in one migration copy chunk.
@@ -141,6 +148,18 @@ pub enum MigrationError {
     Checkpoint(String),
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MigrationLoadError {
+    #[error("migration record is absent")]
+    Missing,
+    #[error("migration record is corrupt: {0}")]
+    Corrupt(String),
+    #[error("migration record storage is unavailable: {0}")]
+    Unavailable(String),
+    #[error("unsupported migration record version {found}, expected {expected}")]
+    UnsupportedVersion { found: u16, expected: u16 },
+}
+
 impl PartialEq for MigrationError {
     fn eq(&self, other: &Self) -> bool {
         self.to_string() == other.to_string()
@@ -179,10 +198,18 @@ pub struct MigrationShard {
 }
 
 /// Durable object-store-backed persistence for one migration record per key.
+#[derive(Clone)]
 pub struct MigrationPersistentStore {
     store: Arc<dyn ObjectStore>,
     active_prefix: Path,
     history_prefix: Path,
+}
+
+/// Durable migration state reconciled with the current shard leases after restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationRecovery {
+    pub record: MigrationRecord,
+    pub current_leases: BTreeMap<ShardId, Option<ShardLease>>,
 }
 
 impl MigrationPersistentStore {
@@ -206,26 +233,88 @@ impl MigrationPersistentStore {
             .join(format!("{migration_id}.json"))
     }
 
-    pub async fn load(&self, migration_id: &str) -> Option<MigrationRecord> {
-        let path = self.active_path(migration_id);
-        match self.store.get(&path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.ok()?;
-                serde_json::from_slice(&bytes).ok()
-            }
-            Err(_) => None,
-        }
+    pub async fn load(&self, migration_id: &str) -> Result<MigrationRecord, MigrationLoadError> {
+        self.load_path(&self.active_path(migration_id)).await
     }
 
-    pub async fn load_history(&self, migration_id: &str) -> Option<MigrationRecord> {
-        let path = self.history_path(migration_id);
-        match self.store.get(&path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.ok()?;
-                serde_json::from_slice(&bytes).ok()
+    pub async fn load_history(
+        &self,
+        migration_id: &str,
+    ) -> Result<MigrationRecord, MigrationLoadError> {
+        self.load_path(&self.history_path(migration_id)).await
+    }
+
+    /// Load every active migration during control restart with a hard bound.
+    pub async fn load_active(&self) -> Result<Vec<MigrationRecord>, MigrationLoadError> {
+        let mut listing = self.store.list(Some(&self.active_prefix));
+        let active_prefix = format!("{}/", self.active_prefix.as_ref());
+        let mut records = Vec::new();
+        while let Some(entry) = listing.next().await {
+            let meta = entry.map_err(|error| {
+                MigrationLoadError::Unavailable(format!("list active migrations: {error}"))
+            })?;
+            if !meta.location.as_ref().starts_with(&active_prefix)
+                || meta
+                    .location
+                    .filename()
+                    .is_none_or(|name| !name.ends_with(".json"))
+            {
+                continue;
             }
-            Err(_) => None,
+            if records.len() == MAX_ACTIVE_MIGRATIONS {
+                return Err(MigrationLoadError::Unavailable(format!(
+                    "active migration record limit {MAX_ACTIVE_MIGRATIONS} exceeded"
+                )));
+            }
+            records.push(self.load_path(&meta.location).await?);
         }
+        records.sort_by(|left, right| left.migration_id.cmp(&right.migration_id));
+        Ok(records)
+    }
+
+    /// Load active migrations with the leases a resumed driver must revalidate.
+    pub async fn recover_active(
+        &self,
+        shard_manager: &ShardManager,
+    ) -> Result<Vec<MigrationRecovery>, MigrationLoadError> {
+        Ok(self
+            .load_active()
+            .await?
+            .into_iter()
+            .map(|record| {
+                let current_leases = record
+                    .donor_shards
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(record.recipient_shard))
+                    .map(|shard_id| (shard_id, shard_manager.get(shard_id)))
+                    .collect();
+                MigrationRecovery {
+                    record,
+                    current_leases,
+                }
+            })
+            .collect())
+    }
+
+    async fn load_path(&self, path: &Path) -> Result<MigrationRecord, MigrationLoadError> {
+        let result = self.store.get(path).await.map_err(|error| match error {
+            object_store::Error::NotFound { .. } => MigrationLoadError::Missing,
+            error => MigrationLoadError::Unavailable(error.to_string()),
+        })?;
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| MigrationLoadError::Unavailable(error.to_string()))?;
+        let record: MigrationRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| MigrationLoadError::Corrupt(error.to_string()))?;
+        if record.record_version != MIGRATION_RECORD_VERSION {
+            return Err(MigrationLoadError::UnsupportedVersion {
+                found: record.record_version,
+                expected: MIGRATION_RECORD_VERSION,
+            });
+        }
+        Ok(record)
     }
 
     pub async fn save(&self, record: &MigrationRecord) -> Result<(), MigrationError> {
@@ -244,11 +333,13 @@ impl MigrationPersistentStore {
         next: MigrationState,
         audit: Option<&FileAuditLog>,
     ) -> Result<bool, MigrationError> {
-        let changed = record
+        let mut next_record = record.clone();
+        let changed = next_record
             .apply_transition(next)
             .map_err(|_| illegal_transition(record.state, next))?;
-        assert_single_authoritative(record); // M6-S1
-        self.save(record).await?;
+        assert_single_authoritative(&next_record); // M6-S1
+        self.save(&next_record).await?;
+        *record = next_record;
         emit_transition_audit(audit, record, next, changed, None);
         Ok(changed)
     }
@@ -264,10 +355,18 @@ impl MigrationPersistentStore {
             .put(&self.history_path(&record.migration_id), bytes.into())
             .await
             .map_err(|e| MigrationError::Storage(format!("persist migration history: {e}")))?;
-        let _ = self
+        match self
             .store
             .delete(&self.active_path(&record.migration_id))
-            .await;
+            .await
+        {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => {
+                return Err(MigrationError::Storage(format!(
+                    "remove active migration record: {error}"
+                )))
+            }
+        }
         emit_transition_audit(audit, record, MigrationState::Done, true, Some("archived"));
         Ok(())
     }
@@ -377,6 +476,7 @@ impl BucketMapVersionTracker {
 
 /// Coordinator implementing the v0.46 migration state machine.
 pub struct MigrationCoordinator {
+    migration_store: Option<Arc<MigrationPersistentStore>>,
     snapshotting_timeout: Duration,
     copying_timeout: Duration,
     cutover_timeout: Duration,
@@ -393,12 +493,18 @@ impl Default for MigrationCoordinator {
 impl MigrationCoordinator {
     pub fn new() -> Self {
         Self {
+            migration_store: None,
             snapshotting_timeout: DEFAULT_SNAPSHOTTING_TIMEOUT,
             copying_timeout: DEFAULT_COPYING_TIMEOUT,
             cutover_timeout: DEFAULT_CUTOVER_TIMEOUT,
             cutover_lag_budget: DEFAULT_CUTOVER_LAG_BUDGET,
             verify_sample_rate: DEFAULT_VERIFY_SAMPLE_RATE,
         }
+    }
+
+    pub fn with_migration_store(mut self, store: Arc<MigrationPersistentStore>) -> Self {
+        self.migration_store = Some(store);
+        self
     }
 
     pub fn with_timeouts(
@@ -430,6 +536,32 @@ impl MigrationCoordinator {
         }
     }
 
+    async fn save_record(
+        &self,
+        record: &mut MigrationRecord,
+        next_record: MigrationRecord,
+    ) -> Result<(), MigrationError> {
+        if let Some(store) = &self.migration_store {
+            store.save(&next_record).await?;
+        }
+        *record = next_record;
+        Ok(())
+    }
+
+    async fn transition_record_durable(
+        &self,
+        record: &mut MigrationRecord,
+        next: MigrationState,
+        audit: Option<&FileAuditLog>,
+    ) -> Result<(), MigrationError> {
+        if let Some(store) = &self.migration_store {
+            store.transition(record, next, audit).await?;
+        } else {
+            self.transition_record(record, next, audit)?;
+        }
+        Ok(())
+    }
+
     pub async fn drive_planned_to_copying(
         &self,
         record: &mut MigrationRecord,
@@ -439,30 +571,56 @@ impl MigrationCoordinator {
         clocks: PhaseClocks,
         audit: Option<&FileAuditLog>,
     ) -> Result<ClusterCheckpoint, MigrationError> {
-        self.transition_record(record, MigrationState::Snapshotting, audit)?;
+        let mut snapshot_record = record.clone();
+        snapshot_record.donor_frontiers = donors
+            .iter()
+            .map(|donor| (donor.shard_id, donor.frontier))
+            .collect();
+        if let Some(donor_frontier) = donors.iter().map(|donor| donor.frontier).min() {
+            snapshot_record.record_frontiers(donor_frontier, recipient.frontier);
+        }
+        self.save_record(record, snapshot_record).await?;
+        self.transition_record_durable(record, MigrationState::Snapshotting, audit)
+            .await?;
         self.abort_on_timeout(
             record,
             MigrationState::Snapshotting,
             clocks.snapshotting_started_at,
             self.snapshotting_timeout,
             audit,
-        )?;
+        )
+        .await?;
 
         let checkpoint_id = checkpoint_coordinator
             .begin_checkpoint(|_, _| {})
             .map_err(checkpoint_error)?;
+        let mut checkpoint_started = record.clone();
+        checkpoint_started.cluster_checkpoint_id = Some(checkpoint_id.0);
+        self.save_record(record, checkpoint_started).await?;
 
         for donor in donors {
+            if let (Some(&shard_checkpoint_id), Some(snapshot_id)) = (
+                record.donor_checkpoints.get(&donor.shard_id),
+                record.donor_checkpoint_snapshots.get(&donor.shard_id),
+            ) {
+                checkpoint_coordinator
+                    .record_shard_checkpoint(
+                        donor.shard_id,
+                        PerShardCheckpoint::new(checkpoint_id, shard_checkpoint_id)
+                            .with_snapshot_id(snapshot_id.clone()),
+                        |_| Ok(()),
+                    )
+                    .map_err(checkpoint_error)?;
+                continue;
+            }
+
+            let mut checkpoint_intent = record.clone();
+            checkpoint_intent.checkpoint_intents.insert(donor.shard_id);
+            self.save_record(record, checkpoint_intent).await?;
             let handle =
                 donor.db.create_checkpoint().await.map_err(|e| {
                     MigrationError::Storage(format!("create donor checkpoint: {e}"))
                 })?;
-            record
-                .donor_checkpoints
-                .insert(donor.shard_id, handle.shard_checkpoint_id);
-            record
-                .donor_checkpoint_snapshots
-                .insert(donor.shard_id, handle.snapshot_id.clone());
             checkpoint_coordinator
                 .record_shard_checkpoint(
                     donor.shard_id,
@@ -471,19 +629,32 @@ impl MigrationCoordinator {
                     |_| Ok(()),
                 )
                 .map_err(checkpoint_error)?;
+            let mut checkpoint_completed = record.clone();
+            checkpoint_completed
+                .checkpoint_intents
+                .remove(&donor.shard_id);
+            checkpoint_completed
+                .donor_checkpoints
+                .insert(donor.shard_id, handle.shard_checkpoint_id);
+            checkpoint_completed
+                .donor_checkpoint_snapshots
+                .insert(donor.shard_id, handle.snapshot_id);
+            self.save_record(record, checkpoint_completed).await?;
         }
         let cluster_checkpoint = checkpoint_coordinator
             .latest_committed()
             .ok_or_else(|| MigrationError::Checkpoint("missing committed checkpoint".into()))?;
 
-        self.transition_record(record, MigrationState::Copying, audit)?;
+        self.transition_record_durable(record, MigrationState::Copying, audit)
+            .await?;
         self.abort_on_timeout(
             record,
             MigrationState::Copying,
             clocks.copying_started_at,
             self.copying_timeout,
             audit,
-        )?;
+        )
+        .await?;
 
         self.copy_bounded_chunks(record, donors, recipient).await?;
         Ok(cluster_checkpoint)
@@ -501,6 +672,11 @@ impl MigrationCoordinator {
     ) -> Result<MigrationCopyStats, MigrationError> {
         let mut stats = MigrationCopyStats::default();
         for donor in donors {
+            let completed_pages = record
+                .copy_cursors
+                .get(&donor.shard_id)
+                .copied()
+                .unwrap_or(0);
             let snapshot_id = record
                 .donor_checkpoint_snapshots
                 .get(&donor.shard_id)
@@ -523,62 +699,96 @@ impl MigrationCoordinator {
                     .await;
             });
 
-            while let Some(page) = receiver.recv().await {
-                let entries =
-                    page.map_err(|e| MigrationError::Storage(format!("scan donor page: {e}")))?;
-                let chunk_rows = entries.len();
-                let chunk_bytes: usize = entries
-                    .iter()
-                    .map(|(key, value)| key.len() + value.len())
-                    .sum();
-                let mut batch = WriteBatch::new();
-                for (key, value) in &entries {
-                    batch.put(key, value);
+            let mut page_index = 0;
+            let copy_result: Result<(), MigrationError> = async {
+                while let Some(page) = receiver.recv().await {
+                    let entries =
+                        page.map_err(|e| MigrationError::Storage(format!("scan donor page: {e}")))?;
+                    if page_index < completed_pages {
+                        page_index += 1;
+                        continue;
+                    }
+                    let entries: Vec<_> =
+                        if entries.iter().any(|(key, _)| key.starts_with(b"bucket/")) {
+                            entries
+                                .into_iter()
+                                .filter(|(key, _)| key_in_buckets(key, &record.buckets))
+                                .collect()
+                        } else {
+                            entries
+                        };
+                    let chunk_rows = entries.len();
+                    let chunk_bytes: usize = entries
+                        .iter()
+                        .map(|(key, value)| key.len() + value.len())
+                        .sum();
+                    let mut intent = record.clone();
+                    intent.copy_intents.insert(donor.shard_id, page_index);
+                    self.save_record(record, intent).await?;
+                    if !entries.is_empty() {
+                        let mut batch = WriteBatch::new();
+                        for (key, value) in &entries {
+                            batch.put(key, value);
+                        }
+                        recipient.db.write_batch(batch).await.map_err(|e| {
+                            MigrationError::Storage(format!("copy into recipient: {e}"))
+                        })?;
+                        recipient.db.flush().await.map_err(|e| {
+                            MigrationError::Storage(format!("flush copy chunk: {e}"))
+                        })?;
+                        stats.chunks += 1;
+                        stats.copied_rows += chunk_rows as u64;
+                        stats.copied_bytes += chunk_bytes as u64;
+                        stats.max_chunk_rows = stats.max_chunk_rows.max(chunk_rows);
+                        stats.max_chunk_bytes = stats.max_chunk_bytes.max(chunk_bytes);
+                    }
+                    let mut completed = record.clone();
+                    completed.copy_intents.remove(&donor.shard_id);
+                    completed
+                        .copy_cursors
+                        .insert(donor.shard_id, page_index + 1);
+                    completed.record_progress(
+                        completed.copied_bytes.unwrap_or(0) + chunk_bytes as u64,
+                        completed.copied_rows.unwrap_or(0) + chunk_rows as u64,
+                    );
+                    self.save_record(record, completed).await?;
+                    page_index += 1;
                 }
-                recipient
-                    .db
-                    .write_batch(batch)
-                    .await
-                    .map_err(|e| MigrationError::Storage(format!("copy into recipient: {e}")))?;
-                recipient
-                    .db
-                    .flush()
-                    .await
-                    .map_err(|e| MigrationError::Storage(format!("flush copy chunk: {e}")))?;
-                stats.chunks += 1;
-                stats.copied_rows += chunk_rows as u64;
-                stats.copied_bytes += chunk_bytes as u64;
-                stats.max_chunk_rows = stats.max_chunk_rows.max(chunk_rows);
-                stats.max_chunk_bytes = stats.max_chunk_bytes.max(chunk_bytes);
-                record.record_progress(
-                    record.copied_bytes.unwrap_or(0) + chunk_bytes as u64,
-                    record.copied_rows.unwrap_or(0) + chunk_rows as u64,
-                );
+                Ok(())
             }
-            producer
-                .await
-                .map_err(|e| MigrationError::Storage(format!("scan donor page task: {e}")))?;
+            .await;
+            if copy_result.is_err() {
+                producer.abort();
+                let _ = producer.await;
+                copy_result?;
+            } else {
+                producer
+                    .await
+                    .map_err(|e| MigrationError::Storage(format!("scan donor page task: {e}")))?;
+            }
         }
         Ok(stats)
     }
 
-    pub fn begin_dual_writing(
+    pub async fn begin_dual_writing(
         &self,
         record: &mut MigrationRecord,
         audit: Option<&FileAuditLog>,
     ) -> Result<(), MigrationError> {
-        self.transition_record(record, MigrationState::DualWriting, audit)
+        self.transition_record_durable(record, MigrationState::DualWriting, audit)
+            .await
     }
 
-    pub fn advance_to_catching_up(
+    pub async fn advance_to_catching_up(
         &self,
         record: &mut MigrationRecord,
         audit: Option<&FileAuditLog>,
     ) -> Result<(), MigrationError> {
-        self.transition_record(record, MigrationState::CatchingUp, audit)
+        self.transition_record_durable(record, MigrationState::CatchingUp, audit)
+            .await
     }
 
-    pub fn advance_to_fencing_old_if_caught_up(
+    pub async fn advance_to_fencing_old_if_caught_up(
         &self,
         record: &mut MigrationRecord,
         donor_frontier: Epoch,
@@ -590,11 +800,21 @@ impl MigrationCoordinator {
         if lag > lag_budget_epochs {
             return Ok(false);
         }
-        self.transition_record(record, MigrationState::FencingOld, audit)?;
+        let mut completed = record.clone();
+        completed.donor_frontiers = completed
+            .donor_shards
+            .iter()
+            .copied()
+            .map(|shard_id| (shard_id, donor_frontier))
+            .collect();
+        completed.record_frontiers(donor_frontier, recipient_frontier);
+        self.save_record(record, completed).await?;
+        self.transition_record_durable(record, MigrationState::FencingOld, audit)
+            .await?;
         Ok(true)
     }
 
-    pub fn await_cutover_readiness(
+    pub async fn await_cutover_readiness(
         &self,
         record: &mut MigrationRecord,
         observed_versions: &BucketMapVersionTracker,
@@ -611,10 +831,11 @@ impl MigrationCoordinator {
             started_at,
             audit,
         )
+        .await
     }
 
     /// Require both observer convergence and a committed frontier before cutover.
-    pub fn await_cutover_readiness_at_frontier(
+    pub async fn await_cutover_readiness_at_frontier(
         &self,
         record: &mut MigrationRecord,
         observed_versions: &BucketMapVersionTracker,
@@ -627,13 +848,16 @@ impl MigrationCoordinator {
             return Ok(false);
         }
         if record.state == MigrationState::FencingOld {
-            self.transition_record(record, MigrationState::Cutover, audit)?;
+            self.transition_record_durable(record, MigrationState::Cutover, audit)
+                .await?;
         }
         match observed_versions
             .all_observed(record.target_bucket_map_version, required_components)?
         {
             true => {
-                record.cutover_epoch = Some(committed_frontier);
+                let mut completed = record.clone();
+                completed.cutover_epoch = Some(committed_frontier);
+                self.save_record(record, completed).await?;
                 Ok(true)
             }
             false => {
@@ -644,7 +868,8 @@ impl MigrationCoordinator {
                         started_at,
                         self.cutover_timeout,
                         audit,
-                    )?;
+                    )
+                    .await?;
                 }
                 Ok(false)
             }
@@ -659,8 +884,12 @@ impl MigrationCoordinator {
         audit: Option<&FileAuditLog>,
     ) -> Result<(), MigrationError> {
         if record.state == MigrationState::Cutover {
-            self.transition_record(record, MigrationState::Verifying, audit)?;
+            self.transition_record_durable(record, MigrationState::Verifying, audit)
+                .await?;
         }
+        let mut verification_started = record.clone();
+        verification_started.record_verification_progress(0);
+        self.save_record(record, verification_started).await?;
         let donor_entries = filtered_entries(donor, &record.buckets).await?;
         let recipient_entries = filtered_entries(recipient, &record.buckets).await?;
         let scanned = donor_entries.len().max(recipient_entries.len());
@@ -674,7 +903,8 @@ impl MigrationCoordinator {
         }
         let _sample_rate = self.verify_sample_rate;
         if donor_entries != recipient_entries {
-            self.transition_record(record, MigrationState::DualWriting, audit)?;
+            self.transition_record_durable(record, MigrationState::DualWriting, audit)
+                .await?;
             let key_hex = donor_entries
                 .iter()
                 .zip(recipient_entries.iter())
@@ -690,10 +920,13 @@ impl MigrationCoordinator {
                 .unwrap_or_else(|| "none".to_string());
             return Err(MigrationError::VerificationDiverged { key_hex });
         }
+        let mut verification_completed = record.clone();
+        verification_completed.record_verification_progress(100);
+        self.save_record(record, verification_completed).await?;
         Ok(())
     }
 
-    pub fn maybe_enter_gc_eligible(
+    pub async fn maybe_enter_gc_eligible(
         &self,
         record: &mut MigrationRecord,
         frontiers: &MigrationConsumerFrontierTracker,
@@ -708,7 +941,8 @@ impl MigrationCoordinator {
         if min_frontier < cutover_epoch {
             return Ok(false);
         }
-        self.transition_record(record, MigrationState::GcEligible, audit)?;
+        self.transition_record_durable(record, MigrationState::GcEligible, audit)
+            .await?;
         Ok(true)
     }
 
@@ -719,16 +953,34 @@ impl MigrationCoordinator {
         store: Option<&MigrationPersistentStore>,
         audit: Option<&FileAuditLog>,
     ) -> Result<CleanupStats, MigrationError> {
+        let durable_store = store.or(self.migration_store.as_deref());
+        if record.state == MigrationState::Done {
+            if let Some(store) = durable_store {
+                store.archive(record, audit).await?;
+            }
+            return Ok(CleanupStats { deleted_keys: 0 });
+        }
         if record.state != MigrationState::GcEligible {
             return Err(MigrationError::ReclamationNotReady {
                 state: record.state,
             });
         }
+        let mut cleanup_started = record.clone();
+        cleanup_started.cleanup_intent = true;
+        if let Some(store) = durable_store {
+            store.save(&cleanup_started).await?;
+            *record = cleanup_started;
+        } else {
+            *record = cleanup_started;
+        }
         let stats = cleanup_donor_buckets(donor, &record.buckets).await?;
-        self.transition_record(record, MigrationState::Done, audit)?;
-        if let Some(store) = store {
-            store.save(record).await?;
+        if let Some(store) = durable_store {
+            store
+                .transition(record, MigrationState::Done, audit)
+                .await?;
             store.archive(record, audit).await?;
+        } else {
+            self.transition_record(record, MigrationState::Done, audit)?;
         }
         Ok(stats)
     }
@@ -747,7 +999,7 @@ impl MigrationCoordinator {
         Ok(())
     }
 
-    fn abort_on_timeout(
+    async fn abort_on_timeout(
         &self,
         record: &mut MigrationRecord,
         state: MigrationState,
@@ -760,14 +1012,8 @@ impl MigrationCoordinator {
             return Ok(());
         }
         let err = timeout_error(state, elapsed, budget);
-        let _ = record.apply_transition(MigrationState::Aborted);
-        emit_transition_audit(
-            audit,
-            record,
-            MigrationState::Aborted,
-            true,
-            Some("timeout"),
-        );
+        self.transition_record_durable(record, MigrationState::Aborted, audit)
+            .await?;
         Err(err)
     }
 }
@@ -780,6 +1026,13 @@ pub struct CleanupStats {
 
 pub fn bucket_key_prefix(bucket: u64) -> Vec<u8> {
     format!("bucket/{bucket}/").into_bytes()
+}
+
+fn key_in_buckets(key: &[u8], buckets: &BucketSet) -> bool {
+    buckets
+        .buckets
+        .iter()
+        .any(|bucket| key.starts_with(&bucket_key_prefix(*bucket)))
 }
 
 fn emit_transition_audit(
@@ -818,6 +1071,7 @@ fn assert_single_authoritative(record: &MigrationRecord) {
             | MigrationState::CatchingUp
             | MigrationState::FencingOld
             | MigrationState::Aborted
+            | MigrationState::Failed
     );
     let recipient_authoritative = matches!(
         record.state,
@@ -840,14 +1094,39 @@ async fn filtered_entries(
     let mut filtered = Vec::new();
     for bucket in &buckets.buckets {
         let prefix = bucket_key_prefix(*bucket);
-        let entries = shard
-            .db
-            .scan_prefix(&prefix)
+        let reader = ShardReader::open(shard.path.clone(), shard.object_store.clone())
             .await
-            .map_err(|e| MigrationError::Storage(format!("scan shard entries: {e}")))?;
-        for (key, value) in entries {
-            filtered.push((key.to_vec(), value.to_vec()));
+            .map_err(|e| MigrationError::Storage(format!("open shard verifier: {e}")))?;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let producer = tokio::spawn({
+            async move {
+                reader
+                    .scan_prefix_pages(&prefix, MAX_COPY_CHUNK_ROWS, MAX_COPY_CHUNK_BYTES, sender)
+                    .await;
+            }
+        });
+        while let Some(page) = receiver.recv().await {
+            let entries =
+                page.map_err(|e| MigrationError::Storage(format!("scan shard entries: {e}")))?;
+            if filtered.len() + entries.len() > MAX_VERIFY_SCAN_KEYS {
+                producer.abort();
+                let _ = producer.await;
+                return Err(MigrationError::VerifyWindowFull {
+                    code: "RS-5031",
+                    used: MAX_VERIFY_SCAN_KEYS + 1,
+                    max: MAX_VERIFY_SCAN_KEYS,
+                    next_steps: "reduce verify_sample_rate, split the migration into fewer buckets, or increase the verify scan bound if memory headroom allows",
+                });
+            }
+            filtered.extend(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.to_vec(), value.to_vec())),
+            );
         }
+        producer
+            .await
+            .map_err(|e| MigrationError::Storage(format!("scan shard page task: {e}")))?;
     }
     filtered.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(filtered)
@@ -857,26 +1136,45 @@ async fn cleanup_donor_buckets(
     donor: &MigrationShard,
     buckets: &BucketSet,
 ) -> Result<CleanupStats, MigrationError> {
-    let mut batch = WriteBatch::new();
     let mut deleted_keys = 0usize;
     for bucket in &buckets.buckets {
         let prefix = bucket_key_prefix(*bucket);
-        let entries = donor
-            .db
-            .scan_prefix(&prefix)
+        let reader = ShardReader::open(donor.path.clone(), donor.object_store.clone())
             .await
-            .map_err(|e| MigrationError::Storage(format!("scan donor cleanup prefix: {e}")))?;
-        for (key, _) in entries {
-            batch.delete(&key);
-            deleted_keys += 1;
+            .map_err(|e| MigrationError::Storage(format!("open donor cleanup reader: {e}")))?;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let producer = tokio::spawn({
+            async move {
+                reader
+                    .scan_prefix_pages(&prefix, MAX_COPY_CHUNK_ROWS, MAX_COPY_CHUNK_BYTES, sender)
+                    .await;
+            }
+        });
+        while let Some(page) = receiver.recv().await {
+            let entries = page
+                .map_err(|e| MigrationError::Storage(format!("scan donor cleanup prefix: {e}")))?;
+            if entries.is_empty() {
+                continue;
+            }
+            let mut batch = WriteBatch::new();
+            for (key, _) in entries.into_iter() {
+                batch.delete(key.as_ref());
+                deleted_keys += 1;
+            }
+            donor
+                .db
+                .write_batch(batch)
+                .await
+                .map_err(|e| MigrationError::Storage(format!("delete donor keys: {e}")))?;
+            donor
+                .db
+                .flush()
+                .await
+                .map_err(|e| MigrationError::Storage(format!("flush donor cleanup: {e}")))?;
         }
-    }
-    if deleted_keys > 0 {
-        donor
-            .db
-            .write_batch(batch)
+        producer
             .await
-            .map_err(|e| MigrationError::Storage(format!("delete donor keys: {e}")))?;
+            .map_err(|e| MigrationError::Storage(format!("scan donor cleanup task: {e}")))?;
     }
     Ok(CleanupStats { deleted_keys })
 }

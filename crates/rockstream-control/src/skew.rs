@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rockstream_plan::OpKind;
@@ -291,7 +292,12 @@ impl ProactiveSplitter {
                 .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
         }
 
-        let coordinator = MigrationCoordinator::new();
+        let coordinator = match migration_store {
+            Some(store) => {
+                MigrationCoordinator::new().with_migration_store(Arc::new(store.clone()))
+            }
+            None => MigrationCoordinator::new(),
+        };
         coordinator
             .drive_planned_to_copying(
                 &mut record,
@@ -308,9 +314,11 @@ impl ProactiveSplitter {
             .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
         coordinator
             .begin_dual_writing(&mut record, audit)
+            .await
             .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
         coordinator
             .advance_to_catching_up(&mut record, audit)
+            .await
             .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
         coordinator
             .advance_to_fencing_old_if_caught_up(
@@ -319,6 +327,7 @@ impl ProactiveSplitter {
                 recipient.frontier,
                 audit,
             )
+            .await
             .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
         let tracker = BucketMapVersionTracker::new();
         for component in ["reader", "exchange", "gateway"] {
@@ -335,6 +344,7 @@ impl ProactiveSplitter {
                 Instant::now(),
                 audit,
             )
+            .await
             .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
 
         if let Some(store) = migration_store {
@@ -363,6 +373,13 @@ impl ProactiveSplitter {
                 )
                 .await
                 .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
+        } else {
+            record
+                .apply_transition(rockstream_types::migration::MigrationState::GcEligible)
+                .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
+        }
+        prune_selected_keys(&donor.db, &selected_keys).await?;
+        if let Some(store) = migration_store {
             store
                 .transition(
                     &mut record,
@@ -371,19 +388,13 @@ impl ProactiveSplitter {
                 )
                 .await
                 .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
-        } else {
-            record
-                .apply_transition(rockstream_types::migration::MigrationState::GcEligible)
-                .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
-            record
-                .apply_transition(rockstream_types::migration::MigrationState::Done)
-                .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
-        }
-        prune_selected_keys(&donor.db, &selected_keys).await?;
-        if let Some(store) = migration_store {
             store
                 .archive(&record, audit)
                 .await
+                .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
+        } else {
+            record
+                .apply_transition(rockstream_types::migration::MigrationState::Done)
                 .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
         }
 

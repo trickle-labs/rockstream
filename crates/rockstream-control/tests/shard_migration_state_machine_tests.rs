@@ -1,7 +1,13 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use object_store::memory::InMemory;
+use object_store::path::Path as ObjectPath;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutOptions, PutPayload,
+    PutResult,
+};
 use rockstream_control::{
     BucketMapVersionTracker, CheckpointCoordinator, MigrationConsumerFrontierTracker,
     MigrationCoordinator, MigrationPersistentStore, MigrationShard, PhaseClocks,
@@ -68,6 +74,106 @@ fn step_to_cutover(record: &mut MigrationRecord) {
     record.cutover_epoch = Some(record.planned_frontier);
 }
 
+#[derive(Debug)]
+struct FailOnPutStore {
+    inner: InMemory,
+    put_count: AtomicUsize,
+    fail_at: AtomicUsize,
+}
+
+impl FailOnPutStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemory::new(),
+            put_count: AtomicUsize::new(0),
+            fail_at: AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    fn fail_at(&self, put: usize) {
+        self.fail_at.store(put, Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Display for FailOnPutStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "FailOnPutStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for FailOnPutStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectPath,
+        bytes: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        let put = self.put_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if put == self.fail_at.load(Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "FailOnPutStore",
+                source: "simulated storage failure".into(),
+            });
+        }
+        self.inner.put_opts(location, bytes, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectPath,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&ObjectPath>,
+        offset: &ObjectPath,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+    ) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
 #[tokio::test]
 async fn snapshotting_pins_donor_checkpoint_at_f_plan() {
     let store = Arc::new(InMemory::new());
@@ -82,7 +188,8 @@ async fn snapshotting_pins_donor_checkpoint_at_f_plan() {
 
     let mut record = make_record();
     let checkpoints = CheckpointCoordinator::new(vec![ShardId(1)]);
-    let coordinator = MigrationCoordinator::new();
+    let persistent = Arc::new(MigrationPersistentStore::new(store.clone()));
+    let coordinator = MigrationCoordinator::new().with_migration_store(persistent.clone());
     let manifest = coordinator
         .drive_planned_to_copying(
             &mut record,
@@ -99,12 +206,18 @@ async fn snapshotting_pins_donor_checkpoint_at_f_plan() {
         .unwrap();
 
     assert_eq!(record.planned_frontier, 42);
+    assert_eq!(record.donor_frontier, Some(42));
+    assert_eq!(record.recipient_frontier, Some(42));
+    assert_eq!(record.lag, Some(0));
     assert_eq!(record.state, MigrationState::Copying);
     assert!(record.donor_checkpoints.contains_key(&ShardId(1)));
     assert_eq!(
         manifest.shards[&ShardId(1)].shard_checkpoint_id,
         record.donor_checkpoints[&ShardId(1)]
     );
+    let persisted = persistent.load(&record.migration_id).await.unwrap();
+    assert_eq!(persisted.state, MigrationState::Copying);
+    assert_eq!(persisted.donor_checkpoints, record.donor_checkpoints);
 }
 
 #[tokio::test]
@@ -140,7 +253,7 @@ async fn copying_recipient_matches_donor_checkpoint() {
     assert_eq!(record.donor_checkpoint_snapshots.len(), 1);
     assert_eq!(
         record.copied_rows,
-        Some(donor.db.scan_prefix(b"").await.unwrap().len() as u64)
+        Some(scan_bucket(&donor.db, 7).await.len() as u64)
     );
 }
 
@@ -153,6 +266,7 @@ async fn bounded_copy_chunks_report_exact_limits_and_output() {
     for i in 0..300 {
         batch.put(&make_key(7, &format!("k{i:04}")), b"value");
     }
+    batch.put(&make_key(99, "not-migrating"), b"value");
     donor.db.write_batch(batch).await.unwrap();
     donor.db.flush().await.unwrap();
 
@@ -161,7 +275,7 @@ async fn bounded_copy_chunks_report_exact_limits_and_output() {
         .apply_transition(MigrationState::Snapshotting)
         .unwrap();
     record.apply_transition(MigrationState::Copying).unwrap();
-    let source_rows = donor.db.scan_prefix(b"").await.unwrap().len();
+    let source_rows = scan_bucket(&donor.db, 7).await.len();
     let stats = MigrationCoordinator::new()
         .copy_bounded_chunks(&mut record, &[donor], &recipient)
         .await
@@ -172,6 +286,86 @@ async fn bounded_copy_chunks_report_exact_limits_and_output() {
     assert!(stats.max_chunk_rows <= 256);
     assert!(stats.max_chunk_bytes <= 1024 * 1024);
     assert_eq!(scan_bucket(&recipient.db, 7).await.len(), 300);
+    assert_eq!(scan_bucket(&recipient.db, 99).await, Vec::new());
+}
+
+#[tokio::test]
+async fn copy_write_failure_requires_a_durable_intent_and_replays_exactly_once() {
+    let donor = make_shard(1, "migration/replay-donor", Arc::new(InMemory::new()), 42).await;
+    let recipient = make_shard(
+        2,
+        "migration/replay-recipient",
+        Arc::new(InMemory::new()),
+        42,
+    )
+    .await;
+    donor.db.put(&make_key(7, "once"), b"value").await.unwrap();
+    donor.db.flush().await.unwrap();
+
+    let failing_store = Arc::new(FailOnPutStore::new());
+    let persistent = Arc::new(MigrationPersistentStore::new(failing_store.clone()));
+    let coordinator = MigrationCoordinator::new().with_migration_store(persistent.clone());
+    let mut record = make_record();
+    record
+        .apply_transition(MigrationState::Snapshotting)
+        .unwrap();
+    record.apply_transition(MigrationState::Copying).unwrap();
+    persistent.save(&record).await.unwrap();
+
+    let before_intent_failure = record.clone();
+    failing_store.fail_at(2);
+    assert!(matches!(
+        coordinator
+            .copy_bounded_chunks(&mut record, std::slice::from_ref(&donor), &recipient)
+            .await,
+        Err(rockstream_control::MigrationError::Storage(_))
+    ));
+    assert_eq!(record, before_intent_failure);
+    assert_eq!(scan_bucket(&recipient.db, 7).await, Vec::new());
+
+    failing_store.fail_at(4);
+    assert!(matches!(
+        coordinator
+            .copy_bounded_chunks(&mut record, std::slice::from_ref(&donor), &recipient)
+            .await,
+        Err(rockstream_control::MigrationError::Storage(_))
+    ));
+    assert_eq!(
+        record.copy_intents,
+        std::collections::BTreeMap::from([(ShardId(1), 0)])
+    );
+    assert_eq!(record.copy_cursors, std::collections::BTreeMap::new());
+    assert_eq!(
+        scan_bucket(&recipient.db, 7).await,
+        vec![(make_key(7, "once"), b"value".to_vec())]
+    );
+
+    failing_store.fail_at(usize::MAX);
+    assert_eq!(
+        coordinator
+            .copy_bounded_chunks(&mut record, std::slice::from_ref(&donor), &recipient)
+            .await
+            .unwrap(),
+        rockstream_control::MigrationCopyStats {
+            chunks: 1,
+            copied_rows: 1,
+            copied_bytes: 18,
+            max_chunk_rows: 1,
+            max_chunk_bytes: 18,
+        }
+    );
+    assert_eq!(
+        record.copy_cursors,
+        std::collections::BTreeMap::from([(ShardId(1), 1)])
+    );
+    assert_eq!(record.copy_intents, std::collections::BTreeMap::new());
+    assert_eq!(record.copied_rows, Some(1));
+    assert_eq!(record.copied_bytes, Some(18));
+    assert_eq!(record.progress().estimated_rows, None);
+    assert_eq!(
+        scan_bucket(&recipient.db, 7).await,
+        vec![(make_key(7, "once"), b"value".to_vec())]
+    );
 }
 
 #[tokio::test]
@@ -221,6 +415,7 @@ async fn verifying_scan_compare_detects_divergence_and_aborts() {
         .unwrap_err();
     assert!(err.to_string().contains("RS-5034"));
     assert_eq!(record.state, MigrationState::DualWriting);
+    assert_eq!(record.verification_progress, Some(0));
 }
 
 #[tokio::test]
@@ -237,17 +432,20 @@ async fn gc_eligible_blocked_until_consumer_frontier_passes_cutover() {
         )
         .await
         .unwrap();
+    assert_eq!(record.verification_progress, Some(100));
     tracker.observe("reader-a", 41).unwrap();
     tracker.observe("gateway-a", 42).unwrap();
 
     assert!(!MigrationCoordinator::new()
         .maybe_enter_gc_eligible(&mut record, &tracker, None)
+        .await
         .unwrap());
     assert_eq!(record.state, MigrationState::Verifying);
 
     tracker.observe("reader-a", 42).unwrap();
     assert!(MigrationCoordinator::new()
         .maybe_enter_gc_eligible(&mut record, &tracker, None)
+        .await
         .unwrap());
     assert_eq!(record.state, MigrationState::GcEligible); // M6-S3
 }
@@ -283,10 +481,14 @@ async fn done_cleanup_is_scan_and_delete_never_range_delete() {
         .await
         .unwrap();
     assert_eq!(record.state, MigrationState::Done);
+    assert!(record.cleanup_intent);
     assert_eq!(stats.deleted_keys, 1);
     assert!(scan_bucket(&donor.db, 7).await.is_empty());
     assert_eq!(scan_bucket(&donor.db, 99).await.len(), 1);
-    assert!(persistent.load(&record.migration_id).await.is_none());
+    assert_eq!(
+        persistent.load(&record.migration_id).await,
+        Err(rockstream_control::MigrationLoadError::Missing)
+    );
     assert_eq!(
         persistent
             .load_history(&record.migration_id)
@@ -294,6 +496,13 @@ async fn done_cleanup_is_scan_and_delete_never_range_delete() {
             .unwrap()
             .state,
         MigrationState::Done
+    );
+    assert!(
+        persistent
+            .load_history(&record.migration_id)
+            .await
+            .unwrap()
+            .cleanup_intent
     );
 
     let source =
@@ -359,6 +568,7 @@ async fn cutover_waits_for_all_observers_before_verifying() {
             Instant::now(),
             None,
         )
+        .await
         .unwrap());
     assert_eq!(record.state, MigrationState::Cutover);
     tracker.observe("gateway", 9).unwrap();
@@ -370,11 +580,12 @@ async fn cutover_waits_for_all_observers_before_verifying() {
             Instant::now(),
             None,
         )
+        .await
         .unwrap());
 }
 
-#[test]
-fn cutover_requires_a_committed_frontier() {
+#[tokio::test]
+async fn cutover_requires_a_committed_frontier() {
     let tracker = BucketMapVersionTracker::new();
     let mut record = make_record();
     for state in [
@@ -400,6 +611,7 @@ fn cutover_requires_a_committed_frontier() {
             Instant::now(),
             None,
         )
+        .await
         .unwrap());
     assert_eq!(record.state, MigrationState::FencingOld);
     assert!(coordinator
@@ -411,6 +623,7 @@ fn cutover_requires_a_committed_frontier() {
             Instant::now(),
             None,
         )
+        .await
         .unwrap());
     assert_eq!(record.cutover_epoch, Some(42));
 }
@@ -438,7 +651,7 @@ fn test_migration_progress_monotonic_all_phases() {
     assert_eq!(record.progress_phase(), "planned");
     assert_eq!(record.bytes_remaining(), Some(10_000_000));
     assert_eq!(record.rows_remaining(), Some(50_000));
-    assert!(record.estimated_remaining_ms().is_some());
+    assert_eq!(record.estimated_remaining_ms(), None);
 
     record
         .apply_transition(MigrationState::Snapshotting)
@@ -455,7 +668,7 @@ fn test_migration_progress_monotonic_all_phases() {
     record.record_progress(4_000_000, 20_000);
     assert_eq!(record.bytes_remaining(), Some(6_000_000));
     assert_eq!(record.rows_remaining(), Some(30_000));
-    assert!(record.estimated_remaining_ms().unwrap() > 0);
+    assert_eq!(record.estimated_remaining_ms(), None);
 
     record.record_progress(8_000_000, 40_000);
     assert_eq!(record.bytes_remaining(), Some(2_000_000));
@@ -477,7 +690,7 @@ fn test_migration_progress_monotonic_all_phases() {
         assert_eq!(record.progress_phase(), next_state.to_string());
         assert_eq!(record.bytes_remaining(), Some(0));
         assert_eq!(record.rows_remaining(), Some(0));
-        assert!(record.estimated_remaining_ms().is_some());
+        assert_eq!(record.estimated_remaining_ms(), None);
     }
 
     record.apply_transition(MigrationState::Done).unwrap();

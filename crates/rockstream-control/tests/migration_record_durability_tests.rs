@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::{ObjectStore, ObjectStoreExt};
-use rockstream_control::MigrationPersistentStore;
+use rockstream_control::{MigrationLoadError, MigrationPersistentStore, ShardManager};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{minio_object_store, start_minio};
-use rockstream_types::ids::ShardId;
-use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
+use rockstream_types::ids::{ShardId, WorkerId};
+use rockstream_types::migration::{
+    BucketSet, MigrationRecord, MigrationState, MIGRATION_RECORD_VERSION,
+};
 
 fn make_record() -> MigrationRecord {
     let mut record = MigrationRecord::new(
@@ -28,6 +30,93 @@ fn make_record() -> MigrationRecord {
 }
 
 const MINIO_BUCKET: &str = "rockstream-migration-durability-test";
+
+#[tokio::test]
+async fn migration_record_load_distinguishes_missing_corrupt_and_unsupported() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let persistent = MigrationPersistentStore::new(store.clone());
+
+    assert_eq!(
+        persistent.load("missing").await,
+        Err(MigrationLoadError::Missing)
+    );
+
+    store
+        .put(
+            &object_store::path::Path::from("topology/migration/corrupt.json"),
+            b"not-json".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        persistent.load("corrupt").await,
+        Err(MigrationLoadError::Corrupt(_))
+    ));
+
+    let mut unsupported = make_record();
+    unsupported.record_version = 99;
+    persistent.save(&unsupported).await.unwrap();
+    assert_eq!(
+        persistent.load(&unsupported.migration_id).await,
+        Err(MigrationLoadError::UnsupportedVersion {
+            found: 99,
+            expected: MIGRATION_RECORD_VERSION,
+        })
+    );
+}
+
+#[tokio::test]
+async fn active_migrations_load_in_stable_order_after_restart() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let persistent = MigrationPersistentStore::new(store);
+    let first = MigrationRecord::new(
+        "migration-b",
+        vec![ShardId(1)],
+        ShardId(2),
+        BucketSet::new([8]),
+        42,
+        9,
+    );
+    let second = MigrationRecord::new(
+        "migration-a",
+        vec![ShardId(3)],
+        ShardId(4),
+        BucketSet::new([9]),
+        43,
+        10,
+    );
+    persistent.save(&first).await.unwrap();
+    persistent.save(&second).await.unwrap();
+
+    assert_eq!(
+        persistent.load_active().await.unwrap(),
+        vec![second.clone(), first.clone()]
+    );
+    persistent.archive(&first, None).await.unwrap();
+    assert_eq!(persistent.load_active().await.unwrap(), vec![second]);
+}
+
+#[tokio::test]
+async fn active_migration_recovery_captures_current_leases() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let persistent = MigrationPersistentStore::new(store);
+    let record = make_record();
+    persistent.save(&record).await.unwrap();
+    let manager = ShardManager::new();
+    let donor_lease = manager.acquire(ShardId(1), WorkerId(10)).unwrap();
+    let recipient_lease = manager.acquire(ShardId(2), WorkerId(20)).unwrap();
+
+    assert_eq!(
+        persistent.recover_active(&manager).await.unwrap(),
+        vec![rockstream_control::MigrationRecovery {
+            record,
+            current_leases: std::collections::BTreeMap::from([
+                (ShardId(1), Some(donor_lease)),
+                (ShardId(2), Some(recipient_lease)),
+            ]),
+        }]
+    );
+}
 
 #[tokio::test]
 async fn migration_record_survives_restart_lfs() {
@@ -88,7 +177,7 @@ async fn test_interrupted_migration_progress_survives_restart_lfs_and_minio() {
     assert_eq!(loaded.progress_phase(), record.progress_phase());
     assert_eq!(loaded.bytes_remaining(), Some(0)); // dual_writing has 0 bytes remaining
     assert_eq!(loaded.rows_remaining(), Some(0));
-    assert!(loaded.estimated_remaining_ms().is_some());
+    assert_eq!(loaded.estimated_remaining_ms(), None);
 
     // Advance loaded record after restart
     loaded.apply_transition(MigrationState::CatchingUp).unwrap();

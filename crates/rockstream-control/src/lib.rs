@@ -77,12 +77,14 @@ pub use manifest::{
 };
 pub use migration::{
     BucketMapVersionTracker, MigrationConsumerFrontierTracker, MigrationCoordinator,
-    MigrationCopyStats, MigrationError, MigrationFillLevel, MigrationPersistentStore,
-    MigrationShard, PhaseClocks, MAX_COPY_CHUNK_BYTES, MAX_COPY_CHUNK_ROWS,
+    MigrationCopyStats, MigrationError, MigrationFillLevel, MigrationLoadError,
+    MigrationPersistentStore, MigrationRecovery, MigrationShard, PhaseClocks,
+    MAX_ACTIVE_MIGRATIONS, MAX_COPY_CHUNK_BYTES, MAX_COPY_CHUNK_ROWS,
 };
 pub use namespace::NamespaceCatalog;
 pub use placement::PlacementAlgorithm;
 pub use qualification_store::QualificationEvidenceStore;
+pub use rockstream_types::migration::MigrationProgress;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use secret_store::{SecretListing, SecretStore, SecretStoreError};
 pub use service::{ControlService, ControlServiceHandle};

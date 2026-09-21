@@ -56,6 +56,40 @@ fn spawn(args: &[&str]) -> Child {
         .unwrap()
 }
 
+fn spawn_worker(
+    storage: &std::path::Path,
+    control_addr: &str,
+    worker_id: u64,
+    minio_port: u16,
+    bucket: &str,
+) -> Child {
+    let worker_id = worker_id.to_string();
+    Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .args([
+            "start",
+            "--storage",
+            storage.to_str().unwrap(),
+            "--role",
+            "worker",
+            "--control",
+            control_addr,
+            "--worker-id",
+            &worker_id,
+        ])
+        .env(
+            "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
+            format!("http://127.0.0.1:{minio_port}"),
+        )
+        .env("ROCKSTREAM_OBJECT_STORE_BUCKET", bucket)
+        .env("ROCKSTREAM_OBJECT_STORE_REGION", "us-east-1")
+        .env("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY", MINIO_USER)
+        .env("ROCKSTREAM_OBJECT_STORE_SECRET_KEY", MINIO_PASS)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
 fn management_status_json(management_addr: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rockstream"))
         .env("RUST_LOG", "off")
@@ -820,38 +854,18 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     ]);
     let mut workers = Vec::new();
     for worker_id in [601_u64, 602] {
-        let worker_id = worker_id.to_string();
         let worker_storage = root.path().join(format!("worker-{worker_id}"));
         std::fs::create_dir_all(&worker_storage).unwrap();
-        workers.push(
-            Command::new(env!("CARGO_BIN_EXE_rockstream"))
-                .args([
-                    "start",
-                    "--storage",
-                    worker_storage.to_str().unwrap(),
-                    "--role",
-                    "worker",
-                    "--control",
-                    &control_addr,
-                    "--worker-id",
-                    &worker_id,
-                ])
-                .env(
-                    "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
-                    format!("http://127.0.0.1:{minio_port}"),
-                )
-                .env("ROCKSTREAM_OBJECT_STORE_BUCKET", bucket)
-                .env("ROCKSTREAM_OBJECT_STORE_REGION", "us-east-1")
-                .env("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY", MINIO_USER)
-                .env("ROCKSTREAM_OBJECT_STORE_SECRET_KEY", MINIO_PASS)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
+        workers.push(spawn_worker(
+            &worker_storage,
+            &control_addr,
+            worker_id,
+            minio_port,
+            bucket,
+        ));
     }
     wait_for_registered_workers(&control_storage.join("audit.jsonl"), 2).await;
-    let processes = ManagementProcesses { control, workers };
+    let mut processes = ManagementProcesses { control, workers };
     wait_for_management_status_nodes(&management_addr, 2).await;
 
     let endpoint = format!("http://{management_addr}");
@@ -1059,7 +1073,6 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
             source_version: "operation-record:2".to_owned(),
         }
     );
-
     let request = MigrateShardRequest {
         protocol_version: 1,
         shard_id: shard_id.clone(),
@@ -1153,7 +1166,6 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
             "resume recipient worker"
         );
     }
-
     let deadline = Instant::now() + Duration::from_secs(30);
     let terminal = loop {
         let operation = management
@@ -1338,7 +1350,11 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
             ])
             .output()
             .expect("show release drain operation");
-        assert!(shown.status.success());
+        assert!(
+            shown.status.success(),
+            "show drain operation failed: {}",
+            String::from_utf8_lossy(&shown.stderr)
+        );
         assert_eq!(shown.stderr, b"");
         let transcript = String::from_utf8(shown.stdout.clone()).unwrap();
         let operation: ManagementOperationInfo =
@@ -1374,6 +1390,41 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
         .expect("drained shard remains leased");
     assert_eq!(drained_shard.owner_node_id, "601");
     assert!(drained_shard.lease_token > transferred_shard.lease_token);
+
+    processes.control.kill().unwrap();
+    processes.control.wait().unwrap();
+    processes.control = spawn(&[
+        "start",
+        "--storage",
+        control_storage.to_str().unwrap(),
+        "--role",
+        "control",
+        "--control-shared-storage",
+        shared_control_storage.to_str().unwrap(),
+        "--control-bind",
+        &control_addr,
+        "--management-addr",
+        &management_addr,
+        "--daemon",
+    ]);
+    wait_for_management_status_nodes(&management_addr, 2).await;
+    let endpoint = format!("http://{management_addr}");
+    management = ManagementServiceClient::connect(endpoint)
+        .await
+        .expect("reconnect to restarted management process");
+    let recovered = management
+        .get_operation(GetOperationRequest {
+            protocol_version: 1,
+            operation_id: drain_accepted.operation_id.clone(),
+        })
+        .await
+        .expect("read terminal operation after controller restart")
+        .into_inner()
+        .operation
+        .expect("recovered terminal operation");
+    assert_eq!(recovered.state, "succeeded");
+    assert_eq!(recovered.progress, "100%");
+    assert_eq!(recovered.phase, "completed");
 
     drop(management);
     drop(processes);
