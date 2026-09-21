@@ -138,15 +138,20 @@ fn make_left_delta() -> ArrowZSet {
         Field::new("k", DataType::Int64, false),
         Field::new("v", DataType::Int64, false),
     ]));
+    let keys = [1, 32]
+        .into_iter()
+        .chain(10_000..10_032)
+        .collect::<Vec<_>>();
+    let values = [10, 20].into_iter().chain(30..62).collect::<Vec<_>>();
     let data = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int64Array::from(vec![1, 32, 10_000])) as _,
-            Arc::new(Int64Array::from(vec![10, 20, 30])) as _,
+            Arc::new(Int64Array::from(keys)) as _,
+            Arc::new(Int64Array::from(values)) as _,
         ],
     )
     .expect("build left delta");
-    ArrowZSet::new(data, vec![1, 1, 1])
+    ArrowZSet::new(data, vec![1; 34])
 }
 
 fn join_values(output: &ArrowZSet) -> Vec<Vec<i64>> {
