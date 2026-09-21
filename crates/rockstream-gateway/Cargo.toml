@@ -46,7 +46,7 @@ chrono.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true
 postgres-types.workspace = true
-object_store = { version = "0.12", features = ["aws"] }
+object_store = { workspace = true }
 rockstream-connectors.workspace = true
 
 

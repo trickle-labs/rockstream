@@ -9,7 +9,7 @@ use bytes::Bytes;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_sim::sim::SimRuntime;
 use rockstream_storage::TieredObjectStore;
 use tempfile::TempDir;

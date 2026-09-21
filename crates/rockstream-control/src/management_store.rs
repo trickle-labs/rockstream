@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;

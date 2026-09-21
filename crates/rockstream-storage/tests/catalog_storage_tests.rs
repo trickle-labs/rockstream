@@ -1,6 +1,6 @@
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use rockstream_storage::catalog::log::CatalogLogManager;
 use rockstream_storage::catalog::*;
 use rockstream_types::ids::*;

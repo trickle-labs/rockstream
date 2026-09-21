@@ -11,8 +11,9 @@ use futures::stream::{self, BoxStream, StreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{
-    Attribute, AttributeValue, Attributes, GetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    Attribute, AttributeValue, Attributes, CopyMode, CopyOptions, GetOptions, GetResult,
+    ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, RenameOptions, RenameTargetMode, Result,
 };
 
 use crate::error::StorageError;
@@ -110,10 +111,6 @@ impl std::fmt::Debug for TieredObjectStore {
 
 #[async_trait]
 impl ObjectStore for TieredObjectStore {
-    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-        self.primary_store(location).put(location, payload).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -123,10 +120,6 @@ impl ObjectStore for TieredObjectStore {
         self.primary_store(location)
             .put_opts(location, payload, opts)
             .await
-    }
-
-    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-        self.primary_store(location).put_multipart(location).await
     }
 
     async fn put_multipart_opts(
@@ -139,23 +132,10 @@ impl ObjectStore for TieredObjectStore {
             .await
     }
 
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        self.get_with_fallback(location, |store| async move { store.get(location).await })
-            .await
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         self.get_with_fallback(location, |store| {
             let options = options.clone();
             async move { store.get_opts(location, options).await }
-        })
-        .await
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        self.get_with_fallback(location, |store| {
-            let range = range.clone();
-            async move { store.get_range(location, range).await }
         })
         .await
     }
@@ -168,13 +148,21 @@ impl ObjectStore for TieredObjectStore {
         .await
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        self.get_with_fallback(location, |store| async move { store.head(location).await })
-            .await
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.primary_store(location).delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let this = self.clone();
+        locations
+            .then(move |location| {
+                let this = this.clone();
+                async move {
+                    let location = location?;
+                    this.primary_store(&location).delete(&location).await?;
+                    Ok(location)
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -207,32 +195,25 @@ impl ObjectStore for TieredObjectStore {
         Ok(ListResult {
             common_prefixes: common_prefixes.into_iter().collect(),
             objects,
+            extensions: Default::default(),
         })
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        if matches!(options.mode, CopyMode::Create) && self.head(to).await.is_ok() {
+            return Ok(());
+        }
         let bytes = self.get(from).await?.bytes().await?;
         self.put(to, bytes.into()).await?;
         Ok(())
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        if self.head(to).await.is_ok() {
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+        if matches!(options.target_mode, RenameTargetMode::Create) && self.head(to).await.is_ok() {
             return Ok(());
         }
-        self.copy(from, to).await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         self.copy(from, to).await?;
         self.delete(from).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        if self.head(to).await.is_ok() {
-            return Ok(());
-        }
-        self.rename(from, to).await
     }
 }
 
@@ -1001,9 +982,6 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for CorruptingStore {
-        async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-            self.inner.put(location, payload).await
-        }
         async fn put_opts(
             &self,
             location: &Path,
@@ -1012,9 +990,6 @@ mod tests {
         ) -> Result<PutResult> {
             self.inner.put_opts(location, payload, opts).await
         }
-        async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart(location).await
-        }
         async fn put_multipart_opts(
             &self,
             location: &Path,
@@ -1022,10 +997,10 @@ mod tests {
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
-        async fn get(&self, location: &Path) -> Result<GetResult> {
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
             // Ensure the object exists (propagates NotFound like a real
             // store), then corrupt the returned payload.
-            let real = self.inner.get(location).await?;
+            let real = self.inner.get_opts(location, options).await?;
             let meta = real.meta.clone();
             Ok(GetResult {
                 payload: object_store::GetResultPayload::Stream(
@@ -1034,22 +1009,14 @@ mod tests {
                 meta,
                 range: 0..9,
                 attributes: Attributes::new(),
+                extensions: Default::default(),
             })
         }
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-        async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-            self.inner.get_range(location, range).await
-        }
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-            self.inner.get_ranges(location, ranges).await
-        }
-        async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-            self.inner.head(location).await
-        }
-        async fn delete(&self, location: &Path) -> Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
         }
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list(prefix)
@@ -1057,11 +1024,8 @@ mod tests {
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

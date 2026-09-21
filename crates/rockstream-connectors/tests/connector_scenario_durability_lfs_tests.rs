@@ -17,7 +17,7 @@ mod common;
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::{ClientConfig, Message};
 use rockstream_connectors::{KafkaSink, SinkConnector};

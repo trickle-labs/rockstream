@@ -7,7 +7,6 @@
 //! - p99 differentiation latency bounds
 //! - S3 GET amplification minimization via CountingObjectStore
 
-use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,12 +15,11 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use rockstream_ops::join::stable_row_id;
@@ -79,8 +77,11 @@ impl ObjectStore for CountingObjectStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -99,17 +100,13 @@ impl ObjectStore for CountingObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.copy_if_not_exists(from, to).await
-    }
-
-    async fn get_range(&self, location: &ObjPath, range: Range<u64>) -> ObjectStoreResult<Bytes> {
-        self.get_count.fetch_add(1, Ordering::SeqCst);
-        self.inner.get_range(location, range).await
+    async fn copy_opts(
+        &self,
+        from: &ObjPath,
+        to: &ObjPath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

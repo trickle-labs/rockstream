@@ -142,7 +142,8 @@ async fn test_create_mat_view_storage_failure_fails_closed() {
     // Failing object store simulator
     use object_store::path::Path as ObjectPath;
     use object_store::{
-        GetResult, ListResult, MultipartUpload, ObjectMeta, PutOptions, PutPayload, PutResult,
+        CopyOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutOptions, PutPayload,
+        PutResult,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -182,8 +183,11 @@ async fn test_create_mat_view_storage_failure_fails_closed() {
         ) -> object_store::Result<GetResult> {
             self.inner.get_opts(location, options).await
         }
-        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
         }
         fn list(
             &self,
@@ -204,15 +208,13 @@ async fn test_create_mat_view_storage_failure_fails_closed() {
         ) -> object_store::Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn copy_if_not_exists(
+        async fn copy_opts(
             &self,
             from: &ObjectPath,
             to: &ObjectPath,
+            options: CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

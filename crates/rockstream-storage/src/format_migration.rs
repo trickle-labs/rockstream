@@ -281,7 +281,7 @@ async fn migrate_shard_format_single_step(
 
     let progress_key = migration_progress_key(from, to);
     let mut processed = 0usize;
-    let mut iter = raw.scan::<&[u8], _>(..).await?;
+    let mut iter = raw.scan(..).await?;
     while let Some(entry) = iter.next().await? {
         if !is_data_key(&entry.key) {
             continue;

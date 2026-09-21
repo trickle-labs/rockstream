@@ -6,7 +6,7 @@
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;

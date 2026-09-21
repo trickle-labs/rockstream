@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use object_store::{path::Path, ObjectStore};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -871,7 +871,7 @@ async fn manifest_object_paths_at(
         add_view(view, shard_path);
     }
     for run in manifest.compacted() {
-        for view in &run.sst_views {
+        for view in run.sst_views() {
             add_view(view, shard_path);
         }
     }
@@ -880,7 +880,7 @@ async fn manifest_object_paths_at(
             add_view(view, shard_path);
         }
         for run in segment.compacted() {
-            for view in &run.sst_views {
+            for view in run.sst_views() {
                 add_view(view, shard_path);
             }
         }

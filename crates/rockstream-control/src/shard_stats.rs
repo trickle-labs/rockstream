@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::frontier::ShardColumnStats;
 use rockstream_types::ids::{ShardId, ViewId};

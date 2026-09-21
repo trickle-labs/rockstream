@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
 
@@ -97,9 +97,14 @@ impl<T: ObjectStore> ObjectStore for ThrottledStoreWrapper<T> {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.maybe_fail()?;
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        if let Err(error) = self.maybe_fail() {
+            return futures::stream::once(async move { Err(error) }).boxed();
+        }
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -111,14 +116,9 @@ impl<T: ObjectStore> ObjectStore for ThrottledStoreWrapper<T> {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         self.maybe_fail()?;
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.maybe_fail()?;
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 
     async fn put_multipart_opts(
@@ -173,6 +173,7 @@ impl ObjectStore for SimObjectStoreWrapper {
         Ok(PutResult {
             e_tag: None,
             version: None,
+            extensions: Default::default(),
         })
     }
 
@@ -208,14 +209,22 @@ impl ObjectStore for SimObjectStoreWrapper {
             },
             range,
             attributes: Default::default(),
+            extensions: Default::default(),
         })
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.inner
-            .delete(location.as_ref())
-            .map_err(Self::convert_err)?;
-        Ok(())
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let inner = self.inner.clone();
+        locations
+            .map(move |location| {
+                let location = location?;
+                inner.delete(location.as_ref()).map_err(Self::convert_err)?;
+                Ok(location)
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -242,15 +251,9 @@ impl ObjectStore for SimObjectStoreWrapper {
         })
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         Err(object_store::Error::NotSupported {
             source: Box::new(std::io::Error::other("copy not supported")),
-        })
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: Box::new(std::io::Error::other("copy_if_not_exists not supported")),
         })
     }
 

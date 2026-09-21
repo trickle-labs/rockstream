@@ -426,7 +426,7 @@ impl SecretStore {
         if let Some(db) = &self.db {
             let prefix = secrets_namespace_prefix(namespace_id);
             let mut iter = db
-                .scan_prefix(&prefix)
+                .scan_prefix(&prefix, ..)
                 .await
                 .map_err(|e| SecretStoreError::storage(e.to_string()))?;
             let mut count = 0;
@@ -631,7 +631,7 @@ impl SecretStore {
         if let Some(db) = &self.db {
             let prefix = secrets_namespace_prefix(namespace_id);
             let mut iter = db
-                .scan_prefix(&prefix)
+                .scan_prefix(&prefix, ..)
                 .await
                 .map_err(|e| SecretStoreError::storage(e.to_string()))?;
             while let Some(entry) = iter
@@ -696,7 +696,7 @@ impl SecretStore {
         if let Some(db) = &self.db {
             let prefix = CATALOG_SECRETS_PREFIX;
             let mut iter = db
-                .scan_prefix(&prefix)
+                .scan_prefix(&prefix, ..)
                 .await
                 .map_err(|e| SecretStoreError::storage(e.to_string()))?;
             while let Some(entry) = iter

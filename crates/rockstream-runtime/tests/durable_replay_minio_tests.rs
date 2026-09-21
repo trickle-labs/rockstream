@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_runtime::exchange::persistence::{
     committed_frontier, execute_durable_request, RequestIdentity,
 };

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_control::{
     ManagementOperationStore, OperationKind, OperationLifecycleError, OperationRecord,
     OperationStatus, OperationStoreError, OperationUpdate,

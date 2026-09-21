@@ -46,7 +46,6 @@ use rockstream_types::frontier::{
 };
 use rockstream_types::ids::{AggregatorId, LeaseToken, ShardId};
 use rockstream_types::timestamp::Epoch;
-use slatedb::config::WriteOptions;
 use slatedb::{Db, WriteBatch};
 
 use crate::audit::{AuditEvent, FileAuditLog};
@@ -777,7 +776,7 @@ struct LeaseState {
     published: Option<Epoch>,
     published_by_generation: HashMap<(String, u64), Epoch>,
     /// v0.45.6 (M2-S3/S4 pair): `true` once `published` has been confirmed
-    /// durably flushed (`WriteOptions { await_durable: true }`) — checked by
+    /// durably flushed after each write — checked by
     /// [`assert_flush_before_lease_handoff_read`] on every lease handoff.
     last_write_synced: bool,
 }
@@ -790,9 +789,9 @@ struct LeaseState {
 /// storage), keyed on `frontier/leader` / `frontier/published`. Mirrors
 /// `formal/m2_frontier_agg.fizz`'s `ObjectStore.cas_lease`/`write_frontier`.
 ///
-/// Every write is issued with `WriteOptions { await_durable: true }`
-/// (DESIGN.md §3.2 "Synchronous frontier writes") so a lease handoff can
-/// never observe a not-yet-durable value — enforced by
+/// Every write is followed by `Db::flush` (DESIGN.md §3.2 "Synchronous
+/// frontier writes") so a lease handoff can never observe a not-yet-durable
+/// value — enforced by
 /// [`assert_flush_before_lease_handoff_read`].
 pub struct FrontierLeaseStore {
     db: Db,
@@ -880,13 +879,11 @@ impl FrontierLeaseStore {
         let mut batch = WriteBatch::new();
         batch.put(LEASE_KEY, &record);
         self.db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: true,
-                    ..Default::default()
-                },
-            )
+            .write(batch)
+            .await
+            .map_err(|e| FrontierLeaseError::Storage(e.to_string()))?;
+        self.db
+            .flush()
             .await
             .map_err(|e| FrontierLeaseError::Storage(e.to_string()))?;
 
@@ -967,13 +964,11 @@ impl FrontierLeaseStore {
         let mut batch = WriteBatch::new();
         batch.put(key, frontier.to_be_bytes());
         self.db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: true,
-                    ..Default::default()
-                },
-            )
+            .write(batch)
+            .await
+            .map_err(|e| FrontierLeaseError::Storage(e.to_string()))?;
+        self.db
+            .flush()
             .await
             .map_err(|e| FrontierLeaseError::Storage(e.to_string()))?;
 
@@ -1109,8 +1104,8 @@ pub fn assert_valid_publisher(
 /// **M2-S3/M2-S4 paired assertion** (second half of the pair, per
 /// FIZZBEE_TEST_PLAN.md §3.7's M2-S3/S4 row): a newly-elected publisher's
 /// first read of the published frontier during lease handoff must only
-/// ever observe a synchronously-flushed (`WriteOptions { await_durable:
-/// true }`) write — never an in-flight or lost one.
+/// ever observe a synchronously-flushed write — never an in-flight or lost
+/// one.
 ///
 /// # Panics
 ///
@@ -1124,7 +1119,7 @@ pub fn assert_flush_before_lease_handoff_read(has_published_value: bool, last_wr
          a published frontier value exists but was not confirmed durably \
          flushed before being observed during lease handoff. \
          next_steps: verify every publish_frontier write path uses \
-         WriteOptions {{ await_durable: true }}; this indicates a durability \
+         Db::flush(); this indicates a durability \
          regression in FrontierLeaseStore."
     );
 }

@@ -5,7 +5,6 @@
 //! `object_store.partial_write` fault is armed.
 
 use std::fmt::{Display, Formatter};
-use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -13,8 +12,8 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -78,12 +77,6 @@ impl Display for FaultInjectingObjectStore {
 
 #[async_trait]
 impl ObjectStore for FaultInjectingObjectStore {
-    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-        self.inner
-            .put(location, self.maybe_truncate_payload(payload))
-            .await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -95,10 +88,6 @@ impl ObjectStore for FaultInjectingObjectStore {
             .await
     }
 
-    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart(location).await
-    }
-
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -107,28 +96,15 @@ impl ObjectStore for FaultInjectingObjectStore {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        self.inner.get(location).await
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         self.inner.get_opts(location, options).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        self.inner.get_range(location, range).await
-    }
-
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        self.inner.get_ranges(location, ranges).await
-    }
-
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        self.inner.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -139,20 +115,12 @@ impl ObjectStore for FaultInjectingObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.copy(from, to).await
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.rename(from, to).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.rename_if_not_exists(from, to).await
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+        self.inner.rename_opts(from, to, options).await
     }
 }
 
@@ -161,6 +129,7 @@ mod tests {
     use super::*;
     use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
+    use object_store::ObjectStoreExt;
     use tempfile::TempDir;
 
     const PARTIAL_WRITE_SEED: u64 = 0;

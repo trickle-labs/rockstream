@@ -8,6 +8,7 @@
 //! - **S8**: MinIO TC integration test — stability under real S3
 
 use bytes::Bytes;
+use object_store::ObjectStoreExt;
 use rockstream_sim::buggify::{buggify_disable, buggify_init};
 use rockstream_sim::{AutoTuner, OscillationDetector, SimObjectStoreHandle, SpikeScenario};
 use rockstream_types::audit::AuditEvent;

@@ -18,7 +18,7 @@ use crate::error::StorageError;
 /// WAL contents during testing.
 pub async fn read_wal_entries(db: &Db, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
     let mut results = Vec::new();
-    let mut iter = db.scan_prefix(prefix).await?;
+    let mut iter = db.scan_prefix(prefix, ..).await?;
     while let Some(entry) = iter.next().await? {
         results.push((entry.key, entry.value));
     }

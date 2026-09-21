@@ -314,7 +314,8 @@ impl ShardDbBuilder {
         self.settings
             .object_store_cache_options
             .max_open_file_handles = 1000;
-        self.settings.object_store_cache_options.cache_puts = true;
+        self.settings.object_store_cache_options.cache_on_flush = true;
+        self.settings.object_store_cache_options.cache_on_compaction = true;
         self.disk_cache_dir = Some(dir_path);
         self
     }
@@ -393,7 +394,8 @@ impl ShardDbBuilder {
                     self.settings
                         .object_store_cache_options
                         .max_open_file_handles = 1000;
-                    self.settings.object_store_cache_options.cache_puts = nvme.cache_puts;
+                    self.settings.object_store_cache_options.cache_on_flush = nvme.cache_puts;
+                    self.settings.object_store_cache_options.cache_on_compaction = nvme.cache_puts;
                     self.disk_cache_dir = Some(nvme.root_folder.clone());
                 }
             }
@@ -580,7 +582,7 @@ impl ShardDb {
         } else {
             prefix.to_vec()
         };
-        let mut iter = self.db.scan_prefix(&physical_prefix).await?;
+        let mut iter = self.db.scan_prefix(&physical_prefix, ..).await?;
         while let Some(entry) = iter.next().await? {
             let key = if strip_version_prefix {
                 let logical = if self.format_version == 3 {
@@ -616,7 +618,7 @@ impl ShardDb {
         } else {
             prefix.to_vec()
         };
-        let mut iter = self.db.scan_prefix(physical_prefix).await?;
+        let mut iter = self.db.scan_prefix(physical_prefix, ..).await?;
         while let Some(entry) = iter.next().await? {
             let key = if strip_version_prefix {
                 let logical = if self.format_version == 3 {
@@ -814,13 +816,13 @@ impl ShardDb {
         prefix: &[u8],
     ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
         let mut results = Vec::new();
-        let mut old_iter = self.db.scan_prefix(prefix).await?;
+        let mut old_iter = self.db.scan_prefix(prefix, ..).await?;
         while let Some(entry) = old_iter.next().await? {
             if self.db.get(format_v2_key(&entry.key)).await?.is_none() {
                 results.push((entry.key, entry.value));
             }
         }
-        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix)).await?;
+        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix), ..).await?;
         while let Some(entry) = new_iter.next().await? {
             let key = logical_key_from_format_v2(&entry.key)
                 .ok_or_else(|| StorageError::Unsupported("invalid v2 storage key".to_string()))?;
@@ -837,7 +839,7 @@ impl ShardDb {
     ) -> Result<(Vec<(Bytes, Bytes)>, bool), StorageError> {
         let mut results = Vec::new();
         let mut total_bytes = 0usize;
-        let mut old_iter = self.db.scan_prefix(prefix).await?;
+        let mut old_iter = self.db.scan_prefix(prefix, ..).await?;
         while let Some(entry) = old_iter.next().await? {
             if self.db.get(format_v2_key(&entry.key)).await?.is_some() {
                 continue;
@@ -851,7 +853,7 @@ impl ShardDb {
                 return Ok((results, true));
             }
         }
-        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix)).await?;
+        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix), ..).await?;
         while let Some(entry) = new_iter.next().await? {
             let key =
                 Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(
@@ -962,7 +964,7 @@ impl ShardDb {
             return self.scan_pending_prefix_bounded(prefix, max_bytes).await;
         }
         let mut results = Vec::new();
-        let mut iter = self.db.scan_prefix(prefix).await?;
+        let mut iter = self.db.scan_prefix(prefix, ..).await?;
         let mut total_bytes: usize = 0;
         while let Some(entry) = iter.next().await? {
             total_bytes += entry.key.len() + entry.value.len();
@@ -1007,7 +1009,7 @@ impl ShardDb {
             prefix.to_vec()
         };
 
-        let mut iter = self.db.scan_prefix(&physical_prefix).await?;
+        let mut iter = self.db.scan_prefix(&physical_prefix, ..).await?;
         while let Some(entry) = iter.next().await? {
             if progress.is_cancelled() {
                 return Err(StorageError::Unsupported(
@@ -1081,7 +1083,7 @@ impl ShardDb {
             prefix.to_vec()
         };
 
-        let mut iter = self.db.scan_prefix(&physical_prefix).await?;
+        let mut iter = self.db.scan_prefix(&physical_prefix, ..).await?;
         let mut rows = Vec::new();
         let mut page_bytes = 0usize;
         let mut is_last_page = true;
@@ -1306,6 +1308,7 @@ impl ShardDb {
         let key = ShardKeyEncoder::frontier_key();
         // M1-S2: non-decreasing epoch assertion is enforced inside put().
         self.put(&key, &epoch.to_be_bytes()).await?;
+        self.flush().await?;
         Ok(ShardFrontierReport { shard_id, epoch })
     }
 

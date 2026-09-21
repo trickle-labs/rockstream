@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::Mutex;
 use rockstream_storage::{ShardDb, ShardReader, WriteBatch};
 use rockstream_types::audit::AuditEvent;

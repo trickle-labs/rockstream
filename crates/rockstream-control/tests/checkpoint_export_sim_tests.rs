@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt};
 use rockstream_control::{CheckpointExportService, CheckpointManifestStore};
 use rockstream_sim::{
     buggify::buggify_disable, buggify::buggify_focus, buggify::buggify_init, SimRuntime,

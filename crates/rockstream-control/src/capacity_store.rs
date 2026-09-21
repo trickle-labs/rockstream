@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_types::capacity::CapacityThresholdManifest;
 
 /// Durable store for capacity threshold manifest and raw measurement chunks.

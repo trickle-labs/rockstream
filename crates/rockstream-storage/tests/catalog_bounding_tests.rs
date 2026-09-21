@@ -1,6 +1,6 @@
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use rockstream_storage::catalog::log::MAX_REPLAY_BUFFER_BYTES;
 use rockstream_storage::catalog::*;
 use rockstream_types::ids::*;
