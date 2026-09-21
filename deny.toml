@@ -27,6 +27,7 @@ allow = [
     # Permissive licenses from DataFusion/Arrow transitive deps:
     "CC0-1.0",     # tiny-keccak (const-random-macro via ahash)
     "bzip2-1.0.6", # libbz2-rs-sys (bzip2 compression codec)
+    "CDLA-Permissive-2.0", # webpki-root-certs via object_store 0.14
 ]
 exceptions = [{ crate = "libfuzzer-sys@0.4.13", allow = ["NCSA"] }]
 
