@@ -226,6 +226,13 @@ async fn optimized_arrangement_lookups_reduce_minio_gets_vs_uncached_baseline() 
     let baseline_store: Arc<dyn ObjectStore> =
         Arc::new(CountingObjectStore::new(raw_store, baseline_gets.clone()));
 
+    let _ = run_join(
+        "optimized",
+        optimized_store.clone(),
+        Some(&optimized_cache),
+        None,
+    )
+    .await;
     let optimized = run_join(
         "optimized",
         optimized_store,
