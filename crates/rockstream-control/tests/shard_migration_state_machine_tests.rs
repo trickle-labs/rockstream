@@ -406,6 +406,8 @@ async fn verifying_scan_compare_detects_divergence_and_aborts() {
     let recipient = make_shard(2, "migration/recipient-verify", store.clone(), 42).await;
     donor.db.put(&make_key(7, "x"), b"left").await.unwrap();
     recipient.db.put(&make_key(7, "x"), b"right").await.unwrap();
+    donor.db.flush().await.unwrap();
+    recipient.db.flush().await.unwrap();
 
     let mut record = make_record();
     step_to_cutover(&mut record);
