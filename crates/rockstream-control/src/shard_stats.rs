@@ -25,8 +25,9 @@ impl ShardStatsPersistentStore {
 
     fn stats_path(&self, view_id: ViewId, shard_id: ShardId) -> Path {
         self.prefix
-            .child(view_id.0.to_string())
-            .child(format!("{}.json", shard_id.0))
+            .clone()
+            .join(view_id.0.to_string())
+            .join(format!("{}.json", shard_id.0))
     }
 
     pub async fn save(
@@ -70,7 +71,7 @@ impl ShardStatsPersistentStore {
         &self,
         view_id: ViewId,
     ) -> Result<Vec<ShardColumnStats>, String> {
-        let prefix = self.prefix.child(view_id.0.to_string());
+        let prefix = self.prefix.clone().join(view_id.0.to_string());
         let mut stream = self.store.list(Some(&prefix));
         let mut out = Vec::new();
         while let Some(entry) = stream.next().await {

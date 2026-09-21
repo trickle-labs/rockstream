@@ -323,7 +323,8 @@ impl ManagementOperationStore {
         }
         Ok(self
             .prefix
-            .child(format!("{}.json", hex::encode(operation_id.as_bytes()))))
+            .clone()
+            .join(format!("{}.json", hex::encode(operation_id.as_bytes()))))
     }
 
     fn transition_path(
@@ -336,9 +337,10 @@ impl ManagementOperationStore {
         }
         Ok(self
             .prefix
-            .child("transitions")
-            .child(hex::encode(operation_id.as_bytes()))
-            .child(format!(
+            .clone()
+            .join("transitions")
+            .join(hex::encode(operation_id.as_bytes()))
+            .join(format!(
                 "{}.json",
                 hex::encode(Sha256::digest(previous_record))
             )))
@@ -348,7 +350,7 @@ impl ManagementOperationStore {
         if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
             return Err(OperationStoreError::InvalidIdempotencyKey);
         }
-        Ok(self.prefix.child("idempotency").child(format!(
+        Ok(self.prefix.clone().join("idempotency").join(format!(
             "{}.json",
             hex::encode(Sha256::digest(key.as_bytes()))
         )))
@@ -358,7 +360,7 @@ impl ManagementOperationStore {
         if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
             return Err(OperationStoreError::InvalidIdempotencyKey);
         }
-        Ok(self.prefix.child(format!(
+        Ok(self.prefix.clone().join(format!(
             "idempotency/{}.json",
             hex::encode(Sha256::digest(key.as_bytes()))
         )))
@@ -486,8 +488,9 @@ impl ManagementOperationStore {
                 .map_err(|error| OperationStoreError::Storage(error.to_string()))?;
             let transition_prefix = self
                 .prefix
-                .child("transitions")
-                .child(hex::encode(operation_id.as_bytes()));
+                .clone()
+                .join("transitions")
+                .join(hex::encode(operation_id.as_bytes()));
             let mut listing = self.store.list(Some(&transition_prefix));
             while let Some(entry) = listing.next().await {
                 let meta =
@@ -647,7 +650,9 @@ impl ManagementOperationStore {
     async fn bound_operation_ids(
         &self,
     ) -> Result<std::collections::HashSet<String>, OperationStoreError> {
-        let mut listing = self.store.list(Some(&self.prefix.child("idempotency")));
+        let mut listing = self
+            .store
+            .list(Some(&self.prefix.clone().join("idempotency")));
         let mut operation_ids = std::collections::HashSet::new();
         while let Some(entry) = listing.next().await {
             let meta = entry.map_err(|error| OperationStoreError::Storage(error.to_string()))?;

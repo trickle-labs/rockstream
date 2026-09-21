@@ -195,11 +195,15 @@ impl MigrationPersistentStore {
     }
 
     fn active_path(&self, migration_id: &str) -> Path {
-        self.active_prefix.child(format!("{migration_id}.json"))
+        self.active_prefix
+            .clone()
+            .join(format!("{migration_id}.json"))
     }
 
     fn history_path(&self, migration_id: &str) -> Path {
-        self.history_prefix.child(format!("{migration_id}.json"))
+        self.history_prefix
+            .clone()
+            .join(format!("{migration_id}.json"))
     }
 
     pub async fn load(&self, migration_id: &str) -> Option<MigrationRecord> {

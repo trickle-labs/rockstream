@@ -28,12 +28,12 @@ impl CheckpointManifestStore {
     }
 
     fn manifest_path(&self, checkpoint_id: CheckpointId) -> Path {
-        self.prefix.child(checkpoint_id.0.to_string())
+        self.prefix.clone().join(checkpoint_id.0.to_string())
     }
 
     fn changelog_path(&self, checkpoint_id: CheckpointId, shard_id: ShardId) -> Path {
         Path::from("control/changelog-checkpoints")
-            .child(format!("{}-{}", checkpoint_id.0, shard_id.0))
+            .join(format!("{}-{}", checkpoint_id.0, shard_id.0))
     }
 
     /// Persist one shard's delta-native checkpoint contribution before that
