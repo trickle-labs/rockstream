@@ -445,6 +445,12 @@ impl ControlService {
                 self.catalog.restore_workers(workers);
             }
         }
+        if let Some(store) = &self.migration_store {
+            store
+                .recover_active(&self.shard_manager)
+                .await
+                .map_err(|error| io::Error::other(format!("migration recovery: {error}")))?;
+        }
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
         tracing::info!(addr = %addr, "control service listening");

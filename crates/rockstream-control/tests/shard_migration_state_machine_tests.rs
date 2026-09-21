@@ -206,6 +206,9 @@ async fn snapshotting_pins_donor_checkpoint_at_f_plan() {
         .unwrap();
 
     assert_eq!(record.planned_frontier, 42);
+    assert_eq!(record.donor_frontier, Some(42));
+    assert_eq!(record.recipient_frontier, Some(42));
+    assert_eq!(record.lag, Some(0));
     assert_eq!(record.state, MigrationState::Copying);
     assert!(record.donor_checkpoints.contains_key(&ShardId(1)));
     assert_eq!(
@@ -250,7 +253,7 @@ async fn copying_recipient_matches_donor_checkpoint() {
     assert_eq!(record.donor_checkpoint_snapshots.len(), 1);
     assert_eq!(
         record.copied_rows,
-        Some(donor.db.scan_prefix(b"").await.unwrap().len() as u64)
+        Some(scan_bucket(&donor.db, 7).await.len() as u64)
     );
 }
 
@@ -263,6 +266,7 @@ async fn bounded_copy_chunks_report_exact_limits_and_output() {
     for i in 0..300 {
         batch.put(&make_key(7, &format!("k{i:04}")), b"value");
     }
+    batch.put(&make_key(99, "not-migrating"), b"value");
     donor.db.write_batch(batch).await.unwrap();
     donor.db.flush().await.unwrap();
 
@@ -271,7 +275,7 @@ async fn bounded_copy_chunks_report_exact_limits_and_output() {
         .apply_transition(MigrationState::Snapshotting)
         .unwrap();
     record.apply_transition(MigrationState::Copying).unwrap();
-    let source_rows = donor.db.scan_prefix(b"").await.unwrap().len();
+    let source_rows = scan_bucket(&donor.db, 7).await.len();
     let stats = MigrationCoordinator::new()
         .copy_bounded_chunks(&mut record, &[donor], &recipient)
         .await
@@ -282,6 +286,7 @@ async fn bounded_copy_chunks_report_exact_limits_and_output() {
     assert!(stats.max_chunk_rows <= 256);
     assert!(stats.max_chunk_bytes <= 1024 * 1024);
     assert_eq!(scan_bucket(&recipient.db, 7).await.len(), 300);
+    assert_eq!(scan_bucket(&recipient.db, 99).await, Vec::new());
 }
 
 #[tokio::test]
@@ -343,10 +348,10 @@ async fn copy_write_failure_requires_a_durable_intent_and_replays_exactly_once()
             .unwrap(),
         rockstream_control::MigrationCopyStats {
             chunks: 1,
-            copied_rows: 2,
-            copied_bytes: 22,
-            max_chunk_rows: 2,
-            max_chunk_bytes: 22,
+            copied_rows: 1,
+            copied_bytes: 18,
+            max_chunk_rows: 1,
+            max_chunk_bytes: 18,
         }
     );
     assert_eq!(
@@ -354,8 +359,9 @@ async fn copy_write_failure_requires_a_durable_intent_and_replays_exactly_once()
         std::collections::BTreeMap::from([(ShardId(1), 1)])
     );
     assert_eq!(record.copy_intents, std::collections::BTreeMap::new());
-    assert_eq!(record.copied_rows, Some(2));
-    assert_eq!(record.copied_bytes, Some(22));
+    assert_eq!(record.copied_rows, Some(1));
+    assert_eq!(record.copied_bytes, Some(18));
+    assert_eq!(record.progress().estimated_rows, None);
     assert_eq!(
         scan_bucket(&recipient.db, 7).await,
         vec![(make_key(7, "once"), b"value".to_vec())]
@@ -409,6 +415,7 @@ async fn verifying_scan_compare_detects_divergence_and_aborts() {
         .unwrap_err();
     assert!(err.to_string().contains("RS-5034"));
     assert_eq!(record.state, MigrationState::DualWriting);
+    assert_eq!(record.verification_progress, Some(0));
 }
 
 #[tokio::test]
@@ -425,6 +432,7 @@ async fn gc_eligible_blocked_until_consumer_frontier_passes_cutover() {
         )
         .await
         .unwrap();
+    assert_eq!(record.verification_progress, Some(100));
     tracker.observe("reader-a", 41).unwrap();
     tracker.observe("gateway-a", 42).unwrap();
 
@@ -473,6 +481,7 @@ async fn done_cleanup_is_scan_and_delete_never_range_delete() {
         .await
         .unwrap();
     assert_eq!(record.state, MigrationState::Done);
+    assert!(record.cleanup_intent);
     assert_eq!(stats.deleted_keys, 1);
     assert!(scan_bucket(&donor.db, 7).await.is_empty());
     assert_eq!(scan_bucket(&donor.db, 99).await.len(), 1);
@@ -487,6 +496,13 @@ async fn done_cleanup_is_scan_and_delete_never_range_delete() {
             .unwrap()
             .state,
         MigrationState::Done
+    );
+    assert!(
+        persistent
+            .load_history(&record.migration_id)
+            .await
+            .unwrap()
+            .cleanup_intent
     );
 
     let source =
@@ -635,7 +651,7 @@ fn test_migration_progress_monotonic_all_phases() {
     assert_eq!(record.progress_phase(), "planned");
     assert_eq!(record.bytes_remaining(), Some(10_000_000));
     assert_eq!(record.rows_remaining(), Some(50_000));
-    assert!(record.estimated_remaining_ms().is_some());
+    assert_eq!(record.estimated_remaining_ms(), None);
 
     record
         .apply_transition(MigrationState::Snapshotting)
@@ -652,7 +668,7 @@ fn test_migration_progress_monotonic_all_phases() {
     record.record_progress(4_000_000, 20_000);
     assert_eq!(record.bytes_remaining(), Some(6_000_000));
     assert_eq!(record.rows_remaining(), Some(30_000));
-    assert!(record.estimated_remaining_ms().unwrap() > 0);
+    assert_eq!(record.estimated_remaining_ms(), None);
 
     record.record_progress(8_000_000, 40_000);
     assert_eq!(record.bytes_remaining(), Some(2_000_000));
@@ -674,7 +690,7 @@ fn test_migration_progress_monotonic_all_phases() {
         assert_eq!(record.progress_phase(), next_state.to_string());
         assert_eq!(record.bytes_remaining(), Some(0));
         assert_eq!(record.rows_remaining(), Some(0));
-        assert!(record.estimated_remaining_ms().is_some());
+        assert_eq!(record.estimated_remaining_ms(), None);
     }
 
     record.apply_transition(MigrationState::Done).unwrap();

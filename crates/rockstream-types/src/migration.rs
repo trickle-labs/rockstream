@@ -125,12 +125,27 @@ pub struct MigrationRecord {
     /// Copy pages whose recipient write was intended but not yet completed.
     #[serde(default)]
     pub copy_intents: BTreeMap<ShardId, u64>,
+    /// Donor checkpoint creations whose completion has not been recorded.
+    #[serde(default)]
+    pub checkpoint_intents: BTreeSet<ShardId>,
+    /// Cluster checkpoint created for this migration snapshot.
+    #[serde(default)]
+    pub cluster_checkpoint_id: Option<u64>,
+    /// Estimated logical rows in the migration payload.
+    #[serde(default)]
+    pub estimated_rows: Option<u64>,
     /// Donor frontiers captured before the snapshot effect.
     #[serde(default)]
     pub donor_frontiers: BTreeMap<ShardId, Epoch>,
+    /// Conservative donor frontier across all donor shards.
+    #[serde(default)]
+    pub donor_frontier: Option<Epoch>,
     /// Recipient frontier captured before the snapshot effect.
     #[serde(default)]
     pub recipient_frontier: Option<Epoch>,
+    /// Donor-to-recipient frontier lag.
+    #[serde(default)]
+    pub lag: Option<Epoch>,
     /// Logical epoch at which writes enter the migration routing policy.
     #[serde(default)]
     pub migration_epoch: Epoch,
@@ -152,6 +167,26 @@ pub struct MigrationRecord {
     /// Rows successfully copied to the recipient shard so far.
     #[serde(default)]
     pub copied_rows: Option<u64>,
+    /// Verification progress as a percentage from 0 through 100.
+    #[serde(default)]
+    pub verification_progress: Option<u64>,
+    /// Donor cleanup was durably requested and may be safely replayed.
+    #[serde(default)]
+    pub cleanup_intent: bool,
+}
+
+/// The durable progress surface for one migration operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationProgress {
+    pub copied_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub copied_rows: Option<u64>,
+    pub estimated_rows: Option<u64>,
+    pub donor_frontier: Option<Epoch>,
+    pub recipient_frontier: Option<Epoch>,
+    pub lag: Option<Epoch>,
+    pub current_phase: MigrationState,
+    pub verification_progress: Option<u64>,
 }
 
 impl MigrationRecord {
@@ -178,8 +213,13 @@ impl MigrationRecord {
             donor_checkpoint_snapshots: BTreeMap::new(),
             copy_cursors: BTreeMap::new(),
             copy_intents: BTreeMap::new(),
+            checkpoint_intents: BTreeSet::new(),
+            cluster_checkpoint_id: None,
+            estimated_rows: None,
             donor_frontiers: BTreeMap::new(),
+            donor_frontier: None,
             recipient_frontier: None,
+            lag: None,
             migration_epoch: planned_frontier,
             cutover_epoch: None,
             created_at_ms: now,
@@ -188,6 +228,8 @@ impl MigrationRecord {
             copied_bytes: None,
             total_rows: None,
             copied_rows: None,
+            verification_progress: None,
+            cleanup_intent: false,
         }
     }
 
@@ -205,7 +247,37 @@ impl MigrationRecord {
     ) -> Self {
         self.total_bytes = total_bytes;
         self.total_rows = total_rows;
+        self.estimated_rows = total_rows;
         self
+    }
+
+    /// Record the durable frontiers observed for this migration.
+    pub fn record_frontiers(&mut self, donor_frontier: Epoch, recipient_frontier: Epoch) {
+        self.donor_frontier = Some(donor_frontier);
+        self.recipient_frontier = Some(recipient_frontier);
+        self.lag = Some(donor_frontier.saturating_sub(recipient_frontier));
+        self.updated_at_ms = now_ms();
+    }
+
+    /// Record bounded verification progress as a percentage.
+    pub fn record_verification_progress(&mut self, progress: u64) {
+        self.verification_progress = Some(progress.min(100));
+        self.updated_at_ms = now_ms();
+    }
+
+    /// Return the exact durable progress fields for management callers.
+    pub fn progress(&self) -> MigrationProgress {
+        MigrationProgress {
+            copied_bytes: self.copied_bytes,
+            total_bytes: self.total_bytes,
+            copied_rows: self.copied_rows,
+            estimated_rows: self.estimated_rows.or(self.total_rows),
+            donor_frontier: self.donor_frontier,
+            recipient_frontier: self.recipient_frontier,
+            lag: self.lag,
+            current_phase: self.state,
+            verification_progress: self.verification_progress,
+        }
     }
 
     /// Record observed progress during copying.
@@ -280,25 +352,24 @@ impl MigrationRecord {
             | MigrationState::FencingOld
             | MigrationState::Cutover
             | MigrationState::Verifying
-            | MigrationState::GcEligible => Some(10),
-            MigrationState::Planned | MigrationState::Snapshotting => self
-                .total_bytes
-                .map(|b| (b / (10 * 1024 * 1024) * 1000).clamp(50, 60_000)),
+            | MigrationState::GcEligible
+            | MigrationState::Planned
+            | MigrationState::Snapshotting => None,
             MigrationState::Copying => {
                 let remaining = self.bytes_remaining()?;
                 if remaining == 0 {
                     return Some(0);
                 }
-                let elapsed_ms = self.updated_at_ms.saturating_sub(self.created_at_ms).max(1);
+                let elapsed_ms = self.updated_at_ms.saturating_sub(self.created_at_ms);
                 let copied = self.copied_bytes.unwrap_or(0);
-                if copied > 0 {
+                if copied > 0 && elapsed_ms > 0 {
                     let rate = (copied as f64) / (elapsed_ms as f64);
                     if rate > 0.0 {
                         let ms = (remaining as f64 / rate) as u64;
                         return Some(ms.min(600_000));
                     }
                 }
-                Some((remaining / (10 * 1024 * 1024) * 1000).clamp(50, 60_000))
+                None
             }
         }
     }
