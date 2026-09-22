@@ -252,7 +252,7 @@ Changes to persistent formats or public protocols require:
 | v0.66.0 | Management Plane | Real typed management API and truthful operational CLI ✅ Done |
 | v0.67.0 | Distributed Data Plane | Row traffic leaves the control plane ✅ Done |
 | v0.67.1 | State beyond RAM | Maintained state and recovery operate within worker budgets ✅ Done |
-| v0.68.0 | Distributed Lifecycle ✅ Done | Migration, drain, and failover become durable sagas |
+| **v0.68** | Distributed Lifecycle ✅ Done | Migration, drain, and failover become durable sagas |
 | **v0.69** | PostgreSQL CDC | First complete external ingestion golden path |
 | **v0.70** | Kafka | Second complete external ingestion golden path |
 | **v0.71** | Observability | Operators can explain health, lag, state, and failures |

@@ -12,8 +12,9 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyMode, CopyOptions, GetOptions, GetResult,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions,
-    PutOptions, PutPayload, PutResult, RenameOptions, RenameTargetMode, Result,
+    ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, RenameTargetMode,
+    Result,
 };
 
 use crate::error::StorageError;
@@ -200,19 +201,52 @@ impl ObjectStore for TieredObjectStore {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        if matches!(options.mode, CopyMode::Create) && self.head(to).await.is_ok() {
-            return Ok(());
-        }
         let bytes = self.get(from).await?.bytes().await?;
-        self.put(to, bytes.into()).await?;
+        let mode = match options.mode {
+            CopyMode::Overwrite => PutMode::Overwrite,
+            CopyMode::Create => {
+                match self.head(to).await {
+                    Ok(_) => {
+                        return Err(object_store::Error::AlreadyExists {
+                            path: to.to_string(),
+                            source: Box::new(std::io::Error::from(
+                                std::io::ErrorKind::AlreadyExists,
+                            )),
+                        });
+                    }
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+                PutMode::Create
+            }
+        };
+        self.put_opts(
+            to,
+            bytes.into(),
+            PutOptions {
+                mode,
+                extensions: options.extensions,
+                ..Default::default()
+            },
+        )
+        .await?;
         Ok(())
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        if matches!(options.target_mode, RenameTargetMode::Create) && self.head(to).await.is_ok() {
-            return Ok(());
-        }
-        self.copy(from, to).await?;
+        let mode = match options.target_mode {
+            RenameTargetMode::Overwrite => CopyMode::Overwrite,
+            RenameTargetMode::Create => CopyMode::Create,
+        };
+        self.copy_opts(
+            from,
+            to,
+            CopyOptions {
+                mode,
+                extensions: options.extensions,
+            },
+        )
+        .await?;
         self.delete(from).await
     }
 }
@@ -766,9 +800,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_if_not_exists_skips_copy_when_destination_present() {
+    async fn copy_if_not_exists_rejects_existing_destination() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let tiered = TieredObjectStore::new(Arc::clone(&store));
+        let routed: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered =
+            TieredObjectStore::new(Arc::clone(&store)).with_route("dst", Arc::clone(&routed));
         store
             .put(&Path::from("src"), Bytes::from("new").into())
             .await
@@ -778,10 +814,12 @@ mod tests {
             .await
             .unwrap();
 
-        tiered
-            .copy_if_not_exists(&Path::from("src"), &Path::from("dst"))
-            .await
-            .unwrap();
+        assert!(matches!(
+            tiered
+                .copy_if_not_exists(&Path::from("src"), &Path::from("dst"))
+                .await,
+            Err(object_store::Error::AlreadyExists { path, .. }) if path == "dst"
+        ));
         let bytes = store
             .get(&Path::from("dst"))
             .await
@@ -790,6 +828,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes.as_ref(), b"existing");
+        assert!(matches!(
+            routed.head(&Path::from("dst")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
@@ -833,7 +875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_if_not_exists_skips_rename_when_destination_present() {
+    async fn rename_if_not_exists_rejects_existing_destination() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let tiered = TieredObjectStore::new(Arc::clone(&store));
         store
@@ -845,11 +887,32 @@ mod tests {
             .await
             .unwrap();
 
-        tiered
-            .rename_if_not_exists(&Path::from("src"), &Path::from("dst"))
-            .await
-            .unwrap();
-        assert!(store.head(&Path::from("src")).await.is_ok());
+        assert!(matches!(
+            tiered
+                .rename_if_not_exists(&Path::from("src"), &Path::from("dst"))
+                .await,
+            Err(object_store::Error::AlreadyExists { path, .. }) if path == "dst"
+        ));
+        assert_eq!(
+            store
+                .get(&Path::from("src"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            Bytes::from("payload")
+        );
+        assert_eq!(
+            store
+                .get(&Path::from("dst"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            Bytes::from("existing")
+        );
     }
 
     #[tokio::test]
