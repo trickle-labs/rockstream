@@ -19,8 +19,8 @@ use futures::stream::BoxStream;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
 
 use rockstream_runtime::exchange::durable::{
@@ -110,8 +110,12 @@ impl ObjectStore for AlwaysFailingStore {
         Err(self.fail())
     }
 
-    async fn delete(&self, _location: &Path) -> Result<()> {
-        Err(self.fail())
+    fn delete_stream(
+        &self,
+        _locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let error = self.fail();
+        futures::stream::once(async move { Err(error) }).boxed()
     }
 
     fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -128,11 +132,7 @@ impl ObjectStore for AlwaysFailingStore {
         Err(self.fail())
     }
 
-    async fn copy(&self, _from: &Path, _to: &Path) -> Result<()> {
-        Err(self.fail())
-    }
-
-    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> Result<()> {
+    async fn copy_opts(&self, _from: &Path, _to: &Path, _options: CopyOptions) -> Result<()> {
         Err(self.fail())
     }
 }

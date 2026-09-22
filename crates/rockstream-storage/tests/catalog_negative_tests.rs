@@ -7,7 +7,7 @@
 
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use rockstream_storage::catalog::{
     CatalogColumn, CatalogMutation, CatalogStore, CatalogTable, CatalogTxn, DependencyKind,
     DurableCatalogStore, ViewDependency,

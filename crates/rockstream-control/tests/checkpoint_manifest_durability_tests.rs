@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_control::{ChangelogCheckpointContribution, CheckpointManifestStore};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{minio_object_store, start_minio};

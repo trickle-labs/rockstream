@@ -7,7 +7,7 @@
 //! - Bounded replay memory: max 64 MB uncommitted txn replay buffer (exceeding fails with `RS-1003`).
 
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_verified::persistence;
 use std::sync::Arc;
 

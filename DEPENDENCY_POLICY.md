@@ -6,9 +6,11 @@ compliance, and build reproducibility.
 ## Rules
 
 1. **License allowlist.** Permitted licenses: MIT, Apache-2.0,
-   Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, ISC, Unicode,
-   CC0-1.0, and bzip2-1.0.6. The last two are permissive/public-domain
-   licenses pulled in as transitive dependencies of Apache Arrow / DataFusion.
+   Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, ISC,
+   Unicode-3.0, Unicode-DFS-2016, Zlib, CC0-1.0, bzip2-1.0.6, and
+   CDLA-Permissive-2.0. `webpki-root-certs` brings in CDLA-Permissive-2.0
+   through `object_store` 0.14. CC0-1.0 and bzip2-1.0.6 come from Apache Arrow
+   and DataFusion dependencies.
    Copyleft licenses (GPL, LGPL, AGPL) are denied.
 
 2. **No wildcard versions.** All dependencies must use exact or bounded

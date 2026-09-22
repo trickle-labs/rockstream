@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::Mutex;
 use rockstream_storage::{ShardDb, ShardReader, WriteBatch};
 use rockstream_types::audit::AuditEvent;
@@ -222,11 +222,15 @@ impl MigrationPersistentStore {
     }
 
     fn active_path(&self, migration_id: &str) -> Path {
-        self.active_prefix.child(format!("{migration_id}.json"))
+        self.active_prefix
+            .clone()
+            .join(format!("{migration_id}.json"))
     }
 
     fn history_path(&self, migration_id: &str) -> Path {
-        self.history_prefix.child(format!("{migration_id}.json"))
+        self.history_prefix
+            .clone()
+            .join(format!("{migration_id}.json"))
     }
 
     pub async fn load(&self, migration_id: &str) -> Result<MigrationRecord, MigrationLoadError> {

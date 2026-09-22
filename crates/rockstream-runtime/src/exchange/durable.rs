@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use serde::{Deserialize, Serialize};
 
 use rockstream_types::error_code::{RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016};

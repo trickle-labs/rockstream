@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt};
 use rockstream_control::{CheckpointExportService, CheckpointManifestStore};
 use rockstream_runtime::RecoveryDriver;
 use rockstream_storage::ShardDb;

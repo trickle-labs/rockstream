@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::RwLock;
 use rand::Rng;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

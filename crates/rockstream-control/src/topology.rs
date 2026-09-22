@@ -6,7 +6,7 @@
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -192,7 +192,7 @@ impl TopologyPersistentStore {
     }
 
     fn worker_path(&self, worker_id: WorkerId) -> Path {
-        self.prefix.child(format!("{}.json", worker_id.0))
+        self.prefix.clone().join(format!("{}.json", worker_id.0))
     }
 
     pub async fn save_worker(&self, worker: &WorkerInfo) -> Result<(), String> {

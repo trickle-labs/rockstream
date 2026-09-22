@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
 use rockstream_control::{CheckpointExportService, CheckpointManifestStore};
 use rockstream_sim::qualification::{
     OracleAuditor, QualificationCluster, QualificationClusterConfig, QualificationWorkloadGenerator,

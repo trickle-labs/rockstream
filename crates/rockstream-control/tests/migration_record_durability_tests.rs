@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_control::{MigrationLoadError, MigrationPersistentStore, ShardManager};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{minio_object_store, start_minio};
@@ -123,6 +123,13 @@ async fn migration_record_survives_restart_lfs() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    store
+        .put(
+            &object_store::path::Path::from("unrelated.json"),
+            b"unrelated".to_vec().into(),
+        )
+        .await
+        .unwrap();
     let persistent_a = MigrationPersistentStore::new(store.clone());
     let state = make_record();
     persistent_a.save(&state).await.unwrap();

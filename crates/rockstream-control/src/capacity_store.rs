@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_types::capacity::CapacityThresholdManifest;
 
 /// Durable store for capacity threshold manifest and raw measurement chunks.
@@ -30,11 +30,11 @@ impl CapacityThresholdStore {
     }
 
     fn manifest_path(&self) -> Path {
-        self.prefix.child("capacity-manifest.json")
+        self.prefix.clone().join("capacity-manifest.json")
     }
 
     fn chunk_path(&self, chunk_id: &str) -> Path {
-        self.prefix.child("chunks").child(chunk_id)
+        self.prefix.clone().join("chunks").join(chunk_id)
     }
 
     /// Persist the sealed threshold manifest with create-only semantics.
@@ -98,7 +98,7 @@ impl CapacityThresholdStore {
 
     /// Load all raw capacity chunks under `chunks/`.
     pub async fn load_raw_chunks(&self) -> Result<Vec<Vec<u8>>, String> {
-        let chunks_prefix = self.prefix.child("chunks");
+        let chunks_prefix = self.prefix.clone().join("chunks");
         let mut list_stream = self.store.list(Some(&chunks_prefix));
         let mut chunks = Vec::new();
 
@@ -126,7 +126,7 @@ impl CapacityThresholdStore {
         let target = if sub_prefix.is_empty() {
             self.prefix.clone()
         } else {
-            self.prefix.child(sub_prefix)
+            self.prefix.clone().join(sub_prefix)
         };
         let mut list_stream = self.store.list(Some(&target));
         let mut deleted_count = 0;

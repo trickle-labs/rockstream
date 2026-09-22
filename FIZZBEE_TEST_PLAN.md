@@ -646,6 +646,9 @@ validates real backend restart/recovery against the verified M1-M7 state machine
 MinIO container registry pins used by storage integration tests are test
 infrastructure; changing the registry host for the same MinIO release does not
 change the model or its assertions.
+The SlateDB v0.16/object_store v0.14 upgrade changes storage API calls and path
+construction only; durable object prefixes, commit ordering, and recovery state
+transitions remain unchanged, so no FizzBee state-transition changes are needed.
 
 To guard against vacuously-passing models (a model that never reaches the
 interesting state trivially satisfies every `always`), each spec includes

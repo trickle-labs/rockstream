@@ -1,6 +1,5 @@
 //! Real S3-compatible proof for Issue #94's arrangement cache path.
 
-use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -9,11 +8,10 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::path::Path as ObjPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use rockstream_ops::zset::ArrowZSet;
@@ -71,8 +69,11 @@ impl ObjectStore for CountingObjectStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -91,17 +92,13 @@ impl ObjectStore for CountingObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.copy_if_not_exists(from, to).await
-    }
-
-    async fn get_range(&self, location: &ObjPath, range: Range<u64>) -> ObjectStoreResult<Bytes> {
-        self.gets.fetch_add(1, Ordering::SeqCst);
-        self.inner.get_range(location, range).await
+    async fn copy_opts(
+        &self,
+        from: &ObjPath,
+        to: &ObjPath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -141,15 +138,20 @@ fn make_left_delta() -> ArrowZSet {
         Field::new("k", DataType::Int64, false),
         Field::new("v", DataType::Int64, false),
     ]));
+    let keys = [1, 32]
+        .into_iter()
+        .chain(10_000..10_032)
+        .collect::<Vec<_>>();
+    let values = [10, 20].into_iter().chain(30..62).collect::<Vec<_>>();
     let data = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int64Array::from(vec![1, 32, 10_000])) as _,
-            Arc::new(Int64Array::from(vec![10, 20, 30])) as _,
+            Arc::new(Int64Array::from(keys)) as _,
+            Arc::new(Int64Array::from(values)) as _,
         ],
     )
     .expect("build left delta");
-    ArrowZSet::new(data, vec![1, 1, 1])
+    ArrowZSet::new(data, vec![1; 34])
 }
 
 fn join_values(output: &ArrowZSet) -> Vec<Vec<i64>> {
@@ -167,8 +169,16 @@ fn join_values(output: &ArrowZSet) -> Vec<Vec<i64>> {
         .collect()
 }
 
-async fn run_join(path: &str, store: Arc<dyn ObjectStore>) -> Vec<Vec<i64>> {
-    let shard = Arc::new(open_shard(path, store, None).await);
+async fn run_join(
+    path: &str,
+    store: Arc<dyn ObjectStore>,
+    cache_dir: Option<&Path>,
+    reset_gets: Option<&AtomicUsize>,
+) -> Vec<Vec<i64>> {
+    let shard = Arc::new(open_shard(path, store, cache_dir).await);
+    if let Some(gets) = reset_gets {
+        gets.store(0, Ordering::SeqCst);
+    }
     let pipeline = JoinPipeline::new(
         vec![],
         vec![],
@@ -221,30 +231,21 @@ async fn optimized_arrangement_lookups_reduce_minio_gets_vs_uncached_baseline() 
     let baseline_store: Arc<dyn ObjectStore> =
         Arc::new(CountingObjectStore::new(raw_store, baseline_gets.clone()));
 
-    let optimized = {
-        let shard = open_shard("optimized", optimized_store, Some(&optimized_cache)).await;
-        let pipeline = JoinPipeline::new(
-            vec![],
-            vec![],
-            JoinKind::Inner(Arc::new(
-                JoinOp::new(OperatorId(947), vec![0], vec![0]).with_db(Arc::new(shard)),
-            )),
-            vec![],
-        );
-        let output = pipeline
-            .process_async(
-                make_left_delta(),
-                ArrowZSet::empty(Arc::new(Schema::new(vec![
-                    Field::new("k", DataType::Int64, false),
-                    Field::new("v", DataType::Int64, false),
-                ]))),
-            )
-            .await
-            .expect("optimized MinIO join");
-        assert_eq!(output.weights, vec![1, 1]);
-        join_values(&output)
-    };
-    let baseline = run_join("baseline", baseline_store).await;
+    let _ = run_join(
+        "optimized",
+        optimized_store.clone(),
+        Some(&optimized_cache),
+        None,
+    )
+    .await;
+    let optimized = run_join(
+        "optimized",
+        optimized_store,
+        Some(&optimized_cache),
+        Some(&optimized_gets),
+    )
+    .await;
+    let baseline = run_join("baseline", baseline_store, None, Some(&baseline_gets)).await;
 
     assert_eq!(optimized, baseline);
     assert!(

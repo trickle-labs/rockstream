@@ -34,8 +34,9 @@ use bytes::Bytes;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{
-    Attribute, Attributes, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    Attribute, Attributes, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result,
 };
 use rockstream_storage::{
     format_migration::migrate_shard_format,
@@ -136,10 +137,6 @@ impl std::fmt::Display for RecordingStore {
 
 #[async_trait]
 impl ObjectStore for RecordingStore {
-    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-        self.inner.put(location, payload).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -153,10 +150,6 @@ impl ObjectStore for RecordingStore {
         self.inner.put_opts(location, payload, opts).await
     }
 
-    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart(location).await
-    }
-
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -165,16 +158,8 @@ impl ObjectStore for RecordingStore {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        self.inner.get(location).await
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         self.inner.get_opts(location, options).await
-    }
-
-    async fn get_range(&self, location: &Path, range: std::ops::Range<u64>) -> Result<Bytes> {
-        self.inner.get_range(location, range).await
     }
 
     async fn get_ranges(
@@ -185,12 +170,11 @@ impl ObjectStore for RecordingStore {
         self.inner.get_ranges(location, ranges).await
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        self.inner.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, Result<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(
@@ -204,12 +188,8 @@ impl ObjectStore for RecordingStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

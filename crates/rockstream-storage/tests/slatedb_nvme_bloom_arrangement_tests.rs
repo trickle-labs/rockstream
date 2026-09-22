@@ -5,7 +5,6 @@
 //! - Tiered NVMe block caching configuration and WorkerStorageContext inheritance
 //! - S3 GET amplification minimization during arrangement lookups
 
-use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -15,13 +14,14 @@ use futures::stream::BoxStream;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use rockstream_storage::reader::ShardReader;
 use rockstream_storage::shard_db::ShardDb;
 use rockstream_storage::storage_context::WorkerStorageContext;
 use rockstream_storage::{JoinSide, ShardKeyEncoder};
+use slatedb::config::Settings;
 
 #[derive(Debug)]
 struct CountingObjectStore {
@@ -69,8 +69,11 @@ impl ObjectStore for CountingObjectStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -89,17 +92,13 @@ impl ObjectStore for CountingObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.copy_if_not_exists(from, to).await
-    }
-
-    async fn get_range(&self, location: &ObjPath, range: Range<u64>) -> ObjectStoreResult<Bytes> {
-        self.get_count.fetch_add(1, Ordering::SeqCst);
-        self.inner.get_range(location, range).await
+    async fn copy_opts(
+        &self,
+        from: &ObjPath,
+        to: &ObjPath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -323,8 +322,13 @@ async fn test_arrangement_cache_reused_across_fresh_worker_contexts() {
         let builder = ShardDb::builder("fresh-worker-arrangement-db", tracking_store.clone())
             .with_storage_context(writer_context)
             .with_bloom_filter(14, 0)
+            .with_settings(Settings {
+                l0_sst_size_bytes: 8 * 1024,
+                ..Settings::default()
+            })
             .with_nvme_cache(&nvme_cache_dir, 32 * 1024 * 1024);
-        assert!(builder.object_store_cache_options().cache_puts);
+        assert!(builder.object_store_cache_options().cache_on_flush);
+        assert!(builder.object_store_cache_options().cache_on_compaction);
         let shard = builder.build().await.expect("build writer");
 
         for i in 0..100u64 {
@@ -346,17 +350,15 @@ async fn test_arrangement_cache_reused_across_fresh_worker_contexts() {
         "writer must populate the shared local cache"
     );
 
-    let reader_context = Arc::new(
-        WorkerStorageContext::new_with_worker_id("arrangement-reader", 1)
-            .with_nvme_cache(&nvme_cache_dir, 32 * 1024 * 1024)
-            .with_filter_bits_per_key(14),
-    );
-    let shard = ShardDb::builder("fresh-worker-arrangement-db", tracking_store)
-        .with_storage_context(reader_context)
-        .with_bloom_filter(14, 0)
-        .build()
-        .await
-        .expect("build fresh reader");
+    let shard = ShardReader::open_with_cache_and_filter(
+        "fresh-worker-arrangement-db",
+        tracking_store,
+        Some(nvme_cache_dir),
+        Some(32 * 1024 * 1024),
+        Some(14),
+    )
+    .await
+    .expect("build fresh reader");
     let gets_before_reads = get_counter.load(Ordering::SeqCst);
 
     for i in 0..100u64 {
