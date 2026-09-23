@@ -359,6 +359,23 @@ async fn test_arrangement_cache_reused_across_fresh_worker_contexts() {
     )
     .await
     .expect("build fresh reader");
+
+    // Load reader metadata and filter blocks before measuring data-cache hits.
+    for i in 0..100u64 {
+        let key = ShardKeyEncoder::join_arr_key(JoinSide::Right, 91, &i.to_be_bytes(), i as u128);
+        assert_eq!(
+            shard.get(&key).await.expect("warm cached arrangement row"),
+            Some(Bytes::from(format!("arrangement-row-{i}")))
+        );
+    }
+    for i in 1000..1050u64 {
+        let key = ShardKeyEncoder::join_arr_key(JoinSide::Right, 91, &i.to_be_bytes(), i as u128);
+        assert_eq!(
+            shard.get(&key).await.expect("warm absent arrangement row"),
+            None
+        );
+    }
+
     let gets_before_reads = get_counter.load(Ordering::SeqCst);
 
     for i in 0..100u64 {
