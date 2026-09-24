@@ -123,11 +123,14 @@ async fn secret_ddl_negative_paths_return_actionable_codes() {
 
     let error = client
         .simple_query(
-            "CREATE SOURCE missing_secret TYPE kafka (secret = 'does_not_exist', topic = 'orders') FORMAT json",
+            "CREATE SOURCE missing_secret TYPE kafka (bootstrap_servers = 'localhost:9092', secret = 'does_not_exist', topic = 'orders') FORMAT json",
         )
         .await
         .unwrap_err();
-    assert!(db_error_message(error).contains("RS-2420"));
+    assert_eq!(
+        db_error_message(error),
+        "[RS-2420] secret.not_found: secret 'does_not_exist' does not exist. Next steps: verify the secret name or run CREATE SECRET to define it."
+    );
 
     client
         .simple_query("CREATE SECRET in_use (TYPE = 'sasl_plain', username = 'u', password = 'p')")
@@ -135,7 +138,7 @@ async fn secret_ddl_negative_paths_return_actionable_codes() {
         .unwrap();
     client
         .simple_query(
-            "CREATE SOURCE kafka_src TYPE kafka (secret = 'in_use', topic = 'orders') FORMAT json",
+            "CREATE SOURCE kafka_src TYPE kafka (bootstrap_servers = 'localhost:9092', secret = 'in_use', topic = 'orders') FORMAT json",
         )
         .await
         .unwrap();
