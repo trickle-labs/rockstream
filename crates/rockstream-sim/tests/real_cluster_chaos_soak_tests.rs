@@ -316,7 +316,7 @@ async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
         .start()
         .await
         .expect("Kafka-compatible broker must start for the chaos proof");
-    let minio = GenericImage::new("minio/minio", "RELEASE.2024-11-07T00-52-20Z")
+    let minio = GenericImage::new("quay.io/minio/minio", "RELEASE.2024-11-07T00-52-20Z")
         .with_wait_for(WaitFor::message_on_stderr("API:"))
         .with_exposed_port(ContainerPort::Tcp(9000))
         .with_cmd(vec!["server".to_string(), "/data".to_string()])
