@@ -14,7 +14,7 @@ use rockstream_gateway::pgoutput_coordinator::{
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::ConnectorId;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_cdc_sustained_workload_and_shard_migration() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),

@@ -306,13 +306,15 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
 
         self.access_queue.push_back(key.clone());
 
-        if let Some(db) = &self.db {
-            let db_key = self.make_db_key(&key);
-            if let Ok(Some(old_spilled)) = block_on_future(db.get(&db_key)) {
-                let _ = block_on_future(db.delete(&db_key));
-                self.spilled_count = self.spilled_count.saturating_sub(1);
-                let spilled_sz = (db_key.len() - self.prefix.len() + old_spilled.len()) as u64;
-                self.spilled_bytes = self.spilled_bytes.saturating_sub(spilled_sz);
+        if self.spilled_count > 0 {
+            if let Some(db) = &self.db {
+                let db_key = self.make_db_key(&key);
+                if let Ok(Some(old_spilled)) = block_on_future(db.get(&db_key)) {
+                    let _ = block_on_future(db.delete(&db_key));
+                    self.spilled_count = self.spilled_count.saturating_sub(1);
+                    let spilled_sz = (db_key.len() - self.prefix.len() + old_spilled.len()) as u64;
+                    self.spilled_bytes = self.spilled_bytes.saturating_sub(spilled_sz);
+                }
             }
         }
 
@@ -331,27 +333,29 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
             return Ok(None);
         }
 
-        if let Some(db) = &self.db {
-            let db_key = self.make_db_key(key);
-            let res = block_on_future(db.get(&db_key))
-                .map_err(|e| OpError::storage_error(format!("spill get err: {e}")))?;
-            if let Some(v_bytes) = res {
-                let val = V::from_spill_bytes(&v_bytes)?;
-                block_on_future(db.delete(&db_key))
-                    .map_err(|e| OpError::storage_error(format!("spill delete err: {e}")))?;
-                self.spilled_count = self.spilled_count.saturating_sub(1);
-                let spilled_sz = (db_key.len() - self.prefix.len() + v_bytes.len()) as u64;
-                self.spilled_bytes = self.spilled_bytes.saturating_sub(spilled_sz);
-                inc_spill_faults_total();
+        if self.spilled_count > 0 {
+            if let Some(db) = &self.db {
+                let db_key = self.make_db_key(key);
+                let res = block_on_future(db.get(&db_key))
+                    .map_err(|e| OpError::storage_error(format!("spill get err: {e}")))?;
+                if let Some(v_bytes) = res {
+                    let val = V::from_spill_bytes(&v_bytes)?;
+                    block_on_future(db.delete(&db_key))
+                        .map_err(|e| OpError::storage_error(format!("spill delete err: {e}")))?;
+                    self.spilled_count = self.spilled_count.saturating_sub(1);
+                    let spilled_sz = (db_key.len() - self.prefix.len() + v_bytes.len()) as u64;
+                    self.spilled_bytes = self.spilled_bytes.saturating_sub(spilled_sz);
+                    inc_spill_faults_total();
 
-                let entry_sz = Self::entry_bytes(key, &val);
-                self.in_memory.insert(key.clone(), val.clone());
-                self.in_memory_bytes += entry_sz;
-                self.access_queue.push_back(key.clone());
-                self.evict_if_needed()?;
-                return Ok(Some(val));
-            } else {
-                self.add_negative(key.clone());
+                    let entry_sz = Self::entry_bytes(key, &val);
+                    self.in_memory.insert(key.clone(), val.clone());
+                    self.in_memory_bytes += entry_sz;
+                    self.access_queue.push_back(key.clone());
+                    self.evict_if_needed()?;
+                    return Ok(Some(val));
+                } else {
+                    self.add_negative(key.clone());
+                }
             }
         }
 
@@ -366,16 +370,18 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
             removed_val = Some(old);
         }
 
-        if let Some(db) = &self.db {
-            let db_key = self.make_db_key(key);
-            if let Ok(Some(old_spilled)) = block_on_future(db.get(&db_key)) {
-                let _ = block_on_future(db.delete(&db_key));
-                self.spilled_count = self.spilled_count.saturating_sub(1);
-                let spilled_sz = (db_key.len() - self.prefix.len() + old_spilled.len()) as u64;
-                self.spilled_bytes = self.spilled_bytes.saturating_sub(spilled_sz);
-                if removed_val.is_none() {
-                    if let Ok(val) = V::from_spill_bytes(&old_spilled) {
-                        removed_val = Some(val);
+        if self.spilled_count > 0 {
+            if let Some(db) = &self.db {
+                let db_key = self.make_db_key(key);
+                if let Ok(Some(old_spilled)) = block_on_future(db.get(&db_key)) {
+                    let _ = block_on_future(db.delete(&db_key));
+                    self.spilled_count = self.spilled_count.saturating_sub(1);
+                    let spilled_sz = (db_key.len() - self.prefix.len() + old_spilled.len()) as u64;
+                    self.spilled_bytes = self.spilled_bytes.saturating_sub(spilled_sz);
+                    if removed_val.is_none() {
+                        if let Ok(val) = V::from_spill_bytes(&old_spilled) {
+                            removed_val = Some(val);
+                        }
                     }
                 }
             }
@@ -392,14 +398,16 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
         if self.negative_set.contains(key) {
             return Ok(false);
         }
-        if let Some(db) = &self.db {
-            let db_key = self.make_db_key(key);
-            let res = block_on_future(db.get(&db_key))
-                .map_err(|e| OpError::storage_error(format!("spill get err: {e}")))?;
-            if res.is_some() {
-                return Ok(true);
-            } else {
-                self.add_negative(key.clone());
+        if self.spilled_count > 0 {
+            if let Some(db) = &self.db {
+                let db_key = self.make_db_key(key);
+                let res = block_on_future(db.get(&db_key))
+                    .map_err(|e| OpError::storage_error(format!("spill get err: {e}")))?;
+                if res.is_some() {
+                    return Ok(true);
+                } else {
+                    self.add_negative(key.clone());
+                }
             }
         }
         Ok(false)
@@ -414,20 +422,22 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
             seen_keys.insert(k.clone());
         }
 
-        if let Some(db) = &self.db {
-            let raw_pairs = block_on_future(db.scan_prefix(&self.prefix))
-                .map_err(|e| OpError::storage_error(format!("spill scan err: {e}")))?;
-            let prefix_len = self.prefix.len();
-            for (k_buf, v_buf) in raw_pairs {
-                if k_buf.len() < prefix_len {
-                    continue;
-                }
-                let k_bytes = &k_buf[prefix_len..];
-                if let Ok(key) = K::from_spill_bytes(k_bytes) {
-                    if !seen_keys.contains(&key) {
-                        if let Ok(val) = V::from_spill_bytes(&v_buf) {
-                            seen_keys.insert(key.clone());
-                            results.push((key, val));
+        if self.spilled_count > 0 {
+            if let Some(db) = &self.db {
+                let raw_pairs = block_on_future(db.scan_prefix(&self.prefix))
+                    .map_err(|e| OpError::storage_error(format!("spill scan err: {e}")))?;
+                let prefix_len = self.prefix.len();
+                for (k_buf, v_buf) in raw_pairs {
+                    if k_buf.len() < prefix_len {
+                        continue;
+                    }
+                    let k_bytes = &k_buf[prefix_len..];
+                    if let Ok(key) = K::from_spill_bytes(k_bytes) {
+                        if !seen_keys.contains(&key) {
+                            if let Ok(val) = V::from_spill_bytes(&v_buf) {
+                                seen_keys.insert(key.clone());
+                                results.push((key, val));
+                            }
                         }
                     }
                 }

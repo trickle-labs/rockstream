@@ -557,16 +557,30 @@ impl SharedPgOutputCoordinator {
             ));
         }
         let route_updates = active.route_updates.values().cloned().collect();
-        let mut entries = self
-            .envelope_buffer
-            .scan_all()
-            .map_err(|error| coordinator_error(&format!("scan pgoutput spill: {error}")))?;
-        entries.sort_by_key(|entry| entry.0.to_spill_bytes());
-        let changes = entries
-            .into_iter()
-            .filter(|(key, _)| key.xid == xid)
-            .map(|(_, value)| value.0)
-            .collect();
+        let changes =
+            if self.envelope_buffer.spilled_bytes() == 0 {
+                let mut changes = Vec::with_capacity(active.next_sequence as usize);
+                for sequence in 0..active.next_sequence {
+                    let key = EnvelopeKey { xid, sequence };
+                    if let Some(entry) = self.envelope_buffer.get(&key).map_err(|error| {
+                        coordinator_error(&format!("get pgoutput change: {error}"))
+                    })? {
+                        changes.push(entry.0);
+                    }
+                }
+                changes
+            } else {
+                let mut entries = self
+                    .envelope_buffer
+                    .scan_all()
+                    .map_err(|error| coordinator_error(&format!("scan pgoutput spill: {error}")))?;
+                entries.sort_by_key(|entry| entry.0.to_spill_bytes());
+                entries
+                    .into_iter()
+                    .filter(|(key, _)| key.xid == xid)
+                    .map(|(_, value)| value.0)
+                    .collect()
+            };
         Ok(BufferedPgOutputEnvelope {
             xid,
             commit_lsn,
@@ -582,17 +596,12 @@ impl SharedPgOutputCoordinator {
         let xid = active.xid;
         let route_updates = active.route_updates.clone();
         let had_spill = self.envelope_buffer.spilled_bytes() > 0;
-        let keys = self
-            .envelope_buffer
-            .scan_all()
-            .map_err(|error| coordinator_error(&format!("scan pgoutput spill: {error}")))?
-            .into_iter()
-            .map(|(key, _)| key)
-            .filter(|key| key.xid == xid)
+        let keys = (0..active.next_sequence)
+            .map(|sequence| EnvelopeKey { xid, sequence })
             .collect::<Vec<_>>();
-        for key in keys {
+        for key in &keys {
             self.envelope_buffer
-                .remove(&key)
+                .remove(key)
                 .map_err(|error| coordinator_error(&format!("delete pgoutput spill: {error}")))?;
         }
         if had_spill {
