@@ -3,7 +3,7 @@
 
 services:
   minio:
-    image: quay.io/minio/minio:RELEASE.2024-01-18T22-51-28Z
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: rockstream-minio
     restart: unless-stopped
     ports:

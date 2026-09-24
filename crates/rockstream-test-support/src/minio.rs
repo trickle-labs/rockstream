@@ -151,7 +151,7 @@ impl Image for MinIO2024 {
     }
 
     fn tag(&self) -> &str {
-        "RELEASE.2024-11-07T00-52-20Z"
+        "RELEASE.2025-09-07T16-13-09Z"
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {
