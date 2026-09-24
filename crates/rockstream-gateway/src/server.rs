@@ -17322,7 +17322,7 @@ fn validate_typed_source_options(
     source_type: &str,
     options: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    if source_type != "postgres_cdc" && source_type != "http_webhook" {
+    if source_type != "postgres_cdc" && source_type != "http_webhook" && source_type != "kafka" {
         return Ok(());
     }
     for key in ["password", "token", "api_key", "authorization"] {
@@ -17332,12 +17332,14 @@ fn validate_typed_source_options(
             ));
         }
     }
-    let has_cred_ref = options.get("credential_ref").is_some_and(|s| !s.is_empty())
-        || options.get("secret").is_some_and(|s| !s.is_empty());
-    if !has_cred_ref {
-        return Err(format!(
-            "[RS-4008] CREATE SOURCE type '{source_type}' requires a non-empty secret or credential_ref. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
-        ));
+    if source_type == "postgres_cdc" || source_type == "http_webhook" {
+        let has_cred_ref = options.get("credential_ref").is_some_and(|s| !s.is_empty())
+            || options.get("secret").is_some_and(|s| !s.is_empty());
+        if !has_cred_ref {
+            return Err(format!(
+                "[RS-4008] CREATE SOURCE type '{source_type}' requires a non-empty secret or credential_ref. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+            ));
+        }
     }
     if source_type == "postgres_cdc" {
         for key in ["publication", "slot"] {
@@ -17351,6 +17353,36 @@ fn validate_typed_source_options(
             if !matches!(policy.as_str(), "initial" | "never" | "always") {
                 return Err(format!(
                     "[RS-4008] CREATE SOURCE option 'snapshot_policy' must be initial|never|always; found '{policy}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                ));
+            }
+        }
+        if let Some(policy) = options.get("schema_policy") {
+            if !matches!(policy.as_str(), "strict" | "evolve" | "error") {
+                return Err(format!(
+                    "[RS-4008] CREATE SOURCE option 'schema_policy' must be strict|evolve|error; found '{policy}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                ));
+            }
+        }
+    }
+    if source_type == "kafka" {
+        let bootstrap = options
+            .get("bootstrap_servers")
+            .or_else(|| options.get("bootstrap.servers"));
+        if bootstrap.is_none_or(String::is_empty) {
+            return Err(format!(
+                "[RS-4008] CREATE SOURCE type 'kafka' requires a non-empty bootstrap_servers or bootstrap.servers. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+            ));
+        }
+        let topic = options.get("topic");
+        if topic.is_none_or(String::is_empty) {
+            return Err(format!(
+                "[RS-4008] CREATE SOURCE type 'kafka' requires a non-empty topic. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+            ));
+        }
+        if let Some(policy) = options.get("offset_policy") {
+            if !matches!(policy.as_str(), "earliest" | "latest") {
+                return Err(format!(
+                    "[RS-4008] CREATE SOURCE option 'offset_policy' must be earliest|latest; found '{policy}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
                 ));
             }
         }

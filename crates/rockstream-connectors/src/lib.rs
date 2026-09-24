@@ -16,7 +16,12 @@ pub mod source_runtime;
 
 pub use fault_injecting_store::FaultInjectingObjectStore;
 pub use kafka_sink::KafkaSink;
-pub use kafka_source::KafkaSource;
+pub use kafka_source::{
+    decode_kafka_payload, redact_sensitive_payload, IncarnationStatus, KafkaDlqDiagnostic,
+    KafkaDlqPolicy, KafkaSource, KafkaSourceIdentity, KafkaSourceIdentityV1,
+    DEFAULT_IDLE_PARTITION_TIMEOUT, DEFAULT_MAX_EPOCH_BATCH_BYTES, DEFAULT_MAX_EPOCH_BATCH_RECORDS,
+    KAFKA_SOURCE_BUFFER_LIMIT,
+};
 pub use postgres_cdc::{
     decode_pgoutput_event, CdcChange, CdcOperation, CdcTransactionEnvelope, CdcWireFormat, PgLsn,
     PgOutputColumn, PgOutputConfig, PgOutputEvent, PgOutputRelationMetadata,

@@ -102,7 +102,7 @@ Inspect and control streaming ingestion sources and connectors.
 
 Scaffold, apply, and verify RockStream streaming projects.
 
-- `rockstream project new <name> [--template <local|postgres-cdc>] [--dir <dir>] [--force]` — Scaffold a new project. The `postgres-cdc` template generates an executable PostgreSQL CDC ingestion project with docker-compose logical replication environment, canonical source DDL, schema, queries, and verification script.
+- `rockstream project new <name> [--template <local|postgres-cdc|kafka>] [--dir <dir>] [--force]` — Scaffold a new project. The `postgres-cdc` template generates an executable PostgreSQL CDC ingestion project with docker-compose logical replication environment, canonical source DDL, schema, queries, and verification script. The `kafka` template generates a real broker-provisioned streaming ingestion project with Redpanda/Kafka docker-compose, canonical source DDL, schema, query verification scripts, and event generator.
 - `rockstream project apply [--dir <dir>] [--endpoint <addr>]` — Apply project schema and source definitions against a running gateway.
 - `rockstream project verify [--dir <dir>] [--endpoint <addr>] [--timeout <sec>]` — Verify maintained materialized views against expected query results.
 

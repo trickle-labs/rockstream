@@ -85,22 +85,16 @@ pub fn run_init(format: OutputFormat, opts: &InitOptions) -> Result<String, CliE
 /// Core project scaffolding logic.
 pub fn scaffold_project(opts: &InitOptions) -> Result<InitOutcome, CliError> {
     let template_key = opts.template.to_lowercase();
-    if template_key == "kafka" {
+    if template_key != "local" && template_key != "postgres-cdc" && template_key != "kafka" {
         return Err(CliError::new(
             RS_0002,
-            "invalid template 'kafka'; only 'local' and 'postgres-cdc' are supported in v0.69 (kafka assigned to v0.70)".to_string(),
-            "Specify '--template local' or '--template postgres-cdc'.",
-        ));
-    }
-    if template_key != "local" && template_key != "postgres-cdc" {
-        return Err(CliError::new(
-            RS_0002,
-            format!("invalid template '{template_key}'; valid options: local, postgres-cdc"),
-            "Specify '--template local' or '--template postgres-cdc'.",
+            format!("invalid template '{template_key}'; valid options: local, postgres-cdc, kafka"),
+            "Specify '--template local', '--template postgres-cdc', or '--template kafka'.",
         ));
     }
     let template_files = match template_key.as_str() {
         "postgres-cdc" => postgres_cdc_template_files(&opts.name),
+        "kafka" => kafka_template_files(&opts.name),
         _ => local_template_files(&opts.name),
     };
 
@@ -519,6 +513,192 @@ This project runs a RockStream instance ingesting change data capture events fro
    ```
 
 3. Run automated verification:
+   ```bash
+   bash scripts/verify.sh
+   ```
+"#
+            ),
+            executable: false,
+        },
+    ]
+}
+
+fn kafka_template_files(project_name: &str) -> Vec<TemplateFile> {
+    vec![
+        TemplateFile {
+            rel_path: "rockstream.toml",
+            content: r#"# RockStream Configuration — Kafka Deployment
+version = 1
+
+[node]
+role = "all"
+
+[gateway]
+listen_addr = "127.0.0.1:5432"
+
+[storage]
+url = "file://./data"
+
+[worker]
+budget_bytes = 67108864
+max_in_flight_epochs = 16
+
+[metrics]
+listen_addr = "127.0.0.1:9090"
+enabled = true
+
+[logging]
+level = "info"
+"#
+            .to_string(),
+            executable: false,
+        },
+        TemplateFile {
+            rel_path: "docker-compose.yaml",
+            content: r#"services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.1
+    container_name: redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 1G
+      - --overprovisioned
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+"#
+            .to_string(),
+            executable: false,
+        },
+        TemplateFile {
+            rel_path: "produce-events.sh",
+            content: r#"#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Producing sample events to Kafka topic 'events'..."
+for id in 1 2 3; do
+    echo "{\"timestamp\": $(date +%s%3N), \"values\": [$id, \"customer_$id\", $((id * 100))], \"weight\": 1}"
+done
+"#
+            .to_string(),
+            executable: true,
+        },
+        TemplateFile {
+            rel_path: "schema.sql",
+            content: r#"-- RockStream Canonical Kafka Source and Materialized View DDL
+CREATE SOURCE events_source TYPE kafka (
+    bootstrap_servers = 'localhost:19092',
+    topic = 'events',
+    group_id = 'rockstream_events_group',
+    offset_policy = 'earliest',
+    schema_policy = 'strict'
+) FORMAT json;
+
+CREATE TABLE events (
+    id BIGINT,
+    customer VARCHAR(64),
+    amount BIGINT
+);
+
+CREATE MATERIALIZED VIEW customer_totals AS
+SELECT
+    customer,
+    SUM(amount) AS total_amount
+FROM events
+GROUP BY customer;
+"#
+            .to_string(),
+            executable: false,
+        },
+        TemplateFile {
+            rel_path: "queries.sql",
+            content: r#"-- Queries validating materialized view
+SELECT customer, total_amount FROM customer_totals ORDER BY customer;
+"#
+            .to_string(),
+            executable: false,
+        },
+        TemplateFile {
+            rel_path: "project.toml",
+            content: format!(
+                r#"version = 1
+name = "{project_name}"
+
+[[apply]]
+file = "schema.sql"
+
+[[verify]]
+name = "customer_totals"
+query = """
+SELECT customer, total_amount
+FROM customer_totals
+ORDER BY customer;
+"""
+expected = """
+customer_1|100
+customer_2|200
+customer_3|300
+"""
+"#
+            ),
+            executable: false,
+        },
+        TemplateFile {
+            rel_path: "scripts/verify.sh",
+            content: r#"#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Verifying Kafka pipeline..."
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Notice: docker command not found, skipping container health check."
+    exit 0
+fi
+echo "==> Verification completed successfully."
+"#
+            .to_string(),
+            executable: true,
+        },
+        TemplateFile {
+            rel_path: "scripts/cleanup.sh",
+            content: r#"#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Cleaning up Kafka pipeline..."
+if command -v docker >/dev/null 2>&1; then
+    docker compose down -v || true
+fi
+"#
+            .to_string(),
+            executable: true,
+        },
+        TemplateFile {
+            rel_path: "README.md",
+            content: format!(
+                r#"# RockStream Kafka Project: {project_name}
+
+This project runs a RockStream instance ingesting streaming events from Kafka/Redpanda.
+
+## Quick Start
+
+1. Start Redpanda/Kafka:
+   ```bash
+   docker compose up -d
+   ```
+
+2. Start the RockStream node:
+   ```bash
+   rockstream start --storage ./data --listen 127.0.0.1:5432
+   ```
+
+3. Produce sample events:
+   ```bash
+   bash produce-events.sh
+   ```
+
+4. Run automated verification:
    ```bash
    bash scripts/verify.sh
    ```

@@ -106,16 +106,16 @@ fn test_configuration_distinction() {
 fn test_service_topology_distinction() {
     let temp_dir = TempDir::new().expect("tempdir");
 
-    // In v0.61, non-local templates are rejected by init with guidance to examples/experimental/
-    let kafka_dir = temp_dir.path().join("kafka_topo");
-    let kafka_opts = InitOptions {
-        name: "kafka_topo".to_string(),
-        template: "kafka".to_string(),
-        dir: Some(kafka_dir),
+    // In v0.70, unsupported templates are rejected by init with guidance
+    let invalid_dir = temp_dir.path().join("invalid_topo");
+    let invalid_opts = InitOptions {
+        name: "invalid_topo".to_string(),
+        template: "invalid_template".to_string(),
+        dir: Some(invalid_dir),
         force: false,
     };
-    let err = run_init(OutputFormat::Json, &kafka_opts).unwrap_err();
-    assert!(err.message.contains("kafka assigned to v0.70"));
+    let err = run_init(OutputFormat::Json, &invalid_opts).unwrap_err();
+    assert!(err.message.contains("invalid template 'invalid_template'"));
 
     // Multi-service Compose profiles reside in examples/experimental/
     let kafka_compose_path =

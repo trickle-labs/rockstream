@@ -254,7 +254,7 @@ Changes to persistent formats or public protocols require:
 | v0.67.1 | State beyond RAM | Maintained state and recovery operate within worker budgets ✅ Done |
 | v0.68.0 | Distributed Lifecycle ✅ Done | Migration, drain, and failover become durable sagas |
 | **v0.69** | PostgreSQL CDC ✅ Done | First complete external ingestion golden path |
-| **v0.70** | Kafka | Second complete external ingestion golden path |
+| **v0.70** | Kafka ✅ Done | Second complete external ingestion golden path |
 | **v0.71** | Observability | Operators can explain health, lag, state, and failures |
 | **v0.72** | Resource Control | Bounded execution and reproducible capacity behavior |
 | **v0.73** | Security | Authentication, authorization, and identity become production-coherent |

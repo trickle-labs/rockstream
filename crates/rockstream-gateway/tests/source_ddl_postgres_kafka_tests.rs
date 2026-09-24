@@ -1171,3 +1171,440 @@ async fn test_source_ddl_persists_versioned_record_and_rejects_slot_collision() 
         "got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn test_kafka_source_ddl_complete_valid_options() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .execute(
+            "CREATE SOURCE events TYPE kafka (
+                bootstrap_servers='localhost:9092',
+                topic='events',
+                group_id='grp1',
+                offset_policy='earliest',
+                schema_policy='strict',
+                credential_ref='vault://kafka/key'
+            ) FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let rows = client.query("SHOW SOURCES;", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "events");
+    assert_eq!(rows[0].get::<_, String>(1), "kafka");
+    assert_eq!(rows[0].get::<_, String>(2), "json");
+}
+
+#[tokio::test]
+async fn test_kafka_source_ddl_dot_notation_aliases() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .execute(
+            "CREATE SECRET kafka_secret (TYPE = 'sasl_plain', username = 'u', password = 'p');",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    client
+        .execute(
+            "CREATE SOURCE events TYPE kafka (
+                bootstrap.servers='localhost:9092',
+                topic='events',
+                group.id='grp1',
+                offset_policy='latest',
+                schema_policy='strict',
+                secret='kafka_secret'
+            ) FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let rows = client.query("SHOW SOURCES;", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "events");
+}
+
+#[tokio::test]
+async fn test_kafka_source_ddl_rejects_inline_password() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE events TYPE kafka (
+                bootstrap_servers='localhost:9092',
+                topic='events',
+                group_id='grp1',
+                offset_policy='earliest',
+                schema_policy='strict',
+                password='secret'
+            ) FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(msg.contains("inline credential"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn test_kafka_source_ddl_rejects_inline_token() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE events TYPE kafka (
+                bootstrap_servers='localhost:9092',
+                topic='events',
+                group_id='grp1',
+                offset_policy='earliest',
+                schema_policy='strict',
+                token='secret_token'
+            ) FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(msg.contains("inline credential"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn test_kafka_source_ddl_rejects_missing_bootstrap() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE events TYPE kafka (
+                topic='events',
+                group_id='grp1',
+                offset_policy='earliest',
+                schema_policy='strict',
+                credential_ref='vault://kafka/key'
+            ) FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(msg.contains("bootstrap"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn test_kafka_source_ddl_rejects_missing_topic() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE events TYPE kafka (
+                bootstrap_servers='localhost:9092',
+                group_id='grp1',
+                offset_policy='earliest',
+                schema_policy='strict',
+                credential_ref='vault://kafka/key'
+            ) FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(msg.contains("topic"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn test_kafka_source_ddl_rejects_invalid_offset_policy() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE events TYPE kafka (
+                bootstrap_servers='localhost:9092',
+                topic='events',
+                group_id='grp1',
+                offset_policy='invalid_policy',
+                schema_policy='strict',
+                credential_ref='vault://kafka/key'
+            ) FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(msg.contains("offset_policy"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn test_kafka_source_ddl_rejects_invalid_schema_policy() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE events TYPE kafka (
+                bootstrap_servers='localhost:9092',
+                topic='events',
+                group_id='grp1',
+                offset_policy='earliest',
+                schema_policy='unknown_policy',
+                credential_ref='vault://kafka/key'
+            ) FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(msg.contains("schema_policy"), "got: {msg}");
+}
+
+#[test]
+fn test_kafka_catalog_rejects_unsupported_version() {
+    use rockstream_storage::catalog::SourceRecordV1;
+    let invalid = serde_json::json!({
+        "version": 99,
+        "id": 101,
+        "name": "kafka_events",
+        "connector_type": "kafka",
+        "table_name": "events",
+        "options": {
+            "bootstrap_servers": "localhost:9092",
+            "topic": "events"
+        },
+        "format": "json"
+    });
+    let invalid_bytes = serde_json::to_vec(&invalid).unwrap();
+    let err = SourceRecordV1::decode_versioned(&invalid_bytes).unwrap_err();
+    let err_str = err.to_string();
+    assert!(err_str.contains("RS-2025"), "got: {err_str}");
+    assert!(
+        err_str.contains("version 99 is not supported"),
+        "got: {err_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_canonical_kafka_source_ddl_and_credential_rejection() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let shard_db = Arc::new(
+        ShardDb::builder(
+            "test-versioned-kafka-shard",
+            Arc::new(object_store::memory::InMemory::new()),
+        )
+        .build()
+        .await
+        .unwrap(),
+    );
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+        Arc::clone(&shard_db),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // 1. Valid Kafka source persists in catalog
+    client
+        .execute(
+            "CREATE SOURCE canonical_kafka TYPE kafka (
+                bootstrap_servers='127.0.0.1:9092',
+                topic='canonical_events',
+                group_id='grp_canon',
+                offset_policy='earliest',
+                schema_policy='strict',
+                credential_ref='vault://kafka/key'
+            ) FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let persisted = shard_db
+        .get(b"catalog:source:v1:canonical_kafka")
+        .await
+        .unwrap()
+        .expect("persisted kafka source record must exist in shard_db");
+    let record = rockstream_storage::catalog::SourceRecordV1::decode_versioned(&persisted).unwrap();
+    assert_eq!(record.version, 1);
+    assert_eq!(record.name, "canonical_kafka");
+    assert_eq!(record.connector_type, "kafka");
+    assert_eq!(record.format, "json");
+
+    // 2. Reject inline credentials
+    for (name, opt) in [
+        ("s_pass", "password='secret'"),
+        ("s_tok", "token='tok123'"),
+        ("s_key", "api_key='key123'"),
+        ("s_auth", "authorization='Bearer xyz'"),
+    ] {
+        let sql = format!(
+            "CREATE SOURCE {name} TYPE kafka (
+                bootstrap_servers='localhost:9092',
+                topic='events',
+                {opt}
+            ) FORMAT json;"
+        );
+        let err = client.execute(&sql, &[]).await.unwrap_err();
+        let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+        assert!(
+            msg.contains("RS-4008"),
+            "expected RS-4008 for {opt}, got: {msg}"
+        );
+    }
+}

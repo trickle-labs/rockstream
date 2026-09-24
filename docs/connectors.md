@@ -95,11 +95,62 @@ When PostgreSQL invalidates a replication slot (e.g. WAL retention exhaustion, e
 
 | Axis | Guarantee |
 | --- | --- |
-| Delivery / recovery | Consumer-group offsets advance only through the committed source checkpoint; recovery seeks the committed token. |
-| Bound / fill metric / backpressure | `KAFKA_SOURCE_BUFFER_LIMIT=50_000` KiB, `last_poll_fill_level`, poll credits, and pause/resume. One overflow record is retained locally. |
-| Degraded states | Assignment/rebalance, broker failure, and paused/backpressured recovery are observable; invalid input/configuration fails closed. |
-| Failure codes | `RS-4001`, `RS-4004`, `RS-4006`, `RS-4015`, `RS-4018`, `RS-4019`, `RS-4020`, `RS-4021`, and `RS-4022`; recover with the action in the registry. |
-| Proof matrix | The seven Kafka source cells below. |
+| Delivery / recovery | Consumer-group offsets advance only through the committed source checkpoint; recovery seeks the committed token. Exactly-once processing coupled with SlateDB epoch commit. |
+| Bound / fill metric / backpressure | `KAFKA_SOURCE_BUFFER_LIMIT=50_000` KiB, `last_poll_fill_level`, poll credits, `max_epoch_batch_records=10,000`, `max_epoch_batch_bytes=8 MiB`, and rdkafka partition pause/resume backpressure. |
+| Degraded states | Assignment/rebalance, broker failure, idle partitions, and paused/backpressured recovery are observable; invalid input/configuration fails closed. |
+| Failure codes | `RS-4001`, `RS-4004`, `RS-4006`, `RS-4014`, `RS-4015`, `RS-4018`, `RS-4019`, `RS-4020`, `RS-4021`, and `RS-4022`; recover with the action in the registry. |
+| Proof matrix | The seven Kafka source cells below plus end-to-end qualification and workload envelope tests. |
+
+### Kafka Configuration Prerequisites
+
+Apache Kafka 2.8+ or Redpanda 23+ cluster with topic partitions and consumer groups enabled:
+- `enable.auto.commit = false` (RockStream strictly commits offsets via durable SlateDB epochs)
+- `auto.offset.reset = earliest` (or `latest`)
+- Multiple partitions supported with dynamic group rebalance
+
+### Canonical Source DDL Contract
+
+RockStream provides canonical source creation for Kafka sources:
+
+```sql
+CREATE SOURCE events_source TYPE kafka (
+    endpoint = 'kafka:9092',
+    topic = 'events',
+    group_id = 'rockstream_group',
+    offset_policy = 'earliest',
+    schema_policy = 'strict',
+    poll_max_records = 1000,
+    poll_max_bytes = 1048576,
+    idle_partition_timeout_ms = 5000
+) FORMAT json;
+```
+
+### Partition Offset Management and Epoch Assembly
+
+- **Durable Epoch Coupling**: Offsets advance upstream only when the corresponding RockStream epoch is durable in SlateDB. Replays caused by downstream worker crashes seek directly to the committed checkpoint offset token.
+- **Idle Partition Isolation**: Multi-partition consumers do not block epoch assembly indefinitely waiting for idle partitions; partitions exceeding `idle_partition_timeout_ms` (default 5,000ms) yield their progress frontier.
+- **Cluster/Topic Incarnation**: Stable cluster ID, topic UUID, and partition count are tracked in `KafkaSourceIdentityV1`. Mismatched incarnations fail closed with `RS-4015`.
+
+### Poison-Record Handling and DLQ Diagnostics
+
+- **Policies**: Configurable via `KafkaDlqPolicy::Block` (default fail-closed) or `KafkaDlqPolicy::Dlq`.
+- **Bounded Capacity**: In-memory and durable DLQ queues are bounded at `MAX_DLQ_CAPACITY = 10,000` items. Overflow triggers `RS-4014` fail-closed backpressure.
+- **Diagnostic Schema**: DLQ records emit 6 structured fields: `topic`, `partition`, `offset`, `error`, `schema`, and `payload_digest` (SHA-256).
+- **Sensitive Payload Redaction**: Payloads are recursively scrubbed of sensitive fields (`password`, `secret`, `token`, `key`, `authorization`, `credit_card`) via `redact_sensitive_payload`.
+
+### Flow Control via Pause/Resume and Truthful Lag
+
+- **Worker Budgets**: Workers enforce `DEFAULT_MAX_EPOCH_BATCH_RECORDS = 10,000` records and `DEFAULT_MAX_EPOCH_BATCH_BYTES = 8 MiB`.
+- **rdkafka Pause/Resume**: When in-flight buffers exceed memory bounds, partition consumption is paused at the rdkafka broker transport level (`pause()`), resuming automatically (`resume()`) when downstream capacity frees up.
+- **Truthful Lag**: `truthful_lag(committed_offsets, high_watermarks)` computes exact per-partition and total lag against broker high watermarks without synthetic heuristics.
+
+### Performance Envelope and SLOs
+
+- **Throughput**: Sustained ingestion >= 10,000 msg/sec (release profile).
+- **Commit Latency**: p99 <= 25 ms.
+- **Freshness Latency**: p99 <= 100 ms.
+- **Point-Read Latency**: p99 <= 10 ms.
+- **Worker Memory Ceiling**: <= 16 MiB buffer ceiling per ingestion worker.
 
 ## Kafka sink
 

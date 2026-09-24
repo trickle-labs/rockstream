@@ -52,9 +52,25 @@ fn test_compose_profile_kafka() {
         force: false,
     };
 
-    // In v0.61, init rejects non-local templates
-    let err = run_init(OutputFormat::Json, &opts).unwrap_err();
-    assert!(err.message.contains("kafka assigned to v0.70"));
+    // In v0.70, kafka template is supported
+    let result = run_init(OutputFormat::Json, &opts).expect("kafka template init");
+    let outcome: rockstream_cli::init::InitOutcome =
+        serde_json::from_str(&result).expect("valid init output");
+    assert_eq!(outcome.template, "kafka");
+    assert_eq!(
+        outcome.generated_files,
+        [
+            "rockstream.toml",
+            "docker-compose.yaml",
+            "produce-events.sh",
+            "schema.sql",
+            "queries.sql",
+            "project.toml",
+            "scripts/verify.sh",
+            "scripts/cleanup.sh",
+            "README.md"
+        ]
+    );
 
     // Verify relocated experimental kafka compose profile
     let exp_compose = std::path::Path::new("../../examples/experimental/kafka/docker-compose.yaml");
@@ -167,16 +183,16 @@ fn test_compose_profile_all() {
     assert!(local_path.join("queries/verify.sql").exists());
     assert!(local_path.join("README.md").exists());
 
-    // Verify non-local templates are rejected
-    let p = target_dir.join("kafka");
+    // Verify unsupported templates are rejected
+    let p = target_dir.join("unsupported");
     let opts = InitOptions {
-        name: "kafka".to_string(),
-        template: "kafka".to_string(),
+        name: "unsupported".to_string(),
+        template: "unsupported".to_string(),
         dir: Some(p),
         force: false,
     };
     let err = run_init(OutputFormat::Json, &opts).unwrap_err();
-    assert!(err.message.contains("kafka assigned to v0.70"));
+    assert!(err.message.contains("invalid template 'unsupported'"));
 }
 
 #[test]

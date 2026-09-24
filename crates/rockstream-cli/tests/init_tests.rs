@@ -72,20 +72,21 @@ fn test_init_local_template() {
 }
 
 #[test]
-fn test_template_selection_rejects_kafka() {
+fn test_template_selection_rejects_unsupported() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let target_dir = temp_dir.path().join("kafka_proj");
+    let target_dir = temp_dir.path().join("unsupported_proj");
 
     let opts = InitOptions {
-        name: "kafka_proj".to_string(),
-        template: "kafka".to_string(),
+        name: "unsupported_proj".to_string(),
+        template: "unsupported".to_string(),
         dir: Some(target_dir),
         force: false,
     };
 
-    let err = run_init(OutputFormat::Json, &opts).expect_err("kafka template must be rejected");
+    let err =
+        run_init(OutputFormat::Json, &opts).expect_err("unsupported template must be rejected");
     assert_eq!(err.code, RS_0002);
-    assert!(err.message.contains("invalid template 'kafka'"));
+    assert!(err.message.contains("invalid template 'unsupported'"));
 }
 
 #[test]
@@ -171,6 +172,91 @@ fn test_cli_scaffold_postgres_cdc_template_generates_runnable_project() {
             cleanup_mode & 0o111,
             0o111,
             "scripts/cleanup.sh must be executable"
+        );
+    }
+}
+
+#[test]
+fn test_cli_scaffold_kafka_template_generates_runnable_project() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let target_dir = temp_dir.path().join("kafka_proj");
+
+    let opts = InitOptions {
+        name: "kafka_proj".to_string(),
+        template: "kafka".to_string(),
+        dir: Some(target_dir.clone()),
+        force: false,
+    };
+
+    let result =
+        run_init(OutputFormat::Json, &opts).expect("kafka template init should succeed in v0.70");
+    let outcome: InitOutcome = serde_json::from_str(&result).expect("valid InitOutcome JSON");
+
+    assert_eq!(outcome.project_name, "kafka_proj");
+    assert_eq!(outcome.template, "kafka");
+    assert_eq!(outcome.status, "created");
+    assert_eq!(outcome.generated_files.len(), 9);
+
+    let expected_files = [
+        "rockstream.toml",
+        "docker-compose.yaml",
+        "produce-events.sh",
+        "schema.sql",
+        "queries.sql",
+        "project.toml",
+        "scripts/verify.sh",
+        "scripts/cleanup.sh",
+        "README.md",
+    ];
+    for file in expected_files {
+        assert!(
+            outcome.generated_files.contains(&file.to_string()),
+            "missing generated file: {file}"
+        );
+        assert!(
+            target_dir.join(file).exists(),
+            "file does not exist on disk: {file}"
+        );
+    }
+
+    // Verify rockstream.toml contains worker budget and storage
+    let config = fs::read_to_string(target_dir.join("rockstream.toml")).expect("rockstream.toml");
+    assert!(config.contains("budget_bytes = 67108864"));
+    assert!(config.contains("role = \"all\""));
+    // Ensure no raw secrets/passwords in rockstream.toml
+    assert!(!config.contains("password ="));
+
+    // Verify docker-compose.yaml contains redpanda/kafka
+    let compose =
+        fs::read_to_string(target_dir.join("docker-compose.yaml")).expect("docker-compose.yaml");
+    assert!(compose.contains("redpanda"));
+
+    // Verify schema.sql contains canonical CREATE SOURCE kafka FORMAT json
+    let schema = fs::read_to_string(target_dir.join("schema.sql")).expect("schema.sql");
+    assert!(schema.contains("CREATE SOURCE events_source TYPE kafka"));
+    assert!(schema.contains("FORMAT json;"));
+
+    // Verify scripts are executable on unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let verify_mode = fs::metadata(target_dir.join("scripts/verify.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            verify_mode & 0o111,
+            0o111,
+            "scripts/verify.sh must be executable"
+        );
+        let produce_mode = fs::metadata(target_dir.join("produce-events.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            produce_mode & 0o111,
+            0o111,
+            "produce-events.sh must be executable"
         );
     }
 }

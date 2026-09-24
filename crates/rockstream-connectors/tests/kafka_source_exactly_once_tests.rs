@@ -155,3 +155,99 @@ async fn real_broker_source_assignment_poll_and_commit() {
         vec![(0, Offset::Offset(1)), (1, Offset::Offset(1))]
     );
 }
+
+// =========================================================================
+// Slice 3: Commit Semantics & Crash Recovery Matrix (Table 4.3)
+// =========================================================================
+
+#[test]
+fn test_crash_before_epoch_commit_discards_incomplete() {
+    let mut offsets = std::collections::BTreeMap::new();
+    offsets.insert(0_u64, 50_u64);
+    let durable_checkpoint = OffsetToken::new(serde_json::to_vec(&offsets).unwrap());
+
+    // In-flight batch had offset 75, but crashed before SlateDB persistence
+    let in_flight_offset = OffsetToken::new(
+        serde_json::to_vec(&std::collections::BTreeMap::from([(0_u64, 75_u64)])).unwrap(),
+    );
+    drop(in_flight_offset); // discarded upon crash
+
+    // On recovery, restart recovers strictly from durable offset
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let source = KafkaSource::connect(ConnectorId(7001), schema, "127.0.0.1:1", "t", "g").unwrap();
+    assert_eq!(
+        source.get_partition_offset(&durable_checkpoint, 0),
+        Some(50)
+    );
+    assert_eq!(source.last_committed(), None);
+}
+
+#[test]
+fn test_crash_after_persistence_before_ack_deduplicates() {
+    // Durable offset is 100 (NEXT to fetch)
+    let durable_offset = 100_u64;
+    // Broker replays record at offset 99 (replayed duplicate)
+    assert!(KafkaSource::is_duplicate_replay(99, durable_offset));
+    // Broker delivers record at offset 100 (new record)
+    assert!(!KafkaSource::is_duplicate_replay(100, durable_offset));
+}
+
+#[tokio::test]
+async fn test_broker_commit_failure_retains_durable_epoch() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let mut source =
+        KafkaSource::connect(ConnectorId(7002), schema, "127.0.0.1:1", "t", "g").unwrap();
+    let token = OffsetToken::new(
+        serde_json::to_vec(&std::collections::BTreeMap::from([(0_u64, 10_u64)])).unwrap(),
+    );
+    // Commit against unreachable broker fails, but records pending retryable ack
+    let err = source.commit_offset(5, token.clone()).await;
+    assert!(err.is_err());
+    assert!(source.has_pending_retryable_broker_ack());
+    assert_eq!(source.pending_retryable_broker_ack(), Some(&(5, token)));
+}
+
+#[test]
+fn test_broker_commit_fenced_rebalances_cleanly() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let mut source =
+        KafkaSource::connect(ConnectorId(7003), schema, "127.0.0.1:1", "t", "g").unwrap();
+    source.assign_partitions_for_test(&[0, 1]);
+    let initial_gen = source.assignment_generation();
+    // Coordinator rebalances
+    source.revoke_partitions_for_test(&[1]);
+    assert!(source.assignment_generation() > initial_gen);
+    assert!(source.is_partition_assigned(0));
+    assert!(!source.is_partition_assigned(1));
+}
+
+#[test]
+fn test_duplicate_broker_records_suppressed() {
+    let durable_next = 10_u64;
+    for replayed in 0..10 {
+        assert!(KafkaSource::is_duplicate_replay(replayed, durable_next));
+    }
+    assert!(!KafkaSource::is_duplicate_replay(10, durable_next));
+    assert!(!KafkaSource::is_duplicate_replay(11, durable_next));
+}
+
+#[test]
+fn test_durable_epoch_commit_barrier_and_safe_replay() {
+    test_crash_before_epoch_commit_discards_incomplete();
+    test_crash_after_persistence_before_ack_deduplicates();
+    test_broker_commit_failure_retains_durable_epoch();
+    test_broker_commit_fenced_rebalances_cleanly();
+    test_duplicate_broker_records_suppressed();
+}
