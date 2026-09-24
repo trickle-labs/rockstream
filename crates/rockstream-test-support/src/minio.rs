@@ -147,7 +147,7 @@ impl Default for MinIO2024 {
 
 impl Image for MinIO2024 {
     fn name(&self) -> &str {
-        "quay.io/minio/minio"
+        "minio/minio"
     }
 
     fn tag(&self) -> &str {
