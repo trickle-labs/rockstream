@@ -48,6 +48,10 @@ on:
       - "formal/edge_*.fizz"
       - "Dockerfile"
 
+concurrency:
+  group: real-cluster-chaos-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   chaos:
     runs-on: ubuntu-latest

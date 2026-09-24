@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: "0 1 * * *"
 
+concurrency:
+  group: long-duration-resource-soak-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   resource-soak:
     runs-on: ubuntu-latest
