@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use testcontainers::core::WaitFor;
+use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, Image};
 
@@ -147,11 +147,16 @@ impl Default for MinIO2024 {
 
 impl Image for MinIO2024 {
     fn name(&self) -> &str {
-        "quay.io/minio/minio"
+        "codemowers/minio"
     }
 
     fn tag(&self) -> &str {
         "RELEASE.2025-09-07T16-13-09Z"
+    }
+
+    fn expose_ports(&self) -> &[ContainerPort] {
+        const PORTS: &[ContainerPort] = &[ContainerPort::Tcp(9000)];
+        PORTS
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {
