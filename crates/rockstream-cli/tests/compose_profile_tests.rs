@@ -54,7 +54,7 @@ fn test_compose_profile_kafka() {
 
     // In v0.61, init rejects non-local templates
     let err = run_init(OutputFormat::Json, &opts).unwrap_err();
-    assert!(err.message.contains("only 'local' is supported"));
+    assert!(err.message.contains("kafka assigned to v0.70"));
 
     // Verify relocated experimental kafka compose profile
     let exp_compose = std::path::Path::new("../../examples/experimental/kafka/docker-compose.yaml");
@@ -91,8 +91,14 @@ fn test_compose_profile_postgres() {
     };
 
     // In v0.61, init rejects non-local templates
-    let err = run_init(OutputFormat::Json, &opts).unwrap_err();
-    assert!(err.message.contains("only 'local' is supported"));
+    let result = run_init(OutputFormat::Json, &opts).expect("postgres-cdc template init");
+    let outcome: rockstream_cli::init::InitOutcome =
+        serde_json::from_str(&result).expect("valid init output");
+    assert_eq!(outcome.template, "postgres-cdc");
+    assert_eq!(outcome.generated_files, [
+        "rockstream.toml", "docker-compose.yaml", "pg-init.sql", "schema.sql",
+        "queries.sql", "project.toml", "scripts/verify.sh", "scripts/cleanup.sh", "README.md"
+    ]);
 
     // Verify relocated experimental postgres compose profile
     let exp_compose =
@@ -152,7 +158,7 @@ fn test_compose_profile_all() {
     assert!(local_path.join("README.md").exists());
 
     // Verify non-local templates are rejected
-    for tmpl in ["kafka", "postgres-cdc"] {
+    for tmpl in ["kafka"] {
         let p = target_dir.join(tmpl);
         let opts = InitOptions {
             name: tmpl.to_string(),
@@ -161,7 +167,7 @@ fn test_compose_profile_all() {
             force: false,
         };
         let err = run_init(OutputFormat::Json, &opts).unwrap_err();
-        assert!(err.message.contains("only 'local' is supported"));
+        assert!(err.message.contains("kafka assigned to v0.70"));
     }
 }
 

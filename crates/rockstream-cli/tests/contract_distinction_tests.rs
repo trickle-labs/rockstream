@@ -115,7 +115,7 @@ fn test_service_topology_distinction() {
         force: false,
     };
     let err = run_init(OutputFormat::Json, &kafka_opts).unwrap_err();
-    assert!(err.message.contains("only 'local' is supported"));
+    assert!(err.message.contains("kafka assigned to v0.70"));
 
     // Multi-service Compose profiles reside in examples/experimental/
     let kafka_compose_path =

@@ -40,17 +40,18 @@ def validate(
     if not isinstance(contract, dict):
         fail("capabilities.toml must define [contract]")
     version = contract.get("version")
-    if version not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0", "v0.65.0", "v0.66.0", "v0.67.0", "v0.67.1", "v0.68.0"}:
-        fail("capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, v0.64.0, v0.65.0, v0.66.0, v0.67.0, or v0.67.1, or v0.68.0")
+    if version not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0", "v0.65.0", "v0.66.0", "v0.67.0", "v0.67.1", "v0.68.0", "v0.69.0"}:
+        fail("capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, v0.64.0, v0.65.0, v0.66.0, v0.67.0, v0.67.1, v0.68.0, or v0.69.0")
 
     roadmap = contract.get("roadmap")
     if not isinstance(roadmap, str):
         fail("contract.roadmap must be a path")
     roadmap_text = check_file(root, roadmap, "roadmap")
+    roadmap_version = str(version).removesuffix(".0")
     roadmap_rows = [
         row
         for row in re.findall(
-            rf"^\| {re.escape(str(version))} \|.*$", roadmap_text, re.MULTILINE
+            rf"^\| \*{{0,2}}{re.escape(roadmap_version)}\*{{0,2}} \|.*$", roadmap_text, re.MULTILINE
         )
         if len(row.split("|")) >= 5 and "✅ Done" in row
     ]
