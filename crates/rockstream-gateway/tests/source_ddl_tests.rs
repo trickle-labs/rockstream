@@ -329,7 +329,7 @@ async fn test_source_ddl_negative_cases() {
     // Create valid source
     client
         .execute(
-            "CREATE SOURCE my_src TYPE kafka (bootstrap.servers='localhost:9092') FORMAT json;",
+            "CREATE SOURCE my_src TYPE kafka (bootstrap.servers='localhost:9092', topic='my-topic') FORMAT json;",
             &[],
         )
         .await
@@ -338,7 +338,7 @@ async fn test_source_ddl_negative_cases() {
     // Duplicate CREATE SOURCE -> RS-4001
     let err = client
         .execute(
-            "CREATE SOURCE my_src TYPE kafka (bootstrap.servers='localhost:9092') FORMAT json;",
+            "CREATE SOURCE my_src TYPE kafka (bootstrap.servers='localhost:9092', topic='my-topic') FORMAT json;",
             &[],
         )
         .await
@@ -371,7 +371,7 @@ async fn test_show_sources_lag_and_offset() {
 
     client
         .execute(
-            "CREATE SOURCE metrics_src TYPE kafka (topic='metrics') FORMAT json;",
+            "CREATE SOURCE metrics_src TYPE kafka (bootstrap_servers='localhost:9092', topic='metrics') FORMAT json;",
             &[],
         )
         .await
