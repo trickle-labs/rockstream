@@ -96,15 +96,10 @@ async fn test_cdc_sustained_workload_and_shard_migration() {
             201,
             CdcOperation::Insert,
             None,
-            Some(vec![
-                Some("0".to_string()),
-                Some("warmup".to_string()),
-            ]),
+            Some(vec![Some("0".to_string()), Some("warmup".to_string())]),
         )
         .unwrap();
-    let _ = coordinator
-        .finish_envelope(0, PgLsn(1))
-        .unwrap();
+    let _ = coordinator.finish_envelope(0, PgLsn(1)).unwrap();
     coordinator.cleanup_committed(&db).await.unwrap();
 
     // ─── 1. Ingest sustained workload (10,000 items) exceeding in-memory worker budget ───
