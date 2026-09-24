@@ -729,6 +729,15 @@ guarantee matrix covered by
 `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
 `crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
 
+The v0.70 Kafka golden connector provides external streaming ingestion with
+partition offset watermark coordination, bounded buffer consumer groups,
+rebalance fence isolation, and schema policy verification in
+`crates/rockstream-connectors/src/kafka_source.rs`. While external Kafka consumer
+protocol dispatch is outside the internal M1–M7 FizzBee consensus models, offset
+advancement barriers and partitioned stream ingestion integrate with the worker
+epoch progress protocol and are verified by integration test coverage and CLI
+template initialization tests.
+
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
 
