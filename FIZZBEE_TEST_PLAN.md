@@ -717,6 +717,18 @@ This in-memory compaction is outside the core M1–M7 FizzBee coordination state
 `crates/rockstream-runtime/tests/in_flight_zset_epoch_compaction_tests.rs` with exact
 output assertions covering net-zero omission and window boundary drains.
 
+The v0.69 PostgreSQL CDC golden connector establishes the complete snapshot and
+WAL fence coordination protocol, quad-LSN progress persistence, transaction
+grouping bounds, bounded worker budgets, and schema evolution isolation in
+`crates/rockstream-connectors` and `crates/rockstream-gateway`. Durable catalog
+reconstruction preserves transactional idempotency across snapshots and log
+compaction (`crates/rockstream-storage/src/catalog/mod.rs`). While external CDC
+ingestion is outside the internal M1–M7 FizzBee consensus models, the fence
+coordination and acknowledgment barrier protocols adhere to the end-to-end
+guarantee matrix covered by
+`crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
+`crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
+
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
 

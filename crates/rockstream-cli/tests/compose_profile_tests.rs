@@ -95,10 +95,20 @@ fn test_compose_profile_postgres() {
     let outcome: rockstream_cli::init::InitOutcome =
         serde_json::from_str(&result).expect("valid init output");
     assert_eq!(outcome.template, "postgres-cdc");
-    assert_eq!(outcome.generated_files, [
-        "rockstream.toml", "docker-compose.yaml", "pg-init.sql", "schema.sql",
-        "queries.sql", "project.toml", "scripts/verify.sh", "scripts/cleanup.sh", "README.md"
-    ]);
+    assert_eq!(
+        outcome.generated_files,
+        [
+            "rockstream.toml",
+            "docker-compose.yaml",
+            "pg-init.sql",
+            "schema.sql",
+            "queries.sql",
+            "project.toml",
+            "scripts/verify.sh",
+            "scripts/cleanup.sh",
+            "README.md"
+        ]
+    );
 
     // Verify relocated experimental postgres compose profile
     let exp_compose =
@@ -158,17 +168,15 @@ fn test_compose_profile_all() {
     assert!(local_path.join("README.md").exists());
 
     // Verify non-local templates are rejected
-    for tmpl in ["kafka"] {
-        let p = target_dir.join(tmpl);
-        let opts = InitOptions {
-            name: tmpl.to_string(),
-            template: tmpl.to_string(),
-            dir: Some(p),
-            force: false,
-        };
-        let err = run_init(OutputFormat::Json, &opts).unwrap_err();
-        assert!(err.message.contains("kafka assigned to v0.70"));
-    }
+    let p = target_dir.join("kafka");
+    let opts = InitOptions {
+        name: "kafka".to_string(),
+        template: "kafka".to_string(),
+        dir: Some(p),
+        force: false,
+    };
+    let err = run_init(OutputFormat::Json, &opts).unwrap_err();
+    assert!(err.message.contains("kafka assigned to v0.70"));
 }
 
 #[test]
