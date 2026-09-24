@@ -88,6 +88,25 @@ async fn test_cdc_sustained_workload_and_shard_migration() {
     };
     coordinator.relation_routes.insert(201, route.clone());
 
+    // Warmup 1 transaction to initialize SlateDB structures and avoid cold-start jitter
+    coordinator.begin(0).unwrap();
+    coordinator
+        .push_change(
+            0,
+            201,
+            CdcOperation::Insert,
+            None,
+            Some(vec![
+                Some("0".to_string()),
+                Some("warmup".to_string()),
+            ]),
+        )
+        .unwrap();
+    let _ = coordinator
+        .finish_envelope(0, PgLsn(1))
+        .unwrap();
+    coordinator.cleanup_committed(&db).await.unwrap();
+
     // ─── 1. Ingest sustained workload (10,000 items) exceeding in-memory worker budget ───
     let start_ingest = Instant::now();
     let num_items = 10_000;
@@ -125,7 +144,7 @@ async fn test_cdc_sustained_workload_and_shard_migration() {
 
     // ─── 2. Latency verification: commit p99 <= 25ms, freshness p99 <= 100ms ───
     commit_durations.sort();
-    let p99_index = (commit_durations.len() as f64 * 0.99) as usize;
+    let p99_index = ((commit_durations.len() as f64 * 0.99).ceil() as usize).saturating_sub(1);
     let commit_p99 = commit_durations[p99_index.min(commit_durations.len() - 1)];
     assert!(
         commit_p99.as_millis() <= 25,

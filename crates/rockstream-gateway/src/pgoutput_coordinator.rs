@@ -581,6 +581,7 @@ impl SharedPgOutputCoordinator {
         })?;
         let xid = active.xid;
         let route_updates = active.route_updates.clone();
+        let had_spill = self.envelope_buffer.spilled_bytes() > 0;
         let keys = self
             .envelope_buffer
             .scan_all()
@@ -594,7 +595,9 @@ impl SharedPgOutputCoordinator {
                 .remove(&key)
                 .map_err(|error| coordinator_error(&format!("delete pgoutput spill: {error}")))?;
         }
-        db.flush().await?;
+        if had_spill {
+            db.flush().await?;
+        }
         self.relation_routes.extend(route_updates);
         self.active_envelope = None;
         self.activating_views.clear();
