@@ -98,6 +98,16 @@ Inspect and control streaming ingestion sources and connectors.
 
 ---
 
+### `rockstream project`
+
+Scaffold, apply, and verify RockStream streaming projects.
+
+- `rockstream project new <name> [--template <local|postgres-cdc>] [--dir <dir>] [--force]` — Scaffold a new project. The `postgres-cdc` template generates an executable PostgreSQL CDC ingestion project with docker-compose logical replication environment, canonical source DDL, schema, queries, and verification script.
+- `rockstream project apply [--dir <dir>] [--endpoint <addr>]` — Apply project schema and source definitions against a running gateway.
+- `rockstream project verify [--dir <dir>] [--endpoint <addr>] [--timeout <sec>]` — Verify maintained materialized views against expected query results.
+
+---
+
 ### `rockstream schema`
 
 Inspect schemas and create or drop schema tables.

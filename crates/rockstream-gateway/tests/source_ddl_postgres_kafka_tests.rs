@@ -523,3 +523,651 @@ async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+#[tokio::test]
+async fn test_source_ddl_complete_valid_options() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .execute(
+            "CREATE SOURCE orders TYPE postgres_cdc (
+                host='localhost',
+                port='5432',
+                database='pg',
+                publication='pub1',
+                slot='slot1',
+                table='orders',
+                schema_policy='evolve',
+                credential_ref='vault://pg/key',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let rows = client.query("SHOW SOURCES;", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "orders");
+}
+
+#[tokio::test]
+async fn test_source_ddl_rejects_inline_password() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE orders TYPE postgres_cdc (
+                host='localhost',
+                publication='pub1',
+                slot='slot1',
+                table='orders',
+                schema_policy='evolve',
+                password='secret',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+}
+
+#[tokio::test]
+async fn test_source_ddl_rejects_missing_publication() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE orders TYPE postgres_cdc (
+                host='localhost',
+                slot='slot1',
+                table='orders',
+                schema_policy='evolve',
+                credential_ref='vault://pg/key',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(
+        msg.contains("publication"),
+        "expected publication in error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_source_ddl_rejects_missing_slot() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE orders TYPE postgres_cdc (
+                host='localhost',
+                publication='pub1',
+                table='orders',
+                schema_policy='evolve',
+                credential_ref='vault://pg/key',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(msg.contains("slot"), "expected slot in error, got: {msg}");
+}
+
+#[tokio::test]
+async fn test_source_ddl_rejects_missing_credential() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE orders TYPE postgres_cdc (
+                host='localhost',
+                publication='pub1',
+                slot='slot1',
+                table='orders',
+                schema_policy='evolve',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+}
+
+#[tokio::test]
+async fn test_source_ddl_rejects_invalid_snapshot_policy() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE orders TYPE postgres_cdc (
+                host='localhost',
+                publication='pub1',
+                slot='slot1',
+                table='orders',
+                schema_policy='evolve',
+                credential_ref='vault://pg/key',
+                snapshot_policy='invalid_policy'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(
+        msg.contains("snapshot_policy"),
+        "expected snapshot_policy in message, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_source_ddl_rejects_invalid_schema_policy() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let err = client
+        .execute(
+            "CREATE SOURCE orders TYPE postgres_cdc (
+                host='localhost',
+                publication='pub1',
+                slot='slot1',
+                table='orders',
+                schema_policy='unknown_policy',
+                credential_ref='vault://pg/key',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-4008"), "expected RS-4008, got: {msg}");
+    assert!(
+        msg.contains("schema_policy"),
+        "expected schema_policy in message, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_source_ddl_rejects_physical_slot_collision() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .execute(
+            "CREATE SOURCE src1 TYPE postgres_cdc (
+                host='127.0.0.1',
+                port='5432',
+                database='postgres',
+                publication='pub1',
+                slot='shared_slot',
+                table='orders1',
+                credential_ref='vault://pg/key'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let err = client
+        .execute(
+            "CREATE SOURCE src2 TYPE postgres_cdc (
+                host='127.0.0.1',
+                port='5432',
+                database='postgres',
+                publication='pub2',
+                slot='shared_slot',
+                table='orders2',
+                credential_ref='vault://pg/key'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(
+        msg.contains("RS-4001") || msg.contains("RS-4013"),
+        "expected RS-4001 or RS-4013 for slot collision, got: {msg}"
+    );
+    assert!(
+        msg.contains("physical pgoutput slot is already owned"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn test_source_catalog_rejects_unsupported_version() {
+    use rockstream_storage::catalog::SourceRecordV1;
+    let valid = serde_json::json!({
+        "version": 1,
+        "id": 100,
+        "name": "orders",
+        "connector_type": "postgres_cdc",
+        "table_name": "orders",
+        "options": {},
+        "format": "pgoutput"
+    });
+    let valid_bytes = serde_json::to_vec(&valid).unwrap();
+    let decoded = SourceRecordV1::decode_versioned(&valid_bytes).unwrap();
+    assert_eq!(decoded.version, 1);
+    assert_eq!(decoded.name, "orders");
+
+    let invalid = serde_json::json!({
+        "version": 99,
+        "id": 100,
+        "name": "orders",
+        "connector_type": "postgres_cdc",
+        "table_name": "orders",
+        "options": {},
+        "format": "pgoutput"
+    });
+    let invalid_bytes = serde_json::to_vec(&invalid).unwrap();
+    let err = SourceRecordV1::decode_versioned(&invalid_bytes).unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("RS-2025"),
+        "expected RS-2025, got: {err_str}"
+    );
+    assert!(
+        err_str.contains("version 99 is not supported"),
+        "got: {err_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_canonical_source_ddl_seven_fields_and_credential_rejection() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // 1. Valid source with all seven fields
+    client
+        .execute(
+            "CREATE SOURCE s_valid TYPE postgres_cdc (
+                host='localhost',
+                port='5432',
+                database='pg',
+                publication='pub1',
+                slot='slot1',
+                table='orders',
+                schema_policy='evolve',
+                credential_ref='vault://pg/key',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // 2. Reject inline password
+    let err = client
+        .execute(
+            "CREATE SOURCE s_inline TYPE postgres_cdc (
+                host='localhost',
+                publication='pub2',
+                slot='slot2',
+                table='orders',
+                schema_policy='evolve',
+                password='secret',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(
+        msg.contains("RS-4008"),
+        "expected RS-4008 for inline password, got: {msg}"
+    );
+
+    // 3. Reject missing publication
+    let err = client
+        .execute(
+            "CREATE SOURCE s_nopub TYPE postgres_cdc (
+                host='localhost',
+                slot='slot3',
+                table='orders',
+                schema_policy='evolve',
+                credential_ref='vault://pg/key',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(
+        msg.contains("RS-4008"),
+        "expected RS-4008 for missing pub, got: {msg}"
+    );
+
+    // 4. Reject missing slot
+    let err = client
+        .execute(
+            "CREATE SOURCE s_noslot TYPE postgres_cdc (
+                host='localhost',
+                publication='pub4',
+                table='orders',
+                schema_policy='evolve',
+                credential_ref='vault://pg/key',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(
+        msg.contains("RS-4008"),
+        "expected RS-4008 for missing slot, got: {msg}"
+    );
+
+    // 5. Reject missing credential
+    let err = client
+        .execute(
+            "CREATE SOURCE s_nocred TYPE postgres_cdc (
+                host='localhost',
+                publication='pub5',
+                slot='slot5',
+                table='orders',
+                schema_policy='evolve',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(
+        msg.contains("RS-4008"),
+        "expected RS-4008 for missing cred, got: {msg}"
+    );
+
+    // 6. Reject invalid snapshot policy
+    let err = client
+        .execute(
+            "CREATE SOURCE s_badsnap TYPE postgres_cdc (
+                host='localhost',
+                publication='pub6',
+                slot='slot6',
+                table='orders',
+                schema_policy='evolve',
+                credential_ref='vault://pg/key',
+                snapshot_policy='invalid_policy'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(
+        msg.contains("RS-4008"),
+        "expected RS-4008 for invalid snapshot_policy, got: {msg}"
+    );
+
+    // 7. Reject invalid schema policy
+    let err = client
+        .execute(
+            "CREATE SOURCE s_badschema TYPE postgres_cdc (
+                host='localhost',
+                publication='pub7',
+                slot='slot7',
+                table='orders',
+                schema_policy='unknown_policy',
+                credential_ref='vault://pg/key',
+                snapshot_policy='initial'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(
+        msg.contains("RS-4008"),
+        "expected RS-4008 for invalid schema_policy, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_source_ddl_persists_versioned_record_and_rejects_slot_collision() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let shard_db = Arc::new(
+        ShardDb::builder(
+            "test-versioned-source-shard",
+            Arc::new(object_store::memory::InMemory::new()),
+        )
+        .build()
+        .await
+        .unwrap(),
+    );
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+        Arc::clone(&shard_db),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .execute(
+            "CREATE SOURCE my_pg_src TYPE postgres_cdc (
+                host='127.0.0.1',
+                port='5432',
+                database='testdb',
+                publication='test_pub',
+                slot='test_slot',
+                table='orders',
+                credential_ref='vault://pg/key'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let persisted = shard_db
+        .get(b"catalog:source:v1:my_pg_src")
+        .await
+        .unwrap()
+        .expect("persisted source record must exist in shard_db");
+    let record = rockstream_storage::catalog::SourceRecordV1::decode_versioned(&persisted).unwrap();
+    assert_eq!(record.version, 1);
+    assert_eq!(record.name, "my_pg_src");
+    assert_eq!(record.connector_type, "postgres_cdc");
+    assert_eq!(record.format, "pgoutput");
+
+    // Second source targeting same physical slot should be rejected
+    let err = client
+        .execute(
+            "CREATE SOURCE another_pg_src TYPE postgres_cdc (
+                host='127.0.0.1',
+                port='5432',
+                database='testdb',
+                publication='other_pub',
+                slot='test_slot',
+                table='orders2',
+                credential_ref='vault://pg/key'
+            ) FORMAT pgoutput;",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(
+        msg.contains("RS-4001") || msg.contains("RS-4013"),
+        "got: {msg}"
+    );
+}

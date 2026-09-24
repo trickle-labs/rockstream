@@ -38,6 +38,59 @@ permanent replacements are documented in
 | Failure codes | `RS-4001`, `RS-4004`, `RS-4011`, `RS-4012`, `RS-4013`, `RS-4014`, `RS-4015`, `RS-4016`, `RS-4018`, `RS-4019`, `RS-4020`, `RS-4021`, and `RS-4022`; recover with the action in the registry. |
 | Proof matrix | The nine PostgreSQL cells below and `retained_source_checkpoint_recovery_has_exact_cdc_and_kafka_transcript_lfs` / `retained_source_checkpoint_recovery_has_exact_cdc_and_kafka_transcript_minio`. |
 
+### PostgreSQL Configuration Prerequisites
+
+PostgreSQL 16+ upstream must have logical replication enabled:
+- `wal_level = logical`
+- `max_replication_slots >= 4`
+- `max_wal_senders >= 4`
+
+### Canonical Source DDL Contract
+
+RockStream freezes one canonical source creation contract across all seven roadmap fields:
+
+```sql
+CREATE SOURCE orders_source TYPE postgres_cdc FORMAT pgoutput OPTIONS (
+    endpoint = 'postgres.internal:5432/db',
+    publication = 'orders_pub',
+    slot = 'orders_slot',
+    table = 'public.orders',
+    schema_policy = 'evolve',
+    credential_ref = 'vault://credentials/pg',
+    snapshot_policy = 'initial'
+);
+```
+
+Plaintext passwords or credentials inline in DDL statements are strictly rejected with `RS-4008`.
+
+### Quad-LSN Progress Persistence and Acknowledgment Barrier
+
+RockStream durably tracks four progress points in `ShardDb`:
+1. `received_lsn`: highest LSN read from the logical replication stream.
+2. `applied_lsn`: highest LSN decoded and buffered in the coordinator.
+3. `durable_lsn`: highest LSN whose corresponding epoch and view effects are committed to SlateDB.
+4. `published_frontier`: highest LSN visible to pgwire queries.
+
+**Upstream Slot Acknowledgment Invariant**:
+`confirmed_flush_lsn <= durable_lsn`
+Standby status updates sent to PostgreSQL never outrun durable SlateDB storage.
+
+### Schema Change Policy Decision Table
+
+| Schema Change | Classification | Engine Action | Affected Table | Unaffected Tables | Recovery Procedure |
+|---|---|---|---|---|---|
+| **Add nullable column** | `Compatible` | Auto-applied in memory & recorded in history | `RUNNING` | `RUNNING` | Automatic |
+| **Type widening** (`int4` → `int8`) | `Compatible` | Lossless widening applied | `RUNNING` | `RUNNING` | Automatic |
+| **Rename column** | `Requires Rebuild` | Relation blocked; stops ingestion for table | `BLOCKED` (`RS-4015`) | `RUNNING` | `rockstream source rebuild <src> --table <t>` |
+| **Drop column** | `Requires Rebuild` | Relation blocked; dependent view invalidated | `BLOCKED` (`RS-4015`) | `RUNNING` | Rebuild view or redefine source |
+| **Primary key change** | `Unsupported` | Relation blocked; PK retraction changed | `BLOCKED` (`RS-4015`) | `RUNNING` | `rockstream source resnapshot <src> --table <t>` |
+
+Unaffected tables in a publication continue ingestion without interruption (relation isolation).
+
+### Recovery and Resnapshot
+
+When PostgreSQL invalidates a replication slot (e.g. WAL retention exhaustion, errors `55000` / `58P01`), the connector transitions to `BLOCKED` with error code `RS-4011` / `RS-4016` and requires an operator-initiated resnapshot.
+
 ## Kafka source
 
 | Axis | Guarantee |

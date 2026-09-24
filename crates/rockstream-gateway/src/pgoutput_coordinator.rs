@@ -323,6 +323,7 @@ pub struct SharedPgOutputCoordinator {
     pub runtime: SourceRuntimeCoordinator<PostgresCdcSource>,
     pub relation_routes: BTreeMap<u32, RelationRoute>,
     pub blocked_state: Option<BlockedRelationState>,
+    pub blocked_relations: BTreeMap<u32, BlockedRelationState>,
     shard_db: Arc<ShardDb>,
     envelope_buffer: SpillableArrangement<EnvelopeKey, SerdeSpill<EncodedChange>>,
     pub active_envelope: Option<ActiveEnvelope>,
@@ -346,6 +347,7 @@ impl SharedPgOutputCoordinator {
             runtime,
             relation_routes: BTreeMap::new(),
             blocked_state: None,
+            blocked_relations: BTreeMap::new(),
             shard_db: Arc::clone(&shard_db),
             envelope_buffer: SpillableArrangement::new(
                 Some(shard_db),
@@ -427,6 +429,22 @@ impl SharedPgOutputCoordinator {
         Ok(())
     }
 
+    pub fn is_relation_blocked(&self, relation_id: u32) -> bool {
+        self.blocked_relations.contains_key(&relation_id)
+            || self
+                .blocked_state
+                .as_ref()
+                .is_some_and(|b| b.relation.relation_id == relation_id)
+    }
+
+    pub fn block_relation(&mut self, blocked: BlockedRelationState) {
+        let relation_id = blocked.relation.relation_id;
+        self.blocked_relations.insert(relation_id, blocked.clone());
+        if self.blocked_state.is_none() {
+            self.blocked_state = Some(blocked);
+        }
+    }
+
     pub fn stage_route(&mut self, xid: u32, route: RelationRoute) -> Result<(), GatewayError> {
         let active = self.require_xid(xid)?;
         active.unrouted_relations.remove(&route.relation_id);
@@ -465,6 +483,9 @@ impl SharedPgOutputCoordinator {
         new_values: Option<Vec<Option<String>>>,
     ) -> Result<(), GatewayError> {
         self.require_xid(xid)?;
+        if self.is_relation_blocked(relation_id) {
+            return Ok(());
+        }
         let schema_version = self
             .active_envelope
             .as_ref()
@@ -677,6 +698,19 @@ pub struct BlockedRelationState {
     pub xid: u32,
     pub relation: rockstream_connectors::PgOutputRelationMetadata,
     pub last_safe_lsn: PgLsn,
+    #[serde(default)]
+    pub recovery_procedure: Option<String>,
+}
+
+impl BlockedRelationState {
+    pub fn recovery_procedure(&self) -> String {
+        self.recovery_procedure.clone().unwrap_or_else(|| {
+            format!(
+                "rockstream source rebuild <src> --table {}",
+                self.relation.name
+            )
+        })
+    }
 }
 
 pub fn append_blocked_state(

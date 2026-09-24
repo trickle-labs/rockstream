@@ -18,12 +18,13 @@ pub use fault_injecting_store::FaultInjectingObjectStore;
 pub use kafka_sink::KafkaSink;
 pub use kafka_source::KafkaSource;
 pub use postgres_cdc::{
-    CdcChange, CdcOperation, CdcTransactionEnvelope, CdcWireFormat, PgLsn, PgOutputColumn,
-    PgOutputConfig, PgOutputEvent, PgOutputRelationMetadata, PgOutputSnapshotRelation,
-    PgOutputSourceSnapshot, PostgresCdcFailure, PostgresCdcSource, PostgresCdcStatus,
-    POSTGRES_CDC_MAX_IN_FLIGHT_BYTES, POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS,
-    POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS, POSTGRES_CDC_MAX_TRANSACTION_BYTES,
-    POSTGRES_CDC_MAX_WAL_LAG_BYTES, POSTGRES_CDC_TRANSACTION_MEMORY_BYTES,
+    decode_pgoutput_event, CdcChange, CdcOperation, CdcTransactionEnvelope, CdcWireFormat, PgLsn,
+    PgOutputColumn, PgOutputConfig, PgOutputEvent, PgOutputRelationMetadata,
+    PgOutputSnapshotRelation, PgOutputSourceSnapshot, PostgresCdcFailure, PostgresCdcSource,
+    PostgresCdcStatus, QuadLsnProgress, POSTGRES_CDC_MAX_IN_FLIGHT_BYTES,
+    POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS, POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS,
+    POSTGRES_CDC_MAX_TRANSACTION_BYTES, POSTGRES_CDC_MAX_WAL_LAG_BYTES,
+    POSTGRES_CDC_TRANSACTION_MEMORY_BYTES,
 };
 pub use sink_connector::{
     assert_epoch_committed_only_after_cluster_checkpoint, assert_no_duplicate_delivery,

@@ -4460,16 +4460,19 @@ impl GatewayHandler {
             rockstream_connectors::PgLsn::from_offset_token(coordinator.runtime.committed_offset())
                 .map_err(source_backfill_error)?;
         let mut batch = rockstream_storage::WriteBatch::new();
+        let recovery_procedure =
+            format!("rockstream source rebuild <src> --table {}", relation.name);
         let blocked = BlockedRelationState {
             code: "RS-1002".to_string(),
             xid,
             relation,
             last_safe_lsn,
+            recovery_procedure: Some(recovery_procedure),
         };
         append_blocked_state(&mut batch, coordinator.connector_id, &blocked)?;
         shard_db.write_batch(batch).await?;
         shard_db.flush().await?;
-        coordinator.blocked_state = Some(blocked);
+        coordinator.block_relation(blocked);
         Err(GatewayError::QueryTimeExecutionFailed {
             detail: "RS-1002: incompatible upstream relation change blocked the pgoutput source"
                 .to_string(),
@@ -8868,12 +8871,12 @@ impl GatewayHandler {
                 })
             {
                 return Ok(vec![create_source_error_response(format!(
-                    "[RS-4013] physical pgoutput slot is already owned by source '{owner}'"
+                    "[RS-4001] physical pgoutput slot is already owned by source '{owner}' [RS-4013]"
                 ))]);
             }
         }
 
-        if !self.catalog.add_source(entry) {
+        if !self.catalog.add_source(entry.clone()) {
             if parsed.if_not_exists {
                 return Ok(vec![Response::Execution(
                     Tag::new("CREATE SOURCE").with_rows(0),
@@ -8899,6 +8902,24 @@ impl GatewayHandler {
                 "create_source",
                 &parsed.name,
             ));
+        }
+
+        if let Some(shard_db) = &self.shard_db {
+            let record = rockstream_storage::catalog::SourceRecordV1::new(
+                rockstream_types::ids::SourceId(rockstream_storage::catalog::stable_name_id(
+                    "source",
+                    &entry.name,
+                )),
+                entry.name.clone(),
+                entry.source_type.clone(),
+                entry.table_name.clone(),
+                entry.options.clone(),
+                entry.format.clone(),
+            );
+            if let Ok(bytes) = serde_json::to_vec(&record) {
+                let key = format!("catalog:source:v1:{}", entry.name);
+                let _ = shard_db.put(key.as_bytes(), &bytes).await;
+            }
         }
 
         Ok(vec![Response::Execution(
@@ -17323,6 +17344,20 @@ fn validate_typed_source_options(
             if options.get(key).is_none_or(String::is_empty) {
                 return Err(format!(
                     "[RS-4008] CREATE SOURCE type 'postgres_cdc' requires a non-empty {key}. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                ));
+            }
+        }
+        if let Some(policy) = options.get("snapshot_policy") {
+            if !matches!(policy.as_str(), "initial" | "never" | "always") {
+                return Err(format!(
+                    "[RS-4008] CREATE SOURCE option 'snapshot_policy' must be initial|never|always; found '{policy}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                ));
+            }
+        }
+        if let Some(policy) = options.get("schema_policy") {
+            if !matches!(policy.as_str(), "strict" | "evolve" | "error") {
+                return Err(format!(
+                    "[RS-4008] CREATE SOURCE option 'schema_policy' must be strict|evolve|error; found '{policy}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
                 ));
             }
         }

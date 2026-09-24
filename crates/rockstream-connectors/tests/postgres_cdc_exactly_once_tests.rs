@@ -255,3 +255,139 @@ fn invalidated_slot_resnapshots_and_slow_subscriber_pauses_before_retention_grow
         (POSTGRES_CDC_MAX_WAL_LAG_BYTES, true)
     );
 }
+
+#[tokio::test]
+async fn test_snapshot_wal_fence_exact_multiset_handoff() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let mut source =
+        PostgresCdcSource::new(ConnectorId(5_300), schema.clone(), CdcWireFormat::PgOutput);
+
+    // Initial snapshot: keys 1, 2, 3
+    let snapshot_batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    let snapshot_batch_weighted =
+        rockstream_types::arrow_batch::append_weight_column(snapshot_batch, &[1, 1, 1]).unwrap();
+    source.set_snapshot_batches(vec![snapshot_batch_weighted]);
+
+    // Enqueue pre-fence and at-fence events to simulate WAL prior to cutover
+    source.decode_and_enqueue(b"B|0/40|9|I|orders|99").unwrap();
+    source.decode_and_enqueue(b"B|0/50|9|I|orders|98").unwrap();
+
+    // Capture fence at consistent point LSN 0/50
+    let fence = source.capture_snapshot_delta_fence(None).await.unwrap();
+    assert_eq!(fence.live, PgLsn::parse("0/50").unwrap().to_offset_token());
+
+    // Stream snapshot
+    let snapshot_stream = source.start_snapshot(&fence, None, None).await.unwrap();
+    let snapshot_records = snapshot_stream.collect::<Vec<_>>();
+    assert_eq!(snapshot_records.len(), 1);
+    let (snap_batch, snap_weights) = split_weight_column(&snapshot_records[0].batch).unwrap();
+    let snap_ids = snap_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(snap_ids, vec![1, 2, 3]);
+    assert_eq!(snap_weights, vec![1, 1, 1]);
+
+    // Enqueue post-fence events:
+    // Insert 4
+    source.decode_and_enqueue(b"B|0/60|9|I|orders|4").unwrap();
+    // Update 1 to 10 (retract 1, insert 10)
+    source
+        .decode_and_enqueue(b"B|0/70|9|U|orders|1|10")
+        .unwrap();
+
+    // Poll delta starting strictly after fence (0/50)
+    let delta = source
+        .poll_delta(fence.live.clone(), 1024 * 1024, 1024, None)
+        .await
+        .unwrap();
+    assert!(!delta.batches.is_empty(), "expected post-fence deltas");
+
+    let (delta_batch, delta_weights) = split_weight_column(&delta.batches[0]).unwrap();
+    let delta_ids = delta_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+
+    // Pre-fence events 99 (at 0/40) and 98 (at 0/50) must be discarded!
+    assert!(
+        !delta_ids.contains(&99),
+        "event before fence must be discarded"
+    );
+    assert!(!delta_ids.contains(&98), "event at fence must be discarded");
+    assert_eq!(delta_ids, vec![4, 1, 10]);
+    assert_eq!(delta_weights, vec![1, -1, 1]);
+
+    // Compute final maintained multiset:
+    // Snapshot: {1: 1, 2: 1, 3: 1}
+    // Delta: {4: +1, 1: -1, 10: +1}
+    // Result: {1: 0, 2: 1, 3: 1, 4: 1, 10: 1}
+    let mut counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for (id, w) in snap_ids.iter().zip(snap_weights.iter()) {
+        *counts.entry(*id).or_default() += *w;
+    }
+    for (id, w) in delta_ids.iter().zip(delta_weights.iter()) {
+        *counts.entry(*id).or_default() += *w;
+    }
+
+    assert_eq!(
+        counts.get(&1).copied().unwrap_or(0),
+        0,
+        "id 1 must be retracted"
+    );
+    assert_eq!(counts.get(&2).copied().unwrap_or(0), 1, "id 2 must exist");
+    assert_eq!(counts.get(&3).copied().unwrap_or(0), 1, "id 3 must exist");
+    assert_eq!(counts.get(&4).copied().unwrap_or(0), 1, "id 4 must exist");
+    assert_eq!(counts.get(&10).copied().unwrap_or(0), 1, "id 10 must exist");
+
+    // Commit delta offset (0/70)
+    source
+        .commit_offset(1, delta.new_offset.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        source.last_committed_lsn(),
+        Some(PgLsn::parse("0/70").unwrap())
+    );
+
+    // Crash recovery check: recreate worker from committed offset
+    let mut recovered =
+        PostgresCdcSource::new(ConnectorId(5_300), schema.clone(), CdcWireFormat::PgOutput);
+    // Replay same stream including duplicate events
+    recovered
+        .decode_and_enqueue(b"B|0/60|9|I|orders|4")
+        .unwrap();
+    recovered
+        .decode_and_enqueue(b"B|0/70|9|U|orders|1|10")
+        .unwrap();
+    // Later event at 0/80
+    recovered
+        .decode_and_enqueue(b"B|0/80|9|I|orders|5")
+        .unwrap();
+
+    let recovered_delta = recovered
+        .poll_delta(delta.new_offset.clone(), 1024 * 1024, 1024, None)
+        .await
+        .unwrap();
+    let (rec_batch, rec_weights) = split_weight_column(&recovered_delta.batches[0]).unwrap();
+    let rec_ids = rec_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    // Zero duplicate rows: only row 5 at 0/80 is emitted!
+    assert_eq!(rec_ids, vec![5]);
+    assert_eq!(rec_weights, vec![1]);
+}

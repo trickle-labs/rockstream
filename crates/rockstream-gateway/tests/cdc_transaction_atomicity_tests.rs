@@ -203,3 +203,90 @@ async fn pgoutput_shared_slot_schema_change_before_commit_exact() {
 async fn pgoutput_schema_incompatible_show_source_status_reports_exact_rs1002() {
     assert_shared_pgoutput_slot_two_tables().await;
 }
+
+#[tokio::test]
+async fn test_upstream_transaction_atomicity_and_overflow_rejection() {
+    use rockstream_connectors::{
+        CdcWireFormat, PgLsn, PostgresCdcSource, SourceConnector, SourceError,
+        POSTGRES_CDC_MAX_TRANSACTION_BYTES,
+    };
+    use rockstream_types::arrow_batch::split_weight_column;
+    use rockstream_types::ids::ConnectorId;
+
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let mut source =
+        PostgresCdcSource::new(ConnectorId(5_400), schema.clone(), CdcWireFormat::PgOutput);
+
+    // 1. Transaction atomicity: multi-row changes buffered until COMMIT
+    source.decode_and_enqueue(b"BEGIN|101").unwrap();
+    source.decode_and_enqueue(b"B|0/10|7|I|one|1").unwrap();
+    source.decode_and_enqueue(b"B|0/11|7|I|one|2").unwrap();
+    source.decode_and_enqueue(b"B|0/12|7|I|one|3").unwrap();
+
+    // Before COMMIT, poll_delta returns nothing (uncommitted transaction is not visible)
+    assert_eq!(source.buffered_records(), 0);
+
+    // After COMMIT, all 3 rows become visible in one atomic epoch
+    source.decode_and_enqueue(b"COMMIT|0/20").unwrap();
+    assert_eq!(source.buffered_records(), 3);
+
+    let delta = source
+        .poll_delta(PgLsn::ZERO.to_offset_token(), 1024 * 1024, 1024, None)
+        .await
+        .unwrap();
+    let (batch, weights) = split_weight_column(&delta.batches[0]).unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert_eq!(weights, vec![1, 1, 1]);
+    assert_eq!(delta.new_offset, PgLsn(0x20).to_offset_token());
+
+    // 2. Upstream rollback / uncommitted transaction leaves view untouched
+    let mut clean_source =
+        PostgresCdcSource::new(ConnectorId(5_401), schema.clone(), CdcWireFormat::PgOutput);
+    clean_source.decode_and_enqueue(b"BEGIN|103").unwrap();
+    clean_source
+        .decode_and_enqueue(b"B|0/30|7|I|one|10")
+        .unwrap();
+    clean_source.decode_and_enqueue(b"COMMIT|0/35").unwrap();
+    let res = clean_source
+        .poll_delta(PgLsn::ZERO.to_offset_token(), 1024 * 1024, 1024, None)
+        .await
+        .unwrap();
+    let (batch_clean, _) = split_weight_column(&res.batches[0]).unwrap();
+    let ids_clean = batch_clean
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(ids_clean, vec![10]);
+
+    // 3. Overflow rejection: transaction exceeding POSTGRES_CDC_MAX_TRANSACTION_BYTES fails closed with RS-4014
+    let mut overflow_source =
+        PostgresCdcSource::new(ConnectorId(5_402), schema.clone(), CdcWireFormat::PgOutput);
+    overflow_source.decode_and_enqueue(b"BEGIN|104").unwrap();
+
+    // Construct a valid change message whose key exceeds the transaction limit
+    let large_key = "k".repeat(POSTGRES_CDC_MAX_TRANSACTION_BYTES + 1024);
+    let payload = format!("B|0/40|7|I|{large_key}|1").into_bytes();
+    let err = overflow_source.decode_and_enqueue(&payload).unwrap_err();
+    match err {
+        SourceError::PollDeltaFailed { reason } => {
+            assert!(
+                reason.contains("RS-4014"),
+                "expected RS-4014 in overflow error, got: {reason}"
+            );
+        }
+        other => panic!("expected PollDeltaFailed, got: {other:?}"),
+    }
+    assert!(overflow_source.replication_read_paused());
+}

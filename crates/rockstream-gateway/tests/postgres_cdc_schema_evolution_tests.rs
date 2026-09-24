@@ -176,3 +176,182 @@ fn pgoutput_schema_reorder_or_rename_blocks_rs1002_without_rows() {
         )
     );
 }
+
+#[tokio::test]
+async fn test_schema_evolution_add_nullable_column_compatible() {
+    let old = base_i32();
+    let new = route(vec![
+        column("id", 23, -1, false, false, true),
+        column("c2", 25, -1, true, false, false),
+    ]);
+    assert_eq!(old.classify(&new), RelationChange::Compatible);
+    assert_compatible_history(old, new).await;
+}
+
+#[test]
+fn test_schema_evolution_rename_column_requires_rebuild() {
+    let old = route(vec![
+        column("c1", 20, -1, false, false, true),
+        column("value", 25, -1, false, false, false),
+    ]);
+    let new = route(vec![
+        column("c1_new", 20, -1, false, false, true),
+        column("value", 25, -1, false, false, false),
+    ]);
+    assert_eq!(
+        old.classify(&new),
+        RelationChange::Breaking(
+            "column was renamed, reordered, or changed key identity".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_schema_evolution_type_widening_compatible() {
+    let old = route(vec![column("c1", 23, -1, false, false, true)]);
+    let new = route(vec![column("c1", 20, -1, false, false, true)]);
+    assert_eq!(old.classify(&new), RelationChange::Compatible);
+    assert_compatible_history(old, new).await;
+}
+
+#[test]
+fn test_schema_evolution_drop_referenced_col_requires_rebuild() {
+    let old = route(vec![
+        column("id", 20, -1, false, false, true),
+        column("c1", 25, -1, false, false, false),
+    ]);
+    let new = route(vec![column("id", 20, -1, false, false, true)]);
+    assert_eq!(
+        old.classify(&new),
+        RelationChange::Breaking("column was dropped".to_string())
+    );
+}
+
+#[test]
+fn test_schema_evolution_primary_key_change_blocks() {
+    let old = route(vec![
+        column("c1", 20, -1, false, false, true),
+        column("c2", 20, -1, false, false, false),
+    ]);
+    let new = route(vec![
+        column("c1", 20, -1, false, false, false),
+        column("c2", 20, -1, false, false, true),
+    ]);
+    assert_eq!(
+        old.classify(&new),
+        RelationChange::Breaking(
+            "column was renamed, reordered, or changed key identity".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_schema_evolution_decision_table_and_relation_isolation() {
+    use rockstream_connectors::{CdcOperation, PgLsn, PgOutputRelationMetadata};
+    use rockstream_gateway::pgoutput_coordinator::BlockedRelationState;
+
+    let identity = SourceIdentityV1::new(
+        "db.example",
+        None,
+        "postgres",
+        "isolated_slot",
+        "isolated_pub",
+        "postgres",
+        "none://trusted",
+    )
+    .unwrap();
+    let connector_id = identity.connector_id();
+    let db = Arc::new(
+        ShardDb::builder("isolation-test", Arc::new(InMemory::new()))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let source = PostgresCdcSource::new(
+        connector_id,
+        Arc::new(Schema::empty()),
+        CdcWireFormat::PgOutput,
+    );
+    let checkpoints =
+        SourceCheckpointStore::new(Arc::clone(&db), connector_id.0 as u128, connector_id);
+    let mut coordinator = SharedPgOutputCoordinator::new(
+        identity,
+        SourceRuntimeCoordinator::new(source, connector_id, OffsetToken::new(vec![]), checkpoints),
+        Arc::clone(&db),
+    );
+
+    let route_orders = RelationRoute {
+        version: 1,
+        relation_id: 101,
+        upstream_namespace: "public".to_string(),
+        upstream_relation: "orders".to_string(),
+        imported_table_id: 101,
+        imported_table_name: "orders".to_string(),
+        columns: vec![column("id", 23, -1, false, false, true)],
+        replica_identity: ReplicaIdentity::Full,
+        schema_version: 1,
+    };
+    let route_payments = RelationRoute {
+        version: 1,
+        relation_id: 102,
+        upstream_namespace: "public".to_string(),
+        upstream_relation: "payments".to_string(),
+        imported_table_id: 102,
+        imported_table_name: "payments".to_string(),
+        columns: vec![column("id", 23, -1, false, false, true)],
+        replica_identity: ReplicaIdentity::Full,
+        schema_version: 1,
+    };
+
+    coordinator
+        .relation_routes
+        .insert(101, route_orders.clone());
+    coordinator
+        .relation_routes
+        .insert(102, route_payments.clone());
+
+    let blocked_orders = BlockedRelationState {
+        code: "RS-1002".to_string(),
+        xid: 500,
+        relation: PgOutputRelationMetadata {
+            relation_id: 101,
+            namespace: "public".to_string(),
+            name: "orders".to_string(),
+            replica_identity: b'f',
+            columns: vec![],
+        },
+        last_safe_lsn: PgLsn(100),
+        recovery_procedure: Some("rockstream source rebuild <src> --table orders".to_string()),
+    };
+    coordinator.block_relation(blocked_orders.clone());
+
+    assert!(coordinator.is_relation_blocked(101));
+    assert!(!coordinator.is_relation_blocked(102));
+    assert_eq!(
+        blocked_orders.recovery_procedure(),
+        "rockstream source rebuild <src> --table orders"
+    );
+
+    coordinator.begin(501).unwrap();
+    coordinator
+        .push_change(
+            501,
+            101,
+            CdcOperation::Insert,
+            None,
+            Some(vec![Some("1".to_string())]),
+        )
+        .unwrap();
+    coordinator
+        .push_change(
+            501,
+            102,
+            CdcOperation::Insert,
+            None,
+            Some(vec![Some("10".to_string())]),
+        )
+        .unwrap();
+
+    let envelope = coordinator.finish_envelope(501, PgLsn(200)).unwrap();
+    assert_eq!(envelope.xid, 501);
+}

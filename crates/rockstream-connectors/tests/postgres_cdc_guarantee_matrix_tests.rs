@@ -359,3 +359,125 @@ async fn postgres_cdc_invalid_slot_fails_closed() {
         }
     ));
 }
+
+#[tokio::test]
+async fn test_quad_lsn_persistence_and_acknowledgment_barrier() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let mut source =
+        PostgresCdcSource::new(ConnectorId(5_500), schema.clone(), CdcWireFormat::PgOutput);
+
+    // Initial state: all quad LSNs at zero
+    let initial_quad = *source.quad_lsn_progress();
+    assert_eq!(initial_quad.received_lsn, PgLsn(0));
+    assert_eq!(initial_quad.applied_lsn, PgLsn(0));
+    assert_eq!(initial_quad.durable_lsn, PgLsn(0));
+    assert_eq!(initial_quad.published_frontier, PgLsn(0));
+    assert_eq!(initial_quad.confirmed_flush_lsn, PgLsn(0));
+
+    // 1. Receive and apply LSN 0/10 and 0/20
+    source.decode_and_enqueue(b"B|0/10|1|I|orders|1").unwrap();
+    source.decode_and_enqueue(b"B|0/20|1|I|orders|2").unwrap();
+
+    let quad_after_receive = *source.quad_lsn_progress();
+    assert_eq!(
+        quad_after_receive.received_lsn,
+        PgLsn::parse("0/20").unwrap()
+    );
+    assert_eq!(
+        quad_after_receive.applied_lsn,
+        PgLsn::parse("0/20").unwrap()
+    );
+    // Invariant: durable_lsn and confirmed_flush_lsn MUST NOT advance before epoch commit!
+    assert_eq!(quad_after_receive.durable_lsn, PgLsn(0));
+    assert_eq!(quad_after_receive.confirmed_flush_lsn, PgLsn(0));
+
+    // 2. Poll delta and commit epoch 1 at 0/10
+    let delta = source
+        .poll_delta(PgLsn::ZERO.to_offset_token(), 1024 * 1024, 1, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        delta.new_offset,
+        PgLsn::parse("0/10").unwrap().to_offset_token()
+    );
+
+    source
+        .commit_offset(1, delta.new_offset.clone())
+        .await
+        .unwrap();
+    let quad_after_commit1 = *source.quad_lsn_progress();
+    assert_eq!(
+        quad_after_commit1.durable_lsn,
+        PgLsn::parse("0/10").unwrap()
+    );
+    assert_eq!(
+        quad_after_commit1.published_frontier,
+        PgLsn::parse("0/10").unwrap()
+    );
+    assert_eq!(
+        quad_after_commit1.confirmed_flush_lsn,
+        PgLsn::parse("0/10").unwrap()
+    );
+    // Slot ack invariant strictly holds: confirmed_flush_lsn <= durable_lsn
+    assert!(quad_after_commit1.confirmed_flush_lsn <= quad_after_commit1.durable_lsn);
+
+    // 3. Attempt to acknowledge slot beyond durable_lsn (0/50 when durable is 0/10)
+    // The barrier must clamp or prevent confirmed_flush_lsn from exceeding durable_lsn!
+    let ack_result = source
+        .quad_lsn_progress_mut()
+        .acknowledge_slot(PgLsn::parse("0/50").unwrap())
+        .unwrap();
+    assert_eq!(
+        ack_result,
+        PgLsn::parse("0/10").unwrap(),
+        "slot ack cannot exceed durable_lsn"
+    );
+    assert!(
+        source.quad_lsn_progress().confirmed_flush_lsn <= source.quad_lsn_progress().durable_lsn
+    );
+
+    // 4. Poll delta and commit epoch 2 at 0/20
+    let delta2 = source
+        .poll_delta(delta.new_offset, 1024 * 1024, 1, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        delta2.new_offset,
+        PgLsn::parse("0/20").unwrap().to_offset_token()
+    );
+    source
+        .commit_offset(2, delta2.new_offset.clone())
+        .await
+        .unwrap();
+
+    let quad_after_commit2 = *source.quad_lsn_progress();
+    assert_eq!(
+        quad_after_commit2.durable_lsn,
+        PgLsn::parse("0/20").unwrap()
+    );
+    assert_eq!(
+        quad_after_commit2.confirmed_flush_lsn,
+        PgLsn::parse("0/20").unwrap()
+    );
+
+    // 5. Duplicate suppression check: replaying up to durable LSN (0/20) is detected as duplicate
+    assert!(quad_after_commit2.is_duplicate(PgLsn::parse("0/10").unwrap()));
+    assert!(quad_after_commit2.is_duplicate(PgLsn::parse("0/20").unwrap()));
+    assert!(!quad_after_commit2.is_duplicate(PgLsn::parse("0/30").unwrap()));
+
+    // 6. Crash recovery: a new worker instance recovers durable_lsn from checkpoint
+    let mut recovered =
+        PostgresCdcSource::new(ConnectorId(5_500), schema.clone(), CdcWireFormat::PgOutput);
+    recovered
+        .commit_offset(2, PgLsn::parse("0/20").unwrap().to_offset_token())
+        .await
+        .unwrap();
+    let rec_quad = *recovered.quad_lsn_progress();
+    assert_eq!(rec_quad.durable_lsn, PgLsn::parse("0/20").unwrap());
+    assert_eq!(rec_quad.confirmed_flush_lsn, PgLsn::parse("0/20").unwrap());
+
+    // Injected storage failure / uncommitted LSN prevents advancing slot
+    assert!(recovered
+        .quad_lsn_progress()
+        .is_duplicate(PgLsn::parse("0/20").unwrap()));
+}

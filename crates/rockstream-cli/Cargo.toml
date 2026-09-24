@@ -45,6 +45,7 @@ async-trait = { workspace = true }
 tonic = { workspace = true }
 
 [dev-dependencies]
+rockstream-connectors = { workspace = true }
 rockstream-test-support = { workspace = true }
 rockstream-docgen = { workspace = true }
 rockstream-sim = { workspace = true }

@@ -223,6 +223,75 @@ struct Wal2JsonChange {
     new: Option<Vec<i64>>,
 }
 
+/// Quad-LSN progress tracking record persisted in durable storage (Step 5, V069-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuadLsnProgress {
+    pub received_lsn: PgLsn,
+    pub applied_lsn: PgLsn,
+    pub durable_lsn: PgLsn,
+    pub published_frontier: PgLsn,
+    pub confirmed_flush_lsn: PgLsn,
+}
+
+impl Default for QuadLsnProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QuadLsnProgress {
+    pub fn new() -> Self {
+        Self {
+            received_lsn: PgLsn(0),
+            applied_lsn: PgLsn(0),
+            durable_lsn: PgLsn(0),
+            published_frontier: PgLsn(0),
+            confirmed_flush_lsn: PgLsn(0),
+        }
+    }
+
+    /// Enforce the fundamental slot acknowledgment invariant:
+    /// confirmed_flush_lsn <= durable_lsn.
+    /// StandbyStatusUpdate to PostgreSQL MUST NEVER advance beyond durable_lsn.
+    pub fn acknowledge_slot(&mut self, target_lsn: PgLsn) -> Result<PgLsn, SourceError> {
+        let max_safe_lsn = self.durable_lsn;
+        let safe_ack = target_lsn.min(max_safe_lsn);
+        if safe_ack < self.confirmed_flush_lsn {
+            return Ok(self.confirmed_flush_lsn);
+        }
+        self.confirmed_flush_lsn = safe_ack;
+        Ok(self.confirmed_flush_lsn)
+    }
+
+    pub fn record_received(&mut self, lsn: PgLsn) {
+        if lsn > self.received_lsn {
+            self.received_lsn = lsn;
+        }
+    }
+
+    pub fn record_applied(&mut self, lsn: PgLsn) {
+        if lsn > self.applied_lsn {
+            self.applied_lsn = lsn;
+        }
+    }
+
+    pub fn record_durable(&mut self, lsn: PgLsn) {
+        if lsn > self.durable_lsn {
+            self.durable_lsn = lsn;
+        }
+    }
+
+    pub fn record_published(&mut self, lsn: PgLsn) {
+        if lsn > self.published_frontier {
+            self.published_frontier = lsn;
+        }
+    }
+
+    pub fn is_duplicate(&self, lsn: PgLsn) -> bool {
+        lsn <= self.durable_lsn
+    }
+}
+
 /// A decoded CDC source with named bounded handoff capacity and fill metrics.
 pub struct PostgresCdcSource {
     _connector_id: ConnectorId,
@@ -249,6 +318,7 @@ pub struct PostgresCdcSource {
     pending_secret_token: Option<SecretToken>,
     active_secret_token_id: Option<String>,
     secret_rotations_applied: u64,
+    quad_lsn: QuadLsnProgress,
 }
 
 /// Connection details for a native pgoutput source. Credentials are resolved
@@ -319,7 +389,16 @@ impl PostgresCdcSource {
             pending_secret_token: None,
             active_secret_token_id: None,
             secret_rotations_applied: 0,
+            quad_lsn: QuadLsnProgress::new(),
         }
+    }
+
+    pub fn quad_lsn_progress(&self) -> &QuadLsnProgress {
+        &self.quad_lsn
+    }
+
+    pub fn quad_lsn_progress_mut(&mut self) -> &mut QuadLsnProgress {
+        &mut self.quad_lsn
     }
 
     pub fn bind_secret(&mut self, secret_name: impl Into<String>) {
@@ -730,6 +809,8 @@ impl PostgresCdcSource {
         };
         match change {
             Ok(change) => {
+                self.quad_lsn.record_received(change.lsn);
+                self.quad_lsn.record_applied(change.lsn);
                 if let Some((_, bytes)) = &mut self.transaction {
                     *bytes = bytes.saturating_add(payload.len());
                     if *bytes > POSTGRES_CDC_MAX_TRANSACTION_BYTES {
@@ -1535,6 +1616,10 @@ impl SourceConnector for PostgresCdcSource {
                     })?;
             }
         }
+        self.quad_lsn.record_durable(lsn);
+        self.quad_lsn.record_published(lsn);
+        self.quad_lsn.acknowledge_slot(lsn)?;
+        assert!(self.quad_lsn.confirmed_flush_lsn <= self.quad_lsn.durable_lsn);
         self.committed = Some((epoch, lsn));
         Ok(())
     }
@@ -1737,7 +1822,7 @@ fn decode_native_pgoutput_text_message(
     }
 }
 
-fn decode_pgoutput_event(
+pub fn decode_pgoutput_event(
     active_xid: &mut Option<u32>,
     payload: &[u8],
 ) -> Result<PgOutputEvent, SourceError> {

@@ -253,7 +253,7 @@ Changes to persistent formats or public protocols require:
 | v0.67.0 | Distributed Data Plane | Row traffic leaves the control plane ✅ Done |
 | v0.67.1 | State beyond RAM | Maintained state and recovery operate within worker budgets ✅ Done |
 | v0.68.0 | Distributed Lifecycle ✅ Done | Migration, drain, and failover become durable sagas |
-| **v0.69** | PostgreSQL CDC | First complete external ingestion golden path |
+| **v0.69** | PostgreSQL CDC ✅ Done | First complete external ingestion golden path |
 | **v0.70** | Kafka | Second complete external ingestion golden path |
 | **v0.71** | Observability | Operators can explain health, lag, state, and failures |
 | **v0.72** | Resource Control | Bounded execution and reproducible capacity behavior |
@@ -1923,7 +1923,7 @@ Distributed lifecycle protocols remain subject to simulation/formal verification
 
 <a id="v0-69"></a>
 
-# 15. v0.69 — PostgreSQL CDC Golden Connector
+# 15. v0.69 — PostgreSQL CDC Golden Connector ✅ Done
 
 ## Focus
 

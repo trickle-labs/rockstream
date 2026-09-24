@@ -10,3 +10,4 @@ output.txt
 /evidence/r1-local/artifacts/
 .cache
 .DS_Store
+/.scratch

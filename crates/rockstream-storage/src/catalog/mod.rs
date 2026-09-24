@@ -177,6 +177,73 @@ pub struct CatalogSourceEntry {
     pub options: HashMap<String, String>,
 }
 
+/// Persisted source record with explicit version tag (v0.69 Step 1, V069-01).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRecordV1 {
+    pub version: u32,
+    pub id: SourceId,
+    pub name: String,
+    pub connector_type: String,
+    pub table_name: Option<String>,
+    pub options: HashMap<String, String>,
+    pub format: String,
+}
+
+impl SourceRecordV1 {
+    pub const CURRENT_VERSION: u32 = 1;
+
+    pub fn new(
+        id: SourceId,
+        name: String,
+        connector_type: String,
+        table_name: Option<String>,
+        options: HashMap<String, String>,
+        format: String,
+    ) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            id,
+            name,
+            connector_type,
+            table_name,
+            options,
+            format,
+        }
+    }
+
+    pub fn from_catalog_entry(entry: &CatalogSourceEntry, format: impl Into<String>) -> Self {
+        Self::new(
+            entry.id,
+            entry.name.clone(),
+            entry.connector_type.clone(),
+            entry.table_name.clone(),
+            entry.options.clone(),
+            format.into(),
+        )
+    }
+
+    /// Decode and validate source record version tag.
+    /// Records with unknown versions are rejected with RS-2025.
+    pub fn decode_versioned(bytes: &[u8]) -> Result<Self, CatalogError> {
+        #[derive(Deserialize)]
+        struct VersionHeader {
+            #[serde(default)]
+            version: Option<u32>,
+        }
+        let header: VersionHeader =
+            serde_json::from_slice(bytes).map_err(|e| CatalogError::DecodeError(e.to_string()))?;
+        let ver = header.version.unwrap_or(0);
+        if ver != Self::CURRENT_VERSION {
+            return Err(CatalogError::IncompatibleVersion(format!(
+                "[RS-2025] unsupported version: source record version {} is not supported (expected {}). Next steps: upgrade the cluster or migrate the catalog definition.",
+                ver,
+                Self::CURRENT_VERSION,
+            )));
+        }
+        serde_json::from_slice(bytes).map_err(|e| CatalogError::DecodeError(e.to_string()))
+    }
+}
+
 /// A sink connector entry in the catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogSinkEntry {
