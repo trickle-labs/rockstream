@@ -1014,14 +1014,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream health`
 
-Show authoritative process health from the management service across the seven independent dimensions:
-- `liveness`: Event loop ticks and process health.
-- `readiness`: Lifecycle readiness state machine.
-- `availability`: Materialized view queryability.
-- `freshness`: Ingestion lag versus SLO.
-- `durability`: Storage commit and checkpoint progress.
-- `capacity`: Memory and disk resource budgets.
-- `degradation`: Aggregated diagnostic degradation reasons.
+Show authoritative process health from the management service
 
 Exit codes
 
@@ -1032,7 +1025,6 @@ Exit codes
 | 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
-
 
 ## `rockstream init`
 
@@ -1714,17 +1706,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream status`
 
-Print cluster topology, view status, and health status across the ten canonical status model fields:
-- `state`: Lifecycle state of the view (`Active`, `Paused`, `Recovering`, `Degraded`, `Failed`).
-- `published_frontier`: Latest committed durability epoch watermark.
-- `input_frontier`: Latest source ingested epoch watermark.
-- `freshness_lag`: Measured lag between input and published frontier in milliseconds.
-- `freshness_slo`: Target freshness SLO in milliseconds.
-- `state_bytes`: SlateDB persistent state footprint in bytes.
-- `memory_bytes`: In-memory arrangement and worker memory usage in bytes.
-- `assigned_shards`: Active shard IDs assigned to compute workers.
-- `degradation_reason`: Canonical degradation reason enum and RS code if degraded.
-- `blocking_operation`: Active blocking migration or checkpoint operation ID if in-flight.
+Print cluster topology and health status
 
 Exit codes
 
@@ -1735,7 +1717,6 @@ Exit codes
 | 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
-
 
 ## `rockstream support`
 

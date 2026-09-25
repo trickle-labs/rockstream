@@ -762,7 +762,8 @@ pub async fn run_doctor_checks(opts: &DoctorOptions) -> DoctorReport {
                                 Some("Verify storage directory path and permissions.".to_string()),
                             );
                         }
-                        let test_file = path.join(format!(".doctor_probe_{}", uuid::Uuid::new_v4()));
+                        let test_file =
+                            path.join(format!(".doctor_probe_{}", uuid::Uuid::new_v4()));
                         if let Err(e) = std::fs::write(&test_file, b"test") {
                             return (
                                 DiagnosticStatus::Fail,
