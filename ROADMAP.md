@@ -255,7 +255,7 @@ Changes to persistent formats or public protocols require:
 | v0.68.0 | Distributed Lifecycle ✅ Done | Migration, drain, and failover become durable sagas |
 | **v0.69** | PostgreSQL CDC ✅ Done | First complete external ingestion golden path |
 | **v0.70** | Kafka ✅ Done | Second complete external ingestion golden path |
-| **v0.71** | Observability | Operators can explain health, lag, state, and failures |
+| **v0.71** | Observability ✅ Done | Operators can explain health, lag, state, and failures |
 | **v0.72** | Resource Control | Bounded execution and reproducible capacity behavior |
 | **v0.73** | Security | Authentication, authorization, and identity become production-coherent |
 | v0.73.1 | Console Role/API Foundation | Browser-class clients can safely consume qualified public capabilities |

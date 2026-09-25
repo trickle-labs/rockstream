@@ -21,4 +21,18 @@
 | pgwire_queries_total | counter | count | command | stable | Total pgwire queries processed |
 | pgwire_query_duration_ms | histogram | ms | command | stable | Duration of pgwire queries in milliseconds |
 | storage_flush_latency_ms | histogram | ms | tier | stable | Storage flush duration latency in milliseconds |
+| rockstream_ingest_rows_total | counter | count | source, partition | stable | Cumulative ingested rows total |
+| rockstream_ingest_bytes_total | counter | bytes | source, partition | stable | Cumulative ingested bytes total |
+| rockstream_execution_rows_total | counter | count | view, operator | stable | Cumulative executed rows processed across pipeline operators |
+| rockstream_epoch_duration_seconds | histogram | seconds | pipeline | stable | Duration of stream execution epochs in seconds |
+| rockstream_frontier_lag_seconds | gauge | seconds | view | stable | Difference between current wall clock and view frontier |
+| rockstream_state_bytes | gauge | bytes | view, backend | stable | Total arrangement and storage state bytes per view |
+| rockstream_memory_bytes | gauge | bytes | worker, category | stable | Heap and arena memory consumed per worker and subsystem |
+| rockstream_exchange_bytes_total | counter | bytes | sender, receiver | stable | Network throughput bytes exchanged across worker channels |
+| rockstream_exchange_backpressure | gauge | ratio | worker, channel | stable | Channel backpressure ratio between 0.0 and 1.0 |
+| rockstream_checkpoint_duration_seconds | histogram | seconds | shard, tier | stable | Duration of durable checkpoint flushes and commits |
+| rockstream_migration_rows_copied_total | counter | count | migration_id | stable | Rows copied during active shard migration or repartitioning |
+| rockstream_connector_lag_records | gauge | count | source, partition | stable | Unconsumed message offset lag across connector partitions |
+| rockstream_errors_total | counter | count | code | stable | Diagnostic and runtime errors grouped by canonical RS code |
+
 

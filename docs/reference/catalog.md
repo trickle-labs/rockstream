@@ -149,3 +149,64 @@ Resource consumption metrics aggregated per workload group
 | state_bytes | 4 | INT8 | false | Durable state footprint in storage |
 | processed_records | 5 | INT8 | false | Cumulative record count processed |
 
+### `shards`
+
+Assigned storage and compute shards across cluster workers  
+**Cardinality bound:** Bounded by total cluster shard count (MAX_CATALOG_SCAN_ROWS = 1000)
+
+| Column | Position | Type | Nullable | Description |
+| --- | --- | --- | --- | --- |
+| shard_id | 1 | TEXT | false | Unique 64-bit hex shard identifier |
+| worker_id | 2 | TEXT | false | Worker holding the active shard lease |
+| state | 3 | TEXT | false | Shard lease status (active, migrating, recovering) |
+| size_bytes | 4 | INT8 | false | SlateDB storage footprint in bytes |
+| l0_sst_count | 5 | INT8 | false | Number of L0 SST files pending compaction |
+
+### `operations`
+
+Active and historical cluster operations and migrations  
+**Cardinality bound:** Bounded by operation retention history (MAX_CATALOG_SCAN_ROWS = 1000)
+
+| Column | Position | Type | Nullable | Description |
+| --- | --- | --- | --- | --- |
+| operation_id | 1 | TEXT | false | Unique operation identifier |
+| operation_type | 2 | TEXT | false | Operation type (checkpoint, migration, rebalance, drain) |
+| state | 3 | TEXT | false | Execution state (running, completed, failed, blocked) |
+| started_at | 4 | TEXT | false | ISO 8601 start timestamp |
+| completed_at | 5 | TEXT | true | ISO 8601 completion timestamp |
+
+### `namespaces`
+
+Database namespaces / schemas registered in catalog  
+**Cardinality bound:** Bounded by namespace count (MAX_CATALOG_SCAN_ROWS = 1000)
+
+| Column | Position | Type | Nullable | Description |
+| --- | --- | --- | --- | --- |
+| name | 1 | TEXT | false | Namespace identifier |
+| owner | 2 | TEXT | false | Owning role / user |
+| created_at | 3 | TEXT | false | Creation ISO 8601 timestamp |
+
+### `tables`
+
+Physical and logical source tables registered in the catalog  
+**Cardinality bound:** Bounded by registered tables count (MAX_CATALOG_SCAN_ROWS = 1000)
+
+| Column | Position | Type | Nullable | Description |
+| --- | --- | --- | --- | --- |
+| namespace | 1 | TEXT | false | Schema name |
+| name | 2 | TEXT | false | Table identifier |
+| table_type | 3 | TEXT | false | Table type (BASE TABLE, VIEW, SOURCE) |
+| schema_version | 4 | INT8 | false | Monotonically increasing schema revision |
+
+### `workloads`
+
+Defined workload namespaces and resource allocation budgets  
+**Cardinality bound:** Bounded by workload count (MAX_CATALOG_SCAN_ROWS = 1000)
+
+| Column | Position | Type | Nullable | Description |
+| --- | --- | --- | --- | --- |
+| name | 1 | TEXT | false | Workload group name |
+| memory_budget_bytes | 2 | INT8 | false | Memory budget limit in bytes |
+| cpu_shares | 3 | INT8 | false | Assigned CPU weight / quota |
+
+

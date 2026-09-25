@@ -214,3 +214,131 @@ async fn test_catalog_stable_identifiers_survive_restart_lfs() {
         "Checkpoint ID must survive restart"
     );
 }
+
+#[tokio::test]
+async fn test_catalog_recovery_probe_survives_process_restart_lfs() {
+    let _g = TEST_LOCK.lock().await;
+    let tmp = tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
+
+    // Phase 1: Initialize ShardDb and commit catalog record
+    {
+        let db = ShardDb::builder("cat-recovery-lfs", store.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"catalog_probe_magic", b"RS_CAT_V1_SNAPSHOT")
+            .await
+            .unwrap();
+    }
+
+    // Phase 2: Reopen ShardDb after restart and probe recovery
+    {
+        let reopened_db = ShardDb::builder("cat-recovery-lfs", store.clone())
+            .build()
+            .await
+            .unwrap();
+        let recovered = reopened_db.get(b"catalog_probe_magic").await.unwrap();
+        assert_eq!(
+            recovered.as_deref(),
+            Some(&b"RS_CAT_V1_SNAPSHOT"[..]),
+            "Catalog snapshot recovery probe must recover persisted magic bytes across restart"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_rockstream_catalog_checkpoints_query_exact_lfs() {
+    let _g = TEST_LOCK.lock().await;
+    let tmp = tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.record_checkpoint(CatalogCheckpointEntry {
+        checkpoint_id: 101,
+        committed_at: "2026-09-25 10:00:00+00".to_string(),
+        epoch_number: 10,
+        frontier: "[10]".to_string(),
+        storage_path: "lfs:///data/checkpoints/chk-101".to_string(),
+        duration_ms: 32,
+    });
+    catalog.record_checkpoint(CatalogCheckpointEntry {
+        checkpoint_id: 102,
+        committed_at: "2026-09-25 10:01:00+00".to_string(),
+        epoch_number: 11,
+        frontier: "[11]".to_string(),
+        storage_path: "lfs:///data/checkpoints/chk-102".to_string(),
+        duration_ms: 28,
+    });
+
+    let (port, handle, _db) = start_gateway("shard-chk-lfs", store.clone(), catalog).await;
+    let client = connect_port(port).await;
+
+    let rows = simple_rows(
+        &client,
+        "SELECT checkpoint_id, epoch_number, frontier, storage_path, duration_ms FROM rockstream_catalog.checkpoints ORDER BY checkpoint_id;",
+    )
+    .await;
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "Must return exactly two recorded checkpoints"
+    );
+    assert_eq!(
+        rows[0],
+        vec![
+            Some("101".to_string()),
+            Some("10".to_string()),
+            Some("[10]".to_string()),
+            Some("lfs:///data/checkpoints/chk-101".to_string()),
+            Some("32".to_string()),
+        ]
+    );
+    assert_eq!(
+        rows[1],
+        vec![
+            Some("102".to_string()),
+            Some("11".to_string()),
+            Some("[11]".to_string()),
+            Some("lfs:///data/checkpoints/chk-102".to_string()),
+            Some("28".to_string()),
+        ]
+    );
+
+    drop(client);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_storage_access_doctor_check_lfs() {
+    let _g = TEST_LOCK.lock().await;
+    let tmp = tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
+
+    let db = ShardDb::builder("probe-doctor-lfs", store)
+        .build()
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    // 1. Write probe
+    db.put(b"probe_doctor_lfs", b"PROBE_STORAGE_ACCESS_OK")
+        .await
+        .unwrap();
+    // 2. Read probe
+    let read_bytes = db.get(b"probe_doctor_lfs").await.unwrap();
+    assert_eq!(read_bytes.as_deref(), Some(&b"PROBE_STORAGE_ACCESS_OK"[..]));
+    // 3. Delete probe
+    db.delete(b"probe_doctor_lfs").await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "Storage access roundtrip must finish well under 500ms bound, took {:?}",
+        elapsed
+    );
+}

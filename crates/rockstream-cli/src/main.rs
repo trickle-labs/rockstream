@@ -800,6 +800,8 @@ fn main() -> ExitCode {
                 }),
                 control: control.or_else(|| cli.control.clone()),
                 gateway,
+                worker: None,
+                connector: None,
                 deep,
                 include_docker,
                 timeout: std::time::Duration::from_secs(timeout),

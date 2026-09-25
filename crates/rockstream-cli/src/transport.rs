@@ -1646,6 +1646,23 @@ impl CatalogClient {
             });
             let view_state = ViewState::from_status_text(state).unwrap_or(ViewState::Running);
             let degradation_status = derive_degradation_status(&view_state, lag);
+            let published_frontier = rockstream_types::metrics::read_view_published_frontier(name);
+            let input_frontier = rockstream_types::metrics::read_view_input_frontier(name);
+            let freshness_lag_ms = lag.as_ref().map(|l| l.total_lag_ms);
+            let state_bytes = rockstream_types::metrics::read_pipeline_state_bytes(name);
+            let memory_bytes = mem.or_else(|| {
+                let bytes = rockstream_types::metrics::read_workload_memory(
+                    workload.as_deref().unwrap_or(name),
+                );
+                if bytes > 0 {
+                    Some(bytes)
+                } else {
+                    None
+                }
+            });
+            let assigned_shards = rockstream_types::metrics::read_view_assigned_shards(name);
+            let blocking_operation = rockstream_types::metrics::read_view_blocking_operation(name);
+
             ViewStatusInfo {
                 namespace: self.identity.namespace.clone(),
                 view_name: name.to_string(),
@@ -1662,6 +1679,13 @@ impl CatalogClient {
                 bytes_remaining: degradation_status.bytes_remaining,
                 rows_remaining: degradation_status.rows_remaining,
                 estimated_remaining_ms: degradation_status.estimated_remaining_ms,
+                published_frontier,
+                input_frontier,
+                freshness_lag_ms,
+                state_bytes,
+                memory_bytes,
+                assigned_shards,
+                blocking_operation,
             }
         };
 

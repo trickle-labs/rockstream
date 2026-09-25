@@ -461,7 +461,42 @@ struct MetricRegistry {
     storage_pressure_write_amplification_bits: AtomicU64,
     storage_pressure_object_store_latency_ms: AtomicU64,
     storage_pressure_object_store_failure_rate_bits: AtomicU64,
+
+    // Status model fields
+    view_published_frontiers: HashMap<String, u64>,
+    view_input_frontiers: HashMap<String, u64>,
+    view_assigned_shards: HashMap<String, Vec<u64>>,
+    view_blocking_operations: HashMap<String, String>,
+
+    // Production metric classes (v0.71 V071-06)
+    ingest_throughput: HashMap<(String, String), (u64, u64)>,
+    ingest_rows_other: u64,
+    ingest_bytes_other: u64,
+    execution_rows: HashMap<(String, String), u64>,
+    execution_rows_other: u64,
+    epoch_durations: HashMap<(String, String), f64>,
+    epoch_durations_other: Option<f64>,
+    frontier_lags: HashMap<String, f64>,
+    frontier_lags_other: Option<f64>,
+    view_state_bytes_map: HashMap<(String, String), u64>,
+    view_state_bytes_other: Option<u64>,
+    worker_memory_bytes_map: HashMap<(String, String), u64>,
+    worker_memory_bytes_other: Option<u64>,
+    exchange_bytes: HashMap<(String, String), u64>,
+    exchange_bytes_other: u64,
+    exchange_backpressures: HashMap<(String, String), f64>,
+    exchange_backpressure_other: Option<f64>,
+    checkpoint_durations: HashMap<(String, String), f64>,
+    checkpoint_duration_other: Option<f64>,
+    migration_rows: HashMap<String, u64>,
+    migration_rows_other: u64,
+    connector_lags: HashMap<(String, String), u64>,
+    connector_lag_other: Option<u64>,
+    diagnostic_errors: HashMap<String, u64>,
+    diagnostic_errors_other: u64,
 }
+
+pub const MAX_METRIC_SERIES_PER_METRIC: usize = 64;
 
 #[derive(Debug, Clone)]
 struct OperatorFrontierEntry {
@@ -568,6 +603,35 @@ impl MetricRegistry {
             storage_pressure_write_amplification_bits: AtomicU64::new(0.0f64.to_bits()),
             storage_pressure_object_store_latency_ms: AtomicU64::new(0),
             storage_pressure_object_store_failure_rate_bits: AtomicU64::new(0.0f64.to_bits()),
+            view_published_frontiers: HashMap::new(),
+            view_input_frontiers: HashMap::new(),
+            view_assigned_shards: HashMap::new(),
+            view_blocking_operations: HashMap::new(),
+            ingest_throughput: HashMap::new(),
+            ingest_rows_other: 0,
+            ingest_bytes_other: 0,
+            execution_rows: HashMap::new(),
+            execution_rows_other: 0,
+            epoch_durations: HashMap::new(),
+            epoch_durations_other: None,
+            frontier_lags: HashMap::new(),
+            frontier_lags_other: None,
+            view_state_bytes_map: HashMap::new(),
+            view_state_bytes_other: None,
+            worker_memory_bytes_map: HashMap::new(),
+            worker_memory_bytes_other: None,
+            exchange_bytes: HashMap::new(),
+            exchange_bytes_other: 0,
+            exchange_backpressures: HashMap::new(),
+            exchange_backpressure_other: None,
+            checkpoint_durations: HashMap::new(),
+            checkpoint_duration_other: None,
+            migration_rows: HashMap::new(),
+            migration_rows_other: 0,
+            connector_lags: HashMap::new(),
+            connector_lag_other: None,
+            diagnostic_errors: HashMap::new(),
+            diagnostic_errors_other: 0,
         }
     }
 }
@@ -1203,6 +1267,252 @@ pub fn reset_all() {
             .store(0, Ordering::Relaxed);
         reg.storage_pressure_object_store_failure_rate_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
+        reg.view_published_frontiers.clear();
+        reg.view_input_frontiers.clear();
+        reg.view_assigned_shards.clear();
+        reg.view_blocking_operations.clear();
+
+        // Reset production metrics
+        reg.ingest_throughput.clear();
+        reg.ingest_rows_other = 0;
+        reg.ingest_bytes_other = 0;
+        reg.execution_rows.clear();
+        reg.execution_rows_other = 0;
+        reg.epoch_durations.clear();
+        reg.epoch_durations_other = None;
+        reg.frontier_lags.clear();
+        reg.frontier_lags_other = None;
+        reg.view_state_bytes_map.clear();
+        reg.view_state_bytes_other = None;
+        reg.worker_memory_bytes_map.clear();
+        reg.worker_memory_bytes_other = None;
+        reg.exchange_bytes.clear();
+        reg.exchange_bytes_other = 0;
+        reg.exchange_backpressures.clear();
+        reg.exchange_backpressure_other = None;
+        reg.checkpoint_durations.clear();
+        reg.checkpoint_duration_other = None;
+        reg.migration_rows.clear();
+        reg.migration_rows_other = 0;
+        reg.connector_lags.clear();
+        reg.connector_lag_other = None;
+        reg.diagnostic_errors.clear();
+        reg.diagnostic_errors_other = 0;
+    });
+}
+
+// ─── Status Model Helpers ─────────────────────────────────────────────────────
+
+pub fn set_view_published_frontier(view_name: &str, epoch: u64) {
+    with_registry(|reg| {
+        reg.view_published_frontiers
+            .insert(view_name.to_string(), epoch);
+    });
+}
+
+pub fn read_view_published_frontier(view_name: &str) -> Option<u64> {
+    with_registry(|reg| reg.view_published_frontiers.get(view_name).copied())
+}
+
+pub fn set_view_input_frontier(view_name: &str, epoch: u64) {
+    with_registry(|reg| {
+        reg.view_input_frontiers
+            .insert(view_name.to_string(), epoch);
+    });
+}
+
+pub fn read_view_input_frontier(view_name: &str) -> Option<u64> {
+    with_registry(|reg| reg.view_input_frontiers.get(view_name).copied())
+}
+
+pub fn set_view_assigned_shards(view_name: &str, shards: Vec<u64>) {
+    with_registry(|reg| {
+        reg.view_assigned_shards
+            .insert(view_name.to_string(), shards);
+    });
+}
+
+pub fn read_view_assigned_shards(view_name: &str) -> Vec<u64> {
+    with_registry(|reg| {
+        reg.view_assigned_shards
+            .get(view_name)
+            .cloned()
+            .unwrap_or_default()
+    })
+}
+
+pub fn set_view_blocking_operation(view_name: &str, op: Option<String>) {
+    with_registry(|reg| {
+        if let Some(op) = op {
+            reg.view_blocking_operations
+                .insert(view_name.to_string(), op);
+        } else {
+            reg.view_blocking_operations.remove(view_name);
+        }
+    });
+}
+
+pub fn read_view_blocking_operation(view_name: &str) -> Option<String> {
+    with_registry(|reg| reg.view_blocking_operations.get(view_name).cloned())
+}
+
+// ─── Production Metrics Helpers (v0.71 V071-06) ──────────────────────────────
+
+pub fn record_ingest_throughput(source: &str, format: &str, rows: u64, bytes: u64) {
+    with_registry(|reg| {
+        let key = (source.to_string(), format.to_string());
+        if let Some(entry) = reg.ingest_throughput.get_mut(&key) {
+            entry.0 += rows;
+            entry.1 += bytes;
+        } else if reg.ingest_throughput.len() < MAX_METRIC_SERIES_PER_METRIC {
+            reg.ingest_throughput.insert(key, (rows, bytes));
+        } else {
+            reg.ingest_rows_other += rows;
+            reg.ingest_bytes_other += bytes;
+        }
+    });
+}
+
+pub fn record_execution_rows(view: &str, operator: &str, rows: u64) {
+    with_registry(|reg| {
+        let key = (view.to_string(), operator.to_string());
+        if let Some(val) = reg.execution_rows.get_mut(&key) {
+            *val += rows;
+        } else if reg.execution_rows.len() < MAX_METRIC_SERIES_PER_METRIC {
+            reg.execution_rows.insert(key, rows);
+        } else {
+            reg.execution_rows_other += rows;
+        }
+    });
+}
+
+pub fn record_epoch_duration_seconds(workload: &str, phase: &str, duration_secs: f64) {
+    with_registry(|reg| {
+        let key = (workload.to_string(), phase.to_string());
+        if reg.epoch_durations.contains_key(&key)
+            || reg.epoch_durations.len() < MAX_METRIC_SERIES_PER_METRIC
+        {
+            reg.epoch_durations.insert(key, duration_secs);
+        } else {
+            reg.epoch_durations_other = Some(duration_secs);
+        }
+    });
+}
+
+pub fn set_frontier_lag_seconds(view: &str, lag_secs: f64) {
+    with_registry(|reg| {
+        let key = view.to_string();
+        if reg.frontier_lags.contains_key(&key)
+            || reg.frontier_lags.len() < MAX_METRIC_SERIES_PER_METRIC
+        {
+            reg.frontier_lags.insert(key, lag_secs);
+        } else {
+            reg.frontier_lags_other = Some(lag_secs);
+        }
+    });
+}
+
+pub fn set_view_state_bytes(view: &str, backend: &str, bytes: u64) {
+    with_registry(|reg| {
+        let key = (view.to_string(), backend.to_string());
+        if reg.view_state_bytes_map.contains_key(&key)
+            || reg.view_state_bytes_map.len() < MAX_METRIC_SERIES_PER_METRIC
+        {
+            reg.view_state_bytes_map.insert(key, bytes);
+        } else {
+            reg.view_state_bytes_other = Some(bytes);
+        }
+    });
+}
+
+pub fn set_worker_memory_bytes(worker: &str, category: &str, bytes: u64) {
+    with_registry(|reg| {
+        let key = (worker.to_string(), category.to_string());
+        if reg.worker_memory_bytes_map.contains_key(&key)
+            || reg.worker_memory_bytes_map.len() < MAX_METRIC_SERIES_PER_METRIC
+        {
+            reg.worker_memory_bytes_map.insert(key, bytes);
+        } else {
+            reg.worker_memory_bytes_other = Some(bytes);
+        }
+    });
+}
+
+pub fn record_exchange_bytes(sender: &str, receiver: &str, bytes: u64) {
+    with_registry(|reg| {
+        let key = (sender.to_string(), receiver.to_string());
+        if let Some(val) = reg.exchange_bytes.get_mut(&key) {
+            *val += bytes;
+        } else if reg.exchange_bytes.len() < MAX_METRIC_SERIES_PER_METRIC {
+            reg.exchange_bytes.insert(key, bytes);
+        } else {
+            reg.exchange_bytes_other += bytes;
+        }
+    });
+}
+
+pub fn set_exchange_backpressure(worker: &str, channel: &str, ratio: f64) {
+    with_registry(|reg| {
+        let key = (worker.to_string(), channel.to_string());
+        if reg.exchange_backpressures.contains_key(&key)
+            || reg.exchange_backpressures.len() < MAX_METRIC_SERIES_PER_METRIC
+        {
+            reg.exchange_backpressures.insert(key, ratio);
+        } else {
+            reg.exchange_backpressure_other = Some(ratio);
+        }
+    });
+}
+
+pub fn record_checkpoint_duration_seconds(shard: &str, tier: &str, duration_secs: f64) {
+    with_registry(|reg| {
+        let key = (shard.to_string(), tier.to_string());
+        if reg.checkpoint_durations.contains_key(&key)
+            || reg.checkpoint_durations.len() < MAX_METRIC_SERIES_PER_METRIC
+        {
+            reg.checkpoint_durations.insert(key, duration_secs);
+        } else {
+            reg.checkpoint_duration_other = Some(duration_secs);
+        }
+    });
+}
+
+pub fn record_migration_rows_copied(migration_id: &str, rows: u64) {
+    with_registry(|reg| {
+        let key = migration_id.to_string();
+        if let Some(val) = reg.migration_rows.get_mut(&key) {
+            *val += rows;
+        } else if reg.migration_rows.len() < MAX_METRIC_SERIES_PER_METRIC {
+            reg.migration_rows.insert(key, rows);
+        } else {
+            reg.migration_rows_other += rows;
+        }
+    });
+}
+
+pub fn set_connector_lag_records(source: &str, partition: &str, records: u64) {
+    with_registry(|reg| {
+        let key = (source.to_string(), partition.to_string());
+        if reg.connector_lags.contains_key(&key)
+            || reg.connector_lags.len() < MAX_METRIC_SERIES_PER_METRIC
+        {
+            reg.connector_lags.insert(key, records);
+        } else {
+            reg.connector_lag_other = Some(records);
+        }
+    });
+}
+
+pub fn record_diagnostic_error(code: &str) {
+    with_registry(|reg| {
+        let key = code.to_string();
+        if let Some(val) = reg.diagnostic_errors.get_mut(&key) {
+            *val += 1;
+        } else if reg.diagnostic_errors.len() < MAX_METRIC_SERIES_PER_METRIC {
+            reg.diagnostic_errors.insert(key, 1);
+        } else {
+            reg.diagnostic_errors_other += 1;
+        }
     });
 }
 
@@ -2924,6 +3234,232 @@ pub fn generate_prometheus_metrics() -> String {
             }
             out.push('\n');
         }
+
+        // ─── 12 Production Metric Classes (v0.71 V071-06) ───────────────────
+        out.push_str("# HELP rockstream_ingest_rows_total Ingested rows total counter.\n");
+        out.push_str("# TYPE rockstream_ingest_rows_total counter\n");
+        let mut ingest: Vec<_> = reg.ingest_throughput.iter().collect();
+        ingest.sort_by_key(|(k, _)| *k);
+        for ((source, format), (rows, _)) in &ingest {
+            out.push_str(&format!(
+                "rockstream_ingest_rows_total{{source=\"{}\",format=\"{}\"}} {}\n",
+                source, format, rows
+            ));
+        }
+        if reg.ingest_rows_other > 0 {
+            out.push_str(&format!(
+                "rockstream_ingest_rows_total{{source=\"__other__\",format=\"__other__\"}} {}\n",
+                reg.ingest_rows_other
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP rockstream_ingest_bytes_total Ingested bytes total counter.\n");
+        out.push_str("# TYPE rockstream_ingest_bytes_total counter\n");
+        for ((source, format), (_, bytes)) in &ingest {
+            out.push_str(&format!(
+                "rockstream_ingest_bytes_total{{source=\"{}\",format=\"{}\"}} {}\n",
+                source, format, bytes
+            ));
+        }
+        if reg.ingest_bytes_other > 0 {
+            out.push_str(&format!(
+                "rockstream_ingest_bytes_total{{source=\"__other__\",format=\"__other__\"}} {}\n",
+                reg.ingest_bytes_other
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP rockstream_execution_rows_total Executed rows total counter.\n");
+        out.push_str("# TYPE rockstream_execution_rows_total counter\n");
+        let mut exec: Vec<_> = reg.execution_rows.iter().collect();
+        exec.sort_by_key(|(k, _)| *k);
+        for ((view, operator), rows) in &exec {
+            out.push_str(&format!(
+                "rockstream_execution_rows_total{{view=\"{}\",operator=\"{}\"}} {}\n",
+                view, operator, rows
+            ));
+        }
+        if reg.execution_rows_other > 0 {
+            out.push_str(&format!(
+                "rockstream_execution_rows_total{{view=\"__other__\",operator=\"__other__\"}} {}\n",
+                reg.execution_rows_other
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP rockstream_epoch_duration_seconds Epoch duration in seconds.\n");
+        out.push_str("# TYPE rockstream_epoch_duration_seconds gauge\n");
+        let mut epochs: Vec<_> = reg.epoch_durations.iter().collect();
+        epochs.sort_by_key(|(k, _)| *k);
+        for ((workload, phase), duration) in &epochs {
+            out.push_str(&format!(
+                "rockstream_epoch_duration_seconds{{workload=\"{}\",phase=\"{}\"}} {}\n",
+                workload, phase, duration
+            ));
+        }
+        if let Some(dur) = reg.epoch_durations_other {
+            out.push_str(&format!("rockstream_epoch_duration_seconds{{workload=\"__other__\",phase=\"__other__\"}} {}\n", dur));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP rockstream_frontier_lag_seconds Frontier lag in seconds.\n");
+        out.push_str("# TYPE rockstream_frontier_lag_seconds gauge\n");
+        let mut lags: Vec<_> = reg.frontier_lags.iter().collect();
+        lags.sort_by_key(|(k, _)| *k);
+        for (view, lag) in &lags {
+            out.push_str(&format!(
+                "rockstream_frontier_lag_seconds{{view=\"{}\"}} {}\n",
+                view, lag
+            ));
+        }
+        if let Some(lag) = reg.frontier_lags_other {
+            out.push_str(&format!(
+                "rockstream_frontier_lag_seconds{{view=\"__other__\"}} {}\n",
+                lag
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP rockstream_state_bytes View state storage size in bytes.\n");
+        out.push_str("# TYPE rockstream_state_bytes gauge\n");
+        let mut state_bytes: Vec<_> = reg.view_state_bytes_map.iter().collect();
+        state_bytes.sort_by_key(|(k, _)| *k);
+        for ((view, backend), bytes) in &state_bytes {
+            out.push_str(&format!(
+                "rockstream_state_bytes{{view=\"{}\",backend=\"{}\"}} {}\n",
+                view, backend, bytes
+            ));
+        }
+        if let Some(b) = reg.view_state_bytes_other {
+            out.push_str(&format!(
+                "rockstream_state_bytes{{view=\"__other__\",backend=\"__other__\"}} {}\n",
+                b
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP rockstream_memory_bytes Worker memory consumption in bytes.\n");
+        out.push_str("# TYPE rockstream_memory_bytes gauge\n");
+        let mut mem_bytes: Vec<_> = reg.worker_memory_bytes_map.iter().collect();
+        mem_bytes.sort_by_key(|(k, _)| *k);
+        for ((worker, category), bytes) in &mem_bytes {
+            out.push_str(&format!(
+                "rockstream_memory_bytes{{worker=\"{}\",category=\"{}\"}} {}\n",
+                worker, category, bytes
+            ));
+        }
+        if let Some(b) = reg.worker_memory_bytes_other {
+            out.push_str(&format!(
+                "rockstream_memory_bytes{{worker=\"__other__\",category=\"__other__\"}} {}\n",
+                b
+            ));
+        }
+        out.push('\n');
+
+        out.push_str(
+            "# HELP rockstream_exchange_bytes_total Exchange network throughput in bytes.\n",
+        );
+        out.push_str("# TYPE rockstream_exchange_bytes_total counter\n");
+        let mut ex_bytes: Vec<_> = reg.exchange_bytes.iter().collect();
+        ex_bytes.sort_by_key(|(k, _)| *k);
+        for ((sender, receiver), bytes) in &ex_bytes {
+            out.push_str(&format!(
+                "rockstream_exchange_bytes_total{{sender=\"{}\",receiver=\"{}\"}} {}\n",
+                sender, receiver, bytes
+            ));
+        }
+        if reg.exchange_bytes_other > 0 {
+            out.push_str(&format!("rockstream_exchange_bytes_total{{sender=\"__other__\",receiver=\"__other__\"}} {}\n", reg.exchange_bytes_other));
+        }
+        out.push('\n');
+
+        out.push_str(
+            "# HELP rockstream_exchange_backpressure Exchange backpressure ratio (0.0 to 1.0).\n",
+        );
+        out.push_str("# TYPE rockstream_exchange_backpressure gauge\n");
+        let mut ex_bp: Vec<_> = reg.exchange_backpressures.iter().collect();
+        ex_bp.sort_by_key(|(k, _)| *k);
+        for ((worker, channel), ratio) in &ex_bp {
+            out.push_str(&format!(
+                "rockstream_exchange_backpressure{{worker=\"{}\",channel=\"{}\"}} {}\n",
+                worker, channel, ratio
+            ));
+        }
+        if let Some(r) = reg.exchange_backpressure_other {
+            out.push_str(&format!("rockstream_exchange_backpressure{{worker=\"__other__\",channel=\"__other__\"}} {}\n", r));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP rockstream_checkpoint_duration_seconds Storage checkpoint duration in seconds.\n");
+        out.push_str("# TYPE rockstream_checkpoint_duration_seconds gauge\n");
+        let mut cp_dur: Vec<_> = reg.checkpoint_durations.iter().collect();
+        cp_dur.sort_by_key(|(k, _)| *k);
+        for ((shard, tier), duration) in &cp_dur {
+            out.push_str(&format!(
+                "rockstream_checkpoint_duration_seconds{{shard=\"{}\",tier=\"{}\"}} {}\n",
+                shard, tier, duration
+            ));
+        }
+        if let Some(d) = reg.checkpoint_duration_other {
+            out.push_str(&format!("rockstream_checkpoint_duration_seconds{{shard=\"__other__\",tier=\"__other__\"}} {}\n", d));
+        }
+        out.push('\n');
+
+        out.push_str(
+            "# HELP rockstream_migration_rows_copied_total Shard migration rows copied total.\n",
+        );
+        out.push_str("# TYPE rockstream_migration_rows_copied_total counter\n");
+        let mut mig_rows: Vec<_> = reg.migration_rows.iter().collect();
+        mig_rows.sort_by_key(|(k, _)| *k);
+        for (migration_id, rows) in &mig_rows {
+            out.push_str(&format!(
+                "rockstream_migration_rows_copied_total{{migration_id=\"{}\"}} {}\n",
+                migration_id, rows
+            ));
+        }
+        if reg.migration_rows_other > 0 {
+            out.push_str(&format!(
+                "rockstream_migration_rows_copied_total{{migration_id=\"__other__\"}} {}\n",
+                reg.migration_rows_other
+            ));
+        }
+        out.push('\n');
+
+        out.push_str(
+            "# HELP rockstream_connector_lag_records Connector consumer lag in records.\n",
+        );
+        out.push_str("# TYPE rockstream_connector_lag_records gauge\n");
+        let mut conn_lag: Vec<_> = reg.connector_lags.iter().collect();
+        conn_lag.sort_by_key(|(k, _)| *k);
+        for ((source, partition), records) in &conn_lag {
+            out.push_str(&format!(
+                "rockstream_connector_lag_records{{source=\"{}\",partition=\"{}\"}} {}\n",
+                source, partition, records
+            ));
+        }
+        if let Some(l) = reg.connector_lag_other {
+            out.push_str(&format!("rockstream_connector_lag_records{{source=\"__other__\",partition=\"__other__\"}} {}\n", l));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP rockstream_errors_total Diagnostic error occurrences total.\n");
+        out.push_str("# TYPE rockstream_errors_total counter\n");
+        let mut diag_err: Vec<_> = reg.diagnostic_errors.iter().collect();
+        diag_err.sort_by_key(|(k, _)| *k);
+        for (code, count) in &diag_err {
+            out.push_str(&format!(
+                "rockstream_errors_total{{code=\"{}\"}} {}\n",
+                code, count
+            ));
+        }
+        if reg.diagnostic_errors_other > 0 {
+            out.push_str(&format!(
+                "rockstream_errors_total{{code=\"__other__\"}} {}\n",
+                reg.diagnostic_errors_other
+            ));
+        }
+        out.push('\n');
     });
     out
 }

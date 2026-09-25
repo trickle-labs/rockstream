@@ -5275,6 +5275,14 @@ impl GatewayHandler {
             return Some(Ok(vec![catalog_resp_to_response(catalog_resp)]));
         }
 
+        // Unknown rockstream_catalog table returns RS-0002 configuration error
+        if ql.contains("from rockstream_catalog.") {
+            return Some(Ok(vec![diagnostic_error_response(
+                rockstream_types::error_code::RS_0002,
+                vec![("query".to_string(), q.to_string())],
+            )]));
+        }
+
         // ── Slice 6: pg_stat_activity virtual table ────────────────────────────
         // Handle: SELECT ... FROM pg_stat_activity [WHERE ...]
         if ql.contains("pg_stat_activity") && ql.contains("from") {

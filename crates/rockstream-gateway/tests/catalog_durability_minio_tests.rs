@@ -230,3 +230,157 @@ async fn test_catalog_stable_identifiers_survive_restart_minio() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn test_catalog_recovery_probe_survives_process_restart_minio() {
+    let _g = TEST_LOCK.lock().await;
+    let (_container, port) = match rockstream_test_support::minio::start_minio(MINIO_BUCKET).await {
+        Some(m) => m,
+        None => {
+            eprintln!(
+                "SKIP test_catalog_recovery_probe_survives_process_restart_minio: Docker not available"
+            );
+            return;
+        }
+    };
+    let store: Arc<dyn ObjectStore> = Arc::new(rockstream_test_support::minio::minio_object_store(
+        port,
+        MINIO_BUCKET,
+    ));
+
+    // Phase 1: Initialize ShardDb on MinIO and commit catalog record
+    {
+        let db = ShardDb::builder("cat-recovery-minio", store.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"catalog_probe_magic_minio", b"RS_CAT_V1_SNAPSHOT_MINIO")
+            .await
+            .unwrap();
+    }
+
+    // Phase 2: Reopen ShardDb after restart and probe recovery
+    {
+        let reopened_db = ShardDb::builder("cat-recovery-minio", store.clone())
+            .build()
+            .await
+            .unwrap();
+        let recovered = reopened_db.get(b"catalog_probe_magic_minio").await.unwrap();
+        assert_eq!(
+            recovered.as_deref(),
+            Some(&b"RS_CAT_V1_SNAPSHOT_MINIO"[..]),
+            "Catalog snapshot recovery probe must recover persisted magic bytes across restart on MinIO"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_rockstream_catalog_checkpoints_query_exact_minio() {
+    let _g = TEST_LOCK.lock().await;
+    let (_container, port) = match rockstream_test_support::minio::start_minio(MINIO_BUCKET).await {
+        Some(m) => m,
+        None => {
+            eprintln!(
+                "SKIP test_rockstream_catalog_checkpoints_query_exact_minio: Docker not available"
+            );
+            return;
+        }
+    };
+    let store: Arc<dyn ObjectStore> = Arc::new(rockstream_test_support::minio::minio_object_store(
+        port,
+        MINIO_BUCKET,
+    ));
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.record_checkpoint(CatalogCheckpointEntry {
+        checkpoint_id: 201,
+        committed_at: "2026-09-25 10:10:00+00".to_string(),
+        epoch_number: 20,
+        frontier: "[20]".to_string(),
+        storage_path: format!("s3://{MINIO_BUCKET}/checkpoints/chk-201"),
+        duration_ms: 45,
+    });
+    catalog.record_checkpoint(CatalogCheckpointEntry {
+        checkpoint_id: 202,
+        committed_at: "2026-09-25 10:11:00+00".to_string(),
+        epoch_number: 21,
+        frontier: "[21]".to_string(),
+        storage_path: format!("s3://{MINIO_BUCKET}/checkpoints/chk-202"),
+        duration_ms: 40,
+    });
+
+    let (port_gw, handle, _db) = start_gateway("shard-chk-minio", store.clone(), catalog).await;
+    let client = connect_port(port_gw).await;
+
+    let rows = simple_rows(
+        &client,
+        "SELECT checkpoint_id, epoch_number, frontier, duration_ms FROM rockstream_catalog.checkpoints ORDER BY checkpoint_id;",
+    )
+    .await;
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "Must return exactly two recorded checkpoints"
+    );
+    assert_eq!(
+        rows[0],
+        vec![
+            Some("201".to_string()),
+            Some("20".to_string()),
+            Some("[20]".to_string()),
+            Some("45".to_string()),
+        ]
+    );
+    assert_eq!(
+        rows[1],
+        vec![
+            Some("202".to_string()),
+            Some("21".to_string()),
+            Some("[21]".to_string()),
+            Some("40".to_string()),
+        ]
+    );
+
+    drop(client);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_storage_access_doctor_check_minio() {
+    let _g = TEST_LOCK.lock().await;
+    let (_container, port) = match rockstream_test_support::minio::start_minio(MINIO_BUCKET).await {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP test_storage_access_doctor_check_minio: Docker not available");
+            return;
+        }
+    };
+    let store = rockstream_test_support::minio::minio_object_store(port, MINIO_BUCKET);
+
+    let db = ShardDb::builder("probe-doctor-minio", store)
+        .build()
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    // 1. Write probe
+    db.put(b"probe_doctor_minio", b"PROBE_STORAGE_ACCESS_MINIO_OK")
+        .await
+        .unwrap();
+    // 2. Read probe
+    let read_bytes = db.get(b"probe_doctor_minio").await.unwrap();
+    assert_eq!(
+        read_bytes.as_deref(),
+        Some(&b"PROBE_STORAGE_ACCESS_MINIO_OK"[..])
+    );
+    // 3. Delete probe
+    db.delete(b"probe_doctor_minio").await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(2500),
+        "MinIO storage access roundtrip took {:?}",
+        elapsed
+    );
+}

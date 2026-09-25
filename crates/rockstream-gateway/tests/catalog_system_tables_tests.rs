@@ -8,9 +8,12 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use rockstream_gateway::{
     catalog_stubs::{
-        CatalogCheckpointEntry, CatalogNodeEntry, CatalogSourceEntry, CatalogStubs, CatalogView,
-        MAX_ARRANGEMENTS_SCAN_ROWS, MAX_CAPABILITIES_SCAN_ROWS, MAX_CHECKPOINTS_SCAN_ROWS,
-        MAX_NODES_SCAN_ROWS, MAX_OPERATORS_SCAN_ROWS, MAX_SOURCES_SCAN_ROWS, MAX_VIEWS_SCAN_ROWS,
+        CatalogCheckpointEntry, CatalogNamespaceEntry, CatalogNodeEntry, CatalogOperationEntry,
+        CatalogShardEntry, CatalogSourceEntry, CatalogStubs, CatalogTableEntry, CatalogView,
+        CatalogWorkloadEntry, MAX_ARRANGEMENTS_SCAN_ROWS, MAX_CAPABILITIES_SCAN_ROWS,
+        MAX_CATALOG_TABLES_SCAN_ROWS, MAX_CATALOG_WORKLOADS_SCAN_ROWS, MAX_CHECKPOINTS_SCAN_ROWS,
+        MAX_NAMESPACES_SCAN_ROWS, MAX_NODES_SCAN_ROWS, MAX_OPERATIONS_SCAN_ROWS,
+        MAX_OPERATORS_SCAN_ROWS, MAX_SHARDS_SCAN_ROWS, MAX_SOURCES_SCAN_ROWS, MAX_VIEWS_SCAN_ROWS,
     },
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
@@ -358,4 +361,167 @@ async fn test_catalog_enforced_scan_bounds() {
         MAX_NODES_SCAN_ROWS,
         "Scan rows must be bounded at max 1000"
     );
+}
+
+#[tokio::test]
+async fn test_canonical_rockstream_catalog_system_tables() {
+    let _g = TEST_LOCK.lock().await;
+    let catalog = CatalogStubs::new();
+
+    catalog.add_shard(CatalogShardEntry {
+        shard_id: 42,
+        view_id: "analytics_orders".to_string(),
+        worker_id: "worker-prod-1".to_string(),
+        state: "ACTIVE".to_string(),
+        frontier: 10500,
+    });
+
+    catalog.add_operation(CatalogOperationEntry {
+        operation_id: "op-backfill-99".to_string(),
+        kind: "backfill".to_string(),
+        target: "analytics_orders".to_string(),
+        phase: "STREAMING".to_string(),
+        progress_pct: 85,
+    });
+
+    catalog.add_namespace(CatalogNamespaceEntry {
+        name: "tenant_analytics".to_string(),
+        owner: "admin_user".to_string(),
+        created_at: "2026-09-01 12:00:00+00".to_string(),
+    });
+
+    catalog.add_catalog_table_entry(CatalogTableEntry {
+        namespace: "tenant_analytics".to_string(),
+        name: "events_raw".to_string(),
+        schema: "event_id bigint, payload jsonb".to_string(),
+        format: "arrow".to_string(),
+        row_count: 500000,
+    });
+
+    catalog.add_catalog_workload_entry(CatalogWorkloadEntry {
+        workload_id: "wl_heavy_etl".to_string(),
+        name: "heavy_etl".to_string(),
+        memory_limit: "16GiB".to_string(),
+        priority: "High".to_string(),
+    });
+
+    let (addr, _handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+
+    // Test rockstream_catalog.shards
+    let shard_rows = simple_rows(
+        &client,
+        "SELECT shard_id, view_id, worker_id, state, frontier FROM rockstream_catalog.shards;",
+    )
+    .await;
+    assert_eq!(shard_rows.len(), 1);
+    assert_eq!(
+        shard_rows[0],
+        vec![
+            Some("42".to_string()),
+            Some("analytics_orders".to_string()),
+            Some("worker-prod-1".to_string()),
+            Some("ACTIVE".to_string()),
+            Some("10500".to_string()),
+        ]
+    );
+
+    // Test WHERE filtering on shards
+    let shard_filter_rows = simple_rows(
+        &client,
+        "SELECT shard_id FROM rockstream_catalog.shards WHERE shard_id = 42;",
+    )
+    .await;
+    assert_eq!(shard_filter_rows.len(), 1);
+    assert_eq!(shard_filter_rows[0], vec![Some("42".to_string())]);
+
+    // Test rockstream_catalog.operations
+    let op_rows = simple_rows(
+        &client,
+        "SELECT operation_id, kind, target, phase, progress_pct FROM rockstream_catalog.operations;",
+    )
+    .await;
+    assert_eq!(op_rows.len(), 1);
+    assert_eq!(
+        op_rows[0],
+        vec![
+            Some("op-backfill-99".to_string()),
+            Some("backfill".to_string()),
+            Some("analytics_orders".to_string()),
+            Some("STREAMING".to_string()),
+            Some("85".to_string()),
+        ]
+    );
+
+    // Test rockstream_catalog.namespaces
+    let ns_rows = simple_rows(
+        &client,
+        "SELECT name, owner, created_at FROM rockstream_catalog.namespaces WHERE name = 'tenant_analytics';",
+    )
+    .await;
+    assert_eq!(ns_rows.len(), 1);
+    assert_eq!(
+        ns_rows[0],
+        vec![
+            Some("tenant_analytics".to_string()),
+            Some("admin_user".to_string()),
+            Some("2026-09-01 12:00:00+00".to_string()),
+        ]
+    );
+
+    // Test rockstream_catalog.tables
+    let tbl_rows = simple_rows(
+        &client,
+        "SELECT namespace, name, schema, format, row_count FROM rockstream_catalog.tables WHERE name = 'events_raw';",
+    )
+    .await;
+    assert_eq!(tbl_rows.len(), 1);
+    assert_eq!(
+        tbl_rows[0],
+        vec![
+            Some("tenant_analytics".to_string()),
+            Some("events_raw".to_string()),
+            Some("event_id bigint, payload jsonb".to_string()),
+            Some("arrow".to_string()),
+            Some("500000".to_string()),
+        ]
+    );
+
+    // Test rockstream_catalog.workloads
+    let wl_rows = simple_rows(
+        &client,
+        "SELECT workload_id, name, memory_limit, priority FROM rockstream_catalog.workloads WHERE name = 'heavy_etl';",
+    )
+    .await;
+    assert_eq!(wl_rows.len(), 1);
+    assert_eq!(
+        wl_rows[0],
+        vec![
+            Some("wl_heavy_etl".to_string()),
+            Some("heavy_etl".to_string()),
+            Some("16GiB".to_string()),
+            Some("High".to_string()),
+        ]
+    );
+
+    // Negative test: invalid table returns RS-0002
+    let neg_err = client
+        .simple_query("SELECT * FROM rockstream_catalog.nonexistent_catalog_table;")
+        .await
+        .unwrap_err();
+    let msg = neg_err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(
+        msg.contains("RS-0002") || msg.contains("Configuration error"),
+        "Expected RS-0002 error, got: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn test_canonical_catalog_scan_bounds() {
+    assert_eq!(MAX_SHARDS_SCAN_ROWS, 4096);
+    assert_eq!(MAX_OPERATIONS_SCAN_ROWS, 1000);
+    assert_eq!(MAX_NAMESPACES_SCAN_ROWS, 256);
+    assert_eq!(MAX_CATALOG_TABLES_SCAN_ROWS, 1000);
+    assert_eq!(MAX_CATALOG_WORKLOADS_SCAN_ROWS, 256);
 }

@@ -283,3 +283,234 @@ async fn test_doctor_output_formats() {
         .iter()
         .any(|c| c.id == "binary.candidate_identity"));
 }
+
+#[tokio::test]
+async fn test_doctor_twelve_checks_complete_matrix() {
+    let opts = DoctorOptions::default();
+    let report = run_doctor_checks(&opts).await;
+
+    let required_twelve_check_ids = [
+        "config.parse_and_semantic",
+        "storage.access",
+        "network.endpoints",
+        "pgwire.connectivity",
+        "control.connectivity",
+        "worker.connectivity",
+        "connector.connectivity",
+        "tls.certificates",
+        "storage.format_compat",
+        "catalog.recovery",
+        "system.port_conflicts",
+        "system.resource_limits",
+    ];
+
+    for check_id in &required_twelve_check_ids {
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == *check_id)
+            .unwrap_or_else(|| {
+                panic!("Roadmap Section 17.3 check {check_id} must be present in doctor report")
+            });
+
+        assert!(
+            check.status == DiagnosticStatus::Pass || check.status == DiagnosticStatus::Warn,
+            "Check {check_id} under default options must be PASS or WARN, got {:?}",
+            check.status
+        );
+        assert!(
+            !check.summary.is_empty(),
+            "Check {check_id} must have non-empty summary"
+        );
+
+        // Verify zero secrets leaked in any field
+        if let Some(ref details) = check.details {
+            assert!(
+                !details.contains("super_secret"),
+                "Secrets must not leak in check {check_id} details"
+            );
+        }
+        if let Some(ref next_steps) = check.next_steps {
+            assert!(
+                !next_steps.contains("super_secret"),
+                "Secrets must not leak in check {check_id} next_steps"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_doctor_check_config_validation() {
+    let opts = DoctorOptions::default();
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "config.parse_and_semantic")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Pass);
+    assert_eq!(check.category, "config");
+}
+
+#[tokio::test]
+async fn test_doctor_check_storage_access() {
+    let temp_dir = TempDir::new().unwrap();
+    let opts = DoctorOptions {
+        storage: Some(temp_dir.path().to_str().unwrap().to_string()),
+        ..DoctorOptions::default()
+    };
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "storage.access")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Pass);
+    assert_eq!(check.category, "storage");
+}
+
+#[tokio::test]
+async fn test_doctor_check_network_endpoints() {
+    let opts = DoctorOptions::default();
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "network.endpoints")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Pass);
+    assert_eq!(check.category, "network");
+}
+
+#[tokio::test]
+async fn test_doctor_check_pgwire_connectivity() {
+    let opts = DoctorOptions {
+        gateway: Some("127.0.0.1:59995".to_string()),
+        timeout: Duration::from_millis(200),
+        ..DoctorOptions::default()
+    };
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "pgwire.connectivity")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Fail);
+    assert_eq!(check.code.as_deref(), Some("RS-0003"));
+}
+
+#[tokio::test]
+async fn test_doctor_check_control_connectivity() {
+    let opts = DoctorOptions {
+        control: Some("http://127.0.0.1:59994".to_string()),
+        timeout: Duration::from_millis(200),
+        ..DoctorOptions::default()
+    };
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "control.connectivity")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Fail);
+    assert_eq!(check.code.as_deref(), Some("RS-0003"));
+}
+
+#[tokio::test]
+async fn test_doctor_check_worker_connectivity() {
+    let opts = DoctorOptions {
+        worker: Some("127.0.0.1:59993".to_string()),
+        timeout: Duration::from_millis(200),
+        ..DoctorOptions::default()
+    };
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "worker.connectivity")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Fail);
+    assert_eq!(check.code.as_deref(), Some("RS-0003"));
+}
+
+#[tokio::test]
+async fn test_doctor_check_connector_connectivity() {
+    let opts = DoctorOptions {
+        connector: Some("127.0.0.1:59992".to_string()),
+        timeout: Duration::from_millis(200),
+        ..DoctorOptions::default()
+    };
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "connector.connectivity")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Fail);
+    assert_eq!(check.code.as_deref(), Some("RS-3701"));
+}
+
+#[tokio::test]
+async fn test_doctor_check_tls_certificates() {
+    let opts = DoctorOptions::default();
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "tls.certificates")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Pass);
+    assert_eq!(check.category, "security");
+}
+
+#[tokio::test]
+async fn test_doctor_check_storage_format_compat() {
+    let opts = DoctorOptions::default();
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "storage.format_compat")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Pass);
+    assert_eq!(check.category, "storage");
+}
+
+#[tokio::test]
+async fn test_doctor_check_catalog_recovery() {
+    let opts = DoctorOptions::default();
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "catalog.recovery")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Pass);
+    assert_eq!(check.category, "catalog");
+}
+
+#[tokio::test]
+async fn test_doctor_check_port_conflicts() {
+    let opts = DoctorOptions::default();
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "system.port_conflicts")
+        .unwrap();
+    assert!(check.status == DiagnosticStatus::Pass || check.status == DiagnosticStatus::Warn);
+    assert_eq!(check.category, "system");
+}
+
+#[tokio::test]
+async fn test_doctor_check_resource_limits() {
+    let opts = DoctorOptions::default();
+    let report = run_doctor_checks(&opts).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "system.resource_limits")
+        .unwrap();
+    assert_eq!(check.status, DiagnosticStatus::Pass);
+    assert_eq!(check.category, "system");
+}

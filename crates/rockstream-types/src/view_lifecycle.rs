@@ -420,6 +420,29 @@ pub fn derive_degradation_status_with_signals(
     DegradationStatus::new(DegradationReason::WaitingOnSource, dominant)
 }
 
+/// Missing observation semantics for status fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationState {
+    Known,
+    Unknown,
+    Stale,
+    Unavailable,
+    NotApplicable,
+}
+
+impl ObservationState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Known => "known",
+            Self::Unknown => "unknown",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+}
+
 /// Summary row returned by `SHOW VIEW STATUS FOR NAMESPACE`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewStatus {
@@ -443,6 +466,27 @@ pub struct ViewStatus {
     /// Typed degradation reason, contributor, and progress fields.
     #[serde(default)]
     pub degradation_status: Option<DegradationStatus>,
+    /// Durably committed epoch visible to readers.
+    #[serde(default)]
+    pub published_frontier: Option<u64>,
+    /// Highest ingested source epoch.
+    #[serde(default)]
+    pub input_frontier: Option<u64>,
+    /// Measured freshness lag in milliseconds.
+    #[serde(default)]
+    pub freshness_lag_ms: Option<u64>,
+    /// SlateDB + RAM arrangement footprint in bytes.
+    #[serde(default)]
+    pub state_bytes: Option<u64>,
+    /// Current RSS / arena memory attributed to view in bytes.
+    #[serde(default)]
+    pub memory_bytes: Option<u64>,
+    /// Shard IDs assigned to this view.
+    #[serde(default)]
+    pub assigned_shards: Vec<u64>,
+    /// In-flight operation blocking progress, if any.
+    #[serde(default)]
+    pub blocking_operation: Option<String>,
 }
 
 impl ViewStatus {
@@ -464,6 +508,13 @@ impl ViewStatus {
             depends_on,
             stage_lag: None,
             degradation_status: None,
+            published_frontier: None,
+            input_frontier: None,
+            freshness_lag_ms: None,
+            state_bytes: None,
+            memory_bytes: None,
+            assigned_shards: Vec::new(),
+            blocking_operation: None,
         }
     }
 

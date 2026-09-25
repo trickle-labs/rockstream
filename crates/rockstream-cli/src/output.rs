@@ -5,7 +5,7 @@
 
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::diagnostic::DiagnosticOccurrence;
-use rockstream_types::view_lifecycle::{DegradationReason, DominantContributor};
+pub use rockstream_types::view_lifecycle::{DegradationReason, DominantContributor};
 use serde::{Deserialize, Serialize};
 
 /// Maximum rows formatted or printed in a single CLI command output buffer.
@@ -234,6 +234,20 @@ pub struct ViewStatusInfo {
     pub rows_remaining: Option<u64>,
     #[serde(default)]
     pub estimated_remaining_ms: Option<u64>,
+    #[serde(default)]
+    pub published_frontier: Option<u64>,
+    #[serde(default)]
+    pub input_frontier: Option<u64>,
+    #[serde(default)]
+    pub freshness_lag_ms: Option<u64>,
+    #[serde(default)]
+    pub state_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub assigned_shards: Vec<u64>,
+    #[serde(default)]
+    pub blocking_operation: Option<String>,
 }
 
 fn default_degradation_reason() -> DegradationReason {

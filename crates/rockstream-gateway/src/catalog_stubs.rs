@@ -21,6 +21,9 @@ use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 use rockstream_types::workload::WorkloadDef;
 use serde::{Deserialize, Serialize};
 
+/// Maximum rows returned by catalog system table scans (v0.71 V071-08 / §4.8).
+pub const MAX_CATALOG_SCAN_ROWS: usize = 1000;
+
 /// Session context passed to catalog query handlers.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -386,6 +389,48 @@ pub struct CatalogCheckpointEntry {
     pub duration_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogShardEntry {
+    pub shard_id: u64,
+    pub view_id: String,
+    pub worker_id: String,
+    pub state: String,
+    pub frontier: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogOperationEntry {
+    pub operation_id: String,
+    pub kind: String,
+    pub target: String,
+    pub phase: String,
+    pub progress_pct: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogNamespaceEntry {
+    pub name: String,
+    pub owner: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogTableEntry {
+    pub namespace: String,
+    pub name: String,
+    pub schema: String,
+    pub format: String,
+    pub row_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogWorkloadEntry {
+    pub workload_id: String,
+    pub name: String,
+    pub memory_limit: String,
+    pub priority: String,
+}
+
 /// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
 #[derive(Debug, Default)]
 struct CatalogStubsInner {
@@ -417,6 +462,16 @@ struct CatalogStubsInner {
     nodes: Vec<CatalogNodeEntry>,
     /// Recorded checkpoints.
     checkpoints: Vec<CatalogCheckpointEntry>,
+    /// Registered shards.
+    shards: Vec<CatalogShardEntry>,
+    /// Registered operations.
+    operations: Vec<CatalogOperationEntry>,
+    /// Registered namespaces.
+    namespaces: Vec<CatalogNamespaceEntry>,
+    /// Explicit catalog table entries.
+    catalog_table_entries: Vec<CatalogTableEntry>,
+    /// Explicit catalog workload entries.
+    catalog_workload_entries: Vec<CatalogWorkloadEntry>,
 }
 
 use rockstream_types::explain::ArrangementSharingInfo;
@@ -964,6 +1019,142 @@ impl CatalogStubs {
         } else {
             checkpoints
         }
+    }
+
+    pub fn add_shard(&self, shard: CatalogShardEntry) {
+        self.inner.write().unwrap().shards.push(shard);
+    }
+
+    pub fn list_shards(&self) -> Vec<CatalogShardEntry> {
+        let shards = self.inner.read().unwrap().shards.clone();
+        if shards.is_empty() {
+            vec![CatalogShardEntry {
+                shard_id: 1,
+                view_id: "default_view".to_string(),
+                worker_id: "worker-0".to_string(),
+                state: "READY".to_string(),
+                frontier: 0,
+            }]
+        } else {
+            shards
+        }
+    }
+
+    pub fn add_operation(&self, operation: CatalogOperationEntry) {
+        self.inner.write().unwrap().operations.push(operation);
+    }
+
+    pub fn list_operations(&self) -> Vec<CatalogOperationEntry> {
+        let ops = self.inner.read().unwrap().operations.clone();
+        if ops.is_empty() {
+            vec![CatalogOperationEntry {
+                operation_id: "op-bootstrap-0".to_string(),
+                kind: "bootstrap".to_string(),
+                target: "system".to_string(),
+                phase: "COMPLETED".to_string(),
+                progress_pct: 100,
+            }]
+        } else {
+            ops
+        }
+    }
+
+    pub fn add_namespace(&self, namespace: CatalogNamespaceEntry) {
+        self.inner.write().unwrap().namespaces.push(namespace);
+    }
+
+    pub fn list_namespaces(&self) -> Vec<CatalogNamespaceEntry> {
+        let inner = self.inner.read().unwrap();
+        if !inner.namespaces.is_empty() {
+            return inner.namespaces.clone();
+        }
+        let mut res = vec![CatalogNamespaceEntry {
+            name: "public".to_string(),
+            owner: "rockstream".to_string(),
+            created_at: "2026-01-01 00:00:00+00".to_string(),
+        }];
+        for schema in &inner.schemas {
+            if schema != "public" {
+                res.push(CatalogNamespaceEntry {
+                    name: schema.clone(),
+                    owner: "rockstream".to_string(),
+                    created_at: "2026-01-01 00:00:00+00".to_string(),
+                });
+            }
+        }
+        res
+    }
+
+    pub fn add_catalog_table_entry(&self, entry: CatalogTableEntry) {
+        self.inner
+            .write()
+            .unwrap()
+            .catalog_table_entries
+            .push(entry);
+    }
+
+    pub fn list_catalog_table_entries(&self) -> Vec<CatalogTableEntry> {
+        let inner = self.inner.read().unwrap();
+        if !inner.catalog_table_entries.is_empty() {
+            return inner.catalog_table_entries.clone();
+        }
+        if inner.tables.is_empty() {
+            return vec![CatalogTableEntry {
+                namespace: "public".to_string(),
+                name: "system_info".to_string(),
+                schema: "default".to_string(),
+                format: "row".to_string(),
+                row_count: 0,
+            }];
+        }
+        inner
+            .tables
+            .values()
+            .map(|t| CatalogTableEntry {
+                namespace: "public".to_string(),
+                name: t.name.clone(),
+                schema: "default".to_string(),
+                format: "row".to_string(),
+                row_count: 0,
+            })
+            .collect()
+    }
+
+    pub fn add_catalog_workload_entry(&self, entry: CatalogWorkloadEntry) {
+        self.inner
+            .write()
+            .unwrap()
+            .catalog_workload_entries
+            .push(entry);
+    }
+
+    pub fn list_catalog_workload_entries(&self) -> Vec<CatalogWorkloadEntry> {
+        let inner = self.inner.read().unwrap();
+        if !inner.catalog_workload_entries.is_empty() {
+            return inner.catalog_workload_entries.clone();
+        }
+        if inner.workloads.is_empty() {
+            return vec![CatalogWorkloadEntry {
+                workload_id: "wl_default".to_string(),
+                name: "default".to_string(),
+                memory_limit: "unlimited".to_string(),
+                priority: "Normal".to_string(),
+            }];
+        }
+        inner
+            .workloads
+            .values()
+            .map(|w| CatalogWorkloadEntry {
+                workload_id: format!("wl_{}", w.name),
+                name: w.name.clone(),
+                memory_limit: w
+                    .memory_limit
+                    .as_ref()
+                    .map(|l| format!("{:?}", l))
+                    .unwrap_or_else(|| "unlimited".to_string()),
+                priority: format!("{:?}", w.priority),
+            })
+            .collect()
     }
 
     pub fn add_workload(&self, workload: WorkloadDef) -> bool {
@@ -2150,6 +2341,21 @@ impl CatalogStubs {
         }
         if ql.contains("rockstream_catalog.checkpoints") {
             return Some(self.catalog_checkpoints_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.shards") {
+            return Some(self.catalog_shards_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.operations") {
+            return Some(self.catalog_operations_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.namespaces") {
+            return Some(self.catalog_namespaces_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.tables") {
+            return Some(self.catalog_tables_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.workloads") {
+            return Some(self.catalog_workloads_response(query, &requested_cols));
         }
         if ql.contains("rockstream_catalog.dead_letter_queue")
             || (ql.contains("dead_letter_queue") && !ql.starts_with("alter "))
@@ -4024,6 +4230,268 @@ impl CatalogStubs {
         CatalogResponse::rows(cols, rows)
     }
 
+    pub fn catalog_shards_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            shards_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let shards = self.list_shards();
+        let rows = shards
+            .into_iter()
+            .filter(|s| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "shard_id") {
+                        if s.shard_id.to_string() != target {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "view_id") {
+                        if !s.view_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "worker_id") {
+                        if !s.worker_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "state") {
+                        if !s.state.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_SHARDS_SCAN_ROWS)
+            .map(|s| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "shard_id" => Some(s.shard_id.to_string()),
+                        "view_id" => Some(s.view_id.clone()),
+                        "worker_id" => Some(s.worker_id.clone()),
+                        "state" => Some(s.state.clone()),
+                        "frontier" => Some(s.frontier.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_operations_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            operations_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let ops = self.list_operations();
+        let rows = ops
+            .into_iter()
+            .filter(|o| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "operation_id") {
+                        if !o.operation_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "kind") {
+                        if !o.kind.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "target") {
+                        if !o.target.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "phase") {
+                        if !o.phase.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_OPERATIONS_SCAN_ROWS)
+            .map(|o| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "operation_id" => Some(o.operation_id.clone()),
+                        "kind" => Some(o.kind.clone()),
+                        "target" => Some(o.target.clone()),
+                        "phase" => Some(o.phase.clone()),
+                        "progress_pct" => Some(o.progress_pct.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_namespaces_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            namespaces_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let nss = self.list_namespaces();
+        let rows = nss
+            .into_iter()
+            .filter(|n| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !n.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "owner") {
+                        if !n.owner.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_NAMESPACES_SCAN_ROWS)
+            .map(|n| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "name" => Some(n.name.clone()),
+                        "owner" => Some(n.owner.clone()),
+                        "created_at" => Some(n.created_at.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_tables_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            tables_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let tables = self.list_catalog_table_entries();
+        let rows = tables
+            .into_iter()
+            .filter(|t| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !t.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "namespace") {
+                        if !t.namespace.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_CATALOG_TABLES_SCAN_ROWS)
+            .map(|t| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "namespace" => Some(t.namespace.clone()),
+                        "name" => Some(t.name.clone()),
+                        "schema" => Some(t.schema.clone()),
+                        "format" => Some(t.format.clone()),
+                        "row_count" => Some(t.row_count.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_workloads_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            workloads_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let workloads = self.list_catalog_workload_entries();
+        let rows = workloads
+            .into_iter()
+            .filter(|w| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "workload_id") {
+                        if !w.workload_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !w.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "priority") {
+                        if !w.priority.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_CATALOG_WORKLOADS_SCAN_ROWS)
+            .map(|w| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "workload_id" => Some(w.workload_id.clone()),
+                        "name" => Some(w.name.clone()),
+                        "memory_limit" => Some(w.memory_limit.clone()),
+                        "priority" => Some(w.priority.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
     fn version(&self) -> CatalogResponse {
         let cols = vec!["version".to_string()];
         let rows = vec![vec![Some(
@@ -4403,6 +4871,59 @@ pub fn checkpoints_columns() -> Vec<String> {
         "frontier".to_string(),
         "storage_path".to_string(),
         "duration_ms".to_string(),
+    ]
+}
+
+pub const MAX_SHARDS_SCAN_ROWS: usize = 4096;
+pub const MAX_OPERATIONS_SCAN_ROWS: usize = 1000;
+pub const MAX_NAMESPACES_SCAN_ROWS: usize = 256;
+pub const MAX_CATALOG_TABLES_SCAN_ROWS: usize = 1000;
+pub const MAX_CATALOG_WORKLOADS_SCAN_ROWS: usize = 256;
+
+pub fn shards_columns() -> Vec<String> {
+    vec![
+        "shard_id".to_string(),
+        "view_id".to_string(),
+        "worker_id".to_string(),
+        "state".to_string(),
+        "frontier".to_string(),
+    ]
+}
+
+pub fn operations_columns() -> Vec<String> {
+    vec![
+        "operation_id".to_string(),
+        "kind".to_string(),
+        "target".to_string(),
+        "phase".to_string(),
+        "progress_pct".to_string(),
+    ]
+}
+
+pub fn namespaces_columns() -> Vec<String> {
+    vec![
+        "name".to_string(),
+        "owner".to_string(),
+        "created_at".to_string(),
+    ]
+}
+
+pub fn tables_columns() -> Vec<String> {
+    vec![
+        "namespace".to_string(),
+        "name".to_string(),
+        "schema".to_string(),
+        "format".to_string(),
+        "row_count".to_string(),
+    ]
+}
+
+pub fn workloads_columns() -> Vec<String> {
+    vec![
+        "workload_id".to_string(),
+        "name".to_string(),
+        "memory_limit".to_string(),
+        "priority".to_string(),
     ]
 }
 

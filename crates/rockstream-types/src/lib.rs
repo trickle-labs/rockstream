@@ -34,6 +34,7 @@ pub mod laws;
 pub mod lease;
 pub mod lifecycle;
 pub mod limits;
+pub mod logging;
 pub mod merge_law;
 pub mod metrics;
 pub mod migration;
@@ -81,10 +82,15 @@ pub use ids::{
 };
 pub use key_capsule::{KeyCapsule, KeyCapsuleError, KeyValue};
 pub use lifecycle::{
-    DependencyHealthReport, DependencyStatus, HealthReason, HealthReport, LifecycleState,
-    LifecycleTracker, LiveResponse, ReadyResponse, RecoveryPhase,
+    DependencyHealthReport, DependencyStatus, HealthDimensionObservation, HealthDimensionStatus,
+    HealthDimensions, HealthReason, HealthReport, LifecycleState, LifecycleTracker, LiveResponse,
+    ReadyResponse, RecoveryPhase,
 };
 pub use limits::{SystemLimit, SystemLimitsCatalog};
+pub use logging::{
+    current_log_context, enter_log_context, LogContext, LogRingBuffer, LogScopeGuard,
+    StructuredLogEvent, CURRENT_TASK_LOG_CONTEXT, MAX_STRUCTURED_LOG_EVENTS,
+};
 pub use platform::{ClassificationTier, PlatformClassification, PlatformClassifier};
 pub use qualification::{
     QualificationAggregateMetrics, QualificationError, QualificationEvidenceManifest,
@@ -94,6 +100,7 @@ pub use qualification::{
 };
 pub use shared_window::{SharedWindowSpec, SharedWindowSpecError};
 pub use state_mutation::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
+pub use view_lifecycle::{ObservationState, ViewState, ViewStatus};
 
 /// Timestamp types.
 pub mod timestamp {

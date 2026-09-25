@@ -443,6 +443,84 @@ impl SchemaCatalog {
         self.db.write_batch(batch).await?;
         Ok(())
     }
+
+    /// Traverse and compute lineage graph bounded by MAX_LINEAGE_DEPTH (16) and MAX_LINEAGE_NODES (256).
+    pub async fn get_lineage(&self, root_view: &str) -> Result<LineageGraph, SqlError> {
+        let all_views = self.load_all_views().await?;
+        let view_names: HashSet<String> = all_views.keys().cloned().collect();
+        let mut adj = HashMap::new();
+        for (vname, vplan) in &all_views {
+            let mut deps = Vec::new();
+            collect_dependencies(vplan, &view_names, &mut deps);
+            adj.insert(vname.clone(), deps);
+        }
+
+        let mut visited = HashSet::new();
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut max_depth_seen = 0;
+        let mut truncated = false;
+
+        visited.insert(root_view.to_string());
+        nodes.push(root_view.to_string());
+        queue.push_back((root_view.to_string(), 0usize));
+
+        while let Some((curr, depth)) = queue.pop_front() {
+            if depth >= MAX_LINEAGE_DEPTH {
+                truncated = true;
+                continue;
+            }
+            if let Some(neighbors) = adj.get(&curr) {
+                for neighbor in neighbors {
+                    if nodes.len() >= MAX_LINEAGE_NODES {
+                        truncated = true;
+                        break;
+                    }
+                    edges.push(LineageEdge {
+                        from: curr.clone(),
+                        to: neighbor.clone(),
+                        depth: depth + 1,
+                    });
+                    if depth + 1 > max_depth_seen {
+                        max_depth_seen = depth + 1;
+                    }
+                    if !visited.contains(neighbor) {
+                        visited.insert(neighbor.clone());
+                        nodes.push(neighbor.clone());
+                        queue.push_back((neighbor.clone(), depth + 1));
+                    }
+                }
+            }
+        }
+
+        Ok(LineageGraph {
+            root: root_view.to_string(),
+            nodes,
+            edges,
+            depth: max_depth_seen,
+            truncated,
+        })
+    }
+}
+
+pub const MAX_LINEAGE_DEPTH: usize = 16;
+pub const MAX_LINEAGE_NODES: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageEdge {
+    pub from: String,
+    pub to: String,
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageGraph {
+    pub root: String,
+    pub nodes: Vec<String>,
+    pub edges: Vec<LineageEdge>,
+    pub depth: usize,
+    pub truncated: bool,
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────

@@ -344,6 +344,150 @@ pub struct ReadyResponse {
     pub reason: Option<String>,
 }
 
+/// Individual dimension health evaluation status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HealthDimensionStatus {
+    Pass,
+    Warn,
+    Fail,
+    Unknown,
+}
+
+impl HealthDimensionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// An observation of a specific health dimension with provenance and timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthDimensionObservation {
+    pub status: HealthDimensionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub sampled_at: u64,
+    pub producer: String,
+    pub is_stale: bool,
+}
+
+impl HealthDimensionObservation {
+    pub fn new(
+        status: HealthDimensionStatus,
+        producer: impl Into<String>,
+        sampled_at: u64,
+    ) -> Self {
+        Self {
+            status,
+            reason: None,
+            sampled_at,
+            producer: producer.into(),
+            is_stale: false,
+        }
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Evaluates staleness against current timestamp (seconds).
+    /// If sampled_at is older than threshold (15s), marks is_stale = true
+    /// and downgrades status to UNKNOWN rather than reporting false healthy zeros.
+    pub fn check_stale(&mut self, now_secs: u64, threshold_secs: u64) {
+        if now_secs.saturating_sub(self.sampled_at) > threshold_secs {
+            self.is_stale = true;
+            self.status = HealthDimensionStatus::Unknown;
+        }
+    }
+}
+
+/// Seven independent health dimensions (Step 1, V071-01, UIE-M6-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthDimensions {
+    pub liveness: HealthDimensionObservation,
+    pub readiness: HealthDimensionObservation,
+    pub availability: HealthDimensionObservation,
+    pub freshness: HealthDimensionObservation,
+    pub durability: HealthDimensionObservation,
+    pub capacity: HealthDimensionObservation,
+    pub degradation: HealthDimensionObservation,
+}
+
+impl HealthDimensions {
+    pub const STALE_OBSERVATION_THRESHOLD_SECS: u64 = 15;
+
+    pub fn new_initial(role: &str, now_secs: u64) -> Self {
+        Self {
+            liveness: HealthDimensionObservation::new(
+                HealthDimensionStatus::Pass,
+                format!("{role}:supervisor"),
+                now_secs,
+            ),
+            readiness: HealthDimensionObservation::new(
+                HealthDimensionStatus::Fail,
+                format!("{role}:lifecycle"),
+                now_secs,
+            )
+            .with_reason("Initializing"),
+            availability: HealthDimensionObservation::new(
+                HealthDimensionStatus::Pass,
+                format!("{role}:gateway"),
+                now_secs,
+            ),
+            freshness: HealthDimensionObservation::new(
+                HealthDimensionStatus::Pass,
+                format!("{role}:frontier"),
+                now_secs,
+            ),
+            durability: HealthDimensionObservation::new(
+                HealthDimensionStatus::Pass,
+                format!("{role}:storage"),
+                now_secs,
+            ),
+            capacity: HealthDimensionObservation::new(
+                HealthDimensionStatus::Pass,
+                format!("{role}:budget"),
+                now_secs,
+            ),
+            degradation: HealthDimensionObservation::new(
+                HealthDimensionStatus::Pass,
+                format!("{role}:diagnostic"),
+                now_secs,
+            ),
+        }
+    }
+
+    /// Check if overall workload health passes.
+    /// Liveness alone NEVER produces workload health.
+    pub fn is_overall_healthy(&self) -> bool {
+        self.liveness.status == HealthDimensionStatus::Pass
+            && self.readiness.status == HealthDimensionStatus::Pass
+            && self.availability.status == HealthDimensionStatus::Pass
+            && self.durability.status == HealthDimensionStatus::Pass
+            && self.freshness.status != HealthDimensionStatus::Fail
+            && self.capacity.status != HealthDimensionStatus::Fail
+            && self.degradation.status != HealthDimensionStatus::Fail
+    }
+
+    /// Apply stale observation policy (15s threshold).
+    pub fn apply_stale_policy(&mut self, now_secs: u64) {
+        self.availability
+            .check_stale(now_secs, Self::STALE_OBSERVATION_THRESHOLD_SECS);
+        self.freshness
+            .check_stale(now_secs, Self::STALE_OBSERVATION_THRESHOLD_SECS);
+        self.durability
+            .check_stale(now_secs, Self::STALE_OBSERVATION_THRESHOLD_SECS);
+        self.capacity
+            .check_stale(now_secs, Self::STALE_OBSERVATION_THRESHOLD_SECS);
+    }
+}
+
 /// Comprehensive JSON body returned by `/health` endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthReport {
@@ -355,6 +499,8 @@ pub struct HealthReport {
     pub dependencies: BTreeMap<String, DependencyHealthReport>,
     pub active_shards: usize,
     pub reasons: Vec<HealthReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<HealthDimensions>,
 }
 
 /// Shared thread-safe tracker for node lifecycle, dependencies, and health state.
@@ -367,6 +513,7 @@ pub struct LifecycleTracker {
     identity: CandidateIdentity,
     dependencies: RwLock<BTreeMap<String, DependencyHealthReport>>,
     reasons: RwLock<Vec<HealthReason>>,
+    dimensions: RwLock<HealthDimensions>,
 }
 
 impl LifecycleTracker {
@@ -377,8 +524,13 @@ impl LifecycleTracker {
 
     /// Create a new tracker starting in an explicit state.
     pub fn new_with_state(role: impl Into<String>, state: LifecycleState) -> Self {
+        let role_str = role.into();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         Self {
-            role: role.into(),
+            role: role_str.clone(),
             state: AtomicU8::new(state.to_u8()),
             recovery_phase: AtomicU8::new(0),
             active_shards: AtomicUsize::new(0),
@@ -386,6 +538,7 @@ impl LifecycleTracker {
             identity: CandidateIdentity::current(),
             dependencies: RwLock::new(BTreeMap::new()),
             reasons: RwLock::new(Vec::new()),
+            dimensions: RwLock::new(HealthDimensions::new_initial(&role_str, now_secs)),
         }
     }
 
@@ -494,6 +647,105 @@ impl LifecycleTracker {
         self.start_time.elapsed().as_secs()
     }
 
+    pub fn dimensions(&self) -> HealthDimensions {
+        let mut dims = self.dimensions.read().clone();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        dims.liveness.status = if self.is_alive() {
+            HealthDimensionStatus::Pass
+        } else {
+            HealthDimensionStatus::Fail
+        };
+        dims.liveness.sampled_at = now_secs;
+        dims.liveness.is_stale = false;
+
+        dims.readiness.status = if self.is_ready() {
+            HealthDimensionStatus::Pass
+        } else {
+            HealthDimensionStatus::Fail
+        };
+        dims.readiness.sampled_at = now_secs;
+        dims.readiness.is_stale = false;
+        if !self.is_ready() {
+            dims.readiness.reason = Some(self.state().as_str().to_string());
+        } else {
+            dims.readiness.reason = None;
+        }
+        dims
+    }
+
+    pub fn set_durability_status(
+        &self,
+        status: HealthDimensionStatus,
+        reason: Option<String>,
+        sampled_at: u64,
+    ) {
+        let mut dims = self.dimensions.write();
+        dims.durability.status = status;
+        dims.durability.reason = reason;
+        dims.durability.sampled_at = sampled_at;
+        dims.durability.is_stale = false;
+    }
+
+    pub fn set_availability_status(
+        &self,
+        status: HealthDimensionStatus,
+        reason: Option<String>,
+        sampled_at: u64,
+    ) {
+        let mut dims = self.dimensions.write();
+        dims.availability.status = status;
+        dims.availability.reason = reason;
+        dims.availability.sampled_at = sampled_at;
+        dims.availability.is_stale = false;
+    }
+
+    pub fn set_freshness_status(
+        &self,
+        status: HealthDimensionStatus,
+        reason: Option<String>,
+        sampled_at: u64,
+    ) {
+        let mut dims = self.dimensions.write();
+        dims.freshness.status = status;
+        dims.freshness.reason = reason;
+        dims.freshness.sampled_at = sampled_at;
+        dims.freshness.is_stale = false;
+    }
+
+    pub fn set_capacity_status(
+        &self,
+        status: HealthDimensionStatus,
+        reason: Option<String>,
+        sampled_at: u64,
+    ) {
+        let mut dims = self.dimensions.write();
+        dims.capacity.status = status;
+        dims.capacity.reason = reason;
+        dims.capacity.sampled_at = sampled_at;
+        dims.capacity.is_stale = false;
+    }
+
+    pub fn set_degradation_status(
+        &self,
+        status: HealthDimensionStatus,
+        reason: Option<String>,
+        sampled_at: u64,
+    ) {
+        let mut dims = self.dimensions.write();
+        dims.degradation.status = status;
+        dims.degradation.reason = reason;
+        dims.degradation.sampled_at = sampled_at;
+        dims.degradation.is_stale = false;
+    }
+
+    pub fn update_dimensions<F: FnOnce(&mut HealthDimensions)>(&self, f: F) {
+        let mut dims = self.dimensions.write();
+        f(&mut dims);
+    }
+
     pub fn generate_live_response(&self) -> (u16, LiveResponse) {
         let state = self.state();
         let code = state.live_http_code();
@@ -528,12 +780,60 @@ impl LifecycleTracker {
 
     pub fn generate_health_report(&self) -> (u16, HealthReport) {
         let state = self.state();
-        let code = state.health_http_code();
+        let mut code = state.health_http_code();
         let dependencies = self.dependencies.read().clone();
         let reasons = self.reasons.read().clone();
 
+        let mut dimensions = self.dimensions.read().clone();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Update instantaneous liveness and readiness
+        dimensions.liveness.status = if self.is_alive() {
+            HealthDimensionStatus::Pass
+        } else {
+            HealthDimensionStatus::Fail
+        };
+        dimensions.liveness.sampled_at = now_secs;
+        dimensions.liveness.is_stale = false;
+
+        dimensions.readiness.status = if self.is_ready() {
+            HealthDimensionStatus::Pass
+        } else {
+            HealthDimensionStatus::Fail
+        };
+        dimensions.readiness.sampled_at = now_secs;
+        dimensions.readiness.is_stale = false;
+        if !self.is_ready() {
+            dimensions.readiness.reason = Some(state.as_str().to_string());
+        } else {
+            dimensions.readiness.reason = None;
+        }
+
+        // Apply stale observation policy (15s threshold)
+        dimensions.apply_stale_policy(now_secs);
+
+        // Grounding Rule: A live process with unavailable storage MUST remain live while reporting durability: FAIL and availability: FAIL.
+        // Liveness alone NEVER produces workload health.
+        if (dimensions.durability.status == HealthDimensionStatus::Fail
+            || dimensions.availability.status == HealthDimensionStatus::Fail)
+            && code == 200
+        {
+            code = 503;
+        }
+
+        let report_status = if dimensions.durability.status == HealthDimensionStatus::Fail
+            || dimensions.availability.status == HealthDimensionStatus::Fail
+        {
+            "unhealthy".to_string()
+        } else {
+            state.health_status_str().to_string()
+        };
+
         let report = HealthReport {
-            status: state.health_status_str().to_string(),
+            status: report_status,
             role: self.role.clone(),
             version: self.identity.semantic_version.clone(),
             commit_sha: self.identity.commit_sha.clone(),
@@ -541,6 +841,7 @@ impl LifecycleTracker {
             dependencies,
             active_shards: self.active_shards(),
             reasons,
+            dimensions: Some(dimensions),
         };
 
         (code, report)

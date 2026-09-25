@@ -738,6 +738,13 @@ advancement barriers and partitioned stream ingestion integrate with the worker
 epoch progress protocol and are verified by integration test coverage and CLI
 template initialization tests.
 
+The v0.71 operational observability and diagnostics release provides canonical
+health dimensions, a 10-field status model, 12 doctor probes, and authoritative
+SQL catalog tables (`rockstream_catalog.*`). While diagnostic inspection and
+metrics export are outside the internal M1–M7 FizzBee consensus models, health
+and status evaluations reflect durable shard/worker state and are verified by
+integration test suites and deterministic simulation tests.
+
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
 
