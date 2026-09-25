@@ -762,7 +762,7 @@ pub async fn run_doctor_checks(opts: &DoctorOptions) -> DoctorReport {
                                 Some("Verify storage directory path and permissions.".to_string()),
                             );
                         }
-                        let test_file = path.join(".doctor_probe");
+                        let test_file = path.join(format!(".doctor_probe_{}", uuid::Uuid::new_v4()));
                         if let Err(e) = std::fs::write(&test_file, b"test") {
                             return (
                                 DiagnosticStatus::Fail,
@@ -1117,7 +1117,11 @@ pub async fn run_doctor_checks(opts: &DoctorOptions) -> DoctorReport {
                         Some("Check storage directory permissions and path.".to_string()),
                     );
                 }
-                let probe_file = path.join(format!(".probe_access_{}", std::process::id()));
+                let probe_file = path.join(format!(
+                    ".probe_access_{}_{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
                 if let Err(e) = std::fs::write(&probe_file, b"probe_payload_v1") {
                     return (
                         DiagnosticStatus::Fail,

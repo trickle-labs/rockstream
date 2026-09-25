@@ -832,9 +832,9 @@ fn test_cli_view_status_explainability_json_exact() {
             estimated_remaining_ms: None,
             published_frontier: None,
             input_frontier: None,
-            freshness_lag_ms: None,
+            freshness_lag_ms: Some(38),
             state_bytes: None,
-            memory_bytes: None,
+            memory_bytes: Some(536870912),
             assigned_shards: Vec::new(),
             blocking_operation: None,
         }]
