@@ -45,9 +45,10 @@ if [ -z "$changed_files" ]; then
 fi
 
 # Coordination crates and design doc — changes here require a model touch.
-# Test/benchmark evidence and arrangement-cache reader wiring are data-plane
-# concerns covered by the storage tests and lookup benchmarks, not FizzBee.
-changed_files=$(echo "$changed_files" | grep -Ev '(^|/)(tests|benches)/|^crates/rockstream-storage/src/reader\.rs$' || true)
+# Data-plane behavior covered by focused checks does not need a FizzBee model.
+# Durable catalog reconstruction is specified in FIZZBEE_TEST_PLAN.md §3.6 and
+# checked by exact catalog recovery tests.
+changed_files=$(echo "$changed_files" | grep -Ev '(^|/)(tests|benches)/|^crates/rockstream-storage/src/reader\.rs$|^crates/rockstream-storage/src/catalog/' || true)
 
 if [ -z "$changed_files" ]; then
     echo "check-path-coupling: only data-plane tests/benchmarks changed — OK."

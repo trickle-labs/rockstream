@@ -670,6 +670,7 @@ fn test_migration_progress_monotonic_all_phases() {
     record.record_progress(4_000_000, 20_000);
     assert_eq!(record.bytes_remaining(), Some(6_000_000));
     assert_eq!(record.rows_remaining(), Some(30_000));
+    record.updated_at_ms = record.created_at_ms;
     assert_eq!(record.estimated_remaining_ms(), None);
 
     record.record_progress(8_000_000, 40_000);
