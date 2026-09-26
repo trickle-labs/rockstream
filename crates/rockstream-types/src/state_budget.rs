@@ -92,7 +92,9 @@ fn quota_overflow_error(name: &str, current: u64, requested: u64) -> StateBudget
 impl std::error::Error for StateBudgetError {}
 
 use crate::ids::WorkloadId;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
 
 // ─── WorkloadBudget ──────────────────────────────────────────────────────────
 
@@ -757,25 +759,29 @@ impl Drop for QuotaGuard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MemoryCategory {
     SlateDbWriteBuffers,
-    BlockAndMetadataCaches,
+    SlateDbBlockCache,
+    SlateDbMetadataCache,
     OperatorState,
     SourceBuffers,
     ExchangeBuffers,
     QueryWorkMemory,
+    CatalogCaches,
     CheckpointStaging,
     MigrationBuffers,
 }
 
 impl MemoryCategory {
-    /// Return all 8 canonical memory categories.
+    /// Return all 10 canonical memory categories.
     pub fn all() -> &'static [MemoryCategory] {
         &[
             MemoryCategory::SlateDbWriteBuffers,
-            MemoryCategory::BlockAndMetadataCaches,
+            MemoryCategory::SlateDbBlockCache,
+            MemoryCategory::SlateDbMetadataCache,
             MemoryCategory::OperatorState,
             MemoryCategory::SourceBuffers,
             MemoryCategory::ExchangeBuffers,
             MemoryCategory::QueryWorkMemory,
+            MemoryCategory::CatalogCaches,
             MemoryCategory::CheckpointStaging,
             MemoryCategory::MigrationBuffers,
         ]
@@ -785,11 +791,13 @@ impl MemoryCategory {
     pub fn name(&self) -> &'static str {
         match self {
             Self::SlateDbWriteBuffers => "slatedb_write_buffers",
-            Self::BlockAndMetadataCaches => "block_and_metadata_caches",
+            Self::SlateDbBlockCache => "slatedb_block_cache",
+            Self::SlateDbMetadataCache => "slatedb_metadata_cache",
             Self::OperatorState => "operator_state",
             Self::SourceBuffers => "source_buffers",
             Self::ExchangeBuffers => "exchange_buffers",
             Self::QueryWorkMemory => "query_work_memory",
+            Self::CatalogCaches => "catalog_caches",
             Self::CheckpointStaging => "checkpoint_staging",
             Self::MigrationBuffers => "migration_buffers",
         }
@@ -799,15 +807,85 @@ impl MemoryCategory {
     pub fn index(&self) -> usize {
         match self {
             Self::SlateDbWriteBuffers => 0,
-            Self::BlockAndMetadataCaches => 1,
-            Self::OperatorState => 2,
-            Self::SourceBuffers => 3,
-            Self::ExchangeBuffers => 4,
-            Self::QueryWorkMemory => 5,
-            Self::CheckpointStaging => 6,
-            Self::MigrationBuffers => 7,
+            Self::SlateDbBlockCache => 1,
+            Self::SlateDbMetadataCache => 2,
+            Self::OperatorState => 3,
+            Self::SourceBuffers => 4,
+            Self::ExchangeBuffers => 5,
+            Self::QueryWorkMemory => 6,
+            Self::CatalogCaches => 7,
+            Self::CheckpointStaging => 8,
+            Self::MigrationBuffers => 9,
         }
     }
+}
+
+/// Stable allocation owner used for worker-wide or workload-owned bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum MemoryOwner {
+    Worker(String),
+    Workload(WorkloadId),
+}
+
+impl MemoryOwner {
+    pub fn worker(id: impl Into<String>) -> Self {
+        Self::Worker(id.into())
+    }
+
+    pub fn workload(id: WorkloadId) -> Self {
+        Self::Workload(id)
+    }
+
+    fn sort_key(&self) -> (u8, String) {
+        match self {
+            Self::Worker(id) => (0, id.clone()),
+            Self::Workload(id) => (1, id.0.to_string()),
+        }
+    }
+}
+
+/// Stable identity of one physical allocation shared by multiple consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemoryAllocationId {
+    _label: String,
+    identity: u64,
+}
+
+impl MemoryAllocationId {
+    /// Create a distinct allocation identity. Clone it to refer to the same allocation.
+    pub fn new(id: impl Into<String>) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            _label: id.into(),
+            identity: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryCategoryUsage {
+    pub category: MemoryCategory,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryOwnerUsage {
+    pub category: MemoryCategory,
+    pub owner: MemoryOwner,
+    pub bytes: u64,
+}
+
+/// Exact ledger view for public worker and workload resource status.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerBudgetStatus {
+    pub total_budget_bytes: u64,
+    pub foreground_reservation_bytes: u64,
+    pub allocator_overhead_pct: u64,
+    pub allocated_bytes: u64,
+    pub allocation_waiter_fill: u64,
+    pub allocation_waiter_capacity: u64,
+    pub categories: Vec<MemoryCategoryUsage>,
+    pub owners: Vec<MemoryOwnerUsage>,
 }
 
 /// Drop-safe byte permit for worker memory allocations.
@@ -816,15 +894,31 @@ impl MemoryCategory {
 pub struct MemoryPermit {
     ledger: Arc<WorkerBudgetLedger>,
     category: MemoryCategory,
+    owner: MemoryOwner,
     bytes: u64,
     active: bool,
 }
 
 impl MemoryPermit {
     pub fn new(ledger: Arc<WorkerBudgetLedger>, category: MemoryCategory, bytes: u64) -> Self {
+        Self::new_for_owner(
+            ledger,
+            category,
+            MemoryOwner::worker(category.name()),
+            bytes,
+        )
+    }
+
+    fn new_for_owner(
+        ledger: Arc<WorkerBudgetLedger>,
+        category: MemoryCategory,
+        owner: MemoryOwner,
+        bytes: u64,
+    ) -> Self {
         Self {
             ledger,
             category,
+            owner,
             bytes,
             active: true,
         }
@@ -847,12 +941,13 @@ impl MemoryPermit {
 impl Drop for MemoryPermit {
     fn drop(&mut self) {
         if self.active && self.bytes > 0 {
-            self.ledger.release(self.category, self.bytes);
+            self.ledger
+                .release_for_owner(self.category, &self.owner, self.bytes);
         }
     }
 }
 
-/// Unified Worker Budget Ledger managing memory across all 8 canonical categories
+/// Unified Worker Budget Ledger managing memory across all 10 canonical categories
 /// with prospective admission, foreground capacity reservations, 10% allocator overhead margin,
 /// and bounded waiter queue tracking.
 #[derive(Debug)]
@@ -860,15 +955,17 @@ pub struct WorkerBudgetLedger {
     total_budget_bytes: u64,
     foreground_reservation_bytes: u64,
     allocator_overhead_pct: u64,
-    categories: [AtomicU64; 8],
+    categories: [AtomicU64; 10],
     waiter_count: AtomicU64,
     max_waiters: u64,
-    shared_cache_charged: AtomicBool,
+    owner_bytes: Mutex<HashMap<(MemoryCategory, MemoryOwner), u64>>,
+    shared_allocations: Mutex<HashSet<(MemoryAllocationId, MemoryCategory, MemoryOwner)>>,
 }
 
 impl WorkerBudgetLedger {
     pub const DEFAULT_ALLOCATOR_OVERHEAD_PCT: u64 = 10;
     pub const DEFAULT_MAX_WAITERS: u64 = 1024;
+    pub const WORKLOAD_MEMORY_HARD_LIMIT_BYTES: u64 = 536_870_912;
 
     /// Create a new `WorkerBudgetLedger` with default waiter bound (1024).
     pub fn new(total_budget_bytes: usize, foreground_reservation_bytes: usize) -> Self {
@@ -892,7 +989,8 @@ impl WorkerBudgetLedger {
             categories: Default::default(),
             waiter_count: AtomicU64::new(0),
             max_waiters: max_waiters as u64,
-            shared_cache_charged: AtomicBool::new(false),
+            owner_bytes: Mutex::new(HashMap::new()),
+            shared_allocations: Mutex::new(HashSet::new()),
         }
     }
 
@@ -945,6 +1043,51 @@ impl WorkerBudgetLedger {
         self.categories[category.index()].load(Ordering::Relaxed)
     }
 
+    /// Return bytes held by one owner without materializing the public status snapshot.
+    pub fn allocated_bytes_for_owner(&self, owner: &MemoryOwner) -> u64 {
+        let owners = self.owner_bytes.lock().expect("owner ledger poisoned");
+        MemoryCategory::all()
+            .iter()
+            .map(|category| {
+                owners
+                    .get(&(*category, owner.clone()))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    pub fn status(&self) -> WorkerBudgetStatus {
+        let owners = self.owner_bytes.lock().expect("owner ledger poisoned");
+        let categories = MemoryCategory::all()
+            .iter()
+            .copied()
+            .map(|category| MemoryCategoryUsage {
+                category,
+                bytes: self.category_bytes(category),
+            })
+            .collect();
+        let mut owner_usage = owners
+            .iter()
+            .map(|((category, owner), bytes)| MemoryOwnerUsage {
+                category: *category,
+                owner: owner.clone(),
+                bytes: *bytes,
+            })
+            .collect::<Vec<_>>();
+        owner_usage.sort_by_key(|usage| (usage.category.index(), usage.owner.sort_key()));
+        WorkerBudgetStatus {
+            total_budget_bytes: self.total_budget_bytes,
+            foreground_reservation_bytes: self.foreground_reservation_bytes,
+            allocator_overhead_pct: self.allocator_overhead_pct,
+            allocated_bytes: self.total_allocated_bytes(),
+            allocation_waiter_fill: self.waiter_count(),
+            allocation_waiter_capacity: self.max_waiters(),
+            categories,
+            owners: owner_usage,
+        }
+    }
+
     pub fn total_allocated_bytes(&self) -> u64 {
         self.categories
             .iter()
@@ -973,13 +1116,41 @@ impl WorkerBudgetLedger {
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<bool, StateBudgetError> {
-        if !self.shared_cache_charged.swap(true, Ordering::SeqCst) {
-            let permit = self.try_acquire(MemoryCategory::BlockAndMetadataCaches, bytes, false)?;
-            permit.defuse();
-            Ok(true)
-        } else {
-            Ok(false)
+        self.charge_shared_allocation_once(
+            MemoryAllocationId {
+                _label: "worker-storage-context/slatedb-block-cache".to_string(),
+                identity: 0,
+            },
+            MemoryCategory::SlateDbBlockCache,
+            MemoryOwner::worker("worker-storage-context"),
+            bytes,
+        )
+    }
+
+    /// Charge a shared allocation once, even when several shards or consumers use it.
+    pub fn charge_shared_allocation_once(
+        self: &Arc<Self>,
+        allocation_id: MemoryAllocationId,
+        category: MemoryCategory,
+        owner: MemoryOwner,
+        bytes: u64,
+    ) -> Result<bool, StateBudgetError> {
+        if bytes == 0 {
+            return Ok(false);
         }
+
+        let mut shared = self
+            .shared_allocations
+            .lock()
+            .expect("shared allocation ledger poisoned");
+        let identity = (allocation_id, category, owner.clone());
+        if shared.contains(&identity) {
+            return Ok(false);
+        }
+        let permit = self.try_acquire_for_owner(category, owner, bytes, false)?;
+        permit.defuse();
+        shared.insert(identity);
+        Ok(true)
     }
 
     pub fn try_acquire(
@@ -988,8 +1159,49 @@ impl WorkerBudgetLedger {
         bytes: u64,
         is_foreground: bool,
     ) -> Result<MemoryPermit, StateBudgetError> {
+        self.try_acquire_for_owner(
+            category,
+            MemoryOwner::worker(category.name()),
+            bytes,
+            is_foreground,
+        )
+    }
+
+    pub fn try_acquire_for_owner(
+        self: &Arc<Self>,
+        category: MemoryCategory,
+        owner: MemoryOwner,
+        bytes: u64,
+        is_foreground: bool,
+    ) -> Result<MemoryPermit, StateBudgetError> {
+        let mut owners = self.owner_bytes.lock().expect("owner ledger poisoned");
         if bytes == 0 {
-            return Ok(MemoryPermit::new(self.clone(), category, 0));
+            return Ok(MemoryPermit::new_for_owner(
+                self.clone(),
+                category,
+                owner,
+                0,
+            ));
+        }
+
+        if let MemoryOwner::Workload(workload_id) = &owner {
+            let current_bytes = MemoryCategory::all()
+                .iter()
+                .map(|category| {
+                    owners
+                        .get(&(*category, MemoryOwner::Workload(*workload_id)))
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
+            if current_bytes.saturating_add(bytes) > Self::WORKLOAD_MEMORY_HARD_LIMIT_BYTES {
+                return Err(StateBudgetError {
+                    operator_name: format!("workload-hard-budget-{}", workload_id.0),
+                    max_bytes: Self::WORKLOAD_MEMORY_HARD_LIMIT_BYTES,
+                    current_bytes,
+                    requested_bytes: bytes,
+                });
+            }
         }
 
         let max_budget = if is_foreground {
@@ -1034,14 +1246,35 @@ impl WorkerBudgetLedger {
                 )
                 .is_ok()
             {
-                return Ok(MemoryPermit::new(self.clone(), category, bytes));
+                let owner_bytes = owners.entry((category, owner.clone())).or_default();
+                *owner_bytes = owner_bytes.saturating_add(bytes);
+                return Ok(MemoryPermit::new_for_owner(
+                    self.clone(),
+                    category,
+                    owner,
+                    bytes,
+                ));
             }
         }
     }
 
     pub fn release(&self, category: MemoryCategory, bytes: u64) {
+        self.release_for_owner(category, &MemoryOwner::worker(category.name()), bytes);
+    }
+
+    pub fn release_for_owner(&self, category: MemoryCategory, owner: &MemoryOwner, bytes: u64) {
         if bytes > 0 {
-            self.categories[category.index()].fetch_sub(bytes, Ordering::SeqCst);
+            let mut owners = self.owner_bytes.lock().expect("owner ledger poisoned");
+            let key = (category, owner.clone());
+            let Some(current) = owners.get_mut(&key) else {
+                return;
+            };
+            let released = bytes.min(*current);
+            *current -= released;
+            if *current == 0 {
+                owners.remove(&key);
+            }
+            self.categories[category.index()].fetch_sub(released, Ordering::SeqCst);
         }
     }
 }

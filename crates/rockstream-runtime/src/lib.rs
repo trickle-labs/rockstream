@@ -28,7 +28,7 @@ pub use client::{
     start_worker_client_with_compaction_config, start_worker_client_with_metadata,
     start_worker_client_with_tls, start_worker_client_with_tls_and_metadata,
     start_worker_client_with_tls_metadata_and_compaction, ShardState, WorkerClientHandle,
-    WorkerDeployment, WorkerDeployments,
+    WorkerDeployment, WorkerDeployments, WorkerResourceStatus,
 };
 pub use compaction::{CompactionBudget, CompactionPermit, CompactionWorker};
 pub use data_plane::DataPlaneClient;
@@ -38,7 +38,8 @@ pub use secrets::{
 pub use shard_actor::{
     CreditError, ExchangeCredit, ExchangeCredits, ExecutionMorsel, FrameExecutor, MailboxFillLevel,
     MorselError, MorselFullReason, MorselLimits, ShardActorError, ShardActorRegistry,
-    SHARD_ACTOR_MAILBOX_BYTES, SHARD_ACTOR_MAILBOX_MESSAGES,
+    ShardMailboxStatus, SHARD_ACTOR_MAILBOX_BYTES, SHARD_ACTOR_MAILBOX_MESSAGES,
+    SHARD_ACTOR_MAILBOX_OVERFLOW_POLICY,
 };
 
 pub mod exchange;
@@ -59,7 +60,10 @@ pub mod quota;
 pub use quota::WorkerQuotaManager;
 
 pub mod source_pressure;
-pub use source_pressure::{SourcePressureController, SourcePressureState};
+pub use source_pressure::{
+    SourcePressureController, SourcePressureState, WorkloadSourcePressureStatus,
+    WORKLOAD_SOURCE_SOFT_LIMIT_BYTES,
+};
 
 pub mod spill_governor;
 pub use spill_governor::{SpillGovernor, SpillGovernorConfig};

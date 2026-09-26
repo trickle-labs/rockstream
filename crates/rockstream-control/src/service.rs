@@ -37,7 +37,7 @@ use rockstream_types::data_plane::{
     SourceDeltaRequest, WorkerExecutionStatus, WorkloadSnapshot,
 };
 use rockstream_types::error_code::{
-    RS_0001, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
+    RS_0001, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004, RS_9001,
 };
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
@@ -57,6 +57,9 @@ use crate::scheduler::ShardScheduler;
 use crate::secret_store::{SecretStore, SecretStoreError};
 use crate::shard::{ShardManager, ShardPersistentStore};
 use crate::topology::{TopologyCatalog, TopologyPersistentStore};
+
+pub const MAX_SOURCE_WAITERS: usize = 1_024;
+const SOURCE_WAITER_OVERFLOW_POLICY: &str = "reject_new_request_with_RS-9001";
 
 const DEFAULT_DRAIN_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_DECOMMISSION_GRACE_MS: u64 = 5_000;
@@ -167,6 +170,46 @@ struct DataPlaneState {
     source_waiters: HashMap<String, SourceWaiter>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceWaiterStatus {
+    pub fill: usize,
+    pub limit: usize,
+    pub overflow_policy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerOutboundChannelStatus {
+    pub worker_id: WorkerId,
+    pub fill: usize,
+    pub capacity: usize,
+    pub overflow_policy: String,
+}
+
+fn source_waiter_status(state: &DataPlaneState) -> SourceWaiterStatus {
+    SourceWaiterStatus {
+        fill: state.source_waiters.len(),
+        limit: MAX_SOURCE_WAITERS,
+        overflow_policy: SOURCE_WAITER_OVERFLOW_POLICY.to_owned(),
+    }
+}
+
+fn worker_outbound_channel_status(
+    senders: &HashMap<WorkerId, mpsc::Sender<ControlMessage>>,
+) -> Vec<WorkerOutboundChannelStatus> {
+    let mut status = senders
+        .iter()
+        .map(|(worker_id, sender)| WorkerOutboundChannelStatus {
+            worker_id: *worker_id,
+            fill: sender.max_capacity().saturating_sub(sender.capacity()),
+            capacity: sender.max_capacity(),
+            overflow_policy: "await_channel_capacity; fail_when_worker_connection_closes"
+                .to_string(),
+        })
+        .collect::<Vec<_>>();
+    status.sort_by_key(|entry| entry.worker_id.0);
+    status
+}
+
 struct DeploymentState {
     request: DeploymentRequest,
     descriptors: HashMap<ShardId, DeploymentDescriptor>,
@@ -177,9 +220,88 @@ struct DeploymentState {
 
 struct SourceWaiter {
     sender: mpsc::Sender<ControlMessage>,
+    workload_id: WorkloadId,
+    workers: HashSet<WorkerId>,
     expected: usize,
     received: usize,
     epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceWaiterInsertError {
+    Duplicate,
+    Full,
+}
+
+fn try_insert_source_waiter(
+    state: &mut DataPlaneState,
+    request_id: String,
+    waiter: SourceWaiter,
+) -> Result<(), SourceWaiterInsertError> {
+    if state.source_waiters.contains_key(&request_id) {
+        return Err(SourceWaiterInsertError::Duplicate);
+    }
+    if state.source_waiters.len() >= MAX_SOURCE_WAITERS {
+        return Err(SourceWaiterInsertError::Full);
+    }
+    state.source_waiters.insert(request_id, waiter);
+    Ok(())
+}
+
+fn source_waiter_overflow_failure() -> ControlMessage {
+    ControlMessage::OperationFailed {
+        code: RS_9001.to_string(),
+        message: format!("{RS_9001}: source request waiter limit ({MAX_SOURCE_WAITERS}) reached"),
+        next_steps: "Retry after in-flight source requests complete.".to_string(),
+    }
+}
+
+fn take_matching_source_waiter(
+    state: &mut DataPlaneState,
+    request_id: &str,
+    workload_id: WorkloadId,
+    epoch: u64,
+) -> Option<SourceWaiter> {
+    state
+        .source_waiters
+        .get(request_id)
+        .is_some_and(|waiter| waiter.workload_id == workload_id && waiter.epoch == epoch)
+        .then(|| state.source_waiters.remove(request_id))
+        .flatten()
+}
+
+fn take_source_waiters_for_worker(
+    state: &mut DataPlaneState,
+    worker_id: WorkerId,
+) -> Vec<(String, SourceWaiter)> {
+    let request_ids = state
+        .source_waiters
+        .iter()
+        .filter(|(_, waiter)| waiter.workers.contains(&worker_id))
+        .map(|(request_id, _)| request_id.clone())
+        .collect::<Vec<_>>();
+    request_ids
+        .into_iter()
+        .filter_map(|request_id| {
+            state
+                .source_waiters
+                .remove(&request_id)
+                .map(|waiter| (request_id, waiter))
+        })
+        .collect()
+}
+
+fn source_waiter_worker_disconnect_failure(
+    request_id: &str,
+    worker_id: WorkerId,
+) -> ControlMessage {
+    ControlMessage::OperationFailed {
+        code: RS_0001.to_string(),
+        message: format!(
+            "{RS_0001}: worker {worker_id} disconnected before source delta request {request_id} completed"
+        ),
+        next_steps: format!("Retry the source delta after worker {worker_id} reconnects."),
+    }
 }
 
 /// Convert the internal [`RaftRole`] to its wire-serializable mirror.
@@ -241,11 +363,24 @@ pub struct ControlServiceHandle {
     /// Shutdown sender; drop or send to stop the service.
     shutdown_tx: broadcast::Sender<()>,
     management: Option<crate::management::ManagementServiceHandle>,
+    data_plane: Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     /// TLS certificate reloader (if internal mTLS is enabled).
     pub reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
 }
 
 impl ControlServiceHandle {
+    /// Current source-request waiter occupancy and rejection policy.
+    pub async fn source_waiter_status(&self) -> SourceWaiterStatus {
+        let state = self.data_plane.lock().await;
+        source_waiter_status(&state)
+    }
+
+    /// Current fill and capacity of each live worker outbound channel.
+    pub async fn worker_outbound_channel_status(&self) -> Vec<WorkerOutboundChannelStatus> {
+        worker_outbound_channel_status(&*self.worker_senders.lock().await)
+    }
+
     /// Signal the service to shut down.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
@@ -627,6 +762,8 @@ impl ControlService {
             addr,
             shutdown_tx,
             management,
+            data_plane: self.data_plane.clone(),
+            worker_senders: self.worker_senders.clone(),
             reloader: reloader_for_handle,
         })
     }
@@ -2196,30 +2333,35 @@ async fn submit_source_delta(
         return;
     }
 
-    let duplicate_request = {
+    let insertion = {
         let mut state = data_plane.lock().await;
-        if state.source_waiters.contains_key(&request.request_id) {
-            true
-        } else {
-            state.source_waiters.insert(
-                request.request_id.clone(),
-                SourceWaiter {
-                    sender: sender.clone(),
-                    expected: routed.len(),
-                    received: 0,
-                    epoch: request.epoch,
-                },
-            );
-            false
-        }
-    };
-    if duplicate_request {
-        send_message(
-            sender,
-            &data_plane_failure("source delta request id is already in flight"),
+        try_insert_source_waiter(
+            &mut state,
+            request.request_id.clone(),
+            SourceWaiter {
+                sender: sender.clone(),
+                workload_id: request.workload_id,
+                workers: routed.iter().map(|(worker_id, _)| *worker_id).collect(),
+                expected: routed.len(),
+                received: 0,
+                epoch: request.epoch,
+            },
         )
-        .await;
-        return;
+    };
+    match insertion {
+        Ok(()) => {}
+        Err(SourceWaiterInsertError::Duplicate) => {
+            send_message(
+                sender,
+                &data_plane_failure("source delta request id is already in flight"),
+            )
+            .await;
+            return;
+        }
+        Err(SourceWaiterInsertError::Full) => {
+            send_message(sender, &source_waiter_overflow_failure()).await;
+            return;
+        }
     }
 
     for (worker_id, frame) in routed {
@@ -3078,6 +3220,48 @@ async fn handle_connection_stream<R, W>(
                     .await;
                 }
             }
+            WorkerMessage::ExecutionFailed {
+                request_id,
+                workload_id,
+                shard_id,
+                epoch,
+                lease_token,
+                code,
+                message,
+            } => {
+                let waiter = {
+                    let mut state = data_plane.lock().await;
+                    let valid_owner = connected_worker_id.is_some_and(|worker_id| {
+                        state
+                            .deployments
+                            .get(&workload_id)
+                            .and_then(|deployment| deployment.descriptors.get(&shard_id))
+                            .is_some_and(|descriptor| {
+                                descriptor.shard.worker_id == worker_id
+                                    && descriptor.shard.lease_token == lease_token
+                            })
+                    });
+                    valid_owner
+                        .then(|| {
+                            take_matching_source_waiter(&mut state, &request_id, workload_id, epoch)
+                        })
+                        .flatten()
+                };
+                if let Some(waiter) = waiter {
+                    send_message(
+                        &waiter.sender,
+                        &ControlMessage::OperationFailed {
+                            code,
+                            message: format!(
+                                "execution failed for request {request_id}, workload {}, shard {}: {message}",
+                                workload_id.0, shard_id.0
+                            ),
+                            next_steps: "Correct the workload input or release memory pressure before retrying.".to_string(),
+                        },
+                    )
+                    .await;
+                }
+            }
             WorkerMessage::ReadWorkload { workload_id } => {
                 let snapshot = {
                     let state = data_plane.lock().await;
@@ -3765,6 +3949,15 @@ async fn handle_connection_stream<R, W>(
     // and reassign its fenced shard leases to the remaining workers.
     if let Some(worker_id) = connected_worker_id {
         worker_senders.lock().await.remove(&worker_id);
+        let source_waiters =
+            take_source_waiters_for_worker(&mut *data_plane.lock().await, worker_id);
+        for (request_id, waiter) in source_waiters {
+            send_message(
+                &waiter.sender,
+                &source_waiter_worker_disconnect_failure(&request_id, worker_id),
+            )
+            .await;
+        }
         let scheduler = ShardScheduler::new(catalog.clone(), shard_manager.clone());
         catalog.deregister(worker_id);
         let assignments = scheduler.on_worker_dead(worker_id).unwrap_or_default();
@@ -3863,6 +4056,248 @@ mod tests {
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn worker_outbound_channel_status_reports_exact_fill_and_policy() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        sender
+            .send(ControlMessage::TopologyChanged {
+                workers: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let senders = HashMap::from([(WorkerId(7), sender)]);
+
+        assert_eq!(
+            worker_outbound_channel_status(&senders),
+            vec![WorkerOutboundChannelStatus {
+                worker_id: WorkerId(7),
+                fill: 1,
+                capacity: 2,
+                overflow_policy: "await_channel_capacity; fail_when_worker_connection_closes"
+                    .to_string(),
+            }]
+        );
+        match receiver.recv().await {
+            Some(ControlMessage::TopologyChanged { workers }) => assert!(workers.is_empty()),
+            response => panic!("expected the exact queued topology message, got {response:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn source_waiters_enforce_exact_limit_and_recover_after_release() {
+        let mut state = DataPlaneState::default();
+        let mut receivers = Vec::with_capacity(MAX_SOURCE_WAITERS);
+        for index in 0..MAX_SOURCE_WAITERS {
+            let (sender, receiver) = mpsc::channel(1);
+            receivers.push(receiver);
+            try_insert_source_waiter(
+                &mut state,
+                format!("waiter-{index}"),
+                SourceWaiter {
+                    sender,
+                    workload_id: WorkloadId(133),
+                    workers: HashSet::from([WorkerId(1)]),
+                    expected: 1,
+                    received: 0,
+                    epoch: index as u64,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            source_waiter_status(&state),
+            SourceWaiterStatus {
+                fill: 1_024,
+                limit: 1_024,
+                overflow_policy: "reject_new_request_with_RS-9001".to_string(),
+            }
+        );
+
+        let (overflow_sender, mut overflow_receiver) = mpsc::channel(1);
+        assert_eq!(
+            try_insert_source_waiter(
+                &mut state,
+                "overflow".to_string(),
+                SourceWaiter {
+                    sender: overflow_sender.clone(),
+                    workload_id: WorkloadId(133),
+                    workers: HashSet::from([WorkerId(1)]),
+                    expected: 1,
+                    received: 0,
+                    epoch: 1_024,
+                },
+            ),
+            Err(SourceWaiterInsertError::Full)
+        );
+        assert_eq!(state.source_waiters.len(), 1_024);
+        assert!(!state.source_waiters.contains_key("overflow"));
+        send_message(&overflow_sender, &source_waiter_overflow_failure()).await;
+        match overflow_receiver.recv().await {
+            Some(ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            }) => {
+                assert_eq!(code, "RS-9001");
+                assert_eq!(
+                    message,
+                    "RS-9001: source request waiter limit (1024) reached"
+                );
+                assert_eq!(
+                    next_steps,
+                    "Retry after in-flight source requests complete."
+                );
+            }
+            response => panic!("expected exact bounded-waiter overflow response, got {response:?}"),
+        }
+
+        state.source_waiters.remove("waiter-0");
+        let (recovered_sender, recovered_receiver) = mpsc::channel(1);
+        receivers.push(recovered_receiver);
+        try_insert_source_waiter(
+            &mut state,
+            "recovered".to_string(),
+            SourceWaiter {
+                sender: recovered_sender,
+                workload_id: WorkloadId(133),
+                workers: HashSet::from([WorkerId(1)]),
+                expected: 1,
+                received: 0,
+                epoch: 1_025,
+            },
+        )
+        .unwrap();
+        assert_eq!(source_waiter_status(&state).fill, 1_024);
+        assert!(state.source_waiters.contains_key("recovered"));
+        let handle = ControlServiceHandle {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            shutdown_tx: broadcast::channel(1).0,
+            management: None,
+            data_plane: Arc::new(AsyncMutex::new(state)),
+            worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
+            reloader: None,
+        };
+        assert_eq!(
+            handle.source_waiter_status().await,
+            SourceWaiterStatus {
+                fill: 1_024,
+                limit: 1_024,
+                overflow_policy: "reject_new_request_with_RS-9001".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_disconnect_releases_only_its_source_waiters_with_exact_failure() {
+        let (affected_sender, mut affected_receiver) = mpsc::channel(1);
+        let (unaffected_sender, _unaffected_receiver) = mpsc::channel(1);
+        let mut state = DataPlaneState::default();
+        state.source_waiters.insert(
+            "req-7".to_string(),
+            SourceWaiter {
+                sender: affected_sender,
+                workload_id: WorkloadId(133),
+                workers: HashSet::from([WorkerId(7), WorkerId(8)]),
+                expected: 2,
+                received: 1,
+                epoch: 11,
+            },
+        );
+        state.source_waiters.insert(
+            "req-9".to_string(),
+            SourceWaiter {
+                sender: unaffected_sender,
+                workload_id: WorkloadId(133),
+                workers: HashSet::from([WorkerId(9)]),
+                expected: 1,
+                received: 0,
+                epoch: 12,
+            },
+        );
+
+        let removed = take_source_waiters_for_worker(&mut state, WorkerId(7));
+
+        assert_eq!(
+            removed
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["req-7"]
+        );
+        assert_eq!(source_waiter_status(&state).fill, 1);
+        send_message(
+            &removed[0].1.sender,
+            &source_waiter_worker_disconnect_failure("req-7", WorkerId(7)),
+        )
+        .await;
+        match affected_receiver.recv().await {
+            Some(ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            }) => assert_eq!(
+                (code.as_str(), message.as_str(), next_steps.as_str()),
+                (
+                    "RS-0001",
+                    "RS-0001: worker worker-7 disconnected before source delta request req-7 completed",
+                    "Retry the source delta after worker worker-7 reconnects.",
+                )
+            ),
+            response => panic!("expected exact source waiter disconnect failure, got {response:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_failure_removes_only_the_matching_source_waiter() {
+        let (source_sender, mut source_receiver) = mpsc::channel(1);
+        let mut state = DataPlaneState::default();
+        state.source_waiters.insert(
+            "req-133".to_string(),
+            SourceWaiter {
+                sender: source_sender,
+                workload_id: WorkloadId(133),
+                workers: HashSet::from([WorkerId(5)]),
+                expected: 2,
+                received: 0,
+                epoch: 7,
+            },
+        );
+
+        assert!(take_matching_source_waiter(&mut state, "other", WorkloadId(133), 7).is_none());
+        assert!(take_matching_source_waiter(&mut state, "req-133", WorkloadId(133), 8).is_none());
+        assert_eq!(state.source_waiters.len(), 1);
+
+        let waiter = take_matching_source_waiter(&mut state, "req-133", WorkloadId(133), 7)
+            .expect("matching source waiter must be removed");
+        assert!(state.source_waiters.is_empty());
+        let failure = ControlMessage::OperationFailed {
+            code: "RS-5003".to_string(),
+            message: "execution failed for request req-133, workload 133, shard 5: hard limit"
+                .to_string(),
+            next_steps: "Correct the workload input or release memory pressure before retrying."
+                .to_string(),
+        };
+        send_message(&waiter.sender, &failure).await;
+        match source_receiver.recv().await {
+            Some(ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            }) => {
+                assert_eq!(code, "RS-5003");
+                assert_eq!(
+                    message,
+                    "execution failed for request req-133, workload 133, shard 5: hard limit"
+                );
+                assert_eq!(
+                    next_steps,
+                    "Correct the workload input or release memory pressure before retrying."
+                );
+            }
+            message => panic!("expected exact execution failure response, got {message:?}"),
+        }
+    }
 
     #[test]
     fn management_ack_waiters_reject_overflow_without_replacing_entries() {

@@ -5,10 +5,17 @@
 //! with strict multi-tenant isolation.
 
 use rockstream_types::ids::{ArrangementId, TenantId};
+use rockstream_types::state_budget::{
+    MemoryCategory, MemoryOwner, MemoryPermit, StateBudgetError, WorkerBudgetLedger,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+pub const WORKER_DISK_CACHE_CAPACITY_BYTES: usize = 32 * 1024 * 1024 * 1024;
+pub const WORKER_SLATEDB_WRITE_BUFFER_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Partitioned cache key guaranteeing tenant and security policy isolation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -43,6 +50,13 @@ pub struct StorageCacheStats {
     pub evictions: u64,
     pub current_bytes: usize,
     pub capacity_bytes: usize,
+}
+
+/// Filesystem usage for the local object-store cache, separate from RAM cache stats.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskCacheStats {
+    pub used_bytes: u64,
+    pub capacity_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -140,6 +154,7 @@ pub struct NvmeCacheConfig {
 
 /// Worker-wide shared storage context managing unified block & index caches.
 pub struct WorkerStorageContext {
+    worker_id: String,
     budget_bytes: usize,
     blocks: Mutex<LruStore>,
     indexes: Mutex<LruStore>,
@@ -149,6 +164,9 @@ pub struct WorkerStorageContext {
     db_cache: Arc<dyn slatedb::db_cache::DbCache>,
     nvme_config: Option<NvmeCacheConfig>,
     filter_bits_per_key: Option<u32>,
+    _block_cache_permit: Option<MemoryPermit>,
+    _metadata_cache_permit: Option<MemoryPermit>,
+    budget_ledger: Option<std::sync::Arc<WorkerBudgetLedger>>,
 }
 
 impl std::fmt::Debug for WorkerStorageContext {
@@ -186,12 +204,13 @@ impl WorkerStorageContext {
             .or_else(|| std::env::var_os("ROCKSTREAM_DISK_CACHE_DIR"))
             .map(|dir| NvmeCacheConfig {
                 root_folder: PathBuf::from(dir),
-                max_cache_size_bytes: 16 * 1024 * 1024 * 1024,
+                max_cache_size_bytes: WORKER_DISK_CACHE_CAPACITY_BYTES,
                 part_size_bytes: 4 * 1024 * 1024,
                 cache_puts: true,
             });
 
         Self {
+            worker_id: worker_id.to_string(),
             budget_bytes,
             blocks: Mutex::new(LruStore::new(block_budget)),
             indexes: Mutex::new(LruStore::new(index_budget)),
@@ -201,7 +220,56 @@ impl WorkerStorageContext {
             db_cache,
             nvme_config,
             filter_bits_per_key: None,
+            _block_cache_permit: None,
+            _metadata_cache_permit: None,
+            budget_ledger: None,
         }
+    }
+
+    /// Create the worker cache and prospectively reserve its bounded RAM capacity.
+    pub fn new_with_worker_id_and_budget(
+        worker_id: &str,
+        budget_bytes: usize,
+        ledger: &std::sync::Arc<WorkerBudgetLedger>,
+    ) -> Result<Self, StateBudgetError> {
+        let block_budget = (budget_bytes * 7) / 10;
+        let index_budget = budget_bytes.saturating_sub(block_budget);
+        let owner = MemoryOwner::worker(worker_id);
+        let block_permit = ledger.try_acquire_for_owner(
+            MemoryCategory::SlateDbBlockCache,
+            owner.clone(),
+            block_budget as u64,
+            false,
+        )?;
+        let metadata_permit = ledger.try_acquire_for_owner(
+            MemoryCategory::SlateDbMetadataCache,
+            owner,
+            index_budget as u64,
+            false,
+        )?;
+        let mut context = Self::new_with_worker_id(worker_id, budget_bytes);
+        context._block_cache_permit = Some(block_permit);
+        context._metadata_cache_permit = Some(metadata_permit);
+        context.budget_ledger = Some(ledger.clone());
+        Ok(context)
+    }
+
+    /// Prospectively reserve one SlateDB instance's bounded unflushed write memory.
+    pub fn reserve_slate_db_write_buffers(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<MemoryPermit>, StateBudgetError> {
+        self.budget_ledger
+            .as_ref()
+            .map(|ledger| {
+                ledger.try_acquire_for_owner(
+                    MemoryCategory::SlateDbWriteBuffers,
+                    MemoryOwner::worker(self.worker_id.clone()),
+                    bytes,
+                    false,
+                )
+            })
+            .transpose()
     }
 
     /// Configure local NVMe block caching tier for hot SSTable blocks.
@@ -240,6 +308,17 @@ impl WorkerStorageContext {
     /// Retrieve the configured NVMe block cache config, if any.
     pub fn nvme_config(&self) -> Option<&NvmeCacheConfig> {
         self.nvme_config.as_ref()
+    }
+
+    /// Independently sum regular file bytes under the configured local cache root.
+    pub fn disk_cache_stats(&self) -> io::Result<Option<DiskCacheStats>> {
+        let Some(config) = &self.nvme_config else {
+            return Ok(None);
+        };
+        Ok(Some(DiskCacheStats {
+            used_bytes: directory_file_bytes(&config.root_folder, true)?,
+            capacity_bytes: config.max_cache_size_bytes as u64,
+        }))
     }
 
     /// Retrieve the configured Bloom filter bits per key, if any.
@@ -330,4 +409,28 @@ impl WorkerStorageContext {
         self.blocks.lock().unwrap().clear();
         self.indexes.lock().unwrap().clear();
     }
+}
+
+fn directory_file_bytes(root: &std::path::Path, missing_root_is_empty: bool) -> io::Result<u64> {
+    let mut entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if missing_root_is_empty && error.kind() == io::ErrorKind::NotFound => {
+            return Ok(0);
+        }
+        Err(error) => return Err(error),
+    };
+    entries.try_fold(0_u64, |total, entry| {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let bytes = if kind.is_dir() {
+            directory_file_bytes(&entry.path(), false)?
+        } else if kind.is_file() {
+            entry.metadata()?.len()
+        } else {
+            0
+        };
+        total.checked_add(bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "disk cache byte total overflow")
+        })
+    })
 }

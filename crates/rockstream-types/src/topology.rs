@@ -10,7 +10,7 @@ use crate::compatibility::{
     ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
 };
 use crate::frontier::MembershipFrontierReport;
-use crate::ids::{ShardId, WorkerId};
+use crate::ids::{LeaseToken, ShardId, WorkerId};
 use crate::lease::{ShardLease, ShardRevokeReason};
 
 /// The role a node is running.
@@ -806,6 +806,15 @@ pub enum WorkerMessage {
         output: crate::data_plane::RuntimeOutputDelta,
         input_rows: u64,
         output_rows: u64,
+    },
+    ExecutionFailed {
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        shard_id: ShardId,
+        epoch: crate::timestamp::Epoch,
+        lease_token: LeaseToken,
+        code: String,
+        message: String,
     },
     ReadWorkload {
         workload_id: crate::ids::WorkloadId,

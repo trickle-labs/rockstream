@@ -16,12 +16,40 @@ use crate::exchange::serialization::deserialize_zset;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::compatibility::{ProtocolVersion, SupportedVersionRange};
 use rockstream_types::config::ExchangeConfig;
+use rockstream_types::ids::WorkloadId;
+use rockstream_types::state_budget::{MemoryPermit, StateBudgetError};
+
+use crate::source_pressure::SourcePressureController;
 
 /// Holds the input channel and Schema metadata for a local exchange target.
 #[derive(Clone)]
 pub struct ExchangeInlet {
     pub sender: mpsc::Sender<ArrowZSet>,
     pub schema: SchemaRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExchangeInletChannelStatus {
+    pub exchange_id: u64,
+    pub target_shard: u32,
+    pub fill: usize,
+    pub capacity: usize,
+    pub overflow_policy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExchangeAckChannelStatus {
+    pub fill: usize,
+    pub capacity: usize,
+    pub overflow_policy: String,
+}
+
+const EXCHANGE_ACK_CHANNEL_CAPACITY: usize = 64;
+
+#[derive(Default)]
+struct ExchangeAckChannelFill {
+    fill: std::sync::atomic::AtomicUsize,
+    capacity: std::sync::atomic::AtomicUsize,
 }
 
 /// A registry of active local exchange destinations (e.g. operators waiting for shuffle inputs).
@@ -31,6 +59,8 @@ pub struct ExchangeRegistry {
     active_shards: Arc<RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>>,
     cluster_frontier: Arc<std::sync::atomic::AtomicU64>,
     grpc_frames_received: Arc<std::sync::atomic::AtomicU64>,
+    source_pressure: Option<Arc<SourcePressureController>>,
+    exchange_ack_channel_fill: Arc<ExchangeAckChannelFill>,
 }
 
 impl Default for ExchangeRegistry {
@@ -40,6 +70,8 @@ impl Default for ExchangeRegistry {
             active_shards: Arc::new(RwLock::new(HashMap::new())),
             cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            source_pressure: None,
+            exchange_ack_channel_fill: Arc::new(ExchangeAckChannelFill::default()),
         }
     }
 }
@@ -59,7 +91,17 @@ impl ExchangeRegistry {
             active_shards,
             cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            source_pressure: None,
+            exchange_ack_channel_fill: Arc::new(ExchangeAckChannelFill::default()),
         }
+    }
+
+    pub fn with_source_pressure_controller(
+        mut self,
+        source_pressure: Arc<SourcePressureController>,
+    ) -> Self {
+        self.source_pressure = Some(source_pressure);
+        self
     }
 
     /// Get total count of gRPC frames received.
@@ -135,6 +177,60 @@ impl ExchangeRegistry {
             .read()
             .get(&(exchange_id, target_shard))
             .cloned()
+    }
+
+    pub fn inlet_channel_status(&self) -> Vec<ExchangeInletChannelStatus> {
+        let mut status = self
+            .inlets
+            .read()
+            .iter()
+            .map(
+                |((exchange_id, target_shard), inlet)| ExchangeInletChannelStatus {
+                    exchange_id: *exchange_id,
+                    target_shard: *target_shard,
+                    fill: inlet
+                        .sender
+                        .max_capacity()
+                        .saturating_sub(inlet.sender.capacity()),
+                    capacity: inlet.sender.max_capacity(),
+                    overflow_policy: "await_receiver_capacity; report_receiver_closed".to_string(),
+                },
+            )
+            .collect::<Vec<_>>();
+        status.sort_by_key(|entry| (entry.exchange_id, entry.target_shard));
+        status
+    }
+
+    pub fn acknowledgement_channel_status(&self) -> ExchangeAckChannelStatus {
+        ExchangeAckChannelStatus {
+            fill: self
+                .exchange_ack_channel_fill
+                .fill
+                .load(std::sync::atomic::Ordering::Relaxed),
+            capacity: self
+                .exchange_ack_channel_fill
+                .capacity
+                .load(std::sync::atomic::Ordering::Relaxed),
+            overflow_policy: "await_stream_capacity".to_string(),
+        }
+    }
+
+    fn reserve_exchange_payload(
+        &self,
+        workload_id: WorkloadId,
+        bytes: u64,
+    ) -> Result<MemoryPermit, StateBudgetError> {
+        let source_pressure = self
+            .source_pressure
+            .as_ref()
+            .ok_or_else(|| StateBudgetError {
+                operator_name: "exchange-budget-not-configured".to_string(),
+                max_bytes: 0,
+                current_bytes: 0,
+                requested_bytes: bytes,
+            })?;
+        source_pressure.can_ingest()?;
+        source_pressure.reserve_exchange_frame(workload_id, bytes)
     }
 }
 
@@ -471,34 +567,66 @@ impl ShuffleService for ShuffleServer {
     ) -> Result<Response<Self::ExchangeStreamStream>, Status> {
         self.validate_protocol_version(request.metadata())?;
         let mut stream = request.into_inner();
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(EXCHANGE_ACK_CHANNEL_CAPACITY);
+        let ack_fill = self.registry.exchange_ack_channel_fill.clone();
+        ack_fill.capacity.fetch_add(
+            EXCHANGE_ACK_CHANNEL_CAPACITY,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let send_fill = ack_fill.clone();
+        let registry = self.registry.clone();
         tokio::spawn(async move {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(frame) => {
+                        let workload_id = WorkloadId(frame.workload_id);
+                        if let Some(pressure) = &registry.source_pressure {
+                            let delay = pressure.workload_frame_delay(workload_id);
+                            if !delay.is_zero() {
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
+                        let admission = registry
+                            .reserve_exchange_payload(workload_id, frame.payload.len() as u64);
+                        let (success, error_code, error_message, permit) = match admission {
+                            Ok(permit) => (true, String::new(), String::new(), Some(permit)),
+                            Err(error) => (
+                                false,
+                                rockstream_types::error_code::RS_5003.to_string(),
+                                error.to_string(),
+                                None,
+                            ),
+                        };
                         let ack = crate::exchange::proto::ExchangeAck {
                             protocol_version: frame.protocol_version,
-                            workload_id: frame.workload_id,
+                            workload_id: workload_id.0,
                             shard_id: frame.shard_id,
                             operator_id: frame.operator_id,
                             epoch: frame.epoch,
                             lease_token: frame.lease_token,
-                            success: true,
-                            error_code: String::new(),
-                            error_message: String::new(),
+                            success,
+                            error_code,
+                            error_message,
                         };
-                        if tx.send(Ok(ack)).await.is_err() {
+                        if send_tracked_exchange_ack(&tx, send_fill.clone(), Ok(ack))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
+                        drop(permit);
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        let _ = send_tracked_exchange_ack(&tx, send_fill.clone(), Err(e)).await;
                         break;
                     }
                 }
             }
         });
-        Ok(Response::new(Box::pin(RxStream { rx })))
+        Ok(Response::new(Box::pin(ExchangeAckStream {
+            rx,
+            fill: ack_fill,
+        })))
     }
 }
 
@@ -515,6 +643,62 @@ pub fn unregister_shared_memory_endpoint(worker_id: rockstream_types::ids::Worke
 
 struct RxStream<T> {
     rx: mpsc::Receiver<T>,
+}
+
+struct TrackedExchangeAck {
+    result: Option<Result<crate::exchange::proto::ExchangeAck, Status>>,
+    fill: Arc<ExchangeAckChannelFill>,
+}
+
+impl Drop for TrackedExchangeAck {
+    fn drop(&mut self) {
+        self.fill
+            .fill
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+struct ExchangeAckStream {
+    rx: mpsc::Receiver<TrackedExchangeAck>,
+    fill: Arc<ExchangeAckChannelFill>,
+}
+
+impl Stream for ExchangeAckStream {
+    type Item = Result<crate::exchange::proto::ExchangeAck, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.get_mut().rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(mut ack)) => std::task::Poll::Ready(ack.result.take()),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ExchangeAckStream {
+    fn drop(&mut self) {
+        self.fill.capacity.fetch_sub(
+            EXCHANGE_ACK_CHANNEL_CAPACITY,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+async fn send_tracked_exchange_ack(
+    sender: &mpsc::Sender<TrackedExchangeAck>,
+    fill: Arc<ExchangeAckChannelFill>,
+    result: Result<crate::exchange::proto::ExchangeAck, Status>,
+) -> Result<(), ()> {
+    let permit = sender.reserve().await.map_err(|_| ())?;
+    fill.fill.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    permit.send(TrackedExchangeAck {
+        result: Some(result),
+        fill,
+    });
+    Ok(())
 }
 
 impl<T> Stream for RxStream<T> {
@@ -539,8 +723,9 @@ mod tests {
     use rockstream_storage::shard_db::ShardDb;
     use rockstream_types::config::{ExchangeConfig, WorkerConfig};
     use rockstream_types::exchange::ShuffleCompression;
-    use rockstream_types::ids::WorkerId;
+    use rockstream_types::ids::{WorkerId, WorkloadId};
     use rockstream_types::lease::ShardLease;
+    use rockstream_types::state_budget::{MemoryCategory, MemoryOwner, WorkerBudgetLedger};
     use rockstream_types::topology::{
         CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
         WorkerLocation,
@@ -637,6 +822,228 @@ mod tests {
         ]));
         registry.register(100, 1, tx, schema);
         (registry, rx)
+    }
+
+    #[test]
+    fn exchange_inlet_status_reports_exact_fill_and_overflow_policy() {
+        let registry = ExchangeRegistry::new();
+        let (sender, _receiver) = mpsc::channel(2);
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        registry.register(9, 3, sender.clone(), schema);
+        sender.try_send(make_wide_compressible_zset(1)).unwrap();
+
+        assert_eq!(
+            registry.inlet_channel_status(),
+            vec![ExchangeInletChannelStatus {
+                exchange_id: 9,
+                target_shard: 3,
+                fill: 1,
+                capacity: 2,
+                overflow_policy: "await_receiver_capacity; report_receiver_closed".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_ack_status_tracks_fill_and_capacity_until_stream_drop() {
+        let registry = ExchangeRegistry::new();
+        let fill = registry.exchange_ack_channel_fill.clone();
+        fill.capacity.fetch_add(
+            EXCHANGE_ACK_CHANNEL_CAPACITY,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let (sender, receiver) = mpsc::channel(EXCHANGE_ACK_CHANNEL_CAPACITY);
+        let expected = crate::exchange::proto::ExchangeAck {
+            protocol_version: 1,
+            workload_id: 7,
+            shard_id: 2,
+            operator_id: 3,
+            epoch: 4,
+            lease_token: 5,
+            success: true,
+            error_code: String::new(),
+            error_message: String::new(),
+        };
+        send_tracked_exchange_ack(&sender, fill.clone(), Ok(expected.clone()))
+            .await
+            .unwrap();
+        let mut stream = ExchangeAckStream { rx: receiver, fill };
+
+        assert_eq!(
+            registry.acknowledgement_channel_status(),
+            ExchangeAckChannelStatus {
+                fill: 1,
+                capacity: EXCHANGE_ACK_CHANNEL_CAPACITY,
+                overflow_policy: "await_stream_capacity".to_string(),
+            }
+        );
+        match stream.next().await {
+            Some(Ok(ack)) => assert_eq!(ack, expected),
+            response => panic!("expected exact queued exchange acknowledgement, got {response:?}"),
+        }
+        assert_eq!(registry.acknowledgement_channel_status().fill, 0);
+        drop(stream);
+        assert_eq!(
+            registry.acknowledgement_channel_status(),
+            ExchangeAckChannelStatus {
+                fill: 0,
+                capacity: 0,
+                overflow_policy: "await_stream_capacity".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn exchange_payload_admission_charges_workload_and_releases_exact_bytes() {
+        let ledger = Arc::new(WorkerBudgetLedger::new(2_147_483_648, 429_496_729));
+        let pressure = Arc::new(SourcePressureController::new(ledger.clone(), 100));
+        let registry = ExchangeRegistry::new().with_source_pressure_controller(pressure);
+        let workload_id = WorkloadId(133);
+        let existing = ledger
+            .try_acquire_for_owner(
+                MemoryCategory::OperatorState,
+                MemoryOwner::workload(workload_id),
+                WorkerBudgetLedger::WORKLOAD_MEMORY_HARD_LIMIT_BYTES - 2,
+                false,
+            )
+            .unwrap();
+
+        let permit = registry
+            .reserve_exchange_payload(workload_id, 2)
+            .expect("the exact workload limit is admitted");
+        assert_eq!(ledger.category_bytes(MemoryCategory::ExchangeBuffers), 2);
+        drop(permit);
+        assert_eq!(
+            ledger.allocated_bytes_for_owner(&MemoryOwner::workload(workload_id)),
+            WorkerBudgetLedger::WORKLOAD_MEMORY_HARD_LIMIT_BYTES - 2
+        );
+        assert_eq!(
+            registry
+                .reserve_exchange_payload(workload_id, 3)
+                .unwrap_err()
+                .to_string(),
+            "RS-5003: state budget exceeded for 'workload-hard-budget-133': current=536870910 bytes, requested=3 bytes, limit=536870912 bytes"
+        );
+        assert_eq!(ledger.category_bytes(MemoryCategory::ExchangeBuffers), 0);
+        drop(existing);
+        assert_eq!(
+            ledger.allocated_bytes_for_owner(&MemoryOwner::workload(workload_id)),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_exchange_stream_returns_exact_admission_outcomes() {
+        let ledger = Arc::new(WorkerBudgetLedger::new(2_147_483_648, 429_496_729));
+        let pressure = Arc::new(SourcePressureController::new(ledger.clone(), 100));
+        let registry = ExchangeRegistry::new().with_source_pressure_controller(pressure);
+        let existing = ledger
+            .try_acquire_for_owner(
+                MemoryCategory::OperatorState,
+                MemoryOwner::workload(WorkloadId(133)),
+                WorkerBudgetLedger::WORKLOAD_MEMORY_HARD_LIMIT_BYTES - 2,
+                false,
+            )
+            .unwrap();
+        let server = ShuffleServer::new(registry);
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(
+                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                        server,
+                    ),
+                )
+                .serve_with_shutdown(addr, async {
+                    let _ = close_rx.await;
+                })
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut client =
+            crate::exchange::proto::shuffle_service_client::ShuffleServiceClient::connect(format!(
+                "http://{addr}"
+            ))
+            .await
+            .unwrap();
+        let frame = |payload: Vec<u8>| crate::exchange::proto::ExchangeFrame {
+            protocol_version: 1,
+            workload_id: 133,
+            shard_id: 4,
+            operator_id: 5,
+            epoch: 6,
+            lease_token: 7,
+            schema_fingerprint: Vec::new(),
+            payload,
+            checksum: Vec::new(),
+        };
+        let (frame_tx, frame_rx) = mpsc::channel(1);
+        let frames = futures::stream::unfold(frame_rx, |mut receiver| async move {
+            receiver.recv().await.map(|frame| (frame, receiver))
+        });
+        let mut request = Request::new(frames);
+        request.metadata_mut().insert(
+            "protocol_version",
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        let mut acknowledgements = client.exchange_stream(request).await.unwrap().into_inner();
+        frame_tx.send(frame(vec![0; 2])).await.unwrap();
+
+        assert_eq!(
+            acknowledgements.message().await.unwrap(),
+            Some(crate::exchange::proto::ExchangeAck {
+                protocol_version: 1,
+                workload_id: 133,
+                shard_id: 4,
+                operator_id: 5,
+                epoch: 6,
+                lease_token: 7,
+                success: true,
+                error_code: String::new(),
+                error_message: String::new(),
+            })
+        );
+        frame_tx.send(frame(vec![0; 3])).await.unwrap();
+        assert_eq!(
+            acknowledgements.message().await.unwrap(),
+            Some(crate::exchange::proto::ExchangeAck {
+                protocol_version: 1,
+                workload_id: 133,
+                shard_id: 4,
+                operator_id: 5,
+                epoch: 6,
+                lease_token: 7,
+                success: false,
+                error_code: "RS-5003".to_string(),
+                error_message: "RS-5003: state budget exceeded for 'workload-hard-budget-133': current=536870910 bytes, requested=3 bytes, limit=536870912 bytes".to_string(),
+            })
+        );
+        assert_eq!(ledger.category_bytes(MemoryCategory::ExchangeBuffers), 0);
+        drop(existing);
+        frame_tx.send(frame(vec![0; 3])).await.unwrap();
+        assert_eq!(
+            acknowledgements.message().await.unwrap(),
+            Some(crate::exchange::proto::ExchangeAck {
+                protocol_version: 1,
+                workload_id: 133,
+                shard_id: 4,
+                operator_id: 5,
+                epoch: 6,
+                lease_token: 7,
+                success: true,
+                error_code: String::new(),
+                error_message: String::new(),
+            })
+        );
+        drop(frame_tx);
+        assert_eq!(acknowledgements.message().await.unwrap(), None);
+        assert_eq!(ledger.category_bytes(MemoryCategory::ExchangeBuffers), 0);
+        let _ = close_tx.send(());
+        server_handle.abort();
     }
 
     async fn read_only_inbox_payload(db: &ShardDb) -> bytes::Bytes {

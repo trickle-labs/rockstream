@@ -87,7 +87,7 @@ pub use qualification_store::QualificationEvidenceStore;
 pub use rockstream_types::migration::MigrationProgress;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use secret_store::{SecretListing, SecretStore, SecretStoreError};
-pub use service::{ControlService, ControlServiceHandle};
+pub use service::{ControlService, ControlServiceHandle, SourceWaiterStatus, MAX_SOURCE_WAITERS};
 pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};
 pub use shard_stats::ShardStatsPersistentStore;
 pub use skew::{

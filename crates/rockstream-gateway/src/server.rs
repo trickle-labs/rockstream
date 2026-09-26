@@ -13865,6 +13865,11 @@ fn catalog_field_type(column: &str) -> Type {
 fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
     match resp {
         CatalogResponse::CommandComplete(tag) => Response::Execution(Tag::new(&tag)),
+        CatalogResponse::Error(message) => Response::Error(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "54000".to_owned(),
+            message,
+        ))),
         CatalogResponse::Rows { columns, rows } => {
             let fields: Vec<FieldInfo> = columns
                 .iter()

@@ -5,6 +5,9 @@ use thiserror::Error;
 /// Errors returned by the storage layer.
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error(transparent)]
+    WorkerBudgetExceeded(#[from] rockstream_types::state_budget::StateBudgetError),
+
     #[error("SlateDB error: {0}")]
     Slate(slatedb::Error),
 

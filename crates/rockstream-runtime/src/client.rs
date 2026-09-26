@@ -3,9 +3,10 @@
 //! Manages registration, periodic heartbeats, shard lease assignment,
 //! and fencing validation with the control plane over TCP.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use arrow::record_batch::RecordBatch;
 use parking_lot::RwLock;
 use serde_json;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -28,6 +29,10 @@ use rockstream_types::data_plane::{
 use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::{LeaseToken, OperatorId, ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardLease;
+use rockstream_types::state_budget::{
+    MemoryCategory, MemoryOwner, MemoryPermit, StateBudgetError, WorkerBudgetLedger,
+    WorkerBudgetStatus,
+};
 use rockstream_types::topology::{
     CapacityHeadroom, ControlMessage, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLocation,
     WorkerMessage, WorkerRegistration,
@@ -35,7 +40,8 @@ use rockstream_types::topology::{
 
 use crate::epoch_compaction::{EpochCompactionConfig, EpochCompactor};
 use crate::secrets::WorkerSecretManager;
-use crate::shard_actor::{FrameExecutor, ShardActorRegistry};
+use crate::shard_actor::{FrameExecutor, ShardActorRegistry, ShardMailboxStatus};
+use crate::source_pressure::{SourcePressureController, WorkloadSourcePressureStatus};
 use rockstream_ops::PhysicalCommitGroup;
 use rockstream_storage::{ShardDb, WriteBatch};
 
@@ -46,6 +52,193 @@ pub struct WorkerDeployment {
     pub compiled: rockstream_ops::compile::CompiledView,
     pub commit_group: Arc<PhysicalCommitGroup>,
     pub compactor: Arc<EpochCompactor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerResourceStatus {
+    pub worker_id: Option<WorkerId>,
+    pub budget: WorkerBudgetStatus,
+    pub disk_cache: Option<rockstream_storage::storage_context::DiskCacheStats>,
+    pub disk_cache_error: Option<String>,
+    #[serde(default)]
+    pub control_line_buffer_fill_bytes: usize,
+    #[serde(default)]
+    pub control_line_buffer_limit_bytes: usize,
+    #[serde(default)]
+    pub control_message_channel_fill: usize,
+    #[serde(default)]
+    pub control_message_channel_capacity: usize,
+    #[serde(default)]
+    pub fence_write_waiter_fill: usize,
+    #[serde(default)]
+    pub fence_write_waiter_capacity: usize,
+    #[serde(default)]
+    pub source_pressure: Vec<WorkloadSourcePressureStatus>,
+    pub shard_mailboxes: Vec<ShardMailboxStatus>,
+}
+
+const MAX_CONTROL_MESSAGE_BYTES: usize = rockstream_types::limits::MAX_CONN_MEMORY_BYTES;
+const WORKER_CONTROL_MESSAGE_CHANNEL_CAPACITY: usize = 32;
+const MAX_FENCE_WRITE_WAITERS: usize = 1024;
+const WORKER_MEMORY_BUDGET_BYTES: usize = 2_147_483_648;
+const WORKER_FOREGROUND_RESERVATION_BYTES: usize = 429_496_729;
+const WORKER_STORAGE_CACHE_BUDGET_BYTES: usize = 536_870_912;
+
+fn worker_storage_context(
+    worker_id: &str,
+    storage_dir: &Path,
+    budget_ledger: &Arc<WorkerBudgetLedger>,
+) -> io::Result<Arc<rockstream_storage::storage_context::WorkerStorageContext>> {
+    let context =
+        rockstream_storage::storage_context::WorkerStorageContext::new_with_worker_id_and_budget(
+            worker_id,
+            WORKER_STORAGE_CACHE_BUDGET_BYTES,
+            budget_ledger,
+        )
+        .map_err(io::Error::other)?;
+    let cache_root = context
+        .nvme_config()
+        .map(|config| config.root_folder.clone())
+        .unwrap_or_else(|| storage_dir.join(worker_id).join("slatedb-cache"));
+    Ok(Arc::new(context.with_nvme_cache(
+        cache_root,
+        rockstream_storage::storage_context::WORKER_DISK_CACHE_CAPACITY_BYTES,
+    )))
+}
+
+async fn read_control_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<Option<String>> {
+    let mut line = Vec::new();
+    if !read_control_line_into(reader, max_bytes, &mut line, None).await? {
+        return Ok(None);
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+async fn read_control_line_into<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+    line: &mut Vec<u8>,
+    fill: Option<&AtomicUsize>,
+) -> io::Result<bool> {
+    line.clear();
+    if let Some(fill) = fill {
+        fill.store(0, Ordering::Relaxed);
+    }
+    loop {
+        let next = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                None
+            } else {
+                let newline = available.iter().position(|byte| *byte == b'\n');
+                let content_len = newline.unwrap_or(available.len());
+                if line.len().saturating_add(content_len) > max_bytes {
+                    line.clear();
+                    if let Some(fill) = fill {
+                        fill.store(0, Ordering::Relaxed);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "control message exceeds maximum encoded size ({} bytes)",
+                            max_bytes
+                        ),
+                    ));
+                }
+                line.extend_from_slice(&available[..content_len]);
+                if let Some(fill) = fill {
+                    fill.store(line.len(), Ordering::Relaxed);
+                }
+                Some((
+                    content_len + usize::from(newline.is_some()),
+                    newline.is_some(),
+                ))
+            }
+        };
+        match next {
+            None if line.is_empty() => return Ok(false),
+            None => break,
+            Some((consumed, true)) => {
+                reader.consume(consumed);
+                break;
+            }
+            Some((consumed, false)) => reader.consume(consumed),
+        }
+    }
+    Ok(true)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ControlMessageAdmissionHint {
+    Execute {
+        frame: ExecuteFrameAdmissionHint,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(serde::Deserialize)]
+struct ExecuteFrameAdmissionHint {
+    request_id: String,
+    workload_id: WorkloadId,
+    shard_id: ShardId,
+    epoch: u64,
+    lease_token: LeaseToken,
+    rows: Vec<serde::de::IgnoredAny>,
+}
+
+#[derive(Debug)]
+struct ExecuteAdmissionContext {
+    request_id: String,
+    workload_id: WorkloadId,
+    shard_id: ShardId,
+    epoch: u64,
+    lease_token: LeaseToken,
+}
+
+fn reserve_control_decode(
+    line: &str,
+    ledger: &Arc<WorkerBudgetLedger>,
+    worker_name: &str,
+) -> Result<
+    (MemoryPermit, Option<ExecuteAdmissionContext>),
+    (Option<ExecuteAdmissionContext>, StateBudgetError),
+> {
+    let hint = serde_json::from_str::<ControlMessageAdmissionHint>(line).ok();
+    let (owner, row_count, execute) = match hint {
+        Some(ControlMessageAdmissionHint::Execute { frame }) => (
+            MemoryOwner::workload(frame.workload_id),
+            frame.rows.len(),
+            Some(ExecuteAdmissionContext {
+                request_id: frame.request_id,
+                workload_id: frame.workload_id,
+                shard_id: frame.shard_id,
+                epoch: frame.epoch,
+                lease_token: frame.lease_token,
+            }),
+        ),
+        Some(ControlMessageAdmissionHint::Other) | None => (
+            MemoryOwner::worker(format!("{worker_name}/control-decode")),
+            0,
+            None,
+        ),
+    };
+    let bytes = (line.len() as u64)
+        .saturating_mul(2)
+        .saturating_add(std::mem::size_of::<ControlMessage>() as u64)
+        .saturating_add(
+            (row_count as u64).saturating_mul(std::mem::size_of::<RuntimeRow>() as u64),
+        );
+    match ledger.try_acquire_for_owner(MemoryCategory::SourceBuffers, owner, bytes, false) {
+        Ok(permit) => Ok((permit, execute)),
+        Err(error) => Err((execute, error)),
+    }
 }
 
 impl WorkerDeployment {
@@ -400,18 +593,25 @@ pub async fn setup_test_deployment(
     Arc<EpochCompactor>,
     mpsc::Receiver<WorkerMessage>,
 ) {
-    let (msg_tx, mut msg_rx) = mpsc::channel(32);
+    let (msg_tx, mut msg_rx) = mpsc::channel(WORKER_CONTROL_MESSAGE_CHANNEL_CAPACITY);
     let worker_id = Arc::new(RwLock::new(Some(WorkerId(42))));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let secret_manager = Arc::new(WorkerSecretManager::new("worker-42".to_string()));
+    let budget_ledger = Arc::new(WorkerBudgetLedger::new(
+        WORKER_MEMORY_BUDGET_BYTES,
+        WORKER_FOREGROUND_RESERVATION_BYTES,
+    ));
     let storage_context = Arc::new(
-        rockstream_storage::storage_context::WorkerStorageContext::new_with_worker_id(
+        rockstream_storage::storage_context::WorkerStorageContext::new_with_worker_id_and_budget(
             "worker-42",
-            536_870_912,
-        ),
+            WORKER_STORAGE_CACHE_BUDGET_BYTES,
+            &budget_ledger,
+        )
+        .unwrap(),
     );
+    let source_pressure = Arc::new(SourcePressureController::new(budget_ledger.clone(), 100));
     let deployments = Arc::new(RwLock::new(HashMap::new()));
     let comp_config_lock = Arc::new(RwLock::new(compaction_config.clone()));
 
@@ -423,6 +623,10 @@ pub async fn setup_test_deployment(
         fence_waiters: fence_waiters.clone(),
         secret_manager,
         storage_context: storage_context.clone(),
+        budget_ledger,
+        source_pressure,
+        control_line_buffer_fill: Arc::new(AtomicUsize::new(0)),
+        actor_registry: ShardActorRegistry::new(),
         compaction_config: comp_config_lock,
         deployments: deployments.clone(),
     };
@@ -527,6 +731,98 @@ pub async fn setup_test_deployment(
 mod data_plane_tests {
     use super::*;
     use rockstream_types::ids::OperatorId;
+
+    #[tokio::test]
+    async fn control_message_line_limit_rejects_before_json_decode() {
+        let mut reader = BufReader::new(&b"1234\n"[..]);
+        let error = read_control_line(&mut reader, 3).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "control message exceeds maximum encoded size (3 bytes)"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_control_buffer_reports_exact_fill_and_eof() {
+        let mut reader = BufReader::new(&b"abc\n"[..]);
+        let mut line = Vec::with_capacity(3);
+        let fill = AtomicUsize::new(0);
+
+        assert!(
+            read_control_line_into(&mut reader, 3, &mut line, Some(&fill))
+                .await
+                .unwrap()
+        );
+        assert_eq!(line, b"abc");
+        assert_eq!(fill.load(Ordering::Relaxed), 3);
+        assert!(
+            !read_control_line_into(&mut reader, 3, &mut line, Some(&fill))
+                .await
+                .unwrap()
+        );
+        assert_eq!(line, b"");
+        assert_eq!(fill.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn execute_decode_reservation_is_workload_owned_and_rejects_before_decode() {
+        let line = serde_json::to_string(&ControlMessage::Execute {
+            frame: RuntimeExchangeMessage {
+                version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                request_id: "request-7".to_string(),
+                workload_id: WorkloadId(7),
+                shard_id: ShardId(3),
+                operator_id: OperatorId(2),
+                lease_token: LeaseToken(9),
+                epoch: 11,
+                source: "items".to_string(),
+                rows: vec![
+                    RuntimeRow {
+                        values_tsv: "1\tone".to_string(),
+                        weight: 1,
+                    },
+                    RuntimeRow {
+                        values_tsv: "2\ttwo".to_string(),
+                        weight: 1,
+                    },
+                ],
+            },
+        })
+        .unwrap();
+        let expected_bytes = (line.len() as u64)
+            .saturating_mul(2)
+            .saturating_add(std::mem::size_of::<ControlMessage>() as u64)
+            .saturating_add(2 * std::mem::size_of::<RuntimeRow>() as u64);
+        let ledger = Arc::new(WorkerBudgetLedger::new(expected_bytes as usize * 2, 0));
+        let (permit, context) = reserve_control_decode(&line, &ledger, "worker-7").unwrap();
+
+        assert_eq!(permit.bytes(), expected_bytes);
+        assert_eq!(
+            ledger.category_bytes(MemoryCategory::SourceBuffers),
+            expected_bytes
+        );
+        assert_eq!(
+            ledger.allocated_bytes_for_owner(&MemoryOwner::workload(WorkloadId(7))),
+            expected_bytes
+        );
+        assert_eq!(context.unwrap().request_id, "request-7");
+        drop(permit);
+        assert_eq!(ledger.status().allocated_bytes, 0);
+
+        let rejecting_ledger = Arc::new(WorkerBudgetLedger::new(1, 0));
+        let (context, error) =
+            reserve_control_decode(&line, &rejecting_ledger, "worker-7").unwrap_err();
+        assert_eq!(context.unwrap().request_id, "request-7");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "RS-5003: state budget exceeded for 'oversized-source_buffers': current=0 bytes, requested={expected_bytes} bytes, limit=1 bytes"
+            )
+        );
+        assert_eq!(rejecting_ledger.status().allocated_bytes, 0);
+    }
 
     #[test]
     fn runtime_rows_convert_exactly() {
@@ -785,6 +1081,224 @@ mod data_plane_tests {
             .expect("deployment exists");
         assert_eq!(retrieved_compactor.config().window_duration, custom_window);
     }
+
+    #[tokio::test]
+    async fn resource_status_reports_budget_and_source_permit_lifecycle() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, _deployments, _db, _compactor, _rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        let frame = |request_id: &str, values_tsv: &str| RuntimeExchangeMessage {
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: request_id.to_string(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "items".to_string(),
+            rows: vec![RuntimeRow {
+                values_tsv: values_tsv.to_string(),
+                weight: 1,
+            }],
+        };
+
+        let before = client.budget_status();
+        client.actor_registry.register(
+            ShardId(100),
+            LeaseToken(777),
+            Arc::new(|_| Box::pin(async {})),
+        );
+        assert_eq!(before.total_budget_bytes, 2_147_483_648);
+        assert_eq!(before.foreground_reservation_bytes, 429_496_729);
+        assert_eq!(before.allocator_overhead_pct, 10);
+        assert_eq!(before.allocated_bytes, 603_979_776);
+        assert_eq!(
+            before.owners,
+            vec![
+                rockstream_types::state_budget::MemoryOwnerUsage {
+                    category: rockstream_types::state_budget::MemoryCategory::SlateDbWriteBuffers,
+                    owner: MemoryOwner::worker("worker-42"),
+                    bytes: 67_108_864,
+                },
+                rockstream_types::state_budget::MemoryOwnerUsage {
+                    category: rockstream_types::state_budget::MemoryCategory::SlateDbBlockCache,
+                    owner: MemoryOwner::worker("worker-42"),
+                    bytes: 375_809_638,
+                },
+                rockstream_types::state_budget::MemoryOwnerUsage {
+                    category: rockstream_types::state_budget::MemoryCategory::SlateDbMetadataCache,
+                    owner: MemoryOwner::worker("worker-42"),
+                    bytes: 161_061_274,
+                },
+            ]
+        );
+        assert_eq!(
+            client.resource_status(),
+            WorkerResourceStatus {
+                worker_id: Some(WorkerId(42)),
+                budget: before.clone(),
+                disk_cache: None,
+                disk_cache_error: None,
+                control_line_buffer_fill_bytes: 0,
+                control_line_buffer_limit_bytes: MAX_CONTROL_MESSAGE_BYTES,
+                control_message_channel_fill: 0,
+                control_message_channel_capacity: WORKER_CONTROL_MESSAGE_CHANNEL_CAPACITY,
+                fence_write_waiter_fill: 0,
+                fence_write_waiter_capacity: MAX_FENCE_WRITE_WAITERS,
+                source_pressure: vec![WorkloadSourcePressureStatus {
+                    workload_id: WorkloadId(1),
+                    allocated_bytes: 0,
+                    soft_limit_bytes: 429_496_729,
+                    state: crate::source_pressure::SourcePressureState::Normal,
+                    available_credits: 100,
+                }],
+                shard_mailboxes: vec![ShardMailboxStatus {
+                    shard_id: ShardId(100),
+                    messages: 0,
+                    bytes: 0,
+                    max_messages: crate::shard_actor::SHARD_ACTOR_MAILBOX_MESSAGES,
+                    max_bytes: crate::shard_actor::SHARD_ACTOR_MAILBOX_BYTES,
+                    overflow_policy: crate::shard_actor::SHARD_ACTOR_MAILBOX_OVERFLOW_POLICY
+                        .to_string(),
+                }],
+            }
+        );
+        let pressure_permit = client
+            .source_pressure
+            .reserve_exchange_frame(WorkloadId(1), 64)
+            .unwrap();
+        assert_eq!(
+            client.resource_status().source_pressure,
+            vec![WorkloadSourcePressureStatus {
+                workload_id: WorkloadId(1),
+                allocated_bytes: 64,
+                soft_limit_bytes: 429_496_729,
+                state: crate::source_pressure::SourcePressureState::Normal,
+                available_credits: 100,
+            }]
+        );
+        drop(pressure_permit);
+        assert_eq!(
+            client.resource_status().source_pressure,
+            vec![WorkloadSourcePressureStatus {
+                workload_id: WorkloadId(1),
+                allocated_bytes: 0,
+                soft_limit_bytes: 429_496_729,
+                state: crate::source_pressure::SourcePressureState::Normal,
+                available_credits: 100,
+            }]
+        );
+        assert_eq!(
+            client.source_pressure_status(WorkloadId(1)),
+            WorkloadSourcePressureStatus {
+                workload_id: WorkloadId(1),
+                allocated_bytes: 0,
+                soft_limit_bytes: 429_496_729,
+                state: crate::source_pressure::SourcePressureState::Normal,
+                available_credits: 100,
+            }
+        );
+
+        client
+            .execute_frame(frame("source-buffer-ok", "1\tone"))
+            .await
+            .unwrap();
+        assert_eq!(client.budget_status(), before);
+
+        let error = client
+            .execute_frame(frame("source-buffer-error", "not-a-row"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "TSV row width does not match source schema"
+        );
+        assert_eq!(client.budget_status(), before);
+    }
+
+    #[tokio::test]
+    async fn fence_write_waiters_reject_exactly_at_the_published_limit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, _deployments, _db, _compactor, mut worker_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        {
+            let mut waiters = client.fence_waiters.lock();
+            let queue = waiters.entry(ShardId(100)).or_default();
+            for _ in 0..MAX_FENCE_WRITE_WAITERS {
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                queue.push(tx);
+            }
+        }
+
+        assert_eq!(
+            client.resource_status().fence_write_waiter_fill,
+            MAX_FENCE_WRITE_WAITERS
+        );
+        let error = client
+            .check_fence_write(ShardId(100), LeaseToken(777))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "RS-9001: quota limit exceeded: maximum fence-write waiters (1024) exceeded; next_steps: retry after the control plane responds"
+        );
+        assert_eq!(client.resource_status().fence_write_waiter_fill, 1024);
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn worker_storage_context_uses_frozen_disk_capacity_and_worker_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(WorkerBudgetLedger::new(
+            WORKER_MEMORY_BUDGET_BYTES,
+            WORKER_FOREGROUND_RESERVATION_BYTES,
+        ));
+        let context = worker_storage_context("worker-7", temp_dir.path(), &ledger).unwrap();
+        let cache = context.nvme_config().unwrap();
+        let configured_root = std::env::var_os("ROCKSTREAM_NVME_CACHE_DIR")
+            .or_else(|| std::env::var_os("ROCKSTREAM_DISK_CACHE_DIR"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| temp_dir.path().join("worker-7/slatedb-cache"));
+
+        assert_eq!(cache.root_folder, configured_root);
+        assert_eq!(cache.max_cache_size_bytes, 34_359_738_368);
+        assert_eq!(
+            ledger.status().allocated_bytes,
+            WORKER_STORAGE_CACHE_BUDGET_BYTES as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn public_resource_status_reports_disk_cache_bytes_and_capacity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_root = temp_dir.path().join("disk-cache");
+        std::fs::create_dir_all(cache_root.join("nested")).unwrap();
+        std::fs::write(cache_root.join("first"), b"abc").unwrap();
+        std::fs::write(cache_root.join("nested/second"), b"12345").unwrap();
+        let (mut client, _deployments, _db, _compactor, _rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        client.storage_context = Arc::new(
+            rockstream_storage::storage_context::WorkerStorageContext::new(1024)
+                .with_nvme_cache(&cache_root, 64),
+        );
+
+        let status = client.resource_status();
+        assert_eq!(
+            status.disk_cache,
+            Some(rockstream_storage::storage_context::DiskCacheStats {
+                used_bytes: 8,
+                capacity_bytes: 64,
+            })
+        );
+        assert_eq!(status.disk_cache_error, None);
+        assert_eq!(
+            status.budget.allocated_bytes,
+            WORKER_STORAGE_CACHE_BUDGET_BYTES as u64 + 67_108_864
+        );
+    }
 }
 
 /// Tracks a shard lease and its local active database instance.
@@ -804,6 +1318,10 @@ pub struct WorkerClientHandle {
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
     secret_manager: Arc<WorkerSecretManager>,
     storage_context: Arc<rockstream_storage::storage_context::WorkerStorageContext>,
+    budget_ledger: Arc<WorkerBudgetLedger>,
+    source_pressure: Arc<SourcePressureController>,
+    control_line_buffer_fill: Arc<AtomicUsize>,
+    actor_registry: ShardActorRegistry,
     compaction_config: Arc<RwLock<EpochCompactionConfig>>,
     deployments: WorkerDeployments,
 }
@@ -851,6 +1369,57 @@ impl WorkerClientHandle {
         &self,
     ) -> Arc<rockstream_storage::storage_context::WorkerStorageContext> {
         self.storage_context.clone()
+    }
+
+    /// Returns the exact worker and workload memory ledger snapshot.
+    pub fn budget_status(&self) -> WorkerBudgetStatus {
+        self.budget_ledger.status()
+    }
+
+    /// Returns workload-owned memory and source pressure at the configured soft limit.
+    pub fn source_pressure_status(&self, workload_id: WorkloadId) -> WorkloadSourcePressureStatus {
+        self.source_pressure.workload_status(workload_id)
+    }
+
+    /// Returns worker memory and per-shard mailbox fill, limits, and overflow policy.
+    pub fn resource_status(&self) -> WorkerResourceStatus {
+        let budget = self.budget_status();
+        let mut workload_ids = budget
+            .owners
+            .iter()
+            .filter_map(|usage| match &usage.owner {
+                MemoryOwner::Workload(workload_id) => Some(*workload_id),
+                MemoryOwner::Worker(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        workload_ids.extend(
+            self.deployments
+                .read()
+                .keys()
+                .map(|(workload_id, _)| *workload_id),
+        );
+        let (disk_cache, disk_cache_error) = match self.storage_context.disk_cache_stats() {
+            Ok(stats) => (stats, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        WorkerResourceStatus {
+            worker_id: self.worker_id(),
+            disk_cache,
+            disk_cache_error,
+            control_line_buffer_fill_bytes: self.control_line_buffer_fill.load(Ordering::Relaxed),
+            control_line_buffer_limit_bytes: MAX_CONTROL_MESSAGE_BYTES,
+            control_message_channel_fill: WORKER_CONTROL_MESSAGE_CHANNEL_CAPACITY
+                .saturating_sub(self.msg_tx.capacity()),
+            control_message_channel_capacity: WORKER_CONTROL_MESSAGE_CHANNEL_CAPACITY,
+            fence_write_waiter_fill: self.fence_waiters.lock().values().map(Vec::len).sum(),
+            fence_write_waiter_capacity: MAX_FENCE_WRITE_WAITERS,
+            source_pressure: workload_ids
+                .into_iter()
+                .map(|workload_id| self.source_pressure_status(workload_id))
+                .collect(),
+            budget,
+            shard_mailboxes: self.actor_registry.mailbox_status(),
+        }
     }
 
     /// Returns the worker ID assigned by the control plane.
@@ -929,21 +1498,20 @@ impl WorkerClientHandle {
     ) -> Result<bool, io::Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            self.fence_waiters
-                .lock()
-                .entry(shard_id)
-                .or_default()
-                .push(tx);
+            let mut waiters = self.fence_waiters.lock();
+            if waiters.values().map(Vec::len).sum::<usize>() >= MAX_FENCE_WRITE_WAITERS {
+                return Err(io::Error::other(format!(
+                    "RS-9001: quota limit exceeded: maximum fence-write waiters ({MAX_FENCE_WRITE_WAITERS}) exceeded; next_steps: retry after the control plane responds"
+                )));
+            }
+            waiters.entry(shard_id).or_default().push(tx);
         }
         let msg = WorkerMessage::FenceWrite {
             shard_id,
             lease_token,
         };
         if self.msg_tx.send(msg).await.is_err() {
-            self.fence_waiters
-                .lock()
-                .get_mut(&shard_id)
-                .map(|w| w.pop());
+            self.fence_waiters.lock().remove(&shard_id);
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "Client channel closed",
@@ -1178,17 +1746,33 @@ where
     let worker_id = Arc::new(RwLock::new(None));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
-    let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMessage>(32);
+    let (msg_tx, mut msg_rx) =
+        mpsc::channel::<WorkerMessage>(WORKER_CONTROL_MESSAGE_CHANNEL_CAPACITY);
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let secret_manager = Arc::new(WorkerSecretManager::new(format!(
         "worker-{proposed_worker_id}"
     )));
-    let storage_context = Arc::new(
-        rockstream_storage::storage_context::WorkerStorageContext::new_with_worker_id(
-            &format!("worker-{proposed_worker_id}"),
-            536_870_912,
-        ),
-    );
+    let worker_name = format!("worker-{proposed_worker_id}");
+    let budget_ledger = Arc::new(WorkerBudgetLedger::new(
+        WORKER_MEMORY_BUDGET_BYTES,
+        WORKER_FOREGROUND_RESERVATION_BYTES,
+    ));
+    let control_line_buffer_permit = budget_ledger
+        .try_acquire_for_owner(
+            MemoryCategory::SourceBuffers,
+            MemoryOwner::worker(format!("{worker_name}/control-line-buffer")),
+            MAX_CONTROL_MESSAGE_BYTES as u64,
+            false,
+        )
+        .map_err(io::Error::other)?;
+    let mut control_line_buffer = Vec::new();
+    control_line_buffer
+        .try_reserve_exact(MAX_CONTROL_MESSAGE_BYTES)
+        .map_err(io::Error::other)?;
+    let control_line_buffer_fill = Arc::new(AtomicUsize::new(0));
+    let storage_context = worker_storage_context(&worker_name, storage_dir, &budget_ledger)?;
+    let source_pressure = Arc::new(SourcePressureController::new(budget_ledger.clone(), 100));
+    let actor_registry = ShardActorRegistry::with_source_pressure(source_pressure.clone());
     let compaction_config = Arc::new(RwLock::new(compaction_config));
 
     let deployments = Arc::new(RwLock::new(HashMap::<
@@ -1204,21 +1788,49 @@ where
         fence_waiters: fence_waiters.clone(),
         secret_manager: secret_manager.clone(),
         storage_context: storage_context.clone(),
+        budget_ledger: budget_ledger.clone(),
+        source_pressure: source_pressure.clone(),
+        control_line_buffer_fill: control_line_buffer_fill.clone(),
+        actor_registry: actor_registry.clone(),
         compaction_config: compaction_config.clone(),
         deployments: deployments.clone(),
     };
 
-    let actor_registry = ShardActorRegistry::new();
     let executor_client = handle.clone();
     let executor_deployments = deployments.clone();
     let execute: FrameExecutor = Arc::new(move |frame| {
         let client = executor_client.clone();
         let deployments = executor_deployments.clone();
         Box::pin(async move {
+            let request_id = frame.request_id.clone();
+            let workload_id = frame.workload_id;
+            let shard_id = frame.shard_id;
+            let epoch = frame.epoch;
+            let lease_token = frame.lease_token;
             if let Err(error) = execute_frame(&client, &deployments, frame).await {
+                let message = error.to_string();
+                let code = if message.starts_with("RS-5003") {
+                    rockstream_types::error_code::RS_5003
+                } else if message.starts_with("RS-9001") {
+                    rockstream_types::error_code::RS_9001
+                } else {
+                    rockstream_types::error_code::RS_0001
+                };
+                let _ = client
+                    .msg_tx
+                    .send(WorkerMessage::ExecutionFailed {
+                        request_id,
+                        workload_id,
+                        shard_id,
+                        epoch,
+                        lease_token,
+                        code: code.to_string(),
+                        message: message.clone(),
+                    })
+                    .await;
                 tracing::warn!(
-                    code = %rockstream_types::error_code::RS_0001,
-                    %error,
+                    %code,
+                    %message,
                     "worker execution refused"
                 );
             }
@@ -1235,8 +1847,10 @@ where
     let execute_clone = execute.clone();
     let storage_context_clone = storage_context.clone();
     let compaction_config_clone = compaction_config.clone();
+    let control_line_fill_clone = control_line_buffer_fill.clone();
 
     let join_handle = tokio::spawn(async move {
+        let _control_line_buffer_permit = control_line_buffer_permit;
         // 1. Send Registration message.
         let reg = WorkerRegistration::new(
             WorkerId(proposed_worker_id),
@@ -1316,12 +1930,79 @@ where
         }));
 
         // 4. Read Loop: process ControlMessage commands from control plane.
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(reader);
+        loop {
+            let has_line = match read_control_line_into(
+                &mut reader,
+                MAX_CONTROL_MESSAGE_BYTES,
+                &mut control_line_buffer,
+                Some(&control_line_fill_clone),
+            )
+            .await
+            {
+                Ok(has_line) => has_line,
+                Err(error) => {
+                    tracing::error!(
+                        code = %rockstream_types::error_code::RS_0001,
+                        error = %error,
+                        "Invalid or oversized message from control plane"
+                    );
+                    break;
+                }
+            };
+            if !has_line {
+                break;
+            }
+            let line = match std::str::from_utf8(&control_line_buffer) {
+                Ok(line) => line,
+                Err(error) => {
+                    tracing::error!(
+                        code = %rockstream_types::error_code::RS_0001,
+                        error = %error,
+                        "Invalid or oversized message from control plane"
+                    );
+                    control_line_buffer.clear();
+                    control_line_fill_clone.store(0, Ordering::Relaxed);
+                    break;
+                }
+            };
             if line.trim().is_empty() {
+                control_line_buffer.clear();
+                control_line_fill_clone.store(0, Ordering::Relaxed);
                 continue;
             }
-            let msg: ControlMessage = match serde_json::from_str(&line) {
+            let (decode_permit, _execute_context) =
+                match reserve_control_decode(line, &budget_ledger, &worker_name) {
+                    Ok(reservation) => reservation,
+                    Err((execute, error)) => {
+                        let is_execute = execute.is_some();
+                        if let Some(execute) = execute {
+                            let _ = msg_tx
+                                .send(WorkerMessage::ExecutionFailed {
+                                    request_id: execute.request_id,
+                                    workload_id: execute.workload_id,
+                                    shard_id: execute.shard_id,
+                                    epoch: execute.epoch,
+                                    lease_token: execute.lease_token,
+                                    code: rockstream_types::error_code::RS_5003.to_string(),
+                                    message: error.to_string(),
+                                })
+                                .await;
+                        }
+                        tracing::warn!(
+                            code = %rockstream_types::error_code::RS_5003,
+                            error = %error,
+                            "Worker refused control-message allocation before decode"
+                        );
+                        control_line_buffer.clear();
+                        control_line_fill_clone.store(0, Ordering::Relaxed);
+                        if is_execute {
+                            continue;
+                        }
+                        break;
+                    }
+                };
+            let msg: ControlMessage = match serde_json::from_str(line) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(
@@ -1330,9 +2011,19 @@ where
                         e,
                         line
                     );
+                    control_line_buffer.clear();
+                    control_line_fill_clone.store(0, Ordering::Relaxed);
                     continue;
                 }
             };
+            let decode_permit = if matches!(&msg, ControlMessage::Execute { .. }) {
+                Some(decode_permit)
+            } else {
+                drop(decode_permit);
+                None
+            };
+            control_line_buffer.clear();
+            control_line_fill_clone.store(0, Ordering::Relaxed);
 
             match msg {
                 ControlMessage::BeginDrain(request) => {
@@ -1510,10 +2201,36 @@ where
                     }
                 }
                 ControlMessage::Execute { frame } => {
-                    if let Err(error) = actor_registry_clone.enqueue(frame) {
+                    let request_id = frame.request_id.clone();
+                    let workload_id = frame.workload_id;
+                    let shard_id = frame.shard_id;
+                    let epoch = frame.epoch;
+                    let lease_token = frame.lease_token;
+                    let enqueue_result =
+                        actor_registry_clone.enqueue_with_backpressure(frame).await;
+                    drop(decode_permit);
+                    if let Err(error) = enqueue_result {
+                        let code =
+                            if matches!(error, crate::shard_actor::ShardActorError::Budget(_)) {
+                                rockstream_types::error_code::RS_5003
+                            } else {
+                                rockstream_types::error_code::RS_0001
+                            };
+                        let message = error.to_string();
+                        let _ = msg_tx
+                            .send(WorkerMessage::ExecutionFailed {
+                                request_id,
+                                workload_id,
+                                shard_id,
+                                epoch,
+                                lease_token,
+                                code: code.to_string(),
+                                message: message.clone(),
+                            })
+                            .await;
                         tracing::warn!(
-                            code = %rockstream_types::error_code::RS_0001,
-                            %error,
+                            %code,
+                            %message,
                             "worker execution frame refused"
                         );
                     }

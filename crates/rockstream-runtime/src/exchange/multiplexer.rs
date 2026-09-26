@@ -50,6 +50,31 @@ pub struct WorkerStreamMultiplexer {
     cancel_token: CancellationToken,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShuffleSenderQueueStatus {
+    pub target_worker_id: WorkerId,
+    pub fill: usize,
+    pub capacity: usize,
+    pub overflow_policy: String,
+}
+
+fn sender_queue_status(
+    streams: &HashMap<WorkerId, mpsc::Sender<ShuffleFrame>>,
+) -> Vec<ShuffleSenderQueueStatus> {
+    let mut status = streams
+        .iter()
+        .map(|(worker_id, sender)| ShuffleSenderQueueStatus {
+            target_worker_id: *worker_id,
+            fill: sender.max_capacity().saturating_sub(sender.capacity()),
+            capacity: sender.max_capacity(),
+            overflow_policy: "await_channel_capacity; durable_fallback_after_stream_failure"
+                .to_string(),
+        })
+        .collect::<Vec<_>>();
+    status.sort_by_key(|entry| entry.target_worker_id.0);
+    status
+}
+
 impl WorkerStreamMultiplexer {
     /// Create a new multiplexer.
     pub fn new(
@@ -630,10 +655,48 @@ impl WorkerStreamMultiplexer {
         self.streams.lock().len()
     }
 
+    /// Current queued shuffle frames for each target worker stream.
+    pub fn sender_queue_status(&self) -> Vec<ShuffleSenderQueueStatus> {
+        sender_queue_status(&self.streams.lock())
+    }
+
     /// Evict a dead or drained worker's stream from the multiplexer and update metrics gauge.
     pub fn evict_worker(&self, worker_id: WorkerId) {
         let mut streams = self.streams.lock();
         streams.remove(&worker_id);
         rockstream_types::metrics::set_exchange_multiplexer_streams_size(streams.len() as u64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sender_queue_status_reports_exact_fill_and_policy() {
+        let (sender, _receiver) = mpsc::channel(2);
+        sender
+            .try_send(ShuffleFrame {
+                exchange_id: 1,
+                src_shard: 2,
+                target_shard: 3,
+                epoch: 4,
+                seq: 5,
+                payload: vec![6].into(),
+                row_count: 1,
+            })
+            .unwrap();
+        let streams = HashMap::from([(WorkerId(7), sender)]);
+
+        assert_eq!(
+            sender_queue_status(&streams),
+            vec![ShuffleSenderQueueStatus {
+                target_worker_id: WorkerId(7),
+                fill: 1,
+                capacity: 2,
+                overflow_policy: "await_channel_capacity; durable_fallback_after_stream_failure"
+                    .to_string(),
+            }]
+        );
     }
 }

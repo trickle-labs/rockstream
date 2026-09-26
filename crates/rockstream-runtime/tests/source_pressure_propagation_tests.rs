@@ -1,7 +1,10 @@
 //! Source Pressure Propagation and Credit Reduction Tests (v0.62.1 Slice 7 / Phase 3b).
 
-use rockstream_runtime::source_pressure::{SourcePressureController, SourcePressureState};
-use rockstream_types::state_budget::{MemoryCategory, WorkerBudgetLedger};
+use rockstream_runtime::source_pressure::{
+    SourcePressureController, SourcePressureState, WorkloadSourcePressureStatus,
+};
+use rockstream_types::ids::WorkloadId;
+use rockstream_types::state_budget::{MemoryCategory, MemoryOwner, WorkerBudgetLedger};
 use std::sync::Arc;
 
 #[test]
@@ -78,4 +81,33 @@ fn test_source_resumes_when_pressure_clears() {
     assert_eq!(controller.pressure_state(), SourcePressureState::Normal);
     assert_eq!(controller.available_credits(), 1000);
     assert!(controller.can_ingest().is_ok());
+}
+
+#[test]
+fn workload_status_reports_worker_pause_that_rejects_ingestion() {
+    let ledger = Arc::new(WorkerBudgetLedger::new(10_000, 0));
+    let controller = SourcePressureController::new(ledger.clone(), 100);
+    let _worker_allocation = ledger
+        .try_acquire_for_owner(
+            MemoryCategory::OperatorState,
+            MemoryOwner::worker("shared-operator-state"),
+            9_000,
+            false,
+        )
+        .expect("worker allocation reaches paused pressure while remaining in budget");
+
+    assert_eq!(
+        controller.can_ingest().unwrap_err().to_string(),
+        "RS-5003: state budget exceeded for 'source_pressure_paused': current=9000 bytes, requested=0 bytes, limit=10000 bytes"
+    );
+    assert_eq!(
+        controller.workload_status(WorkloadId(7)),
+        WorkloadSourcePressureStatus {
+            workload_id: WorkloadId(7),
+            allocated_bytes: 0,
+            soft_limit_bytes: 429_496_729,
+            state: SourcePressureState::Paused,
+            available_credits: 0,
+        }
+    );
 }

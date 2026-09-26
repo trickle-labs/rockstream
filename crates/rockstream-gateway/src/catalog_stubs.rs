@@ -4301,8 +4301,8 @@ impl CatalogStubs {
             requested_cols.to_vec()
         };
         let ql = query.to_lowercase();
-        let ops = self.list_operations();
-        let rows = ops
+        let mut operations = self
+            .list_operations()
             .into_iter()
             .filter(|o| {
                 if ql.contains("where") {
@@ -4329,20 +4329,27 @@ impl CatalogStubs {
                 }
                 true
             })
-            .take(MAX_OPERATIONS_SCAN_ROWS)
-            .map(|o| {
+            .peekable();
+        let mut rows = Vec::new();
+        for operation in operations.by_ref().take(MAX_OPERATIONS_SCAN_ROWS) {
+            rows.push(
                 cols.iter()
                     .map(|col| match col.to_ascii_lowercase().as_str() {
-                        "operation_id" => Some(o.operation_id.clone()),
-                        "kind" => Some(o.kind.clone()),
-                        "target" => Some(o.target.clone()),
-                        "phase" => Some(o.phase.clone()),
-                        "progress_pct" => Some(o.progress_pct.to_string()),
+                        "operation_id" => Some(operation.operation_id.clone()),
+                        "kind" => Some(operation.kind.clone()),
+                        "target" => Some(operation.target.clone()),
+                        "phase" => Some(operation.phase.clone()),
+                        "progress_pct" => Some(operation.progress_pct.to_string()),
                         _ => None,
                     })
-                    .collect()
-            })
-            .collect();
+                    .collect(),
+            );
+        }
+        if operations.peek().is_some() {
+            return CatalogResponse::Error(format!(
+                "[RS-9001] operations catalog scan exceeds the {MAX_OPERATIONS_SCAN_ROWS}-row limit"
+            ));
+        }
         CatalogResponse::rows(cols, rows)
     }
 
@@ -5183,6 +5190,8 @@ pub enum CatalogResponse {
     },
     /// A command completion (no rows).
     CommandComplete(String),
+    /// A bounded catalog operation was rejected before returning partial rows.
+    Error(String),
 }
 
 impl CatalogResponse {
@@ -5201,6 +5210,53 @@ mod tests {
     };
     use rockstream_types::workload::{MemoryLimit, WorkloadDef};
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn operations_catalog_returns_exact_limit_and_rejects_overflow() {
+        let catalog = CatalogStubs::new();
+        for index in 0..MAX_OPERATIONS_SCAN_ROWS {
+            catalog.add_operation(CatalogOperationEntry {
+                operation_id: format!("op-{index:04}"),
+                kind: "drain".to_string(),
+                target: "worker-1".to_string(),
+                phase: "RUNNING".to_string(),
+                progress_pct: 50,
+            });
+        }
+        let query = "SELECT * FROM rockstream_catalog.operations";
+        let expected_rows = (0..MAX_OPERATIONS_SCAN_ROWS)
+            .map(|index| {
+                vec![
+                    Some(format!("op-{index:04}")),
+                    Some("drain".to_string()),
+                    Some("worker-1".to_string()),
+                    Some("RUNNING".to_string()),
+                    Some("50".to_string()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            catalog.catalog_operations_response(query, &[]),
+            CatalogResponse::Rows {
+                columns: operations_columns(),
+                rows: expected_rows,
+            }
+        );
+
+        catalog.add_operation(CatalogOperationEntry {
+            operation_id: "op-over-limit".to_string(),
+            kind: "drain".to_string(),
+            target: "worker-1".to_string(),
+            phase: "RUNNING".to_string(),
+            progress_pct: 50,
+        });
+        assert_eq!(
+            catalog.catalog_operations_response(query, &[]),
+            CatalogResponse::Error(
+                "[RS-9001] operations catalog scan exceeds the 1000-row limit".to_string()
+            )
+        );
+    }
 
     #[test]
     fn show_backfill_status_reports_exact_running_row() {

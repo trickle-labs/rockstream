@@ -47,7 +47,8 @@ pub use shard_db::{
     MAX_RECOVERY_SCAN_BUFFER_BYTES, MAX_RESTORE_SCAN_PAGE_ROWS,
 };
 pub use storage_context::{
-    BlockCacheKey, NvmeCacheConfig, SharedStorageContext, StorageCacheStats, WorkerStorageContext,
+    BlockCacheKey, DiskCacheStats, NvmeCacheConfig, SharedStorageContext, StorageCacheStats,
+    WorkerStorageContext,
 };
 pub use tiered_store::{
     build_migration_object_store, build_runtime_object_store, build_s3_backend_from_config,

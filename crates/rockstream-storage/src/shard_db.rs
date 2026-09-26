@@ -13,6 +13,7 @@ use rockstream_types::compatibility::SupportedStorageFormatRange;
 use rockstream_types::frontier::ShardFrontierReport;
 use rockstream_types::ids::ShardId;
 use rockstream_types::merge_law::{ArrangementHeader, MergeLawId};
+use rockstream_types::state_budget::MemoryPermit;
 use slatedb::config::{CheckpointOptions, CheckpointScope, Settings};
 use slatedb::Db;
 
@@ -156,6 +157,7 @@ pub struct ShardDb {
     format_version: u8,
     migration_pending: bool,
     storage_context: Option<Arc<crate::storage_context::WorkerStorageContext>>,
+    _write_buffer_permit: Option<Arc<MemoryPermit>>,
     concurrency_governor: Option<Arc<crate::concurrency_governor::ConcurrencyGovernor>>,
     disk_cache_dir: Option<std::path::PathBuf>,
     cleanup_on_drop: bool,
@@ -379,6 +381,22 @@ impl ShardDbBuilder {
             .clone()
             .unwrap_or_else(|| "worker-unknown".to_string());
 
+        let write_buffer_permit = if let Some(context) = &self.storage_context {
+            self.settings.max_unflushed_bytes = self
+                .settings
+                .max_unflushed_bytes
+                .min(crate::storage_context::WORKER_SLATEDB_WRITE_BUFFER_CAPACITY_BYTES);
+            self.settings.l0_sst_size_bytes = self
+                .settings
+                .l0_sst_size_bytes
+                .min(self.settings.max_unflushed_bytes / 2);
+            context
+                .reserve_slate_db_write_buffers(self.settings.max_unflushed_bytes as u64)?
+                .map(Arc::new)
+        } else {
+            None
+        };
+
         // Inherit NVMe cache from WorkerStorageContext if not explicitly configured
         if self.disk_cache_dir.is_none() {
             if let Some(ref ctx) = self.storage_context {
@@ -493,6 +511,7 @@ impl ShardDbBuilder {
             format_version,
             migration_pending,
             storage_context: self.storage_context,
+            _write_buffer_permit: write_buffer_permit,
             concurrency_governor: self.concurrency_governor,
             disk_cache_dir: self.disk_cache_dir,
             cleanup_on_drop: self.cleanup_on_drop,
