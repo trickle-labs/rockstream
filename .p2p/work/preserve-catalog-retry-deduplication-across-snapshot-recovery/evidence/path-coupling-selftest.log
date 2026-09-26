@@ -1,0 +1,1 @@
+check-path-coupling tests: Verus-only and catalog recovery changes are excluded; protocol changes require model updates.

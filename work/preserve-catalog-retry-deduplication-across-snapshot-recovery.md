@@ -1,0 +1,52 @@
+# Acceptance contract: #101 Preserve catalog retry deduplication across snapshot recovery
+
+Contract revision: v1
+Source: [captured GitHub issue #101](sources/issue-101.md).
+Source attribution: https://github.com/trickle-labs/rockstream/issues/101, retrieved 2026-09-26; original contract also cites test-suite audit B1 at revision `5d9c3b919682140ec0b365d7dba848cd5cf5ecbb`.
+Parent contract: None
+Prerequisites: None
+
+Advisory learnings: None
+
+Intended outcome: Retrying an already committed catalog operation after snapshot, compaction, and recovery remains an idempotent no-op and never resurrects metadata.
+
+Storage handoff: Canonical destination `work/preserve-catalog-retry-deduplication-across-snapshot-recovery.md`, revision v1; migrated from `docs/acceptance-contracts/101.md` with R1-R5 preserved.
+
+## Acceptance matrix
+
+| ID | Source | Requirement | Boundaries / counterexamples | Seam | Oracle | Planned evidence | Plan state |
+|---|---|---|---|---|---|---|---|
+| R1 | #101 AC1 | After creating T at operation 555, deleting it at operation 556, snapshotting, compacting, and recovering, the catalog reports revision 2 and an empty complete table list. | A recovered revision 1 or resurrected T fails. | Public catalog transaction and recovery APIs. | Expected revision 2 and empty metadata. | Permanent catalog recovery regression with exact records. | planned |
+| R2 | #101 AC2 | Retrying operation 555 returns revision 2, leaves current revision 2, and leaves the complete catalog empty. | Any replayed create or revision regression fails. | Catalog commit/retry API. | Independent expected post-delete catalog state. | Exact retry assertions after recovery. | planned |
+| R3 | #101 AC3 | Retrying the old operation creates or changes no log object and preserves the complete stored-object inventory and bytes. | Any new or changed log object fails. | Catalog object-store boundary. | Byte-for-byte inventory captured before retry. | Object inventory and byte comparison. | planned |
+| R4 | #101 AC4 | Repeated recovery and retry, including an old ALTER after a newer definition, preserve the latest metadata unchanged. | Older definition or revision winning fails. | Recovery plus catalog mutation API. | Latest committed definition and revision. | Repeat recovery/retry regression with full records. | planned |
+| R5 | #101 AC5 | Log-only replay and snapshot recovery both retain successful full-record coverage. | Count-only or fixture-only replay is insufficient. | Existing catalog recovery tests. | Exact metadata and log records. | Named log-only and snapshot tests. | planned |
+
+## Unresolved gaps
+
+- None.
+
+## Open questions
+
+- None.
+
+## Out of scope
+
+- New catalog operation types or a generalized deduplication framework.
+
+## Change notes
+
+- Initial contract.
+- Migrated the existing contract to `work/preserve-catalog-retry-deduplication-across-snapshot-recovery.md`; preserved revision v1, requirement IDs, and acceptance promises.
+
+## Implementation handoff
+
+Hand off to an explicitly authorized /implement-contract invocation.
+Implement the smallest complete solution inside the spec envelope.
+Preserve requirement IDs and promised outcomes.
+Capture the resulting candidate for separate /review-implementation and /prove phases.
+
+## Proof handoff
+
+Evaluate every requirement against this contract revision and one fixed candidate.
+Record actual evidence and verdicts in a separate proof report.

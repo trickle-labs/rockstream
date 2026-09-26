@@ -1,0 +1,12 @@
+{
+  "work_item": "work/preserve-catalog-retry-deduplication-across-snapshot-recovery.md",
+  "work_item_sha256": "1ec42b3f5f7e40411f36b2def29c20ab11e02a7782879b083ee712aae3ad2ed7",
+  "comparison_base": "6442838183ffd913b6a24860072575aacaa9c96a",
+  "binding_inputs": [
+    {
+      "path": "work/sources/issue-101.md",
+      "sha256": "1675f2decaf1ac45de4edfbe2240c64d38b3f095d637796b95aa9a0e42a8668c"
+    }
+  ],
+  "commit": "71ec6550b11453bbc02336dcc8ddfc0d3b2d2d3a"
+}
