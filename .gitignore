@@ -11,3 +11,4 @@ output.txt
 .cache
 .DS_Store
 /.scratch
+/.p2p/tmp/
