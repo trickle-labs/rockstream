@@ -7,6 +7,7 @@
 //! `latest valid snapshot + subsequent valid log entries = current catalog state`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 use super::envelope::compute_checksum;
 use super::{
@@ -33,6 +34,9 @@ pub struct CatalogSnapshot {
     pub sinks: Vec<CatalogSinkEntry>,
     pub roles: Vec<CatalogRoleEntry>,
     pub compiled_plans: Vec<CompiledPlanRecord>,
+    /// Successful operation identities must survive log compaction.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub committed_operations: BTreeSet<u64>,
     pub checksum: u32,
 }
 
@@ -54,6 +58,7 @@ impl CatalogSnapshot {
         sinks: Vec<CatalogSinkEntry>,
         roles: Vec<CatalogRoleEntry>,
         compiled_plans: Vec<CompiledPlanRecord>,
+        committed_operations: BTreeSet<u64>,
     ) -> Result<Self, CatalogError> {
         let mut snap = Self {
             revision,
@@ -70,6 +75,7 @@ impl CatalogSnapshot {
             sinks,
             roles,
             compiled_plans,
+            committed_operations,
             checksum: 0,
         };
 
