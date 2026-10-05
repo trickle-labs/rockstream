@@ -4,10 +4,13 @@ This document explains how RockStream is built and how it works. It is written
 to be read from top to bottom: it starts with the core idea, follows a single
 piece of data on its journey through the system, and then opens up each major
 subsystem in turn. If the [README](README.md) tells you *what* RockStream does
-and *why*, this document tells you *how*. The two deeper specifications —
+and *why*, this document tells you *how*. It describes the **v0.71.0** workspace
+and the current implementation. The deeper specifications —
 [DESIGN.md](DESIGN.md) for the full system and [IVM.md](IVM.md) for the
-incremental engine — remain the authoritative references; this is the map that
-helps you navigate them.
+incremental engine — provide design detail, including planned behavior. For
+public support commitments, use the [capability matrix](docs/capability-matrix.md)
+and [SQL support reference](docs/reference/sql-support.md). An operator or
+protocol implemented in Rust does not by itself imply SQL reachability.
 
 ---
 
@@ -30,11 +33,15 @@ RockStream leans so hard on a *theory* rather than a bag of hand-written rules i
 that incremental computation is treacherous. It is easy to write an
 update-the-total shortcut that is correct for inserts but subtly wrong for
 deletes, or for an outer join, or when a late record arrives out of order. DBSP
-gives a single guarantee that makes the whole system trustworthy:
+provides the equivalence that the implementation aims to preserve:
 
-> For any query `Q` and any stream of changes `Δ`, the incrementally maintained
-> result is *bit-for-bit identical* to what you would get by re-running `Q` over
-> all the accumulated data.
+> For a supported query `Q`, incremental maintenance over changes `Δ` produces
+> the same weighted result as batch evaluation over the accumulated data.
+
+Exact integer and decimal aggregates, integer-key equi-joins, and supported time
+windows are Core capabilities. Floating-point aggregation is approximate and
+Experimental; text aggregates and binary UTF-8 equi-joins are Maintain.
+Equivalence of query results does not imply identical row ordering or wire bytes.
 
 RockStream does not merely hope this holds — it *tests* it continuously, with a
 dedicated correctness oracle described in §9. Everything else in the
@@ -51,7 +58,8 @@ an update is simply a `-1` for the old version paired with a `+1` for the new
 one. Aggregates, joins, and filters all become arithmetic over these weights,
 and — crucially — the operations are associative and commutative, so changes can
 be reordered, batched, and merged without changing the final answer. In the
-code, a Z-set is an Arrow `RecordBatch` with an extra weight column, which means
+code, `ArrowZSet` pairs an Arrow `RecordBatch` with integer weights; helpers also
+encode weights as a column for transport. This means
 the engine gets columnar, vectorized data layout for free. This single
 representation is what lets the same delta flow correctly whether it is processed
 now or replayed after a crash, on one machine or shuffled across thirty.
@@ -64,8 +72,8 @@ Before dissecting the parts, it helps to watch the whole machine move. Suppose
 you have created a materialized view — `SELECT region, SUM(amount) FROM orders
 GROUP BY region` — and a new order arrives.
 
-1. **The change enters.** It arrives either through a **connector** (Kafka, an
-   S3 file, a Postgres CDC stream) or because a client issued a direct `INSERT`
+1. **The change enters.** It arrives either through a **connector** (Kafka or a
+   PostgreSQL CDC stream) or because a client issued a direct `INSERT`
    over the Postgres wire protocol into the **gateway**. Either way it becomes a
    `+1`-weighted row in a Z-set.
 
@@ -77,16 +85,18 @@ GROUP BY region` — and a new order arrives.
 
 3. **It flows through the circuit.** The view's query was compiled, once, into a
    graph of **operators** — a "circuit." Our order's delta enters at the source
-   node and flows downward. The `Filter` and `Project` operators pass deltas
-   through untouched (they are *linear*); the `Aggregate` operator is where the
-   real work happens: it reads the current `SUM` for that region from storage,
+   node and flows downward. The `Filter` and `Project` operators apply their
+   predicate or expressions to the delta (they are *linear*); the `Aggregate`
+   operator reads the current `SUM` for that region from its arrangement,
    adds the delta, and emits the *change to the output* — say, region "EMEA"
    went from 4,200 to 4,350, so it emits `-1×(EMEA,4200)` and `+1×(EMEA,4350)`.
+   Distributed ingestion assigns rows by routing key to shard owners, so equal
+   grouping or join keys reach the same partition.
 
 4. **State is persisted.** The aggregate's running total lives in an
    **arrangement** — an indexed, persistent key-value structure backed by
-   SlateDB on object storage. The new total is written as part of the epoch's
-   atomic **WriteBatch**.
+   SlateDB on a local-filesystem or shared object-store backend. The new total
+   is written as part of the epoch's atomic **WriteBatch**.
 
 5. **The epoch commits.** Once every operator in the circuit has processed the
    epoch and all writes are durable, the shard advances its **frontier** — a
@@ -108,50 +118,37 @@ anatomy behind that heartbeat.
 
 ## 3. The Shape of the System: Crates and Layers
 
-RockStream is a single Cargo workspace of thirteen purpose-built crates, and a
-single binary (`rockstream`) that can play any role in a cluster depending on
-the flags you pass it. The crates stack into clean layers, and the dependency
-arrows only ever point downward — a discipline that keeps the foundational types
-free of execution concerns and the execution engine free of distribution
-concerns.
+The Cargo workspace contains **seventeen crates under `crates/`**, plus the
+`fuzz` package. `rockstream-cli` builds the operator binary, `rockstream`;
+`rockstream-docgen` builds the reference generator. These are responsibility
+boundaries rather than a strict dependency ladder: for example, SQL depends on
+control and storage, and the gateway composes compilation, runtime, and connectors.
 
-```
-                       ┌──────────────────────┐
-   user-facing  ──────▶│   rockstream-cli     │  one binary, role = flag
-                       └──────────┬───────────┘
-                                  │
-        ┌─────────────────────────┼──────────────────────────┐
-        ▼                         ▼                           ▼
-┌───────────────┐      ┌────────────────────┐     ┌────────────────────┐
-│ rockstream-   │      │  rockstream-gateway│     │ rockstream-control │
-│   sql (front) │      │  (Postgres wire)   │     │  (cluster brain)   │
-└──────┬────────┘      └─────────┬──────────┘     └─────────┬──────────┘
-       │                         │                          │
-       ▼                         ▼                          │
-┌───────────────┐      ┌────────────────────┐               │
-│ rockstream-   │      │ rockstream-runtime │◀──────────────┘
-│   diff (∂)    │      │ (worker + exchange)│
-└──────┬────────┘      └─────────┬──────────┘
-       │                         │
-       ▼                         ▼
-┌───────────────┐      ┌────────────────────┐     ┌────────────────────┐
-│ rockstream-   │─────▶│  rockstream-ops    │────▶│ rockstream-storage │
-│   plan (IR)   │      │  (operators)       │     │  (SlateDB wrapper) │
-└───────────────┘      └────────────────────┘     └────────────────────┘
-                                  │
-        ┌─────────────────────────┴──────────────────────────┐
-        ▼                                                     ▼
-┌────────────────────┐                            ┌────────────────────┐
-│rockstream-connectors│                           │  rockstream-types  │
-│ (Kafka/S3/CDC/...)  │                           │  (the lingua franca)│
-└────────────────────┘                            └────────────────────┘
+| Responsibility | Crates | Main contract |
+| --- | --- | --- |
+| Shared vocabulary and verified kernels | `rockstream-types`, `rockstream-verified` | Epochs, weighted batches, identities, schemas, checked arithmetic, codecs, routing and frontier kernels |
+| Compilation | `rockstream-sql`, `rockstream-plan`, `rockstream-diff` | SQL → logical `PlanNode` → physical `OpNode` circuit |
+| Execution and persistence | `rockstream-ops`, `rockstream-runtime`, `rockstream-storage` | Operators, shard actors, exchange, arrangements and durable epoch commits |
+| Coordination and administration | `rockstream-control`, `rockstream-management-proto` | Leases, placement, checkpoints, migrations and versioned management RPCs |
+| User and I/O boundaries | `rockstream-gateway`, `rockstream-connectors`, `rockstream-cli` | PostgreSQL protocol, Kafka/CDC, configuration and node lifecycle |
+| Validation and references | `rockstream-oracle`, `rockstream-sim`, `rockstream-test-support`, `rockstream-docgen` | Batch comparison, seeded faults, external-service harnesses and generated docs |
 
-   testing & validation, used by everything above:
-   rockstream-oracle (correctness)   rockstream-sim (deterministic chaos)
+The following diagram shows the main execution flow, not Cargo dependencies:
+
+```mermaid
+flowchart LR
+    Client[PostgreSQL client] --> Gateway[Gateway]
+    Gateway --> Compiler[SQL / plan / diff]
+    Compiler --> Circuit[Operators / shard actors]
+    Source[Kafka / PostgreSQL CDC] --> Circuit
+    Circuit <--> Storage[SlateDB arrangements]
+    Circuit --> Sink[Kafka sink]
+    Storage --> Gateway
+    Control[Control plane] -->|leases, placement, checkpoints| Circuit
+    CLI[CLI / management API] --> Control
 ```
 
-At the very bottom sits **rockstream-types**, which depends on nothing else in
-the workspace and is depended on by everything. It is the shared vocabulary of
+**rockstream-types** is the shared vocabulary of
 the system: epochs and event-time watermarks, frontiers, Z-set batches, schema
 definitions and their evolution rules, identity types for workers and operators,
 the merge-law descriptors that underpin algebraic aggregation, ACLs, checkpoint
@@ -160,16 +157,11 @@ appear in operator diagnostics. Because every other crate speaks in these terms,
 a frontier means exactly one thing whether it is being computed in an operator,
 shuffled across the network, or reported up to the control plane.
 
-The remaining crates fall into four bands. **The compilation front-end**
-(`rockstream-plan`, `rockstream-sql`, `rockstream-diff`) turns SQL into an
-executable circuit. **The execution engine** (`rockstream-ops`,
-`rockstream-storage`, `rockstream-runtime`) runs that circuit and persists its
-state. **The distributed and user-facing layer** (`rockstream-control`,
-`rockstream-gateway`, `rockstream-connectors`, `rockstream-cli`) coordinates a
-cluster, speaks Postgres, moves data in and out, and provides the operator's
-command line. And **the validation harness** (`rockstream-oracle`,
-`rockstream-sim`) exists purely to prove the other three bands correct. The
-sections that follow walk these bands in the order a query travels through them.
+It depends on **rockstream-verified**, whose Verus kernels are used by production
+callers for selected arithmetic, encoding, routing, persistence and frontier
+checks. This verification covers those kernels under their stated assumptions;
+it is not a proof of the entire database. The sections that follow walk the
+system in the order a query travels through it.
 
 ---
 
@@ -177,7 +169,7 @@ sections that follow walk these bands in the order a query travels through them.
 
 When you write `CREATE MATERIALIZED VIEW sales AS SELECT ...`, three crates
 collaborate to turn that text into a running incremental circuit, and they do so
-exactly once — at deploy time, not on every change.
+at view creation or reconstruction after recovery, rather than on every change.
 
 **rockstream-sql** is the front door. Rather than reinvent SQL parsing and
 optimization, it stands on the shoulders of [Apache
@@ -215,8 +207,15 @@ input into a delta on the running result. This is precisely the place where
 incremental correctness is won or lost, which is why it is small, focused, and
 guarded by the oracle.
 
-The product of these three crates is a physical operator graph — a circuit —
-ready to be handed to the runtime and executed against live deltas.
+`rockstream-ops::compile` constructs executable operators from the physical
+graph. The gateway uses this compiled path for maintained views and dispatches
+committed deltas through view dependencies. Inline views expand at compilation
+time without owning separate maintenance state. Compatible consumers can share
+indexed arrangements tracked by `ArrangementCatalog`.
+
+The Rust IR includes more nodes than the public frontend admits. Unsupported
+constructs must be rejected at the frontend or compilation boundary; see
+[language features](docs/language-features.md) for the supported subset.
 
 ---
 
@@ -228,7 +227,7 @@ If the front-end builds the circuit, **rockstream-ops** is the library of parts
 the circuit is made from, plus the scheduler that drives them. Every node in the
 graph implements a common `Operator` trait and runs inside an `OperatorTask`
 event loop that consumes input deltas and produces output deltas. The crate
-implements the full operator catalog: the stateless linear operators (filter,
+implements the operator catalog: the stateless linear operators (filter,
 project, map); the stateful ones that maintain arrangements (aggregate with its
 DBSP delta rules, min/max via indexed arrangements, distinct, top-K, time
 windows, inner and outer joins); the source operators that introduce data; and
@@ -243,23 +242,31 @@ small `WriteBatch`es into fewer, larger writes to storage, which matters
 enormously when your durable store is object storage and every write has latency
 and cost. The crate also ships an `EmbeddedRuntime` that runs a whole circuit in
 a single process — the engine you get on a laptop, and the engine the tests
-exercise.
+exercise. Public support varies by operator and input type; the capability
+matrix, rather than the presence of an implementation, defines the commitment.
+
+Stateful operators use spillable arrangements to keep a bounded working set in
+memory and load colder keys from `ShardDb` on demand. Worker memory accounting,
+the `SpillGovernor`, transport limits and source-pressure controls share the
+task of keeping work bounded. Dirty state belongs to the durable epoch commit;
+evicting a cache entry is not an acknowledgement of a committed change.
 
 ### 5.2 State and durability (`rockstream-storage`)
 
 Operator state and view results all live in **arrangements**, and arrangements
 live in **SlateDB** — an LSM-tree key-value store designed to sit directly on
-object storage (S3, GCS, MinIO). This choice is foundational rather than
-incidental: it is what lets RockStream treat compute and storage as separate,
-independently scalable tiers, and it is why moving from a laptop to a cluster
-involves no data migration — the same files written against MinIO open against
-S3.
+object storage. The configured backend can be a local filesystem for a standalone
+node or S3-compatible storage, including MinIO, for shared durable state. Shared
+storage allows compute ownership to move without copying a shard's full dataset
+between workers. Moving a local deployment to a different backend still requires
+an explicit export/restore or data transfer.
 
 **rockstream-storage** is the disciplined wrapper around SlateDB's real API
 surface. It owns the **key encoding scheme** that namespaces every shard's data
 so nothing collides; the `ShardDb` abstraction for per-shard reads and writes;
-the `WriteBatch` builders that make an epoch's writes atomic; a `DbReader` for
-consistent cross-shard snapshot reads; and a **merge-operator registry** that
+the `WriteBatch` builders that make an epoch's writes atomic; `ShardReader`,
+which wraps SlateDB's `DbReader` for checkpoint-pinned reads; and a
+**merge-operator registry** that
 teaches SlateDB how to combine partial aggregates (a `SUM`, a `COUNT`) directly
 in the store, so the engine can often avoid an expensive read-modify-write
 round-trip entirely. It also manages the write-ahead log and a WAL-listing cache
@@ -267,7 +274,19 @@ that keeps the hot path from paying for expensive object-store `LIST` calls. A
 deliberate constraint runs through this crate: it assumes only what SlateDB
 actually offers (for example, there is no range-delete, so cleanup is done by
 scan-and-delete or compaction filters), which keeps the design honest about its
-real foundation.
+real foundation. Optional local NVMe block caching and SSTable Bloom filters
+reduce repeated object-store reads and negative arrangement lookups. The cache
+is disposable; the configured durable backend remains authoritative.
+
+Metadata has its own durable owner: `DurableCatalogStore` in
+[`rockstream-storage::catalog`](crates/rockstream-storage/src/catalog/store.rs).
+Catalog transactions persist versioned, checksummed records with stable object
+IDs and a monotonic catalog revision. Recovery loads a valid snapshot and replays
+later transaction logs. Snapshots include committed operation IDs, preserving
+retry deduplication after restart and log compaction. Old logs are deleted only
+after a durable snapshot has been validated. SQL and PostgreSQL catalog
+projections are derived from this recovered state rather than independent
+authoritative copies.
 
 ### 5.3 The worker and the exchange (`rockstream-runtime`)
 
@@ -280,15 +299,26 @@ and a **self-fencing** mechanism that forces a worker which has lost contact wit
 the control plane to stop committing, so it cannot race a newly-appointed owner
 of the same shard.
 
-Its largest responsibility is the **exchange** — the subsystem that moves rows
-between operators that live on different shards (a shuffle, in the parlance of
-distributed query engines). When the producer and consumer happen to be on the
-same worker, exchange is a fast in-memory `Loopback` channel. When they are on
-different workers, rows are encoded as Arrow IPC frames and sent over gRPC, and a
-`DurableShuffleWriter` ensures those shuffle objects are persisted to the WAL
-*before* the sending epoch is allowed to commit — so a crash mid-shuffle loses
-nothing. The exchange layer also handles flow control, connection pooling,
-multiplexing, and the wire-version negotiation that makes rolling upgrades safe.
+`ShardActor` owns a shard's circuit and durable commit path. Source routing uses
+key affinity: the control service hashes a declared routing column into virtual
+buckets and maps buckets to shard owners with rendezvous hashing. Missing routing
+columns fail rather than falling back to arbitrary placement. This keeps equal
+keys together and makes each worker responsible for its own arrangement partition.
+
+The **exchange** subsystem moves weighted Arrow batches between operators.
+It supports bounded loopback channels, a same-host shared-memory path, direct
+gRPC streams with Arrow IPC, and durable object-store shuffle. Path selection
+depends on placement and topology. `DurableShuffleWriter` persists outbox data
+before commit on the durable path; fast paths do not universally write a shuffle
+WAL. Protocol negotiation, frame validation, lease checks, replay identities,
+connection generations and flow-control permits protect the transport boundary.
+
+There is also a separate public request path in
+[`DataPlaneClient`](crates/rockstream-runtime/src/data_plane.rs): the gateway
+sends deployment, source-delta and workload-metadata requests as JSON over TCP to the
+control service. Its `route_source_delta` forwards row-bearing execution messages
+to worker owners and waits for acknowledgements. The existence of direct gRPC
+exchange therefore does not mean all gateway row traffic bypasses control.
 
 ---
 
@@ -296,9 +326,8 @@ multiplexing, and the wire-version negotiation that makes rolling upgrades safe.
 
 A single worker can maintain views happily on its own, but RockStream is built to
 scale horizontally, and **rockstream-control** is the brain that makes a fleet of
-workers behave like one system. It is deliberately lean — it depends only on
-`rockstream-types` — because the control plane must be the most trustworthy
-component in the system.
+workers behave like one system. It uses shared types and verified kernels,
+plan contracts, storage, simulation primitives and the management protocol.
 
 It maintains the **topology catalog** of which workers exist and what they are
 running; a **shard manager** that hands out shard leases protected by **fencing
@@ -310,36 +339,57 @@ especially central to correctness. The **frontier aggregator** collects each
 worker's per-shard frontier reports and computes the cluster-wide frontier as
 their *meet* (the minimum) — the single value that defines what epoch a query can
 be answered consistently at. And the **checkpoint coordinator** drives the
-protocol that gives RockStream exactly-once semantics and fast recovery, which
+protocol that coordinates durable progress and recovery, which
 deserves its own section.
 
 The control plane also keeps an **audit log** (file-backed JSONL) of every action
 it takes — every scaling decision, every degraded-state transition, every
 pipeline change, each stamped with the metric reading that triggered it. This is
 a design principle, not a feature bolt-on: nothing changes silently, and
-`rockstream audit tail` will always tell you *why* something happened.
+`rockstream audit tail` exposes the recorded decisions.
+
+The control crate also contains persistent topology and lease stores, Raft
+leader-election machinery, secret storage and migration coordination. Migration
+progress is durable: donor drain, checkpoint transfer, lease handoff and recipient
+open acknowledgements determine which phase can safely resume after restart.
+
+The versioned gRPC management contract lives in **rockstream-management-proto**.
+The control service exposes node and shard inspection plus drain, migration and
+backup operations. Mutations bind an idempotency key to a request digest and a
+durable operation record; pagination, concurrency and acknowledgement waiters
+have explicit bounds. Endpoint capabilities depend on attached executors and
+storage. This endpoint currently has no TLS or server-side role check; deploy it
+on a trusted network. Its health telemetry is separate from the HTTP node-health
+endpoint described in §10. See the
+[management API reference](docs/reference/management-api.md).
 
 ### The checkpoint protocol, briefly
 
 Exactly-once processing in a distributed system is hard precisely because crashes
 can happen between any two steps. RockStream's answer is a barrier-based
-checkpoint protocol. The coordinator injects a **checkpoint barrier** into each
-shard's WAL; operators propagate it downstream and acknowledge it; rows that
-arrive at a shard before the barrier has propagated from all of its upstreams
-wait in a bounded **alignment buffer**. Only once every shard has acknowledged
-the barrier does the coordinator atomically write the checkpoint manifest — an
-all-or-nothing commit, so a partial write is detectable on recovery by comparing
-the manifest epoch against each shard's committed frontier. Old checkpoints are
-garbage-collected once the cluster frontier moves safely past them. On top of
-this foundation, sink connectors layer a **two-phase commit** (prepare during the
-epoch, commit only after the cluster checkpoint succeeds, abort if it fails) to
-extend exactly-once all the way out to Kafka, S3, or Postgres.
+checkpoint protocol. The coordinator starts a round and injects a
+**checkpoint barrier** for every participating shard. Operators propagate and
+acknowledge barriers; a bounded **alignment buffer** holds data during alignment.
+The coordinator validates per-shard confirmations against the active checkpoint
+ID and commits the cluster manifest only when all participants have confirmed.
+Retained checkpoints are garbage-collected according to the retention horizon.
+On top of
+this foundation, the Kafka sink layers a **two-phase commit** (prepare, then
+commit after checkpoint success or abort on failure). Source offsets and sink
+recovery state must agree with the committed checkpoint; guarantees depend on
+the connector and its configuration, as detailed in §8.
 
-The system commits to concrete recovery budgets and tests them every release:
-failure detection within 5 seconds, shard reassignment within 30 seconds (from
-the checkpoint in storage — no full WAL replay), and pipeline freshness restored
-within 60 seconds. If any budget is missed, a named degraded state fires rather
-than a silent slowdown.
+`RecoveryDriver` reconstructs committed shard state before readiness. Checkpoint
+exports pin the data and metadata needed for restore; malformed manifests,
+missing payloads, incompatible formats and checksum failures must fail closed.
+Standalone restart, backup and restore are separate from cluster reassignment.
+Historical targets of 5 seconds for detection, 30 seconds for reassignment and
+60 seconds for freshness recovery describe particular scenarios, not universal
+restore times. Current recovery paths enforce their own configured budgets and
+report progress and RS-coded failures. Use the
+[disaster-recovery runbook](docs/disaster-recovery.md) and
+[measured chaos baseline](docs/chaos-recovery-baseline.json) for procedures and
+evidence.
 
 ---
 
@@ -359,17 +409,20 @@ read pinned to a single frontier so the answer is internally consistent. On the
 bounded `WriteBuffer` and feeding it into the engine as a change stream — exactly
 as if it had arrived from an external source. This is what lets you get data in
 without standing up a separate database or a Kafka topic. To keep Postgres tools
-happy, the gateway also stubs out enough of `pg_catalog` and `information_schema`
-for clients to introspect, and it manages session state and isolation levels per
-connection.
+happy, the gateway projects the durable catalog into supported `pg_catalog` and
+`information_schema` relations. It also manages transaction/session state,
+prepared statements, cursors and COPY, subject to the documented protocol subset.
 
 Beyond plain queries it offers the features that make a streaming system pleasant
 to use: a `SUBSCRIBE` handler that streams a view's changes to a client as CDC,
 `AS OF EPOCH` historical queries, **freshness tokens** that let a client request
 read-your-writes behavior by waiting for a specific frontier to become visible,
-and authentication via OIDC or mTLS. The same gateway can also expose a native
-**Iceberg REST Catalog** endpoint so external lakehouse tools can discover
-RockStream views by name.
+and authentication via OIDC or mTLS. Supported `rockstream_catalog` relations
+expose source, sink, view, shard, checkpoint, workload and operation state.
+Lineage and view-status diagnostics connect a stalled view to its upstream
+sources and dependencies. PostgreSQL wire compatibility does not imply full
+PostgreSQL SQL compatibility; unsupported constructs fail with actionable
+RS-coded errors.
 
 ---
 
@@ -377,32 +430,36 @@ RockStream views by name.
 
 **rockstream-connectors** is the system's I/O boundary. It defines two contracts
 — a `SourceConnector` trait for bringing data in and a `SinkConnector` trait for
-writing results out — and ships built-in implementations: Kafka source and sink,
-S3 source, object-store sink, and (per the roadmap) Postgres CDC and
-Iceberg/Delta sources.
+writing results out. The supported connector set is **Kafka source, PostgreSQL
+CDC source and Kafka sink**, all Core capabilities in the current contract.
 
 The interesting engineering here is all about exactly-once correctness across the
 boundary. On the source side, a `SourceEpochRegistry` records exactly which input
 partitions and offsets contributed to each epoch, with an `OffsetToken` that
-allows a connector to resume from precisely the right place after a restart —
-never replaying committed data, never skipping uncommitted data. On the sink
-side, connectors implement the two-phase commit described above, so a row is
-delivered to Kafka or S3 *exactly* once even across crashes. The crate carries
-explicit recovery assertions — idempotent dispatch, no duplicates or losses after
-a checkpoint, epochs committed downstream only after the cluster checkpoint — and
-exercises them against real Kafka and MinIO via testcontainers.
+allows recovery to resume from committed progress. Kafka tracks partition
+offsets across rebalances, while PostgreSQL CDC coordinates snapshot-to-stream
+handoff and transaction boundaries, including shared replication-slot consumers.
+Replay can occur; durable identities and committed progress prevent it from
+becoming duplicate visible output.
 
-For the lakehouse story, RockStream can act as a **freshness layer** that
-periodically snapshots views to object storage as Iceberg v2 or Delta Lake
-tables, after which DuckDB, Trino, or Spark can query them directly with
-RockStream entirely out of the read path.
+The Kafka sink prepares transactional output and commits it according to the
+checkpoint protocol. Exactly-once visibility depends on the documented producer,
+broker and consumer settings. The connector guarantee matrices exercise crash
+boundaries, restart, replay, lag and bounded buffering, with external-service
+tests where required. See [connectors](docs/connectors.md) for configuration and
+the capability matrix for named proofs.
+
+Iceberg, Delta, object-store sink, S3 source and webhook source frontends have
+been removed and fail closed. Catalog compatibility records do not make them
+active connectors. Lakehouse exports use the Kafka sink with a downstream writer;
+see [connector migration](docs/connector-migration.md).
 
 ---
 
 ## 9. Why You Can Trust It: Oracle and Simulator
 
-Two crates exist for one reason — to prove the rest of the system correct — and
-together they are the strongest statement of RockStream's engineering values.
+Correctness evidence combines batch comparison, simulation, verified kernels
+and real-backend tests. Each checks a different boundary.
 
 **rockstream-oracle** is the guardian of the central DBSP promise. Its job is to
 relentlessly check that `incremental(query, Δ) == batch(query, accumulated)`. It
@@ -412,29 +469,32 @@ two. It drives this comparison with property tests over every operator — filte
 project, map, the aggregates (SUM/COUNT/AVG), min/max, distinct, top-K, time
 windows, outer joins — and with a SQL fuzzer that throws generated queries at the
 engine, plus TPC-H data generation for realistic shapes. If the incremental
-engine ever disagrees with the batch reference by even a single weighted row, the
-oracle fails the build. This is how a small, theory-derived differentiation pass
-earns the right to be trusted.
+engine disagrees with the reference in a gated test, that test fails. Exact
+weighted comparisons apply to exact types; floating-point cases have their own
+approximate contract.
 
 **rockstream-sim** is the flight simulator, a technique borrowed from
-[FoundationDB](https://www.foundationdb.org/). The trick is that the entire
-system is written against a `Runtime` abstraction for time, task spawning,
-storage, and network I/O. In production it is backed by a real Tokio runtime; in
-testing it is backed by a `SimRuntime` whose clock, network, and object store are
-all deterministic and driven by a single seeded random-number generator. Inside
+[FoundationDB](https://www.foundationdb.org/). Simulated components use a
+`Runtime` abstraction for time, task spawning, storage and network I/O, with
+Tokio and `SimRuntime` implementations. The simulated clock, network and object
+store are deterministic and driven by a seeded random-number generator. Inside
 that simulated world, a `buggify!` macro injects faults at the nastiest
 moments — network partitions, replica failures, object-store brownouts, messages
 reordered and duplicated, two workers crashing milliseconds apart. Because
-everything is deterministic, *any* bug the simulator finds is reproducible from a
-single seed number: failing seeds are minimized, stored in a corpus, and a
-release is blocked until every one of them replays cleanly. Millions of seeded
-scenarios run before each release, which means the rare timing bugs that normally
-fill a production runbook get discovered and fixed on a developer's laptop
-instead.
+the simulated execution is deterministic, failures can be reproduced from a seed
+and retained as regression cases. Production paths also contain direct Tokio and
+external-service I/O; simulation does not replace exercising those paths.
 
-The payoff of these two crates is the confidence that lets RockStream make
-quantitative promises — bit-exact incremental results, exactly-once delivery,
-sub-minute recovery — rather than hedged ones.
+**rockstream-test-support** supplies reusable external harnesses, MinIO setup
+and test PKI. Local-filesystem, MinIO, Kafka, PostgreSQL and multi-process tests
+cover storage and protocol behavior outside the simulated world.
+**rockstream-verified** supplies the smaller formally checked kernels described
+in §3. Fuzz targets exercise malformed inputs and parser boundaries.
+
+The [evidence manifest](docs/evidence-manifest.json), capability proof inventory
+and [version sign-offs](sign-offs/) identify what was checked for each candidate.
+They are the evidence for a release claim; the presence of a simulator or a
+verified kernel alone does not establish an end-to-end guarantee.
 
 ---
 
@@ -443,27 +503,41 @@ sub-minute recovery — rather than hedged ones.
 All of this is delivered as a single executable. **rockstream-cli** builds the
 `rockstream` binary, and a node's *role* is a command-line flag rather than a
 separate program. The same binary can be the whole system, a gateway, a worker,
-or a control node:
+or a control node; a frontier role is also available:
 
-- **Laptop / evaluation:** `rockstream start --storage=./data` — zero
-  configuration, runs the embedded single-process engine, and survives crashes.
-- **Single host (small production):** `rockstream start --role=all
-  --storage=s3://bucket/...` — the same engine, now durable on object storage.
-- **Multi-host cluster:** `--role=control` on the coordinating nodes and
-  `--role=worker` on the rest.
+- **Laptop / single host:** `rockstream start --role all --storage ./data` runs
+  the embedded system with a local durable backend.
+- **Shared object storage:** keep `--storage` as the local node-artifact
+  directory and configure the runtime object-store backend with the
+  `ROCKSTREAM_OBJECT_STORE_*` environment contract. The backend builder requires
+  an endpoint, bucket and credentials; it defaults the region to `us-east-1`.
+  See [`build_runtime_object_store`](crates/rockstream-storage/src/tiered_store.rs).
+- **Multi-host cluster:** start `--role control`, `--role worker` with
+  `--control http://control:8000`, and gateway nodes as needed. Workers need
+  access to the durable state for the shards they own.
 
-Moving up this ladder is purely *additive*. Because no node keeps authoritative
-state on local disk — everything durable lives in SlateDB on object storage —
-there is no data migration when you scale up: the files a laptop wrote against
-MinIO are opened, unchanged, by a cluster against S3. At every tier you connect
-the same way, with `psql` or any Postgres client, and the development loop is the
-same one you would use with an ordinary database: start the binary, open a SQL
-prompt, write a view, insert a few rows, and watch the answer stay current as
-data keeps flowing. The CLI also surfaces the operability tools — `rockstream
-explain` for the annotated operator tree and its pre-deploy cost estimate,
-`rockstream audit tail` for the running record of every control-plane decision,
-and `rockstream support bundle` to collect everything needed to debug a pipeline
-in one command.
+`NodeConfig` supplies effective configuration to the role components;
+`NodeRuntime` coordinates startup, recovery, readiness, drain and shutdown.
+Configuration and backend choice are explicit. A local directory is
+authoritative in a local deployment; shared storage makes lease movement easier,
+but changing backends is an export/restore operation, not automatic scaling.
+See [configuration](docs/configuration.md) and the generated
+[configuration reference](docs/reference/configuration.md).
+
+The HTTP metrics service exposes `/metrics`, `/live`, `/ready` and `/health`.
+Readiness follows lifecycle/recovery state. The health report evaluates liveness,
+readiness, availability, freshness, durability, capacity and degradation, with
+provenance and staleness checks for observations.
+These HTTP reports are distinct from gRPC management `GetHealth`, which remains
+`unknown` without authoritative telemetry registered there.
+
+Operator diagnostics include `rockstream doctor`, `view status`, `source status`,
+`sink status`, `explain`, `resource usage`, `audit tail` and `support bundle`.
+Bounded probes, catalog scans and lineage traversal prevent diagnosis from
+becoming an unbounded workload. **rockstream-docgen** generates the checked-in
+CLI, SQL, configuration, catalog, metric and error references from the public
+contracts. See the [operator guide](docs/operator.md),
+[CLI reference](docs/reference/cli.md) and [metrics](docs/metrics.md).
 
 ---
 
@@ -486,16 +560,18 @@ algebraic law, the system records an explicit, machine-readable reason rather th
 guessing — and `EXPLAIN INCREMENTAL` will show it to you.
 
 **Compute and storage are separate tiers.** SlateDB-on-object-storage is the
-hinge that makes the deployment ladder seamless, recovery fast (reload from a
-checkpoint instead of replaying a log), and scaling a matter of moving leases
-rather than moving data.
+hinge that lets shared-storage deployments move shard ownership independently
+of durable data. Recovery uses committed state, checkpoints and the relevant
+logs; its cost depends on the recovery path and the workload.
 
 **Nothing changes silently, and nothing is promised that isn't tested.** The
-audit log records every control-plane action with its trigger; the oracle proves
-incremental results match batch results; the simulator manufactures the rare
+audit log records control-plane decisions with their triggers; the oracle checks
+incremental results against batch results; the simulator manufactures the rare
 failures that would otherwise surface only in production. The recovery budgets,
-the exactly-once guarantees, and the freshness SLOs are all things the test suite
-checks on every release rather than aspirations in a document.
+connector guarantees, and the freshness SLOs require named evidence for a
+specific candidate and scenario. Public scope is single-region; full PostgreSQL
+compatibility, custom user merge laws and unrestricted SQL are outside the
+current contract.
 
 Read together, these threads explain the architecture's character: a small,
 theory-grounded core wrapped in the operational machinery needed to run it at
