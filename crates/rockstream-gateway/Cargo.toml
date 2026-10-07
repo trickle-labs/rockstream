@@ -34,6 +34,7 @@ rockstream-control.workspace = true
 arrow.workspace = true
 datafusion.workspace = true
 sqlparser.workspace = true
+regex.workspace = true
 rockstream-ops.workspace = true
 rockstream-plan.workspace = true
 rockstream-diff.workspace = true

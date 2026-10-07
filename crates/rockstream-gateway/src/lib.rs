@@ -16,6 +16,7 @@
 
 pub mod admission;
 pub mod auth;
+mod catalog_query;
 pub mod catalog_stubs;
 pub mod change_log;
 pub mod copy_state;

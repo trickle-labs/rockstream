@@ -13864,6 +13864,11 @@ fn catalog_field_type(column: &str) -> Type {
 
 fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
     match resp {
+        CatalogResponse::Error { message } => Response::Error(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "0A000".into(),
+            message,
+        ))),
         CatalogResponse::CommandComplete(tag) => Response::Execution(Tag::new(&tag)),
         CatalogResponse::Rows { columns, rows } => {
             let fields: Vec<FieldInfo> = columns
@@ -16434,9 +16439,12 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
         }
     }
 
-    if let Some(CatalogResponse::Rows { columns, .. }) =
-        catalog.handle_query(q, &crate::catalog_stubs::SessionInfo::default())
-    {
+    if let Some(columns) = catalog.describe_catalog_query(q).or_else(|| {
+        match catalog.handle_query(q, &crate::catalog_stubs::SessionInfo::default()) {
+            Some(CatalogResponse::Rows { columns, .. }) => Some(columns),
+            _ => None,
+        }
+    }) {
         return columns
             .iter()
             .map(|c| {

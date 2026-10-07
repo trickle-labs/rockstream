@@ -1,0 +1,500 @@
+[
+  {
+    "name": "list relations",
+    "sql": "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as \"Type\",\n  pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\"\nFROM pg_catalog.pg_class c\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n     LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam\nWHERE c.relkind IN ('r','p','v','m','S','f','')\n      AND n.nspname <> 'pg_catalog'\n      AND n.nspname !~ '^pg_toast'\n      AND n.nspname <> 'information_schema'\n  AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 1,2;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Type",
+      "Owner"
+    ],
+    "rows": [
+      [
+        "public",
+        "orders",
+        "table",
+        "rockstream"
+      ],
+      [
+        "public",
+        "sales_by_store",
+        "view",
+        "rockstream"
+      ]
+    ]
+  },
+  {
+    "name": "tables only",
+    "sql": "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as \"Type\",\n  pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\"\nFROM pg_catalog.pg_class c\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n     LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam\nWHERE c.relkind IN ('r','p','')\n      AND n.nspname <> 'pg_catalog'\n      AND n.nspname !~ '^pg_toast'\n      AND n.nspname <> 'information_schema'\n  AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 1,2;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Type",
+      "Owner"
+    ],
+    "rows": [
+      [
+        "public",
+        "orders",
+        "table",
+        "rockstream"
+      ]
+    ]
+  },
+  {
+    "name": "views only",
+    "sql": "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as \"Type\",\n  pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\"\nFROM pg_catalog.pg_class c\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\nWHERE c.relkind IN ('v','')\n      AND n.nspname <> 'pg_catalog'\n      AND n.nspname !~ '^pg_toast'\n      AND n.nspname <> 'information_schema'\n  AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 1,2;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Type",
+      "Owner"
+    ],
+    "rows": [
+      [
+        "public",
+        "sales_by_store",
+        "view",
+        "rockstream"
+      ]
+    ]
+  },
+  {
+    "name": "missing relation",
+    "sql": "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as \"Type\",\n  pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\"\nFROM pg_catalog.pg_class c\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n     LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam\nWHERE c.relkind IN ('r','p','t','s','')\n  AND c.relname OPERATOR(pg_catalog.~) '^(definitely_missing)$' COLLATE pg_catalog.default\n  AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 1,2;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Type",
+      "Owner"
+    ],
+    "rows": []
+  },
+  {
+    "name": "list schemas",
+    "sql": "SELECT n.nspname AS \"Name\",\n  pg_catalog.pg_get_userbyid(n.nspowner) AS \"Owner\"\nFROM pg_catalog.pg_namespace n\nWHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'\nORDER BY 1;\n",
+    "columns": [
+      "Name",
+      "Owner"
+    ],
+    "rows": [
+      [
+        "analytics",
+        "rockstream"
+      ],
+      [
+        "public",
+        "rockstream"
+      ]
+    ]
+  },
+  {
+    "name": "functions hide builtins",
+    "sql": "SELECT n.nspname as \"Schema\",\n  p.proname as \"Name\",\n  pg_catalog.pg_get_function_result(p.oid) as \"Result data type\",\n  pg_catalog.pg_get_function_arguments(p.oid) as \"Argument data types\",\n CASE p.prokind\n  WHEN 'a' THEN 'agg'\n  WHEN 'w' THEN 'window'\n  WHEN 'p' THEN 'proc'\n  ELSE 'func'\n END as \"Type\"\nFROM pg_catalog.pg_proc p\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace\nWHERE pg_catalog.pg_function_is_visible(p.oid)\n      AND n.nspname <> 'pg_catalog'\n      AND n.nspname <> 'information_schema'\nORDER BY 1, 2, 4;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Result data type",
+      "Argument data types",
+      "Type"
+    ],
+    "rows": []
+  },
+  {
+    "name": "functions with builtins",
+    "sql": "SELECT n.nspname as \"Schema\",\n  p.proname as \"Name\",\n  pg_catalog.pg_get_function_result(p.oid) as \"Result data type\",\n  pg_catalog.pg_get_function_arguments(p.oid) as \"Argument data types\",\n CASE p.prokind\n  WHEN 'a' THEN 'agg'\n  WHEN 'w' THEN 'window'\n  WHEN 'p' THEN 'proc'\n  ELSE 'func'\n END as \"Type\"\nFROM pg_catalog.pg_proc p\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace\nWHERE pg_catalog.pg_function_is_visible(p.oid)\n\n\nORDER BY 1, 2, 4;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Result data type",
+      "Argument data types",
+      "Type"
+    ],
+    "rows": [
+      [
+        "pg_catalog",
+        "avg",
+        "numeric",
+        "",
+        "agg"
+      ],
+      [
+        "pg_catalog",
+        "count",
+        "bigint",
+        "",
+        "agg"
+      ],
+      [
+        "pg_catalog",
+        "max",
+        "text",
+        "",
+        "agg"
+      ],
+      [
+        "pg_catalog",
+        "min",
+        "text",
+        "",
+        "agg"
+      ],
+      [
+        "pg_catalog",
+        "sum",
+        "bigint",
+        "",
+        "agg"
+      ]
+    ]
+  },
+  {
+    "name": "types hide builtins",
+    "sql": "SELECT n.nspname as \"Schema\",\n  pg_catalog.format_type(t.oid, NULL) AS \"Name\",\n  pg_catalog.obj_description(t.oid, 'pg_type') as \"Description\"\nFROM pg_catalog.pg_type t\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace\nWHERE (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid))\n  AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid)\n      AND n.nspname <> 'pg_catalog'\n      AND n.nspname <> 'information_schema'\n  AND pg_catalog.pg_type_is_visible(t.oid)\nORDER BY 1, 2;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Description"
+    ],
+    "rows": []
+  },
+  {
+    "name": "formatted builtin type",
+    "sql": "SELECT n.nspname as \"Schema\",\n  pg_catalog.format_type(t.oid, NULL) AS \"Name\",\n  pg_catalog.obj_description(t.oid, 'pg_type') as \"Description\"\nFROM pg_catalog.pg_type t\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace\nWHERE (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid))\n  AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid)\n      AND t.oid = 20\n\n  AND pg_catalog.pg_type_is_visible(t.oid)\nORDER BY 1, 2;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Description"
+    ],
+    "rows": [
+      [
+        "pg_catalog",
+        "bigint",
+        null
+      ]
+    ]
+  },
+  {
+    "name": "privileges use relations, not columns",
+    "sql": "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' END as \"Type\",\n  CASE WHEN pg_catalog.array_length(c.relacl, 1) = 0 THEN '(none)' ELSE pg_catalog.array_to_string(c.relacl, E'\\n') END AS \"Access privileges\",\n  pg_catalog.array_to_string(ARRAY(\n    SELECT attname || E':\\n  ' || pg_catalog.array_to_string(attacl, E'\\n  ')\n    FROM pg_catalog.pg_attribute a\n    WHERE attrelid = c.oid AND NOT attisdropped AND attacl IS NOT NULL\n  ), E'\\n') AS \"Column privileges\",\n  pg_catalog.array_to_string(ARRAY(\n    SELECT polname\n    || CASE WHEN NOT polpermissive THEN\n       E' (RESTRICTIVE)'\n       ELSE '' END\n    || CASE WHEN polcmd != '*' THEN\n           E' (' || polcmd::pg_catalog.text || E'):'\n       ELSE E':'\n       END\n    || CASE WHEN polqual IS NOT NULL THEN\n           E'\\n  (u): ' || pg_catalog.pg_get_expr(polqual, polrelid)\n       ELSE E''\n       END\n    || CASE WHEN polwithcheck IS NOT NULL THEN\n           E'\\n  (c): ' || pg_catalog.pg_get_expr(polwithcheck, polrelid)\n       ELSE E''\n       END    || CASE WHEN polroles <> '{0}' THEN\n           E'\\n  to: ' || pg_catalog.array_to_string(\n               ARRAY(\n                   SELECT rolname\n                   FROM pg_catalog.pg_roles\n                   WHERE oid = ANY (polroles)\n                   ORDER BY 1\n               ), E', ')\n       ELSE E''\n       END\n    FROM pg_catalog.pg_policy pol\n    WHERE polrelid = c.oid), E'\\n')\n    AS \"Policies\"\nFROM pg_catalog.pg_class c\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\nWHERE c.relkind IN ('r','v','m','S','f','p')\n      AND n.nspname <> 'pg_catalog'\n      AND n.nspname <> 'information_schema'\n  AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 1, 2;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Type",
+      "Access privileges",
+      "Column privileges",
+      "Policies"
+    ],
+    "rows": [
+      [
+        "public",
+        "orders",
+        "table",
+        null,
+        "",
+        ""
+      ],
+      [
+        "public",
+        "sales_by_store",
+        "view",
+        null,
+        "",
+        ""
+      ]
+    ]
+  },
+  {
+    "name": "indexes join to their table",
+    "sql": "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as \"Type\",\n  pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\",\n  c2.relname as \"Table\"\nFROM pg_catalog.pg_class c\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n     LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam\n     LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n     LEFT JOIN pg_catalog.pg_class c2 ON i.indrelid = c2.oid\nWHERE c.relkind IN ('i','I','')\n      AND n.nspname <> 'pg_catalog'\n      AND n.nspname !~ '^pg_toast'\n      AND n.nspname <> 'information_schema'\n  AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 1,2;\n",
+    "columns": [
+      "Schema",
+      "Name",
+      "Type",
+      "Owner",
+      "Table"
+    ],
+    "rows": [
+      [
+        "public",
+        "orders_id_idx",
+        "index",
+        "rockstream",
+        "orders"
+      ]
+    ]
+  },
+  {
+    "name": "list database",
+    "sql": "SELECT\n  d.datname as \"Name\",\n  pg_catalog.pg_get_userbyid(d.datdba) as \"Owner\",\n  pg_catalog.pg_encoding_to_char(d.encoding) as \"Encoding\",\n  'libc' AS \"Locale Provider\",\n  d.datcollate as \"Collate\",\n  d.datctype as \"Ctype\",\n  NULL as \"Locale\",\n  NULL as \"ICU Rules\",\n  CASE WHEN pg_catalog.array_length(d.datacl, 1) = 0 THEN '(none)' ELSE pg_catalog.array_to_string(d.datacl, E'\\n') END AS \"Access privileges\"\nFROM pg_catalog.pg_database d\nORDER BY 1;\n",
+    "columns": [
+      "Name",
+      "Owner",
+      "Encoding",
+      "Locale Provider",
+      "Collate",
+      "Ctype",
+      "Locale",
+      "ICU Rules",
+      "Access privileges"
+    ],
+    "rows": [
+      [
+        "rockstream",
+        "rockstream",
+        "UTF8",
+        "libc",
+        "C",
+        "C",
+        null,
+        null,
+        null
+      ]
+    ]
+  },
+  {
+    "name": "describe lookup filters by name",
+    "sql": "SELECT c.oid,\n  n.nspname,\n  c.relname\nFROM pg_catalog.pg_class c\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\nWHERE c.relname OPERATOR(pg_catalog.~) '^(orders)$' COLLATE pg_catalog.default\n  AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 2, 3;\n",
+    "columns": [
+      "oid",
+      "nspname",
+      "relname"
+    ],
+    "rows": [
+      [
+        "845059821",
+        "public",
+        "orders"
+      ]
+    ]
+  },
+  {
+    "name": "describe attributes filter by oid and evaluate types and defaults",
+    "sql": "SELECT a.attname,\n  pg_catalog.format_type(a.atttypid, a.atttypmod),\n  (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)\n   FROM pg_catalog.pg_attrdef d\n   WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef),\n  a.attnotnull,\n  (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t\n   WHERE c.oid = a.attcollation AND t.oid = a.atttypid AND a.attcollation <> t.typcollation) AS attcollation,\n  a.attidentity,\n  a.attgenerated\nFROM pg_catalog.pg_attribute a\nWHERE a.attrelid = '845059821' AND a.attnum > 0 AND NOT a.attisdropped\nORDER BY a.attnum;\n",
+    "columns": [
+      "attname",
+      "format_type",
+      "?column?",
+      "attnotnull",
+      "attcollation",
+      "attidentity",
+      "attgenerated"
+    ],
+    "rows": [
+      [
+        "id",
+        "bigint",
+        null,
+        "f",
+        null,
+        "",
+        ""
+      ],
+      [
+        "store_id",
+        "bigint",
+        null,
+        "f",
+        null,
+        "",
+        ""
+      ],
+      [
+        "amount",
+        "bigint",
+        null,
+        "f",
+        null,
+        "",
+        ""
+      ]
+    ]
+  },
+  {
+    "name": "describe policies have no phantom roles",
+    "sql": "SELECT pol.polname, pol.polpermissive,\n  CASE WHEN pol.polroles = '{0}' THEN NULL ELSE pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles where oid = any (pol.polroles) order by 1),',') END,\n  pg_catalog.pg_get_expr(pol.polqual, pol.polrelid),\n  pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid),\n  CASE pol.polcmd\n    WHEN 'r' THEN 'SELECT'\n    WHEN 'a' THEN 'INSERT'\n    WHEN 'w' THEN 'UPDATE'\n    WHEN 'd' THEN 'DELETE'\n    END AS cmd\nFROM pg_catalog.pg_policy pol\nWHERE pol.polrelid = '845059821' ORDER BY 1;\n",
+    "columns": [
+      "polname",
+      "polpermissive",
+      "?column?",
+      "pg_get_expr",
+      "pg_get_expr",
+      "cmd"
+    ],
+    "rows": []
+  },
+  {
+    "name": "describe inheritance has no phantom relations",
+    "sql": "SELECT c.oid::pg_catalog.regclass\nFROM pg_catalog.pg_class c, pg_catalog.pg_inherits i\nWHERE c.oid = i.inhparent AND i.inhrelid = '845059821'\n  AND c.relkind != 'p' AND c.relkind != 'I'\nORDER BY inhseqno;\n",
+    "columns": [
+      "?column?"
+    ],
+    "rows": []
+  },
+  {
+    "name": "ordering and limit",
+    "sql": "SELECT relname FROM pg_catalog.pg_class ORDER BY relname DESC LIMIT 1",
+    "columns": [
+      "relname"
+    ],
+    "rows": [
+      [
+        "sales_by_store"
+      ]
+    ]
+  },
+  {
+    "name": "type oid filter",
+    "sql": "SELECT typname FROM pg_catalog.pg_type WHERE oid = 20",
+    "columns": [
+      "typname"
+    ],
+    "rows": [
+      [
+        "int8"
+      ]
+    ]
+  },
+  {
+    "name": "nested names and literals do not dispatch",
+    "sql": "SELECT 'pg_attribute' AS marker, c.relname FROM pg_catalog.pg_class c WHERE c.relname = 'orders'",
+    "columns": [
+      "marker",
+      "relname"
+    ],
+    "rows": [
+      [
+        "pg_attribute",
+        "orders"
+      ]
+    ]
+  },
+  {
+    "name": "namespace join honors view namespace",
+    "sql": "SELECT n.nspname AS schema, c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'analytics'",
+    "columns": [
+      "schema",
+      "relname"
+    ],
+    "rows": [
+      [
+        "analytics",
+        "report"
+      ]
+    ]
+  },
+  {
+    "name": "NULL join predicates do not match",
+    "sql": "SELECT c.relname, n.nspname FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ON n.oid = NULL WHERE c.relname = 'orders'",
+    "columns": [
+      "relname",
+      "nspname"
+    ],
+    "rows": [
+      [
+        "orders",
+        null
+      ]
+    ]
+  },
+  {
+    "name": "wildcard expands namespace fields",
+    "sql": "SELECT * FROM pg_catalog.pg_namespace ORDER BY nspname",
+    "columns": [
+      "oid",
+      "nspname",
+      "nspowner"
+    ],
+    "rows": [
+      [
+        "369560167",
+        "analytics",
+        "164543853"
+      ],
+      [
+        "13207",
+        "information_schema",
+        "164543853"
+      ],
+      [
+        "11",
+        "pg_catalog",
+        "164543853"
+      ],
+      [
+        "2200",
+        "public",
+        "164543853"
+      ]
+    ]
+  },
+  {
+    "name": "three valued predicates",
+    "sql": "SELECT relname FROM pg_catalog.pg_class WHERE NOT (NULL = 1) OR relname = 'orders'",
+    "columns": [
+      "relname"
+    ],
+    "rows": [
+      [
+        "orders"
+      ]
+    ]
+  },
+  {
+    "name": "default and CASE else retain NULL",
+    "sql": "SELECT CASE WHEN relname = 'orders' THEN NULL ELSE 'view' END AS kind FROM pg_catalog.pg_class WHERE relkind IN ('r','v') AND relnamespace = 2200 ORDER BY relname",
+    "columns": [
+      "kind"
+    ],
+    "rows": [
+      [
+        null
+      ],
+      [
+        "view"
+      ]
+    ]
+  },
+  {
+    "name": "qualified wildcard and uppercase identifiers",
+    "sql": "SELECT N.* FROM pg_catalog.pg_namespace N WHERE N.nspname = 'public'",
+    "columns": [
+      "oid",
+      "nspname",
+      "nspowner"
+    ],
+    "rows": [
+      [
+        "2200",
+        "public",
+        "164543853"
+      ]
+    ]
+  },
+  {
+    "name": "quoted alias and folded output alias",
+    "sql": "SELECT \"C\".RELNAME AS Alias FROM pg_catalog.pg_class \"C\" WHERE \"C\".relname = 'orders'",
+    "columns": [
+      "alias"
+    ],
+    "rows": [
+      [
+        "orders"
+      ]
+    ]
+  },
+  {
+    "name": "table index flags reflect registered indexes",
+    "sql": "SELECT tablename, hasindexes FROM pg_catalog.pg_tables ORDER BY tablename",
+    "columns": [
+      "tablename",
+      "hasindexes"
+    ],
+    "rows": [
+      [
+        "orders",
+        "t"
+      ]
+    ]
+  }
+]
