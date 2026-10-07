@@ -501,7 +501,7 @@ fn eval(
             .cloned()
             .flatten(),
         Expr::Exists { subquery, negated } => {
-            boolean(!run(subquery, provider, session, row)?.1.is_empty() != *negated)
+            boolean(run(subquery, provider, session, row)?.1.is_empty() == *negated)
         }
         Expr::Function(function) => {
             let name = function.name.to_string().to_lowercase();
