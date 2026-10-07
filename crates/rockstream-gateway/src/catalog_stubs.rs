@@ -2284,7 +2284,7 @@ impl CatalogStubs {
             return Some(self.pg_type(&requested_cols));
         }
         if ql.contains("pg_class") {
-            return Some(self.pg_class(&requested_cols));
+            return Some(self.pg_class(query, &requested_cols));
         }
         if ql.contains("pg_roles") {
             return Some(self.pg_roles(&session_info.principal_name, &requested_cols));
@@ -3154,8 +3154,11 @@ impl CatalogStubs {
 
     // ── pg_catalog.pg_class ───────────────────────────────────────────────────
 
-    fn pg_class(&self, requested_cols: &[String]) -> CatalogResponse {
-        let key = ("pg_class".to_string(), requested_cols.to_vec());
+    fn pg_class(&self, query: &str, requested_cols: &[String]) -> CatalogResponse {
+        use sqlparser::ast::{SelectItem, SetExpr, Statement};
+        use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+        let key = ("pg_class".to_string(), vec![query.to_string()]);
         if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
             return cached.clone();
         }
@@ -3169,6 +3172,17 @@ impl CatalogStubs {
         } else {
             requested_cols.to_vec()
         };
+        let projection = Parser::parse_sql(&PostgreSqlDialect {}, query)
+            .ok()
+            .and_then(|statements| statements.into_iter().next())
+            .and_then(|statement| match statement {
+                Statement::Query(query) => match *query.body {
+                    SetExpr::Select(select) => Some(select.projection),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or_default();
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         let mut items = Vec::new();
         for t in self.list_tables() {
@@ -3182,30 +3196,35 @@ impl CatalogStubs {
         }
         for (oid, name, kind) in items {
             let mut row = Vec::new();
-            for c in &cols {
-                let val = match c.as_str() {
-                    "oid" => Some(oid.to_string()),
-                    "relname" => Some(name.clone()),
-                    "table_name" => Some(name.clone()),
-                    "relnamespace" => Some("2200".to_string()),
-                    "namespace" => Some("public".to_string()),
-                    "relkind" => Some(kind.to_string()),
-                    "relhasrules" => Some("f".to_string()),
-                    "relhastriggers" => Some("f".to_string()),
-                    "relispartition" => Some("f".to_string()),
-                    "is_partition" | "has_subclass" | "has_row_level_security" => {
+            let lookup = |c: &str| match c {
+                "oid" => Some(oid.to_string()),
+                "relname" => Some(name.clone()),
+                "table_name" => Some(name.clone()),
+                "relnamespace" => Some("2200".to_string()),
+                "namespace" | "nspname" => Some("public".to_string()),
+                "tableowner" => Some("rockstream".to_string()),
+                "relkind" => Some(kind.to_string()),
+                "relhasrules" => Some("f".to_string()),
+                "relhastriggers" => Some("f".to_string()),
+                "relispartition" => Some("f".to_string()),
+                "is_partition" | "has_subclass" | "has_row_level_security" => Some("f".to_string()),
+                "reloptions" | "description" => None,
+                _ => {
+                    if c.contains("id") {
+                        Some("0".to_string())
+                    } else if c.contains("has") || c.contains("is") {
                         Some("f".to_string())
+                    } else {
+                        Some("".to_string())
                     }
-                    "reloptions" | "description" => None,
-                    _ => {
-                        if c.contains("id") {
-                            Some("0".to_string())
-                        } else if c.contains("has") || c.contains("is") {
-                            Some("f".to_string())
-                        } else {
-                            Some("".to_string())
-                        }
-                    }
+                }
+            };
+            for (i, c) in cols.iter().enumerate() {
+                let val = match projection.get(i) {
+                    Some(
+                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. },
+                    ) => pg_class_expression(expr, &lookup),
+                    _ => lookup(c),
                 };
                 row.push(val);
             }
@@ -4582,6 +4601,49 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
     (y as i32, mo as u32, d as u32)
+}
+
+// ponytail: evaluate catalog reflection expressions only; use the SQL engine for full catalog SQL.
+fn pg_class_expression(
+    expr: &sqlparser::ast::Expr,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    use sqlparser::ast::{Expr, Value};
+
+    match expr {
+        Expr::Identifier(ident) => lookup(&ident.value.to_lowercase()),
+        Expr::CompoundIdentifier(idents) => lookup(&idents.last()?.value.to_lowercase()),
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(value) => Some(value.clone()),
+            _ => None,
+        },
+        Expr::Case {
+            operand: Some(operand),
+            conditions,
+            else_result,
+            ..
+        } => {
+            let operand = pg_class_expression(operand, lookup);
+            for condition in conditions {
+                if operand.is_some() && operand == pg_class_expression(&condition.condition, lookup)
+                {
+                    return pg_class_expression(&condition.result, lookup);
+                }
+            }
+            else_result
+                .as_deref()
+                .and_then(|expr| pg_class_expression(expr, lookup))
+        }
+        Expr::Function(function)
+            if matches!(
+                function.name.to_string().to_lowercase().as_str(),
+                "pg_get_userbyid" | "pg_catalog.pg_get_userbyid"
+            ) =>
+        {
+            lookup("tableowner")
+        }
+        _ => None,
+    }
 }
 
 /// Helper to parse SELECT column names/aliases from query.
