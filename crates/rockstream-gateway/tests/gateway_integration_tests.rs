@@ -402,7 +402,7 @@ async fn psql_catalog_queries_return_exact_metadata() {
         (error.code().code(), error.message()),
         (
             "0A000",
-            "unsupported catalog function: unsupported_catalog_function"
+            "[RS-2026] unsupported catalog function: unsupported_catalog_function"
         )
     );
     handle.abort();

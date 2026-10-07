@@ -42,12 +42,12 @@ fn run(
     outer: &Row,
 ) -> Result<QueryRows> {
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return Err("unsupported catalog query body".into());
+        return Err("[RS-2026] unsupported catalog query body".into());
     };
     if select.distinct.is_some()
         || !matches!(&select.group_by, GroupByExpr::Expressions(e, _) if e.is_empty())
     {
-        return Err("unsupported catalog aggregation".into());
+        return Err("[RS-2026] unsupported catalog aggregation".into());
     }
     let mut rows = vec![outer.clone()];
     let mut fields = Vec::new();
@@ -62,12 +62,12 @@ fn run(
                     (c, false)
                 }
                 JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (c, true),
-                _ => return Err("unsupported catalog join".into()),
+                _ => return Err("[RS-2026] unsupported catalog join".into()),
             };
             let condition = match constraint {
                 JoinConstraint::On(expr) => Some(expr),
                 JoinConstraint::None => None,
-                _ => return Err("unsupported catalog join constraint".into()),
+                _ => return Err("[RS-2026] unsupported catalog join constraint".into()),
             };
             // Include NULLs for an unmatched LEFT JOIN, including its unqualified columns.
             let nulls: Row = columns
@@ -114,7 +114,7 @@ fn run(
                     name.0
                         .last()
                         .and_then(ObjectNamePart::as_ident)
-                        .ok_or("invalid wildcard qualifier")?,
+                        .ok_or("[RS-2026] invalid wildcard qualifier")?,
                 );
                 for (key, name) in &fields {
                     if key.starts_with(&format!("{qualifier}.")) {
@@ -123,7 +123,7 @@ fn run(
                     }
                 }
             }
-            _ => return Err("unsupported catalog projection".into()),
+            _ => return Err("[RS-2026] unsupported catalog projection".into()),
         }
     }
     let mut selected = Vec::new();
@@ -140,7 +140,7 @@ fn run(
         let mut ordering = Vec::new();
         if let Some(order) = &query.order_by {
             let OrderByKind::Expressions(expressions) = &order.kind else {
-                return Err("unsupported catalog ordering".into());
+                return Err("[RS-2026] unsupported catalog ordering".into());
             };
             for order in expressions {
                 let value = if let Expr::Value(v) = &order.expr {
@@ -148,11 +148,11 @@ fn run(
                         values
                             .get(
                                 n.parse::<usize>()
-                                    .map_err(|_| "invalid ORDER BY position")?
+                                    .map_err(|_| "[RS-2026] invalid ORDER BY position")?
                                     .saturating_sub(1),
                             )
                             .cloned()
-                            .ok_or("invalid ORDER BY position")?
+                            .ok_or("[RS-2026] invalid ORDER BY position")?
                     } else {
                         eval(&order.expr, &row, provider, session)?
                     }
@@ -216,15 +216,15 @@ fn run(
     {
         if let Some(l) = l {
             limit = eval(l, outer, provider, session)?
-                .ok_or("NULL LIMIT")?
+                .ok_or("[RS-2026] NULL LIMIT")?
                 .parse()
-                .map_err(|_| "invalid LIMIT")?
+                .map_err(|_| "[RS-2026] invalid LIMIT")?
         }
         if let Some(o) = o {
             offset = eval(&o.value, outer, provider, session)?
-                .ok_or("NULL OFFSET")?
+                .ok_or("[RS-2026] NULL OFFSET")?
                 .parse()
-                .map_err(|_| "invalid OFFSET")?
+                .map_err(|_| "[RS-2026] invalid OFFSET")?
         }
     }
     Ok((
@@ -243,7 +243,7 @@ fn relation(
     provider: &impl Fn(&str) -> Option<CatalogResponse>,
 ) -> Result<RelationRows> {
     let TableFactor::Table { name, alias, .. } = source else {
-        return Err("unsupported catalog relation".into());
+        return Err("[RS-2026] unsupported catalog relation".into());
     };
     let name = name.to_string();
     let qualifier = alias
@@ -257,7 +257,7 @@ fn relation(
                 .to_lowercase()
         });
     let Some(CatalogResponse::Rows { columns, rows }) = provider(&name) else {
-        return Err(format!("unknown catalog relation: {name}"));
+        return Err(format!("[RS-2026] unknown catalog relation: {name}"));
     };
     let fields: Vec<_> = columns
         .iter()
@@ -338,7 +338,7 @@ fn eval(
             }
             Value::Boolean(b) => boolean(*b),
             Value::Null => None,
-            _ => return Err(format!("unsupported catalog literal: {expr}")),
+            _ => return Err(format!("[RS-2026] unsupported catalog literal: {expr}")),
         },
         Expr::Nested(e) | Expr::Collate { expr: e, .. } => value(e)?,
         Expr::Cast {
@@ -397,7 +397,9 @@ fn eval(
                         | BinaryOperator::PGCustomBinaryOperator(_) => {
                             if let BinaryOperator::PGCustomBinaryOperator(parts) = op {
                                 if !matches!(parts.last().map(String::as_str), Some("~" | "!~")) {
-                                    return Err(format!("unsupported catalog operator: {op}"));
+                                    return Err(format!(
+                                        "[RS-2026] unsupported catalog operator: {op}"
+                                    ));
                                 }
                             }
                             let matched = regex::Regex::new(&b)
@@ -413,7 +415,7 @@ fn eval(
                                 },
                             )
                         }
-                        _ => return Err(format!("unsupported catalog operator: {op}")),
+                        _ => return Err(format!("[RS-2026] unsupported catalog operator: {op}")),
                     },
                     _ => None,
                 },
@@ -512,7 +514,7 @@ fn eval(
                     .iter()
                     .map(|arg| match arg {
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => value(e),
-                        _ => Err("unsupported catalog function argument".into()),
+                        _ => Err("[RS-2026] unsupported catalog function argument".into()),
                     })
                     .collect::<Result<Vec<_>>>()?,
                 FunctionArguments::Subquery(query) if name == "array" => {
@@ -526,7 +528,7 @@ fn eval(
                     ))]
                 }
                 FunctionArguments::None => vec![],
-                _ => return Err(format!("unsupported catalog function: {name}")),
+                _ => return Err(format!("[RS-2026] unsupported catalog function: {name}")),
             };
             let arg = args.first().and_then(|v| v.as_deref());
             match name {
@@ -576,10 +578,10 @@ fn eval(
                         .collect::<Vec<_>>()
                         .join(args.get(1).and_then(|v| v.as_deref()).unwrap_or(","))
                 }),
-                _ => return Err(format!("unsupported catalog function: {name}")),
+                _ => return Err(format!("[RS-2026] unsupported catalog function: {name}")),
             }
         }
-        _ => return Err(format!("unsupported catalog expression: {expr}")),
+        _ => return Err(format!("[RS-2026] unsupported catalog expression: {expr}")),
     })
 }
 
