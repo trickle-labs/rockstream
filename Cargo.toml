@@ -48,7 +48,7 @@ futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 criterion = { version = "0.5", features = ["html_reports"] }
-datafusion = "53"
+datafusion = "55"
 object_store = { version = "0.14", features = ["aws"] }
 tempfile = "3"
 testcontainers = "0.23"
