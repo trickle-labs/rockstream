@@ -23,8 +23,9 @@ use thiserror::Error;
 
 use rockstream_types::ids::{
     CompiledPlanId, DatabaseId, IndexId, NamespaceId, PrincipalId, SinkId, SourceId, TableId,
-    ViewId,
+    ViewId, WorkloadId,
 };
+use rockstream_types::workload::WorkloadDef;
 
 pub use envelope::{CatalogEnvelope, CURRENT_CATALOG_FORMAT_VERSION};
 pub use identity::{stable_name_id, IdAllocator};
@@ -253,6 +254,16 @@ pub struct CatalogSinkEntry {
     pub target: String,
     pub options: HashMap<String, String>,
     pub status: String,
+}
+
+/// A workload and its immutable catalog identity.
+///
+/// `WorkloadDef` describes resource policy, not identity; recovery must retain
+/// the ID chosen when that definition was first committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogWorkloadEntry {
+    pub id: WorkloadId,
+    pub definition: WorkloadDef,
 }
 
 /// A role / principal permission entry in the catalog.
