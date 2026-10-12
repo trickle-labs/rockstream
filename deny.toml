@@ -10,6 +10,7 @@ ignore = [
     "RUSTSEC-2026-0194", # quick-xml - pinned by object_store 0.12.x transitive constraint
     "RUSTSEC-2026-0195", # quick-xml - pinned by object_store 0.12.x transitive constraint
     "RUSTSEC-2026-0235", # rkyv - inactive optional rust_decimal feature in the lockfile
+    "RUSTSEC-2024-0449", # unsafe-libyaml - pre-existing serde_yaml dependency; unmaintained, no reported vulnerability
 ]
 
 [licenses]
