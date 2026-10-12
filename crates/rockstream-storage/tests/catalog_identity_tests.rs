@@ -2,7 +2,7 @@ use object_store::memory::InMemory;
 use rockstream_storage::catalog::identity::IdAllocator;
 use rockstream_storage::catalog::*;
 use rockstream_types::ids::*;
-use rockstream_types::workload::{MemoryLimit, WorkloadDef};
+use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -157,27 +157,140 @@ async fn test_source_id_invariance_across_status_changes() {
     assert_eq!(retrieved.options.get("status").unwrap(), "PAUSED");
 }
 
-#[tokio::test]
-async fn test_workload_id_invariance_across_alter_and_restart() {
+// Exact ID-to-definition oracle, including every missing ID.
+async fn mapping(catalog: &DurableCatalogStore, max_id: u64) -> Vec<Option<WorkloadDef>> {
+    let mut result = Vec::new();
+    for id in 1..=max_id {
+        result.push(catalog.get_workload(WorkloadId(id)).await.unwrap());
+    }
+    result
+}
+
+fn workload(name: &str, memory: u64, parallelism: u32, slo: u64, priority: u8) -> WorkloadDef {
+    WorkloadDef::new(name)
+        .with_memory_limit(MemoryLimit::new(memory))
+        .with_max_parallelism(parallelism)
+        .with_freshness_slo(FreshnessSlo::new(slo))
+        .with_priority(WorkloadPriority(priority))
+}
+
+async fn assert_single_workload_identity(snapshot: bool) {
     let store = Arc::new(InMemory::new());
-    let catalog = DurableCatalogStore::new(store.clone(), "test");
+    let catalog = DurableCatalogStore::new(store.clone(), "identity");
+    assert_eq!(catalog.allocate_id().await.unwrap(), 1);
 
-    let workload_id = WorkloadId(catalog.allocate_id().await.unwrap());
-    let wl = WorkloadDef::new("interactive");
-    let txn1 = CatalogTxn::new(1, 1, vec![CatalogMutation::PutWorkload(wl.clone())]).unwrap();
-    catalog.commit_txn(txn1).await.unwrap();
+    let original = workload("interactive", 100 * 1024 * 1024, 8, 250, 17);
+    catalog.commit_txn(CatalogTxn::new(
+        1, 100, vec![CatalogMutation::PutWorkload(original.clone())],
+    ).unwrap()).await.unwrap();
 
-    // Alter workload budget
-    let altered = wl.with_memory_limit(MemoryLimit::new(1024 * 1024 * 100));
-    let txn2 = CatalogTxn::new(2, 2, vec![CatalogMutation::PutWorkload(altered.clone())]).unwrap();
-    catalog.commit_txn(txn2).await.unwrap();
+    let expected = vec![None, Some(original.clone())];
+    assert_eq!(mapping(&catalog, 2).await, expected);
 
-    // Restart
-    let recovered = DurableCatalogStore::recover(store, "test").await.unwrap();
-    let retrieved = recovered.get_workload(workload_id).await.unwrap().unwrap();
-    assert_eq!(retrieved.name, "interactive");
-    assert_eq!(
-        retrieved.memory_limit,
-        Some(MemoryLimit::new(1024 * 1024 * 100))
-    );
+    if snapshot {
+        let saved = catalog.create_snapshot().await.unwrap();
+        assert_eq!(saved.workload_entries, vec![CatalogWorkloadEntry {
+            id: WorkloadId(2), definition: original.clone(),
+        }]);
+        assert_eq!(catalog.compact_logs(1).await.unwrap(), 1);
+    }
+
+    let recovered = DurableCatalogStore::recover(store, "identity").await.unwrap();
+    assert_eq!(mapping(&recovered, 2).await, expected);
+    assert_eq!(recovered.allocate_id().await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn workload_identity_survives_log_only_recovery() {
+    assert_single_workload_identity(false).await;
+}
+
+#[tokio::test]
+async fn workload_identity_survives_snapshot_compaction() {
+    assert_single_workload_identity(true).await;
+}
+
+async fn assert_gaps_deletion_and_second_recovery(snapshot: bool) {
+    let store = Arc::new(InMemory::new());
+    let catalog = DurableCatalogStore::new(store.clone(), "gaps");
+    assert_eq!(catalog.allocate_id().await.unwrap(), 1);
+    let first = workload("first", 1024, 2, 100, 3);
+    let deleted = workload("deleted", 2048, 4, 200, 7);
+    let third = workload("third", 4096, 8, 300, 11);
+    let updated = workload("first", 8192, 16, 400, 13);
+
+    catalog.commit_txn(CatalogTxn::new(1, 101, vec![
+        CatalogMutation::PutWorkload(first),
+    ]).unwrap()).await.unwrap();
+    assert_eq!(catalog.allocate_id().await.unwrap(), 3);
+    catalog.commit_txn(CatalogTxn::new(2, 102, vec![
+        CatalogMutation::PutWorkload(deleted),
+    ]).unwrap()).await.unwrap();
+    assert_eq!(catalog.allocate_id().await.unwrap(), 5);
+    catalog.commit_txn(CatalogTxn::new(3, 103, vec![
+        CatalogMutation::PutWorkload(third.clone()),
+    ]).unwrap()).await.unwrap();
+    catalog.commit_txn(CatalogTxn::new(4, 104, vec![
+        CatalogMutation::PutWorkload(updated.clone()),
+    ]).unwrap()).await.unwrap();
+    catalog.commit_txn(CatalogTxn::new(5, 105, vec![
+        CatalogMutation::DeleteWorkload(WorkloadId(4)),
+    ]).unwrap()).await.unwrap();
+
+    let expected = vec![
+        None, Some(updated.clone()), None, None, None, Some(third.clone()),
+    ];
+    assert_eq!(mapping(&catalog, 6).await, expected);
+
+    if snapshot {
+        catalog.create_snapshot().await.unwrap();
+        assert_eq!(catalog.compact_logs(5).await.unwrap(), 5);
+    }
+
+    let recovered = DurableCatalogStore::recover(store.clone(), "gaps").await.unwrap();
+    assert_eq!(mapping(&recovered, 6).await, expected);
+    assert_eq!(recovered.allocate_id().await.unwrap(), 7);
+
+    // Deleting by the ORIGINAL ID must not remove a neighboring workload.
+    recovered.commit_txn(CatalogTxn::new(6, 106, vec![
+        CatalogMutation::DeleteWorkload(WorkloadId(2)),
+    ]).unwrap()).await.unwrap();
+    let surviving = vec![None, None, None, None, None, Some(third)];
+    assert_eq!(mapping(&recovered, 6).await, surviving);
+
+    let second = DurableCatalogStore::recover(store.clone(), "gaps").await.unwrap();
+    assert_eq!(mapping(&second, 6).await, surviving);
+    if snapshot {
+        second.create_snapshot().await.unwrap();
+        second.compact_logs(6).await.unwrap();
+        let third_recovery = DurableCatalogStore::recover(store, "gaps").await.unwrap();
+        assert_eq!(mapping(&third_recovery, 6).await, surviving);
+    }
+}
+
+#[tokio::test]
+async fn workload_gaps_and_deletes_survive_log_recovery() {
+    assert_gaps_deletion_and_second_recovery(false).await;
+}
+
+#[tokio::test]
+async fn workload_gaps_and_deletes_survive_snapshot_recovery() {
+    assert_gaps_deletion_and_second_recovery(true).await;
+}
+
+#[tokio::test]
+async fn workload_id_invariance_across_alter_and_restart() {
+    let store = Arc::new(InMemory::new());
+    let catalog = DurableCatalogStore::new(store.clone(), "alter");
+    let original = workload("interactive", 2048, 2, 500, 9);
+    let altered = workload("interactive", 4096, 4, 250, 5);
+    catalog.commit_txn(CatalogTxn::new(1, 1, vec![
+        CatalogMutation::PutWorkload(original),
+    ]).unwrap()).await.unwrap();
+    catalog.commit_txn(CatalogTxn::new(2, 2, vec![
+        CatalogMutation::PutWorkload(altered.clone()),
+    ]).unwrap()).await.unwrap();
+    assert_eq!(mapping(&catalog, 1).await, vec![Some(altered.clone())]);
+    let recovered = DurableCatalogStore::recover(store, "alter").await.unwrap();
+    assert_eq!(mapping(&recovered, 1).await, vec![Some(altered)]);
 }
