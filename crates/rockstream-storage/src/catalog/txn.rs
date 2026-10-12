@@ -36,7 +36,10 @@ pub enum CatalogMutation {
     PutInlineView(CatalogInlineView),
     DeleteInlineView(ViewId),
     PutViewDependency(ViewDependency),
-    DeleteViewDependency { parent_id: u64, child_id: u64 },
+    DeleteViewDependency {
+        parent_id: u64,
+        child_id: u64,
+    },
     PutIndex(CatalogIndexEntry),
     DeleteIndex(IndexId),
     PutWorkload(WorkloadDef),
