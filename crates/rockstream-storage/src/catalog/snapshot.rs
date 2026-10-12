@@ -13,6 +13,7 @@ use super::envelope::compute_checksum;
 use super::{
     CatalogDatabase, CatalogError, CatalogIndexEntry, CatalogInlineView, CatalogNamespace,
     CatalogRoleEntry, CatalogSinkEntry, CatalogSourceEntry, CatalogTable, CatalogView,
+    CatalogWorkloadEntry,
     CompiledPlanRecord, ViewDependency,
 };
 use rockstream_types::workload::WorkloadDef;
@@ -29,7 +30,11 @@ pub struct CatalogSnapshot {
     pub inline_views: Vec<CatalogInlineView>,
     pub view_dependencies: Vec<ViewDependency>,
     pub indexes: Vec<CatalogIndexEntry>,
+    /// Legacy field retained for decoding old snapshots and their checksums.
     pub workloads: Vec<WorkloadDef>,
+    /// Exact identity mapping for snapshots written by the current catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workload_entries: Vec<CatalogWorkloadEntry>,
     pub sources: Vec<CatalogSourceEntry>,
     pub sinks: Vec<CatalogSinkEntry>,
     pub roles: Vec<CatalogRoleEntry>,
@@ -53,7 +58,7 @@ impl CatalogSnapshot {
         inline_views: Vec<CatalogInlineView>,
         view_dependencies: Vec<ViewDependency>,
         indexes: Vec<CatalogIndexEntry>,
-        workloads: Vec<WorkloadDef>,
+        workload_entries: Vec<CatalogWorkloadEntry>,
         sources: Vec<CatalogSourceEntry>,
         sinks: Vec<CatalogSinkEntry>,
         roles: Vec<CatalogRoleEntry>,
@@ -70,7 +75,8 @@ impl CatalogSnapshot {
             inline_views,
             view_dependencies,
             indexes,
-            workloads,
+            workloads: vec![],
+            workload_entries,
             sources,
             sinks,
             roles,
