@@ -24,7 +24,7 @@ use super::txn::{CatalogMutation, CatalogTxn};
 use super::{
     CatalogDatabase, CatalogError, CatalogIndexEntry, CatalogInlineView, CatalogNamespace,
     CatalogRoleEntry, CatalogSinkEntry, CatalogSourceEntry, CatalogTable, CatalogView,
-    CompiledPlanRecord, DependencyKind, ViewDependency,
+    CatalogWorkloadEntry, CompiledPlanRecord, DependencyKind, ViewDependency,
 };
 use rockstream_types::ids::{
     CompiledPlanId, DatabaseId, IndexId, NamespaceId, PrincipalId, SinkId, SourceId, TableId,
@@ -165,7 +165,10 @@ impl DurableCatalogStore {
             state.inline_views.values().cloned().collect(),
             state.view_dependencies.clone(),
             state.indexes.values().cloned().collect(),
-            state.workloads.values().cloned().collect(),
+            state.workloads.iter().map(|(&id, definition)| CatalogWorkloadEntry {
+                id,
+                definition: definition.clone(),
+            }).collect(),
             state.sources.values().cloned().collect(),
             state.sinks.values().cloned().collect(),
             state.roles.values().cloned().collect(),
@@ -325,10 +328,16 @@ impl DurableCatalogStore {
                             catalog.id_allocator.observe(idx.id.0);
                             recovered_state.indexes.insert(idx.id, idx);
                         }
-                        for (idx, wl) in snap.workloads.into_iter().enumerate() {
-                            let wid = WorkloadId((idx + 1) as u64);
-                            catalog.id_allocator.observe(wid.0);
-                            recovered_state.workloads.insert(wid, wl);
+                        // Legacy snapshots omitted IDs. Only new snapshots carry a
+                        // recoverable workload mapping; never guess IDs by position.
+                        if !snap.workloads.is_empty() && snap.workload_entries.is_empty() {
+                            return Err(CatalogError::DecodeError(
+                                "[RS-1003] snapshot contains workloads without durable IDs; cannot recover identities safely".into(),
+                            ));
+                        }
+                        for entry in snap.workload_entries {
+                            catalog.id_allocator.observe(entry.id.0);
+                            recovered_state.workloads.insert(entry.id, entry.definition);
                         }
                         for src in snap.sources {
                             catalog.id_allocator.observe(src.id.0);
@@ -502,6 +511,10 @@ fn apply_mutation_to_state(
             let wid = existing_id.unwrap_or_else(|| WorkloadId(allocator.allocate()));
             state.workloads.insert(wid, wl.clone());
         }
+        CatalogMutation::PutWorkloadWithId(entry) => {
+            allocator.observe(entry.id.0);
+            state.workloads.insert(entry.id, entry.definition.clone());
+        }
         CatalogMutation::DeleteWorkload(id) => {
             state.workloads.remove(id);
         }
@@ -621,6 +634,31 @@ impl CatalogStore for DurableCatalogStore {
                 }
             }
         }
+
+        // Resolve implicit workload identities before writing the transaction log.
+        // Replay must use recorded IDs, never allocate according to replay order.
+        let mut resolved = txn.mutations.clone();
+        let mut workload_ids: HashMap<String, WorkloadId> = state.workloads
+            .iter().map(|(&id, def)| (def.name.clone(), id)).collect();
+        for mutation in &mut resolved {
+            match mutation {
+                CatalogMutation::PutWorkload(definition) => {
+                    let id = *workload_ids.entry(definition.name.clone())
+                        .or_insert_with(|| WorkloadId(self.id_allocator.allocate()));
+                    *mutation = CatalogMutation::PutWorkloadWithId(CatalogWorkloadEntry {
+                        id, definition: definition.clone(),
+                    });
+                }
+                CatalogMutation::PutWorkloadWithId(entry) => {
+                    workload_ids.insert(entry.definition.name.clone(), entry.id);
+                }
+                CatalogMutation::DeleteWorkload(id) => {
+                    workload_ids.retain(|_, existing| existing != id);
+                }
+                _ => {}
+            }
+        }
+        let txn = CatalogTxn::new(txn.revision, txn.operation_id, resolved)?;
 
         // 3. Durably persist transaction log
         let bytes = txn.encode()?;
