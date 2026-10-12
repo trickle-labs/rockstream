@@ -13,8 +13,7 @@ use super::envelope::compute_checksum;
 use super::{
     CatalogDatabase, CatalogError, CatalogIndexEntry, CatalogInlineView, CatalogNamespace,
     CatalogRoleEntry, CatalogSinkEntry, CatalogSourceEntry, CatalogTable, CatalogView,
-    CatalogWorkloadEntry,
-    CompiledPlanRecord, ViewDependency,
+    CatalogWorkloadEntry, CompiledPlanRecord, ViewDependency,
 };
 use rockstream_types::workload::WorkloadDef;
 
