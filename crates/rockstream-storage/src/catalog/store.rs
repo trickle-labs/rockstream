@@ -165,10 +165,14 @@ impl DurableCatalogStore {
             state.inline_views.values().cloned().collect(),
             state.view_dependencies.clone(),
             state.indexes.values().cloned().collect(),
-            state.workloads.iter().map(|(&id, definition)| CatalogWorkloadEntry {
-                id,
-                definition: definition.clone(),
-            }).collect(),
+            state
+                .workloads
+                .iter()
+                .map(|(&id, definition)| CatalogWorkloadEntry {
+                    id,
+                    definition: definition.clone(),
+                })
+                .collect(),
             state.sources.values().cloned().collect(),
             state.sinks.values().cloned().collect(),
             state.roles.values().cloned().collect(),
@@ -638,15 +642,20 @@ impl CatalogStore for DurableCatalogStore {
         // Resolve implicit workload identities before writing the transaction log.
         // Replay must use recorded IDs, never allocate according to replay order.
         let mut resolved = txn.mutations.clone();
-        let mut workload_ids: HashMap<String, WorkloadId> = state.workloads
-            .iter().map(|(&id, def)| (def.name.clone(), id)).collect();
+        let mut workload_ids: HashMap<String, WorkloadId> = state
+            .workloads
+            .iter()
+            .map(|(&id, def)| (def.name.clone(), id))
+            .collect();
         for mutation in &mut resolved {
             match mutation {
                 CatalogMutation::PutWorkload(definition) => {
-                    let id = *workload_ids.entry(definition.name.clone())
+                    let id = *workload_ids
+                        .entry(definition.name.clone())
                         .or_insert_with(|| WorkloadId(self.id_allocator.allocate()));
                     *mutation = CatalogMutation::PutWorkloadWithId(CatalogWorkloadEntry {
-                        id, definition: definition.clone(),
+                        id,
+                        definition: definition.clone(),
                     });
                 }
                 CatalogMutation::PutWorkloadWithId(entry) => {
