@@ -78,7 +78,8 @@ pub use manifest::{
 pub use migration::{
     BucketMapVersionTracker, MigrationConsumerFrontierTracker, MigrationCoordinator,
     MigrationCopyStats, MigrationError, MigrationFillLevel, MigrationLoadError,
-    MigrationPersistentStore, MigrationRecovery, MigrationShard, PhaseClocks,
+    MigrationPersistentStore, MigrationRecovery, MigrationRecoveryBlockReason, MigrationShard,
+    MigrationStartupError, MigrationStartupOutcome, MigrationStartupStatus, PhaseClocks,
     MAX_ACTIVE_MIGRATIONS, MAX_COPY_CHUNK_BYTES, MAX_COPY_CHUNK_ROWS,
 };
 pub use namespace::NamespaceCatalog;
