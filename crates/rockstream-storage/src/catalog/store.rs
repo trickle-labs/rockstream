@@ -260,6 +260,10 @@ impl DurableCatalogStore {
     }
 
     /// Recover catalog state from durable storage.
+    ///
+    /// A failed listing is never an empty listing. An unreadable snapshot can
+    /// only be bypassed when an earlier snapshot and contiguous logs reconstruct
+    /// at least the revision that the unreadable snapshot advertised.
     pub async fn recover(
         store: Arc<dyn ObjectStore>,
         prefix: impl Into<String>,
@@ -267,123 +271,159 @@ impl DurableCatalogStore {
         let prefix = prefix.into();
         let catalog = Self::new(Arc::clone(&store), prefix.clone());
 
-        // 1. Find latest valid snapshot
+        // Find all finalized snapshots before selecting a recovery base.
         let snap_prefix = format!("{}/catalog/snapshots/", prefix);
         let snap_prefix_path = ObjectPath::from(snap_prefix.trim_start_matches('/'));
 
         let mut snapshots: Vec<(u64, ObjectPath)> = Vec::new();
         let mut list_stream = store.list(Some(&snap_prefix_path));
         while let Some(item) = list_stream.next().await {
-            if let Ok(meta) = item {
-                let location = meta.location;
-                let filename = location.as_ref().split('/').next_back().unwrap_or_default();
-                if filename.ends_with(".snap") && !filename.ends_with(".tmp") {
-                    if let Ok(rev) = filename.trim_end_matches(".snap").parse::<u64>() {
-                        snapshots.push((rev, location));
-                    }
+            let meta = item.map_err(|e| {
+                CatalogError::Storage(format!("[RS-0003] snapshot list error: {e}"))
+            })?;
+            let location = meta.location;
+            let filename = location.as_ref().split('/').next_back().unwrap_or_default();
+            if filename.ends_with(".snap") {
+                if let Ok(rev) = filename.trim_end_matches(".snap").parse::<u64>() {
+                    snapshots.push((rev, location));
                 }
             }
         }
 
         snapshots.sort_by_key(|(rev, _)| *rev);
-
+        let latest_snapshot_revision = snapshots.last().map(|(rev, _)| *rev);
+        let mut snapshot_error = None;
         let mut recovered_state = CatalogInnerState::default();
         let mut start_revision = 0;
 
-        // Try from latest snapshot backward until a valid one is found
-        while let Some((_rev, path)) = snapshots.pop() {
-            if let Ok(res) = store.get(&path).await {
-                if let Ok(bytes) = res.bytes().await {
-                    if let Ok(snap) = CatalogSnapshot::decode(&bytes) {
-                        start_revision = snap.revision;
-                        recovered_state.revision = snap.revision;
-                        recovered_state.committed_operations =
-                            snap.committed_operations.into_iter().collect();
-                        catalog.id_allocator.observe(snap.high_water_mark);
-
-                        for db in snap.databases {
-                            catalog.id_allocator.observe(db.id.0);
-                            recovered_state.databases.insert(db.id, db);
-                        }
-                        for ns in snap.namespaces {
-                            catalog.id_allocator.observe(ns.id.0);
-                            recovered_state.namespaces.insert(ns.id, ns);
-                        }
-                        for tbl in snap.tables {
-                            catalog.id_allocator.observe(tbl.id.0);
-                            recovered_state
-                                .tables_by_name
-                                .insert(tbl.name.clone(), tbl.id);
-                            recovered_state.tables.insert(tbl.id, tbl);
-                        }
-                        for view in snap.views {
-                            catalog.id_allocator.observe(view.id.0);
-                            recovered_state
-                                .views_by_name
-                                .insert(view.name.clone(), view.id);
-                            recovered_state.views.insert(view.id, view);
-                        }
-                        for iv in snap.inline_views {
-                            catalog.id_allocator.observe(iv.id.0);
-                            recovered_state.inline_views.insert(iv.id, iv);
-                        }
-                        recovered_state.view_dependencies = snap.view_dependencies;
-                        for idx in snap.indexes {
-                            catalog.id_allocator.observe(idx.id.0);
-                            recovered_state.indexes.insert(idx.id, idx);
-                        }
-                        // Legacy snapshots omitted IDs. Only new snapshots carry a
-                        // recoverable workload mapping; never guess IDs by position.
-                        if !snap.workloads.is_empty() && snap.workload_entries.is_empty() {
-                            return Err(CatalogError::DecodeError(
-                                "[RS-1003] snapshot contains workloads without durable IDs; cannot recover identities safely".into(),
-                            ));
-                        }
-                        for entry in snap.workload_entries {
-                            catalog.id_allocator.observe(entry.id.0);
-                            recovered_state.workloads.insert(entry.id, entry.definition);
-                        }
-                        for src in snap.sources {
-                            catalog.id_allocator.observe(src.id.0);
-                            recovered_state.sources.insert(src.id, src);
-                        }
-                        for sink in snap.sinks {
-                            catalog.id_allocator.observe(sink.id.0);
-                            recovered_state.sinks.insert(sink.id, sink);
-                        }
-                        for r in snap.roles {
-                            catalog.id_allocator.observe(r.id.0);
-                            recovered_state.roles.insert(r.id, r);
-                        }
-                        for plan in snap.compiled_plans {
-                            catalog.id_allocator.observe(plan.id.0);
-                            recovered_state.compiled_plans.insert(plan.id, plan);
-                        }
-                        break;
-                    }
+        // Try snapshots from newest to oldest. Do not publish an older state
+        // unless log replay below can fill every missing revision.
+        while let Some((listed_revision, path)) = snapshots.pop() {
+            let loaded = async {
+                let result = store.get(&path).await.map_err(|e| {
+                    CatalogError::Storage(format!(
+                        "[RS-0003] failed to get catalog snapshot {}: {e}",
+                        path.as_ref()
+                    ))
+                })?;
+                let bytes = result.bytes().await.map_err(|e| {
+                    CatalogError::Storage(format!(
+                        "[RS-0003] failed to read catalog snapshot bytes {}: {e}",
+                        path.as_ref()
+                    ))
+                })?;
+                let snap = CatalogSnapshot::decode(&bytes)?;
+                if snap.revision != listed_revision {
+                    return Err(CatalogError::DecodeError(format!(
+                        "[RS-1003] catalog snapshot {} claims revision {} instead of {}; next_steps: inspect snapshot file",
+                        path.as_ref(),
+                        snap.revision,
+                        listed_revision
+                    )));
                 }
+                // Legacy snapshots omitted workload IDs and cannot restore
+                // those identities without their original transaction logs.
+                if !snap.workloads.is_empty() && snap.workload_entries.is_empty() {
+                    return Err(CatalogError::DecodeError(
+                        "[RS-1003] snapshot contains workloads without durable IDs; cannot recover identities safely".into(),
+                    ));
+                }
+                Ok::<CatalogSnapshot, CatalogError>(snap)
             }
+            .await;
+
+            let snap = match loaded {
+                Ok(snap) => snap,
+                Err(error) => {
+                    // Keep the newest failure to report if fallback is incomplete.
+                    if snapshot_error.is_none() {
+                        snapshot_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+
+            start_revision = snap.revision;
+            recovered_state.revision = snap.revision;
+            recovered_state.committed_operations =
+                snap.committed_operations.into_iter().collect();
+            catalog.id_allocator.observe(snap.high_water_mark);
+
+            for db in snap.databases {
+                catalog.id_allocator.observe(db.id.0);
+                recovered_state.databases.insert(db.id, db);
+            }
+            for ns in snap.namespaces {
+                catalog.id_allocator.observe(ns.id.0);
+                recovered_state.namespaces.insert(ns.id, ns);
+            }
+            for tbl in snap.tables {
+                catalog.id_allocator.observe(tbl.id.0);
+                recovered_state
+                    .tables_by_name
+                    .insert(tbl.name.clone(), tbl.id);
+                recovered_state.tables.insert(tbl.id, tbl);
+            }
+            for view in snap.views {
+                catalog.id_allocator.observe(view.id.0);
+                recovered_state
+                    .views_by_name
+                    .insert(view.name.clone(), view.id);
+                recovered_state.views.insert(view.id, view);
+            }
+            for iv in snap.inline_views {
+                catalog.id_allocator.observe(iv.id.0);
+                recovered_state.inline_views.insert(iv.id, iv);
+            }
+            recovered_state.view_dependencies = snap.view_dependencies;
+            for idx in snap.indexes {
+                catalog.id_allocator.observe(idx.id.0);
+                recovered_state.indexes.insert(idx.id, idx);
+            }
+            for entry in snap.workload_entries {
+                catalog.id_allocator.observe(entry.id.0);
+                recovered_state.workloads.insert(entry.id, entry.definition);
+            }
+            for src in snap.sources {
+                catalog.id_allocator.observe(src.id.0);
+                recovered_state.sources.insert(src.id, src);
+            }
+            for sink in snap.sinks {
+                catalog.id_allocator.observe(sink.id.0);
+                recovered_state.sinks.insert(sink.id, sink);
+            }
+            for role in snap.roles {
+                catalog.id_allocator.observe(role.id.0);
+                recovered_state.roles.insert(role.id, role);
+            }
+            for plan in snap.compiled_plans {
+                catalog.id_allocator.observe(plan.id.0);
+                recovered_state.compiled_plans.insert(plan.id, plan);
+            }
+            break;
         }
 
-        // 2. Scan and replay log entries with revision > start_revision
+        // The log listing must finish successfully before replay can publish
+        // anything. A failed page is not proof that no later files exist.
         let log_prefix = format!("{}/catalog/log/", prefix);
         let log_prefix_path = ObjectPath::from(log_prefix.trim_start_matches('/'));
 
         let mut log_files: Vec<(u64, u64, ObjectPath)> = Vec::new();
         let mut log_stream = store.list(Some(&log_prefix_path));
         while let Some(item) = log_stream.next().await {
-            if let Ok(meta) = item {
-                let location = meta.location;
-                let filename = location.as_ref().split('/').next_back().unwrap_or_default();
-                if filename.ends_with(".log") {
-                    let parts: Vec<&str> = filename.trim_end_matches(".log").split('_').collect();
-                    if parts.len() == 2 {
-                        if let (Ok(rev), Ok(op_id)) =
-                            (parts[0].parse::<u64>(), parts[1].parse::<u64>())
-                        {
-                            if rev > start_revision {
-                                log_files.push((rev, op_id, location));
-                            }
+            let meta = item.map_err(|e| {
+                CatalogError::Storage(format!("[RS-0003] log list error: {e}"))
+            })?;
+            let location = meta.location;
+            let filename = location.as_ref().split('/').next_back().unwrap_or_default();
+            if filename.ends_with(".log") {
+                let parts: Vec<&str> = filename.trim_end_matches(".log").split('_').collect();
+                if parts.len() == 2 {
+                    if let (Ok(rev), Ok(op_id)) =
+                        (parts[0].parse::<u64>(), parts[1].parse::<u64>())
+                    {
+                        if rev > start_revision {
+                            log_files.push((rev, op_id, location));
                         }
                     }
                 }
@@ -393,7 +433,16 @@ impl DurableCatalogStore {
         log_files.sort_by_key(|(rev, op_id, _)| (*rev, *op_id));
 
         let mut total_buffer_bytes = 0;
-        for (rev, _op_id, path) in log_files {
+        let mut expected_revision = start_revision;
+        for (rev, op_id, path) in log_files {
+            if rev != expected_revision.saturating_add(1) {
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
+                    expected_revision.saturating_add(1),
+                    rev
+                )));
+            }
+
             let res = store.get(&path).await.map_err(|e| {
                 CatalogError::Storage(format!(
                     "[RS-0003] failed to read log file {}: {e}",
@@ -412,16 +461,17 @@ impl DurableCatalogStore {
                 )));
             }
 
-            let txn = match CatalogTxn::decode(&bytes) {
-                Ok(t) => t,
-                Err(e) => {
-                    // Halt log replay cleanly on corruption
-                    tracing::warn!("Catalog log corruption detected at revision {rev}: {e}");
-                    break;
-                }
-            };
+            // A bad record must not turn a complete listing into a partial
+            // catalog. Preserve the original error and every stored object.
+            let txn = CatalogTxn::decode(&bytes)?;
+            if txn.revision != rev || txn.operation_id != op_id {
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] catalog log {} has mismatched revision or operation ID; next_steps: inspect catalog log files",
+                    path.as_ref()
+                )));
+            }
+            expected_revision = rev;
 
-            // Deduplication
             if recovered_state
                 .committed_operations
                 .contains(&txn.operation_id)
@@ -429,7 +479,6 @@ impl DurableCatalogStore {
                 continue;
             }
 
-            // Apply mutations
             for mutation in &txn.mutations {
                 apply_mutation_to_state(&mut recovered_state, &catalog.id_allocator, mutation);
             }
@@ -439,9 +488,20 @@ impl DurableCatalogStore {
             recovered_state.revision = txn.revision;
         }
 
+        // An unreadable newer snapshot cannot be ignored if the remaining
+        // history stops short of its revision (including a corrupt revision 0).
+        if let Some(error) = snapshot_error {
+            if latest_snapshot_revision.is_some_and(|rev| recovered_state.revision < rev)
+                || (start_revision == 0 && recovered_state.revision == 0)
+            {
+                return Err(error);
+            }
+        }
+
         *catalog.state.write().await = recovered_state;
         Ok(catalog)
     }
+
 }
 
 fn apply_mutation_to_state(
