@@ -909,3 +909,6 @@ mod tests {
         n2.shutdown();
     }
 }
+
+#[cfg(test)]
+mod persistence_ordering_tests;
