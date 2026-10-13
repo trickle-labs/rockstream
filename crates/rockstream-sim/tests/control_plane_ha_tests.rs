@@ -1262,31 +1262,57 @@ mod real_leader_fencing_108 {
             return;
         }
         let cluster = tc::TcCluster::boot(if isolation { "108-isolate" } else { "108-kill" }).await;
-        let (old_idx, old_term) = cluster.wait_for_single_leader(Duration::from_secs(15)).await;
+        let (old_idx, old_term) = cluster
+            .wait_for_single_leader(Duration::from_secs(15))
+            .await;
         let old_addr = cluster.nodes[old_idx].control_addr;
-        let (_, old_lease, old_worker) =
-            tc::register_and_request_shard(&cluster, 10, 108).await;
+        let (_, old_lease, old_worker) = tc::register_and_request_shard(&cluster, 10, 108).await;
         assert_eq!(old_lease.worker_id, WorkerId(10));
 
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-        let db = ShardDb::builder("worker-shard-108", store.clone()).build().await.unwrap();
+        let db = ShardDb::builder("worker-shard-108", store.clone())
+            .build()
+            .await
+            .unwrap();
         let mut committed = Vec::new();
         let mut outcomes = Vec::new();
-        outcomes.push(attempt(old_addr, old_lease.lease_token, &db,
-            b"row/01", b"ack-before", &mut committed).await);
+        outcomes.push(
+            attempt(
+                old_addr,
+                old_lease.lease_token,
+                &db,
+                b"row/01",
+                b"ack-before",
+                &mut committed,
+            )
+            .await,
+        );
         assert_eq!(outcomes, vec![true]);
 
         if isolation {
             // Disconnect the elected leader from the shared Docker Raft
             // network without killing its running OS process.
             let status = std::process::Command::new("docker")
-                .args(["network", "disconnect", "-f", &cluster.network, &cluster.nodes[old_idx].name])
-                .status().unwrap();
+                .args([
+                    "network",
+                    "disconnect",
+                    "-f",
+                    &cluster.network,
+                    &cluster.nodes[old_idx].name,
+                ])
+                .status()
+                .unwrap();
             assert!(status.success(), "failed to isolate leader");
             let inspect = std::process::Command::new("docker")
-                .args(["inspect", "-f", "{{.State.Running}}", &cluster.nodes[old_idx].name])
-                .output().unwrap();
+                .args([
+                    "inspect",
+                    "-f",
+                    "{{.State.Running}}",
+                    &cluster.nodes[old_idx].name,
+                ])
+                .output()
+                .unwrap();
             assert!(inspect.status.success());
             assert_eq!(String::from_utf8_lossy(&inspect.stdout).trim(), "true");
         } else {
@@ -1295,7 +1321,9 @@ mod real_leader_fencing_108 {
 
         // Re-election must involve one of the two original surviving
         // processes, with no bootstrap process added.
-        let (new_idx, new_term) = cluster.wait_for_single_leader(Duration::from_secs(30)).await;
+        let (new_idx, new_term) = cluster
+            .wait_for_single_leader(Duration::from_secs(30))
+            .await;
         assert_ne!(old_idx, new_idx);
         assert!(new_term > old_term);
         let new_addr = cluster.nodes[new_idx].control_addr;
@@ -1305,14 +1333,19 @@ mod real_leader_fencing_108 {
         let _old_worker = old_worker;
         let mut new_worker = tc::register_worker(new_addr, 10).await;
         let wire = serde_json::to_string(&WorkerMessage::RequestShard {
-            worker_id: WorkerId(10), shard_id: ShardId(108),
-        }).unwrap() + "\n";
+            worker_id: WorkerId(10),
+            shard_id: ShardId(108),
+        })
+        .unwrap()
+            + "\n";
         new_worker.write_all(wire.as_bytes()).await.unwrap();
         let mut reader = BufReader::new(&mut new_worker);
         let new_lease = loop {
             let mut line = String::new();
             tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-                .await.unwrap().unwrap();
+                .await
+                .unwrap()
+                .unwrap();
             match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
                 ControlMessage::ShardAssigned { lease, .. } => break lease,
                 ControlMessage::TopologyChanged { .. } => continue,
@@ -1322,27 +1355,64 @@ mod real_leader_fencing_108 {
         assert_eq!(new_lease.worker_id, WorkerId(10));
         assert!(new_lease.lease_token.0 > old_lease.lease_token.0);
 
-        outcomes.push(attempt(new_addr, old_lease.lease_token, &db,
-            b"row/stale", b"never-commit", &mut committed).await);
-        outcomes.push(attempt(new_addr, new_lease.lease_token, &db,
-            b"row/02", b"ack-after", &mut committed).await);
+        outcomes.push(
+            attempt(
+                new_addr,
+                old_lease.lease_token,
+                &db,
+                b"row/stale",
+                b"never-commit",
+                &mut committed,
+            )
+            .await,
+        );
+        outcomes.push(
+            attempt(
+                new_addr,
+                new_lease.lease_token,
+                &db,
+                b"row/02",
+                b"ack-after",
+                &mut committed,
+            )
+            .await,
+        );
         if isolation {
             // Old process is still alive and must reject its own old token.
-            outcomes.push(attempt(old_addr, old_lease.lease_token, &db,
-                b"row/isolated", b"never-commit", &mut committed).await);
+            outcomes.push(
+                attempt(
+                    old_addr,
+                    old_lease.lease_token,
+                    &db,
+                    b"row/isolated",
+                    b"never-commit",
+                    &mut committed,
+                )
+                .await,
+            );
             assert_eq!(outcomes, vec![true, false, true, false]);
         } else {
             assert_eq!(outcomes, vec![true, false, true]);
         }
-        assert_eq!(committed, vec![
-            (b"row/01".to_vec(), b"ack-before".to_vec()),
-            (b"row/02".to_vec(), b"ack-after".to_vec()),
-        ]);
+        assert_eq!(
+            committed,
+            vec![
+                (b"row/01".to_vec(), b"ack-before".to_vec()),
+                (b"row/02".to_vec(), b"ack-after".to_vec()),
+            ]
+        );
         db.close().await.unwrap();
-        let recovered = ShardDb::builder("worker-shard-108", store).build().await.unwrap();
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = recovered.scan_prefix(b"row/")
-            .await.unwrap().into_iter()
-            .map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+        let recovered = ShardDb::builder("worker-shard-108", store)
+            .build()
+            .await
+            .unwrap();
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = recovered
+            .scan_prefix(b"row/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
         assert_eq!(rows, committed);
         recovered.close().await.unwrap();
         drop(reader);
