@@ -152,6 +152,17 @@ struct RaftInner {
     role: RaftRole,
     current_leader: Option<RaftNodeId>,
     last_contact: Instant,
+    /// Last majority-backed confirmation of this node's leadership.
+    last_quorum_contact: Instant,
+    /// Strictly shorter than a follower's earliest election timeout.
+    leader_quorum_timeout: Duration,
+}
+
+/// Reject stale leadership even before the background heartbeat task demotes
+/// a process that has lost contact with its voting majority.
+fn has_live_leader_quorum(guard: &RaftInner) -> bool {
+    guard.role == RaftRole::Leader
+        && guard.last_quorum_contact.elapsed() < guard.leader_quorum_timeout
 }
 
 /// Handle to a running Raft node's election state. Cheap to clone; safe to
@@ -190,7 +201,7 @@ impl RaftHandle {
     }
 
     pub fn is_leader(&self) -> bool {
-        self.inner.read().role == RaftRole::Leader
+        has_live_leader_quorum(&self.inner.read())
     }
 
     pub fn current_term(&self) -> u64 {
@@ -208,7 +219,7 @@ impl RaftHandle {
     /// with the write.
     pub fn require_leader(&self) -> Result<u64, NotLeader> {
         let guard = self.inner.read();
-        if guard.role == RaftRole::Leader {
+        if has_live_leader_quorum(&guard) {
             assert_write_requires_leadership(guard.role, true);
             Ok(guard.persistent.current_term)
         } else {
@@ -220,7 +231,7 @@ impl RaftHandle {
     /// derived from, or `None` if this node is not currently leader.
     pub fn leader_epoch(&self) -> Option<u64> {
         let guard = self.inner.read();
-        if guard.role == RaftRole::Leader {
+        if has_live_leader_quorum(&guard) {
             Some(control_leader_epoch(
                 guard.persistent.current_term,
                 guard.node_id,
@@ -412,6 +423,13 @@ pub async fn spawn_raft_node(
         role: RaftRole::Follower,
         current_leader: None,
         last_contact: Instant::now(),
+        last_quorum_contact: Instant::now(),
+        // Expire stale authority before surviving followers can elect a new
+        // leader. Every majority heartbeat round renews this lease.
+        leader_quorum_timeout: config
+            .election_timeout_min
+            .saturating_sub(config.heartbeat_interval / 2)
+            .max(config.heartbeat_interval),
     }));
 
     let listener = TcpListener::bind(bind_addr).await?;
@@ -715,6 +733,7 @@ async fn start_election(
             if votes >= majority {
                 guard.role = RaftRole::Leader;
                 guard.current_leader = Some(node_id);
+                guard.last_quorum_contact = Instant::now();
                 // node_role is ephemeral (not persisted) — matches the
                 // FizzBee spec's `@state(ephemeral=["node_role", ...])`
                 // annotation.
@@ -744,11 +763,16 @@ async fn send_heartbeats(
         .iter()
         .map(|(_, addr)| send_heartbeat(addr, term, node_id, config.rpc_timeout));
     let mut highest = term;
+    let mut acknowledgements = 1usize; // the leader itself
     for resp in join_all(futures).await.into_iter().flatten() {
         if resp.term > highest {
             highest = resp.term;
         }
+        if resp.term == term {
+            acknowledgements += 1;
+        }
     }
+    let majority = config.peers.len().div_ceil(2) + 1;
     if highest > term {
         let _transition = store.transition_lock.lock().await;
         // See `start_election`'s comment: the guard's scope must end at
@@ -767,6 +791,18 @@ async fn send_heartbeats(
         };
         if let Some(snapshot) = step_down_snapshot {
             store.save(&snapshot).await;
+        }
+    } else {
+        let mut guard = inner.write();
+        if guard.role == RaftRole::Leader && guard.persistent.current_term == term {
+            if acknowledgements >= majority {
+                guard.last_quorum_contact = Instant::now();
+            } else if !has_live_leader_quorum(&guard) {
+                // Loss of majority is an ephemeral demotion; no durable term
+                // or vote changes. The isolated process cannot grant leases.
+                guard.role = RaftRole::Follower;
+                guard.current_leader = None;
+            }
         }
     }
 }
