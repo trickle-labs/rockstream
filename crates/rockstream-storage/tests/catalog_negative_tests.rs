@@ -59,7 +59,10 @@ async fn test_corrupt_record_fails_closed_without_partial_metadata() {
     let error = DurableCatalogStore::recover(store.clone(), prefix)
         .await
         .unwrap_err();
-    assert!(matches!(error, rockstream_storage::catalog::CatalogError::DecodeError(_)));
+    assert!(matches!(
+        error,
+        rockstream_storage::catalog::CatalogError::DecodeError(_)
+    ));
     assert!(error.to_string().contains("[RS-1003]"));
 }
 
