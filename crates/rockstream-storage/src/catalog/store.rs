@@ -345,8 +345,7 @@ impl DurableCatalogStore {
 
             start_revision = snap.revision;
             recovered_state.revision = snap.revision;
-            recovered_state.committed_operations =
-                snap.committed_operations.into_iter().collect();
+            recovered_state.committed_operations = snap.committed_operations.into_iter().collect();
             catalog.id_allocator.observe(snap.high_water_mark);
 
             for db in snap.databases {
@@ -411,16 +410,14 @@ impl DurableCatalogStore {
         let mut log_files: Vec<(u64, u64, ObjectPath)> = Vec::new();
         let mut log_stream = store.list(Some(&log_prefix_path));
         while let Some(item) = log_stream.next().await {
-            let meta = item.map_err(|e| {
-                CatalogError::Storage(format!("[RS-0003] log list error: {e}"))
-            })?;
+            let meta =
+                item.map_err(|e| CatalogError::Storage(format!("[RS-0003] log list error: {e}")))?;
             let location = meta.location;
             let filename = location.as_ref().split('/').next_back().unwrap_or_default();
             if filename.ends_with(".log") {
                 let parts: Vec<&str> = filename.trim_end_matches(".log").split('_').collect();
                 if parts.len() == 2 {
-                    if let (Ok(rev), Ok(op_id)) =
-                        (parts[0].parse::<u64>(), parts[1].parse::<u64>())
+                    if let (Ok(rev), Ok(op_id)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>())
                     {
                         if rev > start_revision {
                             log_files.push((rev, op_id, location));
@@ -501,7 +498,6 @@ impl DurableCatalogStore {
         *catalog.state.write().await = recovered_state;
         Ok(catalog)
     }
-
 }
 
 fn apply_mutation_to_state(
