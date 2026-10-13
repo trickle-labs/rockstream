@@ -648,6 +648,8 @@ impl CatalogStubs {
         let sources = store.list_sources().await.map_err(|e| e.to_string())?;
         let sinks = store.list_sinks().await.map_err(|e| e.to_string())?;
 
+        let view_deps = store.list_view_dependencies().await.map_err(|e| e.to_string())?;
+
         let mut inner = self.inner.write().unwrap();
         inner.tables.clear();
         let mut table_id_to_name = std::collections::HashMap::new();
@@ -671,7 +673,34 @@ impl CatalogStubs {
             );
         }
         inner.views.clear();
+        inner.deps.clear();
+        let mut view_id_to_name = std::collections::HashMap::new();
+        for v in &views {
+            view_id_to_name.insert(v.id.0, v.name.clone());
+        }
+        for dep in view_deps {
+            if let Some(parent_name) = view_id_to_name.get(&dep.parent_id) {
+                let child_name = match dep.dependency_kind {
+                    rockstream_storage::catalog::DependencyKind::Table => table_id_to_name
+                        .get(&rockstream_types::ids::TableId(dep.child_id))
+                        .cloned(),
+                    rockstream_storage::catalog::DependencyKind::View => view_id_to_name
+                        .get(&dep.child_id)
+                        .cloned(),
+                };
+                if let Some(child) = child_name {
+                    inner
+                        .deps
+                        .entry(parent_name.clone())
+                        .or_default()
+                        .push(child);
+                }
+            }
+        }
+        let mut view_states = self.view_states.write().unwrap();
+        view_states.clear();
         for v in views {
+            view_states.insert(v.name.clone(), ViewState::Running);
             let cols = v
                 .columns
                 .into_iter()
@@ -691,6 +720,7 @@ impl CatalogStubs {
                 },
             );
         }
+        drop(view_states);
         inner.indexes.clear();
         for idx in indexes {
             let state = match idx.state {

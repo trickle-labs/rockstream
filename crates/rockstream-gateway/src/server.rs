@@ -10059,9 +10059,10 @@ impl GatewayHandler {
             // visible to the ShardReader (DbReader reads from SSTs, not the
             // in-memory WAL buffer; without a flush the SELECT after COMMIT
             // would see stale state until the background 100 ms flush fires).
-            if let Err(e) = shard_db.flush().await {
-                tracing::warn!("post-commit shard flush failed (non-fatal): {e}");
-            }
+            // Flushing also guarantees durable persistence before acknowledging COMMIT.
+            shard_db.flush().await.map_err(|e| {
+                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+            })?;
         }
 
         let table_name = ops
