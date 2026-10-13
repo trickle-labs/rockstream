@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "scripts" / "ci-test-matrix.json"
-SKIP_LINE = re.compile(r"(?im)^\\s*(?:SKIP\\b|SKIPPING\\b|.*\\bSKIP:\\s*)")
+SKIP_LINE = re.compile(r"(?im)^\s*(?:SKIP\b|SKIPPING\b|.*\bSKIP:\s*)")
 
 
 def target_id(package: str, kind: str, name: str) -> str:
