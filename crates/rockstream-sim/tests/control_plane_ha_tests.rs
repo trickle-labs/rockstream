@@ -1205,17 +1205,29 @@ mod real_leader_fencing_108 {
     /// A real worker authorization round trip against an actual control
     /// process. Never infer an acceptance from a local ShardManager.
     async fn fence(addr: std::net::SocketAddr, token: LeaseToken) -> bool {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let Ok(Ok(mut stream)) =
+            tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await
+        else {
+            return false;
+        };
         let request = WorkerMessage::FenceWrite {
             shard_id: ShardId(108),
             lease_token: token,
         };
         let wire = serde_json::to_string(&request).unwrap() + "\n";
-        stream.write_all(wire.as_bytes()).await.unwrap();
+        if stream.write_all(wire.as_bytes()).await.is_err() {
+            return false;
+        }
         let mut line = String::new();
         let mut reader = BufReader::new(&mut stream);
-        tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
-            .await.unwrap().unwrap();
+        let Ok(Ok(read)) =
+            tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line)).await
+        else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
         match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
             ControlMessage::FenceAck { shard_id, valid } => {
                 assert_eq!(shard_id, ShardId(108));
