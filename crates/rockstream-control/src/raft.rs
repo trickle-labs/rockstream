@@ -37,7 +37,7 @@ use parking_lot::RwLock;
 use rand::Rng;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 use rockstream_types::raft::{
     HeartbeatRequest, HeartbeatResponse, RaftNodeId, RaftRpcRequest, RaftRpcResponse,
@@ -81,6 +81,8 @@ pub struct RaftPersistentState {
 pub struct RaftPersistentStore {
     store: Arc<dyn ObjectStore>,
     path: Path,
+    /// Serialize each authority transition with its durable PUT.
+    transition_lock: Mutex<()>,
 }
 
 impl RaftPersistentStore {
@@ -88,6 +90,7 @@ impl RaftPersistentStore {
         Self {
             store,
             path: Path::from("control/raft/state.json"),
+            transition_lock: Mutex::new(()),
         }
     }
 
@@ -494,6 +497,7 @@ async fn handle_request_vote(
     inner: &Arc<RwLock<RaftInner>>,
     store: &RaftPersistentStore,
 ) -> RequestVoteResponse {
+    let _transition = store.transition_lock.lock().await;
     let (grant, response_term, snapshot) = {
         let mut guard = inner.write();
         if req.term > guard.persistent.current_term {
@@ -522,6 +526,7 @@ async fn handle_heartbeat(
     inner: &Arc<RwLock<RaftInner>>,
     store: &RaftPersistentStore,
 ) -> HeartbeatResponse {
+    let _transition = store.transition_lock.lock().await;
     let mut to_persist = None;
     let response_term = {
         let mut guard = inner.write();
@@ -655,19 +660,21 @@ async fn start_election(
     inner: &Arc<RwLock<RaftInner>>,
     store: &RaftPersistentStore,
 ) {
-    let (term, node_id, snapshot) = {
-        let mut guard = inner.write();
-        guard.role = RaftRole::Candidate;
-        guard.persistent.current_term += 1;
-        guard.persistent.voted_for = Some(config.node_id);
-        guard.last_contact = Instant::now();
-        (
-            guard.persistent.current_term,
-            config.node_id,
-            guard.persistent,
-        )
+    // Persist the self-vote before sending any RPCs. Never hold this lock
+    // across peer network calls, which can themselves lead to transitions.
+    let (term, node_id) = {
+        let _transition = store.transition_lock.lock().await;
+        let (term, snapshot) = {
+            let mut guard = inner.write();
+            guard.role = RaftRole::Candidate;
+            guard.persistent.current_term += 1;
+            guard.persistent.voted_for = Some(config.node_id);
+            guard.last_contact = Instant::now();
+            (guard.persistent.current_term, guard.persistent)
+        };
+        store.save(&snapshot).await;
+        (term, config.node_id)
     };
-    store.save(&snapshot).await;
 
     let mut votes = 1usize; // vote for self
     let majority = config.peers.len().div_ceil(2) + 1;
@@ -691,6 +698,7 @@ async fn start_election(
     // `.await` below — required for the containing future to remain `Send`
     // (a lock guard held live across an `.await` point is not `Send`, even
     // if it is logically dropped on every path before reaching that point).
+    let _transition = store.transition_lock.lock().await;
     let step_down_snapshot: Option<RaftPersistentState> = {
         let mut guard = inner.write();
         // Drop this outcome if a concurrent RPC already moved us past the
@@ -742,6 +750,7 @@ async fn send_heartbeats(
         }
     }
     if highest > term {
+        let _transition = store.transition_lock.lock().await;
         // See `start_election`'s comment: the guard's scope must end at
         // this block's closing brace, before the `.await` below.
         let step_down_snapshot: Option<RaftPersistentState> = {
