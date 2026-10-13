@@ -471,6 +471,7 @@ impl ControlService {
                 match outcome.status {
                     MigrationStartupStatus::Blocked(reason) => {
                         tracing::error!(
+                            code = %rockstream_types::error_code::RS_5033,
                             migration_id = %outcome.recovery.record.migration_id,
                             phase = %outcome.recovery.record.state,
                             ?reason,
