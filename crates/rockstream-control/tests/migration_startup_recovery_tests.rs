@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use object_store::memory::InMemory;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use rockstream_control::topology::TopologyCatalog;
 use rockstream_control::{
     ControlService, MigrationLoadError, MigrationPersistentStore, MigrationRecoveryBlockReason,
