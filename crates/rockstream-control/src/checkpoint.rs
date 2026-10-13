@@ -327,7 +327,33 @@ impl CheckpointCoordinator {
             &BTreeMap<ShardId, ChangelogCheckpointContribution>,
         ) -> Result<(), CoordinatorError>,
     {
-        let contributions = {
+        self.record_shard_changelog_checkpoint_with_hook(
+            shard_id,
+            psc,
+            contribution,
+            || {},
+            commit_manifest,
+        )
+    }
+
+    // Called after the contribution is staged, outside the coordinator lock.
+    // Tests use this seam to pause before the shard confirms.
+    fn record_shard_changelog_checkpoint_with_hook<F, H>(
+        &self,
+        shard_id: ShardId,
+        psc: PerShardCheckpoint,
+        contribution: ChangelogCheckpointContribution,
+        after_recorded: H,
+        commit_manifest: F,
+    ) -> Result<Option<ClusterCheckpoint>, CoordinatorError>
+    where
+        F: FnOnce(
+            &ClusterCheckpoint,
+            &BTreeMap<ShardId, ChangelogCheckpointContribution>,
+        ) -> Result<(), CoordinatorError>,
+        H: FnOnce(),
+    {
+        {
             let mut guard = self.inner.lock();
             let round = guard
                 .in_progress
@@ -351,16 +377,17 @@ impl CheckpointCoordinator {
                 });
             }
             round.changelog_contributions.insert(shard_id, contribution);
-            round.changelog_contributions.clone()
-        };
+        }
 
-        self.record_shard_checkpoint(shard_id, psc, |manifest| {
+        after_recorded();
+
+        self.record_shard_checkpoint_with_contributions(shard_id, psc, |manifest, contributions| {
             assert_eq!(
                 manifest.shards.len(),
                 contributions.len(),
                 "M1-S1: a changelog checkpoint manifest requires one durable contribution per shard"
             );
-            commit_manifest(manifest, &contributions)
+            commit_manifest(manifest, contributions)
         })
     }
 
@@ -419,6 +446,25 @@ impl CheckpointCoordinator {
     where
         F: FnOnce(&ClusterCheckpoint) -> Result<(), CoordinatorError>,
     {
+        self.record_shard_checkpoint_with_contributions(shard_id, psc, |manifest, _| {
+            commit_manifest(manifest)
+        })
+    }
+
+    // Snapshot contributions while holding the lock that observes the final
+    // confirmation; an earlier per-shard snapshot can be stale.
+    fn record_shard_checkpoint_with_contributions<F>(
+        &self,
+        shard_id: ShardId,
+        psc: PerShardCheckpoint,
+        commit_manifest: F,
+    ) -> Result<Option<ClusterCheckpoint>, CoordinatorError>
+    where
+        F: FnOnce(
+            &ClusterCheckpoint,
+            &BTreeMap<ShardId, ChangelogCheckpointContribution>,
+        ) -> Result<(), CoordinatorError>,
+    {
         let mut guard = self.inner.lock();
 
         let round = guard
@@ -457,6 +503,7 @@ impl CheckpointCoordinator {
             .map(|(&sid, psc)| (sid, psc.clone()))
             .collect();
         let credits_held = round.credits_held;
+        let contributions = round.changelog_contributions.clone();
         guard.in_progress = None;
 
         for (sid, psc) in confirmations {
@@ -468,7 +515,7 @@ impl CheckpointCoordinator {
             self.credits.release();
         }
 
-        commit_manifest(&manifest)?;
+        commit_manifest(&manifest, &contributions)?;
 
         let completed_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -765,48 +812,173 @@ mod tests {
         assert_eq!(manifest.shards.len(), 2);
     }
 
+    type ChangelogCommit = (
+        ClusterCheckpoint,
+        BTreeMap<ShardId, ChangelogCheckpointContribution>,
+    );
+
+    fn expected_changelog_round(
+        id: CheckpointId,
+    ) -> (
+        ClusterCheckpoint,
+        BTreeMap<ShardId, ChangelogCheckpointContribution>,
+    ) {
+        (
+            ClusterCheckpoint {
+                checkpoint_id: id,
+                shards: BTreeMap::from([
+                    (
+                        ShardId(0),
+                        PerShardCheckpoint::new(id, 10).with_snapshot_id("snapshot-a"),
+                    ),
+                    (
+                        ShardId(1),
+                        PerShardCheckpoint::new(id, 20).with_snapshot_id("snapshot-b"),
+                    ),
+                ]),
+            },
+            BTreeMap::from([
+                (ShardId(0), changelog(id, 1, 10)),
+                (ShardId(1), changelog(id, 2, 20)),
+            ]),
+        )
+    }
+
+    fn assert_complete_changelog_round(
+        coord: &CheckpointCoordinator,
+        completion: Option<ClusterCheckpoint>,
+        callbacks: &Mutex<Vec<ChangelogCommit>>,
+        expected_manifest: &ClusterCheckpoint,
+        expected_contributions: &BTreeMap<ShardId, ChangelogCheckpointContribution>,
+    ) {
+        assert_eq!(completion, Some(expected_manifest.clone()));
+        assert_eq!(
+            callbacks.lock().as_slice(),
+            &[(expected_manifest.clone(), expected_contributions.clone())]
+        );
+        assert_eq!(coord.latest_committed(), Some(expected_manifest.clone()));
+        assert_eq!(coord.committed_checkpoints(), vec![expected_manifest.clone()]);
+        assert_eq!(coord.credits_used(), 0);
+    }
+
     #[test]
     fn changelog_manifest_waits_for_every_durable_shard_contribution() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0, 1]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
-        let first = changelog(id, 1, 10);
-        let second = changelog(id, 2, 20);
+        let (expected_manifest, expected_contributions) = expected_changelog_round(id);
+        let callbacks = Mutex::new(Vec::new());
 
         assert_eq!(
             coord
                 .record_shard_changelog_checkpoint(
                     ShardId(0),
-                    PerShardCheckpoint::new(id, 10),
-                    first.clone(),
+                    PerShardCheckpoint::new(id, 10).with_snapshot_id("snapshot-a"),
+                    changelog(id, 1, 10),
                     |_, _| panic!("manifest must wait for every shard"),
                 )
                 .unwrap(),
             None
         );
 
-        let manifest = coord
+        let completion = coord
             .record_shard_changelog_checkpoint(
                 ShardId(1),
-                PerShardCheckpoint::new(id, 20),
-                second.clone(),
+                PerShardCheckpoint::new(id, 20).with_snapshot_id("snapshot-b"),
+                changelog(id, 2, 20),
                 |manifest, contributions| {
-                    assert_eq!(
-                        manifest.shards,
-                        BTreeMap::from([
-                            (ShardId(0), PerShardCheckpoint::new(id, 10)),
-                            (ShardId(1), PerShardCheckpoint::new(id, 20)),
-                        ])
-                    );
-                    assert_eq!(
-                        contributions,
-                        &BTreeMap::from([(ShardId(0), first), (ShardId(1), second)])
-                    );
+                    callbacks
+                        .lock()
+                        .push((manifest.clone(), contributions.clone()));
                     Ok(())
                 },
             )
-            .unwrap()
             .unwrap();
-        assert_eq!(manifest.checkpoint_id, id);
+
+        assert_complete_changelog_round(
+            &coord,
+            completion,
+            &callbacks,
+            &expected_manifest,
+            &expected_contributions,
+        );
+    }
+
+    #[test]
+    fn concurrent_changelog_confirmations_commit_complete_contributions_in_either_order() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+
+        for paused_shard in [ShardId(0), ShardId(1)] {
+            let coord = make_coordinator(&[0, 1]);
+            let id = coord.begin_checkpoint(noop_inject).unwrap();
+            let (expected_manifest, expected_contributions) = expected_changelog_round(id);
+            let callbacks = Arc::new(Mutex::new(Vec::new()));
+            let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+            let paused_checkpoint = expected_manifest.shards[&paused_shard].clone();
+            let paused_contribution = expected_contributions[&paused_shard].clone();
+            let expected_staged = BTreeMap::from([(paused_shard, paused_contribution.clone())]);
+            let worker_coord = coord.clone();
+            let observed_coord = coord.clone();
+            let worker_callbacks = Arc::clone(&callbacks);
+            let worker = std::thread::spawn(move || {
+                worker_coord.record_shard_changelog_checkpoint_with_hook(
+                    paused_shard,
+                    paused_checkpoint,
+                    paused_contribution,
+                    || {
+                        let staged = observed_coord
+                            .inner
+                            .lock()
+                            .in_progress
+                            .as_ref()
+                            .unwrap()
+                            .changelog_contributions
+                            .clone();
+                        staged_tx.send(staged).unwrap();
+                        resume_rx.recv().unwrap();
+                    },
+                    |manifest, contributions| {
+                        worker_callbacks
+                            .lock()
+                            .push((manifest.clone(), contributions.clone()));
+                        Ok(())
+                    },
+                )
+            });
+
+            // The paused shard has recorded its contribution, and its
+            // captured map intentionally omits the other shard.
+            assert_eq!(staged_rx.recv().unwrap(), expected_staged);
+            let other_shard = if paused_shard == ShardId(0) {
+                ShardId(1)
+            } else {
+                ShardId(0)
+            };
+            assert_eq!(
+                coord
+                    .record_shard_changelog_checkpoint(
+                        other_shard,
+                        expected_manifest.shards[&other_shard].clone(),
+                        expected_contributions[&other_shard].clone(),
+                        |_, _| panic!("the paused shard must be the final confirmation"),
+                    )
+                    .unwrap(),
+                None
+            );
+            assert!(callbacks.lock().is_empty());
+
+            resume_tx.send(()).unwrap();
+            let completion = worker.join().unwrap().unwrap();
+            assert_complete_changelog_round(
+                &coord,
+                completion,
+                callbacks.as_ref(),
+                &expected_manifest,
+                &expected_contributions,
+            );
+        }
     }
 
     #[test]
