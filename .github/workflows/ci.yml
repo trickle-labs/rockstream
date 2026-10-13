@@ -30,6 +30,15 @@ jobs:
         run: docker info
       - name: Build unified-binary test image
         run: docker build -t rockstream-tc-test:latest .
+      - name: Record HA test case execution
+        run: python3 scripts/ci-test-inventory.py run --job pr-ha
+      - name: Upload HA test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-accounting-ha
+          path: target/ci-test-results/
+          if-no-files-found: error
       - name: Control-plane HA tests
         env:
           RS_TC_DEBUG: "1"
@@ -114,6 +123,10 @@ jobs:
         run: bash scripts/check-operator-state-bytes.sh
       - name: operator-state-bytes checker self-test
         run: bash scripts/check-operator-state-bytes.test.sh
+      - name: CI test-accounting self-tests
+        run: python3 scripts/ci-test-inventory.test.py
+      - name: Validate Cargo test target assignment
+        run: python3 scripts/ci-test-inventory.py check --out target/ci-test-results/assignment.json
       - name: path-coupling check
         run: bash scripts/check-path-coupling.sh
       - name: path-coupling checker self-test
@@ -214,6 +227,28 @@ jobs:
             --cache-from type=gha,scope=rockstream-tc-test-check \
             --cache-to type=gha,mode=max,scope=rockstream-tc-test-check \
             .
+      - name: Record workspace test case execution
+        if: matrix.shard == 'workspace'
+        run: python3 scripts/ci-test-inventory.py run --job pr-workspace
+      - name: Record crate test case execution
+        if: matrix.shard == 'crates'
+        run: python3 scripts/ci-test-inventory.py run --job pr-crates
+      - name: Record gateway test case execution
+        if: matrix.shard == 'gateway'
+        run: python3 scripts/ci-test-inventory.py run --job pr-gateway
+      - name: Record simulation unit case execution
+        if: matrix.shard == 'sim-unit'
+        run: python3 scripts/ci-test-inventory.py run --job pr-sim-unit
+      - name: Record all ordinary simulation integration cases
+        if: matrix.shard == 'sim-integration'
+        run: python3 scripts/ci-test-inventory.py run --job pr-sim
+      - name: Upload exact test execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-accounting-${{ matrix.shard }}
+          path: target/ci-test-results/
+          if-no-files-found: warn
       - name: Workspace tests
         if: matrix.shard == 'workspace'
         run: |
@@ -253,10 +288,16 @@ jobs:
     needs:
       - check-quality
       - check-tests
+      - control-plane-ha
+      - formal-verify
+      - verus-verify
+      - nexmark-regression-gate
+      - benchmark
+      - docker-build
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any Check shard failed
-        if: needs.check-quality.result != 'success' || needs.check-tests.result != 'success'
+        if: ${{ contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled') || contains(join(needs.*.result, ','), 'skipped') }}
         run: |
           echo "A Check shard did not pass."
           exit 1
