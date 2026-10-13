@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_control::raft::{RaftPersistentState, RaftPersistentStore};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{minio_object_store, start_minio};
@@ -36,7 +36,7 @@ async fn raft_term_vote_log_survive_restart_lfs() {
 
     // First "boot": no state persisted yet, node votes for itself at term 3.
     let persistent_a = RaftPersistentStore::new(store.clone());
-    let before_boot = persistent_a.load().await;
+    let before_boot = persistent_a.load().await.unwrap();
     assert_eq!(
         before_boot,
         RaftPersistentState::default(),
