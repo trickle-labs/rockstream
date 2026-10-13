@@ -407,15 +407,18 @@ async fn held_self_election_then_higher_vote_cannot_regress_authority() {
     );
 
     release.send(()).unwrap();
-    first.await;
-    assert_eq!(fixture.inner.read().role, RaftRole::Leader);
+    // Both contenders must remain polled: Tokio's mutex is FIFO and the
+    // election needs to reacquire it after persisting its self-vote.
+    // Awaiting the election alone would park behind an unpolled vote waiter.
+    let ((), vote_response) = tokio::join!(first, second);
     assert_eq!(
-        second.await,
+        vote_response,
         RequestVoteResponse {
             term: 8,
             vote_granted: true,
         }
     );
+    // The higher term wins before the election can publish leadership.
     assert_eq!(fixture.inner.read().role, RaftRole::Follower);
     fixture.assert_restart(latest, vec![held, latest]).await;
 }
