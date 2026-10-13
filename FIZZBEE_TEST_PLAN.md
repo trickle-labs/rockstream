@@ -654,6 +654,33 @@ independent round-trip, fault-injected startup, side-effect, byte-preservation,
 and absent-state cases are exercised by
 `crates/rockstream-control/tests/raft_state_durability_tests.rs`.
 
+**M7 persisted-authority write ordering (issue #105).** An accepted
+`RequestVote`, an observed higher-term `Heartbeat`, or a local election
+must publish the corresponding `(current_term, voted_for)` to durable storage
+*before* acknowledging the RPC or using its new election authority. The M7
+logical actions assume that a completed term/vote change is durably ordered;
+the implementation closes the gap between that model boundary and real
+unconditional object-store PUTs by taking one per-node asynchronous
+`RaftPersistentStore::transition_lock` across both the in-memory transition
+and the subsequent PUT. This covers inbound vote and heartbeat handlers,
+the election self-vote, and higher-term step-down after outbound vote or
+heartbeat RPCs; the lock is **not** held while awaiting peer RPCs. A higher
+term's write cannot overtake a still-in-flight lower-term write, nor can a
+dependent acknowledgement precede its own successful PUT. Unlike conditional
+writes or an external transaction coordinator, this local lock only orders
+writers sharing one `RaftPersistentStore` instance; it does not claim
+cross-process compare-and-swap semantics.
+
+The production-boundary regression tests in
+`crates/rockstream-control/src/raft/persistence_ordering_tests.rs`
+explicitly park a term-7 ObjectStore PUT while polling concurrent higher-term
+vote, heartbeat, and election paths, then release that write. They compare
+the complete ordered write transcript, term-8 recovered vote B (or the
+scenario-specific empty vote), and the exact rejection of a subsequent
+term-8 candidate on the restarted TCP peer listener. These tests cover the
+real async storage interleavings excluded from the abstract M7 transition
+model; no new FizzBee transition or invariant is asserted.
+
 ### 3.6 Cross-Cutting Coverage Assertions
 
 The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
