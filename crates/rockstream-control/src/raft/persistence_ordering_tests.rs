@@ -432,7 +432,7 @@ async fn outbound_heartbeat_step_down_and_higher_vote_are_persisted_in_order() {
             other => panic!("unexpected peer request: {other:?}"),
         }
         let reply = RaftRpcResponse::Heartbeat(HeartbeatResponse { term: 7 });
-        let encoded = format!("{}\\n", serde_json::to_string(&reply).unwrap());
+        let encoded = format!("{}\n", serde_json::to_string(&reply).unwrap());
         reader.into_inner().write_all(encoded.as_bytes()).await.unwrap();
     });
 
