@@ -212,6 +212,51 @@ pub struct MigrationRecovery {
     pub current_leases: BTreeMap<ShardId, Option<ShardLease>>,
 }
 
+/// Why control startup cannot safely advance an active migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationRecoveryBlockReason {
+    /// Copy, fencing and verification require a live migration driver.
+    NeedsOnlineDriver,
+    /// Donor deletion was not durably authorized before the crash.
+    CleanupNotStarted,
+    /// A cleanup-intent record without a committed cutover is unsafe.
+    MissingCutoverEpoch,
+    /// Recipient verification has not durably completed.
+    VerificationNotComplete,
+    /// Startup cleanup supports only one distinct donor shard.
+    UnsupportedDonorSet,
+    /// Recipient ownership is not represented in the recovered lease table.
+    MissingRecipientLease,
+    /// This control process has no open handle to the donor database.
+    MissingDonorHandle,
+}
+
+/// Exact result of processing one migration record during control startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationStartupStatus {
+    /// Donor cleanup had completed; the durable Done record was archived.
+    ArchivedDone,
+    /// Persisted cleanup intent was replayed and the record was archived.
+    ReplayedCleanup { deleted_keys: usize },
+    /// No destructive recovery was attempted; the active record is retained.
+    Blocked(MigrationRecoveryBlockReason),
+}
+
+/// Startup status together with the *unchanged* recovered record and leases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationStartupOutcome {
+    pub recovery: MigrationRecovery,
+    pub status: MigrationStartupStatus,
+}
+
+#[derive(Debug, Error)]
+pub enum MigrationStartupError {
+    #[error("load active migrations: {0}")]
+    Load(#[from] MigrationLoadError),
+    #[error("resume migration cleanup: {0}")]
+    Cleanup(#[from] MigrationError),
+}
+
 impl MigrationPersistentStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self {
@@ -295,6 +340,89 @@ impl MigrationPersistentStore {
                 }
             })
             .collect())
+    }
+
+    /// Reconcile every active migration before accepting worker connections.
+    ///
+    /// Only a persisted Done record, or GC with durable cleanup intent and
+    /// verified recipient ownership, can be finished without a live migration
+    /// driver. All other phases are reported as blocked, retaining the full
+    /// original record and leaving shard data and leases untouched.
+    ///
+    /// A GC replay requires an explicitly supplied, already-open donor shard:
+    /// a control process must not guess worker-owned shard paths or open them
+    /// behind a worker's back. Cleanup is scan-and-delete and can be replayed
+    /// after a partial deletion or a crash at any later persistence boundary.
+    pub async fn recover_on_start(
+        &self,
+        shard_manager: &ShardManager,
+        donor_shards: &BTreeMap<ShardId, MigrationShard>,
+        audit: Option<&FileAuditLog>,
+    ) -> Result<Vec<MigrationStartupOutcome>, MigrationStartupError> {
+        let recoveries = self.recover_active(shard_manager).await?;
+        let mut outcomes = Vec::with_capacity(recoveries.len());
+        for recovery in recoveries {
+            let record = &recovery.record;
+            let status = match record.state {
+                MigrationState::Done if record.cleanup_intent => {
+                    self.archive(record, audit).await?;
+                    MigrationStartupStatus::ArchivedDone
+                }
+                MigrationState::Done => MigrationStartupStatus::Blocked(
+                    MigrationRecoveryBlockReason::CleanupNotStarted,
+                ),
+                MigrationState::GcEligible if !record.cleanup_intent => {
+                    MigrationStartupStatus::Blocked(MigrationRecoveryBlockReason::CleanupNotStarted)
+                }
+                MigrationState::GcEligible if record.cutover_epoch.is_none() => {
+                    MigrationStartupStatus::Blocked(MigrationRecoveryBlockReason::MissingCutoverEpoch)
+                }
+                MigrationState::GcEligible if record.verification_progress != Some(100) => {
+                    MigrationStartupStatus::Blocked(
+                        MigrationRecoveryBlockReason::VerificationNotComplete,
+                    )
+                }
+                MigrationState::GcEligible
+                    if record.donor_shards.len() != 1
+                        || record.donor_shards[0] == record.recipient_shard =>
+                {
+                    MigrationStartupStatus::Blocked(
+                        MigrationRecoveryBlockReason::UnsupportedDonorSet,
+                    )
+                }
+                MigrationState::GcEligible
+                    if recovery
+                        .current_leases
+                        .get(&record.recipient_shard)
+                        .and_then(Option::as_ref)
+                        .is_none() =>
+                {
+                    MigrationStartupStatus::Blocked(
+                        MigrationRecoveryBlockReason::MissingRecipientLease,
+                    )
+                }
+                MigrationState::GcEligible => {
+                    if let Some(donor) = donor_shards.get(&record.donor_shards[0]) {
+                        let mut resumed = record.clone();
+                        let stats = MigrationCoordinator::new()
+                            .finish_done(&mut resumed, donor, Some(self), audit)
+                            .await?;
+                        MigrationStartupStatus::ReplayedCleanup {
+                            deleted_keys: stats.deleted_keys,
+                        }
+                    } else {
+                        MigrationStartupStatus::Blocked(
+                            MigrationRecoveryBlockReason::MissingDonorHandle,
+                        )
+                    }
+                }
+                _ => MigrationStartupStatus::Blocked(
+                    MigrationRecoveryBlockReason::NeedsOnlineDriver,
+                ),
+            };
+            outcomes.push(MigrationStartupOutcome { recovery, status });
+        }
+        Ok(outcomes)
     }
 
     async fn load_path(&self, path: &Path) -> Result<MigrationRecord, MigrationLoadError> {
