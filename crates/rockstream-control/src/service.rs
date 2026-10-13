@@ -50,7 +50,9 @@ use rockstream_types::topology::{
 use crate::audit::{AuditEvent, FileAuditLog};
 use crate::frontier::FrontierAggregator;
 use crate::management_store::{ManagementOperationStore, OperationStatus, OperationUpdate};
-use crate::migration::MigrationPersistentStore;
+use crate::migration::{
+    MigrationPersistentStore, MigrationShard, MigrationStartupOutcome, MigrationStartupStatus,
+};
 use crate::placement::PlacementAlgorithm;
 use crate::raft::{RaftHandle, RaftRole};
 use crate::scheduler::ShardScheduler;
@@ -241,6 +243,8 @@ pub struct ControlServiceHandle {
     /// Shutdown sender; drop or send to stop the service.
     shutdown_tx: broadcast::Sender<()>,
     management: Option<crate::management::ManagementServiceHandle>,
+    /// Explicit outcomes for every active record inspected on startup.
+    pub migration_recovery: Vec<MigrationStartupOutcome>,
     /// TLS certificate reloader (if internal mTLS is enabled).
     pub reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
 }
@@ -298,6 +302,8 @@ pub struct ControlService {
     topology_store: Option<Arc<TopologyPersistentStore>>,
     /// Optional durable migration record store (v0.46).
     migration_store: Option<Arc<MigrationPersistentStore>>,
+    /// Already-open donor shards authorized for startup cleanup replay.
+    migration_recovery_donors: BTreeMap<ShardId, MigrationShard>,
     /// Shared drain queue state with a named bound.
     drain_state: Arc<AsyncMutex<DrainState>>,
     /// Optional internal TLS configuration for control plane mTLS.
@@ -325,6 +331,7 @@ impl ControlService {
             frontier: None,
             topology_store: None,
             migration_store: None,
+            migration_recovery_donors: BTreeMap::new(),
             drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
             internal_tls: None,
             secret_store: Arc::new(SecretStore::new(
@@ -387,6 +394,12 @@ impl ControlService {
         self
     }
 
+    /// Supply an already-open donor shard for replaying durably authorized cleanup.
+    pub fn with_migration_recovery_donor(mut self, donor: MigrationShard) -> Self {
+        self.migration_recovery_donors.insert(donor.shard_id, donor);
+        self
+    }
+
     /// Attach an [`InternalTlsConfig`] for internal mTLS mutual authentication.
     pub fn with_internal_tls(mut self, config: InternalTlsConfig) -> Self {
         self.internal_tls = Some(config);
@@ -445,12 +458,38 @@ impl ControlService {
                 self.catalog.restore_workers(workers);
             }
         }
-        if let Some(store) = &self.migration_store {
-            store
-                .recover_active(&self.shard_manager)
+        let migration_recovery = if let Some(store) = &self.migration_store {
+            let outcomes = store
+                .recover_on_start(
+                    &self.shard_manager,
+                    &self.migration_recovery_donors,
+                    self.audit.as_deref(),
+                )
                 .await
                 .map_err(|error| io::Error::other(format!("migration recovery: {error}")))?;
-        }
+            for outcome in &outcomes {
+                match outcome.status {
+                    MigrationStartupStatus::Blocked(reason) => {
+                        tracing::error!(
+                            migration_id = %outcome.recovery.record.migration_id,
+                            phase = %outcome.recovery.record.state,
+                            ?reason,
+                            "migration recovery blocked; active record retained"
+                        );
+                    }
+                    status => {
+                        tracing::info!(
+                            migration_id = %outcome.recovery.record.migration_id,
+                            ?status,
+                            "migration recovered during control startup"
+                        );
+                    }
+                }
+            }
+            outcomes
+        } else {
+            Vec::new()
+        };
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
         tracing::info!(addr = %addr, "control service listening");
@@ -627,6 +666,7 @@ impl ControlService {
             addr,
             shutdown_tx,
             management,
+            migration_recovery,
             reloader: reloader_for_handle,
         })
     }
