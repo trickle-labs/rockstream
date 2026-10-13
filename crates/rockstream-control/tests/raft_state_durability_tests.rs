@@ -389,7 +389,7 @@ async fn raft_startup_rejects_body_read_failure_without_side_effects() {
     assert_failed_startup(
         backing,
         ReadFault::Body,
-        io::ErrorKind::Other,
+        io::ErrorKind::UnexpectedEof,
         "body read failed",
     )
     .await;
