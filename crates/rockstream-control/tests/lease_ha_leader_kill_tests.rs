@@ -36,10 +36,11 @@ async fn send_and_recv(stream: &mut TcpStream, msg: &WorkerMessage) -> String {
     }
 }
 
-/// P4: Real control-plane leader kill (SIGKILL leader) results in follower assuming
-/// shard-lease authority with in-flight lease continuity.
+/// Legacy orderly shutdown and fresh single-node bootstrap test. This does
+/// NOT prove real SIGKILL or a surviving three-node quorum; see issue #108's
+/// real-process kill/isolation tests in control_plane_ha_tests.rs.
 #[tokio::test]
-async fn test_leader_sigkill_follower_takeover_lease_continuity() {
+async fn test_orderly_shutdown_then_fresh_bootstrap_lease_continuity() {
     let shared_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
     // 1. Leader Node A starts and acquires lease for Shard 10
@@ -84,7 +85,7 @@ async fn test_leader_sigkill_follower_takeover_lease_continuity() {
     assert_eq!(lease1.shard_id, ShardId(10));
     assert_eq!(lease1.worker_id, WorkerId(1));
 
-    // 2. SIGKILL / shutdown Leader Node A
+    // 2. Gracefully shut down Node A (not SIGKILL).
     handle_a.shutdown();
     node_a.shutdown();
 
@@ -153,9 +154,10 @@ async fn test_leader_sigkill_follower_takeover_lease_continuity() {
     node_b.shutdown();
 }
 
-/// P5: Deposed leader cannot write or issue leases; zero dual-writer window observed during leader transition.
+/// Forced demotion only: this checks the NotLeader gate, not autonomous
+/// loss of authority under a live network partition.
 #[tokio::test]
-async fn test_deposed_leader_fenced_zero_dual_writer() {
+async fn test_forced_demotion_rejects_lease_request() {
     let shared_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
     // 1. Leader Node A and Follower Node B (not leader)
