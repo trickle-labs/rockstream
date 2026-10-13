@@ -249,35 +249,11 @@ jobs:
           name: ci-test-accounting-${{ matrix.shard }}
           path: target/ci-test-results/
           if-no-files-found: warn
-      - name: Workspace tests
-        if: matrix.shard == 'workspace'
-        run: |
-          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql
-      - name: Crate tests
-        if: matrix.shard == 'crates'
-        run: |
-          cargo test -p rockstream-connectors --lib --tests -- --test-threads=1
-          cargo test -p rockstream-control --lib --tests -- --test-threads=1
-          cargo test -p rockstream-ops --lib --tests -- --test-threads=1
-          cargo test -p rockstream-runtime --lib --tests -- --test-threads=1
-          cargo test -p rockstream-storage --lib --tests -- --test-threads=1
-          cargo test -p rockstream-sql --lib --tests -- --test-threads=1
-      - name: Gateway tests
+      - name: Preserve PGWire conformance JSON proof
         if: matrix.shard == 'gateway'
         run: |
           mkdir -p target
-          rm -f target/pgwire-test-results.json
           ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
-          cargo test -p rockstream-gateway --lib --tests -- --test-threads=1
-          cargo test -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
-          cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
-          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS=60 ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS=10 cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
-      - name: Simulation unit tests
-        if: matrix.shard == 'sim-unit'
-        run: cargo test -p rockstream-sim --features simulation --lib -- --test-threads=1
-      - name: Simulation integration tests
-        if: matrix.shard == 'sim-integration'
-        run: cargo test -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
       - name: Remove Docker test image
         if: always() && matrix.shard == 'gateway'
         run: docker image rm rockstream-tc-test:latest || true
