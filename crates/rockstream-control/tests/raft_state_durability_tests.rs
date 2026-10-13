@@ -53,7 +53,7 @@ async fn raft_term_vote_log_survive_restart_lfs() {
     let persistent_b = RaftPersistentStore::new(Arc::new(
         LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
     ));
-    let recovered = persistent_b.load().await;
+    let recovered = persistent_b.load().await.unwrap();
     assert_eq!(
         recovered, state,
         "current_term/voted_for must survive an LFS-backed control node restart identically"
@@ -69,7 +69,7 @@ async fn raft_term_vote_log_survive_restart_lfs() {
     let persistent_c = RaftPersistentStore::new(Arc::new(
         LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
     ));
-    assert_eq!(persistent_c.load().await, state2);
+    assert_eq!(persistent_c.load().await.unwrap(), state2);
 }
 
 // ─── MinIO (S3, TestContainers) durability test ────────────────────────────
@@ -99,7 +99,7 @@ async fn raft_term_vote_log_survive_restart_minio_tc() {
     let store_a = minio_object_store(port, MINIO_BUCKET);
     let persistent_a = RaftPersistentStore::new(store_a);
     assert_eq!(
-        persistent_a.load().await,
+        persistent_a.load().await.unwrap(),
         RaftPersistentState::default(),
         "a fresh bucket must see the zero-value default"
     );
@@ -114,9 +114,272 @@ async fn raft_term_vote_log_survive_restart_minio_tc() {
     // construct against the same durable backing store).
     let store_b = minio_object_store(port, MINIO_BUCKET);
     let persistent_b = RaftPersistentStore::new(store_b);
-    let recovered = persistent_b.load().await;
+    let recovered = persistent_b.load().await.unwrap();
     assert_eq!(
         recovered, state,
         "current_term/voted_for must survive a MinIO-backed control node restart identically"
     );
+}
+
+// ─── Issue #104: fail closed on unreadable Raft authority ─────────────────
+
+use async_trait::async_trait;
+use futures::stream::{self, BoxStream, StreamExt};
+use object_store::memory::InMemory;
+use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
+use rockstream_control::raft::{spawn_raft_node, RaftConfig, RaftRole};
+use std::fmt;
+use std::io;
+use std::sync::Mutex;
+use std::time::Duration;
+
+const RAFT_STATE_PATH: &str = "control/raft/state.json";
+const AUTHORITY: RaftPersistentState = RaftPersistentState {
+    current_term: 7,
+    voted_for: Some(1), // Candidate A.
+};
+
+#[derive(Clone, Copy, Debug)]
+enum ReadFault {
+    None,
+    Permission,
+    TransientGet,
+    Body,
+}
+
+#[derive(Debug)]
+struct FaultStore {
+    inner: Arc<dyn ObjectStore>,
+    fault: ReadFault,
+    transcript: Arc<Mutex<Vec<String>>>,
+}
+
+impl fmt::Display for FaultStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "raft startup fault store")
+    }
+}
+
+impl FaultStore {
+    fn error(&self, message: &str, kind: io::ErrorKind) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "raft startup fault store",
+            source: Box::new(io::Error::new(kind, message.to_string())),
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FaultStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.transcript.lock().unwrap().push("persistent-write".into());
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+        match self.fault {
+            ReadFault::Permission => Err(self.error("permission denied", io::ErrorKind::PermissionDenied)),
+            ReadFault::TransientGet => Err(self.error("GET temporarily unavailable", io::ErrorKind::TimedOut)),
+            ReadFault::Body => {
+                let mut result = self.inner.get_opts(location, opts).await?;
+                result.payload = GetResultPayload::Stream(
+                    stream::once(async {
+                        Err(object_store::Error::Generic {
+                            store: "raft startup fault store",
+                            source: Box::new(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "body read failed",
+                            )),
+                        })
+                    })
+                    .boxed(),
+                );
+                Ok(result)
+            }
+            ReadFault::None => self.inner.get_opts(location, opts).await,
+        }
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+async fn stored_bytes(store: &Arc<dyn ObjectStore>) -> Vec<u8> {
+    store
+        .get(&Path::from(RAFT_STATE_PATH))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+async fn assert_failed_startup(
+    store: Arc<dyn ObjectStore>,
+    fault: ReadFault,
+    expected_kind: io::ErrorKind,
+    expected_message: &str,
+) {
+    let original = stored_bytes(&store).await;
+    let transcript = Arc::new(Mutex::new(Vec::<String>::new()));
+    let injected: Arc<dyn ObjectStore> = Arc::new(FaultStore {
+        inner: store.clone(),
+        fault,
+        transcript: transcript.clone(),
+    });
+
+    let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved);
+
+    let error = match spawn_raft_node(
+        &addr.to_string(),
+        RaftConfig::new(0, vec![], true),
+        injected,
+    )
+    .await
+    {
+        Ok(node) => {
+            node.shutdown();
+            panic!("corrupt/unreadable authority unexpectedly started Raft");
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), expected_kind);
+    assert!(
+        error.to_string().contains(expected_message),
+        "unexpected startup error: {error}"
+    );
+    assert_eq!(stored_bytes(&store).await, original);
+
+    // Startup must fail before binding the listener or spawning election /
+    // peer-RPC tasks. No votes or leadership events can be emitted.
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    drop(listener);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(*transcript.lock().unwrap(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn raft_startup_restores_term_seven_and_vote_a_exactly() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
+
+    // A non-bootstrap restart must not initiate an election on startup.
+    let node = spawn_raft_node(
+        "127.0.0.1:0",
+        RaftConfig::new(0, vec![], false),
+        backing.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(node.handle.current_term(), 7);
+    assert_eq!(node.handle.role(), RaftRole::Follower);
+    assert_eq!(node.handle.current_leader(), None);
+    assert_eq!(RaftPersistentStore::new(backing.clone()).load().await.unwrap(), AUTHORITY);
+    node.shutdown();
+}
+
+#[tokio::test]
+async fn raft_startup_rejects_malformed_authority_without_side_effects() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    backing
+        .put(&Path::from(RAFT_STATE_PATH), b"{malformed".to_vec().into())
+        .await
+        .unwrap();
+    assert_failed_startup(backing, ReadFault::None, io::ErrorKind::InvalidData, "malformed Raft term/vote state").await;
+}
+
+#[tokio::test]
+async fn raft_startup_rejects_permission_denied_without_side_effects() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
+    assert_failed_startup(backing, ReadFault::Permission, io::ErrorKind::PermissionDenied, "permission denied").await;
+}
+
+#[tokio::test]
+async fn raft_startup_rejects_transient_get_without_side_effects() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
+    assert_failed_startup(backing, ReadFault::TransientGet, io::ErrorKind::TimedOut, "GET temporarily unavailable").await;
+}
+
+#[tokio::test]
+async fn raft_startup_rejects_body_read_failure_without_side_effects() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
+    assert_failed_startup(backing, ReadFault::Body, io::ErrorKind::Other, "body read failed").await;
+}
+
+#[tokio::test]
+async fn raft_startup_bootstraps_only_when_authority_is_truly_absent() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let persistent = RaftPersistentStore::new(backing.clone());
+    assert_eq!(persistent.load().await.unwrap(), RaftPersistentState::default());
+
+    let node = spawn_raft_node(
+        "127.0.0.1:0",
+        RaftConfig::new(0, vec![], true),
+        backing.clone(),
+    )
+    .await
+    .unwrap();
+    for _ in 0..30 {
+        if node.handle.is_leader() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(node.handle.role(), RaftRole::Leader);
+    assert_eq!(node.handle.current_term(), 1);
+    assert_eq!(
+        persistent.load().await.unwrap(),
+        RaftPersistentState {
+            current_term: 1,
+            voted_for: Some(0),
+        }
+    );
+    node.shutdown();
 }
