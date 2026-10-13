@@ -71,7 +71,13 @@ impl ObjectStore for DelayedPutStore {
         let bytes: bytes::Bytes = payload.clone().into();
         let snapshot: RaftPersistentState = serde_json::from_slice(&bytes).unwrap();
         if snapshot == self.held_state && !self.blocked.swap(true, Ordering::SeqCst) {
-            self.entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            self.entered
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
             let release = self.release.lock().unwrap().take().unwrap();
             release.await.expect("test must release held Raft PUT");
         }
@@ -129,7 +135,9 @@ async fn fixture(
 ) -> (Fixture, oneshot::Receiver<()>, oneshot::Sender<()>) {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let initial = authority(6, None);
-    RaftPersistentStore::new(backing.clone()).save(&initial).await;
+    RaftPersistentStore::new(backing.clone())
+        .save(&initial)
+        .await;
 
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
@@ -241,7 +249,10 @@ async fn held_term_seven_vote_cannot_overwrite_durable_term_eight_vote() {
     tokio::pin!(first);
     assert!(matches!(futures::poll!(first.as_mut()), Poll::Pending));
     entered.await.unwrap();
-    assert_eq!(fixture.delayed.committed(), Vec::<RaftPersistentState>::new());
+    assert_eq!(
+        fixture.delayed.committed(),
+        Vec::<RaftPersistentState>::new()
+    );
 
     let second = handle_request_vote(
         RequestVoteRequest {
@@ -303,7 +314,10 @@ async fn held_heartbeat_then_higher_vote_preserves_term_eight_vote() {
     );
     tokio::pin!(second);
     assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
-    assert_eq!(fixture.delayed.committed(), Vec::<RaftPersistentState>::new());
+    assert_eq!(
+        fixture.delayed.committed(),
+        Vec::<RaftPersistentState>::new()
+    );
 
     release.send(()).unwrap();
     assert_eq!(first.await, HeartbeatResponse { term: 7 });
@@ -345,7 +359,10 @@ async fn held_vote_then_higher_heartbeat_preserves_term_eight_empty_vote() {
     );
     tokio::pin!(second);
     assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
-    assert_eq!(fixture.delayed.committed(), Vec::<RaftPersistentState>::new());
+    assert_eq!(
+        fixture.delayed.committed(),
+        Vec::<RaftPersistentState>::new()
+    );
 
     release.send(()).unwrap();
     assert_eq!(
@@ -384,7 +401,10 @@ async fn held_self_election_then_higher_vote_cannot_regress_authority() {
     assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
     // No leadership event while the self-vote is not yet durable.
     assert_eq!(fixture.inner.read().role, RaftRole::Candidate);
-    assert_eq!(fixture.delayed.committed(), Vec::<RaftPersistentState>::new());
+    assert_eq!(
+        fixture.delayed.committed(),
+        Vec::<RaftPersistentState>::new()
+    );
 
     release.send(()).unwrap();
     first.await;
@@ -433,7 +453,11 @@ async fn outbound_heartbeat_step_down_and_higher_vote_are_persisted_in_order() {
         }
         let reply = RaftRpcResponse::Heartbeat(HeartbeatResponse { term: 7 });
         let encoded = format!("{}\n", serde_json::to_string(&reply).unwrap());
-        reader.into_inner().write_all(encoded.as_bytes()).await.unwrap();
+        reader
+            .into_inner()
+            .write_all(encoded.as_bytes())
+            .await
+            .unwrap();
     });
 
     let mut config = RaftConfig::new(A, vec![(B, addr.to_string())], false);
@@ -457,7 +481,10 @@ async fn outbound_heartbeat_step_down_and_higher_vote_are_persisted_in_order() {
     );
     tokio::pin!(second);
     assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
-    assert_eq!(fixture.delayed.committed(), Vec::<RaftPersistentState>::new());
+    assert_eq!(
+        fixture.delayed.committed(),
+        Vec::<RaftPersistentState>::new()
+    );
 
     release.send(()).unwrap();
     first.await.unwrap();
