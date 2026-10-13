@@ -128,8 +128,8 @@ use futures::stream::{self, BoxStream, StreamExt};
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use rockstream_control::raft::{spawn_raft_node, RaftConfig, RaftRole};
 use std::fmt;
@@ -181,7 +181,10 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        self.transcript.lock().unwrap().push("persistent-write".into());
+        self.transcript
+            .lock()
+            .unwrap()
+            .push("persistent-write".into());
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -197,10 +200,10 @@ impl ObjectStore for FaultStore {
         match self.fault {
             ReadFault::Permission => {
                 Err(self.error("permission denied", io::ErrorKind::PermissionDenied))
-            },
+            }
             ReadFault::TransientGet => {
                 Err(self.error("GET temporarily unavailable", io::ErrorKind::TimedOut))
-            },
+            }
             ReadFault::Body => {
                 let mut result = self.inner.get_opts(location, opts).await?;
                 result.payload = GetResultPayload::Stream(
@@ -232,10 +235,7 @@ impl ObjectStore for FaultStore {
         self.inner.list(prefix)
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -309,7 +309,9 @@ async fn assert_failed_startup(
 #[tokio::test]
 async fn raft_startup_restores_term_seven_and_vote_a_exactly() {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
+    RaftPersistentStore::new(backing.clone())
+        .save(&AUTHORITY)
+        .await;
 
     // A non-bootstrap restart must not initiate an election on startup.
     let node = spawn_raft_node(
@@ -322,7 +324,13 @@ async fn raft_startup_restores_term_seven_and_vote_a_exactly() {
     assert_eq!(node.handle.current_term(), 7);
     assert_eq!(node.handle.role(), RaftRole::Follower);
     assert_eq!(node.handle.current_leader(), None);
-    assert_eq!(RaftPersistentStore::new(backing.clone()).load().await.unwrap(), AUTHORITY);
+    assert_eq!(
+        RaftPersistentStore::new(backing.clone())
+            .load()
+            .await
+            .unwrap(),
+        AUTHORITY
+    );
     node.shutdown();
 }
 
@@ -345,7 +353,9 @@ async fn raft_startup_rejects_malformed_authority_without_side_effects() {
 #[tokio::test]
 async fn raft_startup_rejects_permission_denied_without_side_effects() {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
+    RaftPersistentStore::new(backing.clone())
+        .save(&AUTHORITY)
+        .await;
     assert_failed_startup(
         backing,
         ReadFault::Permission,
@@ -358,7 +368,9 @@ async fn raft_startup_rejects_permission_denied_without_side_effects() {
 #[tokio::test]
 async fn raft_startup_rejects_transient_get_without_side_effects() {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
+    RaftPersistentStore::new(backing.clone())
+        .save(&AUTHORITY)
+        .await;
     assert_failed_startup(
         backing,
         ReadFault::TransientGet,
@@ -371,7 +383,9 @@ async fn raft_startup_rejects_transient_get_without_side_effects() {
 #[tokio::test]
 async fn raft_startup_rejects_body_read_failure_without_side_effects() {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
+    RaftPersistentStore::new(backing.clone())
+        .save(&AUTHORITY)
+        .await;
     assert_failed_startup(
         backing,
         ReadFault::Body,
@@ -385,7 +399,10 @@ async fn raft_startup_rejects_body_read_failure_without_side_effects() {
 async fn raft_startup_bootstraps_only_when_authority_is_truly_absent() {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let persistent = RaftPersistentStore::new(backing.clone());
-    assert_eq!(persistent.load().await.unwrap(), RaftPersistentState::default());
+    assert_eq!(
+        persistent.load().await.unwrap(),
+        RaftPersistentState::default()
+    );
 
     let node = spawn_raft_node(
         "127.0.0.1:0",
