@@ -1,0 +1,284 @@
+{
+  "schema_version": 1,
+  "description": "Cargo target ownership and execution policy for issue #110. No implicit simulation target assignment.",
+  "package_jobs": {
+    "rockstream-cli": "pr-workspace",
+    "rockstream-diff": "pr-workspace",
+    "rockstream-docgen": "pr-workspace",
+    "rockstream-management-proto": "pr-workspace",
+    "rockstream-oracle": "pr-workspace",
+    "rockstream-plan": "pr-workspace",
+    "rockstream-test-support": "pr-workspace",
+    "rockstream-types": "pr-workspace",
+    "rockstream-verified": "pr-workspace",
+    "rockstream-fuzz": "pr-workspace",
+    "rockstream-connectors": "pr-crates",
+    "rockstream-control": "pr-crates",
+    "rockstream-ops": "pr-crates",
+    "rockstream-runtime": "pr-crates",
+    "rockstream-storage": "pr-crates",
+    "rockstream-sql": "pr-crates",
+    "rockstream-gateway": "pr-gateway"
+  },
+  "sim_lib_job": "pr-sim-unit",
+  "sim_groups": {
+    "pr-sim": [
+      "accounting_gate_tests",
+      "auto_tuner_chaos_tests",
+      "az_aware_exchange_sim_tests",
+      "backfill_fence_sim_tests",
+      "benchmark_process_isolation_tests",
+      "catalog_coordination_tests",
+      "cdc_transaction_sim_tests",
+      "cli_inspection_sim_tests",
+      "control_sim",
+      "dlq_crash_recovery_sim_tests",
+      "dml_coordination_fault_tests",
+      "e2e_delta_native_qualification_tests",
+      "e2e_qualification_tests",
+      "edge_case_recovery_tests",
+      "explainability_progress_sim_tests",
+      "external_benchmark_harness_tests",
+      "factorized_plan_path_coupling_tests",
+      "failure_matrix_tests",
+      "frontier_publisher_election",
+      "hostile_tenant_real_ingest_quota_tests",
+      "hot_key_detection_sim_tests",
+      "internal_mtls_sim_tests",
+      "kafka_source_sim_tests",
+      "lifecycle_coordination_tests",
+      "lock_poisoning_sim_tests",
+      "observability_sim_tests",
+      "qualification_lifecycle_tests",
+      "qualification_recovery_tests",
+      "qualification_resource_tests",
+      "qualification_sim_coordination_tests",
+      "query_time_scatter_sim_tests",
+      "recovery_coordination_fault_tests",
+      "recursive_cte_sim_tests",
+      "rolling_upgrade_sim_tests",
+      "scale_proof_20_views_sharing_tests",
+      "scenario_reproducibility_sim_tests",
+      "secrets_sim_tests",
+      "shard_merge_sim_tests",
+      "shard_migration_sim_tests",
+      "shard_split_sim_tests",
+      "shard_stats_checkpoint_sim_tests",
+      "sim_aggregate_consolidation_tests",
+      "sim_aggregate_coordination_tests",
+      "sim_concurrent_maintenance_fault_tests",
+      "sim_migration_crash_boundary_tests",
+      "sim_shared_trace_crash_boundary_tests",
+      "skew_control_loop_sim_tests",
+      "spill_coordination_sim_tests",
+      "spot_preemption",
+      "storage_pressure_admission_tests",
+      "v05910_introspection_sim_tests",
+      "v05911_sql_ergonomics_sim_tests",
+      "v05912_error_catalog_sim_tests",
+      "v05913_product_surface_sim_tests",
+      "v05914_golden_path_sim_tests",
+      "worker_drain_sim_tests",
+      "workload_admission_control"
+    ],
+    "pr-ha": [
+      "control_plane_ha_tests"
+    ],
+    "nightly-seeds": [
+      "chaos_tests",
+      "dst_fuzz_harness",
+      "progress_soak",
+      "resource_leak_soak_tests"
+    ],
+    "nightly-docker": [
+      "checkpoint_recovery",
+      "real_cluster_chaos_soak_tests",
+      "recovery_slo_tests",
+      "resource_leak_soak_real_binary_tests",
+      "shard_migration_tc_tests",
+      "worker_drain_tc_tests"
+    ],
+    "release-docker": [
+      "rolling_upgrade_tests"
+    ]
+  },
+  "jobs": {
+    "pr-workspace": {
+      "tier": "pull_request",
+      "features": [],
+      "services": []
+    },
+    "pr-crates": {
+      "tier": "pull_request",
+      "features": [],
+      "package_features": {
+        "rockstream-connectors": [
+          "simulation"
+        ],
+        "rockstream-control": [
+          "simulation"
+        ],
+        "rockstream-runtime": [
+          "simulation"
+        ],
+        "rockstream-sql": [
+          "testcontainers"
+        ]
+      },
+      "services": []
+    },
+    "pr-gateway": {
+      "tier": "pull_request",
+      "features": [
+        "testcontainers"
+      ],
+      "services": [
+        "docker"
+      ]
+    },
+    "pr-sim-unit": {
+      "tier": "pull_request",
+      "features": [
+        "simulation"
+      ],
+      "services": []
+    },
+    "pr-sim": {
+      "tier": "pull_request",
+      "features": [
+        "simulation"
+      ],
+      "services": []
+    },
+    "pr-ha": {
+      "tier": "pull_request",
+      "features": [
+        "simulation"
+      ],
+      "services": [
+        "docker"
+      ]
+    },
+    "nightly-seeds": {
+      "tier": "nightly",
+      "features": [
+        "simulation"
+      ],
+      "services": []
+    },
+    "nightly-docker": {
+      "tier": "nightly",
+      "features": [
+        "simulation",
+        "docker_tests"
+      ],
+      "services": [
+        "docker"
+      ]
+    },
+    "release-docker": {
+      "tier": "release",
+      "features": [
+        "simulation",
+        "docker_tests"
+      ],
+      "services": [
+        "docker"
+      ],
+      "required_env": [
+        "ROCKSTREAM_ROLLING_N_IMAGE",
+        "ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE"
+      ]
+    },
+    "daily-resource": {
+      "tier": "nightly",
+      "features": [
+        "simulation",
+        "docker_tests"
+      ],
+      "services": [
+        "docker"
+      ],
+      "supplemental_targets": [
+        "resource_leak_soak_real_binary_tests"
+      ],
+      "cases": {
+        "resource_leak_soak_real_binary_tests": [
+          "resource_leak_soak_real_binary_minio_churn_is_flat"
+        ]
+      }
+    }
+  },
+  "target_requirements": {
+    "rockstream-sim/test:*": {
+      "features": [
+        "simulation"
+      ]
+    },
+    "rockstream-sim/test:real_cluster_chaos_soak_tests": {
+      "features": [
+        "simulation",
+        "docker_tests"
+      ],
+      "services": [
+        "docker"
+      ]
+    },
+    "rockstream-sim/test:resource_leak_soak_real_binary_tests": {
+      "features": [
+        "simulation",
+        "docker_tests"
+      ],
+      "services": [
+        "docker"
+      ]
+    },
+    "rockstream-sim/test:rolling_upgrade_tests": {
+      "features": [
+        "docker_tests"
+      ],
+      "services": [
+        "docker"
+      ]
+    },
+    "rockstream-sim/test:recovery_slo_tests": {
+      "features": [
+        "docker_tests"
+      ],
+      "services": [
+        "docker"
+      ]
+    },
+    "rockstream-sim/test:shard_migration_tc_tests": {
+      "services": [
+        "docker"
+      ]
+    },
+    "rockstream-sim/test:worker_drain_tc_tests": {
+      "services": [
+        "docker"
+      ]
+    },
+    "rockstream-sim/test:checkpoint_recovery": {
+      "services": [
+        "docker"
+      ]
+    },
+    "rockstream-sim/test:control_plane_ha_tests": {
+      "services": [
+        "docker"
+      ]
+    },
+    "rockstream-connectors/test:source_coordination_sim_tests": {
+      "features": [
+        "simulation"
+      ]
+    }
+  },
+  "known_limitations": {
+    "rockstream-cli::test/r1_real_worker_data_plane_tests::real_workers_execute_aggregate_join_and_fenced_failover": "Unimplemented direct gateway-to-worker source transport; #110 audit A1. This ignored case is not executed and does not count as a mandatory pass.",
+    "rockstream-sql::test/lfs_catalog::register_workload_survives_restart_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
+    "rockstream-sql::test/lfs_catalog::index_point_lookup_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
+    "rockstream-sql::test/lfs_catalog::index_backfill_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory."
+  }
+}
