@@ -648,7 +648,10 @@ impl CatalogStubs {
         let sources = store.list_sources().await.map_err(|e| e.to_string())?;
         let sinks = store.list_sinks().await.map_err(|e| e.to_string())?;
 
-        let view_deps = store.list_view_dependencies().await.map_err(|e| e.to_string())?;
+        let view_deps = store
+            .list_view_dependencies()
+            .await
+            .map_err(|e| e.to_string())?;
 
         let mut inner = self.inner.write().unwrap();
         inner.tables.clear();
@@ -684,9 +687,9 @@ impl CatalogStubs {
                     rockstream_storage::catalog::DependencyKind::Table => table_id_to_name
                         .get(&rockstream_types::ids::TableId(dep.child_id))
                         .cloned(),
-                    rockstream_storage::catalog::DependencyKind::View => view_id_to_name
-                        .get(&dep.child_id)
-                        .cloned(),
+                    rockstream_storage::catalog::DependencyKind::View => {
+                        view_id_to_name.get(&dep.child_id).cloned()
+                    }
                 };
                 if let Some(child) = child_name {
                     inner

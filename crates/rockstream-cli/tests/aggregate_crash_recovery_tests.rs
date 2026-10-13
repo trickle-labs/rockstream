@@ -23,9 +23,7 @@ use rockstream_gateway::{
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
-use rockstream_storage::{
-    catalog::DurableCatalogStore, ShardDb, ShardKeyEncoder, ShardReader,
-};
+use rockstream_storage::{catalog::DurableCatalogStore, ShardDb, ShardKeyEncoder, ShardReader};
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -338,7 +336,10 @@ async fn test_issue_109_immediate_crash_recovery_without_recreation() {
         .iter()
         .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
         .count();
-    assert_eq!(recheck_count, 0, "idempotent replay must not re-apply mutation");
+    assert_eq!(
+        recheck_count, 0,
+        "idempotent replay must not re-apply mutation"
+    );
 
     // Continued accumulation on top of restored arrangement
     client2
@@ -547,7 +548,10 @@ async fn test_issue_109_unacknowledged_writes_unknown_outcome_contract() {
     if unack_committed {
         assert_eq!(
             recovered_items,
-            vec![(1, "acknowledged".to_string()), (2, "unacknowledged".to_string())],
+            vec![
+                (1, "acknowledged".to_string()),
+                (2, "unacknowledged".to_string())
+            ],
             "unacknowledged write committed before kill"
         );
     } else {
@@ -558,4 +562,3 @@ async fn test_issue_109_unacknowledged_writes_unknown_outcome_contract() {
         );
     }
 }
-
