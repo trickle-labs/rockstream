@@ -3366,7 +3366,12 @@ async fn handle_connection_stream<R, W>(
                             .await;
                     }
                 }
-                let valid = shard_manager.is_valid_writer(shard_id, lease_token);
+                // A partitioned former leader must never certify a stale
+                // lease. Only a live Raft quorum authority may fence writes.
+                let valid = raft
+                    .as_ref()
+                    .is_none_or(|node| node.require_leader().is_ok())
+                    && shard_manager.is_valid_writer(shard_id, lease_token);
                 tracing::debug!(
                     %shard_id,
                     token = lease_token.0,
