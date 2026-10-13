@@ -297,7 +297,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any Check shard failed
-        if: ${{ contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled') || contains(join(needs.*.result, ','), 'skipped') }}
+        if: ${{ needs.check-quality.result != 'success' || needs.check-tests.result != 'success' || needs.control-plane-ha.result != 'success' || needs.formal-verify.result != 'success' || needs.verus-verify.result != 'success' || needs.nexmark-regression-gate.result != 'success' || needs.benchmark.result != 'success' || needs.docker-build.result != 'success' }}
         run: |
           echo "A Check shard did not pass."
           exit 1
