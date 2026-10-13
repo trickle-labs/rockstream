@@ -636,6 +636,24 @@ reached a green CI-fast result (~5s, comparable to M4's own ~6.6s baseline)
 after five iterative state-space/liveness fixes, documented in the spec's own
 header comments and in `formal/findings.md`.
 
+**M7 persisted-authority startup boundary (issue #104).** The M7 Raft
+model assumes a running node has first restored its durable
+`(current_term, voted_for)` pair. A never-before-created state object is
+initialized to exactly `(0, None)`. On restart, existing valid bytes (for
+example, term 7 and vote A) must be restored without modifying authority.
+Malformed JSON, permission errors, transient object GET errors, and errors
+while reading an object body are **not** equivalent to absence: the real
+`RaftPersistentStore::load` returns an `RS-0003` storage/corruption error
+and `spawn_raft_node` aborts before opening a peer listener or spawning the
+election driver. Every failed startup leaves the persisted bytes untouched
+and emits no vote grants or leadership events. These storage-read failures
+are a *precondition failure outside the running-node election state space*,
+not an M7 leader-election transition; the M7-S1/M7-S2/M7-S3 and M7-L1
+assertions remain unchanged for nodes that successfully start. The
+independent round-trip, fault-injected startup, side-effect, byte-preservation,
+and absent-state cases are exercised by
+`crates/rockstream-control/tests/raft_state_durability_tests.rs`.
+
 ### 3.6 Cross-Cutting Coverage Assertions
 
 The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
