@@ -399,3 +399,74 @@ async fn held_self_election_then_higher_vote_cannot_regress_authority() {
     assert_eq!(fixture.inner.read().role, RaftRole::Follower);
     fixture.assert_restart(latest, vec![held, latest]).await;
 }
+
+#[tokio::test]
+async fn outbound_heartbeat_step_down_and_higher_vote_are_persisted_in_order() {
+    let held = authority(7, None);
+    let latest = authority(8, Some(B));
+    let (fixture, entered, release) = fixture(held).await;
+
+    // Start with a term-6 leader so a higher-term heartbeat reply invokes
+    // the outbound send_heartbeats step-down persistence path.
+    RaftPersistentStore::new(fixture.backing.clone())
+        .save(&authority(6, Some(A)))
+        .await;
+    {
+        let mut guard = fixture.inner.write();
+        guard.persistent = authority(6, Some(A));
+        guard.role = RaftRole::Leader;
+        guard.current_leader = Some(A);
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let responder = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        match serde_json::from_str::<RaftRpcRequest>(&line).unwrap() {
+            RaftRpcRequest::Heartbeat(req) => {
+                assert_eq!(req.term, 6);
+                assert_eq!(req.leader_id, A);
+            }
+            other => panic!("unexpected peer request: {other:?}"),
+        }
+        let reply = RaftRpcResponse::Heartbeat(HeartbeatResponse { term: 7 });
+        let encoded = format!("{}\\n", serde_json::to_string(&reply).unwrap());
+        reader.into_inner().write_all(encoded.as_bytes()).await.unwrap();
+    });
+
+    let mut config = RaftConfig::new(A, vec![(B, addr.to_string())], false);
+    config.rpc_timeout = Duration::from_secs(10);
+    let inner = fixture.inner.clone();
+    let store = fixture.store.clone();
+    let first = tokio::spawn(async move {
+        send_heartbeats(&config, &inner, &store).await;
+    });
+    entered.await.unwrap();
+    responder.await.unwrap();
+    assert_eq!(fixture.inner.read().role, RaftRole::Follower);
+
+    let second = handle_request_vote(
+        RequestVoteRequest {
+            term: 8,
+            candidate_id: B,
+        },
+        &fixture.inner,
+        &fixture.store,
+    );
+    tokio::pin!(second);
+    assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
+    assert_eq!(fixture.delayed.committed(), Vec::<RaftPersistentState>::new());
+
+    release.send(()).unwrap();
+    first.await.unwrap();
+    assert_eq!(
+        second.await,
+        RequestVoteResponse {
+            term: 8,
+            vote_granted: true,
+        }
+    );
+    fixture.assert_restart(latest, vec![held, latest]).await;
+}
