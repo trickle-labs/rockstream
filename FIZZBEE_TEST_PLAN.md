@@ -683,6 +683,24 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #108 adds a real three-control-process M7/M4 authority-loss oracle in
+`crates/rockstream-sim/tests/control_plane_ha_tests.rs`:
+`three_process_sigkill_rejects_stale_writes_and_recovers_exact_rows`
+(SIGKILL without bootstrap) and
+`three_process_live_isolation_rejects_stale_writes_and_recovers_exact_rows`
+(disconnect old leader from the Raft network while its process stays alive).
+Both use real worker-facing `FenceWrite` authorization before durable shard
+writes, compare the exact pre/post-transition accept/deny transcript,
+reopen persistent storage, and compare the entire row map against the
+independent acknowledged history. This extends M7-S1/S2/S3 and M4-S1/S3
+conformance: a current leader must hold a recent voting quorum, and an
+isolated former leader must fail closed rather than validate a stale lease.
+The older `lease_ha_leader_kill_tests.rs` tests are explicitly relabeled
+as orderly shutdown/fresh bootstrap and forced demotion, respectively; they
+are not automatic leader-death or network-partition evidence.
+
+
+
 Issue #107 makes control startup reconcile persisted M6 migrations instead of
 dropping the recovered records. Restart from Copying, FencingOld and Verifying
 requires a live driver and therefore surfaces a typed blocked outcome without
