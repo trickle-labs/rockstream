@@ -1,8 +1,7 @@
 //! Catalog Negative Tests and Corrupt Record Containment (v0.63 Slice 8).
 //!
 //! Asserts that:
-//! 1. Corrupted transaction log records halt log replay cleanly, preserving prior valid
-//!    revision without publishing partial corrupted metadata.
+//! 1. Corrupted transaction logs fail recovery rather than publishing earlier partial state.
 //! 2. Missing referenced objects prevent transaction commit with RS-1004.
 
 use object_store::memory::InMemory;
@@ -56,25 +55,12 @@ async fn test_corrupt_record_fails_closed_without_partial_metadata() {
         .expect("put corrupted log failed");
 
     // 3. Recover catalog from durable storage:
-    // Replay should halt cleanly at the corruption boundary without crashing,
-    // preserving the last known valid state (revision 1) and never creating partial metadata.
-    let recovered = DurableCatalogStore::recover(store.clone(), prefix)
+    // No recovered store may be published from only the first valid record.
+    let error = DurableCatalogStore::recover(store.clone(), prefix)
         .await
-        .expect("recovery should halt cleanly on corrupted log entry");
-
-    assert_eq!(
-        recovered.get_revision().await,
-        1,
-        "Recovery must preserve prior valid revision"
-    );
-    assert!(
-        recovered
-            .get_table_by_name("valid_table")
-            .await
-            .unwrap()
-            .is_some(),
-        "Valid table must be intact"
-    );
+        .unwrap_err();
+    assert!(matches!(error, rockstream_storage::catalog::CatalogError::DecodeError(_)));
+    assert!(error.to_string().contains("[RS-1003]"));
 }
 
 #[tokio::test]
