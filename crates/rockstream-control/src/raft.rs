@@ -91,16 +91,26 @@ impl RaftPersistentStore {
         }
     }
 
-    /// Load the persisted state, or the zero-value default if nothing has
-    /// been persisted yet (first-ever boot of this control node).
-    pub async fn load(&self) -> RaftPersistentState {
-        match self.store.get(&self.path).await {
-            Ok(result) => match result.bytes().await {
-                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-                Err(_) => RaftPersistentState::default(),
-            },
-            Err(_) => RaftPersistentState::default(),
-        }
+    /// Load persisted authority. Only a genuinely missing object represents
+    /// first boot; corruption or an unreadable object must abort startup.
+    pub async fn load(&self) -> io::Result<RaftPersistentState> {
+        let result = match self.store.get(&self.path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Ok(RaftPersistentState::default());
+            }
+            Err(error) => return Err(raft_load_error("failed to get", error)),
+        };
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| raft_load_error("failed to read body of", error))?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("RS-0003: malformed Raft term/vote state: {error}"),
+            )
+        })
     }
 
     /// Persist state. Term/vote MUST be durable before the caller acts on
@@ -116,6 +126,21 @@ impl RaftPersistentStore {
             .await
             .expect("RS-0003: failed to persist Raft term/vote state");
     }
+}
+
+/// Preserve an underlying filesystem error kind when the object store
+/// wraps it, while retaining the storage error code and its original cause.
+fn raft_load_error(action: &str, error: object_store::Error) -> io::Error {
+    let kind = match &error {
+        object_store::Error::Generic { source, .. } => source
+            .downcast_ref::<io::Error>()
+            .map_or(io::ErrorKind::Other, io::Error::kind),
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(
+        kind,
+        format!("RS-0003: {action} Raft term/vote state: {error}"),
+    )
 }
 
 struct RaftInner {
@@ -377,7 +402,7 @@ pub async fn spawn_raft_node(
     object_store: Arc<dyn ObjectStore>,
 ) -> io::Result<RaftNodeHandleFull> {
     let store = Arc::new(RaftPersistentStore::new(object_store));
-    let initial = store.load().await;
+    let initial = store.load().await?;
     let inner = Arc::new(RwLock::new(RaftInner {
         node_id: config.node_id,
         persistent: initial,
@@ -802,7 +827,7 @@ mod tests {
     #[tokio::test]
     async fn persistent_store_roundtrips_through_object_store() {
         let store = RaftPersistentStore::new(mem_store());
-        let loaded = store.load().await;
+        let loaded = store.load().await.unwrap();
         assert_eq!(loaded, RaftPersistentState::default());
 
         let state = RaftPersistentState {
@@ -810,7 +835,7 @@ mod tests {
             voted_for: Some(2),
         };
         store.save(&state).await;
-        let reloaded = store.load().await;
+        let reloaded = store.load().await.unwrap();
         assert_eq!(reloaded, state);
     }
 
