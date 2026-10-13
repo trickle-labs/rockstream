@@ -857,7 +857,10 @@ mod tests {
             &[(expected_manifest.clone(), expected_contributions.clone())]
         );
         assert_eq!(coord.latest_committed(), Some(expected_manifest.clone()));
-        assert_eq!(coord.committed_checkpoints(), vec![expected_manifest.clone()]);
+        assert_eq!(
+            coord.committed_checkpoints(),
+            vec![expected_manifest.clone()]
+        );
         assert_eq!(coord.credits_used(), 0);
     }
 
