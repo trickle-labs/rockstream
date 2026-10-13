@@ -368,14 +368,16 @@ impl MigrationPersistentStore {
                     self.archive(record, audit).await?;
                     MigrationStartupStatus::ArchivedDone
                 }
-                MigrationState::Done => MigrationStartupStatus::Blocked(
-                    MigrationRecoveryBlockReason::CleanupNotStarted,
-                ),
+                MigrationState::Done => {
+                    MigrationStartupStatus::Blocked(MigrationRecoveryBlockReason::CleanupNotStarted)
+                }
                 MigrationState::GcEligible if !record.cleanup_intent => {
                     MigrationStartupStatus::Blocked(MigrationRecoveryBlockReason::CleanupNotStarted)
                 }
                 MigrationState::GcEligible if record.cutover_epoch.is_none() => {
-                    MigrationStartupStatus::Blocked(MigrationRecoveryBlockReason::MissingCutoverEpoch)
+                    MigrationStartupStatus::Blocked(
+                        MigrationRecoveryBlockReason::MissingCutoverEpoch,
+                    )
                 }
                 MigrationState::GcEligible if record.verification_progress != Some(100) => {
                     MigrationStartupStatus::Blocked(
@@ -416,9 +418,9 @@ impl MigrationPersistentStore {
                         )
                     }
                 }
-                _ => MigrationStartupStatus::Blocked(
-                    MigrationRecoveryBlockReason::NeedsOnlineDriver,
-                ),
+                _ => {
+                    MigrationStartupStatus::Blocked(MigrationRecoveryBlockReason::NeedsOnlineDriver)
+                }
             };
             outcomes.push(MigrationStartupOutcome { recovery, status });
         }
