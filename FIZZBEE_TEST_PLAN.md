@@ -683,6 +683,26 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #107 makes control startup reconcile persisted M6 migrations instead of
+dropping the recovered records. Restart from Copying, FencingOld and Verifying
+requires a live driver and therefore surfaces a typed blocked outcome without
+advancing the M6 state machine or altering lease ownership and bucket contents.
+GcEligible may resume donor cleanup only when cleanup intent was durably recorded
+before the interruption, a cutover epoch and completed verification are recorded,
+recipient lease ownership exists, and the donor database is explicitly available.
+Cleanup uses idempotent per-key deletion; a persisted Done record with cleanup
+intent is archived even if history was already written. An unsupported replay
+remains blocked with its complete active record intact. These startup choices
+preserve the existing M6-S1 single-authority and M6-S3 cutover/frontier rules
+rather than introducing any new model state or migration ownership policy.
+The production startup regressions in
+`crates/rockstream-control/tests/migration_startup_recovery_tests.rs`
+assert exact blocked states and intact records for the four phases, partial
+cleanup completion, both terminal archive interruption windows, complete
+donor/recipient maps, unchanged authoritative leases and unrelated buckets,
+and idempotent second startup. The abstract M6 FizzBee model remains unchanged.
+
+
 Issue #106 tightens the changelog checkpoint coordinator's final-confirmation
 snapshot: after each shard records its durable contribution, the last shard
 confirmation must commit a complete manifest and matching contributions map
