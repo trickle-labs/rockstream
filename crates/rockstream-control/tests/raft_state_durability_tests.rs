@@ -195,8 +195,12 @@ impl ObjectStore for FaultStore {
 
     async fn get_opts(&self, location: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
         match self.fault {
-            ReadFault::Permission => Err(self.error("permission denied", io::ErrorKind::PermissionDenied)),
-            ReadFault::TransientGet => Err(self.error("GET temporarily unavailable", io::ErrorKind::TimedOut)),
+            ReadFault::Permission => {
+                Err(self.error("permission denied", io::ErrorKind::PermissionDenied))
+            },
+            ReadFault::TransientGet => {
+                Err(self.error("GET temporarily unavailable", io::ErrorKind::TimedOut))
+            },
             ReadFault::Body => {
                 let mut result = self.inner.get_opts(location, opts).await?;
                 result.payload = GetResultPayload::Stream(
@@ -329,28 +333,52 @@ async fn raft_startup_rejects_malformed_authority_without_side_effects() {
         .put(&Path::from(RAFT_STATE_PATH), b"{malformed".to_vec().into())
         .await
         .unwrap();
-    assert_failed_startup(backing, ReadFault::None, io::ErrorKind::InvalidData, "malformed Raft term/vote state").await;
+    assert_failed_startup(
+        backing,
+        ReadFault::None,
+        io::ErrorKind::InvalidData,
+        "malformed Raft term/vote state",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn raft_startup_rejects_permission_denied_without_side_effects() {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
-    assert_failed_startup(backing, ReadFault::Permission, io::ErrorKind::PermissionDenied, "permission denied").await;
+    assert_failed_startup(
+        backing,
+        ReadFault::Permission,
+        io::ErrorKind::PermissionDenied,
+        "permission denied",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn raft_startup_rejects_transient_get_without_side_effects() {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
-    assert_failed_startup(backing, ReadFault::TransientGet, io::ErrorKind::TimedOut, "GET temporarily unavailable").await;
+    assert_failed_startup(
+        backing,
+        ReadFault::TransientGet,
+        io::ErrorKind::TimedOut,
+        "GET temporarily unavailable",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn raft_startup_rejects_body_read_failure_without_side_effects() {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     RaftPersistentStore::new(backing.clone()).save(&AUTHORITY).await;
-    assert_failed_startup(backing, ReadFault::Body, io::ErrorKind::Other, "body read failed").await;
+    assert_failed_startup(
+        backing,
+        ReadFault::Body,
+        io::ErrorKind::Other,
+        "body read failed",
+    )
+    .await;
 }
 
 #[tokio::test]
