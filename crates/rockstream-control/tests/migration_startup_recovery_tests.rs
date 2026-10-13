@@ -1,5 +1,4 @@
 //! Restart regression tests for issue #107: exercise production ControlService::start.
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use object_store::memory::InMemory;
