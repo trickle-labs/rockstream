@@ -156,6 +156,8 @@ async fn fixture(
         role: RaftRole::Follower,
         current_leader: None,
         last_contact: Instant::now(),
+        last_quorum_contact: Instant::now(),
+        leader_quorum_timeout: DEFAULT_ELECTION_TIMEOUT_MIN,
     }));
     (
         Fixture {
