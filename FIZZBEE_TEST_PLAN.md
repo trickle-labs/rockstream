@@ -683,6 +683,19 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #106 tightens the changelog checkpoint coordinator's final-confirmation
+snapshot: after each shard records its durable contribution, the last shard
+confirmation must commit a complete manifest and matching contributions map
+from the same completed round. Confirmations may interleave in either order;
+a per-shard map snapshot taken before final confirmation is not a valid commit
+oracle. This is an implementation-level atomicity boundary within the M1-S1
+all-shard checkpoint completion rule, not a new FizzBee transition. The
+sequential and both barrier-synchronized concurrent schedules are asserted by
+`changelog_manifest_waits_for_every_durable_shard_contribution` and
+`concurrent_changelog_confirmations_commit_complete_contributions_in_either_order`
+in `crates/rockstream-control/src/checkpoint.rs`: exactly one complete callback,
+matching latest committed manifest, and zero remaining alignment credits.
+
 The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
 `formal/m1_epoch_commit.fizz`: logical epochs may stage independently, but the
 published physical frontier advances only after a complete group is durable.
