@@ -3,18 +3,23 @@ use std::sync::Arc;
 
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
-use rockstream_control::{
-    ControlService, MigrationLoadError, MigrationPersistentStore,
-    MigrationRecoveryBlockReason, MigrationShard, MigrationStartupStatus, ShardManager,
-};
 use rockstream_control::topology::TopologyCatalog;
+use rockstream_control::{
+    ControlService, MigrationLoadError, MigrationPersistentStore, MigrationRecoveryBlockReason,
+    MigrationShard, MigrationStartupStatus, ShardManager,
+};
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::{ShardId, WorkerId};
 use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
 
 fn record(state: MigrationState, id: &str) -> MigrationRecord {
     let mut record = MigrationRecord::new(
-        id, vec![ShardId(1)], ShardId(2), BucketSet::new([7, 8]), 42, 9,
+        id,
+        vec![ShardId(1)],
+        ShardId(2),
+        BucketSet::new([7, 8]),
+        42,
+        9,
     );
     for next in [
         MigrationState::Snapshotting,
@@ -27,7 +32,9 @@ fn record(state: MigrationState, id: &str) -> MigrationRecord {
         MigrationState::GcEligible,
         MigrationState::Done,
     ] {
-        if record.state == state { break; }
+        if record.state == state {
+            break;
+        }
         record.apply_transition(next).unwrap();
     }
     record
@@ -35,7 +42,9 @@ fn record(state: MigrationState, id: &str) -> MigrationRecord {
 
 async fn shard(store: Arc<InMemory>, id: u64, path: &str) -> MigrationShard {
     let db = ShardDb::builder(path.to_owned(), store.clone())
-        .build().await.unwrap();
+        .build()
+        .await
+        .unwrap();
     MigrationShard {
         shard_id: ShardId(id),
         path: path.to_owned(),
@@ -46,9 +55,13 @@ async fn shard(store: Arc<InMemory>, id: u64, path: &str) -> MigrationShard {
 }
 
 async fn keys(db: &ShardDb) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut result: Vec<_> = db.scan_prefix(b"bucket/")
-        .await.unwrap().into_iter()
-        .map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+    let mut result: Vec<_> = db
+        .scan_prefix(b"bucket/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(k, v)| (k.to_vec(), v.to_vec()))
+        .collect();
     result.sort();
     result
 }
@@ -66,18 +79,24 @@ async fn start(
         service = service.with_migration_recovery_donor(donor);
     }
     let handle = service.start("127.0.0.1:0").await.unwrap();
-    assert_eq!(persistent.load_active().await.unwrap().len(),
-        handle.migration_recovery.iter().filter(|outcome| matches!(
-            outcome.status, MigrationStartupStatus::Blocked(_)
-        )).count());
+    assert_eq!(
+        persistent.load_active().await.unwrap().len(),
+        handle
+            .migration_recovery
+            .iter()
+            .filter(|outcome| matches!(outcome.status, MigrationStartupStatus::Blocked(_)))
+            .count()
+    );
     handle
 }
 
 #[tokio::test]
 async fn startup_blocks_unsafe_phases_without_changing_record_data_or_leases() {
     for state in [
-        MigrationState::Copying, MigrationState::FencingOld,
-        MigrationState::Verifying, MigrationState::GcEligible,
+        MigrationState::Copying,
+        MigrationState::FencingOld,
+        MigrationState::Verifying,
+        MigrationState::GcEligible,
     ] {
         let store = Arc::new(InMemory::new());
         let persistent = MigrationPersistentStore::new(store.clone());
@@ -99,18 +118,28 @@ async fn startup_blocks_unsafe_phases_without_changing_record_data_or_leases() {
         let leases = manager.snapshot();
 
         for _ in 0..2 {
-            let handle = start(&persistent, store.clone(), manager.clone(), Some(donor.clone())).await;
+            let handle = start(
+                &persistent,
+                store.clone(),
+                manager.clone(),
+                Some(donor.clone()),
+            )
+            .await;
             let outcome = &handle.migration_recovery[0];
             assert_eq!(outcome.recovery.record, record);
-            assert_eq!(outcome.status, MigrationStartupStatus::Blocked(
-                if state == MigrationState::GcEligible {
+            assert_eq!(
+                outcome.status,
+                MigrationStartupStatus::Blocked(if state == MigrationState::GcEligible {
                     MigrationRecoveryBlockReason::CleanupNotStarted
                 } else {
                     MigrationRecoveryBlockReason::NeedsOnlineDriver
-                }
-            ));
+                })
+            );
             assert_eq!(persistent.load("blocked").await.unwrap(), record);
-            assert_eq!(persistent.load_history("blocked").await, Err(MigrationLoadError::Missing));
+            assert_eq!(
+                persistent.load_history("blocked").await,
+                Err(MigrationLoadError::Missing)
+            );
             assert_eq!(keys(&donor.db).await, before_donor);
             assert_eq!(keys(&recipient.db).await, before_recipient);
             assert_eq!(manager.snapshot(), leases);
@@ -148,24 +177,42 @@ async fn startup_replays_partial_cleanup_and_then_is_idempotent() {
     record.verification_progress = Some(100);
     persistent.save(&record).await.unwrap();
 
-    let handle = start(&persistent, store.clone(), manager.clone(), Some(donor.clone())).await;
-    assert_eq!(handle.migration_recovery[0].status,
-        MigrationStartupStatus::ReplayedCleanup { deleted_keys: 2 });
-    assert_eq!(persistent.load("partial-cleanup").await, Err(MigrationLoadError::Missing));
+    let handle = start(
+        &persistent,
+        store.clone(),
+        manager.clone(),
+        Some(donor.clone()),
+    )
+    .await;
+    assert_eq!(
+        handle.migration_recovery[0].status,
+        MigrationStartupStatus::ReplayedCleanup { deleted_keys: 2 }
+    );
+    assert_eq!(
+        persistent.load("partial-cleanup").await,
+        Err(MigrationLoadError::Missing)
+    );
     let history = persistent.load_history("partial-cleanup").await.unwrap();
     assert_eq!(history.state, MigrationState::Done);
     assert!(history.cleanup_intent);
-    assert_eq!(keys(&donor.db).await,
-        vec![(b"bucket/99/keep".to_vec(), b"unrelated".to_vec())]);
+    assert_eq!(
+        keys(&donor.db).await,
+        vec![(b"bucket/99/keep".to_vec(), b"unrelated".to_vec())]
+    );
     assert_eq!(keys(&recipient.db).await, recipient_before);
     assert_eq!(manager.snapshot(), leases);
     handle.shutdown();
 
     let handle2 = start(&persistent, store, manager.clone(), Some(donor.clone())).await;
     assert!(handle2.migration_recovery.is_empty());
-    assert_eq!(persistent.load_history("partial-cleanup").await.unwrap(), history);
-    assert_eq!(keys(&donor.db).await,
-        vec![(b"bucket/99/keep".to_vec(), b"unrelated".to_vec())]);
+    assert_eq!(
+        persistent.load_history("partial-cleanup").await.unwrap(),
+        history
+    );
+    assert_eq!(
+        keys(&donor.db).await,
+        vec![(b"bucket/99/keep".to_vec(), b"unrelated".to_vec())]
+    );
     assert_eq!(keys(&recipient.db).await, recipient_before);
     assert_eq!(manager.snapshot(), leases);
     handle2.shutdown();
@@ -189,14 +236,23 @@ async fn startup_archives_done_after_history_persistence_interruption() {
         persistent.save(&record).await.unwrap();
         if history_already_persisted {
             // Reproduce the durable history-write / active-delete gap.
-            store.put(
-                &object_store::path::Path::from("topology/migration_history/done.json"),
-                serde_json::to_vec(&record).unwrap().into(),
-            ).await.unwrap();
+            store
+                .put(
+                    &object_store::path::Path::from("topology/migration_history/done.json"),
+                    serde_json::to_vec(&record).unwrap().into(),
+                )
+                .await
+                .unwrap();
         }
         let handle = start(&persistent, store.clone(), manager.clone(), None).await;
-        assert_eq!(handle.migration_recovery[0].status, MigrationStartupStatus::ArchivedDone);
-        assert_eq!(persistent.load("done").await, Err(MigrationLoadError::Missing));
+        assert_eq!(
+            handle.migration_recovery[0].status,
+            MigrationStartupStatus::ArchivedDone
+        );
+        assert_eq!(
+            persistent.load("done").await,
+            Err(MigrationLoadError::Missing)
+        );
         assert_eq!(persistent.load_history("done").await.unwrap(), record);
         assert_eq!(manager.snapshot(), leases);
         handle.shutdown();
