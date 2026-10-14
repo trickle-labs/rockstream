@@ -1287,6 +1287,16 @@ impl MultiAggregatePipeline {
             match *col_kind {
                 FinalizeCol::Direct(idx) => {
                     let col = acc.data.column(1 + idx).clone();
+                    // Missing aggregate lanes (including cancelling outer-join
+                    // transitions) use the pipeline's declared zero default.
+                    let col = if col.null_count() > 0 {
+                        let values = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        Arc::new(Int64Array::from_iter_values(
+                            values.iter().map(|v| v.unwrap_or(0)),
+                        )) as ArrayRef
+                    } else {
+                        col
+                    };
                     fields.push(Field::new(
                         format!("agg{i}"),
                         col.data_type().clone(),

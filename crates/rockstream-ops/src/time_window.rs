@@ -23,7 +23,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
@@ -131,12 +131,15 @@ type WindowMap = HashMap<Vec<u8>, (Vec<i64>, i64)>;
 /// Previously-emitted output: group_key_bytes → row_vals.
 type EmittedMap = HashMap<Vec<u8>, Vec<i64>>;
 
+/// Tumble arrangements retain both NULL validity and emitted multiplicity.
+type TumbleWindowMap = HashMap<Vec<u8>, (Vec<Option<i64>>, i64)>;
+
 #[derive(Clone)]
 struct TumbleWindowState {
     /// window_id → row entries (positive and negative weight).
-    windows: HashMap<i64, WindowMap>,
+    windows: HashMap<i64, TumbleWindowMap>,
     /// window_id → previously emitted output for diff computation.
-    prev_output: HashMap<i64, EmittedMap>,
+    prev_output: HashMap<i64, TumbleWindowMap>,
     /// Current watermark.
     watermark: WatermarkState,
     /// Windows that have been finalized (closed and fully emitted).
@@ -169,13 +172,13 @@ impl TumbleWindowState {
         for wmap in self.windows.values() {
             bytes += 8;
             for (gk, (vals, _)) in wmap {
-                bytes += (gk.len() + vals.len() * 8 + 8) as u64;
+                bytes += (gk.len() + vals.len() * std::mem::size_of::<Option<i64>>() + 8) as u64;
             }
         }
         for omap in self.prev_output.values() {
             bytes += 8;
-            for (gk, vals) in omap {
-                bytes += (gk.len() + vals.len() * 8) as u64;
+            for (gk, (vals, _)) in omap {
+                bytes += (gk.len() + vals.len() * std::mem::size_of::<Option<i64>>() + 8) as u64;
             }
         }
         bytes
@@ -280,6 +283,8 @@ impl SessionWindowState {
 /// Assigns each input row to a fixed-size, non-overlapping time window.
 /// Windows close when the watermark advances past the window end.
 /// Late rows (event_time_ms < watermark_ms) are handled per late_data_policy.
+/// A retraction admits corrections to its window throughout the same epoch,
+/// regardless of input row order. Unpaired late inserts still follow the policy.
 pub struct TumbleWindowOp {
     /// Output schema: [window_id: i64, ...input_cols...]
     pub schema: SchemaRef,
@@ -360,7 +365,8 @@ impl TumbleWindowOp {
 
         let mut st = self.state.lock().unwrap();
         for (key, value) in entries {
-            if let Some((row_vals, weight)) = decode_window_value(&value, self.n_input_cols) {
+            if let Some((row_vals, weight)) = decode_tumble_window_value(&value, self.n_input_cols)
+            {
                 if key.len() < prefix_len + 8 {
                     continue;
                 }
@@ -395,13 +401,13 @@ impl TumbleWindowOp {
         let window_size_ms = self.window_size_ms;
         let window_ids: Vec<i64> = st.windows.keys().copied().collect();
         for window_id in window_ids {
-            let positive_rows: EmittedMap = st
+            let positive_rows: TumbleWindowMap = st
                 .windows
                 .get(&window_id)
                 .map(|m| {
                     m.iter()
                         .filter(|(_, (_, w))| *w > 0)
-                        .map(|(k, (vals, _))| (k.clone(), vals.clone()))
+                        .map(|(k, row)| (k.clone(), row.clone()))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -456,12 +462,19 @@ impl TumbleWindowOp {
             .unwrap_or(state.watermark.watermark_ms);
 
         let mut dirty_windows: HashSet<i64> = HashSet::new();
-        // Windows an earlier retraction in *this same* batch has already
-        // reopened (see the closed-window check below for why this
-        // matters — a single `process_epoch` call can batch many rows from
-        // one commit whose relative order doesn't reflect real arrival
-        // order).
-        let mut reopened_this_epoch: HashSet<i64> = HashSet::new();
+        // Retractions admit the whole epoch's correction to that window,
+        // including inserts that happen to precede them in the input batch.
+        let corrected_windows: HashSet<i64> = delta
+            .weights
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w < 0)
+            .map(|(row_idx, _)| {
+                let vals = extract_tumble_row(&delta.data, row_idx);
+                let time = vals.get(self.time_col).copied().flatten().unwrap_or(0);
+                floor_div(time, self.window_size_ms) * self.window_size_ms
+            })
+            .collect();
 
         // ── Apply input delta ────────────────────────────────────────────────
         for row_idx in 0..delta.num_rows() {
@@ -469,9 +482,9 @@ impl TumbleWindowOp {
             if w == 0 {
                 continue;
             }
-            let row_vals = extract_row_vals(&delta.data, row_idx, self.n_input_cols);
+            let row_vals = extract_tumble_row(&delta.data, row_idx);
             let event_time_ms = if self.time_col < self.n_input_cols {
-                row_vals[self.time_col]
+                row_vals[self.time_col].unwrap_or(0)
             } else {
                 0
             };
@@ -479,70 +492,36 @@ impl TumbleWindowOp {
             // Assign to window.
             let window_id = floor_div(event_time_ms, self.window_size_ms) * self.window_size_ms;
 
-            // A window is "closed" if either (a) its own close boundary is
-            // already behind the watermark (frozen as of this epoch's
-            // start — see `epoch_start_watermark`'s doc comment), or (b) a
-            // *previous* epoch already explicitly finalized it — unless
-            // this same batch already reopened it via an earlier
-            // retraction, in which case every row targeting it for the
-            // rest of this epoch is treated as belonging to an open window
-            // again (an UPDATE's "new" half, paired with a retraction of
-            // the "old" half processed earlier in this same batch, isn't
-            // stray late data — it's the other half of a correction this
-            // batch has already decided to apply).
-            //
-            // Comparing against *this window's own* close boundary (rather
-            // than just the raw watermark) matters because a much-larger
-            // window (e.g. a 1-day tumble) can have its end boundary far
-            // ahead of the watermark even though many rows inside it have
-            // timestamps behind that same watermark (the watermark tracks
-            // the single latest event time seen across the whole
-            // batch/stream, not this row's own window) — using the raw
-            // watermark would wrongly treat those rows as late. This
-            // formula is exactly the one the output phase below uses to
-            // *set* `finalized`, so it agrees with that bookkeeping even
-            // for a window that was never previously touched (and so never
-            // appeared in `state.finalized` at all).
+            // Compare the window's close boundary to the frozen watermark;
+            // corrections in this epoch bypass the late-insert policy.
             let window_closed = (epoch_start_watermark > window_id + self.window_size_ms
                 || state.finalized.contains(&window_id))
-                && !reopened_this_epoch.contains(&window_id);
+                && !corrected_windows.contains(&window_id);
 
-            if window_closed {
-                if w > 0 {
-                    // A retraction (w < 0) always corresponds to a row this
-                    // operator already accepted earlier (it can only arrive
-                    // after the matching insertion was processed), so it
-                    // must never be dropped as "late" — doing so would leave
-                    // the retracted row's effect permanently baked into an
-                    // already-emitted window output, silently corrupting
-                    // every downstream aggregate forever.
-                    assert!(
-                        matches!(
-                            self.late_data_policy,
-                            LateDataPolicy::Drop
-                                | LateDataPolicy::Update
-                                | LateDataPolicy::RouteToSink { .. }
-                        ),
-                        "EDGE-LATE: every late row must follow a declared policy"
-                    );
-                    if matches!(self.late_data_policy, LateDataPolicy::RouteToSink { .. }) {
-                        let mut routed = self.late_route_rows.lock().unwrap();
-                        if routed.len() >= TUMBLE_WINDOW_LATE_ROUTE_LIMIT {
-                            return Err(OpError::late_route_overflow(
-                                routed.len(),
-                                TUMBLE_WINDOW_LATE_ROUTE_LIMIT,
-                            ));
-                        }
-                        routed.push(row_vals.clone());
-                        self.late_route_fill_level
-                            .store(routed.len(), Ordering::Relaxed);
+            if window_closed && w > 0 {
+                assert!(
+                    matches!(
+                        self.late_data_policy,
+                        LateDataPolicy::Drop
+                            | LateDataPolicy::Update
+                            | LateDataPolicy::RouteToSink { .. }
+                    ),
+                    "EDGE-LATE: every late row must follow a declared policy"
+                );
+                if matches!(self.late_data_policy, LateDataPolicy::RouteToSink { .. }) {
+                    let mut routed = self.late_route_rows.lock().unwrap();
+                    if routed.len() >= TUMBLE_WINDOW_LATE_ROUTE_LIMIT {
+                        return Err(OpError::late_route_overflow(
+                            routed.len(),
+                            TUMBLE_WINDOW_LATE_ROUTE_LIMIT,
+                        ));
                     }
-                    if self.late_data_policy == LateDataPolicy::Drop {
-                        continue;
-                    }
-                } else {
-                    state.finalized.remove(&window_id);
-                    reopened_this_epoch.insert(window_id);
+                    routed.push(row_vals.iter().map(|v| v.unwrap_or(0)).collect());
+                    self.late_route_fill_level
+                        .store(routed.len(), Ordering::Relaxed);
+                }
+                if self.late_data_policy == LateDataPolicy::Drop {
+                    continue;
                 }
             }
 
@@ -551,7 +530,7 @@ impl TumbleWindowOp {
                 watermark_ms: event_time_ms,
             });
 
-            let group_key = encode_row(&row_vals);
+            let group_key = encode_tumble_row(&row_vals);
             let window = state.windows.entry(window_id).or_default();
             let entry = window.entry(group_key).or_insert((row_vals, 0i64));
             entry.1 += w;
@@ -579,49 +558,49 @@ impl TumbleWindowOp {
             ws.into_iter().collect()
         };
 
-        let mut output_rows: Vec<(Vec<i64>, i64)> = Vec::new();
+        let mut output_rows: Vec<(Vec<Option<i64>>, i64)> = Vec::new();
 
         for window_id in all_windows {
             // Build new current state (positive-weight rows only).
-            let new_state: HashMap<Vec<u8>, Vec<i64>> = state
+            let new_state: TumbleWindowMap = state
                 .windows
                 .get(&window_id)
                 .map(|m| {
                     m.iter()
                         .filter(|(_, (_, w))| *w > 0)
-                        .map(|(k, (vals, _))| (k.clone(), vals.clone()))
+                        .map(|(k, row)| (k.clone(), row.clone()))
                         .collect()
                 })
                 .unwrap_or_default();
 
             // Get previous emitted state (clone to avoid borrow conflict).
-            let old_emitted: EmittedMap = state
+            let old_emitted: TumbleWindowMap = state
                 .prev_output
                 .get(&window_id)
                 .cloned()
                 .unwrap_or_default();
 
-            // Retract rows no longer present.
-            for (key, old_vals) in &old_emitted {
-                if !new_state.contains_key(key) {
-                    let mut out_vals = vec![window_id];
+            // Emit weight differences, including partially retracted duplicates.
+            for (key, (old_vals, old_weight)) in &old_emitted {
+                let new_weight = new_state.get(key).map_or(0, |(_, w)| *w);
+                let diff = new_weight - old_weight;
+                if diff != 0 {
+                    let mut out_vals = vec![Some(window_id)];
                     out_vals.extend_from_slice(old_vals);
-                    output_rows.push((out_vals, -1));
+                    output_rows.push((out_vals, diff));
                 }
             }
 
             // Insert newly-present rows.
-            let mut new_emitted: EmittedMap = HashMap::new();
-            for (key, vals) in &new_state {
+            for (key, (vals, weight)) in &new_state {
                 if !old_emitted.contains_key(key) {
-                    let mut out_vals = vec![window_id];
+                    let mut out_vals = vec![Some(window_id)];
                     out_vals.extend_from_slice(vals);
-                    output_rows.push((out_vals, 1));
+                    output_rows.push((out_vals, *weight));
                 }
-                new_emitted.insert(key.clone(), vals.to_vec());
             }
 
-            state.prev_output.insert(window_id, new_emitted);
+            state.prev_output.insert(window_id, new_state);
 
             // Mark as finalized if watermark has advanced past window end.
             if watermark_ms > window_id + window_size_ms {
@@ -633,7 +612,7 @@ impl TumbleWindowOp {
         drop(state);
 
         self.fill_level.store(total, Ordering::Relaxed);
-        build_output(&self.schema, output_rows)
+        build_tumble_output(&self.schema, output_rows)
     }
 }
 
@@ -1242,6 +1221,44 @@ fn derive_sessions(rows: &[Vec<i64>], time_col: usize, gap_ms: i64) -> Vec<(i64,
     sessions
 }
 
+fn extract_tumble_row(batch: &RecordBatch, row_idx: usize) -> Vec<Option<i64>> {
+    batch
+        .columns()
+        .iter()
+        .map(|col| {
+            let col = col.as_any().downcast_ref::<Int64Array>().unwrap();
+            (!col.is_null(row_idx)).then(|| col.value(row_idx))
+        })
+        .collect()
+}
+
+fn encode_tumble_row(vals: &[Option<i64>]) -> Vec<u8> {
+    let mut key = encode_row(&vals.iter().map(|v| v.unwrap_or(0)).collect::<Vec<_>>());
+    // Non-NULL keys keep their legacy encoding; NULL positions distinguish zero.
+    for (i, val) in vals.iter().enumerate() {
+        if val.is_none() {
+            key.extend_from_slice(&(i as u64).to_be_bytes());
+        }
+    }
+    key
+}
+
+fn build_tumble_output(
+    schema: &SchemaRef,
+    rows: Vec<(Vec<Option<i64>>, i64)>,
+) -> Result<ArrowZSet, OpError> {
+    let arrays = (0..schema.fields().len())
+        .map(|col| {
+            Arc::new(Int64Array::from_iter(
+                rows.iter().map(|(vals, _)| vals[col]),
+            )) as ArrayRef
+        })
+        .collect();
+    let weights = rows.iter().map(|(_, w)| *w).collect();
+    let data = RecordBatch::try_new(schema.clone(), arrays).map_err(OpError::arrow)?;
+    Ok(ArrowZSet::new(data, weights))
+}
+
 fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i64> {
     batch
         .columns()
@@ -1329,6 +1346,37 @@ fn decode_window_value(bytes: &[u8], n_input_cols: usize) -> Option<(Vec<i64>, i
     Some((vals, weight))
 }
 
+fn encode_tumble_window_value(row_vals: &[Option<i64>], weight: i64) -> Vec<u8> {
+    let vals = row_vals.iter().map(|v| v.unwrap_or(0)).collect::<Vec<_>>();
+    let mut bytes = encode_window_value(&vals, weight);
+    // Only nullable rows need a validity trailer; old non-NULL state stays valid.
+    if row_vals.iter().any(Option::is_none) {
+        bytes.extend(row_vals.iter().map(|v| u8::from(v.is_some())));
+    }
+    bytes
+}
+
+fn decode_tumble_window_value(
+    bytes: &[u8],
+    n_input_cols: usize,
+) -> Option<(Vec<Option<i64>>, i64)> {
+    let legacy_len = 8 + n_input_cols * 8;
+    if bytes.len() != legacy_len && bytes.len() != legacy_len + n_input_cols {
+        return None;
+    }
+    let (vals, weight) = decode_window_value(bytes, n_input_cols)?;
+    let validity = &bytes[legacy_len..];
+    if validity.iter().any(|v| *v > 1) {
+        return None;
+    }
+    let vals = vals
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (validity.is_empty() || validity[i] == 1).then_some(v))
+        .collect();
+    Some((vals, weight))
+}
+
 /// Persist TumbleWindowOp state to a ShardDb.
 ///
 /// Uses only point Put/Delete operations — never DeleteRange.
@@ -1346,7 +1394,7 @@ pub fn append_tumble_window_state(
         for (&window_id, window_map) in &state.windows {
             for (group_key, (row_vals, weight)) in window_map {
                 let key = ShardKeyEncoder::tumble_window_key(oid, window_id, group_key);
-                let value = encode_window_value(row_vals, *weight);
+                let value = encode_tumble_window_value(row_vals, *weight);
                 batch.put(&key, &value);
             }
         }
@@ -1381,45 +1429,7 @@ pub async fn load_tumble_window_state(
     op_id: OperatorId,
 ) -> Result<TumbleWindowOp, OpError> {
     let op = TumbleWindowOp::new(input_schema, time_col, window_size_ms, late_data_policy);
-    let n_input_cols = op.n_input_cols;
-    let oid = op_id.0;
-
-    // Load window entries and watermark before locking state.
-    let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
-    let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
-    let prefix_len = prefix.len(); // 1 + 2 + 8 = 11
-
-    let wm_key = ShardKeyEncoder::watermark_key(oid);
-    let wm_bytes = db.get(&wm_key).await.ok().flatten();
-
-    let mut st = op.state.lock().unwrap();
-
-    for (key, value) in entries {
-        if let Some((row_vals, weight)) = decode_window_value(&value, n_input_cols) {
-            // key = prefix + window_id(8) + group_key(var)
-            if key.len() < prefix_len + 8 {
-                continue;
-            }
-            let window_id =
-                i64::from_be_bytes(key[prefix_len..prefix_len + 8].try_into().unwrap_or([0; 8]));
-            let group_key = key[prefix_len + 8..].to_vec();
-            st.windows
-                .entry(window_id)
-                .or_default()
-                .insert(group_key, (row_vals, weight));
-        }
-    }
-
-    if let Some(bytes) = wm_bytes {
-        if bytes.len() >= 8 {
-            let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
-            st.watermark = WatermarkState { watermark_ms: wm };
-        }
-    }
-
-    let total = st.total_rows();
-    drop(st);
-    op.fill_level.store(total, Ordering::Relaxed);
+    op.restore_in_place(db, op_id).await?;
     Ok(op)
 }
 
@@ -1640,6 +1650,46 @@ pub async fn persist_watermark(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn tumble_state_encoding_preserves_legacy_rows_and_null_validity() {
+        let legacy = [
+            2_i64.to_be_bytes(),
+            1_i64.to_be_bytes(),
+            7_i64.to_be_bytes(),
+        ]
+        .concat();
+        assert_eq!(encode_tumble_window_value(&[Some(1), Some(7)], 2), legacy);
+        assert_eq!(
+            decode_tumble_window_value(&legacy, 2),
+            Some((vec![Some(1), Some(7)], 2))
+        );
+
+        let nullable = [
+            (-1_i64).to_be_bytes().as_slice(),
+            &1_i64.to_be_bytes(),
+            &0_i64.to_be_bytes(),
+            &[1, 0],
+        ]
+        .concat();
+        assert_eq!(encode_tumble_window_value(&[Some(1), None], -1), nullable);
+        assert_eq!(
+            decode_tumble_window_value(&nullable, 2),
+            Some((vec![Some(1), None], -1))
+        );
+        assert_eq!(encode_tumble_row(&[Some(1), Some(0)]), encode_row(&[1, 0]));
+        assert_eq!(
+            encode_tumble_row(&[Some(1), None]),
+            [encode_row(&[1, 0]), 1_u64.to_be_bytes().to_vec()].concat()
+        );
+        assert_eq!(
+            decode_tumble_window_value(&nullable[..nullable.len() - 1], 2),
+            None
+        );
+        let mut invalid = nullable;
+        *invalid.last_mut().unwrap() = 2;
+        assert_eq!(decode_tumble_window_value(&invalid, 2), None);
+    }
 
     fn input_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
