@@ -1,0 +1,242 @@
+//! Exact nullable relations through the compiled production path (#112 R1–R5).
+
+use std::{collections::HashMap, sync::Arc};
+
+use arrow::{
+    array::Int64Array,
+    datatypes::{DataType, Field, Schema, SchemaRef},
+    record_batch::RecordBatch,
+};
+use object_store::local::LocalFileSystem;
+use rockstream_ops::{compile::JoinCompiled, compile_plan, ArrowZSet};
+use rockstream_plan::{OuterJoinKind, PlanNode};
+use rockstream_storage::ShardDb;
+use rockstream_types::ids::OperatorId;
+use tempfile::TempDir;
+
+type Row = (Vec<Option<i64>>, i64);
+
+fn input(key: Option<i64>, value: Option<i64>, weight: i64) -> ArrowZSet {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    ArrowZSet::new(
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![key])),
+                Arc::new(Int64Array::from(vec![value])),
+            ],
+        )
+        .unwrap(),
+        vec![weight],
+    )
+}
+
+fn empty() -> ArrowZSet {
+    ArrowZSet::empty(input(None, None, 1).data.schema())
+}
+
+fn expected_schema(kind: OuterJoinKind) -> SchemaRef {
+    let names = if matches!(kind, OuterJoinKind::Semi | OuterJoinKind::Anti) {
+        vec!["l_0", "l_1"]
+    } else {
+        vec!["l_0", "l_1", "r_0", "r_1"]
+    };
+    Arc::new(Schema::new(
+        names
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Int64, true))
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn assert_relation(output: ArrowZSet, kind: OuterJoinKind, mut expected: Vec<Row>) {
+    assert_eq!(output.data.schema(), expected_schema(kind));
+    let columns = output
+        .data
+        .columns()
+        .iter()
+        .map(|column| {
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut actual = output
+        .weights
+        .iter()
+        .enumerate()
+        .map(|(row, weight)| (columns.iter().map(|column| column[row]).collect(), *weight))
+        .collect::<Vec<Row>>();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+async fn open_db(dir: &TempDir) -> Arc<ShardDb> {
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    Arc::new(ShardDb::builder("shard", store).build().await.unwrap())
+}
+
+fn compile(kind: OuterJoinKind, db: Arc<ShardDb>) -> JoinCompiled {
+    let plan = PlanNode::ViewSink {
+        view_name: "nullable_join".into(),
+        pk: vec![0],
+        child: Box::new(PlanNode::OuterJoin {
+            kind,
+            left: Box::new(PlanNode::Source { name: "l".into() }),
+            right: Box::new(PlanNode::Source { name: "r".into() }),
+            left_keys: vec![0],
+            right_keys: vec![0],
+            left_arr_id: OperatorId(112),
+            right_arr_id: OperatorId(113),
+            unmatched_arr_id: OperatorId(114),
+        }),
+    };
+    let schemas = HashMap::from([
+        ("l".into(), empty().data.schema()),
+        ("r".into(), empty().data.schema()),
+    ]);
+    compile_plan(&plan, db, &schemas).unwrap().join.unwrap()
+}
+
+#[tokio::test]
+async fn compiled_null_keys_never_match_and_retract_exactly() {
+    for kind in [
+        OuterJoinKind::Left,
+        OuterJoinKind::Right,
+        OuterJoinKind::Full,
+        OuterJoinKind::Semi,
+        OuterJoinKind::Anti,
+    ] {
+        for reopen in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let db = open_db(&dir).await;
+            let join = compile(kind, db.clone());
+            let left = (vec![None, Some(7), None, None], 1);
+            let right = (vec![None, None, None, Some(7)], 1);
+            let expected = match kind {
+                OuterJoinKind::Left => vec![left],
+                OuterJoinKind::Right => vec![right],
+                OuterJoinKind::Full => vec![left, right],
+                OuterJoinKind::Semi => vec![],
+                OuterJoinKind::Anti => vec![(vec![None, Some(7)], 1)],
+            };
+            assert_relation(
+                join.pipeline
+                    .process(input(None, Some(7), 1), input(None, Some(7), 1))
+                    .unwrap(),
+                kind,
+                expected,
+            );
+            let (db, join) = if reopen {
+                join.pipeline.persist(&db).await.unwrap();
+                db.flush().await.unwrap();
+                drop(join);
+                Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+                let db = open_db(&dir).await;
+                let join = compile(kind, db.clone());
+                join.pipeline.restore(&db).await.unwrap();
+                (db, join)
+            } else {
+                (db, join)
+            };
+            let expected = if matches!(kind, OuterJoinKind::Right | OuterJoinKind::Full) {
+                vec![(vec![None, None, None, Some(7)], -1)]
+            } else {
+                vec![]
+            };
+            assert_relation(
+                join.pipeline
+                    .process(empty(), input(None, Some(7), -1))
+                    .unwrap(),
+                kind,
+                expected,
+            );
+            let expected = match kind {
+                OuterJoinKind::Left | OuterJoinKind::Full => {
+                    vec![(vec![None, Some(7), None, None], -1)]
+                }
+                OuterJoinKind::Anti => vec![(vec![None, Some(7)], -1)],
+                _ => vec![],
+            };
+            assert_relation(
+                join.pipeline
+                    .process(input(None, Some(7), -1), empty())
+                    .unwrap(),
+                kind,
+                expected,
+            );
+            drop(join);
+            Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn compiled_null_payload_is_distinct_from_zero_after_reopen() {
+    for kind in [
+        OuterJoinKind::Left,
+        OuterJoinKind::Right,
+        OuterJoinKind::Full,
+        OuterJoinKind::Semi,
+        OuterJoinKind::Anti,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        let join = compile(kind, db.clone());
+        assert_relation(
+            join.pipeline
+                .process(input(Some(1), None, 1), input(Some(1), Some(0), 1))
+                .unwrap(),
+            kind,
+            match kind {
+                OuterJoinKind::Semi => vec![(vec![Some(1), None], 1)],
+                OuterJoinKind::Anti => vec![],
+                _ => vec![(vec![Some(1), None, Some(1), Some(0)], 1)],
+            },
+        );
+        join.pipeline.persist(&db).await.unwrap();
+        db.flush().await.unwrap();
+        drop(join);
+        Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+        let db = open_db(&dir).await;
+        let join = compile(kind, db.clone());
+        join.pipeline.restore(&db).await.unwrap();
+        assert_relation(
+            join.pipeline
+                .process(empty(), input(Some(1), Some(0), -1))
+                .unwrap(),
+            kind,
+            match kind {
+                OuterJoinKind::Left | OuterJoinKind::Full => vec![
+                    (vec![Some(1), None, Some(1), Some(0)], -1),
+                    (vec![Some(1), None, None, None], 1),
+                ],
+                OuterJoinKind::Right => vec![(vec![Some(1), None, Some(1), Some(0)], -1)],
+                OuterJoinKind::Semi => vec![(vec![Some(1), None], -1)],
+                OuterJoinKind::Anti => vec![(vec![Some(1), None], 1)],
+            },
+        );
+        assert_relation(
+            join.pipeline
+                .process(input(Some(1), None, -1), empty())
+                .unwrap(),
+            kind,
+            match kind {
+                OuterJoinKind::Left | OuterJoinKind::Full => {
+                    vec![(vec![Some(1), None, None, None], -1)]
+                }
+                OuterJoinKind::Anti => vec![(vec![Some(1), None], -1)],
+                _ => vec![],
+            },
+        );
+        drop(join);
+        Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+    }
+}

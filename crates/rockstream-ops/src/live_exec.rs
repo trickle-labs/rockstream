@@ -1479,15 +1479,10 @@ impl JoinKind {
     }
 
     /// Load the join's persisted arrangement(s) from `db` in place.
-    /// `OuterJoinOp` (semi/anti/outer joins) is out of scope for now — no
-    /// Durability Slice in the v0.51.4 plan exercises an outer join, and
-    /// its extra `left_key_weight`/`right_key_weight` tables would need
-    /// their own in-place restore method; `JoinOp` (inner join, what the
-    /// plan's join durability test actually exercises) is fully restored.
     async fn restore(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
             JoinKind::Inner(op) => op.restore_in_place(db).await,
-            JoinKind::Outer(_) => Ok(()),
+            JoinKind::Outer(op) => op.restore_in_place(db).await,
             JoinKind::Factorized(op) => op.restore_in_place(db).await,
         }
     }
@@ -1685,8 +1680,7 @@ impl JoinPipeline {
     }
 
     /// Load the join's persisted arrangement(s), and any stateful pre/post
-    /// stage's state, from `db` in place. See `JoinKind::restore` for the
-    /// `OuterJoinOp` scope note.
+    /// stage's state, from `db` in place.
     pub async fn restore(&self, db: &ShardDb) -> Result<(), OpError> {
         self.join.restore(db).await?;
         for stage in &self.left_pre {
