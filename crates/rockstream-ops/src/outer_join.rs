@@ -6,8 +6,8 @@
 //!
 //! ## NULL encoding
 //!
-//! NULL values in the output (NULL-padding for unmatched rows) are encoded as
-//! `0i64` in the output Int64 columns.  All real column values are non-null.
+//! NULL-padding for unmatched rows is represented as Arrow NULL, preserving
+//! the distinction from a real zero value.
 //!
 //! ## State persistence
 //!
@@ -42,6 +42,24 @@ pub fn outer_join_output_schema_n(left_n_cols: usize, right_n_cols: usize) -> Sc
         (0..left_n_cols)
             .map(|i| Field::new(format!("l_{i}"), DataType::Int64, true))
             .chain((0..right_n_cols).map(|i| Field::new(format!("r_{i}"), DataType::Int64, true)))
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn output_schema(kind: OuterJoinKind, left_n_cols: usize, right_n_cols: usize) -> SchemaRef {
+    let (left_nullable, right_nullable) = match kind {
+        OuterJoinKind::Left => (false, true),
+        OuterJoinKind::Right => (true, false),
+        OuterJoinKind::Full => (true, true),
+        OuterJoinKind::Semi | OuterJoinKind::Anti => unreachable!(),
+    };
+    Arc::new(Schema::new(
+        (0..left_n_cols)
+            .map(|i| Field::new(format!("l_{i}"), DataType::Int64, left_nullable))
+            .chain(
+                (0..right_n_cols)
+                    .map(|i| Field::new(format!("r_{i}"), DataType::Int64, right_nullable)),
+            )
             .collect::<Vec<_>>(),
     ))
 }
@@ -382,7 +400,7 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let out_schema = output_schema(self.kind, self.left_n_cols, self.right_n_cols);
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         // Compute staged right delta per key.
@@ -511,7 +529,7 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let out_schema = output_schema(self.kind, self.left_n_cols, self.right_n_cols);
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_lw: HashMap<Vec<u8>, i64> = {
@@ -628,7 +646,7 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let out_schema = output_schema(self.kind, self.left_n_cols, self.right_n_cols);
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_rw: HashMap<Vec<u8>, i64> = {
@@ -1352,6 +1370,7 @@ impl crate::op::Operator for OuterJoinOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
     use rockstream_types::ids::OperatorId;
     use std::sync::Arc;
 
@@ -1384,7 +1403,7 @@ mod tests {
     }
 
     /// Extract (l_k, l_v, r_v_or_null, weight) from left-join output (4-col).
-    fn extract_left_join_output(batch: &ArrowZSet) -> Vec<(i64, i64, i64, i64)> {
+    fn extract_left_join_output(batch: &ArrowZSet) -> Vec<(i64, i64, Option<i64>, i64)> {
         if batch.is_empty() {
             return vec![];
         }
@@ -1406,8 +1425,15 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        let mut rows: Vec<(i64, i64, i64, i64)> = (0..batch.num_rows())
-            .map(|i| (lk.value(i), lv.value(i), rv.value(i), batch.weights[i]))
+        let mut rows: Vec<(i64, i64, Option<i64>, i64)> = (0..batch.num_rows())
+            .map(|i| {
+                (
+                    lk.value(i),
+                    lv.value(i),
+                    (!rv.is_null(i)).then(|| rv.value(i)),
+                    batch.weights[i],
+                )
+            })
             .collect();
         rows.sort();
         rows
@@ -1446,8 +1472,22 @@ mod tests {
         // No right rows.
         let out = op.process_epoch(left, empty_kv()).unwrap();
         let rows = extract_left_join_output(&out);
-        // (k=10, lv=100, rv=NULL=0, w=1)
-        assert!(rows.contains(&(10, 100, 0, 1)), "unmatched left: {rows:?}");
+        assert!(
+            rows.contains(&(10, 100, None, 1)),
+            "unmatched left: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn left_join_keeps_null_distinct_from_zero() {
+        let op = OuterJoinOp::new(OperatorId(23), OuterJoinKind::Left, vec![0], vec![0]);
+        let left = make_kv_batch(&[(7, 70, 1), (8, 80, 1)]);
+        let right = make_kv_batch(&[(7, 0, 1)]);
+        let out = op.process_epoch(left, right).unwrap();
+        assert_eq!(
+            extract_left_join_output(&out),
+            vec![(7, 70, Some(0), 1), (8, 80, None, 1)]
+        );
     }
 
     #[test]
@@ -1458,10 +1498,10 @@ mod tests {
         let out = op.process_epoch(left, right).unwrap();
         let rows = extract_left_join_output(&out);
         // Should include (5, 50, 500, 1) from inner join.
-        assert!(rows.contains(&(5, 50, 500, 1)), "matched: {rows:?}");
+        assert!(rows.contains(&(5, 50, Some(500), 1)), "matched: {rows:?}");
         // Should NOT include NULL-padded row.
         assert!(
-            !rows.contains(&(5, 50, 0, 1)),
+            !rows.contains(&(5, 50, None, 1)),
             "no null pad when matched: {rows:?}"
         );
     }
@@ -1474,20 +1514,23 @@ mod tests {
         let l1 = make_kv_batch(&[(7, 70, 1)]);
         let out1 = op.process_epoch(l1, empty_kv()).unwrap();
         let rows1 = extract_left_join_output(&out1);
-        assert!(rows1.contains(&(7, 70, 0, 1)), "epoch1 null pad: {rows1:?}");
+        assert!(
+            rows1.contains(&(7, 70, None, 1)),
+            "epoch1 null pad: {rows1:?}"
+        );
 
         // Epoch 2: right arrives for same key → retract NULL-pad, add inner.
         let r2 = make_kv_batch(&[(7, 700, 1)]);
         let out2 = op.process_epoch(empty_kv(), r2).unwrap();
         let rows2 = extract_left_join_output(&out2);
-        // Retract NULL-pad: (7, 70, 0, -1).
+        // Retract NULL-pad.
         assert!(
-            rows2.contains(&(7, 70, 0, -1)),
+            rows2.contains(&(7, 70, None, -1)),
             "retract null pad: {rows2:?}"
         );
         // Add inner: (7, 70, 700, +1).
         assert!(
-            rows2.contains(&(7, 70, 700, 1)),
+            rows2.contains(&(7, 70, Some(700), 1)),
             "inner join added: {rows2:?}"
         );
     }
@@ -1507,12 +1550,12 @@ mod tests {
         let rows2 = extract_left_join_output(&out2);
         // Retract inner: (3, 30, 300, -1).
         assert!(
-            rows2.contains(&(3, 30, 300, -1)),
+            rows2.contains(&(3, 30, Some(300), -1)),
             "retract inner: {rows2:?}"
         );
-        // Add NULL-pad: (3, 30, 0, +1).
+        // Add NULL-pad.
         assert!(
-            rows2.contains(&(3, 30, 0, 1)),
+            rows2.contains(&(3, 30, None, 1)),
             "add null pad back: {rows2:?}"
         );
     }

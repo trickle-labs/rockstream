@@ -22,8 +22,8 @@ use std::sync::{
 };
 
 use crate::op::Operator;
-use arrow::array::{ArrayRef, Int64Array};
-use arrow::datatypes::SchemaRef;
+use arrow::array::{ArrayRef, Int64Array, UInt64Array};
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use rockstream_plan::{WindowExpr, WindowFunc};
@@ -94,8 +94,23 @@ fn row_hash(vals: &[i64]) -> u128 {
     ((h0 as u128) << 64) | (h1 as u128)
 }
 
-fn output_row_hash(output_vals: &[i64]) -> u128 {
-    row_hash(output_vals)
+fn output_row_hash(output_vals: &[i64], nulls: &[bool]) -> u128 {
+    let mut bytes = Vec::with_capacity(output_vals.len() * 9);
+    for (value, is_null) in output_vals.iter().zip(nulls) {
+        bytes.extend_from_slice(&value.to_be_bytes());
+        bytes.push(u8::from(*is_null));
+    }
+    let mut chunks = bytes.chunks_exact(8);
+    let mut words = Vec::new();
+    for chunk in &mut chunks {
+        words.push(i64::from_be_bytes(chunk.try_into().unwrap()));
+    }
+    if !chunks.remainder().is_empty() {
+        let mut tail = [0; 8];
+        tail[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
+        words.push(i64::from_be_bytes(tail));
+    }
+    row_hash(&words)
 }
 
 // ─── Window function evaluation ───────────────────────────────────────────────
@@ -108,9 +123,9 @@ fn eval_window_batch(
     sorted_rows: &[(Vec<u8>, Vec<i64>)],
     window_exprs: &[WindowExpr],
     n_input_cols: usize,
-) -> Result<Vec<Vec<i64>>, OpError> {
+) -> Result<Vec<Vec<Option<i64>>>, OpError> {
     let n = sorted_rows.len();
-    let mut result = vec![vec![0i64; n]; window_exprs.len()];
+    let mut result = vec![vec![Some(0i64); n]; window_exprs.len()];
 
     for (expr_idx, expr) in window_exprs.iter().enumerate() {
         let out = &mut result[expr_idx];
@@ -133,7 +148,7 @@ fn eval_window_batch(
         match &expr.func {
             WindowFunc::RowNumber => {
                 for i in 0..n {
-                    out[i] = (i + 1) as i64;
+                    out[i] = Some((i + 1) as i64);
                 }
             }
 
@@ -143,7 +158,7 @@ fn eval_window_batch(
                     if i > 0 && order_vals[i] != order_vals[i - 1] {
                         rank = (i + 1) as i64;
                     }
-                    out[i] = rank;
+                    out[i] = Some(rank);
                 }
             }
 
@@ -153,7 +168,7 @@ fn eval_window_batch(
                     if i > 0 && order_vals[i] != order_vals[i - 1] {
                         dense += 1;
                     }
-                    out[i] = dense;
+                    out[i] = Some(dense);
                 }
             }
 
@@ -163,12 +178,12 @@ fn eval_window_batch(
                     if i >= *offset {
                         let src_vals = &sorted_rows[i - offset].1;
                         out[i] = if lag_col_idx < n_input_cols {
-                            src_vals[lag_col_idx]
+                            Some(src_vals[lag_col_idx])
                         } else {
-                            0
+                            Some(0)
                         };
                     } else {
-                        out[i] = 0;
+                        out[i] = None;
                     }
                 }
             }
@@ -179,12 +194,12 @@ fn eval_window_batch(
                     if i + offset < n {
                         let src_vals = &sorted_rows[i + offset].1;
                         out[i] = if lead_col_idx < n_input_cols {
-                            src_vals[lead_col_idx]
+                            Some(src_vals[lead_col_idx])
                         } else {
-                            0
+                            Some(0)
                         };
                     } else {
-                        out[i] = 0;
+                        out[i] = None;
                     }
                 }
             }
@@ -209,7 +224,7 @@ fn eval_window_batch(
                             0
                         };
                     }
-                    out[i] = sum;
+                    out[i] = Some(sum);
                 }
             }
 
@@ -234,7 +249,7 @@ fn eval_window_batch(
                             0
                         };
                     }
-                    out[i] = if count > 0 { sum / count } else { 0 };
+                    out[i] = Some(if count > 0 { sum / count } else { 0 });
                 }
             }
 
@@ -258,8 +273,8 @@ fn eval_window_batch(
 /// Only rows with weight > 0 participate in window computation.
 type PartMap = HashMap<u128, (Vec<u8>, Vec<i64>, i64)>;
 
-/// Output cache entry: output_row_hash → output_vals (input + window results).
-type OutputCache = HashMap<u128, Vec<i64>>;
+/// Output cache entry: output_row_hash → values and per-column NULL flags.
+type OutputCache = HashMap<u128, (Vec<i64>, Vec<bool>)>;
 
 struct WindowState {
     /// Input arrangement: part_key_bytes → row entries
@@ -295,8 +310,8 @@ impl WindowState {
         }
         for (pk, ocache) in &self.prev_output {
             bytes += pk.len() as u64;
-            for output_vals in ocache.values() {
-                bytes += (16 + output_vals.len() * 8) as u64;
+            for (output_vals, nulls) in ocache.values() {
+                bytes += (16 + output_vals.len() * 8 + nulls.len()) as u64;
             }
         }
         bytes
@@ -310,7 +325,7 @@ impl WindowState {
 /// Implements partition-based recomputation: when any row in a partition
 /// changes, the entire partition is re-evaluated and the diff is emitted.
 pub struct WindowOp {
-    /// Output schema: input_schema + one Int64 column per window expr.
+    /// Output schema: input schema plus the typed window result columns.
     schema: SchemaRef,
     /// Number of input columns (schema.fields().len() - window_exprs.len()).
     n_input_cols: usize,
@@ -400,7 +415,7 @@ impl WindowOp {
         }
 
         // Recompute output for each affected partition.
-        let mut all_output: Vec<(Vec<i64>, i64)> = Vec::new();
+        let mut all_output: Vec<(Vec<i64>, Vec<bool>, i64)> = Vec::new();
         let mut new_oversized: Vec<Vec<u8>> = Vec::new();
 
         for part_key in affected.keys() {
@@ -426,8 +441,8 @@ impl WindowOp {
 
             // Retract previous output for this partition.
             if let Some(prev) = state.prev_output.get(part_key) {
-                for out_vals in prev.values() {
-                    all_output.push((out_vals.clone(), -1));
+                for (out_vals, nulls) in prev.values() {
+                    all_output.push((out_vals.clone(), nulls.clone(), -1));
                 }
             }
 
@@ -438,12 +453,15 @@ impl WindowOp {
 
                 for i in 0..rows_in_part.len() {
                     let mut out_vals = rows_in_part[i].1.clone();
+                    let mut nulls = vec![false; n_in];
                     for expr_idx in 0..n_exprs {
-                        out_vals.push(window_results[expr_idx][i]);
+                        let value = window_results[expr_idx][i];
+                        out_vals.push(value.unwrap_or_default());
+                        nulls.push(value.is_none());
                     }
-                    let oh = output_row_hash(&out_vals);
-                    new_prev.insert(oh, out_vals.clone());
-                    all_output.push((out_vals, 1));
+                    let oh = output_row_hash(&out_vals, &nulls);
+                    new_prev.insert(oh, (out_vals.clone(), nulls.clone()));
+                    all_output.push((out_vals, nulls, 1));
                 }
 
                 state.prev_output.insert(part_key.clone(), new_prev);
@@ -503,30 +521,33 @@ impl Operator for WindowOp {
 
 // ─── Output builder ──────────────────────────────────────────────────────────
 
-fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZSet, OpError> {
+fn build_output(
+    schema: &SchemaRef,
+    rows: Vec<(Vec<i64>, Vec<bool>, i64)>,
+) -> Result<ArrowZSet, OpError> {
     if rows.is_empty() {
         return Ok(ArrowZSet::empty(schema.clone()));
     }
 
     // Aggregate by output_row_hash to cancel intra-epoch retractions.
-    let mut agg: HashMap<u128, (i64, Vec<i64>)> = HashMap::new();
-    for (vals, w) in rows {
-        let h = output_row_hash(&vals);
-        let entry = agg.entry(h).or_insert((0, vals));
+    let mut agg: HashMap<u128, (i64, Vec<i64>, Vec<bool>)> = HashMap::new();
+    for (vals, nulls, w) in rows {
+        let h = output_row_hash(&vals, &nulls);
+        let entry = agg.entry(h).or_insert((0, vals, nulls));
         entry.0 += w;
     }
 
     let num_cols = schema.fields().len();
-    let mut col_builders: Vec<Vec<i64>> = vec![Vec::new(); num_cols];
+    let mut col_builders: Vec<Vec<Option<i64>>> = vec![Vec::new(); num_cols];
     let mut weights: Vec<i64> = Vec::new();
 
-    for (_, (net_w, vals)) in agg {
+    for (_, (net_w, vals, nulls)) in agg {
         if net_w == 0 {
             continue;
         }
         weights.push(net_w);
         for (ci, &val) in vals.iter().enumerate().take(num_cols) {
-            col_builders[ci].push(val);
+            col_builders[ci].push((!nulls[ci]).then_some(val));
         }
     }
 
@@ -536,8 +557,19 @@ fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZ
 
     let arrays: Vec<ArrayRef> = col_builders
         .into_iter()
-        .map(|col| Arc::new(Int64Array::from(col)) as ArrayRef)
-        .collect();
+        .enumerate()
+        .map(|(index, col)| match schema.field(index).data_type() {
+            DataType::Int64 => Ok(Arc::new(Int64Array::from(col)) as ArrayRef),
+            DataType::UInt64 => Ok(Arc::new(UInt64Array::from(
+                col.into_iter()
+                    .map(|value| value.unwrap_or_default() as u64)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef),
+            data_type => Err(OpError::unimplemented(format!(
+                "WindowOp output type {data_type:?}"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let data = RecordBatch::try_new(schema.clone(), arrays).map_err(OpError::arrow)?;
     Ok(ArrowZSet::new(data, weights))
@@ -579,19 +611,22 @@ fn decode_arr_value(bytes: &[u8], n_input_cols: usize) -> Option<(Vec<u8>, Vec<i
     Some((order_key, vals, weight))
 }
 
-/// Encode output row values as storage value bytes.
-///
-/// Format: `[col0:8 BE]...[colN:8 BE]`
-fn encode_output_value(vals: &[i64]) -> Vec<u8> {
+/// Encode output values, preserving the legacy all-valid format.
+fn encode_output_value(vals: &[i64], nulls: &[bool]) -> Vec<u8> {
     let mut v = Vec::with_capacity(vals.len() * 8);
     for val in vals {
         v.extend_from_slice(&val.to_be_bytes());
     }
+    if nulls.iter().any(|is_null| *is_null) {
+        v.extend(nulls.iter().map(|is_null| u8::from(*is_null)));
+    }
     v
 }
 
-fn decode_output_value(bytes: &[u8], n_cols: usize) -> Option<Vec<i64>> {
-    if bytes.len() < n_cols * 8 {
+fn decode_output_value(bytes: &[u8], n_cols: usize) -> Option<(Vec<i64>, Vec<bool>)> {
+    let values_len = n_cols * 8;
+    let has_nulls = bytes.len() == values_len + n_cols;
+    if bytes.len() != values_len && !has_nulls {
         return None;
     }
     let mut vals = Vec::with_capacity(n_cols);
@@ -599,7 +634,19 @@ fn decode_output_value(bytes: &[u8], n_cols: usize) -> Option<Vec<i64>> {
         let v = i64::from_be_bytes(bytes[i * 8..(i + 1) * 8].try_into().ok()?);
         vals.push(v);
     }
-    Some(vals)
+    let nulls = if has_nulls {
+        bytes[values_len..]
+            .iter()
+            .map(|flag| match flag {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        vec![false; n_cols]
+    };
+    Some((vals, nulls))
 }
 
 /// Persist WindowOp arrangement and output cache to a ShardDb.
@@ -626,9 +673,9 @@ pub fn append_window_state(
 
         // Write output cache entries.
         for (part_key, out_map) in &state.prev_output {
-            for (out_hash, out_vals) in out_map {
+            for (out_hash, (out_vals, nulls)) in out_map {
                 let key = ShardKeyEncoder::window_prev_output_key(oid, part_key, *out_hash);
-                let value = encode_output_value(out_vals);
+                let value = encode_output_value(out_vals, nulls);
                 batch.put(&key, &value);
             }
         }
@@ -739,6 +786,7 @@ pub async fn load_window_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn schema_kv_rn() -> SchemaRef {
@@ -775,6 +823,94 @@ mod tests {
         .unwrap();
         let _ = schema; // schema is for the op, not the input batch
         ArrowZSet::new(data, w)
+    }
+
+    #[test]
+    fn lag_emits_null_and_rank_keeps_uint64_type() {
+        let legacy_value = encode_output_value(&[1, 2], &[false, false]);
+        assert_eq!(
+            legacy_value,
+            [1i64.to_be_bytes(), 2i64.to_be_bytes()].concat()
+        );
+        let null_value = encode_output_value(&[1, 0], &[false, true]);
+        assert_eq!(
+            decode_output_value(&null_value, 2),
+            Some((vec![1, 0], vec![false, true]))
+        );
+
+        let lag_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Int64, false),
+            Field::new("lag_id", DataType::Int64, true),
+        ]));
+        let lag = WindowOp::new(
+            lag_schema.clone(),
+            vec![WindowExpr {
+                func: WindowFunc::Lag { offset: 1 },
+                partition_by: vec![1],
+                order_by: vec![0],
+            }],
+        );
+        let lag_out = lag
+            .process_epoch(make_batch(lag_schema, &[(1, 0, 1), (2, 0, 1)]), 1)
+            .unwrap();
+        let lag_values = lag_out
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ids = lag_out
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let first_row = (0..lag_out.num_rows())
+            .find(|&i| ids.value(i) == 1)
+            .unwrap();
+        let second_row = (0..lag_out.num_rows())
+            .find(|&i| ids.value(i) == 2)
+            .unwrap();
+        assert!(lag_values.is_null(first_row));
+        assert_eq!(lag_values.value(second_row), 1);
+
+        let rank_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Int64, false),
+            Field::new("rank", DataType::UInt64, false),
+        ]));
+        let rank = WindowOp::new(
+            rank_schema.clone(),
+            vec![WindowExpr {
+                func: WindowFunc::Rank,
+                partition_by: vec![1],
+                order_by: vec![0],
+            }],
+        );
+        let rank_out = rank
+            .process_epoch(make_batch(rank_schema, &[(1, 0, 1), (2, 0, 1)]), 1)
+            .unwrap();
+        let ranks = rank_out
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let rank_ids = rank_out
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let first_rank_row = (0..rank_out.num_rows())
+            .find(|&i| rank_ids.value(i) == 1)
+            .unwrap();
+        let second_rank_row = (0..rank_out.num_rows())
+            .find(|&i| rank_ids.value(i) == 2)
+            .unwrap();
+        assert_eq!(ranks.value(first_rank_row), 1);
+        assert_eq!(ranks.value(second_rank_row), 2);
     }
 
     /// Collect (k, v, window_result) rows from the positive-weight output.

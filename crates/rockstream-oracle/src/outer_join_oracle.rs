@@ -5,8 +5,7 @@
 //! `incremental(q, Δ) == batch(q, accumulated)` for every sequence of
 //! random insert/delete deltas on both sides.
 //!
-//! NULL values (unmatched rows) are encoded as `0i64` and represented as
-//! `None` in the oracle comparison tuples.
+//! NULL values (unmatched rows) remain Arrow NULL and distinct from zero.
 //!
 //! ## Test structure
 //!
@@ -21,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use rockstream_ops::outer_join::OuterJoinOp;
@@ -69,16 +68,12 @@ fn empty_kv() -> ArrowZSet {
 
 /// Batch reference for LEFT JOIN.
 ///
-/// Returns sorted `Vec<(l_k, l_v, i64)>` for all live left rows,
-/// using `0i64` as the NULL sentinel for unmatched right columns
-/// (same encoding as `OuterJoinOp`).
-///
-/// **Important**: the proptest input generator guarantees that right-side `v`
-/// values are in `[1, 10)` so that `0` unambiguously identifies NULL-padded rows.
+/// Returns sorted `Vec<(l_k, l_v, Option<i64>)>` for all live left rows,
+/// using `None` for unmatched right columns.
 pub fn batch_reference_left(
     left_acc: &BTreeMap<(i64, i64), i64>,
     right_acc: &BTreeMap<(i64, i64), i64>,
-) -> Vec<(i64, i64, i64)> {
+) -> Vec<(i64, i64, Option<i64>)> {
     // Group right by key.
     let mut right_by_key: BTreeMap<i64, Vec<(i64, i64)>> = BTreeMap::new();
     for (&(rk, rv), &w) in right_acc {
@@ -87,7 +82,7 @@ pub fn batch_reference_left(
         }
     }
 
-    let mut result_map: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+    let mut result_map: BTreeMap<(i64, i64, Option<i64>), i64> = BTreeMap::new();
     for (&(lk, lv), &lw) in left_acc {
         if lw <= 0 {
             continue;
@@ -95,15 +90,14 @@ pub fn batch_reference_left(
         if let Some(rights) = right_by_key.get(&lk) {
             for &(rv, rw) in rights {
                 let net = lw * rw;
-                *result_map.entry((lk, lv, rv)).or_insert(0) += net;
+                *result_map.entry((lk, lv, Some(rv))).or_insert(0) += net;
             }
         } else {
-            // No match → NULL pad: right value encoded as 0 (same as operator).
-            *result_map.entry((lk, lv, 0i64)).or_insert(0) += lw;
+            *result_map.entry((lk, lv, None)).or_insert(0) += lw;
         }
     }
 
-    let mut result: Vec<(i64, i64, i64)> = result_map
+    let mut result: Vec<(i64, i64, Option<i64>)> = result_map
         .into_iter()
         .filter(|(_, w)| *w > 0)
         .map(|(k, _)| k)
@@ -206,13 +200,10 @@ pub fn batch_reference_anti(
 
 /// Accumulate LEFT JOIN output over epochs.
 ///
-/// Returns `Vec<(l_k, l_v, i64)>` with positive net weight.
-/// The operator encodes NULL-padded right columns as `0i64`.
-/// The proptest input generator guarantees that right-side `v` values are in
-/// `[1, 10)` so that `0` unambiguously identifies NULL-padded rows.
-pub fn incremental_left_join(epochs: &[EpochPair]) -> Vec<(i64, i64, i64)> {
+/// Returns `Vec<(l_k, l_v, Option<i64>)>` with positive net weight.
+pub fn incremental_left_join(epochs: &[EpochPair]) -> Vec<(i64, i64, Option<i64>)> {
     let op = OuterJoinOp::new(OperatorId(0), OuterJoinKind::Left, vec![0], vec![0]);
-    let mut output_acc: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+    let mut output_acc: BTreeMap<(i64, i64, Option<i64>), i64> = BTreeMap::new();
 
     for (left_epoch, right_epoch) in epochs {
         let left = if left_epoch.is_empty() {
@@ -250,7 +241,11 @@ pub fn incremental_left_join(epochs: &[EpochPair]) -> Vec<(i64, i64, i64)> {
             .downcast_ref::<Int64Array>()
             .unwrap();
         for i in 0..output.num_rows() {
-            let key = (lk_col.value(i), lv_col.value(i), rv_col.value(i));
+            let key = (
+                lk_col.value(i),
+                lv_col.value(i),
+                (!rv_col.is_null(i)).then(|| rv_col.value(i)),
+            );
             let w = output.weights[i];
             let entry = output_acc.entry(key).or_insert(0);
             *entry += w;
@@ -260,7 +255,7 @@ pub fn incremental_left_join(epochs: &[EpochPair]) -> Vec<(i64, i64, i64)> {
         }
     }
 
-    let mut result: Vec<(i64, i64, i64)> = output_acc
+    let mut result: Vec<(i64, i64, Option<i64>)> = output_acc
         .into_iter()
         .filter(|(_, w)| *w > 0)
         .map(|(k, _)| k)
@@ -385,9 +380,7 @@ pub fn incremental_anti_join(epochs: &[EpochPair]) -> Vec<(i64, i64)> {
 
 /// Assert `incremental == batch` for the LEFT JOIN query.
 ///
-/// Both sides use raw `(l_k, l_v, r_v_or_0)` tuples where `0` is the
-/// NULL sentinel for unmatched right columns.  The right-side input must
-/// only contain non-zero values to avoid ambiguity with the NULL sentinel.
+/// Both sides preserve NULL as `None`, so a real zero remains distinguishable.
 pub fn assert_oracle_left_join(epochs: &[EpochPair]) {
     let mut left_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
     let mut right_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
@@ -505,12 +498,17 @@ mod tests {
     use super::*;
 
     // ── LEFT JOIN deterministic ───────────────────────────────────────────────
-    // Note: right-side values use [1, 100] to avoid 0 (NULL sentinel).
+    // Right-side values include zero to distinguish it from NULL.
 
     #[test]
     fn oracle_left_join_unmatched() {
-        // Left row with no right → NULL pad (rv=0).
+        // Left row with no right → NULL pad.
         assert_oracle_left_join(&[(vec![(1, 10, 1)], vec![])]);
+    }
+
+    #[test]
+    fn oracle_left_join_keeps_null_distinct_from_zero() {
+        assert_oracle_left_join(&[(vec![(1, 10, 1), (2, 20, 1)], vec![(1, 0, 1)])]);
     }
 
     #[test]
@@ -625,7 +623,7 @@ mod tests {
             /// Oracle property test: incremental == batch for ≥100k random
             /// delta sequences for LEFT JOIN.
             ///
-            /// Right-side values use range [1, 10) to avoid the 0 NULL sentinel.
+            /// Right-side values include zero, which must differ from NULL.
             #[test]
             #[allow(clippy::items_after_test_module)]
             fn oracle_left_join_100k(
@@ -638,8 +636,7 @@ mod tests {
                 ),
                 right_raw in prop::collection::vec(
                     prop::collection::vec(
-                        // Right values start at 1 to avoid 0 (NULL sentinel).
-                        ((0i64..4i64, 1i64..10i64), prop::bool::ANY),
+                        ((0i64..4i64, 0i64..10i64), prop::bool::ANY),
                         0..8usize,
                     ),
                     1..5usize,

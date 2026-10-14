@@ -1,11 +1,12 @@
 //! Randomized SQL query fuzzer and incremental engine validator (v0.14).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array};
+use arrow::array::{new_empty_array, ArrayRef, Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
 
 use rockstream_ops::aggregate::AggregateOp;
@@ -17,7 +18,7 @@ use rockstream_ops::outer_join::OuterJoinOp;
 use rockstream_ops::project::{NamedExpr, ProjectOp};
 use rockstream_ops::window::WindowOp;
 use rockstream_ops::zset::ArrowZSet;
-use rockstream_plan::{AggregateFunc, Expr, PlanNode};
+use rockstream_plan::{AggregateFunc, Expr, PlanNode, WindowFunc};
 use rockstream_sql::SqlFrontend;
 use rockstream_types::ids::OperatorId;
 
@@ -209,12 +210,11 @@ pub fn apply_delta_physically(current: &ArrowZSet, delta: &ArrowZSet) -> ArrowZS
     if delta.is_empty() {
         return current.clone();
     }
-    let mut active_rows = Vec::new();
-    for i in 0..current.num_rows() {
-        active_rows.push(get_row_as_vec(&current.data, i));
-    }
+    let mut active_rows: Vec<Vec<ScalarValue>> = (0..current.num_rows())
+        .map(|i| get_row_as_scalars(&current.data, i))
+        .collect();
     for i in 0..delta.num_rows() {
-        let row_val = get_row_as_vec(&delta.data, i);
+        let row_val = get_row_as_scalars(&delta.data, i);
         let w = delta.weights[i];
         if w > 0 {
             for _ in 0..w {
@@ -231,33 +231,25 @@ pub fn apply_delta_physically(current: &ArrowZSet, delta: &ArrowZSet) -> ArrowZS
     rebuild_zset(current.schema(), &active_rows)
 }
 
-fn get_row_as_vec(batch: &RecordBatch, row_idx: usize) -> Vec<i64> {
-    let mut row = Vec::new();
-    for col_idx in 0..batch.num_columns() {
-        let col = batch
-            .column(col_idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        row.push(col.value(row_idx));
-    }
-    row
+fn get_row_as_scalars(batch: &RecordBatch, row_idx: usize) -> Vec<ScalarValue> {
+    batch
+        .columns()
+        .iter()
+        .map(|column| ScalarValue::try_from_array(column, row_idx).unwrap())
+        .collect()
 }
 
-fn rebuild_zset(schema: SchemaRef, active_rows: &[Vec<i64>]) -> ArrowZSet {
-    if active_rows.is_empty() {
-        return ArrowZSet::empty(schema);
-    }
+fn rebuild_zset(schema: SchemaRef, active_rows: &[Vec<ScalarValue>]) -> ArrowZSet {
     let num_cols = schema.fields().len();
-    let mut columns: Vec<Vec<i64>> = vec![Vec::new(); num_cols];
-    for row in active_rows {
-        for col_idx in 0..num_cols {
-            columns[col_idx].push(row[col_idx]);
-        }
-    }
-    let arrow_cols: Vec<ArrayRef> = columns
-        .into_iter()
-        .map(|col| Arc::new(Int64Array::from(col)) as ArrayRef)
+    let arrow_cols: Vec<ArrayRef> = (0..num_cols)
+        .map(|col_idx| {
+            if active_rows.is_empty() {
+                new_empty_array(schema.field(col_idx).data_type())
+            } else {
+                ScalarValue::iter_to_array(active_rows.iter().map(|row| row[col_idx].clone()))
+                    .unwrap()
+            }
+        })
         .collect();
     let data = RecordBatch::try_new(schema, arrow_cols).unwrap();
     let weights = vec![1; active_rows.len()];
@@ -384,9 +376,8 @@ pub fn generate_random_query(seed: u64) -> String {
             // HAVING + scalar subquery: GROUP BY with a HAVING threshold that is
             // computed from a scalar subquery over t2.  This exercises the planner
             // path where a HAVING predicate references an aggregate from a different
-            // relation — the "nested aggregation" planner path.  If the planner does
-            // not yet support scalar subqueries in HAVING, sql_to_plan_node returns
-            // Err and run_fuzz_case silently skips the case (correct behaviour).
+            // relation — the "nested aggregation" planner path. These exact
+            // forms are allowlisted only with their contractual RS-1013 error.
             let agg_fn = match rng.next_range(0, 1) {
                 0 => "COUNT(id)",
                 _ => "SUM(val)",
@@ -488,13 +479,23 @@ impl ExecNode {
                 key_lookup,
             } => {
                 let in_val = input.evaluate(inputs, epoch_id);
+                let aggregate_nullable = matches!(
+                    func,
+                    AggregateFunc::Sum
+                        | AggregateFunc::Avg
+                        | AggregateFunc::Min
+                        | AggregateFunc::Max
+                );
                 if in_val.is_empty() {
-                    let schema = Arc::new(Schema::new(vec![
-                        Field::new("k", DataType::Int64, false),
-                        Field::new("sum_v", DataType::Int64, false),
-                        Field::new("count", DataType::Int64, false),
-                        Field::new("avg_v", DataType::Int64, false),
-                    ]));
+                    let fields: Vec<Field> = (0..group_by.len())
+                        .map(|i| Field::new(format!("k{i}"), DataType::Int64, false))
+                        .chain(std::iter::once(Field::new(
+                            "agg",
+                            DataType::Int64,
+                            aggregate_nullable,
+                        )))
+                        .collect();
+                    let schema = Arc::new(Schema::new(fields));
                     return ArrowZSet::empty(schema);
                 }
 
@@ -588,16 +589,24 @@ impl ExecNode {
 
                 if raw_out.is_empty() {
                     let logical_schema = if group_by.is_empty() {
-                        Arc::new(Schema::new(vec![Field::new("agg", DataType::Int64, false)]))
+                        Arc::new(Schema::new(vec![Field::new(
+                            "agg",
+                            DataType::Int64,
+                            aggregate_nullable,
+                        )]))
                     } else if group_by.len() == 1 {
                         Arc::new(Schema::new(vec![
                             Field::new("k", DataType::Int64, false),
-                            Field::new("agg", DataType::Int64, false),
+                            Field::new("agg", DataType::Int64, aggregate_nullable),
                         ]))
                     } else {
                         let fields: Vec<Field> = (0..group_by.len())
                             .map(|j| Field::new(format!("k{j}"), DataType::Int64, false))
-                            .chain(std::iter::once(Field::new("agg", DataType::Int64, false)))
+                            .chain(std::iter::once(Field::new(
+                                "agg",
+                                DataType::Int64,
+                                aggregate_nullable,
+                            )))
                             .collect();
                         Arc::new(Schema::new(fields))
                     };
@@ -630,11 +639,8 @@ impl ExecNode {
                             (0..raw_out.num_rows()).map(|i| sum_arr.value(i)).collect()
                         }
                         AggregateFunc::Avg => {
-                            // v0.51.6 Slice 4: `avg_v` is genuinely `Float64`
-                            // now; this fuzzer compares every aggregate as
-                            // `Int64` (the DataFusion oracle side is also
-                            // `CAST`-truncated to `Int64` in `run_df_batch`),
-                            // so truncate here to keep both sides consistent.
+                            // This corpus uses `CAST(AVG(...) AS BIGINT)`, so
+                            // match that SQL result type at the incremental boundary.
                             (0..raw_out.num_rows())
                                 .map(|i| avg_arr.value(i) as i64)
                                 .collect()
@@ -643,8 +649,11 @@ impl ExecNode {
                     };
 
                     if group_by.is_empty() {
-                        let logical_schema =
-                            Arc::new(Schema::new(vec![Field::new("agg", DataType::Int64, false)]));
+                        let logical_schema = Arc::new(Schema::new(vec![Field::new(
+                            "agg",
+                            DataType::Int64,
+                            aggregate_nullable,
+                        )]));
                         let data = RecordBatch::try_new(
                             logical_schema,
                             vec![Arc::new(Int64Array::from(agg_vals)) as ArrayRef],
@@ -654,7 +663,7 @@ impl ExecNode {
                     } else if group_by.len() == 1 {
                         let logical_schema = Arc::new(Schema::new(vec![
                             Field::new("k", DataType::Int64, false),
-                            Field::new("agg", DataType::Int64, false),
+                            Field::new("agg", DataType::Int64, aggregate_nullable),
                         ]));
                         let data = RecordBatch::try_new(
                             logical_schema,
@@ -681,7 +690,11 @@ impl ExecNode {
                         }
                         let fields: Vec<Field> = (0..group_by.len())
                             .map(|j| Field::new(format!("k{j}"), DataType::Int64, false))
-                            .chain(std::iter::once(Field::new("agg", DataType::Int64, false)))
+                            .chain(std::iter::once(Field::new(
+                                "agg",
+                                DataType::Int64,
+                                aggregate_nullable,
+                            )))
                             .collect();
                         let logical_schema = Arc::new(Schema::new(fields));
                         let mut arrow_cols: Vec<ArrayRef> = orig_key_cols
@@ -888,9 +901,18 @@ pub fn build_exec_node(plan: &PlanNode, next_id: &mut u64) -> ExecNode {
             window_exprs,
         } => {
             let in_node = build_exec_node(input, next_id);
-            let num_cols = get_column_count(input) + window_exprs.len();
-            let fields: Vec<Field> = (0..num_cols)
+            let fields: Vec<Field> = (0..get_column_count(input))
                 .map(|i| Field::new(format!("col_{i}"), DataType::Int64, false))
+                .chain(window_exprs.iter().enumerate().map(|(i, expr)| {
+                    let (data_type, nullable) = match &expr.func {
+                        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+                            (DataType::UInt64, false)
+                        }
+                        WindowFunc::Lag { .. } | WindowFunc::Lead { .. } => (DataType::Int64, true),
+                        _ => (DataType::Int64, false),
+                    };
+                    Field::new(format!("window_{i}"), data_type, nullable)
+                }))
                 .collect();
             let schema = Arc::new(Schema::new(fields));
             let op = WindowOp::new(schema, window_exprs.clone());
@@ -903,149 +925,294 @@ pub fn build_exec_node(plan: &PlanNode, next_id: &mut u64) -> ExecNode {
     }
 }
 
-async fn run_df_batch(ctx: &SessionContext, query: &str) -> BTreeMap<Vec<i64>, i64> {
-    let df = ctx.sql(query).await.unwrap();
-    let batches = df.collect().await.unwrap();
-    let mut results = BTreeMap::new();
-    for batch in batches {
-        let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
-        let mut col_arrays = Vec::new();
-        for j in 0..num_cols {
-            let col = batch.column(j);
-            let casted_col = if col.data_type() != &DataType::Int64 {
-                arrow::compute::cast(col, &DataType::Int64).unwrap()
-            } else {
-                col.clone()
-            };
-            let int_col = casted_col
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .clone();
-            col_arrays.push(int_col);
-        }
-        for i in 0..num_rows {
-            let mut row = Vec::new();
-            for col_array in &col_arrays {
-                row.push(col_array.value(i));
-            }
-            *results.entry(row).or_insert(0) += 1;
-        }
-    }
-    results
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OracleField {
+    data_type: DataType,
+    nullable: bool,
 }
 
-// ─── Core Fuzz Assertion ─────────────────────────────────────────────────────
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypedResult {
+    fields: Vec<OracleField>,
+    rows: HashMap<Vec<ScalarValue>, i64>,
+}
 
-/// Accumulate Z-set output rows into `acc` (row → net weight), pruning zeros.
-fn accumulate_output(out: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
-    if out.is_empty() {
-        return;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowWeightMismatch {
+    row: Vec<ScalarValue>,
+    expected_weight: i64,
+    actual_weight: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OracleMismatch {
+    Schema {
+        expected: Vec<OracleField>,
+        actual: Vec<OracleField>,
+    },
+    Rows(Vec<RowWeightMismatch>),
+}
+
+fn empty_result(schema: &Schema) -> TypedResult {
+    TypedResult {
+        // The planner IR carries positional columns but drops projection aliases.
+        fields: schema
+            .fields()
+            .iter()
+            .map(|field| OracleField {
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+            })
+            .collect(),
+        rows: HashMap::new(),
     }
-    let num_cols = out.data.num_columns();
-    let col_arrays: Vec<_> = (0..num_cols)
-        .map(|j| {
-            out.data
-                .column(j)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
+}
+
+fn add_batch_rows(result: &mut TypedResult, batch: &RecordBatch, weights: &[i64]) {
+    for row_idx in 0..batch.num_rows() {
+        let row: Vec<ScalarValue> = batch
+            .columns()
+            .iter()
+            .map(|column| ScalarValue::try_from_array(column, row_idx).unwrap())
+            .collect();
+        let weight = weights[row_idx];
+        let net = result.rows.entry(row.clone()).or_insert(0);
+        *net += weight;
+        if *net == 0 {
+            result.rows.remove(&row);
+        }
+    }
+}
+
+fn accumulate_output(out: &ArrowZSet, acc: &mut TypedResult) {
+    add_batch_rows(acc, &out.data, &out.weights);
+}
+
+fn compare_results(expected: &TypedResult, actual: &TypedResult) -> Result<(), OracleMismatch> {
+    if expected.fields != actual.fields {
+        return Err(OracleMismatch::Schema {
+            expected: expected.fields.clone(),
+            actual: actual.fields.clone(),
+        });
+    }
+
+    let rows: std::collections::HashSet<_> = expected
+        .rows
+        .keys()
+        .chain(actual.rows.keys())
+        .cloned()
+        .collect();
+    let mut differences: Vec<_> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let expected_weight = expected.rows.get(&row).copied().unwrap_or(0);
+            let actual_weight = actual.rows.get(&row).copied().unwrap_or(0);
+            (expected_weight != actual_weight).then_some(RowWeightMismatch {
+                row,
+                expected_weight,
+                actual_weight,
+            })
         })
         .collect();
-    for i in 0..out.num_rows() {
-        let row: Vec<i64> = col_arrays.iter().map(|c| c.value(i)).collect();
-        *acc.entry(row).or_insert(0) += out.weights[i];
+    differences.sort_by_key(|difference| format!("{:?}", difference.row));
+    if differences.is_empty() {
+        Ok(())
+    } else {
+        Err(OracleMismatch::Rows(differences))
     }
-    acc.retain(|_, &mut w| w != 0);
+}
+
+async fn run_df_batch(ctx: &SessionContext, query: &str) -> Result<TypedResult, String> {
+    let df = ctx
+        .sql(query)
+        .await
+        .map_err(|error| format!("{error}; full_error={error:?}"))?;
+    let mut result = empty_result(df.schema().as_arrow());
+    let batches = df
+        .collect()
+        .await
+        .map_err(|error| format!("{error}; full_error={error:?}"))?;
+    for batch in batches {
+        let batch_result = empty_result(batch.schema().as_ref());
+        if batch_result.fields != result.fields {
+            return Err(format!(
+                "DataFusion batch schema changed: planned={:?} batch={:?}",
+                result.fields, batch_result.fields
+            ));
+        }
+        add_batch_rows(&mut result, &batch, &vec![1; batch.num_rows()]);
+    }
+    Ok(result)
 }
 
 /// Build a DataFusion `SessionContext` loaded with all tables from `dataset`.
 async fn make_df_ctx_and_run(
     dataset: &HashMap<String, ArrowZSet>,
     query: &str,
-) -> BTreeMap<Vec<i64>, i64> {
+) -> Result<TypedResult, String> {
     let ctx = SessionContext::new();
     for (name, zset) in dataset {
         let mem_table = datafusion::datasource::memory::MemTable::try_new(
             zset.schema(),
             vec![vec![zset.data.clone()]],
         )
-        .unwrap();
-        ctx.register_table(name, Arc::new(mem_table)).unwrap();
+        .map_err(|error| format!("register table {name}: {error}; full_error={error:?}"))?;
+        ctx.register_table(name, Arc::new(mem_table))
+            .map_err(|error| format!("register table {name}: {error}; full_error={error:?}"))?;
     }
     run_df_batch(&ctx, query).await
 }
 
-pub async fn run_fuzz_case(seed: u64) {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OracleCaseOutcome {
+    Compared { epochs: Vec<&'static str> },
+    ExpectedUnsupported { error: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleCaseReport {
+    pub seed: u64,
+    pub sql: String,
+    pub outcome: OracleCaseOutcome,
+    pub operation_history: Vec<String>,
+}
+
+const EXPECTED_UNSUPPORTED_SCALAR_HAVING_ERROR: &str =
+    "[RS-1013] Unsupported plan node in incremental lowering: join_filter_non_eq";
+const SCALAR_HAVING_QUERIES: [&str; 4] = [
+    "SELECT category, COUNT(id) FROM t1 GROUP BY category HAVING COUNT(id) > (SELECT CAST(AVG(val) AS BIGINT) FROM t2)",
+    "SELECT category, COUNT(id) FROM t1 GROUP BY category HAVING COUNT(id) > (SELECT COUNT(id) FROM t2)",
+    "SELECT category, SUM(val) FROM t1 GROUP BY category HAVING SUM(val) > (SELECT CAST(AVG(val) AS BIGINT) FROM t2)",
+    "SELECT category, SUM(val) FROM t1 GROUP BY category HAVING SUM(val) > (SELECT COUNT(id) FROM t2)",
+];
+
+fn expected_unsupported_error(query: &str) -> Option<&'static str> {
+    SCALAR_HAVING_QUERIES
+        .contains(&query)
+        .then_some(EXPECTED_UNSUPPORTED_SCALAR_HAVING_ERROR)
+}
+
+fn compile_failure_message(query: &str, seed: u64, error: &rockstream_sql::SqlError) -> String {
+    format!(
+        "SQL oracle failure: sql={query:?} seed={seed} phase=compile contractual_error={error} full_error={error:?}"
+    )
+}
+
+pub async fn run_fuzz_case(seed: u64) -> OracleCaseReport {
     let query = generate_random_query(seed);
-    run_fuzz_case_for_query(&query, seed).await;
+    run_fuzz_case_for_query(&query, seed).await
 }
 
 /// Run the full 3-epoch fuzz oracle for an arbitrary SQL query string.
 /// Used by both `run_fuzz_case` and the dedicated scalar-subquery test.
-pub async fn run_fuzz_case_for_query(query: &str, seed: u64) {
+pub async fn run_fuzz_case_for_query(query: &str, seed: u64) -> OracleCaseReport {
+    let initial_dataset = generate_synthetic_dataset(seed);
+    let delta = generate_synthetic_deltas(&initial_dataset, seed + 1);
+    let delta_2 = negate_insertions(&delta);
+    run_case_with_deltas(
+        query,
+        seed,
+        initial_dataset,
+        vec![("mixed_delta", delta), ("cross_epoch_retraction", delta_2)],
+        vec![
+            format!("snapshot(seed={seed})"),
+            format!("mixed_delta(seed={})", seed + 1),
+            format!("retract_insertions(seed={})", seed + 1),
+        ],
+    )
+    .await
+}
+
+async fn run_case_with_deltas(
+    query: &str,
+    seed: u64,
+    initial_dataset: HashMap<String, ArrowZSet>,
+    deltas: Vec<(&'static str, HashMap<String, ArrowZSet>)>,
+    history: Vec<String>,
+) -> OracleCaseReport {
     let frontend = SqlFrontend::new();
-    frontend.register_table("t1", t1_schema()).unwrap();
-    frontend.register_table("t2", t2_schema()).unwrap();
+    for (name, zset) in &initial_dataset {
+        frontend
+            .register_table(name, zset.schema())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "SQL oracle failure: sql={query:?} seed={seed} phase=register_table({name}) contractual_error={error} full_error={error:?}"
+                )
+            });
+    }
 
     let plan_node = match frontend.sql_to_plan_node(query).await {
         Ok(p) => p,
-        Err(_) => {
-            // If the query failed compilation, skip
-            return;
+        Err(error) => {
+            if let Some(expected) = expected_unsupported_error(query) {
+                if error.to_string() == expected {
+                    return OracleCaseReport {
+                        seed,
+                        sql: query.to_string(),
+                        outcome: OracleCaseOutcome::ExpectedUnsupported {
+                            error: expected.to_string(),
+                        },
+                        operation_history: Vec::new(),
+                    };
+                }
+            }
+            panic!("{}", compile_failure_message(query, seed, &error));
         }
     };
 
     let mut next_id = 0;
     let exec_tree = build_exec_node(&plan_node, &mut next_id);
+    let mut accumulated: Option<TypedResult> = None;
+    let mut current_dataset = initial_dataset.clone();
+    let mut compared_epochs = Vec::new();
+    let epochs = std::iter::once(("snapshot", initial_dataset)).chain(deltas.into_iter());
 
-    // ── Epoch 0: initial snapshot ──────────────────────────────────────────
-    let initial_dataset = generate_synthetic_dataset(seed);
-    let mut inc_acc: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+    for (epoch_id, (phase, inputs)) in epochs.enumerate() {
+        if epoch_id > 0 {
+            for (name, delta) in &inputs {
+                if let Some(current) = current_dataset.get(name) {
+                    current_dataset.insert(name.clone(), apply_delta_physically(current, delta));
+                }
+            }
+        }
 
-    let out_0 = exec_tree.evaluate(&initial_dataset, 1);
-    accumulate_output(&out_0, &mut inc_acc);
+        let out = exec_tree.evaluate(&inputs, epoch_id as u64 + 1);
+        let phase_result = empty_result(out.data.schema().as_ref());
+        let acc = accumulated.get_or_insert(phase_result.clone());
+        if acc.fields != phase_result.fields {
+            panic!(
+                "SQL oracle mismatch: sql={query:?} seed={seed} phase={phase} mismatch={:?}; history={history:?}",
+                OracleMismatch::Schema {
+                    expected: acc.fields.clone(),
+                    actual: phase_result.fields,
+                }
+            );
+        }
+        accumulate_output(&out, acc);
 
-    let df_0 = make_df_ctx_and_run(&initial_dataset, query).await;
-    assert_eq!(inc_acc, df_0, "Fuzz Epoch 0 mismatch for query: {}", query);
-
-    // ── Epoch 1: apply mixed delta (retractions + insertions) ─────────────
-    let delta = generate_synthetic_deltas(&initial_dataset, seed + 1);
-
-    let mut dataset_after_1 = initial_dataset.clone();
-    for (name, d) in &delta {
-        let current = dataset_after_1.get(name).unwrap();
-        dataset_after_1.insert(name.clone(), apply_delta_physically(current, d));
+        let batch = make_df_ctx_and_run(&current_dataset, query)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "SQL oracle failure: sql={query:?} seed={seed} phase={phase} reference_error={error}; history={history:?}"
+                )
+            });
+        if let Err(mismatch) = compare_results(&batch, acc) {
+            panic!(
+                "SQL oracle mismatch: sql={query:?} seed={seed} phase={phase} mismatch={mismatch:?}; history={history:?}"
+            );
+        }
+        compared_epochs.push(phase);
     }
 
-    let out_1 = exec_tree.evaluate(&delta, 2);
-    accumulate_output(&out_1, &mut inc_acc);
-
-    let df_1 = make_df_ctx_and_run(&dataset_after_1, query).await;
-    assert_eq!(inc_acc, df_1, "Fuzz Epoch 1 mismatch for query: {}", query);
-
-    // ── Epoch 2: retract the rows that were inserted in epoch 1 ───────────
-    // This is the hardest case for the accumulator: it must correctly "undo"
-    // state changes from two epochs ago, where the to-be-retracted rows were
-    // not present in the original epoch-0 dataset.
-    let delta_2 = negate_insertions(&delta);
-
-    let mut dataset_after_2 = dataset_after_1.clone();
-    for (name, d2) in &delta_2 {
-        let current = dataset_after_2.get(name).unwrap();
-        dataset_after_2.insert(name.clone(), apply_delta_physically(current, d2));
+    OracleCaseReport {
+        seed,
+        sql: query.to_string(),
+        outcome: OracleCaseOutcome::Compared {
+            epochs: compared_epochs,
+        },
+        operation_history: history,
     }
-
-    let out_2 = exec_tree.evaluate(&delta_2, 3);
-    accumulate_output(&out_2, &mut inc_acc);
-
-    let df_2 = make_df_ctx_and_run(&dataset_after_2, query).await;
-    assert_eq!(
-        inc_acc, df_2,
-        "Fuzz Epoch 2 (cross-epoch retraction) mismatch for query: {}",
-        query
-    );
 }
 
 // ─── Soak / Unit Tests ───────────────────────────────────────────────────────
@@ -1053,25 +1220,53 @@ pub async fn run_fuzz_case_for_query(query: &str, seed: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Decimal128Array;
     use std::time::{Duration, Instant};
 
     #[tokio::test]
     async fn test_fuzz_simple_cases() {
-        // Seeds 0-299 cover all 15 query types (0-14) with ≥20 expected samples
-        // each. Type 11 = Semi-join, 12 = Anti-join (NOT IN), 13 = multi-key
-        // GROUP BY, 14 = HAVING + scalar subquery (skipped if planner does not
-        // support it yet).  Each seed exercises 3 epochs (initial, delta,
-        // cross-epoch retraction), so 300 seeds give 900 epoch-level oracle
-        // checks.
+        // Seeds 0-299 cover the fixed query corpus; the report records every
+        // supported SQL/epoch comparison and each exact allowlisted rejection.
         //
         // Seed 1116 is a regression test for the AggregateOp consolidation bug:
         // concurrent retraction from both join sides (t1.id=49 AND t2.id=49)
         // caused the DBSP bilinear triple (−1, −1, +1) to hit count=0 transiently,
         // corrupting the per-group sum.
+        let mut reports = Vec::new();
         for seed in 0..300 {
-            run_fuzz_case(seed).await;
+            reports.push(run_fuzz_case(seed).await);
         }
-        run_fuzz_case(1116).await;
+        reports.push(run_fuzz_case(1116).await);
+        assert_eq!(
+            reports.iter().map(|report| report.seed).collect::<Vec<_>>(),
+            (0..300).chain([1116]).collect::<Vec<_>>()
+        );
+        for report in &reports {
+            assert_eq!(report.sql, generate_random_query(report.seed));
+            match &report.outcome {
+                OracleCaseOutcome::Compared { epochs } => assert_eq!(
+                    epochs,
+                    &["snapshot", "mixed_delta", "cross_epoch_retraction"]
+                ),
+                OracleCaseOutcome::ExpectedUnsupported { error } => assert_eq!(
+                    Some(error.as_str()),
+                    expected_unsupported_error(&report.sql)
+                ),
+            }
+            if matches!(&report.outcome, OracleCaseOutcome::Compared { .. }) {
+                assert_eq!(
+                    report.operation_history,
+                    [
+                        format!("snapshot(seed={})", report.seed),
+                        format!("mixed_delta(seed={})", report.seed + 1),
+                        format!("retract_insertions(seed={})", report.seed + 1),
+                    ]
+                );
+            } else {
+                assert!(report.operation_history.is_empty());
+            }
+            println!("SQL_ORACLE_CASE {report:?}");
+        }
     }
 
     /// Fuzzer soak test running up to a specified duration or iteration count.
@@ -1101,12 +1296,8 @@ mod tests {
     /// - `COUNT(id) > (SELECT CAST(AVG(val) AS BIGINT) FROM t2)` — most common path
     /// - `SUM(val)  > (SELECT COUNT(id) FROM t2)` — second form
     ///
-    /// Each variant is run through the full 3-epoch fuzz harness (initial snapshot,
-    /// mixed delta, cross-epoch retraction).  If the planner does not yet support
-    /// scalar subqueries in HAVING the compilation step returns `Err` and
-    /// `run_fuzz_case` silently skips the case — the test still passes but prints a
-    /// notice so we know coverage is absent.  When the planner does support it, the
-    /// equivalence oracle catches any mismatch immediately.
+    /// Each variant is either compared at all three epochs or must match the
+    /// bounded allowlist's exact contractual compiler error.
     #[tokio::test]
     async fn test_having_scalar_subquery_planner_coverage() {
         let queries: &[&str] = &[
@@ -1118,30 +1309,290 @@ mod tests {
              HAVING COUNT(id) > (SELECT COUNT(id) FROM t2)",
         ];
 
-        let frontend = SqlFrontend::new();
-        frontend.register_table("t1", t1_schema()).unwrap();
-        frontend.register_table("t2", t2_schema()).unwrap();
-
-        let mut any_supported = false;
         for query in queries {
-            match frontend.sql_to_plan_node(query).await {
-                Ok(_) => {
-                    any_supported = true;
-                    // Planner supports it — run full 3-epoch equivalence check.
-                    run_fuzz_case_for_query(query, 42).await;
-                }
-                Err(_) => {
-                    println!(
-                        "HAVING scalar subquery not yet supported by planner (skipped): {query}"
-                    );
+            let report = run_fuzz_case_for_query(query, 42).await;
+            match report.outcome {
+                OracleCaseOutcome::Compared { epochs } => assert_eq!(
+                    epochs,
+                    ["snapshot", "mixed_delta", "cross_epoch_retraction"]
+                ),
+                OracleCaseOutcome::ExpectedUnsupported { error } => {
+                    assert_eq!(Some(error.as_str()), expected_unsupported_error(query));
                 }
             }
         }
-        if !any_supported {
-            println!(
-                "NOTE: all HAVING-scalar-subquery variants were skipped; \
-                 planner does not support scalar subqueries in HAVING yet."
-            );
+    }
+
+    fn typed_result(fields: Vec<OracleField>, rows: Vec<(Vec<ScalarValue>, i64)>) -> TypedResult {
+        TypedResult {
+            fields,
+            rows: rows.into_iter().collect(),
         }
+    }
+
+    #[test]
+    fn typed_oracle_mutations_report_exact_mismatches() {
+        let int = OracleField {
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let nullable_int = OracleField {
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        let decimal = OracleField {
+            data_type: DataType::Decimal128(12, 2),
+            nullable: false,
+        };
+
+        let null_expected = typed_result(
+            vec![int.clone(), nullable_int.clone()],
+            vec![(
+                vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(None)],
+                1,
+            )],
+        );
+        let null_as_zero = typed_result(
+            vec![int.clone(), nullable_int],
+            vec![(
+                vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(0))],
+                1,
+            )],
+        );
+        assert_eq!(
+            compare_results(&null_expected, &null_as_zero),
+            Err(OracleMismatch::Rows(vec![
+                RowWeightMismatch {
+                    row: vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(0))],
+                    expected_weight: 0,
+                    actual_weight: 1,
+                },
+                RowWeightMismatch {
+                    row: vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(None)],
+                    expected_weight: 1,
+                    actual_weight: 0,
+                },
+            ]))
+        );
+
+        let fraction_expected = typed_result(
+            vec![decimal.clone()],
+            vec![(vec![ScalarValue::Decimal128(Some(125), 12, 2)], 1)],
+        );
+        let fraction_changed = typed_result(
+            vec![decimal.clone()],
+            vec![(vec![ScalarValue::Decimal128(Some(126), 12, 2)], 1)],
+        );
+        assert_eq!(
+            compare_results(&fraction_expected, &fraction_changed),
+            Err(OracleMismatch::Rows(vec![
+                RowWeightMismatch {
+                    row: vec![ScalarValue::Decimal128(Some(125), 12, 2)],
+                    expected_weight: 1,
+                    actual_weight: 0,
+                },
+                RowWeightMismatch {
+                    row: vec![ScalarValue::Decimal128(Some(126), 12, 2)],
+                    expected_weight: 0,
+                    actual_weight: 1,
+                },
+            ]))
+        );
+
+        let wrong_type = typed_result(
+            vec![OracleField {
+                data_type: DataType::Float64,
+                nullable: false,
+            }],
+            vec![(vec![ScalarValue::Float64(Some(1.25))], 1)],
+        );
+        assert_eq!(
+            compare_results(&fraction_expected, &wrong_type),
+            Err(OracleMismatch::Schema {
+                expected: vec![decimal],
+                actual: vec![OracleField {
+                    data_type: DataType::Float64,
+                    nullable: false,
+                }],
+            })
+        );
+
+        let duplicate_expected = typed_result(
+            vec![int.clone()],
+            vec![(vec![ScalarValue::Int64(Some(7))], 2)],
+        );
+        let duplicate_dropped = typed_result(
+            vec![int.clone()],
+            vec![(vec![ScalarValue::Int64(Some(7))], 1)],
+        );
+        assert_eq!(
+            compare_results(&duplicate_expected, &duplicate_dropped),
+            Err(OracleMismatch::Rows(vec![RowWeightMismatch {
+                row: vec![ScalarValue::Int64(Some(7))],
+                expected_weight: 2,
+                actual_weight: 1,
+            }]))
+        );
+
+        let same_count_sum = typed_result(
+            vec![int.clone()],
+            vec![
+                (vec![ScalarValue::Int64(Some(10))], 1),
+                (vec![ScalarValue::Int64(Some(30))], 1),
+            ],
+        );
+        let values_changed = typed_result(vec![int], vec![(vec![ScalarValue::Int64(Some(20))], 2)]);
+        assert_eq!(
+            compare_results(&same_count_sum, &values_changed),
+            Err(OracleMismatch::Rows(vec![
+                RowWeightMismatch {
+                    row: vec![ScalarValue::Int64(Some(10))],
+                    expected_weight: 1,
+                    actual_weight: 0,
+                },
+                RowWeightMismatch {
+                    row: vec![ScalarValue::Int64(Some(20))],
+                    expected_weight: 0,
+                    actual_weight: 2,
+                },
+                RowWeightMismatch {
+                    row: vec![ScalarValue::Int64(Some(30))],
+                    expected_weight: 1,
+                    actual_weight: 0,
+                },
+            ]))
+        );
+    }
+
+    #[test]
+    fn compile_failure_has_sql_seed_phase_and_full_error() {
+        let error = rockstream_sql::SqlError::UnsupportedPlanNode {
+            node_type: "TestNode".to_string(),
+        };
+        assert_eq!(
+            compile_failure_message("SELECT 1", 7, &error),
+            "SQL oracle failure: sql=\"SELECT 1\" seed=7 phase=compile contractual_error=[RS-1013] Unsupported plan node in incremental lowering: TestNode full_error=UnsupportedPlanNode { node_type: \"TestNode\" }"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_outer_join_and_decimal_cases_run_through_sql_planner() {
+        let initial = HashMap::from([
+            (
+                "t1".to_string(),
+                make_zset(t1_schema(), vec![vec![1, 2], vec![10, 20], vec![1, 1]], 1),
+            ),
+            (
+                "t2".to_string(),
+                make_zset(t2_schema(), vec![vec![1], vec![0], vec![1]], 1),
+            ),
+        ]);
+        let empty_left = ArrowZSet::empty(t1_schema());
+        let empty_right = ArrowZSet::empty(t2_schema());
+        let insert_match = HashMap::from([
+            ("t1".to_string(), empty_left.clone()),
+            (
+                "t2".to_string(),
+                make_zset(t2_schema(), vec![vec![2], vec![7], vec![1]], 1),
+            ),
+        ]);
+        let retract_zero_match = HashMap::from([
+            ("t1".to_string(), empty_left),
+            (
+                "t2".to_string(),
+                make_zset(t2_schema(), vec![vec![1], vec![0], vec![1]], -1),
+            ),
+        ]);
+        let report = run_case_with_deltas(
+            "SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id",
+            501,
+            initial,
+            vec![
+                ("insert_match", insert_match),
+                ("retract_zero_match", retract_zero_match),
+            ],
+            vec![
+                "snapshot: t1 ids 1,2; t2 id 1 value 0".to_string(),
+                "insert t2 id 2 value 7".to_string(),
+                "retract t2 id 1 value 0".to_string(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            report.outcome,
+            OracleCaseOutcome::Compared {
+                epochs: vec!["snapshot", "insert_match", "retract_zero_match"],
+            }
+        );
+
+        let decimal_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Decimal128(12, 2), false),
+            Field::new("category", DataType::Int64, false),
+        ]));
+        let decimal_rows = |rows: &[(i64, i128, i64, i64)]| {
+            let values = Decimal128Array::from(
+                rows.iter()
+                    .map(|(_, value, _, _)| *value)
+                    .collect::<Vec<_>>(),
+            )
+            .with_precision_and_scale(12, 2)
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                decimal_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(values) as ArrayRef,
+                    Arc::new(Int64Array::from(
+                        rows.iter()
+                            .map(|(_, _, category, _)| *category)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            ArrowZSet::new(
+                batch,
+                rows.iter().map(|(_, _, _, weight)| *weight).collect(),
+            )
+        };
+        let decimal_initial = HashMap::from([
+            (
+                "t1".to_string(),
+                decimal_rows(&[(1, 125, 1, 1), (2, 875, 2, 1)]),
+            ),
+            ("t2".to_string(), empty_right.clone()),
+        ]);
+        let decimal_insert = HashMap::from([
+            ("t1".to_string(), decimal_rows(&[(3, 12345, 3, 1)])),
+            ("t2".to_string(), empty_right.clone()),
+        ]);
+        let decimal_retract = HashMap::from([
+            ("t1".to_string(), decimal_rows(&[(3, 12345, 3, -1)])),
+            ("t2".to_string(), empty_right),
+        ]);
+        let report = run_case_with_deltas(
+            "SELECT val FROM t1",
+            502,
+            decimal_initial,
+            vec![
+                ("decimal_insert", decimal_insert),
+                ("decimal_retract", decimal_retract),
+            ],
+            vec![
+                "snapshot: t1 values 1.25, 8.75".to_string(),
+                "insert t1 value 123.45".to_string(),
+                "retract t1 value 123.45".to_string(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            report.outcome,
+            OracleCaseOutcome::Compared {
+                epochs: vec!["snapshot", "decimal_insert", "decimal_retract"],
+            }
+        );
     }
 }
