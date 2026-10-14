@@ -51,7 +51,10 @@ fn test_sim_runtime_recovery_under_storage_and_network_faults() {
     // Treat the phase-only transition as incomplete rather than claiming a
     // successful recovery without recovered state.
     assert_eq!(driver.phase(), RecoveryPhase::Ready);
-    assert!(!driver.is_ready(), "phase-only recovery must not be reported ready");
+    assert!(
+        !driver.is_ready(),
+        "phase-only recovery must not be reported ready"
+    );
 
     // 3. Atomicity under simulated abrupt failure during manifest generation
     let files = vec![BackupFileEntry {
