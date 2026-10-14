@@ -701,6 +701,71 @@ mod tests {
     }
 
     #[test]
+    fn sqlalchemy_style_column_reflection_reads_registered_view() {
+        use crate::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView};
+
+        let catalog = CatalogStubs::new();
+        catalog.add_view(CatalogView {
+            name: "numeric_view".into(),
+            sql: "SELECT 1 AS c_int2".into(),
+            columns: vec![CatalogColumn {
+                name: "c_int2".into(),
+                data_type: "Int16".into(),
+            }],
+            namespace: "public".into(),
+            op_id: None,
+        });
+
+        // Real PostgreSQL reflection shape: pg_class, outer-joined attributes,
+        // empty identity/default catalogs, relation-kind ANY and schema scope.
+        let query = r#"
+            SELECT pg_catalog.pg_attribute.attname AS name,
+                   pg_catalog.format_type(pg_catalog.pg_attribute.atttypid,
+                                          pg_catalog.pg_attribute.atttypmod) AS format_type,
+                   (SELECT pg_catalog.pg_get_expr(pg_catalog.pg_attrdef.adbin,
+                                                   pg_catalog.pg_attrdef.adrelid)
+                      FROM pg_catalog.pg_attrdef
+                     WHERE pg_catalog.pg_attrdef.adrelid = pg_catalog.pg_attribute.attrelid
+                       AND pg_catalog.pg_attrdef.adnum = pg_catalog.pg_attribute.attnum
+                       AND pg_catalog.pg_attribute.atthasdef) AS "default",
+                   pg_catalog.pg_attribute.attnotnull AS not_null,
+                   pg_catalog.pg_class.relname AS table_name,
+                   pg_catalog.pg_description.description AS comment,
+                   pg_catalog.pg_attribute.attgenerated AS generated,
+                   (SELECT pg_catalog.pg_sequence.seqstart
+                      FROM pg_catalog.pg_sequence
+                     WHERE pg_catalog.pg_attribute.attidentity != '') AS identity_options
+              FROM pg_catalog.pg_class
+              LEFT OUTER JOIN pg_catalog.pg_attribute
+                ON pg_catalog.pg_class.oid = pg_catalog.pg_attribute.attrelid
+               AND pg_catalog.pg_attribute.attnum > 0
+               AND NOT pg_catalog.pg_attribute.attisdropped
+              LEFT OUTER JOIN pg_catalog.pg_description
+                ON pg_catalog.pg_description.objoid = pg_catalog.pg_attribute.attrelid
+               AND pg_catalog.pg_description.objsubid = pg_catalog.pg_attribute.attnum
+              JOIN pg_catalog.pg_namespace
+                ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace
+             WHERE pg_catalog.pg_class.relkind = ANY (ARRAY['r', 'p', 'f', 'v', 'm'])
+               AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid)
+               AND pg_catalog.pg_namespace.nspname != 'pg_catalog'
+               AND pg_catalog.pg_class.relname IN ('numeric_view')
+             ORDER BY pg_catalog.pg_class.relname, pg_catalog.pg_attribute.attnum
+        "#;
+        let Some(CatalogResponse::Rows { columns, rows }) =
+            catalog.handle_query(query, &SessionInfo::default())
+        else {
+            panic!("SQLAlchemy-style reflection must resolve to catalog rows");
+        };
+        assert_eq!(columns[0], "name");
+        assert_eq!(columns[1], "format_type");
+        assert_eq!(columns[4], "table_name");
+        assert_eq!(rows.len(), 1, "a registered view must be reflected");
+        assert_eq!(rows[0][0].as_deref(), Some("c_int2"));
+        assert_eq!(rows[0][1].as_deref(), Some("smallint"));
+        assert_eq!(rows[0][4].as_deref(), Some("numeric_view"));
+    }
+
+    #[test]
     fn catalog_any_array_rejects_unsupported_rhs() {
         use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
