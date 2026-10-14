@@ -227,6 +227,11 @@ jobs:
             --cache-from type=gha,scope=rockstream-tc-test-check \
             --cache-to type=gha,mode=max,scope=rockstream-tc-test-check \
             .
+      - name: Preserve PGWire conformance JSON proof
+        if: matrix.shard == 'gateway'
+        run: |
+          mkdir -p target
+          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
       - name: Record workspace test case execution
         if: matrix.shard == 'workspace'
         run: python3 scripts/ci-test-inventory.py run --job pr-workspace
@@ -249,11 +254,6 @@ jobs:
           name: ci-test-accounting-${{ matrix.shard }}
           path: target/ci-test-results/
           if-no-files-found: warn
-      - name: Preserve PGWire conformance JSON proof
-        if: matrix.shard == 'gateway'
-        run: |
-          mkdir -p target
-          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
       - name: Remove Docker test image
         if: always() && matrix.shard == 'gateway'
         run: docker image rm rockstream-tc-test:latest || true
