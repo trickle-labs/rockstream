@@ -62,7 +62,11 @@ fn pgjdbc_like(value: &str, pattern: &str) -> bool {
             other => expression.push_str(&regex::escape(&other.to_string())),
         }
     }
-    expression.push('
+    expression.push('$');
+    regex::Regex::new(&expression)
+        .expect("escaped PostgreSQL LIKE expression")
+        .is_match(value)
+}
 
 /// Postgres type OIDs used in RowDescription fields.
 pub const PG_OID_INT2: i32 = 21;
