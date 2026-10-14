@@ -246,7 +246,21 @@ def build_artifacts(package: dict, targets: list[dict], features: list[str], env
     print("+", " ".join(cmd), flush=True)
     process = run_cmd(cmd, ROOT, env)
     if process.returncode:
-        raise RuntimeError(f"Cargo failed for {package['name']}: {process.stderr[-2500:]}\n{process.stdout[-800:]}")
+        diagnostics = []
+        for line in process.stdout.splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if item.get("reason") == "compiler-message":
+                message = item.get("message", {})
+                if message.get("level") == "error":
+                    diagnostics.append(message.get("rendered") or message.get("message", ""))
+        raise RuntimeError(
+            f"Cargo failed for {package['name']}:\\n"
+            + "\\n".join(diagnostics[-30:])
+            + f"\\nstderr:\\n{process.stderr[-4000:]}"
+        )
     got = {}
     for line in process.stdout.splitlines():
         try:
