@@ -1,9 +1,12 @@
 #[test]
 fn ci_workspace_test_runs_explicit_feature_matrix() {
     let workflow = include_str!("../../../.github/workflows/ci.yml");
-    assert!(workflow
-        .lines()
-        .any(|line| line == "          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql"));
+    // The accounting runner supersedes the old hard-coded Cargo command.
+    // Require both live Cargo discovery and an explicit workspace execution.
+    assert!(workflow.contains("python3 scripts/ci-test-inventory.py check"));
+    assert!(workflow.contains("python3 scripts/ci-test-inventory.py run --job pr-workspace"));
+    let matrix = include_str!("../../../scripts/ci-test-matrix.json");
+    assert!(matrix.contains("\"pr-workspace\""));
     assert!(workflow.lines().any(|line| line.contains(
         "cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json"
     )));
@@ -105,9 +108,9 @@ fn ci_workspace_test_runs_explicit_feature_matrix() {
             .to_str()
             .unwrap();
         assert!(
-            workflow.contains(&format!("--features {feature}"))
-                && workflow.contains(&format!("--test {target}")),
-            "{path} must be compiled and run by the {feature} CI matrix",
+            matrix.contains(&format!("\"{target}\""))
+                || workflow.contains(&format!("--test {target}")),
+            "{path} must have an explicit CI assignment",
         );
     }
 }
