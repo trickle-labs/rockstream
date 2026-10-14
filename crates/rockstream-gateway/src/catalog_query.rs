@@ -796,6 +796,57 @@ mod tests {
     }
 
     #[test]
+    fn prisma_derived_catalog_join_returns_existing_view_columns() {
+        use crate::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView};
+
+        let catalog = CatalogStubs::new();
+        catalog.add_view(CatalogView {
+            name: "numeric_view".into(),
+            sql: "SELECT 1 AS c_int2".into(),
+            columns: vec![CatalogColumn {
+                name: "c_int2".into(),
+                data_type: "Int16".into(),
+            }],
+            namespace: "public".into(),
+            op_id: None,
+        });
+        // Mirrors Prisma's nested pg_class/pg_namespace catalog join. The
+        // array is the already-bound value of Prisma's $1 schema parameter.
+        let query = r#"
+            SELECT oid.namespace, info.table_name, info.column_name,
+                   format_type(att.atttypid, att.atttypmod) AS formatted_type,
+                   info.data_type, info.is_nullable
+            FROM information_schema.columns info
+            JOIN pg_attribute att ON att.attname = info.column_name
+            JOIN (
+                SELECT pg_class.oid, relname, pg_namespace.nspname AS namespace
+                FROM pg_class
+                JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+                    AND pg_namespace.nspname = ANY (ARRAY['public'])
+                WHERE reltype > 0
+            ) AS oid ON oid.oid = att.attrelid
+                AND relname = info.table_name
+                AND namespace = info.table_schema
+            WHERE table_schema = ANY (ARRAY['public'])
+            ORDER BY namespace, table_name, ordinal_position
+        "#;
+        let Some(CatalogResponse::Rows { columns, rows }) =
+            catalog.handle_query(query, &SessionInfo::default())
+        else {
+            panic!("Prisma derived catalog reflection must return rows");
+        };
+        assert_eq!(columns, vec![
+            "namespace", "table_name", "column_name",
+            "formatted_type", "data_type", "is_nullable"
+        ]);
+        assert_eq!(rows.len(), 1, "registered view must be discoverable");
+        assert_eq!(rows[0][0].as_deref(), Some("public"));
+        assert_eq!(rows[0][1].as_deref(), Some("numeric_view"));
+        assert_eq!(rows[0][2].as_deref(), Some("c_int2"));
+        assert_eq!(rows[0][3].as_deref(), Some("smallint"));
+    }
+
+    #[test]
     fn catalog_any_array_rejects_unsupported_rhs() {
         use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
