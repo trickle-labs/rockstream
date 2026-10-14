@@ -1446,11 +1446,11 @@ fn window_oracle(function: &str, key_type: &str, mutated: bool) -> Vec<Vec<Strin
             let lag = index
                 .checked_sub(1)
                 .map(|prior| partition[prior].to_string())
-                .unwrap_or_else(|| "0".to_owned());
+                .unwrap_or_default();
             let lead = partition
                 .get(index + 1)
                 .map(i32::to_string)
-                .unwrap_or_else(|| "0".to_owned());
+                .unwrap_or_default();
             let analytic = match function {
                 "ROW_NUMBER" => (index + 1).to_string(),
                 "RANK" => rank.to_string(),
