@@ -5621,3 +5621,105 @@ mod tests {
         assert!(catalog.get_source("kafka_test").is_none());
     }
 }
+
+#[cfg(test)]
+mod pgjdbc_reflection_tests {
+    use super::*;
+
+    const JDBC_COLUMNS_SQL: &str = r#"
+        SELECT * FROM (
+            SELECT n.nspname,c.relname,a.attname,a.atttypid,
+                   a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) AS attnotnull,
+                   a.atttypmod,a.attlen,t.typtypmod,
+                   row_number() OVER (PARTITION BY a.attrelid ORDER BY a.attnum) AS attnum,
+                   nullif(a.attidentity, '') as attidentity,
+                   nullif(a.attgenerated, '') as attgenerated,
+                   pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS adsrc,
+                   dsc.description,t.typbasetype,t.typtype
+            FROM pg_catalog.pg_namespace n
+            JOIN pg_catalog.pg_class c ON (c.relnamespace = n.oid)
+            JOIN pg_catalog.pg_attribute a ON (a.attrelid=c.oid)
+            JOIN pg_catalog.pg_type t ON (a.atttypid = t.oid)
+            LEFT JOIN pg_catalog.pg_attrdef def ON (a.attrelid=def.adrelid AND a.attnum = def.adnum)
+            LEFT JOIN pg_catalog.pg_description dsc ON (c.oid=dsc.objoid AND a.attnum = dsc.objsubid)
+            WHERE c.relkind in ('r','p','v','f','m') and a.attnum > 0 AND NOT a.attisdropped
+              AND n.nspname LIKE 'public'
+              AND c.relname LIKE 'numeric_view'
+        ) c WHERE true AND attname LIKE '%'
+        ORDER BY nspname,c.relname,attnum
+    "#;
+
+    fn catalog() -> CatalogStubs {
+        let catalog = CatalogStubs::new();
+        catalog.add_view(CatalogView {
+            name: "numeric_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![
+                CatalogColumn { name: "c_int2".to_string(), data_type: "Int16".to_string() },
+                CatalogColumn { name: "c_int4".to_string(), data_type: "Int32".to_string() },
+                CatalogColumn { name: "c_int8".to_string(), data_type: "Int64".to_string() },
+                CatalogColumn { name: "c_float4".to_string(), data_type: "Float32".to_string() },
+                CatalogColumn { name: "c_float64".to_string(), data_type: "Float64".to_string() },
+                CatalogColumn { name: "c_bool".to_string(), data_type: "Boolean".to_string() },
+            ],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+        catalog
+    }
+
+    #[test]
+    fn jdbc_column_metadata_reports_six_real_columns_and_types() {
+        let CatalogResponse::Rows { columns, rows } = catalog()
+            .handle_query(JDBC_COLUMNS_SQL, &SessionInfo::default())
+            .expect("JDBC column metadata query recognized")
+        else {
+            panic!("JDBC reflection must return rows");
+        };
+        assert_eq!(columns.len(), 15);
+        assert_eq!(columns[0], "nspname");
+        assert_eq!(columns[2], "attname");
+        assert_eq!(rows.len(), 6);
+        let expected = [
+            ("c_int2", PG_OID_INT2),
+            ("c_int4", PG_OID_INT4),
+            ("c_int8", PG_OID_INT8),
+            ("c_float4", PG_OID_FLOAT4),
+            ("c_float64", PG_OID_FLOAT8),
+            ("c_bool", PG_OID_BOOL),
+        ];
+        for (i, ((name, oid), row)) in expected.iter().zip(&rows).enumerate() {
+            assert_eq!(row[0].as_deref(), Some("public"));
+            assert_eq!(row[1].as_deref(), Some("numeric_view"));
+            assert_eq!(row[2].as_deref(), Some(*name));
+            assert_eq!(row[3].as_deref(), Some(oid.to_string().as_str()));
+            assert_eq!(row[8].as_deref(), Some((i + 1).to_string().as_str()));
+        }
+    }
+
+    #[test]
+    fn jdbc_column_metadata_respects_requested_patterns() {
+        let cat = catalog();
+        for (query, expected_columns) in [
+            (JDBC_COLUMNS_SQL.replace("LIKE 'public'", "LIKE 'private'"), 0),
+            (JDBC_COLUMNS_SQL.replace("LIKE 'numeric_view'", "LIKE 'missing'"), 0),
+            (JDBC_COLUMNS_SQL.replace("attname LIKE '%'", "attname LIKE 'c_int_'"), 3),
+        ] {
+            let CatalogResponse::Rows { rows, .. } = cat
+                .handle_query(&query, &SessionInfo::default())
+                .expect("filtered JDBC query recognized")
+            else {
+                panic!("JDBC reflection must return rows");
+            };
+            assert_eq!(rows.len(), expected_columns, "{query}");
+        }
+    }
+
+    #[test]
+    fn jdbc_like_respects_wildcards_and_escaped_literals() {
+        assert!(pgjdbc_like("numeric_view", "numeric\\_view"));
+        assert!(!pgjdbc_like("numericXview", "numeric\\_view"));
+        assert!(pgjdbc_like("c_int2", "c_int_"));
+        assert!(!pgjdbc_like("c_int22", "c_int_"));
+    }
+}
