@@ -3105,10 +3105,9 @@ impl CatalogStubs {
 
         // pgjdbc embeds escaped SQL literals for the caller's metadata
         // patterns. Apply each literal as a LIKE filter before returning data.
-        let filter = regex::Regex::new(
-            r"(?i)\b(n\.nspname|c\.relname|attname)\s+like\s+'((?:''|[^'])*)'",
-        )
-        .expect("constant JDBC filter pattern");
+        let filter =
+            regex::Regex::new(r"(?i)\b(n\.nspname|c\.relname|attname)\s+like\s+'((?:''|[^'])*)'")
+                .expect("constant JDBC filter pattern");
         let mut schema_pattern = None;
         let mut table_pattern = None;
         let mut column_pattern = None;
@@ -3127,14 +3126,29 @@ impl CatalogStubs {
             entries.push((catalog_relation_name(&table.name, "public"), table.columns));
         }
         for view in self.list_views() {
-            entries.push((catalog_relation_name(&view.name, &view.namespace), view.columns));
+            entries.push((
+                catalog_relation_name(&view.name, &view.namespace),
+                view.columns,
+            ));
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         let columns = [
-            "nspname", "relname", "attname", "atttypid", "attnotnull",
-            "atttypmod", "attlen", "typtypmod", "attnum", "attidentity",
-            "attgenerated", "adsrc", "description", "typbasetype", "typtype",
+            "nspname",
+            "relname",
+            "attname",
+            "atttypid",
+            "attnotnull",
+            "atttypmod",
+            "attlen",
+            "typtypmod",
+            "attnum",
+            "attidentity",
+            "attgenerated",
+            "adsrc",
+            "description",
+            "typbasetype",
+            "typtype",
         ]
         .into_iter()
         .map(str::to_string)
@@ -3375,8 +3389,12 @@ impl CatalogStubs {
                         // pg_class.reltype identifies the relation composite type.
                         // Prisma's catalog introspection filters out reltype = 0.
                         "reltype" => Some(
-                            if kind == "i" { 0 } else { view_oid(&format!("type:{full_name}")) }
-                                .to_string(),
+                            if kind == "i" {
+                                0
+                            } else {
+                                view_oid(&format!("type:{full_name}"))
+                            }
+                            .to_string(),
                         ),
                         "relhasindex" => Some(
                             if indexes.iter().any(|i| i.table == full_name) {
