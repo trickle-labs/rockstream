@@ -1036,7 +1036,7 @@ async fn run_df_batch(ctx: &SessionContext, query: &str) -> Result<TypedResult, 
         let batch_result = empty_result(batch.schema().as_ref());
         if batch_result.fields != result.fields {
             return Err(format!(
-                "DataFusion batch schema changed: planned={:?} batch={:?}",
+                "[RS-0001] DataFusion batch schema changed: planned={:?} batch={:?}",
                 result.fields, batch_result.fields
             ));
         }
