@@ -304,6 +304,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_preserves_non_int64_arrow_types() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, true),
+            Field::new("count", DataType::UInt64, false),
+        ]));
+        let empty = ArrowZSet::empty(schema.clone());
+        assert_eq!(empty.num_rows(), 0);
+        assert_eq!(empty.schema(), schema);
+        assert_eq!(empty.data.column(0).data_type(), &DataType::Int32);
+        assert_eq!(empty.data.column(1).data_type(), &DataType::Utf8);
+        assert_eq!(empty.data.column(2).data_type(), &DataType::UInt64);
+    }
+
+    #[test]
     fn try_new_rejects_misaligned_weights() {
         let zs = ArrowZSet::from_ab_rows(&[(1, 10)], 1);
         assert_eq!(
