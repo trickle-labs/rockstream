@@ -351,7 +351,9 @@ impl Stage {
                 crate::time_window::append_session_window_state(op, *id, target)
             }
             Stage::Window(op, id) => crate::window::append_window_state(op, *id, target),
-            Stage::TopK(op, id) => crate::topk::append_topk_state(op, *id, target),
+            Stage::TopK(op, id) => {
+                crate::topk::append_topk_state_with_db(op, *id, target, Some(db))
+            }
             Stage::KeyPack(packer, id) => {
                 packer.append_state(*id, target);
                 Ok(())

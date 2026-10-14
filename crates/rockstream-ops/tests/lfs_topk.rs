@@ -442,3 +442,13 @@ async fn lfs_topk_no_range_delete() {
     batch.delete(b"key2");
     let _ = batch;
 }
+
+#[path = "common/topk_recovery.rs"]
+mod topk_recovery;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lfs_topk_spilled_state_recovers_after_close() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    topk_recovery::spilled_recovery(store, "topk-recovery").await;
+}

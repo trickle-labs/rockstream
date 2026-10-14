@@ -176,3 +176,21 @@ async fn minio_topk_random_changes() {
         "top-K correct after MinIO reload + one epoch"
     );
 }
+
+#[path = "common/topk_recovery.rs"]
+mod topk_recovery;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn minio_topk_spilled_state_recovers_after_close() {
+    let minio = start_minio().await;
+    let Some((_container, port)) = minio else {
+        assert!(
+            std::env::var_os("CI").is_none()
+                && std::env::var("ROCKSTREAM_REQUIRE_DOCKER").as_deref() != Ok("1"),
+            "MinIO recovery evidence requires Docker in CI"
+        );
+        eprintln!("SKIP: Docker unavailable for MinIO spill recovery");
+        return;
+    };
+    topk_recovery::spilled_recovery(minio_object_store(port), "topk-recovery").await;
+}
