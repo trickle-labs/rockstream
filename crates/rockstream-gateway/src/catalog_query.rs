@@ -835,10 +835,17 @@ mod tests {
         else {
             panic!("Prisma derived catalog reflection must return rows");
         };
-        assert_eq!(columns, vec![
-            "namespace", "table_name", "column_name",
-            "formatted_type", "data_type", "is_nullable"
-        ]);
+        assert_eq!(
+            columns,
+            vec![
+                "namespace",
+                "table_name",
+                "column_name",
+                "formatted_type",
+                "data_type",
+                "is_nullable",
+            ]
+        );
         assert_eq!(rows.len(), 1, "registered view must be discoverable");
         assert_eq!(rows[0][0].as_deref(), Some("public"));
         assert_eq!(rows[0][1].as_deref(), Some("numeric_view"));
