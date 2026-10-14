@@ -348,7 +348,6 @@ async fn test_nexmark_q0_q3_lfs() {
     use rockstream_gateway::subscribe_handler::deliver_snapshot;
     use rockstream_gateway::subscribe_parser::parse_subscribe;
     use rockstream_storage::ShardDb;
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     let store = Arc::new(InMemory::new());
