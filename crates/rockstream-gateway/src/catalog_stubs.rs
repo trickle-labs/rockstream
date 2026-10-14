@@ -3071,6 +3071,10 @@ impl CatalogStubs {
             "pg_policy" => "oid polname polrelid polpermissive polroles polqual polwithcheck polcmd",
             "pg_inherits" => "inhrelid inhparent inhseqno inhdetachpending",
             "pg_attrdef" => "oid adrelid adnum adbin",
+            // SQLAlchemy reflects identity columns through a correlated
+            // pg_sequence lookup even when the relation has no identity.
+            // An empty pg_sequence catalog is valid; an absent one is not.
+            "pg_sequence" => "seqrelid seqtypid seqstart seqincrement seqmax seqmin seqcache seqcycle",
             "pg_collation" => "oid collname",
             "pg_auth_members" => "roleid member grantor admin_option",
             "pg_tables" => return Some(self.pg_tables(&[])),
