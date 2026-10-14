@@ -187,7 +187,7 @@ def observed_results(
             item.update(outcome="unexpected_skip", reason="test body printed a SKIP marker despite libtest success")
             errors.append(f"unexpected in-test skip: {cid}")
         elif event["event"] == "failed":
-            item.update(outcome="failed", reason=(event.get("stdout") or "test failed")[-1200:])
+            item.update(outcome="failed", reason=(event.get("stdout") or "test failed")[-20000:])
             errors.append(f"failed mandatory case: {cid}")
         else:
             item["outcome"] = "passed"
