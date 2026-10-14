@@ -4290,8 +4290,8 @@ async fn test_nexmark_q0_q9_minio() {
         let oracle_rows = run_df_oracle(query.to_string()).await;
 
         // Compare both results (unsorted, but sorted to compare set equivalence)
-        let psql_set: BTreeSet<String> = psql_rows.into_iter().collect();
-        let oracle_set: BTreeSet<String> = oracle_rows.into_iter().collect();
+        let psql_set: std::collections::BTreeSet<String> = psql_rows.into_iter().collect();
+        let oracle_set: std::collections::BTreeSet<String> = oracle_rows.into_iter().collect();
         assert_eq!(
             psql_set, oracle_set,
             "bit-identical comparison failed for {view}"
