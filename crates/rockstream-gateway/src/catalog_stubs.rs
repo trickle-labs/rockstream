@@ -5655,12 +5655,30 @@ mod pgjdbc_reflection_tests {
             name: "numeric_view".to_string(),
             sql: "SELECT 1".to_string(),
             columns: vec![
-                CatalogColumn { name: "c_int2".to_string(), data_type: "Int16".to_string() },
-                CatalogColumn { name: "c_int4".to_string(), data_type: "Int32".to_string() },
-                CatalogColumn { name: "c_int8".to_string(), data_type: "Int64".to_string() },
-                CatalogColumn { name: "c_float4".to_string(), data_type: "Float32".to_string() },
-                CatalogColumn { name: "c_float64".to_string(), data_type: "Float64".to_string() },
-                CatalogColumn { name: "c_bool".to_string(), data_type: "Boolean".to_string() },
+                CatalogColumn {
+                    name: "c_int2".to_string(),
+                    data_type: "Int16".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_int4".to_string(),
+                    data_type: "Int32".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_int8".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_float4".to_string(),
+                    data_type: "Float32".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_float64".to_string(),
+                    data_type: "Float64".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_bool".to_string(),
+                    data_type: "Boolean".to_string(),
+                },
             ],
             namespace: "public".to_string(),
             op_id: None,
@@ -5701,9 +5719,18 @@ mod pgjdbc_reflection_tests {
     fn jdbc_column_metadata_respects_requested_patterns() {
         let cat = catalog();
         for (query, expected_columns) in [
-            (JDBC_COLUMNS_SQL.replace("LIKE 'public'", "LIKE 'private'"), 0),
-            (JDBC_COLUMNS_SQL.replace("LIKE 'numeric_view'", "LIKE 'missing'"), 0),
-            (JDBC_COLUMNS_SQL.replace("attname LIKE '%'", "attname LIKE 'c_int_'"), 3),
+            (
+                JDBC_COLUMNS_SQL.replace("LIKE 'public'", "LIKE 'private'"),
+                0,
+            ),
+            (
+                JDBC_COLUMNS_SQL.replace("LIKE 'numeric_view'", "LIKE 'missing'"),
+                0,
+            ),
+            (
+                JDBC_COLUMNS_SQL.replace("attname LIKE '%'", "attname LIKE 'c_int_'"),
+                3,
+            ),
         ] {
             let CatalogResponse::Rows { rows, .. } = cat
                 .handle_query(&query, &SessionInfo::default())
