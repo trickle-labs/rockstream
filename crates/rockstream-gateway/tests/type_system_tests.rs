@@ -441,8 +441,10 @@ async fn test_orm_conformance() {
 
     let python_script = format!(
         "import sqlalchemy as sa
-engine = sa.create_engine('postgresql+psycopg2://test:test@{}:{}/test')
+engine = sa.create_engine('postgresql+psycopg2://test:test@{}:{}/test', echo=True)
 insp = sa.inspect(engine)
+print('REFLECTION DEBUG: tables', insp.get_table_names())
+print('REFLECTION DEBUG: views', insp.get_view_names())
 cols = insp.get_columns('numeric_view')
 print('COLS:', cols)
 assert len(cols) == 6, f'Expected 6 columns, got {{len(cols)}}'
