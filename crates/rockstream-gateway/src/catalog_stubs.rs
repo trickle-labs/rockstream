@@ -44,6 +44,26 @@ impl Default for SessionInfo {
 
 static SERVER_START_TIME: OnceLock<SystemTime> = OnceLock::new();
 
+/// Case-sensitive PostgreSQL LIKE matching with backslash escapes.
+fn pgjdbc_like(value: &str, pattern: &str) -> bool {
+    let mut expression = String::from("(?s)^");
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(literal) = chars.next() {
+                    expression.push_str(&regex::escape(&literal.to_string()));
+                } else {
+                    expression.push_str(r"\\");
+                }
+            }
+            '%' => expression.push_str(".*"),
+            '_' => expression.push('.'),
+            other => expression.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    expression.push('
+
 /// Postgres type OIDs used in RowDescription fields.
 pub const PG_OID_INT2: i32 = 21;
 pub const PG_OID_INT4: i32 = 23;
@@ -2198,6 +2218,10 @@ impl CatalogStubs {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        if let Some(result) = self.pgjdbc_columns_query(q) {
+            return Some(result);
+        }
+
         if let Ok(statements) =
             sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, q)
         {
@@ -3053,6 +3077,5674 @@ impl CatalogStubs {
             CatalogResponse::Rows { columns, .. } => Some(columns),
             _ => None,
         }
+    }
+
+    /// PostgreSQL JDBC 42.7 getColumns() uses a derived SELECT with a
+    /// row_number() window over pg_namespace/pg_class/pg_attribute/pg_type.
+    /// Our small catalog evaluator deliberately does not implement general
+    /// window aggregation, so execute this identifiable metadata query from
+    /// the live catalog entries. Never credit a nonmatching SQL statement.
+    fn pgjdbc_columns_query(&self, query: &str) -> Option<CatalogResponse> {
+        let shape = regex::Regex::new(
+            r"(?is)^select\s+\*\s+from\s*\(\s*select\s+n\.nspname\s*,\s*c\.relname\s*,\s*a\.attname\s*,",
+        )
+        .expect("constant JDBC query signature");
+        if !shape.is_match(query)
+            || !query.contains("pg_catalog.pg_attribute")
+            || !query.contains("pg_catalog.pg_type")
+            || !query.contains("pg_catalog.pg_namespace")
+            || !query.contains("pg_catalog.pg_class")
+            || !query.to_ascii_lowercase().contains("row_number()")
+        {
+            return None;
+        }
+
+        // pgjdbc embeds escaped SQL literals for the caller's metadata
+        // patterns. Apply each literal as a LIKE filter before returning data.
+        let filter = regex::Regex::new(
+            r"(?i)\b(n\.nspname|c\.relname|attname)\s+like\s+'((?:''|[^'])*)'",
+        )
+        .expect("constant JDBC filter pattern");
+        let mut schema_pattern = None;
+        let mut table_pattern = None;
+        let mut column_pattern = None;
+        for capture in filter.captures_iter(query) {
+            let pattern = capture[2].replace("''", "'");
+            match capture[1].to_ascii_lowercase().as_str() {
+                "n.nspname" => schema_pattern = Some(pattern),
+                "c.relname" => table_pattern = Some(pattern),
+                "attname" => column_pattern = Some(pattern),
+                _ => unreachable!(),
+            }
+        }
+
+        let mut entries = Vec::new();
+        for table in self.list_tables() {
+            entries.push((catalog_relation_name(&table.name, "public"), table.columns));
+        }
+        for view in self.list_views() {
+            entries.push((catalog_relation_name(&view.name, &view.namespace), view.columns));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let columns = [
+            "nspname", "relname", "attname", "atttypid", "attnotnull",
+            "atttypmod", "attlen", "typtypmod", "attnum", "attidentity",
+            "attgenerated", "adsrc", "description", "typbasetype", "typtype",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut rows = Vec::new();
+        for ((schema, name), attributes) in entries {
+            if schema_pattern
+                .as_deref()
+                .is_some_and(|pattern| !pgjdbc_like(&schema, pattern))
+                || table_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| !pgjdbc_like(&name, pattern))
+            {
+                continue;
+            }
+            for (ordinal, attribute) in attributes.iter().enumerate() {
+                if column_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| !pgjdbc_like(&attribute.name, pattern))
+                {
+                    continue;
+                }
+                rows.push(vec![
+                    Some(schema.clone()),
+                    Some(name.clone()),
+                    Some(attribute.name.clone()),
+                    Some(arrow_type_to_pg_oid(&attribute.data_type).to_string()),
+                    Some("f".into()),
+                    Some("-1".into()),
+                    Some("-1".into()),
+                    Some("-1".into()),
+                    Some((ordinal + 1).to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("0".into()),
+                    Some("b".into()),
+                ]);
+                if rows.len() >= MAX_CATALOG_SCAN_ROWS {
+                    return Some(CatalogResponse::Rows { columns, rows });
+                }
+            }
+        }
+        Some(CatalogResponse::Rows { columns, rows })
+    }
+
+    fn pg_catalog_rows(&self, relation: &str, session: &SessionInfo) -> Option<CatalogResponse> {
+        let relation = relation.to_lowercase().replace('"', "");
+        let name = relation.strip_prefix("pg_catalog.").unwrap_or(&relation);
+        let fields = match name {
+            "pg_class" => "oid relname relnamespace relkind reltype relowner relchecks relhasindex relhasrules relhastriggers relrowsecurity relforcerowsecurity relhasoids relispartition reltablespace reloftype relpersistence relreplident relam reltoastrelid relacl definition",
+            "pg_attribute" => "attrelid nspname relname attname atttypid attnotnull atttypmod attlen typtypmod attnum attidentity attgenerated adsrc description typbasetype typtype format_type attisdropped atthasdef attcollation attacl",
+            "pg_namespace" => "oid nspname nspowner",
+            "pg_type" => "oid typname typlen typarray typnamespace typtype typrelid typelem typcollation format_type",
+            "pg_proc" => "oid proname pronamespace prorettype proargtypes prokind",
+            "pg_index" => "indexrelid indrelid indisunique indisprimary indisclustered indisvalid indisreplident indkey indexdef",
+            "pg_roles" => "oid rolname rolsuper rolinherit rolcreaterole rolcreatedb rolcanlogin rolconnlimit rolreplication rolbypassrls rolvaliduntil",
+            "pg_database" => "oid datname datdba encoding datcollate datctype datacl datistemplate datallowconn",
+            "pg_am" => "oid amname",
+            "pg_policy" => "oid polname polrelid polpermissive polroles polqual polwithcheck polcmd",
+            "pg_inherits" => "inhrelid inhparent inhseqno inhdetachpending",
+            "pg_attrdef" => "oid adrelid adnum adbin",
+            // SQLAlchemy reflects identity columns through a correlated
+            // pg_sequence lookup even when the relation has no identity.
+            // An empty pg_sequence catalog is valid; an absent one is not.
+            "pg_sequence" => "seqrelid seqtypid seqstart seqincrement seqmax seqmin seqcache seqcycle",
+            "pg_collation" => "oid collname",
+            "pg_auth_members" => "roleid member grantor admin_option",
+            "pg_tables" => return Some(self.pg_tables(&[])),
+            "pg_views" => return Some(self.pg_views(&[])),
+            "pg_constraint" => return Some(self.pg_constraint(&[])),
+            "pg_description" => return Some(self.pg_description(&[])),
+            "pg_enum" => return Some(self.pg_enum(&[])),
+            "pg_user" => return Some(self.pg_user(&session.principal_name, &[])),
+            "information_schema.tables" => return Some(self.information_schema_tables(&[])),
+            "information_schema.columns" => return Some(self.information_schema_columns(&[])),
+            "information_schema.key_column_usage" => return Some(self.key_column_usage(&[])),
+            "information_schema.referential_constraints" => return Some(self.referential_constraints(&[])),
+            "pg_statistic_ext" | "pg_publication" | "pg_publication_rel" | "pg_rewrite" | "pg_tablespace" => "",
+            _ => return None,
+        };
+        let columns: Vec<String> = fields.split_whitespace().map(str::to_string).collect();
+        Some(match name {
+            "pg_class" => self.pg_class(&columns),
+            "pg_attribute" => self.pg_attribute(&columns),
+            "pg_namespace" => self.pg_namespace(&columns),
+            "pg_type" => self.pg_type(&columns),
+            "pg_proc" => self.pg_proc(&columns),
+            "pg_index" => self.pg_index(&columns),
+            "pg_roles" => self.pg_roles(&session.principal_name, &columns),
+            "pg_database" => CatalogResponse::rows(
+                columns,
+                vec![vec![
+                    Some(view_oid("rockstream").to_string()),
+                    Some("rockstream".into()),
+                    Some(view_oid("rockstream").to_string()),
+                    Some("6".into()),
+                    Some("C".into()),
+                    Some("C".into()),
+                    None,
+                    Some("f".into()),
+                    Some("t".into()),
+                ]],
+            ),
+            "pg_am" => {
+                CatalogResponse::rows(columns, vec![vec![Some("2".into()), Some("heap".into())]])
+            }
+            _ => CatalogResponse::rows(columns, vec![]),
+        })
+    }
+
+    // ── pg_catalog.pg_tables ──────────────────────────────────────────────────
+
+    fn pg_tables(&self, requested_cols: &[String]) -> CatalogResponse {
+        let key = ("pg_tables".to_string(), requested_cols.to_vec());
+        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
+            vec![
+                "schemaname".to_string(),
+                "tablename".to_string(),
+                "tableowner".to_string(),
+                "hasindexes".to_string(),
+                "hasrules".to_string(),
+                "hastriggers".to_string(),
+                "rowsecurity".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
+        for t in self.list_tables() {
+            let (schema, name) = catalog_relation_name(&t.name, "public");
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "schemaname" => Some(schema.clone()),
+                    "tablename" => Some(name.clone()),
+                    "tableowner" => Some("rockstream".to_string()),
+                    "hasindexes" => Some(
+                        if self.list_indexes().iter().any(|i| i.table == t.name) {
+                            "t"
+                        } else {
+                            "f"
+                        }
+                        .into(),
+                    ),
+                    "hasrules" => Some("f".to_string()),
+                    "hastriggers" => Some("f".to_string()),
+                    "rowsecurity" => Some("f".to_string()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        let resp = CatalogResponse::rows(cols, rows);
+        self.projection_cache
+            .write()
+            .unwrap()
+            .insert(key, resp.clone());
+        resp
+    }
+
+    // ── pg_catalog.pg_views ───────────────────────────────────────────────────
+
+    fn pg_views(&self, requested_cols: &[String]) -> CatalogResponse {
+        let key = ("pg_views".to_string(), requested_cols.to_vec());
+        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
+            vec![
+                "schemaname".to_string(),
+                "viewname".to_string(),
+                "viewowner".to_string(),
+                "definition".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
+        for v in self.list_views() {
+            let (schema, name) = catalog_relation_name(&v.name, &v.namespace);
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "schemaname" => Some(schema.clone()),
+                    "viewname" => Some(name.clone()),
+                    "viewowner" => Some("rockstream".to_string()),
+                    "definition" => Some(v.sql.clone()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        let resp = CatalogResponse::rows(cols, rows);
+        self.projection_cache
+            .write()
+            .unwrap()
+            .insert(key, resp.clone());
+        resp
+    }
+
+    // ── pg_catalog.pg_class ───────────────────────────────────────────────────
+
+    fn pg_class(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = requested_cols.to_vec();
+        let indexes = self.list_indexes();
+        let mut items = Vec::new();
+        for t in self.list_tables() {
+            items.push((t.name, "r", "public".to_string(), None));
+        }
+        for v in self.list_views() {
+            items.push((v.name, "v", v.namespace, Some(v.sql)));
+        }
+        for idx in &indexes {
+            let (schema, _) = catalog_relation_name(&idx.table, "public");
+            items.push((idx.name.clone(), "i", schema, None));
+        }
+        let rows = items
+            .into_iter()
+            .map(|(full_name, kind, namespace, definition)| {
+                let oid = view_oid(&full_name);
+                let (schema, name) = catalog_relation_name(&full_name, &namespace);
+                cols.iter()
+                    .map(|c| match c.as_str() {
+                        "oid" => Some(oid.to_string()),
+                        "relname" | "table_name" => Some(name.clone()),
+                        "relnamespace" => Some(catalog_namespace_oid(&schema).to_string()),
+                        "namespace" | "nspname" => Some(schema.clone()),
+                        "relowner" => Some(view_oid("rockstream").to_string()),
+                        "tableowner" => Some("rockstream".into()),
+                        "relkind" => Some(kind.into()),
+                        // pg_class.reltype identifies the relation composite type.
+                        // Prisma's catalog introspection filters out reltype = 0.
+                        "reltype" => {
+                            let reltype = if kind == "i" {
+                                0
+                            } else {
+                                view_oid(&format!("type:{full_name}"))
+                            };
+                            Some(reltype.to_string())
+                        }
+                        "relhasindex" => Some(
+                            if indexes.iter().any(|i| i.table == full_name) {
+                                "t"
+                            } else {
+                                "f"
+                            }
+                            .into(),
+                        ),
+                        "relhasrules"
+                        | "relhastriggers"
+                        | "relispartition"
+                        | "relrowsecurity"
+                        | "relforcerowsecurity"
+                        | "relhasoids"
+                        | "is_partition"
+                        | "has_subclass"
+                        | "has_row_level_security" => Some("f".into()),
+                        "relchecks" | "reltablespace" | "reloftype" | "reltoastrelid" => {
+                            Some("0".into())
+                        }
+                        "relam" => Some(if kind == "r" { "2" } else { "0" }.into()),
+                        "relpersistence" => Some("p".into()),
+                        "relreplident" => Some("d".into()),
+                        "definition" => definition.clone(),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    // ── pg_catalog.pg_attribute ──────────────────────────────────────────────
+
+    fn pg_attribute(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() || requested_cols.contains(&"*".to_string()) {
+            vec![
+                "nspname".to_string(),
+                "relname".to_string(),
+                "attname".to_string(),
+                "atttypid".to_string(),
+                "attnotnull".to_string(),
+                "atttypmod".to_string(),
+                "attlen".to_string(),
+                "typtypmod".to_string(),
+                "attnum".to_string(),
+                "attidentity".to_string(),
+                "attgenerated".to_string(),
+                "adsrc".to_string(),
+                "description".to_string(),
+                "typbasetype".to_string(),
+                "typtype".to_string(),
+                "format_type".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut items = Vec::new();
+        for t in self.list_tables() {
+            let oid = view_oid(&t.name);
+            let (schema, name) = catalog_relation_name(&t.name, "public");
+            for (i, col) in t.columns.iter().enumerate() {
+                items.push((
+                    oid,
+                    name.clone(),
+                    schema.clone(),
+                    col.name.clone(),
+                    arrow_type_to_pg_oid(&col.data_type),
+                    arrow_type_to_pg_data_type(&col.data_type),
+                    i as i16 + 1,
+                ));
+            }
+        }
+        for v in self.list_views() {
+            let oid = view_oid(&v.name);
+            let (schema, name) = catalog_relation_name(&v.name, &v.namespace);
+            for (i, col) in v.columns.iter().enumerate() {
+                items.push((
+                    oid,
+                    name.clone(),
+                    schema.clone(),
+                    col.name.clone(),
+                    arrow_type_to_pg_oid(&col.data_type),
+                    arrow_type_to_pg_data_type(&col.data_type),
+                    i as i16 + 1,
+                ));
+            }
+        }
+        for (attrelid, relname, schema, attname, atttypid, format_type, attnum) in items {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "attrelid" => Some(attrelid.to_string()),
+                    "relname" | "table_name" => Some(relname.clone()),
+                    "attname" | "name" => Some(attname.clone()),
+                    "atttypid" => Some(atttypid.to_string()),
+                    "format_type" => Some(format_type.to_string()),
+                    "attnum" => Some(attnum.to_string()),
+                    "attnotnull" | "not_null" => Some("f".to_string()),
+                    "atthasdef" => Some("f".into()),
+                    "default" => None,
+                    "attidentity" => Some("".into()),
+                    "identity_options" => None,
+                    "attgenerated" | "generated" => Some("".to_string()),
+                    "comment" => None,
+                    "collation" => None,
+                    "is_dropped" | "attisdropped" => Some("f".to_string()),
+                    "nspname" => Some(schema.clone()),
+                    "attcollation" => Some("0".into()),
+                    "attacl" => None,
+                    "atttypmod" => Some("-1".to_string()),
+                    "attlen" => Some("-1".to_string()),
+                    "typtypmod" => Some("-1".to_string()),
+                    "adsrc" => None,
+                    "description" => None,
+                    "typbasetype" => Some("0".to_string()),
+                    "typtype" => Some("b".to_string()),
+                    _ => {
+                        if c.contains("id") {
+                            Some("0".to_string())
+                        } else if c.contains("has") || c.contains("is") {
+                            Some("f".to_string())
+                        } else {
+                            Some("".to_string())
+                        }
+                    }
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        CatalogResponse::rows(cols, rows)
+    }
+
+    // ── pg_catalog.pg_namespace ──────────────────────────────────────────────
+
+    fn pg_namespace(&self, requested_cols: &[String]) -> CatalogResponse {
+        let mut names = std::collections::BTreeSet::from([
+            "public".to_string(),
+            "pg_catalog".to_string(),
+            "information_schema".to_string(),
+        ]);
+        names.extend(self.inner.read().unwrap().schemas.iter().cloned());
+        names.extend(self.list_namespaces().into_iter().map(|n| n.name));
+        for view in self.list_views() {
+            names.insert(catalog_relation_name(&view.name, &view.namespace).0);
+        }
+        for table in self.list_tables() {
+            names.insert(catalog_relation_name(&table.name, "public").0);
+        }
+        let rows = names
+            .into_iter()
+            .map(|name| {
+                requested_cols
+                    .iter()
+                    .map(|c| match c.as_str() {
+                        "oid" => Some(catalog_namespace_oid(&name).to_string()),
+                        "nspname" | "namespace_name" => Some(name.clone()),
+                        "nspowner" => Some(view_oid("rockstream").to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(requested_cols.to_vec(), rows)
+    }
+
+    // ── pg_catalog.pg_type ───────────────────────────────────────────────────
+
+    fn pg_type(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "typname".to_string(),
+                "typlen".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let type_rows = vec![
+            (PG_OID_INT2, "int2", 2i32, 0, 11, "b"),
+            (PG_OID_INT4, "int4", 4i32, 1007, 11, "b"),
+            (PG_OID_INT8, "int8", 8, 1016, 11, "b"),
+            (PG_OID_FLOAT4, "float4", 4, 0, 11, "b"),
+            (PG_OID_FLOAT8, "float8", 8, 1022, 11, "b"),
+            (PG_OID_TEXT, "text", -1, 1009, 11, "b"),
+            (PG_OID_BOOL, "bool", 1, 1000, 11, "b"),
+            (PG_OID_BYTEA, "bytea", -1, 0, 11, "b"),
+            (PG_OID_TIMESTAMP, "timestamp", 8, 0, 11, "b"),
+            (PG_OID_TIMESTAMPTZ, "timestamptz", 8, 0, 11, "b"),
+            (PG_OID_DATE, "date", 4, 0, 11, "b"),
+            (PG_OID_TIME, "time", 8, 0, 11, "b"),
+            (PG_OID_UUID, "uuid", 16, 2951, 11, "b"),
+            (PG_OID_NUMERIC, "numeric", -1, 0, 11, "b"),
+            (PG_OID_JSON, "json", -1, 0, 11, "b"),
+            (PG_OID_JSONB, "jsonb", -1, 0, 11, "b"),
+            (PG_OID_VARCHAR, "varchar", -1, 0, 11, "b"),
+            (PG_OID_CHAR, "bpchar", -1, 0, 11, "b"),
+            (PG_OID_INTERVAL, "interval", 16, 0, 11, "b"),
+            (PG_OID_ARRAY_INT4, "_int4", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_INT8, "_int8", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_TEXT, "_text", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_FLOAT8, "_float8", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_BOOL, "_bool", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_UUID, "_uuid", -1, 0, 11, "b"),
+        ];
+        let mut rows = Vec::new();
+        for (oid, name, len, typarray, typnamespace, typtype) in type_rows {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "oid" => Some(oid.to_string()),
+                    "typname" | "domname" => Some(name.to_string()),
+                    "typlen" => Some(len.to_string()),
+                    "typarray" => Some(typarray.to_string()),
+                    "typnamespace" => Some(typnamespace.to_string()),
+                    "typtype" => Some(typtype.to_string()),
+                    "attype" => Some(name.to_string()),
+                    "typrelid" | "typcollation" => Some("0".into()),
+                    "typelem" => Some(
+                        match name {
+                            "_int4" => PG_OID_INT4,
+                            "_int8" => PG_OID_INT8,
+                            "_text" => PG_OID_TEXT,
+                            "_float8" => PG_OID_FLOAT8,
+                            "_bool" => PG_OID_BOOL,
+                            "_uuid" => PG_OID_UUID,
+                            _ => 0,
+                        }
+                        .to_string(),
+                    ),
+                    "format_type" => Some(
+                        match name {
+                            "int2" => "smallint",
+                            "int4" => "integer",
+                            "int8" => "bigint",
+                            "float4" => "real",
+                            "float8" => "double precision",
+                            "bool" => "boolean",
+                            "varchar" => "character varying",
+                            "bpchar" => "character",
+                            "timestamp" => "timestamp without time zone",
+                            "timestamptz" => "timestamp with time zone",
+                            "time" => "time without time zone",
+                            "_int4" => "integer[]",
+                            "_int8" => "bigint[]",
+                            "_text" => "text[]",
+                            "_float8" => "double precision[]",
+                            "_bool" => "boolean[]",
+                            "_uuid" => "uuid[]",
+                            _ => name,
+                        }
+                        .into(),
+                    ),
+                    "typbasetype" => Some("0".to_string()),
+                    "typtypmod" => Some("-1".to_string()),
+                    _ => {
+                        if c.contains("id") {
+                            Some("0".to_string())
+                        } else {
+                            Some("".to_string())
+                        }
+                    }
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        CatalogResponse::rows(cols, rows)
+    }
+
+    // ── information_schema.tables ────────────────────────────────────────────
+
+    fn information_schema_tables(&self, requested_cols: &[String]) -> CatalogResponse {
+        let key = (
+            "information_schema_tables".to_string(),
+            requested_cols.to_vec(),
+        );
+        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
+            vec![
+                "table_catalog".to_string(),
+                "table_schema".to_string(),
+                "table_name".to_string(),
+                "table_type".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
+        let mut items = Vec::new();
+        for t in self.list_tables() {
+            items.push((catalog_relation_name(&t.name, "public"), "BASE TABLE"));
+        }
+        for v in self.list_views() {
+            items.push((catalog_relation_name(&v.name, &v.namespace), "VIEW"));
+        }
+        for ((schema, name), table_type) in items {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "table_catalog" => Some("rockstream".to_string()),
+                    "table_schema" => Some(schema.clone()),
+                    "table_name" => Some(name.clone()),
+                    "table_type" => Some(table_type.to_string()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        let resp = CatalogResponse::rows(cols, rows);
+        self.projection_cache
+            .write()
+            .unwrap()
+            .insert(key, resp.clone());
+        resp
+    }
+
+    // ── information_schema.columns ───────────────────────────────────────────
+
+    fn information_schema_columns(&self, requested_cols: &[String]) -> CatalogResponse {
+        let key = (
+            "information_schema_columns".to_string(),
+            requested_cols.to_vec(),
+        );
+        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
+            vec![
+                "table_catalog".to_string(),
+                "table_schema".to_string(),
+                "table_name".to_string(),
+                "column_name".to_string(),
+                "ordinal_position".to_string(),
+                "data_type".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
+        let mut items = Vec::new();
+        for t in self.list_tables() {
+            for (i, col) in t.columns.iter().enumerate() {
+                items.push((
+                    catalog_relation_name(&t.name, "public"),
+                    col.name.clone(),
+                    i + 1,
+                    arrow_type_to_pg_data_type(&col.data_type),
+                ));
+            }
+        }
+        for v in self.list_views() {
+            for (i, col) in v.columns.iter().enumerate() {
+                items.push((
+                    catalog_relation_name(&v.name, &v.namespace),
+                    col.name.clone(),
+                    i + 1,
+                    arrow_type_to_pg_data_type(&col.data_type),
+                ));
+            }
+        }
+        for ((schema, table_name), column_name, pos, data_type) in items {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "table_catalog" => Some("rockstream".to_string()),
+                    "table_schema" => Some(schema.clone()),
+                    "table_name" => Some(table_name.clone()),
+                    "column_name" => Some(column_name.clone()),
+                    "ordinal_position" => Some(pos.to_string()),
+                    "data_type" => Some(data_type.to_string()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        let resp = CatalogResponse::rows(cols, rows);
+        self.projection_cache
+            .write()
+            .unwrap()
+            .insert(key, resp.clone());
+        resp
+    }
+
+    // ── pg_catalog.pg_proc ────────────────────────────────────────────────────
+
+    fn pg_proc(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "proname".to_string(),
+                "pronamespace".to_string(),
+                "prorettype".to_string(),
+                "proargtypes".to_string(),
+                "prokind".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let raw_rows = vec![
+            (2147, "count", 11, 20, "", "a"),
+            (2108, "sum", 11, 20, "", "a"),
+            (2101, "avg", 11, 1700, "", "a"),
+            (2130, "min", 11, 25, "", "a"),
+            (2115, "max", 11, 25, "", "a"),
+        ];
+        let mut rows = Vec::new();
+        for (oid, proname, pronamespace, prorettype, proargtypes, prokind) in raw_rows {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "oid" => Some(oid.to_string()),
+                    "proname" => Some(proname.to_string()),
+                    "pronamespace" => Some(pronamespace.to_string()),
+                    "prorettype" => Some(prorettype.to_string()),
+                    "proargtypes" => Some(proargtypes.to_string()),
+                    "prokind" => Some(prokind.to_string()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        CatalogResponse::rows(cols, rows)
+    }
+
+    // ── pg_catalog.pg_constraint ──────────────────────────────────────────────
+
+    fn pg_constraint(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "conname".to_string(),
+                "connamespace".to_string(),
+                "contype".to_string(),
+                "conrelid".to_string(),
+                "contypid".to_string(),
+                "conindid".to_string(),
+                "confrelid".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── pg_catalog.pg_index ───────────────────────────────────────────────────
+
+    fn pg_index(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "indexrelid".to_string(),
+                "indrelid".to_string(),
+                "indisunique".to_string(),
+                "indisprimary".to_string(),
+                "indkey".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
+        for idx in self.list_indexes() {
+            let indexrelid = view_oid(&idx.name).to_string();
+            let indrelid = view_oid(&idx.table).to_string();
+            let mut indkey_vals = Vec::new();
+            if let Some(t) = self.get_table(&idx.table) {
+                for col_name in &idx.index_cols {
+                    if let Some(pos) = t.columns.iter().position(|c| &c.name == col_name) {
+                        indkey_vals.push((pos + 1).to_string());
+                    }
+                }
+            } else if let Some(v) = self.get_view(&idx.table) {
+                for col_name in &idx.index_cols {
+                    if let Some(pos) = v.columns.iter().position(|c| &c.name == col_name) {
+                        indkey_vals.push((pos + 1).to_string());
+                    }
+                }
+            }
+            if indkey_vals.is_empty() {
+                indkey_vals.push("1".to_string());
+            }
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "indexrelid" => Some(indexrelid.clone()),
+                    "indrelid" => Some(indrelid.clone()),
+                    "indisunique" => Some("f".to_string()),
+                    "indisprimary" => Some("f".to_string()),
+                    "indisclustered" | "indisreplident" => Some("f".into()),
+                    "indisvalid" => Some(
+                        if idx.state == CatalogIndexState::Ready {
+                            "t"
+                        } else {
+                            "f"
+                        }
+                        .into(),
+                    ),
+                    "indkey" => Some(indkey_vals.join(" ")),
+                    "indexdef" => Some(format!(
+                        "CREATE INDEX {} ON {} ({})",
+                        idx.name,
+                        idx.table,
+                        idx.index_cols.join(", ")
+                    )),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        CatalogResponse::rows(cols, rows)
+    }
+
+    // ── pg_catalog.pg_description ─────────────────────────────────────────────
+
+    fn pg_description(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "objoid".to_string(),
+                "classoid".to_string(),
+                "objsubid".to_string(),
+                "description".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── pg_catalog.pg_enum ────────────────────────────────────────────────────
+
+    fn pg_enum(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "enumtypid".to_string(),
+                "enumsortorder".to_string(),
+                "enumlabel".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── pg_catalog.pg_roles ───────────────────────────────────────────────────
+
+    fn pg_roles(&self, principal_name: &str, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "rolname".to_string(),
+                "rolsuper".to_string(),
+                "rolinherit".to_string(),
+                "rolcreaterole".to_string(),
+                "rolcreatedb".to_string(),
+                "rolcanlogin".to_string(),
+                "rolconnlimit".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut row = Vec::new();
+        for c in &cols {
+            let val = match c.as_str() {
+                "oid" => Some(view_oid(principal_name).to_string()),
+                "rolname" => Some(principal_name.to_string()),
+                "rolsuper" => Some("t".to_string()),
+                "rolinherit" => Some("t".to_string()),
+                "rolcreaterole" => Some("t".to_string()),
+                "rolcreatedb" => Some("t".to_string()),
+                "rolcanlogin" => Some("t".to_string()),
+                "rolconnlimit" => Some("-1".to_string()),
+                _ => Some("".to_string()),
+            };
+            row.push(val);
+        }
+        CatalogResponse::rows(cols, vec![row])
+    }
+
+    // ── pg_catalog.pg_user ────────────────────────────────────────────────────
+
+    fn pg_user(&self, principal_name: &str, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "usename".to_string(),
+                "usesysid".to_string(),
+                "usecreatedb".to_string(),
+                "usesuper".to_string(),
+                "usecatupd".to_string(),
+                "valuntil".to_string(),
+                "useconfig".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut row = Vec::new();
+        for c in &cols {
+            let val = match c.as_str() {
+                "usename" => Some(principal_name.to_string()),
+                "usesysid" => Some(view_oid(principal_name).to_string()),
+                "usecreatedb" => Some("t".to_string()),
+                "usesuper" => Some("t".to_string()),
+                "usecatupd" => Some("t".to_string()),
+                "valuntil" => None,
+                "useconfig" => None,
+                _ => Some("".to_string()),
+            };
+            row.push(val);
+        }
+        CatalogResponse::rows(cols, vec![row])
+    }
+
+    // ── information_schema.key_column_usage ──────────────────────────────────
+
+    fn key_column_usage(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "constraint_catalog".to_string(),
+                "constraint_schema".to_string(),
+                "constraint_name".to_string(),
+                "table_catalog".to_string(),
+                "table_schema".to_string(),
+                "table_name".to_string(),
+                "column_name".to_string(),
+                "ordinal_position".to_string(),
+                "position_in_unique_constraint".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── information_schema.referential_constraints ───────────────────────────
+
+    fn referential_constraints(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "constraint_catalog".to_string(),
+                "constraint_schema".to_string(),
+                "constraint_name".to_string(),
+                "unique_constraint_catalog".to_string(),
+                "unique_constraint_schema".to_string(),
+                "unique_constraint_name".to_string(),
+                "match_option".to_string(),
+                "update_rule".to_string(),
+                "delete_rule".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── pg_catalog functions ─────────────────────────────────────────────────
+
+    pub fn rockstream_version(&self) -> CatalogResponse {
+        let id = rockstream_types::candidate_identity::CandidateIdentity::current();
+        let cols = vec![
+            "product_version".to_string(),
+            "candidate_id".to_string(),
+            "source_sha".to_string(),
+            "artifact_digest".to_string(),
+        ];
+        let candidate_id = id.candidate_id();
+        let rows = vec![vec![
+            Some(id.semantic_version),
+            Some(candidate_id),
+            Some(id.commit_sha),
+            Some(id.lockfile_digest),
+        ]];
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn capabilities_response(&self, query: &str, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            capabilities_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+
+        let registry = rockstream_types::capability::CapabilityRegistry::current();
+        let ql = query.to_lowercase();
+        let rows = registry
+            .capabilities()
+            .iter()
+            .filter(|c| {
+                if let Some(where_part) = ql.split("where ").nth(1) {
+                    if let Some(target) = extract_filter_target(where_part, "tier") {
+                        if !c.tier.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(where_part, "kind") {
+                        if !c.kind.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(where_part, "reachability") {
+                        if !c
+                            .reachability
+                            .to_lowercase()
+                            .contains(&target.to_lowercase())
+                        {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(where_part, "id") {
+                        if !c.id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .map(|c| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "id" => Some(c.id.clone()),
+                        "kind" => Some(c.kind.clone()),
+                        "name" => Some(c.name.clone()),
+                        "tier" => Some(c.tier.clone()),
+                        "reachability" => Some(c.reachability.clone()),
+                        "dispatch_count" => Some(c.dispatch_count().to_string()),
+                        "proof_ref" => Some(c.proof_ref().to_string()),
+                        "doc_anchor" => Some(c.doc_anchor().to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_nodes_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            nodes_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let nodes = self.list_nodes();
+        let rows = nodes
+            .into_iter()
+            .filter(|n| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "role") {
+                        if !n.role.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "worker_id") {
+                        if !n.worker_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "node_id") {
+                        if !n.node_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_NODES_SCAN_ROWS)
+            .map(|n| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "node_id" => Some(n.node_id.clone()),
+                        "worker_id" => Some(n.worker_id.clone()),
+                        "role" => Some(n.role.clone()),
+                        "address" => Some(sanitize_catalog_secret(&n.address)),
+                        "state" => Some(n.state.clone()),
+                        "lease_count" => Some(n.lease_count.to_string()),
+                        "memory_budget_bytes" => Some(n.memory_budget_bytes.to_string()),
+                        "last_heartbeat_at" => Some(n.last_heartbeat_at.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_sources_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            sources_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let sources = self.list_sources();
+        let inner = self.inner.read().unwrap();
+        let rows = sources
+            .into_iter()
+            .filter(|s| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !s.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "type") {
+                        if !s.source_type.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_SOURCES_SCAN_ROWS)
+            .map(|s| {
+                let runtime = inner.source_runtime.get(&s.name);
+                let buffer_fill = runtime.map(|r| r.buffer_fill).unwrap_or(0);
+                let schema_version = runtime.map(|r| r.relation_schema_version).unwrap_or(1);
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "name" => Some(sanitize_catalog_secret(&s.name)),
+                        "type" => Some(sanitize_catalog_secret(&s.source_type)),
+                        "format" => Some(s.format.clone()),
+                        "status" => Some(s.status.clone()),
+                        "live_offset" => Some(s.live_offset.clone()),
+                        "live_lag_ms" => Some(s.live_lag.to_string()),
+                        "buffer_fill" => Some(buffer_fill.to_string()),
+                        "schema_version" => Some(schema_version.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_views_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            views_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let views = self.list_views();
+        let arrangements = self.view_arrangements.read().unwrap();
+        let engine_facts = self.view_engine_facts.read().unwrap();
+        let states = self.view_states.read().unwrap();
+        let rows = views
+            .into_iter()
+            .filter(|v| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "view_name") {
+                        if !v.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !v.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_VIEWS_SCAN_ROWS)
+            .map(|v| {
+                let workload_name = self.workload_for_view(&v.name);
+                let arrangement = arrangements.get(&v.name);
+                let facts = engine_facts.get(&v.name);
+                let state_str = states
+                    .get(&v.name)
+                    .map(|s| format!("{s:?}"))
+                    .unwrap_or_else(|| "ACTIVE".to_string());
+                let arr_id = arrangement
+                    .as_ref()
+                    .and_then(|a| a.arrangement_id.map(|id| id.to_string()))
+                    .or_else(|| {
+                        facts
+                            .as_ref()
+                            .and_then(|f| f.arrangement_id.map(|id| id.to_string()))
+                    })
+                    .unwrap_or_else(|| format!("{:016x}", view_oid(&v.name)));
+                let shared_bytes = arrangement
+                    .map(|a| a.shared_state_bytes)
+                    .or_else(|| facts.map(|f| f.shared_state_bytes))
+                    .unwrap_or_else(|| read_pipeline_state_bytes(&v.name).unwrap_or(0));
+                let frontier = facts
+                    .map(|f| f.frontier.clone())
+                    .unwrap_or_else(|| "[1]".to_string());
+
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "namespace" => Some(v.namespace.clone()),
+                        "view_name" => Some(v.name.clone()),
+                        "state" => Some(state_str.clone()),
+                        "workload_name" => Some(
+                            workload_name
+                                .clone()
+                                .unwrap_or_else(|| "default".to_string()),
+                        ),
+                        "workload_source" => Some(
+                            workload_name
+                                .clone()
+                                .unwrap_or_else(|| "DEFAULT".to_string()),
+                        ),
+                        "arrangement_id" => Some(arr_id.clone()),
+                        "shared_state_bytes" => Some(shared_bytes.to_string()),
+                        "frontier" => Some(frontier.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_operators_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            operators_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let views = self.list_views();
+        let engine_facts = self.view_engine_facts.read().unwrap();
+        let rows = views
+            .into_iter()
+            .filter(|v| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "view_name") {
+                        if !v.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_OPERATORS_SCAN_ROWS)
+            .map(|v| {
+                let facts = engine_facts.get(&v.name);
+                let op_id_str = format!("op-{:016x}", v.op_id.unwrap_or(view_oid(&v.name) as u64));
+                let dirty_keys = facts.map(|f| f.dirty_key_count).unwrap_or(0);
+                let write_bytes = facts.map(|f| f.logical_write_bytes).unwrap_or(0);
+
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "operator_id" => Some(op_id_str.clone()),
+                        "view_name" => Some(v.name.clone()),
+                        "operator_kind" => Some("ViewSinkOp".to_string()),
+                        "merge_law_id" => Some("ML-001".to_string()),
+                        "dirty_key_count" => Some(dirty_keys.to_string()),
+                        "logical_write_bytes" => Some(write_bytes.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_arrangements_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            arrangements_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let arrangements = self.view_arrangements.read().unwrap();
+        let views = self.list_views();
+        let mut unique_arrangements: HashMap<String, (usize, u64, u64, String, String)> =
+            HashMap::new();
+
+        for (view_name, arr) in arrangements.iter() {
+            let id_str = arr
+                .arrangement_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| format!("{:016x}", view_oid(view_name)));
+            unique_arrangements.insert(
+                id_str,
+                (
+                    arr.consumer_count,
+                    arr.shared_state_bytes,
+                    arr.bytes_saved_by_sharing,
+                    arr.compaction_frontier.to_string(),
+                    "hash(id)".to_string(),
+                ),
+            );
+        }
+        for view in views {
+            let id = format!("{:016x}", view_oid(&view.name));
+            unique_arrangements.entry(id).or_insert((
+                1,
+                read_pipeline_state_bytes(&view.name).unwrap_or(0),
+                0,
+                "[1]".to_string(),
+                "hash(id)".to_string(),
+            ));
+        }
+
+        let mut rows_vec: Vec<_> = unique_arrangements.into_iter().collect();
+        rows_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let rows = rows_vec
+            .into_iter()
+            .filter(|(id, _)| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "arrangement_id") {
+                        if !id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_ARRANGEMENTS_SCAN_ROWS)
+            .map(
+                |(id, (consumer_count, state_bytes, bytes_saved, frontier, part))| {
+                    cols.iter()
+                        .map(|col| match col.to_ascii_lowercase().as_str() {
+                            "arrangement_id" => Some(id.clone()),
+                            "consumer_count" => Some(consumer_count.to_string()),
+                            "shared_state_bytes" => Some(state_bytes.to_string()),
+                            "bytes_saved" => Some(bytes_saved.to_string()),
+                            "compaction_frontier" => Some(frontier.clone()),
+                            "partitioning" => Some(sanitize_catalog_secret(&part)),
+                            _ => None,
+                        })
+                        .collect()
+                },
+            )
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_checkpoints_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            checkpoints_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let checkpoints = self.list_checkpoints();
+        let rows = checkpoints
+            .into_iter()
+            .filter(|c| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "checkpoint_id") {
+                        if c.checkpoint_id.to_string() != target {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_CHECKPOINTS_SCAN_ROWS)
+            .map(|c| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "checkpoint_id" => Some(c.checkpoint_id.to_string()),
+                        "committed_at" => Some(c.committed_at.clone()),
+                        "epoch_number" => Some(c.epoch_number.to_string()),
+                        "frontier" => Some(c.frontier.clone()),
+                        "storage_path" => Some(sanitize_catalog_secret(&c.storage_path)),
+                        "duration_ms" => Some(c.duration_ms.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_shards_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            shards_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let shards = self.list_shards();
+        let rows = shards
+            .into_iter()
+            .filter(|s| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "shard_id") {
+                        if s.shard_id.to_string() != target {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "view_id") {
+                        if !s.view_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "worker_id") {
+                        if !s.worker_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "state") {
+                        if !s.state.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_SHARDS_SCAN_ROWS)
+            .map(|s| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "shard_id" => Some(s.shard_id.to_string()),
+                        "view_id" => Some(s.view_id.clone()),
+                        "worker_id" => Some(s.worker_id.clone()),
+                        "state" => Some(s.state.clone()),
+                        "frontier" => Some(s.frontier.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_operations_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            operations_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let ops = self.list_operations();
+        let rows = ops
+            .into_iter()
+            .filter(|o| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "operation_id") {
+                        if !o.operation_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "kind") {
+                        if !o.kind.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "target") {
+                        if !o.target.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "phase") {
+                        if !o.phase.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_OPERATIONS_SCAN_ROWS)
+            .map(|o| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "operation_id" => Some(o.operation_id.clone()),
+                        "kind" => Some(o.kind.clone()),
+                        "target" => Some(o.target.clone()),
+                        "phase" => Some(o.phase.clone()),
+                        "progress_pct" => Some(o.progress_pct.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_namespaces_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            namespaces_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let nss = self.list_namespaces();
+        let rows = nss
+            .into_iter()
+            .filter(|n| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !n.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "owner") {
+                        if !n.owner.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_NAMESPACES_SCAN_ROWS)
+            .map(|n| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "name" => Some(n.name.clone()),
+                        "owner" => Some(n.owner.clone()),
+                        "created_at" => Some(n.created_at.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_tables_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            tables_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let tables = self.list_catalog_table_entries();
+        let rows = tables
+            .into_iter()
+            .filter(|t| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !t.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "namespace") {
+                        if !t.namespace.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_CATALOG_TABLES_SCAN_ROWS)
+            .map(|t| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "namespace" => Some(t.namespace.clone()),
+                        "name" => Some(t.name.clone()),
+                        "schema" => Some(t.schema.clone()),
+                        "format" => Some(t.format.clone()),
+                        "row_count" => Some(t.row_count.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_workloads_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            workloads_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let workloads = self.list_catalog_workload_entries();
+        let rows = workloads
+            .into_iter()
+            .filter(|w| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "workload_id") {
+                        if !w.workload_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !w.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "priority") {
+                        if !w.priority.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_CATALOG_WORKLOADS_SCAN_ROWS)
+            .map(|w| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "workload_id" => Some(w.workload_id.clone()),
+                        "name" => Some(w.name.clone()),
+                        "memory_limit" => Some(w.memory_limit.clone()),
+                        "priority" => Some(w.priority.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    fn version(&self) -> CatalogResponse {
+        let cols = vec!["version".to_string()];
+        let rows = vec![vec![Some(
+            "PostgreSQL 14.9 (RockStream) on x86_64-unknown-linux-gnu, compiled by rustc, 64-bit"
+                .to_string(),
+        )]];
+        CatalogResponse::rows(cols, rows)
+    }
+
+    fn current_schema(&self) -> CatalogResponse {
+        let cols = vec!["current_schema".to_string()];
+        let rows = vec![vec![Some("public".to_string())]];
+        CatalogResponse::rows(cols, rows)
+    }
+
+    fn current_database(&self) -> CatalogResponse {
+        let cols = vec!["current_database".to_string()];
+        let rows = vec![vec![Some("rockstream".to_string())]];
+        CatalogResponse::rows(cols, rows)
+    }
+
+    fn current_setting(&self, query: &str) -> CatalogResponse {
+        let cols = vec!["current_setting".to_string()];
+        let val = if query.contains("transaction_isolation") {
+            "read committed"
+        } else if query.contains("server_version_num") {
+            "140000"
+        } else if query.contains("standard_conforming_strings") {
+            "on"
+        } else {
+            ""
+        };
+        let rows = vec![vec![Some(val.to_string())]];
+        CatalogResponse::rows(cols, rows)
+    }
+}
+
+/// Parse the second quoted string argument from `set_config('key', 'value', is_local)`.
+fn parse_set_config_value(query: &str) -> Option<String> {
+    let mut quote_count = 0u32;
+    let mut in_quote = false;
+    let mut collecting = false;
+    let mut val = String::new();
+    for c in query.chars() {
+        if c == '\'' {
+            if in_quote {
+                if collecting {
+                    return Some(val);
+                }
+                in_quote = false;
+                quote_count += 1;
+            } else {
+                in_quote = true;
+                if quote_count == 1 {
+                    collecting = true;
+                }
+            }
+        } else if collecting && in_quote {
+            val.push(c);
+        }
+    }
+    None
+}
+
+/// Format a SystemTime as ISO 8601 without chrono (YYYY-MM-DD HH:MM:SS+00).
+fn format_system_time(t: SystemTime) -> String {
+    let duration = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let secs = duration.as_secs();
+    let secs_of_day = secs % 86400;
+    let days = secs / 86400;
+    let h = secs_of_day / 3600;
+    let m = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}+00", y, mo, d, h, m, s)
+}
+
+/// Rata Die civil_from_days algorithm (no-dep calendar math).
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y as i32, mo as u32, d as u32)
+}
+
+fn catalog_relation_name(full_name: &str, namespace: &str) -> (String, String) {
+    match full_name.rsplit_once('.') {
+        Some((schema, name)) => (schema.to_string(), name.to_string()),
+        None => (namespace.to_string(), full_name.to_string()),
+    }
+}
+
+fn catalog_namespace_oid(name: &str) -> i32 {
+    match name {
+        "pg_catalog" => 11,
+        "information_schema" => 13207,
+        "public" => 2200,
+        _ => view_oid(&format!("namespace:{name}")),
+    }
+}
+
+/// Helper to parse SELECT column names/aliases from query.
+fn parse_select_columns(query: &str) -> Vec<String> {
+    let ql = query.to_lowercase();
+    let select_idx = match ql.find("select") {
+        Some(idx) => idx + 6,
+        None => return Vec::new(),
+    };
+    // Find "from" at paren level 0
+    let mut from_idx = None;
+    let mut paren_level = 0;
+    let chars: Vec<char> = query.chars().collect();
+    let mut i = select_idx;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '(' {
+            paren_level += 1;
+        } else if c == ')' {
+            if paren_level > 0 {
+                paren_level -= 1;
+            }
+        } else if c.is_alphabetic() && paren_level == 0 && i + 4 <= chars.len() {
+            let word: String = chars[i..i + 4].iter().collect();
+            if word.eq_ignore_ascii_case("from") {
+                let prev_char = if i > 0 { chars[i - 1] } else { ' ' };
+                let next_char = if i + 4 < chars.len() {
+                    chars[i + 4]
+                } else {
+                    ' '
+                };
+                if !prev_char.is_alphanumeric() && !next_char.is_alphanumeric() {
+                    from_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let from_idx = match from_idx {
+        Some(idx) => idx,
+        None => return Vec::new(),
+    };
+    if from_idx <= select_idx {
+        return Vec::new();
+    }
+    let select_part = &query[select_idx..from_idx];
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut paren_level = 0;
+    for c in select_part.chars() {
+        if c == '(' {
+            paren_level += 1;
+            current.push(c);
+        } else if c == ')' {
+            if paren_level > 0 {
+                paren_level -= 1;
+            }
+            current.push(c);
+        } else if c == ',' && paren_level == 0 {
+            parts.push(current.trim().to_string());
+            current = String::new();
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+
+    let mut cols = Vec::new();
+    for part in parts {
+        // Normalize whitespace (newlines, tabs, extra spaces)
+        let part_normalized = part.split_whitespace().collect::<Vec<&str>>().join(" ");
+        let part_lower = part_normalized.to_lowercase();
+
+        if let Some(as_idx) = part_lower.rfind(" as ") {
+            let alias = part_normalized[as_idx + 4..]
+                .trim()
+                .trim_matches('"')
+                .trim();
+            cols.push(alias.to_string());
+        } else {
+            let words: Vec<&str> = part_normalized.split_whitespace().collect();
+            if let Some(last_word) = words.last() {
+                let last_word = last_word.trim_matches('"').trim();
+                if let Some(dot_idx) = last_word.rfind('.') {
+                    cols.push(last_word[dot_idx + 1..].to_string());
+                } else {
+                    cols.push(last_word.to_string());
+                }
+            }
+        }
+    }
+    cols
+}
+
+pub(crate) fn view_resource_usage_columns() -> Vec<String> {
+    vec![
+        "view_name".to_string(),
+        "workload_name".to_string(),
+        "state_bytes".to_string(),
+        "memory_bytes".to_string(),
+        "memory_limit_bytes".to_string(),
+        "state_budget_bytes".to_string(),
+        "freshness_slo_ms".to_string(),
+        "freshness_lag_ms".to_string(),
+        "slo_compliant".to_string(),
+        "degraded_reason".to_string(),
+        "estimated_cost_per_hour".to_string(),
+    ]
+}
+
+pub(crate) fn workload_status_columns() -> Vec<String> {
+    vec![
+        "workload_name".to_string(),
+        "priority".to_string(),
+        "max_parallelism".to_string(),
+        "memory_limit_bytes".to_string(),
+        "freshness_slo_ms".to_string(),
+        "view_count".to_string(),
+        "over_budget_relaxed_view_count".to_string(),
+        "paused_view_count".to_string(),
+    ]
+}
+
+pub(crate) fn workload_resource_usage_columns() -> Vec<String> {
+    vec![
+        "workload_name".to_string(),
+        "view_count".to_string(),
+        "state_bytes".to_string(),
+        "memory_bytes".to_string(),
+        "memory_limit_bytes".to_string(),
+        "state_budget_bytes".to_string(),
+        "freshness_slo_ms".to_string(),
+        "freshness_lag_ms".to_string(),
+        "slo_compliant".to_string(),
+        "degraded_reason".to_string(),
+        "estimated_cost_per_hour".to_string(),
+    ]
+}
+
+pub(crate) fn show_sources_columns() -> Vec<String> {
+    vec![
+        "name".to_string(),
+        "type".to_string(),
+        "format".to_string(),
+        "status".to_string(),
+        "offset".to_string(),
+        "lag".to_string(),
+        "remediation".to_string(),
+    ]
+}
+
+pub(crate) fn show_sinks_columns() -> Vec<String> {
+    vec!["name", "format", "path", "catalog", "state", "remediation"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+pub(crate) fn view_status_columns() -> Vec<String> {
+    vec![
+        "namespace".to_string(),
+        "view_name".to_string(),
+        "state".to_string(),
+        "workload_name".to_string(),
+        "freshness_slo_ms".to_string(),
+        "memory_limit_bytes".to_string(),
+        "depends_on".to_string(),
+        "source_lag_ms".to_string(),
+        "decode_lag_ms".to_string(),
+        "compute_lag_ms".to_string(),
+        "alignment_lag_ms".to_string(),
+        "sink_lag_ms".to_string(),
+        "spill_lag_ms".to_string(),
+        "storage_pressure_ms".to_string(),
+        "total_lag_ms".to_string(),
+        "degradation_reason".to_string(),
+        "reason_code".to_string(),
+        "dominant_contributor".to_string(),
+        "progress_phase".to_string(),
+        "bytes_remaining".to_string(),
+        "rows_remaining".to_string(),
+        "estimated_remaining_ms".to_string(),
+        "arrangement_id".to_string(),
+        "consumer_count".to_string(),
+        "shared_state_bytes".to_string(),
+        "bytes_saved_by_sharing".to_string(),
+        "compaction_frontier".to_string(),
+        "delta_amplification".to_string(),
+        "join_amplification".to_string(),
+        "merge_operand_count".to_string(),
+        "dirty_key_count".to_string(),
+        "logical_write_bytes".to_string(),
+        "physical_write_amplification".to_string(),
+        "hot_key_bucket_count".to_string(),
+        "factorization_strategy".to_string(),
+        "predicate_filter_selectivity".to_string(),
+        "cache_hit_rate".to_string(),
+        "epoch_group_size".to_string(),
+        "checkpoint_mode".to_string(),
+        "compaction_debt".to_string(),
+        "spill_bytes".to_string(),
+        "checkpoint_id".to_string(),
+        "frontier".to_string(),
+        "recommended_action_key".to_string(),
+    ]
+}
+
+pub const MAX_NODES_SCAN_ROWS: usize = 1000;
+pub const MAX_SOURCES_SCAN_ROWS: usize = 1000;
+pub const MAX_VIEWS_SCAN_ROWS: usize = 5000;
+pub const MAX_OPERATORS_SCAN_ROWS: usize = 10000;
+pub const MAX_ARRANGEMENTS_SCAN_ROWS: usize = 5000;
+pub const MAX_CHECKPOINTS_SCAN_ROWS: usize = 1000;
+pub const MAX_CAPABILITIES_SCAN_ROWS: usize = 1000;
+
+pub fn nodes_columns() -> Vec<String> {
+    vec![
+        "node_id".to_string(),
+        "worker_id".to_string(),
+        "role".to_string(),
+        "address".to_string(),
+        "state".to_string(),
+        "lease_count".to_string(),
+        "memory_budget_bytes".to_string(),
+        "last_heartbeat_at".to_string(),
+    ]
+}
+
+pub fn sources_columns() -> Vec<String> {
+    vec![
+        "name".to_string(),
+        "type".to_string(),
+        "format".to_string(),
+        "status".to_string(),
+        "live_offset".to_string(),
+        "live_lag_ms".to_string(),
+        "buffer_fill".to_string(),
+        "schema_version".to_string(),
+    ]
+}
+
+pub fn views_columns() -> Vec<String> {
+    vec![
+        "namespace".to_string(),
+        "view_name".to_string(),
+        "state".to_string(),
+        "workload_name".to_string(),
+        "workload_source".to_string(),
+        "arrangement_id".to_string(),
+        "shared_state_bytes".to_string(),
+        "frontier".to_string(),
+    ]
+}
+
+pub fn operators_columns() -> Vec<String> {
+    vec![
+        "operator_id".to_string(),
+        "view_name".to_string(),
+        "operator_kind".to_string(),
+        "merge_law_id".to_string(),
+        "dirty_key_count".to_string(),
+        "logical_write_bytes".to_string(),
+    ]
+}
+
+pub fn arrangements_columns() -> Vec<String> {
+    vec![
+        "arrangement_id".to_string(),
+        "consumer_count".to_string(),
+        "shared_state_bytes".to_string(),
+        "bytes_saved".to_string(),
+        "compaction_frontier".to_string(),
+        "partitioning".to_string(),
+    ]
+}
+
+pub fn checkpoints_columns() -> Vec<String> {
+    vec![
+        "checkpoint_id".to_string(),
+        "committed_at".to_string(),
+        "epoch_number".to_string(),
+        "frontier".to_string(),
+        "storage_path".to_string(),
+        "duration_ms".to_string(),
+    ]
+}
+
+pub const MAX_SHARDS_SCAN_ROWS: usize = 4096;
+pub const MAX_OPERATIONS_SCAN_ROWS: usize = 1000;
+pub const MAX_NAMESPACES_SCAN_ROWS: usize = 256;
+pub const MAX_CATALOG_TABLES_SCAN_ROWS: usize = 1000;
+pub const MAX_CATALOG_WORKLOADS_SCAN_ROWS: usize = 256;
+
+pub fn shards_columns() -> Vec<String> {
+    vec![
+        "shard_id".to_string(),
+        "view_id".to_string(),
+        "worker_id".to_string(),
+        "state".to_string(),
+        "frontier".to_string(),
+    ]
+}
+
+pub fn operations_columns() -> Vec<String> {
+    vec![
+        "operation_id".to_string(),
+        "kind".to_string(),
+        "target".to_string(),
+        "phase".to_string(),
+        "progress_pct".to_string(),
+    ]
+}
+
+pub fn namespaces_columns() -> Vec<String> {
+    vec![
+        "name".to_string(),
+        "owner".to_string(),
+        "created_at".to_string(),
+    ]
+}
+
+pub fn tables_columns() -> Vec<String> {
+    vec![
+        "namespace".to_string(),
+        "name".to_string(),
+        "schema".to_string(),
+        "format".to_string(),
+        "row_count".to_string(),
+    ]
+}
+
+pub fn workloads_columns() -> Vec<String> {
+    vec![
+        "workload_id".to_string(),
+        "name".to_string(),
+        "memory_limit".to_string(),
+        "priority".to_string(),
+    ]
+}
+
+pub fn sanitize_catalog_secret(input: &str) -> String {
+    let mut out = input.to_string();
+    if let Some(proto_pos) = out.find("://") {
+        if let Some(at_pos) = out[proto_pos + 3..].find('@') {
+            let userinfo = &out[proto_pos + 3..proto_pos + 3 + at_pos];
+            if userinfo.contains(':') {
+                let user = userinfo.split(':').next().unwrap_or("");
+                let prefix = &out[..proto_pos + 3];
+                let rest = &out[proto_pos + 3 + at_pos..];
+                out = format!("{prefix}{user}:***{rest}");
+            } else {
+                let prefix = &out[..proto_pos + 3];
+                let rest = &out[proto_pos + 3 + at_pos..];
+                out = format!("{prefix}***{rest}");
+            }
+        }
+    }
+    for sensitive_key in &[
+        "password",
+        "secret",
+        "secret_key",
+        "access_key",
+        "token",
+        "credential",
+        "auth_token",
+    ] {
+        if let Some(pos) = out.to_lowercase().find(sensitive_key) {
+            if let Some(eq_pos) = out[pos..].find('=') {
+                let val_start = pos + eq_pos + 1;
+                let val_end = out[val_start..]
+                    .find('&')
+                    .or_else(|| out[val_start..].find(' '))
+                    .or_else(|| out[val_start..].find(';'))
+                    .map(|p| val_start + p)
+                    .unwrap_or(out.len());
+                let prefix = &out[..val_start];
+                let rest = &out[val_end..];
+                out = format!("{prefix}***{rest}");
+            }
+        }
+    }
+    out
+}
+
+fn extract_filter_target(query_lower: &str, field: &str) -> Option<String> {
+    let search_target = if let Some(where_part) = query_lower.split("where ").nth(1) {
+        where_part
+    } else {
+        query_lower
+    };
+    for part in search_target.split(field).skip(1) {
+        if let Some(after_eq) = part.split('=').nth(1) {
+            let cleaned = after_eq
+                .trim()
+                .trim_matches(|c: char| c == '\'' || c == '"' || c == ';' || c.is_whitespace());
+            let token = cleaned
+                .split(|c: char| c == '\'' || c == '"' || c == ';' || c.is_whitespace())
+                .next()
+                .unwrap_or("");
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn capabilities_columns() -> Vec<String> {
+    vec![
+        "id".to_string(),
+        "kind".to_string(),
+        "name".to_string(),
+        "tier".to_string(),
+        "reachability".to_string(),
+        "dispatch_count".to_string(),
+        "proof_ref".to_string(),
+        "doc_anchor".to_string(),
+    ]
+}
+
+pub(crate) fn show_source_status_columns() -> Vec<String> {
+    vec![
+        "name".to_string(),
+        "type".to_string(),
+        "format".to_string(),
+        "status".to_string(),
+        "live_offset".to_string(),
+        "live_lag".to_string(),
+        "owner".to_string(),
+        "committed_checkpoint".to_string(),
+        "buffer_fill".to_string(),
+        "blocked_reason".to_string(),
+        "options".to_string(),
+        "source_identity_hash".to_string(),
+        "slot".to_string(),
+        "publication".to_string(),
+        "active_xid".to_string(),
+        "envelope_bytes".to_string(),
+        "in_memory_bytes".to_string(),
+        "spill_bytes".to_string(),
+        "attached_view_count".to_string(),
+        "affected_view_count".to_string(),
+        "relation_schema_version".to_string(),
+    ]
+}
+
+fn redacted_source_options(options: &HashMap<String, String>) -> HashMap<String, String> {
+    options
+        .iter()
+        .map(|(key, value)| {
+            let key_lower = key.to_ascii_lowercase();
+            let redacted = ["credential", "secret", "password", "token"]
+                .iter()
+                .any(|needle| key_lower.contains(needle));
+            (
+                key.clone(),
+                if redacted {
+                    "<redacted>".to_string()
+                } else {
+                    value.clone()
+                },
+            )
+        })
+        .collect()
+}
+
+fn fmt_bool(value: bool) -> Option<String> {
+    Some(if value { "true" } else { "false" }.to_string())
+}
+
+fn fmt_opt_u64(value: Option<u64>) -> Option<String> {
+    value.map(|value| value.to_string())
+}
+
+fn fmt_opt_u32(value: Option<u32>) -> Option<String> {
+    value.map(|value| value.to_string())
+}
+
+fn fmt_opt_f64(value: Option<f64>) -> Option<String> {
+    value.map(|value| format!("{value:.6}"))
+}
+
+fn workload_id_for_name(name: &str) -> WorkloadId {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    WorkloadId(hash)
+}
+
+pub(crate) fn dead_letter_queue_columns() -> Vec<String> {
+    vec![
+        "arrived_at".to_string(),
+        "source_name".to_string(),
+        "source_offset".to_string(),
+        "error_code".to_string(),
+        "error_message".to_string(),
+        "raw_bytes_hex".to_string(),
+        "replay_attempt".to_string(),
+    ]
+}
+
+pub(crate) fn project_dead_letter_queue(
+    cols: &[String],
+    entry: &rockstream_types::dlq::DlqEntry,
+) -> Vec<Option<String>> {
+    cols.iter()
+        .map(|col| match col.as_str() {
+            "arrived_at" => Some(entry.arrived_at.to_string()),
+            "source_name" => Some(entry.source_name.clone()),
+            "source_offset" => Some(entry.source_offset.clone()),
+            "error_code" => Some(entry.error_code.clone()),
+            "error_message" => Some(entry.error_message.clone()),
+            "raw_bytes_hex" => Some(entry.raw_bytes_hex.clone()),
+            "replay_attempt" => Some(entry.replay_attempt.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(crate) fn project_view_resource_usage(
+    cols: &[String],
+    entry: &CatalogViewResourceUsageEntry,
+) -> Vec<Option<String>> {
+    cols.iter()
+        .map(|col| match col.as_str() {
+            "view_name" => Some(entry.view_name.clone()),
+            "workload_name" => entry.workload_name.clone(),
+            "state_bytes" => Some(entry.state_bytes.to_string()),
+            "memory_bytes" => Some(entry.memory_bytes.to_string()),
+            "memory_limit_bytes" => fmt_opt_u64(entry.memory_limit_bytes),
+            "state_budget_bytes" => Some(entry.state_budget_bytes.to_string()),
+            "freshness_slo_ms" => fmt_opt_u64(entry.freshness_slo_ms),
+            "freshness_lag_ms" => fmt_opt_u64(entry.freshness_lag_ms),
+            "slo_compliant" => fmt_bool(entry.slo_compliant),
+            "degraded_reason" => entry.degraded_reason.clone(),
+            "estimated_cost_per_hour" => fmt_opt_f64(entry.estimated_cost_per_hour),
+            _ => Some(String::new()),
+        })
+        .collect()
+}
+
+pub(crate) fn project_workload_status(
+    cols: &[String],
+    entry: &CatalogWorkloadStatusEntry,
+) -> Vec<Option<String>> {
+    cols.iter()
+        .map(|col| match col.as_str() {
+            "workload_name" => Some(entry.workload_name.clone()),
+            "priority" => Some(entry.priority.to_string()),
+            "max_parallelism" => fmt_opt_u32(entry.max_parallelism),
+            "memory_limit_bytes" => fmt_opt_u64(entry.memory_limit_bytes),
+            "freshness_slo_ms" => fmt_opt_u64(entry.freshness_slo_ms),
+            "view_count" => Some(entry.view_count.to_string()),
+            "over_budget_relaxed_view_count" => {
+                Some(entry.over_budget_relaxed_view_count.to_string())
+            }
+            "paused_view_count" => Some(entry.paused_view_count.to_string()),
+            _ => Some(String::new()),
+        })
+        .collect()
+}
+
+pub(crate) fn project_workload_resource_usage(
+    cols: &[String],
+    entry: &CatalogWorkloadResourceUsageEntry,
+) -> Vec<Option<String>> {
+    cols.iter()
+        .map(|col| match col.as_str() {
+            "workload_name" => Some(entry.workload_name.clone()),
+            "view_count" => Some(entry.view_count.to_string()),
+            "state_bytes" => Some(entry.state_bytes.to_string()),
+            "memory_bytes" => Some(entry.memory_bytes.to_string()),
+            "memory_limit_bytes" => fmt_opt_u64(entry.memory_limit_bytes),
+            "state_budget_bytes" => Some(entry.state_budget_bytes.to_string()),
+            "freshness_slo_ms" => fmt_opt_u64(entry.freshness_slo_ms),
+            "freshness_lag_ms" => fmt_opt_u64(entry.freshness_lag_ms),
+            "slo_compliant" => fmt_bool(entry.slo_compliant),
+            "degraded_reason" => entry.degraded_reason.clone(),
+            "estimated_cost_per_hour" => fmt_opt_f64(entry.estimated_cost_per_hour),
+            _ => Some(String::new()),
+        })
+        .collect()
+}
+
+/// A response from the catalog stub handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogResponse {
+    Error {
+        message: String,
+    },
+    /// A result set with column names and rows.
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Option<String>>>,
+    },
+    /// A command completion (no rows).
+    CommandComplete(String),
+}
+
+impl CatalogResponse {
+    fn rows(columns: Vec<String>, rows: Vec<Vec<Option<String>>>) -> Self {
+        CatalogResponse::Rows { columns, rows }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rockstream_control::audit::FileAuditLog;
+    use rockstream_types::metrics::{
+        read_workload_memory, reset_all, set_state_budget, METRICS_TEST_LOCK,
+    };
+    use rockstream_types::workload::{MemoryLimit, WorkloadDef};
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn show_backfill_status_reports_exact_running_row() {
+        let catalog = CatalogStubs::new();
+        catalog.add_view(CatalogView {
+            name: "orders_by_customer".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+
+        let response = catalog
+            .handle_query(
+                "SHOW BACKFILL STATUS FOR MATERIALIZED VIEW orders_by_customer",
+                &SessionInfo::default(),
+            )
+            .unwrap();
+        let CatalogResponse::Rows { columns, rows } = response else {
+            panic!("SHOW BACKFILL STATUS must return rows");
+        };
+        assert_eq!(
+            columns,
+            [
+                "view_name",
+                "phase",
+                "cursor_position",
+                "rows_remaining",
+                "estimated_rows",
+                "budget_state",
+                "blocked_reason",
+            ]
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("orders_by_customer".to_string()),
+                Some("RUNNING".to_string()),
+                None,
+                Some("0".to_string()),
+                Some("0".to_string()),
+                Some("ADMITTED".to_string()),
+                None,
+            ]]
+        );
+    }
+
+    #[test]
+    fn workload_memory_limit_transitions_views_and_audits() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        set_state_budget(1_000);
+
+        let tmp = NamedTempFile::new().unwrap();
+        let log = FileAuditLog::open(tmp.path()).unwrap();
+
+        let catalog = CatalogStubs::new();
+        catalog.add_workload(WorkloadDef::new("fast").with_memory_limit(MemoryLimit::new(100)));
+        for view_name in ["fast_a", "fast_b"] {
+            catalog.add_view_in_namespace(CatalogView {
+                name: view_name.to_string(),
+                sql: "SELECT 1".to_string(),
+                columns: vec![],
+                namespace: "public".to_string(),
+                op_id: None,
+            });
+            catalog.assign_view_workload(view_name, "fast");
+        }
+
+        catalog.set_view_state_bytes("fast_a", 60, Some(&log));
+        catalog.set_view_state_bytes("fast_b", 30, Some(&log));
+        assert_eq!(catalog.view_state("fast_a"), ViewState::Running);
+        assert_eq!(catalog.view_state("fast_b"), ViewState::Running);
+        assert_eq!(read_workload_memory("fast"), 90);
+
+        catalog.set_view_state_bytes("fast_b", 50, Some(&log));
+        assert_eq!(catalog.view_state("fast_b"), ViewState::OverBudgetRelaxed);
+        assert_eq!(
+            read_workload_memory("fast"),
+            90,
+            "workload accounting must not exceed the limit when acquisition fails"
+        );
+
+        catalog.set_view_state_bytes("fast_a", 40, Some(&log));
+        catalog.set_view_state_bytes("fast_b", 50, Some(&log));
+        assert_eq!(catalog.view_state("fast_b"), ViewState::Running);
+        assert_eq!(read_workload_memory("fast"), 90);
+
+        let actions: Vec<String> = log
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.action)
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                "workload.memory_limit_exceeded".to_string(),
+                "workload.memory_limit_recovered".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_source_catalog_registration() {
+        let catalog = CatalogStubs::new();
+        let mut opts = HashMap::new();
+        opts.insert(
+            "bootstrap.servers".to_string(),
+            "localhost:9092".to_string(),
+        );
+        opts.insert("topic".to_string(), "test_events".to_string());
+
+        let source = CatalogSourceEntry {
+            name: "kafka_test".to_string(),
+            table_name: None,
+            source_type: "kafka".to_string(),
+            options: opts,
+            format: "json".to_string(),
+            status: "OK".to_string(),
+            live_offset: "0".to_string(),
+            live_lag: 0,
+        };
+
+        assert!(catalog.add_source(source.clone()));
+        assert!(!catalog.add_source(source.clone()));
+
+        let fetched = catalog.get_source("kafka_test").unwrap();
+        assert_eq!(fetched.source_type, "kafka");
+        assert_eq!(fetched.format, "json");
+        assert_eq!(fetched.status, "OK");
+
+        assert!(catalog.update_source_status("kafka_test", "PAUSED"));
+        assert_eq!(catalog.get_source("kafka_test").unwrap().status, "PAUSED");
+
+        let sources = catalog.list_sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "kafka_test");
+
+        assert!(catalog.remove_source("kafka_test"));
+        assert!(catalog.get_source("kafka_test").is_none());
+    }
+}
+);
+    regex::Regex::new(&expression)
+        .expect("escaped PostgreSQL LIKE expression")
+        .is_match(value)
+}
+
+
+
+/// Postgres type OIDs used in RowDescription fields.
+pub const PG_OID_INT2: i32 = 21;
+pub const PG_OID_INT4: i32 = 23;
+pub const PG_OID_INT8: i32 = 20;
+pub const PG_OID_FLOAT4: i32 = 700;
+pub const PG_OID_FLOAT8: i32 = 701;
+pub const PG_OID_TEXT: i32 = 25;
+pub const PG_OID_BOOL: i32 = 16;
+pub const PG_OID_BYTEA: i32 = 17;
+pub const PG_OID_TIMESTAMP: i32 = 1114;
+pub const PG_OID_TIMESTAMPTZ: i32 = 1184;
+pub const PG_OID_DATE: i32 = 1082;
+pub const PG_OID_TIME: i32 = 1083;
+pub const PG_OID_UUID: i32 = 2950;
+pub const PG_OID_NUMERIC: i32 = 1700;
+pub const PG_OID_JSON: i32 = 114;
+pub const PG_OID_JSONB: i32 = 3802;
+pub const PG_OID_VARCHAR: i32 = 1043;
+pub const PG_OID_CHAR: i32 = 1042;
+pub const PG_OID_INTERVAL: i32 = 1186;
+
+pub const PG_OID_ARRAY_INT4: i32 = 1007;
+pub const PG_OID_ARRAY_INT8: i32 = 1016;
+pub const PG_OID_ARRAY_TEXT: i32 = 1009;
+pub const PG_OID_ARRAY_FLOAT8: i32 = 1022;
+pub const PG_OID_ARRAY_BOOL: i32 = 1000;
+pub const PG_OID_ARRAY_UUID: i32 = 2951;
+
+/// Map an Arrow data type name to a Postgres type OID.
+pub fn arrow_type_to_pg_oid(arrow_type: &str) -> i32 {
+    match arrow_type {
+        "Int16" => PG_OID_INT2,
+        "Int32" => PG_OID_INT4,
+        "Int64" => PG_OID_INT8,
+        "Float32" => PG_OID_FLOAT4,
+        "Float64" => PG_OID_FLOAT8,
+        "Utf8" | "LargeUtf8" => PG_OID_TEXT,
+        "Boolean" => PG_OID_BOOL,
+        "Binary" | "LargeBinary" => PG_OID_BYTEA,
+        "Timestamp" | "TimestampMicrosecond" | "TimestampNanosecond" => PG_OID_TIMESTAMP,
+        "TimestampTz" => PG_OID_TIMESTAMPTZ,
+        "Date32" | "Date64" => PG_OID_DATE,
+        "Time32" | "Time64" => PG_OID_TIME,
+        "Uuid" | "UUID" => PG_OID_UUID,
+        "Decimal" | "Decimal128" | "Decimal256" => PG_OID_NUMERIC,
+        "Json" | "JSON" => PG_OID_JSON,
+        "Jsonb" | "JSONB" => PG_OID_JSONB,
+        "Varchar" | "VARCHAR" => PG_OID_VARCHAR,
+        "Char" | "CHAR" => PG_OID_CHAR,
+        "Interval" => PG_OID_INTERVAL,
+        "_int4" | "List(Int32)" => PG_OID_ARRAY_INT4,
+        "_int8" | "List(Int64)" => PG_OID_ARRAY_INT8,
+        "_text" | "List(Utf8)" => PG_OID_ARRAY_TEXT,
+        "_float8" | "List(Float64)" => PG_OID_ARRAY_FLOAT8,
+        "_bool" | "List(Boolean)" => PG_OID_ARRAY_BOOL,
+        "_uuid" | "List(Uuid)" => PG_OID_ARRAY_UUID,
+        _ => PG_OID_TEXT,
+    }
+}
+
+/// Map an Arrow data type name to a Postgres data type string (for
+/// `information_schema.columns.data_type`).
+pub fn arrow_type_to_pg_data_type(arrow_type: &str) -> &'static str {
+    match arrow_type {
+        "Int16" => "smallint",
+        "Int32" => "integer",
+        "Int64" => "bigint",
+        "Float32" => "real",
+        "Float64" => "double precision",
+        "Utf8" | "LargeUtf8" => "text",
+        "Boolean" => "boolean",
+        "Binary" | "LargeBinary" => "bytea",
+        "Timestamp" | "TimestampMicrosecond" | "TimestampNanosecond" => {
+            "timestamp without time zone"
+        }
+        "TimestampTz" => "timestamp with time zone",
+        "Date32" | "Date64" => "date",
+        "Time32" | "Time64" => "time without time zone",
+        "Uuid" | "UUID" => "uuid",
+        "Decimal" | "Decimal128" | "Decimal256" => "numeric",
+        "Json" | "JSON" => "json",
+        "Jsonb" | "JSONB" => "jsonb",
+        "Varchar" | "VARCHAR" => "character varying",
+        "Char" | "CHAR" => "character",
+        "Interval" => "interval",
+        "_int4" | "List(Int32)" => "integer[]",
+        "_int8" | "List(Int64)" => "bigint[]",
+        "_text" | "List(Utf8)" => "text[]",
+        "_float8" | "List(Float64)" => "double precision[]",
+        "_bool" | "List(Boolean)" => "boolean[]",
+        "_uuid" | "List(Uuid)" => "uuid[]",
+        _ => "text",
+    }
+}
+
+/// Stable OID derived from a view name (FNV-1a, truncated to positive i32).
+pub fn view_oid(view_name: &str) -> i32 {
+    let mut h: u32 = 0x811c9dc5;
+    for byte in view_name.as_bytes() {
+        h ^= *byte as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    // Ensure positive and non-zero
+    ((h & 0x7FFF_FFFF) | 1) as i32
+}
+
+/// A view entry as seen by the catalog stubs.
+#[derive(Debug, Clone)]
+pub struct CatalogView {
+    pub name: String,
+    pub sql: String,
+    pub columns: Vec<CatalogColumn>,
+    /// Namespace this view belongs to (v0.26). Default: "public".
+    pub namespace: String,
+    /// `OperatorId` (as u64) of the compiled `ViewSinkOp` backing this view
+    /// (v0.51.3 Slice 4). Set once `handle_create_view` successfully
+    /// compiles the view's SELECT via `rockstream_ops::compile_plan` — a
+    /// shard-backed gateway (`--role all`) either has this `Some` or the
+    /// `CREATE VIEW` itself failed with `RS-1019` (v0.51.4 Slice 8; there
+    /// is no materializer fallback left to silently serve an uncompiled
+    /// view). `None` only occurs for a standalone `--role gateway` process
+    /// (no local `ShardDb` to compile against) whose view data is served
+    /// from elsewhere via `ViewReader`.
+    pub op_id: Option<u64>,
+}
+
+/// Runtime progress for a materialized-view backfill. Kept separate from the
+/// catalog definition so ordinary views stay on the existing read path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackfillProgress {
+    pub phase: &'static str,
+    pub cursor_position: Option<String>,
+    pub rows_remaining: u64,
+    pub estimated_rows: u64,
+    pub budget_state: String,
+    pub blocked_reason: Option<String>,
+}
+
+impl BackfillProgress {
+    fn snapshotting() -> Self {
+        Self {
+            phase: "SNAPSHOTTING",
+            cursor_position: None,
+            rows_remaining: 0,
+            estimated_rows: 0,
+            budget_state: "ADMITTED".to_string(),
+            blocked_reason: None,
+        }
+    }
+}
+
+/// A table entry registered by `CREATE TABLE` commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogTable {
+    pub name: String,
+    pub columns: Vec<CatalogColumn>,
+    pub pk_cols: Vec<String>,
+}
+
+impl CatalogTable {
+    pub fn new(name: impl Into<String>, columns: Vec<CatalogColumn>) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            pk_cols: Vec::new(),
+        }
+    }
+
+    pub fn with_pk(
+        name: impl Into<String>,
+        columns: Vec<CatalogColumn>,
+        pk_cols: Vec<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            pk_cols,
+        }
+    }
+}
+
+/// A column in a catalog view entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogColumn {
+    pub name: String,
+    /// Arrow data type name (e.g. "Int64", "Utf8").
+    pub data_type: String,
+}
+
+/// State of a secondary index as tracked by the gateway catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogIndexState {
+    Building,
+    Ready,
+}
+
+/// A secondary index entry registered via `CREATE INDEX` through the pgwire layer.
+#[derive(Debug, Clone)]
+pub struct CatalogIndexEntry {
+    pub name: String,
+    pub table: String,
+    pub index_cols: Vec<String>,
+    pub state: CatalogIndexState,
+    /// OperatorId (as u64) of the `IndexArrangeOp` backing this index.
+    /// Set via `mark_index_ready` once backfill completes. `None` means the
+    /// index is still Building and cannot serve point lookups through the gateway.
+    pub op_id: Option<u64>,
+}
+
+/// A sink entry registered via `CREATE SINK` through the pgwire layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogSinkEntry {
+    pub name: String,
+    pub view: String,
+    pub format: String,
+    pub path: String,
+    pub snapshot_interval_epochs: Option<u64>,
+    pub snapshot_interval_ms: Option<u64>,
+    pub parquet_row_group_bytes: Option<u64>,
+    pub format_version: Option<u64>,
+    pub partition_by: Vec<String>,
+    pub catalog: String,
+    /// Last epoch whose snapshot was committed through this sink (v0.44
+    /// slice 10, `EXPLAIN` annotation). `None` until the first snapshot
+    /// commits.
+    pub last_snapshot_epoch: Option<u64>,
+    /// `"OK"` normally; set to `"CATALOG_WARN"` when the pluggable catalog
+    /// registrar (glue/hive/rest/ducklake) failed to register the latest
+    /// snapshot without failing the sink's commit (DESIGN.md §13.6.5).
+    pub state: String,
+}
+
+/// A source entry registered via `CREATE SOURCE` through the pgwire layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogSourceEntry {
+    pub name: String,
+    /// Existing same-named table this source can feed. `None` preserves
+    /// metadata-only source DDL that has no relational binding.
+    pub table_name: Option<String>,
+    pub source_type: String,
+    pub options: HashMap<String, String>,
+    pub format: String,
+    pub status: String,
+    pub live_offset: String,
+    pub live_lag: u64,
+}
+
+/// Live source registration kept with the catalog under the same lock.  This
+/// prevents a `CREATE SOURCE` from becoming visible before its lifecycle state
+/// exists, and makes `SHOW SOURCE STATUS` read runtime rather than stale DDL.
+#[derive(Debug, Clone)]
+struct CatalogSourceRuntimeEntry {
+    status: String,
+    live_offset: String,
+    live_lag: u64,
+    owner: Option<String>,
+    committed_checkpoint: u64,
+    buffer_fill: usize,
+    blocked_reason: Option<String>,
+    source_identity_hash: Option<String>,
+    active_xid: Option<u32>,
+    envelope_bytes: usize,
+    in_memory_bytes: u64,
+    spill_bytes: u64,
+    attached_view_count: usize,
+    affected_view_count: usize,
+    relation_schema_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgOutputSourceRuntimeDetail {
+    pub source_identity_hash: String,
+    pub active_xid: Option<u32>,
+    pub envelope_bytes: usize,
+    pub in_memory_bytes: u64,
+    pub spill_bytes: u64,
+    pub attached_view_count: usize,
+    pub affected_view_count: usize,
+    pub relation_schema_version: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogViewResourceUsageEntry {
+    pub view_name: String,
+    pub workload_name: Option<String>,
+    pub state_bytes: u64,
+    pub memory_bytes: u64,
+    pub memory_limit_bytes: Option<u64>,
+    pub state_budget_bytes: u64,
+    pub freshness_slo_ms: Option<u64>,
+    pub freshness_lag_ms: Option<u64>,
+    pub slo_compliant: bool,
+    pub degraded_reason: Option<String>,
+    pub estimated_cost_per_hour: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogWorkloadResourceUsageEntry {
+    pub workload_name: String,
+    pub view_count: u64,
+    pub state_bytes: u64,
+    pub memory_bytes: u64,
+    pub memory_limit_bytes: Option<u64>,
+    pub state_budget_bytes: u64,
+    pub freshness_slo_ms: Option<u64>,
+    pub freshness_lag_ms: Option<u64>,
+    pub slo_compliant: bool,
+    pub degraded_reason: Option<String>,
+    pub estimated_cost_per_hour: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogWorkloadStatusEntry {
+    pub workload_name: String,
+    pub priority: u8,
+    pub max_parallelism: Option<u32>,
+    pub memory_limit_bytes: Option<u64>,
+    pub freshness_slo_ms: Option<u64>,
+    pub view_count: u64,
+    pub over_budget_relaxed_view_count: u64,
+    pub paused_view_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogNodeEntry {
+    pub node_id: String,
+    pub worker_id: String,
+    pub role: String,
+    pub address: String,
+    pub state: String,
+    pub lease_count: u64,
+    pub memory_budget_bytes: u64,
+    pub last_heartbeat_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCheckpointEntry {
+    pub checkpoint_id: u64,
+    pub committed_at: String,
+    pub epoch_number: u64,
+    pub frontier: String,
+    pub storage_path: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogShardEntry {
+    pub shard_id: u64,
+    pub view_id: String,
+    pub worker_id: String,
+    pub state: String,
+    pub frontier: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogOperationEntry {
+    pub operation_id: String,
+    pub kind: String,
+    pub target: String,
+    pub phase: String,
+    pub progress_pct: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogNamespaceEntry {
+    pub name: String,
+    pub owner: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogTableEntry {
+    pub namespace: String,
+    pub name: String,
+    pub schema: String,
+    pub format: String,
+    pub row_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogWorkloadEntry {
+    pub workload_id: String,
+    pub name: String,
+    pub memory_limit: String,
+    pub priority: String,
+}
+
+/// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
+#[derive(Debug, Default)]
+struct CatalogStubsInner {
+    /// Keyed by view name.
+    views: HashMap<String, CatalogView>,
+    /// Keyed by table name (from CREATE TABLE).
+    tables: HashMap<String, CatalogTable>,
+    /// Dependency map: view_name → list of view names it depends on (parsed
+    /// from `FROM`/`JOIN` clauses in CREATE VIEW SQL).
+    deps: HashMap<String, Vec<String>>,
+    /// Keyed by index name (from CREATE INDEX). v0.32.
+    indexes: HashMap<String, CatalogIndexEntry>,
+    /// Keyed by sink name (from CREATE SINK). v0.44.
+    sinks: HashMap<String, CatalogSinkEntry>,
+    /// Keyed by source name (from CREATE SOURCE). v0.51.9.
+    sources: HashMap<String, CatalogSourceEntry>,
+    /// Keyed by source name; registered/removed atomically with `sources`.
+    source_runtime: HashMap<String, CatalogSourceRuntimeEntry>,
+
+    /// Keyed by workload name.
+    workloads: HashMap<String, WorkloadDef>,
+    /// View name → workload name.
+    view_workloads: HashMap<String, String>,
+    /// View name → latest per-shard pruning statistics.
+    shard_stats: HashMap<String, Vec<ShardColumnStats>>,
+    /// Registered schemas.
+    schemas: HashSet<String>,
+    /// Registered nodes.
+    nodes: Vec<CatalogNodeEntry>,
+    /// Recorded checkpoints.
+    checkpoints: Vec<CatalogCheckpointEntry>,
+    /// Registered shards.
+    shards: Vec<CatalogShardEntry>,
+    /// Registered operations.
+    operations: Vec<CatalogOperationEntry>,
+    /// Registered namespaces.
+    namespaces: Vec<CatalogNamespaceEntry>,
+    /// Explicit catalog table entries.
+    catalog_table_entries: Vec<CatalogTableEntry>,
+    /// Explicit catalog workload entries.
+    catalog_workload_entries: Vec<CatalogWorkloadEntry>,
+}
+
+use rockstream_types::explain::ArrangementSharingInfo;
+
+/// In-memory catalog of views exposed to Postgres clients.
+///
+/// Thread-safe via interior `RwLock` so that `Arc<CatalogStubs>` can be
+/// mutated at runtime (e.g. by CREATE VIEW commands on the gateway).
+#[derive(Debug)]
+pub struct CatalogStubs {
+    inner: RwLock<CatalogStubsInner>,
+    workload_catalog: Option<Arc<WorkloadCatalog>>,
+    // Naturally bounded by the number of catalog-defined workloads.
+    workload_budgets: RwLock<HashMap<String, Arc<WorkloadBudget>>>,
+    view_budgets: RwLock<HashMap<String, Arc<StateBudget>>>,
+    view_states: RwLock<HashMap<String, ViewState>>,
+    backfills: RwLock<HashMap<String, BackfillProgress>>,
+    view_arrangements: RwLock<HashMap<String, ArrangementSharingInfo>>,
+    view_engine_facts: RwLock<HashMap<String, rockstream_types::explain::ViewEngineFacts>>,
+    /// Monotonic counter minting gateway-local `op_id`s for `CREATE INDEX`
+    /// automatic backfill (Slice 5, v0.51.2). Not derived from any real
+    /// runtime-DAG `IndexArrangeOp` — see v0.51.2 plan §2 scoping decision.
+    next_index_op_id: std::sync::atomic::AtomicU64,
+    durable_store: RwLock<Option<Arc<rockstream_storage::catalog::DurableCatalogStore>>>,
+    catalog_revision: std::sync::atomic::AtomicU64,
+    projection_cache: RwLock<HashMap<(String, Vec<String>), CatalogResponse>>,
+}
+
+const V0522_CONNECTOR_CATALOG_KEY: &[u8] = b"rockstream/catalog/connectors/v0522";
+const REMOVED_CONNECTOR_REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.";
+
+/// Exact v0.52.2 connector-catalog envelope, read by one bounded key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V0522ConnectorCatalog {
+    pub sinks: Vec<CatalogSinkEntry>,
+    pub sources: Vec<CatalogSourceEntry>,
+}
+
+impl Default for CatalogStubs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CatalogStubs {
+    pub async fn load_v0522_removed_connectors(
+        &self,
+        shard_db: &rockstream_storage::ShardDb,
+    ) -> Result<(), String> {
+        let Some(bytes) = shard_db
+            .get(V0522_CONNECTOR_CATALOG_KEY)
+            .await
+            .map_err(|error| {
+                format!(
+                    "[RS-4017] connector.removed: cannot load legacy connector catalog: {error}"
+                )
+            })?
+        else {
+            return Ok(());
+        };
+        let legacy: V0522ConnectorCatalog = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("[RS-4017] connector.removed: invalid legacy connector catalog: {error}")
+        })?;
+        for mut sink in legacy.sinks {
+            sink.state = "REMOVED".to_string();
+            self.add_sink(sink);
+        }
+        for mut source in legacy.sources {
+            if matches!(source.source_type.as_str(), "s3" | "http_webhook") {
+                source.status = "REMOVED".to_string();
+            }
+            self.add_source(source);
+        }
+        Ok(())
+    }
+
+    pub async fn seed_v0522_connector_catalog(
+        shard_db: &rockstream_storage::ShardDb,
+        catalog: &V0522ConnectorCatalog,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec(catalog).map_err(|error| error.to_string())?;
+        shard_db
+            .put(V0522_CONNECTOR_CATALOG_KEY, &bytes)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(CatalogStubsInner::default()),
+            workload_catalog: None,
+            workload_budgets: RwLock::new(HashMap::new()),
+            view_budgets: RwLock::new(HashMap::new()),
+            view_states: RwLock::new(HashMap::new()),
+            backfills: RwLock::new(HashMap::new()),
+            view_arrangements: RwLock::new(HashMap::new()),
+            view_engine_facts: RwLock::new(HashMap::new()),
+            next_index_op_id: std::sync::atomic::AtomicU64::new(1),
+            durable_store: RwLock::new(None),
+            catalog_revision: std::sync::atomic::AtomicU64::new(0),
+            projection_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub async fn with_workload_catalog(
+        workload_catalog: Arc<WorkloadCatalog>,
+    ) -> Result<Self, SqlError> {
+        let catalog = Self {
+            inner: RwLock::new(CatalogStubsInner::default()),
+            workload_catalog: Some(Arc::clone(&workload_catalog)),
+            workload_budgets: RwLock::new(HashMap::new()),
+            view_budgets: RwLock::new(HashMap::new()),
+            view_states: RwLock::new(HashMap::new()),
+            backfills: RwLock::new(HashMap::new()),
+            view_arrangements: RwLock::new(HashMap::new()),
+            view_engine_facts: RwLock::new(HashMap::new()),
+            next_index_op_id: std::sync::atomic::AtomicU64::new(1),
+            durable_store: RwLock::new(None),
+            catalog_revision: std::sync::atomic::AtomicU64::new(0),
+            projection_cache: RwLock::new(HashMap::new()),
+        };
+        let workloads = workload_catalog.load_all_workloads().await?;
+        let mut inner = catalog.inner.write().unwrap();
+        inner.workloads = workloads;
+        drop(inner);
+        Ok(catalog)
+    }
+
+    /// Return the current catalog revision.
+    pub fn get_revision(&self) -> u64 {
+        self.catalog_revision
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Set the catalog revision and invalidate projection caches.
+    pub fn set_revision(&self, rev: u64) {
+        self.catalog_revision
+            .store(rev, std::sync::atomic::Ordering::SeqCst);
+        self.projection_cache.write().unwrap().clear();
+    }
+
+    /// Invalidate all system catalog projection caches and advance revision.
+    pub fn invalidate_projection_caches(&self) {
+        self.catalog_revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.projection_cache.write().unwrap().clear();
+    }
+
+    /// Attach a durable catalog store.
+    pub fn set_durable_store(&self, store: Arc<rockstream_storage::catalog::DurableCatalogStore>) {
+        *self.durable_store.write().unwrap() = Some(store);
+    }
+
+    /// Retrieve the attached durable catalog store.
+    pub fn get_durable_store(
+        &self,
+    ) -> Option<Arc<rockstream_storage::catalog::DurableCatalogStore>> {
+        self.durable_store.read().unwrap().clone()
+    }
+
+    /// Reconstruct gateway catalog state from the attached durable catalog store.
+    pub async fn sync_from_durable_store(&self) -> Result<(), String> {
+        let Some(store) = self.get_durable_store() else {
+            return Ok(());
+        };
+        use rockstream_storage::catalog::CatalogStore;
+        let rev = store.get_revision().await;
+        self.catalog_revision
+            .store(rev, std::sync::atomic::Ordering::SeqCst);
+
+        let tables = store.list_tables().await.map_err(|e| e.to_string())?;
+        let views = store.list_views().await.map_err(|e| e.to_string())?;
+        let indexes = store.list_indexes().await.map_err(|e| e.to_string())?;
+        let workloads = store.list_workloads().await.map_err(|e| e.to_string())?;
+        let sources = store.list_sources().await.map_err(|e| e.to_string())?;
+        let sinks = store.list_sinks().await.map_err(|e| e.to_string())?;
+
+        let mut inner = self.inner.write().unwrap();
+        inner.tables.clear();
+        let mut table_id_to_name = std::collections::HashMap::new();
+        for t in tables {
+            table_id_to_name.insert(t.id, t.name.clone());
+            let cols = t
+                .columns
+                .into_iter()
+                .map(|c| CatalogColumn {
+                    name: c.name,
+                    data_type: c.data_type,
+                })
+                .collect();
+            inner.tables.insert(
+                t.name.clone(),
+                CatalogTable {
+                    name: t.name,
+                    columns: cols,
+                    pk_cols: t.pk_cols,
+                },
+            );
+        }
+        inner.views.clear();
+        for v in views {
+            let cols = v
+                .columns
+                .into_iter()
+                .map(|c| CatalogColumn {
+                    name: c.name,
+                    data_type: c.data_type,
+                })
+                .collect();
+            inner.views.insert(
+                v.name.clone(),
+                CatalogView {
+                    name: v.name,
+                    sql: v.sql,
+                    columns: cols,
+                    namespace: "public".to_string(),
+                    op_id: v.op_id,
+                },
+            );
+        }
+        inner.indexes.clear();
+        for idx in indexes {
+            let state = match idx.state {
+                rockstream_storage::catalog::CatalogIndexState::Building => {
+                    CatalogIndexState::Building
+                }
+                rockstream_storage::catalog::CatalogIndexState::Ready => CatalogIndexState::Ready,
+            };
+            let table_name = table_id_to_name
+                .get(&idx.table_id)
+                .cloned()
+                .unwrap_or_else(|| format!("table_{}", idx.table_id));
+            inner.indexes.insert(
+                idx.name.clone(),
+                CatalogIndexEntry {
+                    name: idx.name,
+                    table: table_name,
+                    index_cols: idx.index_cols,
+                    state,
+                    op_id: idx.op_id,
+                },
+            );
+        }
+        inner.workloads.clear();
+        for w in workloads {
+            inner.workloads.insert(w.name.clone(), w);
+        }
+        inner.sources.clear();
+        inner.source_runtime.clear();
+        for s in sources {
+            inner.sources.insert(
+                s.name.clone(),
+                CatalogSourceEntry {
+                    name: s.name.clone(),
+                    table_name: s.table_name,
+                    source_type: s.connector_type,
+                    options: s.options,
+                    format: "json".to_string(),
+                    status: "RUNNING".to_string(),
+                    live_offset: "0".to_string(),
+                    live_lag: 0,
+                },
+            );
+            inner.source_runtime.insert(
+                s.name,
+                CatalogSourceRuntimeEntry {
+                    status: "RUNNING".to_string(),
+                    live_offset: "0".to_string(),
+                    live_lag: 0,
+                    owner: Some("gateway:pending".to_string()),
+                    committed_checkpoint: 0,
+                    buffer_fill: 0,
+                    blocked_reason: None,
+                    source_identity_hash: None,
+                    active_xid: None,
+                    envelope_bytes: 0,
+                    in_memory_bytes: 0,
+                    spill_bytes: 0,
+                    attached_view_count: 0,
+                    affected_view_count: 0,
+                    relation_schema_version: 0,
+                },
+            );
+        }
+        inner.sinks.clear();
+        for s in sinks {
+            inner.sinks.insert(
+                s.name.clone(),
+                CatalogSinkEntry {
+                    name: s.name.clone(),
+                    view: s.target.clone(),
+                    format: "parquet".to_string(),
+                    path: s.target,
+                    snapshot_interval_epochs: None,
+                    snapshot_interval_ms: None,
+                    parquet_row_group_bytes: None,
+                    format_version: None,
+                    partition_by: vec![],
+                    catalog: "memory".to_string(),
+                    last_snapshot_epoch: None,
+                    state: "OK".to_string(),
+                },
+            );
+        }
+        drop(inner);
+        self.projection_cache.write().unwrap().clear();
+        Ok(())
+    }
+
+    /// Persist mutations to the durable catalog store if attached.
+    pub fn persist_mutations(&self, mutations: Vec<rockstream_storage::catalog::CatalogMutation>) {
+        if let Some(store) = self.get_durable_store() {
+            let rev = self
+                .catalog_revision
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if let Ok(txn) = rockstream_storage::catalog::CatalogTxn::new(rev, rev, mutations) {
+                use rockstream_storage::catalog::CatalogStore;
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    match handle.runtime_flavor() {
+                        tokio::runtime::RuntimeFlavor::MultiThread => {
+                            tokio::task::block_in_place(|| {
+                                handle.block_on(async {
+                                    let _ = store.commit_txn(txn).await;
+                                })
+                            });
+                        }
+                        _ => {
+                            let store_clone = store.clone();
+                            handle.spawn(async move {
+                                let _ = store_clone.commit_txn(txn).await;
+                            });
+                        }
+                    }
+                } else {
+                    futures::executor::block_on(async {
+                        let _ = store.commit_txn(txn).await;
+                    });
+                }
+            }
+        }
+    }
+
+    /// Mints a fresh monotonic `op_id` for a gateway-local index arrangement
+    /// backfilled by `CREATE INDEX` (Slice 5, v0.51.2).
+    pub fn mint_index_op_id(&self) -> u64 {
+        self.next_index_op_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Register a view in the catalog without dependency tracking.
+    pub fn add_view(&self, view: CatalogView) {
+        self.add_view_with_deps(view, vec![]);
+    }
+
+    /// Register a view with an explicit dependency list.
+    ///
+    /// Does **not** perform cycle detection — use
+    /// [`detect_cycle_with_new_view`] first if needed.
+    pub fn add_view_with_deps(&self, view: CatalogView, deps: Vec<String>) {
+        let mut inner = self.inner.write().unwrap();
+        self.view_states
+            .write()
+            .unwrap()
+            .entry(view.name.clone())
+            .or_insert(ViewState::Running);
+        inner.deps.insert(view.name.clone(), deps.clone());
+        inner.views.insert(view.name.clone(), view.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+
+        let cols = view
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| rockstream_storage::catalog::CatalogColumn {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: true,
+                ordinal: (i + 1) as u32,
+            })
+            .collect();
+        let vid = rockstream_types::ids::ViewId(rockstream_storage::catalog::stable_name_id(
+            "view", &view.name,
+        ));
+        let cat_view = rockstream_storage::catalog::CatalogView {
+            id: vid,
+            name: view.name.clone(),
+            namespace_id: rockstream_types::ids::NamespaceId(1),
+            sql: view.sql.clone(),
+            compiled_plan_id: None,
+            op_id: view.op_id,
+            columns: cols,
+        };
+        let mut mutations = vec![rockstream_storage::catalog::CatalogMutation::PutView(
+            cat_view,
+        )];
+        for dep in &deps {
+            let child_id = self
+                .get_table(dep)
+                .map(|t| rockstream_storage::catalog::stable_name_id("table", &t.name))
+                .or_else(|| {
+                    self.get_view(dep)
+                        .map(|v| rockstream_storage::catalog::stable_name_id("view", &v.name))
+                })
+                .unwrap_or(0);
+            mutations.push(
+                rockstream_storage::catalog::CatalogMutation::PutViewDependency(
+                    rockstream_storage::catalog::ViewDependency {
+                        parent_id: vid.0,
+                        child_id,
+                        dependency_kind: rockstream_storage::catalog::DependencyKind::Table,
+                    },
+                ),
+            );
+        }
+        self.persist_mutations(mutations);
+    }
+
+    /// Register a view that already has its namespace set.
+    pub fn add_view_in_namespace(&self, view: CatalogView) {
+        self.add_view_with_deps(view, vec![]);
+    }
+
+    /// List all registered views.
+    pub fn list_views(&self) -> Vec<CatalogView> {
+        let inner = self.inner.read().unwrap();
+        let mut v: Vec<CatalogView> = inner.views.values().cloned().collect();
+        v.sort_by_key(|v| v.name.clone());
+        v
+    }
+
+    /// Look up a view by name, cloning the entry.
+    pub fn get_view(&self, name: &str) -> Option<CatalogView> {
+        let inner = self.inner.read().unwrap();
+        inner.views.get(name).cloned()
+    }
+
+    /// Remove a view from the catalog (DROP VIEW).
+    pub fn remove_view(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        self.view_states.write().unwrap().remove(name);
+        self.view_arrangements.write().unwrap().remove(name);
+        self.view_engine_facts.write().unwrap().remove(name);
+        let removed = inner.views.remove(name).is_some();
+        drop(inner);
+        if removed {
+            self.invalidate_projection_caches();
+            let vid = rockstream_types::ids::ViewId(rockstream_storage::catalog::stable_name_id(
+                "view", name,
+            ));
+            self.persist_mutations(vec![
+                rockstream_storage::catalog::CatalogMutation::DeleteView(vid),
+            ]);
+        }
+        removed
+    }
+
+    /// Set arrangement sharing metadata for a view.
+    pub fn set_view_arrangement_sharing(&self, view_name: &str, info: ArrangementSharingInfo) {
+        self.view_arrangements
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), info);
+    }
+
+    /// Retrieve arrangement sharing metadata for a view.
+    pub fn get_view_arrangement_sharing(&self, view_name: &str) -> Option<ArrangementSharingInfo> {
+        self.view_arrangements
+            .read()
+            .unwrap()
+            .get(view_name)
+            .cloned()
+    }
+
+    /// List all view arrangement sharing entries.
+    pub fn list_view_arrangements(&self) -> Vec<(String, ArrangementSharingInfo)> {
+        self.view_arrangements
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Set raw engine facts for a view (OBS-03).
+    pub fn set_view_engine_facts(
+        &self,
+        view_name: &str,
+        facts: rockstream_types::explain::ViewEngineFacts,
+    ) {
+        self.view_engine_facts
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), facts);
+    }
+
+    /// Retrieve raw engine facts for a view.
+    pub fn get_view_engine_facts(
+        &self,
+        view_name: &str,
+    ) -> Option<rockstream_types::explain::ViewEngineFacts> {
+        self.view_engine_facts
+            .read()
+            .unwrap()
+            .get(view_name)
+            .cloned()
+    }
+
+    pub fn add_node(&self, node: CatalogNodeEntry) {
+        self.inner.write().unwrap().nodes.push(node);
+    }
+
+    pub fn record_checkpoint(&self, checkpoint: CatalogCheckpointEntry) {
+        self.inner.write().unwrap().checkpoints.push(checkpoint);
+    }
+
+    pub fn list_nodes(&self) -> Vec<CatalogNodeEntry> {
+        let nodes = self.inner.read().unwrap().nodes.clone();
+        if nodes.is_empty() {
+            vec![CatalogNodeEntry {
+                node_id: "node-1".to_string(),
+                worker_id: "worker-0".to_string(),
+                role: "all".to_string(),
+                address: "127.0.0.1:5432".to_string(),
+                state: "ONLINE".to_string(),
+                lease_count: 1,
+                memory_budget_bytes: 1073741824,
+                last_heartbeat_at: "2026-08-24T10:00:00Z".to_string(),
+            }]
+        } else {
+            nodes
+        }
+    }
+
+    pub fn list_checkpoints(&self) -> Vec<CatalogCheckpointEntry> {
+        let checkpoints = self.inner.read().unwrap().checkpoints.clone();
+        if checkpoints.is_empty() {
+            vec![CatalogCheckpointEntry {
+                checkpoint_id: 1,
+                committed_at: "2026-08-24T10:00:00Z".to_string(),
+                epoch_number: 1,
+                frontier: "[1]".to_string(),
+                storage_path: "s3://bucket/checkpoints/chk-1".to_string(),
+                duration_ms: 45,
+            }]
+        } else {
+            checkpoints
+        }
+    }
+
+    pub fn add_shard(&self, shard: CatalogShardEntry) {
+        self.inner.write().unwrap().shards.push(shard);
+    }
+
+    pub fn list_shards(&self) -> Vec<CatalogShardEntry> {
+        let shards = self.inner.read().unwrap().shards.clone();
+        if shards.is_empty() {
+            vec![CatalogShardEntry {
+                shard_id: 1,
+                view_id: "default_view".to_string(),
+                worker_id: "worker-0".to_string(),
+                state: "READY".to_string(),
+                frontier: 0,
+            }]
+        } else {
+            shards
+        }
+    }
+
+    pub fn add_operation(&self, operation: CatalogOperationEntry) {
+        self.inner.write().unwrap().operations.push(operation);
+    }
+
+    pub fn list_operations(&self) -> Vec<CatalogOperationEntry> {
+        let ops = self.inner.read().unwrap().operations.clone();
+        if ops.is_empty() {
+            vec![CatalogOperationEntry {
+                operation_id: "op-bootstrap-0".to_string(),
+                kind: "bootstrap".to_string(),
+                target: "system".to_string(),
+                phase: "COMPLETED".to_string(),
+                progress_pct: 100,
+            }]
+        } else {
+            ops
+        }
+    }
+
+    pub fn add_namespace(&self, namespace: CatalogNamespaceEntry) {
+        self.inner.write().unwrap().namespaces.push(namespace);
+    }
+
+    pub fn list_namespaces(&self) -> Vec<CatalogNamespaceEntry> {
+        let inner = self.inner.read().unwrap();
+        if !inner.namespaces.is_empty() {
+            return inner.namespaces.clone();
+        }
+        let mut res = vec![CatalogNamespaceEntry {
+            name: "public".to_string(),
+            owner: "rockstream".to_string(),
+            created_at: "2026-01-01 00:00:00+00".to_string(),
+        }];
+        for schema in &inner.schemas {
+            if schema != "public" {
+                res.push(CatalogNamespaceEntry {
+                    name: schema.clone(),
+                    owner: "rockstream".to_string(),
+                    created_at: "2026-01-01 00:00:00+00".to_string(),
+                });
+            }
+        }
+        res
+    }
+
+    pub fn add_catalog_table_entry(&self, entry: CatalogTableEntry) {
+        self.inner
+            .write()
+            .unwrap()
+            .catalog_table_entries
+            .push(entry);
+    }
+
+    pub fn list_catalog_table_entries(&self) -> Vec<CatalogTableEntry> {
+        let inner = self.inner.read().unwrap();
+        if !inner.catalog_table_entries.is_empty() {
+            return inner.catalog_table_entries.clone();
+        }
+        if inner.tables.is_empty() {
+            return vec![CatalogTableEntry {
+                namespace: "public".to_string(),
+                name: "system_info".to_string(),
+                schema: "default".to_string(),
+                format: "row".to_string(),
+                row_count: 0,
+            }];
+        }
+        inner
+            .tables
+            .values()
+            .map(|t| CatalogTableEntry {
+                namespace: "public".to_string(),
+                name: t.name.clone(),
+                schema: "default".to_string(),
+                format: "row".to_string(),
+                row_count: 0,
+            })
+            .collect()
+    }
+
+    pub fn add_catalog_workload_entry(&self, entry: CatalogWorkloadEntry) {
+        self.inner
+            .write()
+            .unwrap()
+            .catalog_workload_entries
+            .push(entry);
+    }
+
+    pub fn list_catalog_workload_entries(&self) -> Vec<CatalogWorkloadEntry> {
+        let inner = self.inner.read().unwrap();
+        if !inner.catalog_workload_entries.is_empty() {
+            return inner.catalog_workload_entries.clone();
+        }
+        if inner.workloads.is_empty() {
+            return vec![CatalogWorkloadEntry {
+                workload_id: "wl_default".to_string(),
+                name: "default".to_string(),
+                memory_limit: "unlimited".to_string(),
+                priority: "Normal".to_string(),
+            }];
+        }
+        inner
+            .workloads
+            .values()
+            .map(|w| CatalogWorkloadEntry {
+                workload_id: format!("wl_{}", w.name),
+                name: w.name.clone(),
+                memory_limit: w
+                    .memory_limit
+                    .as_ref()
+                    .map(|l| format!("{:?}", l))
+                    .unwrap_or_else(|| "unlimited".to_string()),
+                priority: format!("{:?}", w.priority),
+            })
+            .collect()
+    }
+
+    pub fn add_workload(&self, workload: WorkloadDef) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.workloads.contains_key(&workload.name) {
+            return false;
+        }
+        inner
+            .workloads
+            .insert(workload.name.clone(), workload.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutWorkload(workload),
+        ]);
+        true
+    }
+
+    pub fn update_workload(&self, workload: WorkloadDef) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if !inner.workloads.contains_key(&workload.name) {
+            return false;
+        }
+        inner
+            .workloads
+            .insert(workload.name.clone(), workload.clone());
+        self.workload_budgets
+            .write()
+            .unwrap()
+            .remove(&workload.name);
+        drop(inner);
+        self.invalidate_projection_caches();
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutWorkload(workload),
+        ]);
+        true
+    }
+
+    pub fn remove_workload(&self, workload_name: &str) -> bool {
+        let removed = {
+            let mut inner = self.inner.write().unwrap();
+            inner.workloads.remove(workload_name).is_some()
+        };
+        if !removed {
+            return false;
+        }
+        self.workload_budgets.write().unwrap().remove(workload_name);
+        self.invalidate_projection_caches();
+        let wid = rockstream_types::ids::WorkloadId(rockstream_storage::catalog::stable_name_id(
+            "workload",
+            workload_name,
+        ));
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::DeleteWorkload(wid),
+        ]);
+        true
+    }
+
+    pub async fn add_workload_async(&self, workload: WorkloadDef) -> Result<bool, SqlError> {
+        if !self.add_workload(workload.clone()) {
+            return Ok(false);
+        }
+        if let Some(catalog) = &self.workload_catalog {
+            if let Err(error) = catalog.register_workload(&workload).await {
+                let mut inner = self.inner.write().unwrap();
+                inner.workloads.remove(&workload.name);
+                return Err(error);
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn update_workload_async(&self, workload: WorkloadDef) -> Result<bool, SqlError> {
+        if !self.update_workload(workload.clone()) {
+            return Ok(false);
+        }
+        if let Some(catalog) = &self.workload_catalog {
+            catalog.update_workload(&workload).await?;
+        }
+        Ok(true)
+    }
+
+    pub async fn remove_workload_async(&self, workload_name: &str) -> Result<bool, SqlError> {
+        if !self.remove_workload(workload_name) {
+            return Ok(false);
+        }
+        if let Some(catalog) = &self.workload_catalog {
+            catalog.remove_workload(workload_name).await?;
+        }
+        Ok(true)
+    }
+
+    pub fn get_workload(&self, name: &str) -> Option<WorkloadDef> {
+        let inner = self.inner.read().unwrap();
+        inner.workloads.get(name).cloned()
+    }
+
+    pub fn list_workloads(&self) -> Vec<WorkloadDef> {
+        let inner = self.inner.read().unwrap();
+        let mut workloads: Vec<WorkloadDef> = inner.workloads.values().cloned().collect();
+        workloads.sort_by(|a, b| a.name.cmp(&b.name));
+        workloads
+    }
+
+    pub fn assign_view_workload(&self, view_name: &str, workload_name: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner
+            .view_workloads
+            .insert(view_name.to_string(), workload_name.to_string());
+    }
+
+    pub fn workload_for_view(&self, view_name: &str) -> Option<String> {
+        let inner = self.inner.read().unwrap();
+        inner.view_workloads.get(view_name).cloned()
+    }
+
+    /// Register a table in the catalog.
+    ///
+    /// If the table already exists, the call is idempotent only when the caller
+    /// handles `IF NOT EXISTS` logic. Returns `true` if a new table was inserted,
+    /// `false` if a table with the same name already existed.
+    pub fn add_table(&self, table: CatalogTable) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.tables.contains_key(&table.name) {
+            return false;
+        }
+        inner.tables.insert(table.name.clone(), table.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+
+        let cols = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| rockstream_storage::catalog::CatalogColumn {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: true,
+                ordinal: (i + 1) as u32,
+            })
+            .collect();
+        let tid = rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
+            "table",
+            &table.name,
+        ));
+        let cat_table = rockstream_storage::catalog::CatalogTable {
+            id: tid,
+            name: table.name.clone(),
+            namespace_id: rockstream_types::ids::NamespaceId(1),
+            columns: cols,
+            pk_cols: table.pk_cols.clone(),
+        };
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutTable(cat_table),
+        ]);
+        true
+    }
+
+    /// Update the column list for an existing view (called after materialisation).
+    pub fn update_view_columns(&self, view_name: &str, columns: Vec<CatalogColumn>) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(v) = inner.views.get_mut(view_name) {
+            v.columns = columns;
+        }
+        drop(inner);
+        self.invalidate_projection_caches();
+    }
+
+    pub fn update_table_columns(&self, table_name: &str, columns: Vec<CatalogColumn>) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(table) = inner.tables.get_mut(table_name) {
+            table.columns = columns;
+        }
+        drop(inner);
+        self.invalidate_projection_caches();
+    }
+
+    /// Set the `OperatorId` (as u64) of the compiled `ViewSinkOp` backing a
+    /// view (v0.51.3 Slice 4). Called by `handle_create_view` once
+    /// `rockstream_ops::compile_plan` succeeds for the view's SELECT.
+    pub fn set_view_op_id(&self, view_name: &str, op_id: u64) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(v) = inner.views.get_mut(view_name) {
+            v.op_id = Some(op_id);
+            return true;
+        }
+        false
+    }
+
+    /// Return the dependency list for a specific view.
+    pub fn get_view_deps(&self, view_name: &str) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        inner.deps.get(view_name).cloned().unwrap_or_default()
+    }
+
+    /// Look up a table by name, cloning the entry.
+    pub fn get_table(&self, name: &str) -> Option<CatalogTable> {
+        let inner = self.inner.read().unwrap();
+        inner.tables.get(name).cloned()
+    }
+
+    /// List all registered tables.
+    pub fn list_tables(&self) -> Vec<CatalogTable> {
+        let inner = self.inner.read().unwrap();
+        let mut v: Vec<CatalogTable> = inner.tables.values().cloned().collect();
+        v.sort_by_key(|t| t.name.clone());
+        v
+    }
+
+    /// Remove a table from the catalog (DROP TABLE).
+    pub fn remove_table(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let removed = inner.tables.remove(name).is_some();
+        drop(inner);
+        if removed {
+            self.invalidate_projection_caches();
+            let tid = rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
+                "table", name,
+            ));
+            self.persist_mutations(vec![
+                rockstream_storage::catalog::CatalogMutation::DeleteTable(tid),
+            ]);
+        }
+        removed
+    }
+
+    /// Add a schema to the catalog (CREATE SCHEMA).
+    pub fn add_schema(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.schemas.contains(name) || name.eq_ignore_ascii_case("public") {
+            return false;
+        }
+        inner.schemas.insert(name.to_string());
+        drop(inner);
+        self.invalidate_projection_caches();
+        true
+    }
+
+    /// Remove a schema from the catalog (DROP SCHEMA).
+    pub fn remove_schema(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let removed = inner.schemas.remove(name);
+        drop(inner);
+        self.invalidate_projection_caches();
+        removed
+    }
+
+    /// Check if a schema exists in the catalog.
+    pub fn has_schema(&self, name: &str) -> bool {
+        if name.eq_ignore_ascii_case("public") {
+            return true;
+        }
+        let inner = self.inner.read().unwrap();
+        inner.schemas.contains(name)
+    }
+
+    /// Check whether adding a new view with the given dependencies would
+    /// introduce a cycle.
+    ///
+    /// Returns `Some((view_name, cycle_path))` if a cycle is detected,
+    /// `None` if the new view is acyclic.
+    pub fn detect_cycle_with_new_view(
+        &self,
+        new_name: &str,
+        new_deps: &[String],
+    ) -> Option<(String, Vec<String>)> {
+        let inner = self.inner.read().unwrap();
+        let mut all_deps = inner.deps.clone();
+        all_deps.insert(new_name.to_string(), new_deps.to_vec());
+
+        // DFS: can we reach `new_name` starting from any of its deps?
+        fn can_reach(
+            target: &str,
+            current: &str,
+            all_deps: &HashMap<String, Vec<String>>,
+            visited: &mut HashSet<String>,
+            path: &mut Vec<String>,
+        ) -> bool {
+            if current == target {
+                return true;
+            }
+            if visited.contains(current) {
+                return false;
+            }
+            visited.insert(current.to_string());
+            path.push(current.to_string());
+            if let Some(dep_list) = all_deps.get(current) {
+                for dep in dep_list {
+                    if can_reach(target, dep, all_deps, visited, path) {
+                        return true;
+                    }
+                }
+            }
+            path.pop();
+            false
+        }
+
+        for dep in new_deps {
+            let mut visited = HashSet::new();
+            let mut path = vec![new_name.to_string()];
+            if can_reach(new_name, dep, &all_deps, &mut visited, &mut path) {
+                path.push(dep.to_string());
+                return Some((new_name.to_string(), path));
+            }
+        }
+        None
+    }
+
+    // ── Index catalog (v0.32 pgwire DDL wiring) ───────────────────────────────
+
+    /// Register a new index in Building state. Returns `false` if an index
+    /// with the same name and a different table already exists (RS-2016).
+    pub fn add_index(&self, entry: CatalogIndexEntry) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(existing) = inner.indexes.get(&entry.name) {
+            if existing.table != entry.table {
+                return false;
+            }
+        }
+        inner.indexes.insert(entry.name.clone(), entry.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+
+        let iid = rockstream_types::ids::IndexId(rockstream_storage::catalog::stable_name_id(
+            "index",
+            &entry.name,
+        ));
+        let tid = rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
+            "table",
+            &entry.table,
+        ));
+        let cat_idx = rockstream_storage::catalog::CatalogIndexEntry {
+            id: iid,
+            name: entry.name.clone(),
+            table_id: tid,
+            index_cols: entry.index_cols.clone(),
+            pk_cols: vec![],
+            state: match entry.state {
+                CatalogIndexState::Building => {
+                    rockstream_storage::catalog::CatalogIndexState::Building
+                }
+                CatalogIndexState::Ready => rockstream_storage::catalog::CatalogIndexState::Ready,
+            },
+            op_id: entry.op_id,
+        };
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutIndex(cat_idx),
+        ]);
+        true
+    }
+
+    /// Look up an index by name.
+    pub fn get_index(&self, name: &str) -> Option<CatalogIndexEntry> {
+        let inner = self.inner.read().unwrap();
+        inner.indexes.get(name).cloned()
+    }
+
+    /// Remove an index entry (DROP INDEX).
+    pub fn remove_index(&self, name: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.indexes.remove(name);
+        drop(inner);
+        self.invalidate_projection_caches();
+        let iid = rockstream_types::ids::IndexId(rockstream_storage::catalog::stable_name_id(
+            "index", name,
+        ));
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::DeleteIndex(iid),
+        ]);
+    }
+
+    /// Transition an existing index back to Building state (REBUILD INDEX).
+    /// Returns `false` if the index does not exist.
+    pub fn rebuild_index(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(entry) = inner.indexes.get_mut(name) {
+            entry.state = CatalogIndexState::Building;
+            return true;
+        }
+        false
+    }
+
+    /// Transition an existing index to Ready state and record its `op_id`.
+    /// Returns `false` if the index does not exist.
+    pub fn mark_index_ready(&self, name: &str, op_id: u64) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(entry) = inner.indexes.get_mut(name) {
+            entry.state = CatalogIndexState::Ready;
+            entry.op_id = Some(op_id);
+            return true;
+        }
+        false
+    }
+
+    /// List all registered index names.
+    pub fn list_index_names(&self) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        let mut names: Vec<String> = inner.indexes.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// List all registered indexes.
+    pub fn list_indexes(&self) -> Vec<CatalogIndexEntry> {
+        let inner = self.inner.read().unwrap();
+        let mut idxs: Vec<CatalogIndexEntry> = inner.indexes.values().cloned().collect();
+        idxs.sort_by(|a, b| a.name.cmp(&b.name));
+        idxs
+    }
+
+    pub fn set_shard_stats(&self, view_name: &str, stats: Vec<ShardColumnStats>) {
+        let mut inner = self.inner.write().unwrap();
+        inner.shard_stats.insert(view_name.to_lowercase(), stats);
+    }
+
+    pub fn shard_stats(&self, view_name: &str) -> Vec<ShardColumnStats> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .shard_stats
+            .get(&view_name.to_lowercase())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Register a new sink. Returns `false` if a sink with the same name and a
+    /// different view already exists.
+    pub fn add_sink(&self, entry: CatalogSinkEntry) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(existing) = inner.sinks.get(&entry.name) {
+            if existing.view != entry.view {
+                return false;
+            }
+        }
+        inner.sinks.insert(entry.name.clone(), entry);
+        true
+    }
+
+    /// Look up a sink by name.
+    pub fn get_sink(&self, name: &str) -> Option<CatalogSinkEntry> {
+        let inner = self.inner.read().unwrap();
+        inner.sinks.get(name).cloned()
+    }
+
+    /// Remove a sink entry (DROP SINK in a later slice).
+    pub fn remove_sink(&self, name: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.sinks.remove(name);
+    }
+
+    /// List all registered sinks.
+    pub fn list_sinks(&self) -> Vec<CatalogSinkEntry> {
+        let inner = self.inner.read().unwrap();
+        let mut sinks: Vec<CatalogSinkEntry> = inner.sinks.values().cloned().collect();
+        sinks.sort_by(|a, b| a.name.cmp(&b.name));
+        sinks
+    }
+
+    // ── Source catalog (v0.51.9 pgwire DDL wiring) ───────────────────────────
+
+    /// Register a new source. Returns `false` if a source with the same name already exists.
+    pub fn add_source(&self, entry: CatalogSourceEntry) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.sources.contains_key(&entry.name) {
+            return false;
+        }
+        inner.source_runtime.insert(
+            entry.name.clone(),
+            CatalogSourceRuntimeEntry {
+                status: entry.status.clone(),
+                live_offset: entry.live_offset.clone(),
+                live_lag: entry.live_lag,
+                owner: Some("gateway:pending".to_string()),
+                committed_checkpoint: 0,
+                buffer_fill: 0,
+                blocked_reason: None,
+                source_identity_hash: None,
+                active_xid: None,
+                envelope_bytes: 0,
+                in_memory_bytes: 0,
+                spill_bytes: 0,
+                attached_view_count: 0,
+                affected_view_count: 0,
+                relation_schema_version: 0,
+            },
+        );
+        inner.sources.insert(entry.name.clone(), entry.clone());
+        drop(inner);
+        self.invalidate_projection_caches();
+
+        let sid = rockstream_types::ids::SourceId(rockstream_storage::catalog::stable_name_id(
+            "source",
+            &entry.name,
+        ));
+        let cat_source = rockstream_storage::catalog::CatalogSourceEntry {
+            id: sid,
+            name: entry.name.clone(),
+            connector_type: entry.source_type.clone(),
+            table_name: entry.table_name.clone(),
+            options: entry.options.clone(),
+        };
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutSource(cat_source),
+        ]);
+        true
+    }
+
+    /// Look up a source by name.
+    pub fn get_source(&self, name: &str) -> Option<CatalogSourceEntry> {
+        let inner = self.inner.read().unwrap();
+        let mut source = inner.sources.get(name)?.clone();
+        let runtime = inner.source_runtime.get(name)?;
+        source.status = runtime.status.clone();
+        source.live_offset = runtime.live_offset.clone();
+        source.live_lag = runtime.live_lag;
+        Some(source)
+    }
+
+    /// Return the bound source table schema, if this source was created after
+    /// a same-named table.
+    pub fn source_table(&self, name: &str) -> Option<CatalogTable> {
+        let inner = self.inner.read().unwrap();
+        let source = inner.sources.get(name)?;
+        inner.tables.get(source.table_name.as_ref()?).cloned()
+    }
+
+    /// Update the status of an existing source ("OK", "PAUSED").
+    pub fn update_source_status(&self, name: &str, status: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.sources.contains_key(name) {
+            let runtime = inner
+                .source_runtime
+                .get_mut(name)
+                .expect("EDGE-SOURCE-RUNTIME: every catalog source has runtime state");
+            runtime.status = status.to_string();
+            if status == "PAUSED" {
+                runtime.owner = None;
+                runtime.blocked_reason = Some("paused by operator".to_string());
+            } else {
+                runtime.owner = Some("gateway:pending".to_string());
+                runtime.blocked_reason = None;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Publish live connector progress without exposing source credentials.
+    pub fn update_source_runtime(&self, name: &str, offset: String, lag: u64) -> bool {
+        self.update_source_runtime_detail(name, None, None, offset, lag, None, None)
+    }
+
+    /// Publish an exact live runtime projection. Checkpoint tokens and source
+    /// credentials are deliberately absent: they are durable/runtime secrets,
+    /// not operator-visible status values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_source_runtime_detail(
+        &self,
+        name: &str,
+        owner: Option<String>,
+        committed_checkpoint: Option<u64>,
+        offset: String,
+        lag: u64,
+        buffer_fill: Option<usize>,
+        blocked_reason: Option<String>,
+    ) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let Some(runtime) = inner.source_runtime.get_mut(name) else {
+            return false;
+        };
+        if let Some(owner) = owner {
+            runtime.owner = Some(owner);
+        }
+        if let Some(committed_checkpoint) = committed_checkpoint {
+            runtime.committed_checkpoint = committed_checkpoint;
+        }
+        runtime.live_offset = offset;
+        runtime.live_lag = lag;
+        if let Some(buffer_fill) = buffer_fill {
+            runtime.buffer_fill = buffer_fill;
+        }
+        runtime.blocked_reason = blocked_reason;
+        true
+    }
+
+    pub fn update_pgoutput_source_runtime(
+        &self,
+        name: &str,
+        detail: PgOutputSourceRuntimeDetail,
+    ) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let Some(runtime) = inner.source_runtime.get_mut(name) else {
+            return false;
+        };
+        runtime.source_identity_hash = Some(detail.source_identity_hash);
+        runtime.active_xid = detail.active_xid;
+        runtime.envelope_bytes = detail.envelope_bytes;
+        runtime.in_memory_bytes = detail.in_memory_bytes;
+        runtime.spill_bytes = detail.spill_bytes;
+        runtime.attached_view_count = detail.attached_view_count;
+        runtime.affected_view_count = detail.affected_view_count;
+        runtime.relation_schema_version = detail.relation_schema_version;
+        true
+    }
+
+    /// Remove a source entry (DROP SOURCE).
+    pub fn remove_source(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let removed = inner.sources.remove(name).is_some();
+        let runtime_removed = inner.source_runtime.remove(name).is_some();
+        assert_eq!(
+            removed, runtime_removed,
+            "EDGE-SOURCE-RUNTIME: catalog and runtime source removal must be atomic"
+        );
+        drop(inner);
+        if removed {
+            self.invalidate_projection_caches();
+            let sid = rockstream_types::ids::SourceId(rockstream_storage::catalog::stable_name_id(
+                "source", name,
+            ));
+            self.persist_mutations(vec![
+                rockstream_storage::catalog::CatalogMutation::DeleteSource(sid),
+            ]);
+        }
+        removed
+    }
+
+    /// List all registered sources.
+    pub fn list_sources(&self) -> Vec<CatalogSourceEntry> {
+        let inner = self.inner.read().unwrap();
+        let mut sources: Vec<CatalogSourceEntry> = inner
+            .sources
+            .values()
+            .map(|source| {
+                let mut source = source.clone();
+                let runtime = inner
+                    .source_runtime
+                    .get(&source.name)
+                    .expect("EDGE-SOURCE-RUNTIME: every catalog source has runtime state");
+                source.status = runtime.status.clone();
+                source.live_offset = runtime.live_offset.clone();
+                source.live_lag = runtime.live_lag;
+                source
+            })
+            .collect();
+        sources.sort_by(|a, b| a.name.cmp(&b.name));
+        sources
+    }
+
+    pub fn sources_response(&self) -> CatalogResponse {
+        let sources = self.list_sources();
+        let rows = sources
+            .into_iter()
+            .map(|s| {
+                vec![
+                    Some(s.name),
+                    Some(s.source_type),
+                    Some(s.format),
+                    Some(s.status.clone()),
+                    Some(s.live_offset),
+                    Some(s.live_lag.to_string()),
+                    (s.status == "REMOVED").then(|| REMOVED_CONNECTOR_REMEDIATION.to_string()),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: show_sources_columns(),
+            rows,
+        }
+    }
+
+    pub fn sinks_response(&self) -> CatalogResponse {
+        let rows = self
+            .list_sinks()
+            .into_iter()
+            .map(|sink| {
+                vec![
+                    Some(sink.name),
+                    Some(sink.format),
+                    Some(sink.path),
+                    Some(sink.catalog),
+                    Some(sink.state.clone()),
+                    (sink.state == "REMOVED").then(|| REMOVED_CONNECTOR_REMEDIATION.to_string()),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: show_sinks_columns(),
+            rows,
+        }
+    }
+
+    pub fn source_status_response(&self, name_filter: Option<&str>) -> CatalogResponse {
+        let sources = self.list_sources();
+        let rows = sources
+            .into_iter()
+            .filter(|s| match name_filter {
+                Some(name) => s.name.eq_ignore_ascii_case(name),
+                None => true,
+            })
+            .map(|s| {
+                let opts_json =
+                    serde_json::to_string(&redacted_source_options(&s.options)).unwrap_or_default();
+                let runtime = self
+                    .inner
+                    .read()
+                    .unwrap()
+                    .source_runtime
+                    .get(&s.name)
+                    .cloned()
+                    .expect("EDGE-SOURCE-RUNTIME: every catalog source has runtime state");
+                vec![
+                    Some(s.name),
+                    Some(s.source_type),
+                    Some(s.format),
+                    Some(s.status),
+                    Some(s.live_offset),
+                    Some(s.live_lag.to_string()),
+                    runtime.owner,
+                    Some(runtime.committed_checkpoint.to_string()),
+                    Some(runtime.buffer_fill.to_string()),
+                    runtime.blocked_reason,
+                    Some(opts_json),
+                    runtime.source_identity_hash,
+                    s.options.get("slot").cloned(),
+                    s.options.get("publication").cloned(),
+                    runtime.active_xid.map(|xid| xid.to_string()),
+                    Some(runtime.envelope_bytes.to_string()),
+                    Some(runtime.in_memory_bytes.to_string()),
+                    Some(runtime.spill_bytes.to_string()),
+                    Some(runtime.attached_view_count.to_string()),
+                    Some(runtime.affected_view_count.to_string()),
+                    Some(runtime.relation_schema_version.to_string()),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: show_source_status_columns(),
+            rows,
+        }
+    }
+
+    pub fn view_status_response(
+        &self,
+        name_filter: Option<&str>,
+        namespace_filter: Option<&str>,
+    ) -> CatalogResponse {
+        let views = self.list_views();
+        let rows = views
+            .into_iter()
+            .filter(|v| match name_filter {
+                Some(name) => v.name.eq_ignore_ascii_case(name),
+                None => true,
+            })
+            .filter(|v| match namespace_filter {
+                Some(ns) => v.namespace.eq_ignore_ascii_case(ns),
+                None => true,
+            })
+            .map(|v| {
+                let workload = self
+                    .workload_for_view(&v.name)
+                    .and_then(|name| self.get_workload(&name));
+                let workload_name = workload.as_ref().map(|w| w.name.clone());
+                let freshness_slo_ms = workload
+                    .as_ref()
+                    .and_then(|w| w.freshness_slo.map(|s| s.target_ms.to_string()));
+                let memory_limit_bytes = workload
+                    .as_ref()
+                    .and_then(|w| w.memory_limit.map(|m| m.bytes.to_string()));
+                let view_state = self
+                    .view_states
+                    .read()
+                    .unwrap()
+                    .get(&v.name)
+                    .cloned()
+                    .unwrap_or(ViewState::Running);
+                let state_str = view_state.to_string();
+                let stage_lag = rockstream_types::metrics::read_view_stage_lag(&v.name)
+                    .or_else(|| {
+                        rockstream_types::metrics::read_freshness_lag(&v.name).map(|tot| {
+                            rockstream_types::metrics::StageLagBreakdown {
+                                source_lag_ms: 0,
+                                decode_lag_ms: 0,
+                                compute_lag_ms: 0,
+                                alignment_lag_ms: 0,
+                                sink_lag_ms: 0,
+                                spill_lag_ms: 0,
+                                storage_pressure_ms: 0,
+                                total_lag_ms: tot,
+                            }
+                        })
+                    })
+                    .unwrap_or_default();
+                let degradation_status = derive_degradation_status(&view_state, Some(stage_lag));
+                let arrangement_info = self.view_arrangements.read().unwrap().get(&v.name).cloned();
+                let engine_facts = self.view_engine_facts.read().unwrap().get(&v.name).cloned();
+                let arr_id_str = engine_facts
+                    .as_ref()
+                    .and_then(|f| f.arrangement_id.map(|id| id.to_string()))
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .and_then(|a| a.arrangement_id.map(|id| id.to_string()))
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                let consumer_count_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.consumer_count.to_string())
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .map(|a| a.consumer_count.to_string())
+                    })
+                    .unwrap_or_else(|| "1".to_string());
+                let shared_bytes_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.shared_state_bytes.to_string())
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .map(|a| a.shared_state_bytes.to_string())
+                    })
+                    .unwrap_or_else(|| "0".to_string());
+                let saved_bytes_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.bytes_saved_by_sharing.to_string())
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .map(|a| a.bytes_saved_by_sharing.to_string())
+                    })
+                    .unwrap_or_else(|| "0".to_string());
+                let compaction_frontier_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.frontier.clone())
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .map(|a| a.compaction_frontier.to_string())
+                    })
+                    .unwrap_or_else(|| "0".to_string());
+
+                let delta_amp_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.delta_amplification))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let join_amp_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.join_amplification))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let merge_operands_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.merge_operand_count.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let dirty_keys_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.dirty_key_count.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let logical_write_bytes_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.logical_write_bytes.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let physical_write_amp_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.physical_write_amplification))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let hot_keys_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.hot_key_bucket_count.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let strategy_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.factorization_strategy.clone())
+                    .unwrap_or_else(|| "Classic".to_string());
+                let selectivity_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.predicate_filter_selectivity))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let cache_hit_rate_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.cache_hit_rate))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let epoch_group_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.epoch_group_size.to_string())
+                    .unwrap_or_else(|| "1".to_string());
+                let checkpoint_mode_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.checkpoint_mode.clone())
+                    .unwrap_or_else(|| "Changelog".to_string());
+                let compaction_debt_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.compaction_debt.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let spill_bytes_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.spill_bytes.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let checkpoint_id_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.checkpoint_id.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let frontier_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.frontier.clone())
+                    .unwrap_or_else(|| "0".to_string());
+                let action_key_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.recommended_action_key.clone())
+                    .unwrap_or_else(|| "none".to_string());
+
+                let source_lag_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.source_lag_ms.to_string())
+                    .unwrap_or_else(|| stage_lag.source_lag_ms.to_string());
+                let compute_lag_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.compute_lag_ms.to_string())
+                    .unwrap_or_else(|| stage_lag.compute_lag_ms.to_string());
+                let degradation_reason_str = engine_facts
+                    .as_ref()
+                    .filter(|f| f.degradation_reason != "None")
+                    .map(|f| f.degradation_reason.clone())
+                    .unwrap_or_else(|| degradation_status.degradation_reason.to_string());
+                let reason_code_str = engine_facts
+                    .as_ref()
+                    .filter(|f| f.reason_code != "OK")
+                    .map(|f| f.reason_code.clone())
+                    .unwrap_or_else(|| degradation_status.reason_code.clone());
+                let dominant_contributor_str = engine_facts
+                    .as_ref()
+                    .filter(|f| f.dominant_contributor != "none")
+                    .map(|f| f.dominant_contributor.clone())
+                    .unwrap_or_else(|| degradation_status.dominant_contributor.to_string());
+
+                vec![
+                    Some(v.namespace),
+                    Some(v.name),
+                    Some(state_str),
+                    workload_name,
+                    freshness_slo_ms,
+                    memory_limit_bytes,
+                    Some("-".to_string()),
+                    Some(source_lag_str),
+                    Some(stage_lag.decode_lag_ms.to_string()),
+                    Some(compute_lag_str),
+                    Some(stage_lag.alignment_lag_ms.to_string()),
+                    Some(stage_lag.sink_lag_ms.to_string()),
+                    Some(stage_lag.spill_lag_ms.to_string()),
+                    Some(stage_lag.storage_pressure_ms.to_string()),
+                    Some(stage_lag.total_lag_ms.to_string()),
+                    Some(degradation_reason_str),
+                    Some(reason_code_str),
+                    Some(dominant_contributor_str),
+                    degradation_status.progress_phase,
+                    degradation_status
+                        .bytes_remaining
+                        .map(|value| value.to_string()),
+                    degradation_status
+                        .rows_remaining
+                        .map(|value| value.to_string()),
+                    degradation_status
+                        .estimated_remaining_ms
+                        .map(|value| value.to_string()),
+                    Some(arr_id_str),
+                    Some(consumer_count_str),
+                    Some(shared_bytes_str),
+                    Some(saved_bytes_str),
+                    Some(compaction_frontier_str),
+                    Some(delta_amp_str),
+                    Some(join_amp_str),
+                    Some(merge_operands_str),
+                    Some(dirty_keys_str),
+                    Some(logical_write_bytes_str),
+                    Some(physical_write_amp_str),
+                    Some(hot_keys_str),
+                    Some(strategy_str),
+                    Some(selectivity_str),
+                    Some(cache_hit_rate_str),
+                    Some(epoch_group_str),
+                    Some(checkpoint_mode_str),
+                    Some(compaction_debt_str),
+                    Some(spill_bytes_str),
+                    Some(checkpoint_id_str),
+                    Some(frontier_str),
+                    Some(action_key_str),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: view_status_columns(),
+            rows,
+        }
+    }
+
+    /// Return the durable lifecycle summary used by `SHOW BACKFILL STATUS`.
+    /// The catalog is the shared read path, so this intentionally has no
+    /// gateway-local cache that could expose a stale publication state.
+    pub fn backfill_status_response(&self, view_name: &str) -> CatalogResponse {
+        let progress = self
+            .backfills
+            .read()
+            .unwrap()
+            .get(view_name)
+            .cloned()
+            .unwrap_or(BackfillProgress {
+                phase: "RUNNING",
+                cursor_position: None,
+                rows_remaining: 0,
+                estimated_rows: 0,
+                budget_state: "ADMITTED".to_string(),
+                blocked_reason: None,
+            });
+        CatalogResponse::rows(
+            vec![
+                "view_name".to_string(),
+                "phase".to_string(),
+                "cursor_position".to_string(),
+                "rows_remaining".to_string(),
+                "estimated_rows".to_string(),
+                "budget_state".to_string(),
+                "blocked_reason".to_string(),
+            ],
+            vec![vec![
+                Some(view_name.to_string()),
+                Some(progress.phase.to_string()),
+                progress.cursor_position,
+                Some(progress.rows_remaining.to_string()),
+                Some(progress.estimated_rows.to_string()),
+                Some(progress.budget_state),
+                progress.blocked_reason,
+            ]],
+        )
+    }
+
+    /// Dispatch a query string to a catalog handler. Returns `Some(rows)` if
+    /// this is a recognized catalog query, `None` if the query should be
+    /// forwarded to the normal query path.
+    ///
+    /// Rows are returned as `Vec<Vec<Option<String>>>`, one inner Vec per row.
+    pub fn handle_query(&self, query: &str, session_info: &SessionInfo) -> Option<CatalogResponse> {
+        let q = query.trim();
+        let ql = q.to_lowercase();
+
+        if let Some(result) = self.pgjdbc_columns_query(q) {
+            return Some(result);
+        }
+
+        if let Ok(statements) =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, q)
+        {
+            if let [sqlparser::ast::Statement::Query(query)] = statements.as_slice() {
+                if let Some(response) = crate::catalog_query::execute(
+                    query,
+                    &|name| self.pg_catalog_rows(name, session_info),
+                    session_info,
+                ) {
+                    return Some(response);
+                }
+            }
+        }
+
+        // Prisma's PostgreSQL probe combines schema existence, server version,
+        // and the numeric version setting in one extended query.
+        if ql.contains("select exists(")
+            && ql.contains("from pg_namespace")
+            && ql.contains("version()")
+            && ql.contains("current_setting")
+        {
+            return Some(CatalogResponse::rows(
+                vec![
+                    "exists".to_string(),
+                    "version".to_string(),
+                    "numeric_version".to_string(),
+                ],
+                vec![vec![
+                    Some("t".to_string()),
+                    Some(
+                        "PostgreSQL 14.9 (RockStream) on x86_64-unknown-linux-gnu, compiled by rustc, 64-bit"
+                            .to_string(),
+                    ),
+                    Some("140000".to_string()),
+                ]],
+            ));
+        }
+
+        // SHOW commands
+        if ql.contains("server_version") {
+            return Some(CatalogResponse::rows(
+                vec!["server_version".to_string()],
+                vec![vec![Some("14.0".to_string())]],
+            ));
+        }
+
+        if ql.contains("transaction_isolation") || ql.contains("transaction isolation level") {
+            return Some(CatalogResponse::rows(
+                vec!["transaction_isolation".to_string()],
+                vec![vec![Some("read committed".to_string())]],
+            ));
+        }
+
+        if ql.contains("standard_conforming_strings") {
+            return Some(CatalogResponse::rows(
+                vec!["standard_conforming_strings".to_string()],
+                vec![vec![Some("on".to_string())]],
+            ));
+        }
+
+        // functions
+        if ql.contains("rockstream_version()") {
+            return Some(self.rockstream_version());
+        }
+        if ql.contains("version()") {
+            return Some(self.version());
+        }
+        if ql.contains("current_schema()") {
+            return Some(self.current_schema());
+        }
+        if ql.contains("current_database()") {
+            return Some(self.current_database());
+        }
+        if ql.contains("current_setting") {
+            return Some(self.current_setting(&ql));
+        }
+
+        let requested_cols = parse_select_columns(query);
+
+        if ql.contains("rockstream_catalog.view_resource_usage") {
+            return Some(self.view_resource_usage(&requested_cols));
+        }
+        if ql.contains("rockstream_catalog.workload_resource_usage") {
+            return Some(self.workload_resource_usage(&requested_cols));
+        }
+        if ql.contains("rockstream_catalog.capabilities") {
+            return Some(self.capabilities_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.nodes") {
+            return Some(self.catalog_nodes_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.sources") {
+            return Some(self.catalog_sources_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.views") {
+            return Some(self.catalog_views_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.operators") {
+            return Some(self.catalog_operators_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.arrangements") {
+            return Some(self.catalog_arrangements_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.checkpoints") {
+            return Some(self.catalog_checkpoints_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.shards") {
+            return Some(self.catalog_shards_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.operations") {
+            return Some(self.catalog_operations_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.namespaces") {
+            return Some(self.catalog_namespaces_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.tables") {
+            return Some(self.catalog_tables_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.workloads") {
+            return Some(self.catalog_workloads_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.dead_letter_queue")
+            || (ql.contains("dead_letter_queue") && !ql.starts_with("alter "))
+        {
+            return Some(self.dead_letter_queue(query, &requested_cols));
+        }
+
+        // S7: bootstrap functions and identity keywords (SELECT without FROM)
+        if ql.starts_with("select ") && !ql.contains(" from ") {
+            if ql.contains("current_user") {
+                return Some(CatalogResponse::rows(
+                    vec!["current_user".to_string()],
+                    vec![vec![Some(session_info.principal_name.clone())]],
+                ));
+            }
+            if ql.contains("session_user") {
+                return Some(CatalogResponse::rows(
+                    vec!["session_user".to_string()],
+                    vec![vec![Some(session_info.principal_name.clone())]],
+                ));
+            }
+            if ql.contains("current_schemas(") {
+                let include_implicit = ql.contains("true");
+                let mut parts: Vec<String> = if include_implicit {
+                    vec!["pg_catalog".to_string()]
+                } else {
+                    vec![]
+                };
+                for s in session_info.search_path.split(',') {
+                    let trimmed = s.trim().to_string();
+                    if !trimmed.is_empty() {
+                        parts.push(trimmed);
+                    }
+                }
+                let arr = format!("{{{}}}", parts.join(","));
+                return Some(CatalogResponse::rows(
+                    vec!["current_schemas".to_string()],
+                    vec![vec![Some(arr)]],
+                ));
+            }
+            if ql.contains("pg_backend_pid(") {
+                return Some(CatalogResponse::rows(
+                    vec!["pg_backend_pid".to_string()],
+                    vec![vec![Some(session_info.backend_pid.to_string())]],
+                ));
+            }
+            if ql.contains("pg_is_in_recovery(") {
+                return Some(CatalogResponse::rows(
+                    vec!["pg_is_in_recovery".to_string()],
+                    vec![vec![Some("f".to_string())]],
+                ));
+            }
+            if ql.contains("set_config(") {
+                let val = parse_set_config_value(q).unwrap_or_default();
+                return Some(CatalogResponse::rows(
+                    vec!["set_config".to_string()],
+                    vec![vec![Some(val)]],
+                ));
+            }
+            if ql.contains("pg_postmaster_start_time(") {
+                let t = *SERVER_START_TIME.get_or_init(SystemTime::now);
+                let ts = format_system_time(t);
+                return Some(CatalogResponse::rows(
+                    vec!["pg_postmaster_start_time".to_string()],
+                    vec![vec![Some(ts)]],
+                ));
+            }
+            if ql.contains("txid_current(") {
+                return Some(CatalogResponse::rows(
+                    vec!["txid_current".to_string()],
+                    vec![vec![Some("0".to_string())]],
+                ));
+            }
+        }
+
+        // S7: SHOW ALL
+        if ql.trim_end_matches(';') == "show all" {
+            let cols = vec![
+                "name".to_string(),
+                "setting".to_string(),
+                "description".to_string(),
+            ];
+            let params: &[(&str, &str, &str)] = &[
+                (
+                    "search_path",
+                    session_info.search_path.as_str(),
+                    "Schema search path",
+                ),
+                ("client_encoding", "UTF8", "Client-side character encoding"),
+                ("server_encoding", "UTF8", "Server-side character encoding"),
+                (
+                    "transaction_isolation",
+                    "read committed",
+                    "Transaction isolation level",
+                ),
+                (
+                    "standard_conforming_strings",
+                    "on",
+                    "Standard conforming strings",
+                ),
+                ("DateStyle", "ISO, YMD", "Date/time format"),
+                ("integer_datetimes", "on", "Integer timestamps"),
+                ("server_version", "14.9", "Server version"),
+                ("timezone", "UTC", "Timezone"),
+                ("application_name", "", "Application name"),
+            ];
+            let rows: Vec<Vec<Option<String>>> = params
+                .iter()
+                .map(|(name, val, desc)| {
+                    vec![
+                        Some(name.to_string()),
+                        Some(val.to_string()),
+                        Some(desc.to_string()),
+                    ]
+                })
+                .collect();
+            return Some(CatalogResponse::rows(cols, rows));
+        }
+
+        if ql.trim_end_matches(';') == "show rockstream capabilities"
+            || ql.trim_end_matches(';') == "show capabilities"
+        {
+            return Some(self.capabilities_response(query, &[]));
+        }
+
+        if ql.trim_end_matches(';') == "show sources" {
+            return Some(self.sources_response());
+        }
+        if ql.trim_end_matches(';') == "show source status" {
+            return Some(self.source_status_response(None));
+        }
+        if ql.starts_with("show source status for ") {
+            let source_name = q["show source status for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            self.get_source(source_name)?;
+            return Some(self.source_status_response(Some(source_name)));
+        }
+        if ql.starts_with("show backfill status for materialized view ") {
+            let view_name = q["show backfill status for materialized view ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            self.get_view(view_name)?;
+            return Some(self.backfill_status_response(view_name));
+        }
+        if ql.trim_end_matches(';') == "show view status" {
+            return Some(self.view_status_response(None, None));
+        }
+        if ql.starts_with("show view status for namespace ") {
+            let namespace = q["show view status for namespace ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            return Some(self.view_status_response(None, Some(namespace)));
+        }
+        if ql.starts_with("show view status for ") {
+            let view_name = q["show view status for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            self.get_view(view_name)?;
+            return Some(self.view_status_response(Some(view_name), None));
+        }
+
+        // S7: SHOW client_encoding / SHOW server_encoding
+        if let Some(rest) = ql.strip_prefix("show ") {
+            let key = rest.trim().trim_end_matches(';');
+            if key == "client_encoding" || key == "server_encoding" {
+                return Some(CatalogResponse::rows(
+                    vec![key.to_string()],
+                    vec![vec![Some("UTF8".to_string())]],
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub fn view_resource_usage_entries(&self) -> Vec<CatalogViewResourceUsageEntry> {
+        let views = self.list_views();
+        let state_budget_bytes = read_state_budget();
+        let pricing = active_pricing_config();
+        let mut entries = Vec::new();
+
+        for view in views {
+            let workload = self
+                .workload_for_view(&view.name)
+                .and_then(|name| self.get_workload(&name));
+            let workload_name = workload.as_ref().map(|w| w.name.clone());
+            let workload_memory = workload_name
+                .as_deref()
+                .map(read_workload_memory)
+                .unwrap_or(0);
+            let sibling_count = workload_name
+                .as_deref()
+                .map(|name| self.views_for_workload(name).len() as u64)
+                .unwrap_or(1)
+                .max(1);
+            let memory_bytes = if workload_name.is_some() {
+                workload_memory / sibling_count
+            } else {
+                0
+            };
+            let state_bytes = read_pipeline_state_bytes(&view.name).unwrap_or(0);
+            let freshness_slo_ms = workload
+                .as_ref()
+                .and_then(|w| w.freshness_slo.map(|s| s.target_ms));
+            let freshness_lag_ms = read_freshness_lag(&view.name);
+            let memory_limit_bytes = workload
+                .as_ref()
+                .and_then(|w| w.memory_limit.map(|limit| limit.bytes));
+            let mut degraded_reason = None;
+            let mut slo_compliant = true;
+            if let (Some(limit), true) = (memory_limit_bytes, memory_bytes > 0) {
+                if memory_bytes > limit {
+                    slo_compliant = false;
+                    degraded_reason = Some(format!(
+                        "memory_bytes {} exceeds MEMORY_LIMIT {}",
+                        memory_bytes, limit
+                    ));
+                }
+            }
+            if degraded_reason.is_none() {
+                if let (Some(slo_ms), Some(lag_ms)) = (freshness_slo_ms, freshness_lag_ms) {
+                    if lag_ms > slo_ms {
+                        slo_compliant = false;
+                        degraded_reason = Some(format!(
+                            "freshness_lag_ms {} exceeds freshness_slo_ms {}",
+                            lag_ms, slo_ms
+                        ));
+                    }
+                }
+            }
+            let estimated_cost_per_hour = estimate_cost_per_hour(
+                pricing.as_ref(),
+                &CostEstimateInput {
+                    state_bytes,
+                    memory_bytes,
+                    memory_limit_bytes,
+                    shard_count: 1,
+                    object_store_storage_bytes: state_bytes,
+                    ..Default::default()
+                },
+            );
+
+            entries.push(CatalogViewResourceUsageEntry {
+                view_name: view.name,
+                workload_name,
+                state_bytes,
+                memory_bytes,
+                memory_limit_bytes,
+                state_budget_bytes,
+                freshness_slo_ms,
+                freshness_lag_ms,
+                slo_compliant,
+                degraded_reason,
+                estimated_cost_per_hour,
+            });
+        }
+
+        entries.sort_by(|a, b| a.view_name.cmp(&b.view_name));
+        entries
+    }
+
+    pub fn workload_resource_usage_entries(&self) -> Vec<CatalogWorkloadResourceUsageEntry> {
+        let workloads = self.list_workloads();
+        let view_entries = self.view_resource_usage_entries();
+        let state_budget_bytes = read_state_budget();
+        let pricing = active_pricing_config();
+        let mut rows = Vec::new();
+
+        for workload in workloads {
+            let matching: Vec<&CatalogViewResourceUsageEntry> = view_entries
+                .iter()
+                .filter(|entry| entry.workload_name.as_deref() == Some(workload.name.as_str()))
+                .collect();
+            let view_count = matching.len() as u64;
+            let state_bytes = matching.iter().map(|entry| entry.state_bytes).sum();
+            let memory_bytes = read_workload_memory(&workload.name);
+            let freshness_lag_ms = matching
+                .iter()
+                .filter_map(|entry| entry.freshness_lag_ms)
+                .max();
+            let freshness_slo_ms = workload.freshness_slo.map(|s| s.target_ms);
+            let memory_limit_bytes = workload.memory_limit.map(|m| m.bytes);
+            let mut slo_compliant = matching.iter().all(|entry| entry.slo_compliant);
+            let degraded_reason = matching
+                .iter()
+                .find_map(|entry| entry.degraded_reason.clone())
+                .or_else(|| {
+                    if let Some(limit) = memory_limit_bytes {
+                        if memory_bytes > limit {
+                            slo_compliant = false;
+                            return Some(format!(
+                                "memory_bytes {} exceeds MEMORY_LIMIT {}",
+                                memory_bytes, limit
+                            ));
+                        }
+                    }
+                    None
+                });
+            let estimated_cost_per_hour = estimate_cost_per_hour(
+                pricing.as_ref(),
+                &CostEstimateInput {
+                    state_bytes,
+                    memory_bytes,
+                    memory_limit_bytes,
+                    shard_count: view_count.max(1) as u32,
+                    object_store_storage_bytes: state_bytes,
+                    cold_storage_fraction: 0.0,
+                    ..Default::default()
+                },
+            );
+            rows.push(CatalogWorkloadResourceUsageEntry {
+                workload_name: workload.name,
+                view_count,
+                state_bytes,
+                memory_bytes,
+                memory_limit_bytes,
+                state_budget_bytes,
+                freshness_slo_ms,
+                freshness_lag_ms,
+                slo_compliant,
+                degraded_reason,
+                estimated_cost_per_hour,
+            });
+        }
+
+        rows.sort_by(|a, b| a.workload_name.cmp(&b.workload_name));
+        rows
+    }
+
+    pub fn cluster_resource_usage_entry(&self) -> CatalogWorkloadResourceUsageEntry {
+        let rows = self.workload_resource_usage_entries();
+        let state_budget_bytes = read_state_budget();
+        let state_bytes = rows.iter().map(|row| row.state_bytes).sum();
+        let memory_bytes = rows.iter().map(|row| row.memory_bytes).sum();
+        let view_count = rows.iter().map(|row| row.view_count).sum();
+        let freshness_lag_ms = rows.iter().filter_map(|row| row.freshness_lag_ms).max();
+        let degraded_reason = rows.iter().find_map(|row| row.degraded_reason.clone());
+        let estimated_cost_per_hour = rows
+            .iter()
+            .map(|row| row.estimated_cost_per_hour.unwrap_or(0.0))
+            .sum::<f64>();
+        CatalogWorkloadResourceUsageEntry {
+            workload_name: "cluster".to_string(),
+            view_count,
+            state_bytes,
+            memory_bytes,
+            memory_limit_bytes: None,
+            state_budget_bytes,
+            freshness_slo_ms: None,
+            freshness_lag_ms,
+            slo_compliant: rows.iter().all(|row| row.slo_compliant),
+            degraded_reason,
+            estimated_cost_per_hour: if active_pricing_config().is_some() {
+                Some(estimated_cost_per_hour)
+            } else {
+                None
+            },
+        }
+    }
+
+    pub fn view_resource_usage(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            view_resource_usage_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let rows = self
+            .view_resource_usage_entries()
+            .into_iter()
+            .map(|entry| project_view_resource_usage(&cols, &entry))
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn workload_resource_usage(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            workload_resource_usage_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let rows = self
+            .workload_resource_usage_entries()
+            .into_iter()
+            .map(|entry| project_workload_resource_usage(&cols, &entry))
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn dead_letter_queue(&self, query: &str, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            dead_letter_queue_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let dlq = rockstream_types::dlq::get_global_dlq().lock();
+        let ql = query.to_lowercase();
+        let rows = dlq
+            .iter()
+            .filter(|entry| {
+                if ql.contains("where") {
+                    if ql.contains("source_name =") || ql.contains("source_name=") {
+                        let target = ql
+                            .split("source_name")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim()
+                            .trim_start_matches('=')
+                            .trim()
+                            .trim_matches('\'')
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .trim_matches('\'');
+                        if !target.is_empty() && !entry.source_name.to_lowercase().contains(target)
+                        {
+                            return false;
+                        }
+                    }
+                    if ql.contains("error_code =") || ql.contains("error_code=") {
+                        let target = ql
+                            .split("error_code")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim()
+                            .trim_start_matches('=')
+                            .trim()
+                            .trim_matches('\'')
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .trim_matches('\'');
+                        if !target.is_empty() && !entry.error_code.to_lowercase().contains(target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .map(|entry| project_dead_letter_queue(&cols, entry))
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn views_for_workload(&self, workload_name: &str) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        let mut views: Vec<String> = inner
+            .view_workloads
+            .iter()
+            .filter(|(_, assigned)| assigned.as_str() == workload_name)
+            .map(|(view, _)| view.clone())
+            .collect();
+        views.sort();
+        views
+    }
+
+    pub fn set_view_state_bytes(
+        &self,
+        view_name: &str,
+        bytes: u64,
+        audit_log: Option<&rockstream_control::audit::FileAuditLog>,
+    ) {
+        set_pipeline_state_bytes(view_name, bytes);
+        self.reconcile_view_budget(view_name, bytes, audit_log);
+    }
+
+    pub fn view_state(&self, view_name: &str) -> ViewState {
+        self.view_states
+            .read()
+            .unwrap()
+            .get(view_name)
+            .cloned()
+            .unwrap_or(ViewState::Running)
+    }
+
+    pub fn set_view_state(&self, view_name: &str, state: ViewState) {
+        self.view_states
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), state);
+    }
+
+    /// Start a materialized-view backfill before it can be read.
+    pub fn begin_backfill(&self, view_name: &str, estimated_rows: u64) {
+        self.set_view_state(view_name, ViewState::BackfillingFromEpoch(0));
+        let mut progress = BackfillProgress::snapshotting();
+        progress.estimated_rows = estimated_rows;
+        progress.rows_remaining = estimated_rows;
+        self.backfills
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), progress);
+    }
+
+    /// Advance the in-process lifecycle after snapshot rows are committed.
+    pub fn catch_up_backfill(&self, view_name: &str, cursor_position: Option<String>) {
+        self.set_view_state(view_name, ViewState::BackfillingFromEpoch(0));
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.phase = "CATCHING_UP";
+            if cursor_position.is_some() {
+                progress.cursor_position = cursor_position;
+            }
+            progress.rows_remaining = 0;
+        }
+    }
+
+    /// Reflect the most recent durable source M3 cursor without changing phase.
+    pub fn update_backfill_cursor(&self, view_name: &str, cursor_position: String) {
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.cursor_position = Some(cursor_position);
+        }
+    }
+
+    /// Reflect the progress record that was committed with the source M3.
+    pub fn update_backfill_progress(
+        &self,
+        view_name: &str,
+        cursor_position: String,
+        rows_remaining: u64,
+        estimated_rows: u64,
+    ) {
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.cursor_position = Some(cursor_position);
+            progress.rows_remaining = rows_remaining;
+            progress.estimated_rows = estimated_rows;
+        }
+    }
+
+    pub fn backfill_has_cursor(&self, view_name: &str) -> bool {
+        self.backfills
+            .read()
+            .unwrap()
+            .get(view_name)
+            .is_some_and(|progress| progress.cursor_position.is_some())
+    }
+
+    /// Publish only after the snapshot/output commit reaches its frontier.
+    pub fn publish_backfill(&self, view_name: &str) {
+        self.set_view_state(view_name, ViewState::Running);
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.phase = "RUNNING";
+            progress.rows_remaining = 0;
+            progress.blocked_reason = None;
+        }
+    }
+
+    /// A view without a tracked materialized backfill is legacy-published.
+    pub fn is_backfill_published(&self, view_name: &str) -> bool {
+        self.backfills
+            .read()
+            .unwrap()
+            .get(view_name)
+            .is_none_or(|progress| progress.phase == "RUNNING")
+    }
+
+    pub fn workload_status_entries(&self) -> Vec<CatalogWorkloadStatusEntry> {
+        let workloads = self.list_workloads();
+        let mut rows = Vec::new();
+        for workload in workloads {
+            let views = self.views_for_workload(&workload.name);
+            let mut over_budget_relaxed_view_count = 0u64;
+            let mut paused_view_count = 0u64;
+            for view_name in &views {
+                match self.view_state(view_name) {
+                    ViewState::OverBudgetRelaxed => over_budget_relaxed_view_count += 1,
+                    ViewState::Paused => paused_view_count += 1,
+                    _ => {}
+                }
+            }
+            rows.push(CatalogWorkloadStatusEntry {
+                workload_name: workload.name,
+                priority: workload.priority.0,
+                max_parallelism: workload.max_parallelism,
+                memory_limit_bytes: workload.memory_limit.map(|limit| limit.bytes),
+                freshness_slo_ms: workload.freshness_slo.map(|slo| slo.target_ms),
+                view_count: views.len() as u64,
+                over_budget_relaxed_view_count,
+                paused_view_count,
+            });
+        }
+        rows.sort_by(|a, b| a.workload_name.cmp(&b.workload_name));
+        rows
+    }
+
+    pub fn workload_status(&self) -> CatalogResponse {
+        let columns = workload_status_columns();
+        let rows = self
+            .workload_status_entries()
+            .into_iter()
+            .map(|entry| project_workload_status(&columns, &entry))
+            .collect();
+        CatalogResponse::rows(columns, rows)
+    }
+
+    fn reconcile_view_budget(
+        &self,
+        view_name: &str,
+        bytes: u64,
+        audit_log: Option<&rockstream_control::audit::FileAuditLog>,
+    ) {
+        let Some(workload_name) = self.workload_for_view(view_name) else {
+            return;
+        };
+        let Some(workload) = self.get_workload(&workload_name) else {
+            return;
+        };
+        let Some(memory_limit) = workload.memory_limit.map(|limit| limit.bytes) else {
+            return;
+        };
+
+        let workload_budget = self
+            .workload_budgets
+            .write()
+            .unwrap()
+            .entry(workload_name.clone())
+            .or_insert_with(|| {
+                Arc::new(WorkloadBudget::new(
+                    workload_id_for_name(&workload_name),
+                    memory_limit,
+                ))
+            })
+            .clone();
+        let global_budget = match read_state_budget() {
+            0 => u64::MAX,
+            value => value,
+        };
+        let budget = self
+            .view_budgets
+            .write()
+            .unwrap()
+            .entry(view_name.to_string())
+            .or_insert_with(|| {
+                Arc::new(StateBudget::new_with_workload(
+                    view_name.to_string(),
+                    global_budget,
+                    Some(Arc::clone(&workload_budget)),
+                ))
+            })
+            .clone();
+        let recover_if_needed = |this: &CatalogStubs| {
+            if this.view_state(view_name).is_over_budget_relaxed()
+                && workload_budget.current_bytes() <= memory_limit
+            {
+                this.set_view_state(view_name, ViewState::Running);
+                if let Some(log) = audit_log {
+                    let _ = log.append(&AuditEvent::now(
+                        "system",
+                        "workload.memory_limit_recovered",
+                        view_name,
+                    ));
+                }
+            }
+        };
+        let accounted = budget.current_bytes();
+        if bytes > accounted {
+            let delta = bytes - accounted;
+            match budget.try_acquire(delta) {
+                Ok(()) => {
+                    set_workload_memory(&workload_name, workload_budget.current_bytes());
+                    recover_if_needed(self);
+                }
+                Err(error) => {
+                    set_workload_memory(&workload_name, workload_budget.current_bytes());
+                    if error.operator_name.starts_with("workload-")
+                        && !self.view_state(view_name).is_over_budget_relaxed()
+                    {
+                        self.set_view_state(view_name, ViewState::OverBudgetRelaxed);
+                        if let Some(log) = audit_log {
+                            let _ = log.append(&AuditEvent::now(
+                                "system",
+                                "workload.memory_limit_exceeded",
+                                view_name,
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if bytes < accounted {
+            budget.release(accounted - bytes);
+            set_workload_memory(&workload_name, workload_budget.current_bytes());
+            recover_if_needed(self);
+        } else {
+            recover_if_needed(self);
+        }
+    }
+
+    /// Resolve a view by name within a given search_path (S9 search-path-aware lookup).
+    pub fn resolve_view(&self, name: &str, search_path: &[&str]) -> Option<CatalogView> {
+        let inner = self.inner.read().unwrap();
+        if let Some(view) = inner.views.get(name) {
+            if search_path
+                .iter()
+                .any(|s| s.trim() == view.namespace.as_str())
+            {
+                return Some(view.clone());
+            }
+        }
+        None
+    }
+
+    pub(crate) fn describe_catalog_query(&self, sql: &str) -> Option<Vec<String>> {
+        let statements =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+                .ok()?;
+        let [sqlparser::ast::Statement::Query(query)] = statements.as_slice() else {
+            return None;
+        };
+        let mut query = query.clone();
+        query.limit_clause = None;
+        let session = SessionInfo::default();
+        let response = crate::catalog_query::execute(
+            &query,
+            &|name| match self.pg_catalog_rows(name, &session)? {
+                CatalogResponse::Rows { columns, .. } => Some(CatalogResponse::Rows {
+                    columns,
+                    rows: vec![],
+                }),
+                _ => None,
+            },
+            &session,
+        )?;
+        match response {
+            CatalogResponse::Rows { columns, .. } => Some(columns),
+            _ => None,
+        }
+    }
+
+    /// PostgreSQL JDBC 42.7 getColumns() uses a derived SELECT with a
+    /// row_number() window over pg_namespace/pg_class/pg_attribute/pg_type.
+    /// Our small catalog evaluator deliberately does not implement general
+    /// window aggregation, so execute this identifiable metadata query from
+    /// the live catalog entries. Never credit a nonmatching SQL statement.
+    fn pgjdbc_columns_query(&self, query: &str) -> Option<CatalogResponse> {
+        let shape = regex::Regex::new(
+            r"(?is)^select\s+\*\s+from\s*\(\s*select\s+n\.nspname\s*,\s*c\.relname\s*,\s*a\.attname\s*,",
+        )
+        .expect("constant JDBC query signature");
+        if !shape.is_match(query)
+            || !query.contains("pg_catalog.pg_attribute")
+            || !query.contains("pg_catalog.pg_type")
+            || !query.contains("pg_catalog.pg_namespace")
+            || !query.contains("pg_catalog.pg_class")
+            || !query.to_ascii_lowercase().contains("row_number()")
+        {
+            return None;
+        }
+
+        // pgjdbc embeds escaped SQL literals for the caller's metadata
+        // patterns. Apply each literal as a LIKE filter before returning data.
+        let filter = regex::Regex::new(
+            r"(?i)\b(n\.nspname|c\.relname|attname)\s+like\s+'((?:''|[^'])*)'",
+        )
+        .expect("constant JDBC filter pattern");
+        let mut schema_pattern = None;
+        let mut table_pattern = None;
+        let mut column_pattern = None;
+        for capture in filter.captures_iter(query) {
+            let pattern = capture[2].replace("''", "'");
+            match capture[1].to_ascii_lowercase().as_str() {
+                "n.nspname" => schema_pattern = Some(pattern),
+                "c.relname" => table_pattern = Some(pattern),
+                "attname" => column_pattern = Some(pattern),
+                _ => unreachable!(),
+            }
+        }
+
+        let mut entries = Vec::new();
+        for table in self.list_tables() {
+            entries.push((catalog_relation_name(&table.name, "public"), table.columns));
+        }
+        for view in self.list_views() {
+            entries.push((catalog_relation_name(&view.name, &view.namespace), view.columns));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let columns = [
+            "nspname", "relname", "attname", "atttypid", "attnotnull",
+            "atttypmod", "attlen", "typtypmod", "attnum", "attidentity",
+            "attgenerated", "adsrc", "description", "typbasetype", "typtype",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut rows = Vec::new();
+        for ((schema, name), attributes) in entries {
+            if schema_pattern
+                .as_deref()
+                .is_some_and(|pattern| !pgjdbc_like(&schema, pattern))
+                || table_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| !pgjdbc_like(&name, pattern))
+            {
+                continue;
+            }
+            for (ordinal, attribute) in attributes.iter().enumerate() {
+                if column_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| !pgjdbc_like(&attribute.name, pattern))
+                {
+                    continue;
+                }
+                rows.push(vec![
+                    Some(schema.clone()),
+                    Some(name.clone()),
+                    Some(attribute.name.clone()),
+                    Some(arrow_type_to_pg_oid(&attribute.data_type).to_string()),
+                    Some("f".into()),
+                    Some("-1".into()),
+                    Some("-1".into()),
+                    Some("-1".into()),
+                    Some((ordinal + 1).to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("0".into()),
+                    Some("b".into()),
+                ]);
+                if rows.len() >= MAX_CATALOG_SCAN_ROWS {
+                    return Some(CatalogResponse::Rows { columns, rows });
+                }
+            }
+        }
+        Some(CatalogResponse::Rows { columns, rows })
     }
 
     fn pg_catalog_rows(&self, relation: &str, session: &SessionInfo) -> Option<CatalogResponse> {
