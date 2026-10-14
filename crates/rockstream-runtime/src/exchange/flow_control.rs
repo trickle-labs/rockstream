@@ -15,13 +15,13 @@ pub const DEFAULT_MAX_PENDING_REQUESTS: usize = 256;
 
 type CreditKey = (u64, u32, u32);
 
-#[derive(Clone, Copy)]
 struct ChannelCreditState {
     available_rows: u32,
     max_rows: u32,
     rows_in_flight: u32,
     batches_in_flight: usize,
     bytes_in_flight: usize,
+    awaiting_ack: Vec<((u64, u64), (usize, u32))>,
 }
 
 impl ChannelCreditState {
@@ -32,6 +32,7 @@ impl ChannelCreditState {
             rows_in_flight: 0,
             batches_in_flight: 0,
             bytes_in_flight: 0,
+            awaiting_ack: Vec::new(),
         }
     }
 }
@@ -59,6 +60,17 @@ impl std::fmt::Debug for FlowPermit {
 }
 
 impl FlowPermit {
+    /// Transfer ownership to acknowledgement accounting before publishing the frame.
+    pub(crate) fn handoff(mut self, epoch: u64, seq: u64) {
+        let mut channels = self.controller.channels.lock();
+        if let Some(state) = channels.get_mut(&self.key) {
+            state
+                .awaiting_ack
+                .push(((epoch, seq), (self.batch_bytes, self.row_count)));
+            self.active = false;
+        }
+    }
+
     pub fn acquired_at(&self) -> Instant {
         self.acquired_at
     }
@@ -248,6 +260,12 @@ impl FlowController {
                 self.max_batch_bytes
             ));
         }
+        if batch_bytes > self.max_inflight_bytes {
+            return Err(format!(
+                "[{RS_3006}] exchange frame size ({batch_bytes} bytes) exceeds max_inflight_bytes ({}) limit. Next steps: split large record batches into smaller chunks within configured transport budget.",
+                self.max_inflight_bytes
+            ));
+        }
         Ok(())
     }
 
@@ -351,6 +369,9 @@ impl FlowController {
         }
 
         loop {
+            let notified = self.global_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             match self.try_acquire_batch_permit(
                 exchange_id,
                 src_shard,
@@ -363,7 +384,7 @@ impl FlowController {
                     if !err.contains("RESOURCE_EXHAUSTED") {
                         return Err(err);
                     }
-                    self.global_notify.notified().await;
+                    notified.await;
                 }
             }
         }
@@ -394,8 +415,11 @@ impl FlowController {
             Self::update_batch_metrics(&channels, new_bytes, new_pending);
         }
 
-        self.global_notify.notify_waiters();
+        self.notify_waiters(key);
+    }
 
+    fn notify_waiters(&self, key: CreditKey) {
+        self.global_notify.notify_waiters();
         let notifiers = self.notifiers.lock();
         if let Some(notify) = notifiers.get(&key) {
             notify.notify_waiters();
@@ -406,7 +430,20 @@ impl FlowController {
     pub fn teardown_exchange(&self, exchange_id: u64) {
         {
             let mut channels = self.channels.lock();
-            channels.retain(|k, _| k.0 != exchange_id);
+            channels.retain(|key, state| {
+                if key.0 != exchange_id {
+                    return true;
+                }
+                let bytes = state
+                    .awaiting_ack
+                    .iter()
+                    .map(|(_, (bytes, _))| *bytes as u64)
+                    .sum::<u64>();
+                self.aggregate_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                self.pending_requests
+                    .fetch_sub(state.awaiting_ack.len() as u64, Ordering::Relaxed);
+                false
+            });
             let cur_bytes = self.aggregate_bytes.load(Ordering::Relaxed);
             let cur_pending = self.pending_requests.load(Ordering::Relaxed);
             Self::update_batch_metrics(&channels, cur_bytes, cur_pending);
@@ -442,14 +479,36 @@ impl FlowController {
             .or_insert_with(|| ChannelCreditState::new(self.row_budget()))
     }
 
-    /// Process a received ShuffleAck and restore row credits for the corresponding channel.
+    /// Release the matching delivered reservation, or legacy row-only credits.
     pub fn handle_ack(&self, ack: &ShuffleAck) {
-        self.release_credit(
-            ack.exchange_id,
-            ack.src_shard,
-            ack.target_shard,
-            ack.credit_grant,
-        );
+        let key = (ack.exchange_id, ack.src_shard, ack.target_shard);
+        let reservation = {
+            let mut channels = self.channels.lock();
+            let state = self.channel_state(&mut channels, key);
+            if let Some(index) = state
+                .awaiting_ack
+                .iter()
+                .position(|(identity, _)| *identity == (ack.epoch, ack.seq))
+            {
+                Some(state.awaiting_ack.remove(index).1)
+            } else {
+                // Keep legacy credit release atomic with admission; stale ACKs cannot free a new batch.
+                if state.batches_in_flight == 0 {
+                    state.rows_in_flight -= ack.credit_grant.min(state.rows_in_flight);
+                    state.available_rows = state
+                        .available_rows
+                        .saturating_add(ack.credit_grant)
+                        .min(state.max_rows);
+                }
+                Self::update_credit_metrics(&channels);
+                None
+            }
+        };
+        if let Some((batch_bytes, row_count)) = reservation {
+            self.release_batch_permit(key, batch_bytes, row_count);
+        } else {
+            self.notify_waiters(key);
+        }
     }
 
     pub fn release_credit(
@@ -470,15 +529,7 @@ impl FlowController {
             Self::update_credit_metrics(&channels);
         }
 
-        if self.aggregate_bytes.load(Ordering::Relaxed) > 0
-            || self.pending_requests.load(Ordering::Relaxed) > 0
-        {
-            self.global_notify.notify_waiters();
-        }
-        let notifiers = self.notifiers.lock();
-        if let Some(notify) = notifiers.get(&key) {
-            notify.notify_waiters();
-        }
+        self.notify_waiters(key);
     }
 
     /// Check current available row credits without blocking or consuming.
@@ -487,9 +538,8 @@ impl FlowController {
         let channels = self.channels.lock();
         channels
             .get(&key)
-            .copied()
-            .unwrap_or_else(|| ChannelCreditState::new(self.row_budget()))
-            .available_rows
+            .map(|state| state.available_rows)
+            .unwrap_or_else(|| self.row_budget())
     }
 
     pub fn rows_in_flight(&self, exchange_id: u64, src_shard: u32, target_shard: u32) -> u32 {
@@ -513,6 +563,7 @@ impl FlowController {
                 rows_in_flight: 0,
                 batches_in_flight: 0,
                 bytes_in_flight: 0,
+                awaiting_ack: Vec::new(),
             },
         );
         Self::update_credit_metrics(&channels);
@@ -544,6 +595,9 @@ impl FlowController {
         };
 
         loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock();
                 let state = self.channel_state(&mut channels, key);
@@ -554,7 +608,7 @@ impl FlowController {
                     return Ok(());
                 }
             }
-            notify.notified().await;
+            notified.await;
         }
     }
 }
