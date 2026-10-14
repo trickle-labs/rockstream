@@ -421,6 +421,64 @@ fn eval(
                 },
             }
         }
+        // PostgreSQL's reflection queries (including SQLAlchemy get_columns)
+        // filter relkinds using `relkind = ANY (ARRAY['r', 'v', ...])`.
+        // Evaluate array membership against the actual catalog row; do not
+        // silently turn an unsupported predicate into an empty result.
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => {
+            let input = value(left)?;
+            let members = match right.as_ref() {
+                Expr::Array(array) => array.elem.iter().map(value).collect::<Result<Vec<_>>>()?,
+                Expr::Nested(e) => match e.as_ref() {
+                    Expr::Array(array) => {
+                        array.elem.iter().map(value).collect::<Result<Vec<_>>>()?
+                    }
+                    _ => return Err("[RS-2026] unsupported ANY array expression".into()),
+                },
+                _ => return Err("[RS-2026] unsupported ANY operand".into()),
+            };
+            let matched = |a: &str, b: &str| -> Result<bool> {
+                Ok(match compare_op {
+                    BinaryOperator::Eq => a == b,
+                    BinaryOperator::NotEq => a != b,
+                    BinaryOperator::Gt => compare(a, b).is_gt(),
+                    BinaryOperator::GtEq => !compare(a, b).is_lt(),
+                    BinaryOperator::Lt => compare(a, b).is_lt(),
+                    BinaryOperator::LtEq => !compare(a, b).is_gt(),
+                    _ => return Err("[RS-2026] unsupported ANY comparison".into()),
+                })
+            };
+            match input {
+                None => None,
+                Some(input) => {
+                    let mut has_null = false;
+                    let mut any_match = false;
+                    for member in members {
+                        match member {
+                            Some(member) => {
+                                if matched(&input, &member)? {
+                                    any_match = true;
+                                    break;
+                                }
+                            }
+                            None => has_null = true,
+                        }
+                    }
+                    if any_match {
+                        boolean(true)
+                    } else if has_null {
+                        None
+                    } else {
+                        boolean(false)
+                    }
+                }
+            }
+        }
         Expr::InList {
             expr,
             list,
