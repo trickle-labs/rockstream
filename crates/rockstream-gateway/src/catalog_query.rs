@@ -52,11 +52,11 @@ fn run(
     let mut rows = vec![outer.clone()];
     let mut fields = Vec::new();
     for source in &select.from {
-        let (columns, right) = relation(&source.relation, provider)?;
+        let (columns, right) = relation(&source.relation, provider, session, outer)?;
         rows = join(rows, &right, None, false, provider, session)?;
         fields.extend(columns);
         for item in &source.joins {
-            let (columns, right) = relation(&item.relation, provider)?;
+            let (columns, right) = relation(&item.relation, provider, session, outer)?;
             let (constraint, left) = match &item.join_operator {
                 JoinOperator::Join(c) | JoinOperator::Inner(c) | JoinOperator::CrossJoin(c) => {
                     (c, false)
@@ -241,23 +241,41 @@ fn run(
 fn relation(
     source: &TableFactor,
     provider: &impl Fn(&str) -> Option<CatalogResponse>,
+    session: &SessionInfo,
+    outer: &Row,
 ) -> Result<RelationRows> {
-    let TableFactor::Table { name, alias, .. } = source else {
-        return Err("[RS-2026] unsupported catalog relation".into());
-    };
-    let name = name.to_string();
-    let qualifier = alias
-        .as_ref()
-        .map(|a| identifier(&a.name))
-        .unwrap_or_else(|| {
-            name.rsplit('.')
-                .next()
-                .unwrap()
-                .trim_matches('"')
-                .to_lowercase()
-        });
-    let Some(CatalogResponse::Rows { columns, rows }) = provider(&name) else {
-        return Err(format!("[RS-2026] unknown catalog relation: {name}"));
+    let (qualifier, columns, rows) = match source {
+        TableFactor::Table { name, alias, .. } => {
+            let name = name.to_string();
+            let qualifier = alias
+                .as_ref()
+                .map(|a| identifier(&a.name))
+                .unwrap_or_else(|| {
+                    name.rsplit('.')
+                        .next()
+                        .unwrap()
+                        .trim_matches('"')
+                        .to_lowercase()
+                });
+            let Some(CatalogResponse::Rows { columns, rows }) = provider(&name) else {
+                return Err(format!("[RS-2026] unknown catalog relation: {name}"));
+            };
+            (qualifier, columns, rows)
+        }
+        TableFactor::Derived {
+            lateral: false,
+            subquery,
+            alias: Some(alias),
+            ..
+        } => {
+            // PostgreSQL clients such as Prisma join a projected catalog
+            // subquery (SELECT pg_class.oid, ...) as a relation. Use the same
+            // evaluator and preserve its actual rows rather than assuming
+            // that a selected catalog binary establishes reflection.
+            let (columns, rows) = run(subquery, provider, session, outer)?;
+            (identifier(&alias.name), columns, rows)
+        }
+        _ => return Err("[RS-2026] unsupported catalog relation".into()),
     };
     let fields: Vec<_> = columns
         .iter()
