@@ -344,7 +344,7 @@ fn eval(
                 .or(schema_qualified)
                 .cloned()
                 .unwrap_or_default()
-        },
+        }
         Expr::Value(v) => match &v.value {
             Value::SingleQuotedString(s) | Value::EscapedStringLiteral(s) | Value::Number(s, _) => {
                 Some(s.clone())
@@ -673,7 +673,6 @@ fn lookup(
         .find(|row| row[key].as_deref() == Some(input))?[column]
         .clone()
 }
-
 
 #[cfg(test)]
 mod tests {
