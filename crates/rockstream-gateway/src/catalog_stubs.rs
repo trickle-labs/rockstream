@@ -3059,7 +3059,7 @@ impl CatalogStubs {
         let relation = relation.to_lowercase().replace('"', "");
         let name = relation.strip_prefix("pg_catalog.").unwrap_or(&relation);
         let fields = match name {
-            "pg_class" => "oid relname relnamespace relkind relowner relchecks relhasindex relhasrules relhastriggers relrowsecurity relforcerowsecurity relhasoids relispartition reltablespace reloftype relpersistence relreplident relam reltoastrelid relacl definition",
+            "pg_class" => "oid relname relnamespace relkind reltype relowner relchecks relhasindex relhasrules relhastriggers relrowsecurity relforcerowsecurity relhasoids relispartition reltablespace reloftype relpersistence relreplident relam reltoastrelid relacl definition",
             "pg_attribute" => "attrelid nspname relname attname atttypid attnotnull atttypmod attlen typtypmod attnum attidentity attgenerated adsrc description typbasetype typtype format_type attisdropped atthasdef attcollation attacl",
             "pg_namespace" => "oid nspname nspowner",
             "pg_type" => "oid typname typlen typarray typnamespace typtype typrelid typelem typcollation format_type",
@@ -3245,6 +3245,12 @@ impl CatalogStubs {
                         "relowner" => Some(view_oid("rockstream").to_string()),
                         "tableowner" => Some("rockstream".into()),
                         "relkind" => Some(kind.into()),
+                        // pg_class.reltype identifies the relation composite type.
+                        // Prisma's catalog introspection filters out reltype = 0.
+                        "reltype" => Some(
+                            if kind == "i" { 0 } else { view_oid(&format!("type:{full_name}")) }
+                                .to_string(),
+                        ),
                         "relhasindex" => Some(
                             if indexes.iter().any(|i| i.table == full_name) {
                                 "t"
