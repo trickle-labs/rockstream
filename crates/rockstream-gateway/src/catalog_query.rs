@@ -686,13 +686,13 @@ mod tests {
             if name != "pg_catalog.pg_class" {
                 return None;
             }
-            Some(CatalogResponse::rows(
-                vec!["relname".to_string(), "relkind".to_string()],
-                vec![
+            Some(CatalogResponse::Rows {
+                columns: vec!["relname".to_string(), "relkind".to_string()],
+                rows: vec![
                     vec![Some("numeric_view".into()), Some("v".into())],
                     vec![Some("unrelated_table".into()), Some("r".into())],
                 ],
-            ))
+            })
         };
         let statement = Parser::parse_sql(
             &PostgreSqlDialect {},
@@ -792,10 +792,10 @@ mod tests {
         };
         let provider = |name: &str| {
             (name == "pg_class").then(|| {
-                CatalogResponse::rows(
-                    vec!["relname".into(), "relkind".into()],
-                    vec![vec![Some("v".into()), Some("v".into())]],
-                )
+                CatalogResponse::Rows {
+                    columns: vec!["relname".into(), "relkind".into()],
+                    rows: vec![vec![Some("v".into()), Some("v".into())]],
+                }
             })
         };
         assert!(matches!(
