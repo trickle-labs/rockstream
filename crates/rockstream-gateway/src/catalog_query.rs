@@ -335,12 +335,13 @@ fn eval(
             // pg_catalog.pg_class.oid identifiers; resolve those to the same
             // column without accidentally matching unrelated bare "oid".
             let key = parts.join(".");
+            let schema_qualified = if parts.len() >= 3 {
+                row.get(&parts[parts.len() - 2..].join("."))
+            } else {
+                None
+            };
             row.get(&key)
-                .or_else(|| {
-                    (parts.len() >= 3).then(|| {
-                        row.get(&parts[parts.len() - 2..].join("."))
-                    }).flatten()
-                })
+                .or(schema_qualified)
                 .cloned()
                 .unwrap_or_default()
         },
