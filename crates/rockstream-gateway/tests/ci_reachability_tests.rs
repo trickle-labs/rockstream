@@ -108,9 +108,14 @@ fn ci_workspace_test_runs_explicit_feature_matrix() {
             .to_str()
             .unwrap();
         assert!(
-            matrix.contains(&format!("\"{target}\""))
-                || workflow.contains(&format!("--test {target}")),
+            matrix.contains(&format!("\\\"{target}\\\""))
+                || (path.starts_with("crates/rockstream-gateway/")
+                    && matrix.contains("\\\"rockstream-gateway\\\"")),
             "{path} must have an explicit CI assignment",
+        );
+        assert!(
+            matrix.contains(&format!("\\\"{feature}\\\"")),
+            "{path} requires its feature to be declared in the CI matrix",
         );
     }
 }
