@@ -660,3 +660,70 @@ fn lookup(
         .find(|row| row[key].as_deref() == Some(input))?[column]
         .clone()
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_any_array_filters_real_relation_kinds() {
+        use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+        let provider = |name: &str| -> Option<CatalogResponse> {
+            if name != "pg_catalog.pg_class" {
+                return None;
+            }
+            Some(CatalogResponse::rows(
+                vec!["relname".to_string(), "relkind".to_string()],
+                vec![
+                    vec![Some("numeric_view".into()), Some("v".into())],
+                    vec![Some("unrelated_table".into()), Some("r".into())],
+                ],
+            ))
+        };
+        let statement = Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "SELECT relname FROM pg_catalog.pg_class WHERE relkind = ANY (ARRAY['v', 'm'])",
+        )
+        .expect("valid PostgreSQL ANY expression")
+        .remove(0);
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected SELECT query");
+        };
+        let result = execute(&query, &provider, &SessionInfo::default())
+            .expect("catalog query was recognized");
+        let CatalogResponse::Rows { columns, rows } = result else {
+            panic!("catalog ANY expression must execute successfully");
+        };
+        assert_eq!(columns, vec!["relname"]);
+        assert_eq!(rows, vec![vec![Some("numeric_view".into())]]);
+    }
+
+    #[test]
+    fn catalog_any_array_rejects_unsupported_rhs() {
+        use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+        let statement = Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "SELECT relname FROM pg_class WHERE relkind = ANY (subquery_value)",
+        )
+        .expect("valid expression")
+        .remove(0);
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected SELECT query");
+        };
+        let provider = |name: &str| {
+            (name == "pg_class").then(|| {
+                CatalogResponse::rows(
+                    vec!["relname".into(), "relkind".into()],
+                    vec![vec![Some("v".into()), Some("v".into())]],
+                )
+            })
+        };
+        assert!(matches!(
+            execute(&query, &provider, &SessionInfo::default()),
+            Some(CatalogResponse::Error { .. })
+        ));
+    }
+}
