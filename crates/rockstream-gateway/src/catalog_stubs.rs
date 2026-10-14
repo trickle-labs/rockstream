@@ -3247,10 +3247,14 @@ impl CatalogStubs {
                         "relkind" => Some(kind.into()),
                         // pg_class.reltype identifies the relation composite type.
                         // Prisma's catalog introspection filters out reltype = 0.
-                        "reltype" => Some(
-                            if kind == "i" { 0 } else { view_oid(&format!("type:{full_name}")) }
-                                .to_string(),
-                        ),
+                        "reltype" => {
+                            let reltype = if kind == "i" {
+                                0
+                            } else {
+                                view_oid(&format!("type:{full_name}"))
+                            };
+                            Some(reltype.to_string())
+                        }
                         "relhasindex" => Some(
                             if indexes.iter().any(|i| i.table == full_name) {
                                 "t"
