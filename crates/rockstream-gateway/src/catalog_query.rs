@@ -328,10 +328,22 @@ fn eval(
     let value = |e| eval(e, row, provider, session);
     Ok(match expr {
         Expr::Identifier(id) => row.get(&identifier(id)).cloned().unwrap_or_default(),
-        Expr::CompoundIdentifier(ids) => row
-            .get(&ids.iter().map(identifier).collect::<Vec<_>>().join("."))
-            .cloned()
-            .unwrap_or_default(),
+        Expr::CompoundIdentifier(ids) => {
+            let parts = ids.iter().map(identifier).collect::<Vec<_>>();
+            // Relation maps are keyed by their SQL alias or unqualified table
+            // name (pg_class.oid). PostgreSQL clients use fully qualified
+            // pg_catalog.pg_class.oid identifiers; resolve those to the same
+            // column without accidentally matching unrelated bare "oid".
+            let key = parts.join(".");
+            row.get(&key)
+                .or_else(|| {
+                    (parts.len() >= 3).then(|| {
+                        row.get(&parts[parts.len() - 2..].join("."))
+                    }).flatten()
+                })
+                .cloned()
+                .unwrap_or_default()
+        },
         Expr::Value(v) => match &v.value {
             Value::SingleQuotedString(s) | Value::EscapedStringLiteral(s) | Value::Number(s, _) => {
                 Some(s.clone())
