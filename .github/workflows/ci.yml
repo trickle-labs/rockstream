@@ -29,7 +29,22 @@ jobs:
       - name: Require Docker
         run: docker info
       - name: Build unified-binary test image
-        run: docker build -t rockstream-tc-test:latest .
+        run: |
+          for attempt in 1 2 3; do
+            if docker build -t rockstream-tc-test:latest . 2>&1 | tee docker-build.log; then
+              exit 0
+            fi
+            # Retry only transient registry/network responses. Compilation or
+            # test-image construction errors must fail without retry masking.
+            if ! grep -Eqi '502 Bad Gateway|503 Service Unavailable|429 Too Many Requests|unexpected status code|TLS handshake timeout' docker-build.log; then
+              exit 1
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "Transient registry error: retrying image build ($attempt/3)"
+            sleep "$((attempt * 10))"
+          done
       - name: Record HA test case execution
         run: python3 scripts/ci-test-inventory.py run --job pr-ha
       - name: Upload HA test evidence
