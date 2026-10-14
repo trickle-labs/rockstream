@@ -801,7 +801,7 @@ mod tests {
         Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
-            Field::new("result", DataType::Int64, false),
+            Field::new("result", DataType::Int64, true),
         ]))
     }
 
