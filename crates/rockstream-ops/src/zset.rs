@@ -97,16 +97,13 @@ impl ArrowZSet {
 
     /// Create an empty `ArrowZSet` with the given schema.
     pub fn empty(schema: SchemaRef) -> Self {
-        use arrow::array::{BooleanArray, Float64Array, StringArray};
+        // Build a zero-length array of the precise declared Arrow type.
+        // Falling back to Int64 for types such as Int32 makes the empty
+        // RecordBatch invalid and can panic during legitimate empty epochs.
         let columns: Vec<ArrayRef> = schema
             .fields()
             .iter()
-            .map(|f| match f.data_type() {
-                DataType::Utf8 => Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
-                DataType::Boolean => Arc::new(BooleanArray::from(Vec::<bool>::new())) as ArrayRef,
-                DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
-                _ => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-            })
+            .map(|field| arrow::array::new_empty_array(field.data_type()))
             .collect();
         let data = RecordBatch::try_new(schema, columns).expect("empty batch");
         Self::try_new(data, Vec::new()).expect("empty ArrowZSet")
