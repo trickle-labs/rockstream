@@ -969,13 +969,13 @@ fn empty_result(schema: &Schema) -> TypedResult {
 }
 
 fn add_batch_rows(result: &mut TypedResult, batch: &RecordBatch, weights: &[i64]) {
-    for row_idx in 0..batch.num_rows() {
+    assert_eq!(weights.len(), batch.num_rows());
+    for (row_idx, &weight) in weights.iter().enumerate() {
         let row: Vec<ScalarValue> = batch
             .columns()
             .iter()
             .map(|column| ScalarValue::try_from_array(column, row_idx).unwrap())
             .collect();
-        let weight = weights[row_idx];
         let net = result.rows.entry(row.clone()).or_insert(0);
         *net += weight;
         if *net == 0 {
