@@ -46,10 +46,37 @@ pub fn outer_join_output_schema_n(left_n_cols: usize, right_n_cols: usize) -> Sc
     ))
 }
 
+fn output_schema(kind: OuterJoinKind, left: &Schema, right: &Schema) -> SchemaRef {
+    let left_padded = matches!(kind, OuterJoinKind::Right | OuterJoinKind::Full);
+    let right_padded = matches!(kind, OuterJoinKind::Left | OuterJoinKind::Full);
+    let mut fields = left
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            Field::new(
+                format!("l_{i}"),
+                DataType::Int64,
+                left_padded || field.is_nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !matches!(kind, OuterJoinKind::Semi | OuterJoinKind::Anti) {
+        fields.extend(right.fields().iter().enumerate().map(|(i, field)| {
+            Field::new(
+                format!("r_{i}"),
+                DataType::Int64,
+                right_padded || field.is_nullable(),
+            )
+        }));
+    }
+    Arc::new(Schema::new(fields))
+}
+
 /// Output schema for semi/anti join: left columns only.
 pub fn semi_anti_output_schema_n(left_n_cols: usize) -> SchemaRef {
     let fields: Vec<Field> = (0..left_n_cols)
-        .map(|i| Field::new(format!("l_{i}"), DataType::Int64, true))
+        .map(|i| Field::new(format!("l_{i}"), DataType::Int64, false))
         .collect();
     Arc::new(Schema::new(fields))
 }
@@ -410,7 +437,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         // Compute staged right delta per key.
@@ -539,7 +570,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_lw: HashMap<Vec<u8>, i64> = {
@@ -656,7 +691,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_rw: HashMap<Vec<u8>, i64> = {
@@ -855,7 +894,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = semi_anti_output_schema_n(self.left_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_rw: HashMap<Vec<u8>, i64> = {
@@ -928,7 +971,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = semi_anti_output_schema_n(self.left_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_rw: HashMap<Vec<u8>, i64> = {

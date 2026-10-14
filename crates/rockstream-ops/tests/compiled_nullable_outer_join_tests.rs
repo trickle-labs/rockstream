@@ -52,8 +52,12 @@ fn expected_schema(kind: OuterJoinKind) -> SchemaRef {
     ))
 }
 
-fn assert_relation(output: ArrowZSet, kind: OuterJoinKind, mut expected: Vec<Row>) {
-    assert_eq!(output.data.schema(), expected_schema(kind));
+fn assert_relation(output: ArrowZSet, kind: OuterJoinKind, expected: Vec<Row>) {
+    assert_relation_schema(output, expected_schema(kind), expected);
+}
+
+fn assert_relation_schema(output: ArrowZSet, schema: SchemaRef, mut expected: Vec<Row>) {
+    assert_eq!(output.data.schema(), schema);
     let columns = output
         .data
         .columns()
@@ -83,7 +87,12 @@ async fn open_db(dir: &TempDir) -> Arc<ShardDb> {
     Arc::new(ShardDb::builder("shard", store).build().await.unwrap())
 }
 
-fn compile(kind: OuterJoinKind, db: Arc<ShardDb>) -> JoinCompiled {
+fn compile(
+    kind: OuterJoinKind,
+    db: Arc<ShardDb>,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
+) -> JoinCompiled {
     let plan = PlanNode::ViewSink {
         view_name: "nullable_join".into(),
         pk: vec![0],
@@ -98,11 +107,97 @@ fn compile(kind: OuterJoinKind, db: Arc<ShardDb>) -> JoinCompiled {
             unmatched_arr_id: OperatorId(114),
         }),
     };
-    let schemas = HashMap::from([
-        ("l".into(), empty().data.schema()),
-        ("r".into(), empty().data.schema()),
-    ]);
+    let schemas = HashMap::from([("l".into(), left_schema), ("r".into(), right_schema)]);
     compile_plan(&plan, db, &schemas).unwrap().join.unwrap()
+}
+
+#[tokio::test]
+async fn compiled_outer_join_schema_preserves_each_input_column_nullability() {
+    for kind in [
+        OuterJoinKind::Left,
+        OuterJoinKind::Right,
+        OuterJoinKind::Full,
+        OuterJoinKind::Semi,
+        OuterJoinKind::Anti,
+    ] {
+        for (left_nullable, right_nullable) in [(false, false), (true, false), (false, true)] {
+            let schema = |nullable| {
+                Arc::new(Schema::new(vec![
+                    Field::new("k", DataType::Int64, false),
+                    Field::new("v", DataType::Int64, nullable),
+                ]))
+            };
+            let left_schema = schema(left_nullable);
+            let right_schema = schema(right_nullable);
+            let nullable = match kind {
+                OuterJoinKind::Left => vec![false, left_nullable, true, true],
+                OuterJoinKind::Right => vec![true, true, false, right_nullable],
+                OuterJoinKind::Full => vec![true; 4],
+                OuterJoinKind::Semi | OuterJoinKind::Anti => vec![false, left_nullable],
+            };
+            let expected_schema = Arc::new(Schema::new(
+                expected_schema(kind)
+                    .fields()
+                    .iter()
+                    .zip(nullable)
+                    .map(|(field, nullable)| Field::new(field.name(), DataType::Int64, nullable))
+                    .collect::<Vec<_>>(),
+            ));
+            let dir = TempDir::new().unwrap();
+            let db = open_db(&dir).await;
+            let join = compile(kind, db.clone(), left_schema.clone(), right_schema.clone());
+            assert_relation_schema(
+                join.pipeline
+                    .process(
+                        ArrowZSet::empty(left_schema.clone()),
+                        ArrowZSet::empty(right_schema.clone()),
+                    )
+                    .unwrap(),
+                expected_schema.clone(),
+                vec![],
+            );
+            let left_value = (!left_nullable).then_some(7);
+            let right_value = (!right_nullable).then_some(0);
+            let row = |schema, value| {
+                let columns = input(Some(1), value, 1).data.columns().to_vec();
+                ArrowZSet::new(RecordBatch::try_new(schema, columns).unwrap(), vec![1])
+            };
+            let expected = match kind {
+                OuterJoinKind::Semi => vec![(vec![Some(1), left_value], 1)],
+                OuterJoinKind::Anti => vec![],
+                _ => vec![(vec![Some(1), left_value, Some(1), right_value], 1)],
+            };
+            assert_relation_schema(
+                join.pipeline
+                    .process(
+                        row(left_schema.clone(), left_value),
+                        row(right_schema.clone(), right_value),
+                    )
+                    .unwrap(),
+                expected_schema.clone(),
+                expected,
+            );
+            join.pipeline.persist(&db).await.unwrap();
+            db.flush().await.unwrap();
+            drop(join);
+            Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+            let db = open_db(&dir).await;
+            let join = compile(kind, db.clone(), left_schema.clone(), right_schema.clone());
+            join.pipeline.restore(&db).await.unwrap();
+            assert_relation_schema(
+                join.pipeline
+                    .process(
+                        ArrowZSet::empty(left_schema),
+                        ArrowZSet::empty(right_schema),
+                    )
+                    .unwrap(),
+                expected_schema,
+                vec![],
+            );
+            drop(join);
+            Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+        }
+    }
 }
 
 #[tokio::test]
@@ -117,7 +212,12 @@ async fn compiled_null_keys_never_match_and_retract_exactly() {
         for reopen in [false, true] {
             let dir = TempDir::new().unwrap();
             let db = open_db(&dir).await;
-            let join = compile(kind, db.clone());
+            let join = compile(
+                kind,
+                db.clone(),
+                empty().data.schema(),
+                empty().data.schema(),
+            );
             let left = (vec![None, Some(7), None, None], 1);
             let right = (vec![None, None, None, Some(7)], 1);
             let expected = match kind {
@@ -140,7 +240,12 @@ async fn compiled_null_keys_never_match_and_retract_exactly() {
                 drop(join);
                 Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
                 let db = open_db(&dir).await;
-                let join = compile(kind, db.clone());
+                let join = compile(
+                    kind,
+                    db.clone(),
+                    empty().data.schema(),
+                    empty().data.schema(),
+                );
                 join.pipeline.restore(&db).await.unwrap();
                 (db, join)
             } else {
@@ -189,7 +294,12 @@ async fn compiled_null_payload_is_distinct_from_zero_after_reopen() {
     ] {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
-        let join = compile(kind, db.clone());
+        let join = compile(
+            kind,
+            db.clone(),
+            empty().data.schema(),
+            empty().data.schema(),
+        );
         assert_relation(
             join.pipeline
                 .process(input(Some(1), None, 1), input(Some(1), Some(0), 1))
@@ -206,7 +316,12 @@ async fn compiled_null_payload_is_distinct_from_zero_after_reopen() {
         drop(join);
         Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
         let db = open_db(&dir).await;
-        let join = compile(kind, db.clone());
+        let join = compile(
+            kind,
+            db.clone(),
+            empty().data.schema(),
+            empty().data.schema(),
+        );
         join.pipeline.restore(&db).await.unwrap();
         assert_relation(
             join.pipeline
