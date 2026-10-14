@@ -683,6 +683,20 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #114 adds TopK spill/checkpoint recovery conformance at the M1 storage
+boundary. `ShardDb::set_fail_scans` injects a prefix-scan error before returning
+records; it does not change durable storage or the coordination state machine.
+`topk_storage_failures_leave_full_state_unchanged` in
+`crates/rockstream-ops/src/topk.rs` compares every accepted partition and stored
+spill record after scan, corruption, and atomic write failures.
+`topk_truncated_checkpoint_returns_corruption` rejects a malformed persisted
+record without returning a partial operator. The LFS and MinIO
+`*_topk_spilled_state_recovers_after_close` tests checkpoint actual spilled rows,
+close/reopen the same backend, and compare complete weighted outputs with
+uninterrupted execution. TopK ranking and record decoding remain data-plane
+concerns under §1.2; these tests retain M1's atomic `WriteBatch` assumption and
+add implementation coverage without introducing a new FizzBee transition.
+
 Issue #108 adds a real three-control-process M7/M4 authority-loss oracle in
 `crates/rockstream-sim/tests/control_plane_ha_tests.rs`:
 `three_process_sigkill_rejects_stale_writes_and_recovers_exact_rows`
