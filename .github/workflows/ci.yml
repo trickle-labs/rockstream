@@ -30,6 +30,7 @@ jobs:
         run: docker info
       - name: Build unified-binary test image
         run: |
+          set -o pipefail
           for attempt in 1 2 3; do
             if docker build -t rockstream-tc-test:latest . 2>&1 | tee docker-build.log; then
               exit 0
