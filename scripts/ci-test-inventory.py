@@ -331,13 +331,17 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
                                                   "features": features, "services": spec.get("services", []), "tests": []})
                     continue
                 cwd = Path(packages[package_name]["manifest_path"]).parent
+                # Cargo normally supplies these when it executes a test harness.
+                # Direct binary execution must preserve that execution contract.
+                package_env = env.copy()
+                package_env["CARGO_MANIFEST_DIR"] = str(cwd)
                 for t in pts:
                     key = target_id(t["package"], t["kind"], t["name"])
                     executable = harnesses[key]
                     record = {**t, "features": features, "services": spec.get("services", []),
                               "executable": executable, "tests": [], "status": "failed"}
                     try:
-                        listing = run_cmd([executable, "--list"], cwd, env)
+                        listing = run_cmd([executable, "--list"], cwd, package_env)
                         if listing.returncode:
                             raise RuntimeError(f"--list failed: {listing.stderr[-1000:]}")
                         listed = parse_list(listing.stdout)
@@ -348,13 +352,13 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
                             events = []
                             nonzero = []
                             for case in cases:
-                                proc = run_cmd(args + ["--exact", case], cwd, env)
+                                proc = run_cmd(args + ["--exact", case], cwd, package_env)
                                 events.extend(parse_events(proc.stdout))
                                 if proc.returncode:
                                     nonzero.append(f"{case}: exit {proc.returncode} {proc.stderr[-500:]}")
                             execution_error = "; ".join(nonzero)
                         else:
-                            proc = run_cmd(args, cwd, env)
+                            proc = run_cmd(args, cwd, package_env)
                             events = parse_events(proc.stdout)
                             execution_error = f"libtest exit {proc.returncode}: {proc.stderr[-800:]}" if proc.returncode else ""
                         tests, violations, n_passed = observed_results(
