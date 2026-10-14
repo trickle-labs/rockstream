@@ -791,11 +791,9 @@ mod tests {
             panic!("expected SELECT query");
         };
         let provider = |name: &str| {
-            (name == "pg_class").then(|| {
-                CatalogResponse::Rows {
-                    columns: vec!["relname".into(), "relkind".into()],
-                    rows: vec![vec![Some("v".into()), Some("v".into())]],
-                }
+            (name == "pg_class").then(|| CatalogResponse::Rows {
+                columns: vec!["relname".into(), "relkind".into()],
+                rows: vec![vec![Some("v".into()), Some("v".into())]],
             })
         };
         assert!(matches!(
