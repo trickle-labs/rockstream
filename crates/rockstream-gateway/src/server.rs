@@ -780,7 +780,7 @@ fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType 
         .strip_prefix("Decimal(")
         .or_else(|| dt.strip_prefix("DECIMAL("))
         .and_then(|value| value.strip_suffix(')'))
-        .and_then(|value| value.split_once(','))
+        .map(|value| value.split_once(',').unwrap_or((value, "0")))
         .and_then(|(precision, scale)| {
             Some((precision.trim().parse().ok()?, scale.trim().parse().ok()?))
         })
@@ -8432,6 +8432,23 @@ impl GatewayHandler {
         // Parse column list: content between outermost parentheses.
         let parsed = parse_create_table_columns(after);
 
+        for column in &parsed.columns {
+            if column.data_type.starts_with("Decimal(") {
+                let valid = matches!(
+                    string_to_arrow_datatype(&column.data_type),
+                    datafusion::arrow::datatypes::DataType::Decimal128(p, s)
+                        if (1..=38).contains(&p) && s >= 0 && s as u8 <= p
+                );
+                if !valid {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "[RS-1012] Invalid decimal precision or scale".to_owned(),
+                    )))]);
+                }
+            }
+        }
+
         self.catalog.add_table(CatalogTable {
             name: table_name.clone(),
             columns: parsed.columns,
@@ -10847,6 +10864,7 @@ impl GatewayHandler {
     fn build_returning_response(
         &self,
         table: &str,
+        command: &str,
         table_columns: &[String],
         returning_cols: &[String],
         rows: Vec<Vec<String>>,
@@ -10904,13 +10922,20 @@ impl GatewayHandler {
                     .get(i)
                     .map(|f| f.datatype())
                     .unwrap_or(&Type::TEXT);
-                encode_typed_field(&mut encoder, dt, Some(v.as_str()))
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                encode_typed_field_with_format(
+                    &mut encoder,
+                    dt,
+                    Some(v.as_str()).filter(|v| *v != r"\N"),
+                    Some(schema_ref[i].format()),
+                )
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             }
             encoder.finish()
         });
         let stream = Box::pin(data_stream);
-        promote_response(Response::Query(QueryResponse::new(schema, stream)))
+        let mut response = QueryResponse::new(schema, stream);
+        response.set_command_tag(command);
+        promote_response(Response::Query(response))
     }
 
     async fn check_pk_exists(
@@ -10973,6 +10998,21 @@ impl GatewayHandler {
         predicate: Option<&rockstream_sql::dml::DmlPredicate>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<(String, Vec<String>)>> {
+        let column_types: HashMap<_, _> = self
+            .catalog
+            .get_table(table)
+            .map(|ct| {
+                ct.columns
+                    .into_iter()
+                    .map(|c| {
+                        (
+                            c.name.to_lowercase(),
+                            string_to_arrow_datatype(&c.data_type),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut live_rows: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
         if let Some(shard_db) = &self.shard_db {
@@ -11044,7 +11084,7 @@ impl GatewayHandler {
                     row_map.insert(col.clone(), val_opt);
                 }
 
-                match pred.evaluate(&row_map) {
+                match pred.evaluate(&row_map, &column_types) {
                     Ok(tri) => {
                         if tri.is_true() {
                             matched.push((row_key, fields));
@@ -11055,7 +11095,11 @@ impl GatewayHandler {
                         let sqlstate = if err_str.contains("RS-1013") {
                             "0A000"
                         } else if err_str.contains("RS-1016") {
-                            "22012"
+                            if err_str.contains("division by zero") {
+                                "22012"
+                            } else {
+                                "22003"
+                            }
                         } else {
                             "42804"
                         };
@@ -11174,6 +11218,20 @@ impl GatewayHandler {
             .as_ref()
             .map(|ct| ct.columns.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_else(|| assignments.iter().map(|(c, _)| c.clone()).collect());
+        let column_types: HashMap<_, _> = table_entry
+            .as_ref()
+            .map(|ct| {
+                ct.columns
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.name.to_lowercase(),
+                            string_to_arrow_datatype(&c.data_type),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let pk_cols = table_entry.map(|ct| ct.pk_cols).unwrap_or_default();
 
         let matched_rows = match self
@@ -11205,6 +11263,7 @@ impl GatewayHandler {
             if let Some(returning_cols) = &returning_cols {
                 return Ok(vec![self.build_returning_response(
                     &table,
+                    "UPDATE",
                     &table_columns,
                     returning_cols,
                     Vec::new(),
@@ -11231,22 +11290,36 @@ impl GatewayHandler {
             }
 
             for (col_name, scalar_expr) in &assignments {
-                let new_val = match scalar_expr.evaluate(&row_map) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        let sqlstate = if err_str.contains("RS-1016") {
-                            "22012"
-                        } else if err_str.contains("RS-1013") {
-                            "0A000"
-                        } else {
-                            "42601"
-                        };
-                        return Ok(vec![promote_response(Response::Error(Box::new(
-                            ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
-                        )))]);
-                    }
+                let Some(target_type) = column_types.get(col_name) else {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "42703".to_owned(),
+                            format!("[RS-1002] Unknown column: {col_name}"),
+                        ),
+                    )))]);
                 };
+                let new_val =
+                    match scalar_expr.evaluate_assignment(&row_map, &column_types, target_type) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            let sqlstate = if err_str.contains("RS-1016") {
+                                if err_str.contains("division by zero") {
+                                    "22012"
+                                } else {
+                                    "22003"
+                                }
+                            } else if err_str.contains("RS-1013") {
+                                "0A000"
+                            } else {
+                                "42601"
+                            };
+                            return Ok(vec![promote_response(Response::Error(Box::new(
+                                ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                            )))]);
+                        }
+                    };
                 row_map.insert(col_name.clone(), new_val);
             }
 
@@ -11336,6 +11409,7 @@ impl GatewayHandler {
         if let Some(returning_cols) = &returning_cols {
             return Ok(vec![self.build_returning_response(
                 &table,
+                "UPDATE",
                 &table_columns,
                 returning_cols,
                 result_rows,
@@ -11458,6 +11532,7 @@ impl GatewayHandler {
             if let Some(returning_cols) = &returning_cols {
                 return Ok(vec![self.build_returning_response(
                     &table,
+                    "DELETE",
                     &table_columns,
                     returning_cols,
                     Vec::new(),
@@ -11510,6 +11585,7 @@ impl GatewayHandler {
         if let Some(returning_cols) = &returning_cols {
             return Ok(vec![self.build_returning_response(
                 &table,
+                "DELETE",
                 &table_columns,
                 returning_cols,
                 captured_rows,
@@ -15203,8 +15279,8 @@ fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, 
 /// logic.)
 fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatch, String> {
     use datafusion::arrow::array::{
-        ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryBuilder, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryBuilder, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
@@ -15266,21 +15342,15 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
                         .collect();
                     Arc::new(Float64Array::from(vals)) as ArrayRef
                 }
-                DataType::Decimal128(precision, scale) => {
-                    let vals: Vec<Option<i128>> = col_strs[i]
-                        .iter()
-                        .map(|s| {
-                            let mut value = s.as_deref()?.parse::<rust_decimal::Decimal>().ok()?;
-                            value.rescale((*scale).try_into().ok()?);
-                            Some(value.mantissa())
-                        })
-                        .collect();
-                    Arc::new(
-                        Decimal128Array::from(vals)
-                            .with_precision_and_scale(*precision, *scale)
-                            .map_err(|error| error.to_string())?,
-                    ) as ArrayRef
-                }
+                DataType::Decimal128(_, _) => datafusion::arrow::compute::cast_with_options(
+                    &StringArray::from(col_strs[i].clone()),
+                    field.data_type(),
+                    &datafusion::arrow::compute::CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|error| error.to_string())?,
                 DataType::Boolean => {
                     let vals: Vec<Option<bool>> = col_strs[i]
                         .iter()

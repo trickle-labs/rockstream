@@ -75,6 +75,7 @@ pub const PG_OID_ARRAY_UUID: i32 = 2951;
 /// Map an Arrow data type name to a Postgres type OID.
 pub fn arrow_type_to_pg_oid(arrow_type: &str) -> i32 {
     match arrow_type {
+        t if t.starts_with("Decimal(") => PG_OID_NUMERIC,
         "Int16" => PG_OID_INT2,
         "Int32" => PG_OID_INT4,
         "Int64" => PG_OID_INT8,
@@ -108,6 +109,7 @@ pub fn arrow_type_to_pg_oid(arrow_type: &str) -> i32 {
 /// `information_schema.columns.data_type`).
 pub fn arrow_type_to_pg_data_type(arrow_type: &str) -> &'static str {
     match arrow_type {
+        t if t.starts_with("Decimal(") => "numeric",
         "Int16" => "smallint",
         "Int32" => "integer",
         "Int64" => "bigint",
