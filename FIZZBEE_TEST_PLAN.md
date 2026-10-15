@@ -683,6 +683,30 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #116 makes worker-local exchange reservation ownership explicit in
+`WorkerStreamMultiplexer::send_frame`: admission reserves rows, batches, bytes,
+and pending requests together. Cancellation or failure before transport enqueue
+releases the reservation. Queue publication transfers ownership without an
+intervening suspension to acknowledgement accounting keyed by channel, epoch,
+and sequence; cancelling the producer after publication cannot release delivered
+work. A matching acknowledgement releases one queued reservation, including each
+overlapping retransmission. Shared-memory completion, durable upload completion,
+and exchange teardown release the corresponding reservations without a later ack.
+Admission registers its wakeup before checking capacity so release cannot be lost.
+The `production_sender_*` tests in
+`crates/rockstream-runtime/src/exchange/multiplexer.rs` exercise the production
+sender through controlled queue and acknowledgement barriers: each non-row limit
+is saturated independently while row credits remain, oversized frames fail
+without delivery or accounting changes, and cancellation before delivery restores
+the complete budget for a subsequent full-budget weighted batch. Post-delivery
+cancellation retains the reservation until acknowledgement; stale acknowledgements,
+overlapping retransmissions, failed sends, durable delivery, and teardown have
+exact accounting and complete batch oracles. These transport budgets and Tokio
+task cancellation are implementation-level concerns absent from the M1–M7
+models; durable epoch acceptance, frontier publication, and fencing transitions
+remain unchanged. The runtime tests supply this coverage without claiming a new
+FizzBee invariant or adding an abstract protocol transition.
+
 Issue #114 adds TopK spill/checkpoint recovery conformance at the M1 storage
 boundary. `ShardDb::set_fail_scans` injects a prefix-scan error before returning
 records; it does not change durable storage or the coordination state machine.
