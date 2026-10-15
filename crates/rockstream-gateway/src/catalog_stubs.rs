@@ -5832,10 +5832,7 @@ mod pgjdbc_reflection_tests {
                 row[native].as_deref().unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            actual,
-            ["int2", "int4", "int8", "float4", "float8", "bool"]
-        );
+        assert_eq!(actual, ["int2", "int4", "int8", "float4", "float8", "bool"]);
     }
 
     #[test]
