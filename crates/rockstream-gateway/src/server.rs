@@ -19692,3 +19692,24 @@ mod source_batch_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod catalog_array_parameter_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prisma_nested_catalog_any_bind_is_text_array() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT info.column_name FROM information_schema.columns info JOIN (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.nspname = ANY($1)) schemas ON schemas.nspname = info.table_schema";
+        let types = infer_parameter_types(&catalog, sql).await;
+        assert_eq!(types, vec![Type::TEXT_ARRAY]);
+    }
+
+    #[tokio::test]
+    async fn explicitly_cast_catalog_any_bind_keeps_declared_type() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT c.relname FROM pg_catalog.pg_class c WHERE c.oid = ANY($1::int4[])";
+        let types = infer_parameter_types(&catalog, sql).await;
+        assert_eq!(types, vec![Type::INT4_ARRAY]);
+    }
+}
