@@ -64,6 +64,17 @@ in the test corpus.
 | `NoData` | B→F | `gateway_extended_query_tests.rs::test_extended_query_pipeline` |
 | `ParameterDescription` | B→F | `gateway_extended_query_tests.rs::test_extended_query_pipeline` |
 
+Bind interprets each value using its declared text/binary format and the resolved
+Parse parameter type (explicit OIDs take precedence over inference). Malformed
+supported binary values return `ERROR` with SQLSTATE `22P03` before `BindComplete`
+or execution. Invalid parameter counts or format codes return `ERROR` with
+SQLSTATE `08P01`. Both errors discard subsequent messages until `Sync`, which
+returns `ReadyForQuery` with status `I` outside a transaction or `E` inside one.
+An explicit transaction can recover with `ROLLBACK`; rejected statements do not
+change table contents. These Bind errors preserve the connection. Binary arrays
+support zero or one dimension and require complete headers, matching element
+OIDs, valid element widths, and exact declared lengths.
+
 ---
 
 ## Copy Protocol

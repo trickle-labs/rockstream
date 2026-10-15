@@ -117,6 +117,8 @@ pub struct FlowController {
     aggregate_bytes: Arc<AtomicU64>,
     pending_requests: Arc<AtomicU64>,
     global_notify: Arc<Notify>,
+    #[cfg(test)]
+    pub(super) wait_barriers: Option<Arc<(tokio::sync::Barrier, tokio::sync::Barrier)>>,
 }
 
 impl Default for FlowController {
@@ -144,6 +146,8 @@ impl FlowController {
             aggregate_bytes: Arc::new(AtomicU64::new(0)),
             pending_requests: Arc::new(AtomicU64::new(0)),
             global_notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            wait_barriers: None,
         }
     }
 
@@ -384,6 +388,8 @@ impl FlowController {
                     if !err.contains("RESOURCE_EXHAUSTED") {
                         return Err(err);
                     }
+                    #[cfg(test)]
+                    self.pause_before_wait().await;
                     notified.await;
                 }
             }
@@ -608,7 +614,17 @@ impl FlowController {
                     return Ok(());
                 }
             }
+            #[cfg(test)]
+            self.pause_before_wait().await;
             notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_before_wait(&self) {
+        if let Some((checked, resume)) = self.wait_barriers.as_deref() {
+            checked.wait().await;
+            resume.wait().await;
         }
     }
 }

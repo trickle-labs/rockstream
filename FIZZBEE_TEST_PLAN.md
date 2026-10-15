@@ -683,6 +683,26 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #117 closes an implementation-level liveness gap in exchange flow control.
+`FlowController::acquire_batch_permit`, used by `WorkerStreamMultiplexer::send_frame`,
+and the separately reachable row-only `acquire_credit` register their Tokio
+notification future before checking capacity. A release after a failed check but
+before awaiting that future must remain observable; row-only releases also notify
+batch-permit waiters sharing the row budget. Capacity is still checked under the channel lock,
+so one released row admits exactly one acquisition even when multiple waiters wake.
+
+The seven barrier-controlled regressions in
+`crates/rockstream-runtime/src/exchange/credit_wait_tests.rs` pause the real wait
+loops in that gap, drive production sends through a controlled outgoing queue,
+and compare complete frame and completion/accounting transcripts. With budget one,
+one release must complete the next acquisition within a bounded deadline, leaving
+exactly one outstanding row and zero available credit; its release restores zero
+outstanding rows and one available credit. Two waiters require two successive
+releases, send reservations release through matching acknowledgements, and
+batch-permit coverage includes a legacy row-only credit release.
+These tests cover Tokio notification ordering outside the abstract M1–M7 consensus
+state machines; no new FizzBee transition or liveness proof is claimed.
+
 Issue #116 makes worker-local exchange reservation ownership explicit in
 `WorkerStreamMultiplexer::send_frame`: admission reserves rows, batches, bytes,
 and pending requests together. Cancellation or failure before transport enqueue

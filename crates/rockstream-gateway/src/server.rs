@@ -12357,7 +12357,6 @@ impl ExtendedQueryHandler for GatewayHandler {
             .map(|oid| Type::from_oid(*oid).unwrap_or(Type::UNKNOWN))
             .collect::<Vec<Type>>();
         let parsed_stmt = parser.parse_sql(&message.query, &types).await?;
-
         let types = parsed_stmt.parameter_types.clone();
         let stmt = StoredStatement::new(
             message
@@ -12398,6 +12397,37 @@ impl ExtendedQueryHandler for GatewayHandler {
             .unwrap_or_else(|| "unknown".to_string());
         let portal_name = message.portal_name.clone().unwrap_or_default();
 
+        let statement_name = message
+            .statement_name
+            .as_deref()
+            .unwrap_or(pgwire::api::DEFAULT_NAME);
+        let statement = client
+            .portal_store()
+            .get_statement(statement_name)
+            .ok_or_else(|| PgWireError::StatementNotFound(statement_name.to_owned()))?;
+        if message.parameters.len() != statement.parameter_types.len()
+            || (message.parameter_format_codes.len() > 1
+                && message.parameter_format_codes.len() != message.parameters.len())
+            || message
+                .parameter_format_codes
+                .iter()
+                .any(|code| !matches!(code, 0 | 1))
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "08P01".to_string(),
+                "invalid Bind parameter count or format codes".to_string(),
+            ))));
+        }
+        let portal = Portal::try_new(&message, statement)?;
+        for (i, value) in portal.parameters.iter().enumerate() {
+            if portal.parameter_format.is_binary(i) {
+                if let Some(value) = value {
+                    decode_param_bytes(value, portal.statement.parameter_types.get(i))?;
+                }
+            }
+        }
+
         // Bound portals per connection with LRU eviction (v0.51.6 Slice 1)
         // instead of hard-erroring at the cap.
         {
@@ -12426,11 +12456,6 @@ impl ExtendedQueryHandler for GatewayHandler {
             }
         }
 
-        let statement_name = message
-            .statement_name
-            .as_deref()
-            .unwrap_or(pgwire::api::DEFAULT_NAME);
-
         // Binding a portal to a statement counts as use of that statement —
         // promote it to most-recently-used so it isn't evicted while a live
         // portal still depends on it (v0.51.6 Slice 1).
@@ -12438,28 +12463,13 @@ impl ExtendedQueryHandler for GatewayHandler {
             stmts.get(statement_name);
         }
 
-        if let Some(statement) = client.portal_store().get_statement(statement_name) {
-            if message.parameters.len() != statement.parameter_types.len()
-                || (message.parameter_format_codes.len() > 1
-                    && message.parameter_format_codes.len() != message.parameters.len())
-            {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "08P01".to_owned(),
-                    "invalid Bind parameter count or format count (RS-2056)".to_owned(),
-                ))));
-            }
-            let portal = Portal::try_new(&message, statement)?;
-            client.portal_store().put_portal(Arc::new(portal));
-            self.portal_states
-                .remove(&(conn_id.clone(), portal_name.clone()));
-            client
-                .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
-                .await?;
-            Ok(())
-        } else {
-            Err(PgWireError::StatementNotFound(statement_name.to_owned()))
-        }
+        client.portal_store().put_portal(Arc::new(portal));
+        self.portal_states
+            .remove(&(conn_id.clone(), portal_name.clone()));
+        client
+            .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+            .await?;
+        Ok(())
     }
 
     async fn on_close<C>(&self, client: &mut C, message: Close) -> PgWireResult<()>
@@ -18164,9 +18174,13 @@ fn substitute_params_typed(
                         "invalid UTF-8 parameter (RS-2056)".to_owned(),
                     )))
                 })?;
-                format!("'{}'", text.replace('\'', "''"))
+                if matches!(ty.kind(), postgres_types::Kind::Array(_)) {
+                    decode_text_param_bytes(bytes)
+                } else {
+                    format!("'{}'", text.replace('\'', "''"))
+                }
             }
-            Some(bytes) => decode_param_bytes(bytes, Some(ty)),
+            Some(bytes) => decode_param_bytes(bytes, Some(ty))?,
         };
         result.push_str(&sql[end..range.start]);
         result.push_str(&value);
@@ -18176,128 +18190,115 @@ fn substitute_params_typed(
     Ok(result)
 }
 
-fn decode_param_bytes(bytes: &[u8], param_type: Option<&Type>) -> String {
-    if bytes.len() >= 12 && bytes[..4] == [0, 0, 0, 1] {
-        // 1D PostgreSQL binary array decoding
-        let elem_type = i32::from_be_bytes(bytes[8..12].try_into().unwrap_or_default());
-        let dim = i32::from_be_bytes(bytes[12..16].try_into().unwrap_or_default());
-        let mut offset = 20;
-        let mut elems = Vec::new();
-        for _ in 0..dim.max(0) {
-            if offset + 4 > bytes.len() {
-                break;
-            }
-            let len = i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap_or_default());
-            offset += 4;
-            if len < 0 {
-                elems.push("NULL".to_string());
-            } else if offset + len as usize <= bytes.len() {
-                let elem_bytes = &bytes[offset..offset + len as usize];
-                offset += len as usize;
-                let formatted = match elem_type {
-                    20 => i64::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
-                    23 => i32::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
-                    21 => i16::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
-                    16 => {
-                        if !elem_bytes.is_empty() && elem_bytes[0] != 0 {
-                            "true".to_string()
-                        } else {
-                            "false".to_string()
-                        }
-                    }
-                    700 => {
-                        f32::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string()
-                    }
-                    701 => {
-                        f64::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string()
-                    }
-                    _ => {
-                        if let Ok(s) = std::str::from_utf8(elem_bytes) {
-                            if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-                                s.to_string()
-                            } else {
-                                format!("'{}'", s.replace('\'', "''"))
-                            }
-                        } else {
-                            "NULL".to_string()
-                        }
-                    }
-                };
-                elems.push(formatted);
-            }
-        }
-        return format!("ARRAY[{}]", elems.join(", "));
-    }
-
+fn decode_param_bytes(bytes: &[u8], param_type: Option<&Type>) -> PgWireResult<String> {
+    let invalid = || {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_string(),
+            "22P03".to_string(),
+            format!(
+                "invalid binary representation for type {}",
+                param_type.map_or("unknown", Type::name)
+            ),
+        )))
+    };
     if let Some(ty) = param_type {
-        match *ty {
-            Type::INT8 => {
-                if bytes.len() == 8 {
-                    return i64::from_be_bytes(bytes[..8].try_into().unwrap_or_default())
-                        .to_string();
-                }
+        if let postgres_types::Kind::Array(element_type) = ty.kind() {
+            let mut remaining = bytes;
+            let read_i32 = |remaining: &mut &[u8]| {
+                let (head, tail) = remaining.split_at_checked(4).ok_or_else(invalid)?;
+                *remaining = tail;
+                Ok::<_, PgWireError>(i32::from_be_bytes(head.try_into().map_err(|_| invalid())?))
+            };
+            let dimensions = read_i32(&mut remaining)?;
+            let flags = read_i32(&mut remaining)?;
+            let oid = read_i32(&mut remaining)? as u32;
+            if !matches!(flags, 0 | 1) || oid != element_type.oid() {
+                return Err(invalid());
             }
-            Type::INT4 => {
-                if bytes.len() == 4 {
-                    return i32::from_be_bytes(bytes[..4].try_into().unwrap_or_default())
-                        .to_string();
+            if dimensions == 0 {
+                if !remaining.is_empty() {
+                    return Err(invalid());
                 }
+                return Ok("ARRAY[]".to_string());
             }
-            Type::INT2 => {
-                if bytes.len() == 2 {
-                    return i16::from_be_bytes(bytes[..2].try_into().unwrap_or_default())
-                        .to_string();
-                }
+            if dimensions != 1 {
+                return Err(invalid());
             }
-            Type::FLOAT8 => {
-                if bytes.len() == 8 {
-                    return f64::from_be_bytes(bytes[..8].try_into().unwrap_or_default())
-                        .to_string();
-                }
+            let length = read_i32(&mut remaining)?;
+            let lower_bound = read_i32(&mut remaining)?;
+            if length < 0
+                || (length > 0 && lower_bound.checked_add(length - 1).is_none())
+                || length as usize > remaining.len() / 4
+            {
+                return Err(invalid());
             }
-            Type::FLOAT4 => {
-                if bytes.len() == 4 {
-                    return f32::from_be_bytes(bytes[..4].try_into().unwrap_or_default())
-                        .to_string();
-                }
-            }
-            Type::BOOL => {
-                if bytes.len() == 1 {
-                    return if bytes[0] != 0 { "true" } else { "false" }.to_string();
-                }
-            }
-            Type::UUID => {
-                if bytes.len() == 16 {
-                    return format!(
-                        "'{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}'",
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5],
-                        bytes[6], bytes[7],
-                        bytes[8], bytes[9],
-                        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+            let mut elements = Vec::new();
+            for _ in 0..length {
+                let (head, tail) = remaining.split_at_checked(4).ok_or_else(invalid)?;
+                remaining = tail;
+                let length = i32::from_be_bytes(head.try_into().map_err(|_| invalid())?);
+                if length == -1 {
+                    if flags == 0 {
+                        return Err(invalid());
+                    }
+                    elements.push("NULL".to_string());
+                } else {
+                    let length = usize::try_from(length).map_err(|_| invalid())?;
+                    let (element, tail) = remaining.split_at_checked(length).ok_or_else(invalid)?;
+                    remaining = tail;
+                    elements.push(
+                        decode_param_bytes(element, Some(element_type)).map_err(|_| invalid())?,
                     );
                 }
             }
+            if !remaining.is_empty() {
+                return Err(invalid());
+            }
+            return Ok(format!("ARRAY[{}]", elements.join(", ")));
+        }
+
+        macro_rules! number {
+            ($rust_type:ty) => {
+                Ok(
+                    <$rust_type>::from_be_bytes(bytes.try_into().map_err(|_| invalid())?)
+                        .to_string(),
+                )
+            };
+        }
+        return match *ty {
+            Type::INT8 => number!(i64),
+            Type::INT4 => number!(i32),
+            Type::INT2 => number!(i16),
+            Type::FLOAT8 => number!(f64),
+            Type::FLOAT4 => number!(f32),
+            Type::BOOL => match bytes {
+                [0] => Ok("false".to_string()),
+                [1] => Ok("true".to_string()),
+                _ => Err(invalid()),
+            },
+            Type::UUID => uuid::Uuid::from_slice(bytes)
+                .map(|value| format!("'{value}'"))
+                .map_err(|_| invalid()),
             Type::TIMESTAMP | Type::TIMESTAMPTZ => {
-                if bytes.len() == 8 {
-                    let pg_micros = i64::from_be_bytes(bytes[..8].try_into().unwrap_or_default());
-                    let unix_micros = pg_micros + 946_684_800_000_000i64;
-                    let secs = unix_micros.div_euclid(1_000_000);
-                    let nsecs = (unix_micros.rem_euclid(1_000_000) * 1_000) as u32;
-                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
-                        return format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f"));
-                    }
-                }
+                let pg_micros = i64::from_be_bytes(bytes.try_into().map_err(|_| invalid())?);
+                let unix_micros = pg_micros
+                    .checked_add(946_684_800_000_000)
+                    .ok_or_else(invalid)?;
+                let dt =
+                    chrono::DateTime::from_timestamp_micros(unix_micros).ok_or_else(invalid)?;
+                Ok(format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f")))
             }
             Type::VARCHAR | Type::TEXT => {
-                if let Ok(s) = std::str::from_utf8(bytes) {
-                    return format!("'{}'", s.replace('\'', "''"));
-                }
+                let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+                Ok(format!("'{}'", text.replace('\'', "''")))
             }
-            _ => {}
-        }
+            _ => Ok(decode_text_param_bytes(bytes)),
+        };
     }
+    Ok(decode_text_param_bytes(bytes))
+}
 
+fn decode_text_param_bytes(bytes: &[u8]) -> String {
     // Fallback heuristic decoding
     if bytes
         .iter()
@@ -19013,6 +19014,10 @@ fn parse_value_list(s: &str) -> Vec<String> {
     }
     values
 }
+
+#[cfg(test)]
+#[path = "malformed_bind_tests.rs"]
+mod malformed_bind_tests;
 
 #[cfg(test)]
 // These legacy parser tests intentionally use unwrap/expect for concise fixture assertions.

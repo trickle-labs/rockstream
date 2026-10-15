@@ -251,6 +251,13 @@ async fn test_prepared_binding_preserves_lexical_context_and_typed_results() {
             vec![Some("it's $10"), Some("x")],
         ),
         (
+            "SELECT $1 AS value",
+            "SELECT '{literal $1, x}' AS value",
+            vec![Some("{literal $1, x}")],
+            vec![("value", 25)],
+            vec![Some("{literal $1, x}")],
+        ),
+        (
             "SELECT '$1' AS literal",
             "SELECT '$1' AS literal",
             vec![],
@@ -355,13 +362,13 @@ async fn test_prepared_binding_errors_and_sync_recovery() {
             "SELECT $1 AS value",
             vec![],
             "08P01",
-            "invalid Bind parameter count or format count (RS-2056)",
+            "invalid Bind parameter count or format codes",
         ),
         (
             "SELECT $1 AS value",
             vec![Some("x"), Some("y")],
             "08P01",
-            "invalid Bind parameter count or format count (RS-2056)",
+            "invalid Bind parameter count or format codes",
         ),
     ] {
         assert_eq!(

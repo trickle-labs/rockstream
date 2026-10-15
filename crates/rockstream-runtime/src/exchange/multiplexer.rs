@@ -636,6 +636,10 @@ impl WorkerStreamMultiplexer {
 }
 
 #[cfg(test)]
+#[path = "credit_wait_tests.rs"]
+mod credit_wait_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::exchange::flow_control::FlowController;
