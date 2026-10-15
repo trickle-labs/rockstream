@@ -5814,6 +5814,32 @@ mod pgjdbc_reflection_tests {
     }
 
     #[test]
+    fn prisma_information_schema_exposes_all_native_column_types() {
+        let CatalogResponse::Rows { columns, rows } =
+            catalog().information_schema_columns(&[])
+        else {
+            panic!("information_schema.columns must return rows");
+        };
+        let table = columns.iter().position(|c| c == "table_name").unwrap();
+        let native = columns.iter().position(|c| c == "udt_name").unwrap();
+        let native_schema = columns.iter().position(|c| c == "udt_schema").unwrap();
+        let identity = columns.iter().position(|c| c == "is_identity").unwrap();
+        let actual = rows
+            .iter()
+            .filter(|row| row[table].as_deref() == Some("numeric_view"))
+            .map(|row| {
+                assert_eq!(row[native_schema].as_deref(), Some("pg_catalog"));
+                assert_eq!(row[identity].as_deref(), Some("NO"));
+                row[native].as_deref().unwrap().to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            ["int2", "int4", "int8", "float4", "float8", "bool"]
+        );
+    }
+
+    #[test]
     fn jdbc_like_respects_wildcards_and_escaped_literals() {
         assert!(pgjdbc_like("numeric_view", "numeric\\_view"));
         assert!(!pgjdbc_like("numericXview", "numeric\\_view"));
