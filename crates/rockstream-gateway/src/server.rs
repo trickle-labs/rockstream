@@ -467,21 +467,21 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         if let Ok(any_array_param) = regex::Regex::new(
             r"(?i)\bany\s*\(\s*\$([1-9][0-9]*)(?:::(text|int2|int4|int8|uuid)\[\])?\s*\)",
         ) {
-        for matched in any_array_param.captures_iter(sql) {
-            if let Ok(index) = matched[1].parse::<usize>() {
-                if index <= max_idx && !explicit_casts.contains_key(&index) {
-                    let cast = matched.get(2).map(|m| m.as_str().to_ascii_lowercase());
-                    inferred_types[index - 1] = match cast.as_deref() {
-                        Some("int2") => Type::INT2_ARRAY,
-                        Some("int4") => Type::INT4_ARRAY,
-                        Some("int8") => Type::INT8_ARRAY,
-                        Some("uuid") => Type::UUID_ARRAY,
-                        _ => Type::TEXT_ARRAY,
-                    };
+            for matched in any_array_param.captures_iter(sql) {
+                if let Ok(index) = matched[1].parse::<usize>() {
+                    if index <= max_idx && !explicit_casts.contains_key(&index) {
+                        let cast = matched.get(2).map(|m| m.as_str().to_ascii_lowercase());
+                        inferred_types[index - 1] = match cast.as_deref() {
+                            Some("int2") => Type::INT2_ARRAY,
+                            Some("int4") => Type::INT4_ARRAY,
+                            Some("int8") => Type::INT8_ARRAY,
+                            Some("uuid") => Type::UUID_ARRAY,
+                            _ => Type::TEXT_ARRAY,
+                        };
+                    }
                 }
             }
-        }
-        }
+            }
     }
 
     let ctx = SessionContext::new();
