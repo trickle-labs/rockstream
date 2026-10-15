@@ -481,7 +481,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                     }
                 }
             }
-            }
+        }
     }
 
     let ctx = SessionContext::new();
