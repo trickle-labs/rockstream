@@ -815,7 +815,10 @@ mod tests {
         let query = r#"
             SELECT oid.namespace, info.table_name, info.column_name,
                    format_type(att.atttypid, att.atttypmod) AS formatted_type,
-                   info.data_type, info.is_nullable
+                   info.data_type, info.is_nullable,
+                   info.udt_schema AS type_schema_name,
+                   info.udt_name AS full_data_type,
+                   info.is_identity
             FROM information_schema.columns info
             JOIN pg_attribute att ON att.attname = info.column_name
             JOIN (
@@ -844,6 +847,9 @@ mod tests {
                 "formatted_type",
                 "data_type",
                 "is_nullable",
+                "type_schema_name",
+                "full_data_type",
+                "is_identity",
             ]
         );
         assert_eq!(rows.len(), 1, "registered view must be discoverable");
@@ -851,6 +857,11 @@ mod tests {
         assert_eq!(rows[0][1].as_deref(), Some("numeric_view"));
         assert_eq!(rows[0][2].as_deref(), Some("c_int2"));
         assert_eq!(rows[0][3].as_deref(), Some("smallint"));
+        // Prisma requires a non-null native type name; a missing udt_name
+        // previously caused its schema engine to abort despite finding the view.
+        assert_eq!(rows[0][6].as_deref(), Some("pg_catalog"));
+        assert_eq!(rows[0][7].as_deref(), Some("int2"));
+        assert_eq!(rows[0][8].as_deref(), Some("NO"));
     }
 
     #[test]
