@@ -3728,6 +3728,9 @@ impl CatalogStubs {
         if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
             return cached.clone();
         }
+        // Prisma introspection consumes udt_name as full_data_type, even for
+        // built-in numeric and boolean types. Keep the complete reflection
+        // schema in the catalog provider so projected columns are not NULL.
         let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
             vec![
                 "table_catalog".to_string(),
@@ -3736,46 +3739,110 @@ impl CatalogStubs {
                 "column_name".to_string(),
                 "ordinal_position".to_string(),
                 "data_type".to_string(),
+                "udt_schema".to_string(),
+                "udt_name".to_string(),
+                "is_nullable".to_string(),
+                "is_identity".to_string(),
+                "numeric_precision".to_string(),
+                "numeric_scale".to_string(),
+                "numeric_precision_radix".to_string(),
+                "datetime_precision".to_string(),
+                "character_maximum_length".to_string(),
             ]
         } else {
             requested_cols.to_vec()
         };
         let mut rows = Vec::new();
         let mut items = Vec::new();
-        for t in self.list_tables() {
-            for (i, col) in t.columns.iter().enumerate() {
+        for table in self.list_tables() {
+            for (i, col) in table.columns.iter().enumerate() {
                 items.push((
-                    catalog_relation_name(&t.name, "public"),
+                    catalog_relation_name(&table.name, "public"),
                     col.name.clone(),
                     i + 1,
-                    arrow_type_to_pg_data_type(&col.data_type),
+                    arrow_type_to_pg_oid(&col.data_type),
                 ));
             }
         }
-        for v in self.list_views() {
-            for (i, col) in v.columns.iter().enumerate() {
+        for view in self.list_views() {
+            for (i, col) in view.columns.iter().enumerate() {
                 items.push((
-                    catalog_relation_name(&v.name, &v.namespace),
+                    catalog_relation_name(&view.name, &view.namespace),
                     col.name.clone(),
                     i + 1,
-                    arrow_type_to_pg_data_type(&col.data_type),
+                    arrow_type_to_pg_oid(&col.data_type),
                 ));
             }
         }
-        for ((schema, table_name), column_name, pos, data_type) in items {
-            let mut row = Vec::new();
-            for c in &cols {
-                let val = match c.as_str() {
-                    "table_catalog" => Some("rockstream".to_string()),
-                    "table_schema" => Some(schema.clone()),
-                    "table_name" => Some(table_name.clone()),
-                    "column_name" => Some(column_name.clone()),
-                    "ordinal_position" => Some(pos.to_string()),
-                    "data_type" => Some(data_type.to_string()),
-                    _ => Some("".to_string()),
-                };
-                row.push(val);
-            }
+        for ((schema, table_name), column_name, pos, oid) in items {
+            let (udt_name, precision, scale, radix, datetime_precision) = match oid {
+                PG_OID_INT2 => ("int2", Some("16"), Some("0"), Some("2"), None),
+                PG_OID_INT4 => ("int4", Some("32"), Some("0"), Some("2"), None),
+                PG_OID_INT8 => ("int8", Some("64"), Some("0"), Some("2"), None),
+                PG_OID_FLOAT4 => ("float4", Some("24"), None, Some("2"), None),
+                PG_OID_FLOAT8 => ("float8", Some("53"), None, Some("2"), None),
+                PG_OID_BOOL => ("bool", None, None, None, None),
+                PG_OID_BYTEA => ("bytea", None, None, None, None),
+                PG_OID_TIMESTAMP => ("timestamp", None, None, None, Some("6")),
+                PG_OID_TIMESTAMPTZ => ("timestamptz", None, None, None, Some("6")),
+                PG_OID_TIME => ("time", None, None, None, Some("6")),
+                PG_OID_DATE => ("date", None, None, None, None),
+                PG_OID_UUID => ("uuid", None, None, None, None),
+                PG_OID_NUMERIC => ("numeric", None, None, Some("10"), None),
+                PG_OID_JSON => ("json", None, None, None, None),
+                PG_OID_JSONB => ("jsonb", None, None, None, None),
+                PG_OID_VARCHAR => ("varchar", None, None, None, None),
+                PG_OID_CHAR => ("bpchar", None, None, None, None),
+                PG_OID_INTERVAL => ("interval", None, None, None, Some("6")),
+                PG_OID_ARRAY_INT4 => ("_int4", None, None, None, None),
+                PG_OID_ARRAY_INT8 => ("_int8", None, None, None, None),
+                PG_OID_ARRAY_TEXT => ("_text", None, None, None, None),
+                PG_OID_ARRAY_FLOAT8 => ("_float8", None, None, None, None),
+                PG_OID_ARRAY_BOOL => ("_bool", None, None, None, None),
+                PG_OID_ARRAY_UUID => ("_uuid", None, None, None, None),
+                _ => ("text", None, None, None, None),
+            };
+            let row = cols.iter().map(|c| match c.as_str() {
+                "table_catalog" => Some("rockstream".to_string()),
+                "table_schema" => Some(schema.clone()),
+                "table_name" => Some(table_name.clone()),
+                "column_name" => Some(column_name.clone()),
+                "ordinal_position" => Some(pos.to_string()),
+                "data_type" => Some(
+                    match oid {
+                        PG_OID_INT2 => "smallint",
+                        PG_OID_INT4 => "integer",
+                        PG_OID_INT8 => "bigint",
+                        PG_OID_FLOAT4 => "real",
+                        PG_OID_FLOAT8 => "double precision",
+                        PG_OID_BOOL => "boolean",
+                        PG_OID_BYTEA => "bytea",
+                        PG_OID_TIMESTAMP => "timestamp without time zone",
+                        PG_OID_TIMESTAMPTZ => "timestamp with time zone",
+                        PG_OID_TIME => "time without time zone",
+                        PG_OID_DATE => "date",
+                        PG_OID_UUID => "uuid",
+                        PG_OID_NUMERIC => "numeric",
+                        PG_OID_JSON => "json",
+                        PG_OID_JSONB => "jsonb",
+                        PG_OID_VARCHAR => "character varying",
+                        PG_OID_CHAR => "character",
+                        PG_OID_INTERVAL => "interval",
+                        _ => "text",
+                    }
+                    .to_string(),
+                ),
+                "udt_schema" => Some("pg_catalog".to_string()),
+                "udt_name" => Some(udt_name.to_string()),
+                "is_nullable" => Some("YES".to_string()),
+                "is_identity" => Some("NO".to_string()),
+                "numeric_precision" => precision.map(str::to_string),
+                "numeric_scale" => scale.map(str::to_string),
+                "numeric_precision_radix" => radix.map(str::to_string),
+                "datetime_precision" => datetime_precision.map(str::to_string),
+                "character_maximum_length" => None,
+                _ => None,
+            }).collect();
             rows.push(row);
         }
         let resp = CatalogResponse::rows(cols, rows);
