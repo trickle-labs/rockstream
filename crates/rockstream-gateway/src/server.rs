@@ -464,7 +464,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
     // such parameters would otherwise be described as scalar TEXT. Preserve
     // explicit casts and only infer text[] for catalog schema-list filters.
     if sql.contains("pg_catalog") || sql.contains("information_schema") {
-        let any_array_param = regex::Regex::new(r"(?i)\\bany\\s*\\(\\s*\\$([1-9][0-9]*)\\s*\\)")
+        let any_array_param = regex::Regex::new(r"(?i)\bany\s*\(\s*\$([1-9][0-9]*)\s*\)")
             .expect("static ANY parameter pattern");
         for matched in any_array_param.captures_iter(sql) {
             if let Ok(index) = matched[1].parse::<usize>() {
