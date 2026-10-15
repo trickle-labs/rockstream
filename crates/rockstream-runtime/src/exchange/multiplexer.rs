@@ -222,25 +222,25 @@ impl WorkerStreamMultiplexer {
         target_worker: WorkerId,
         frame: ShuffleFrame,
     ) -> Result<(), String> {
-        let exchange_id = frame.exchange_id;
-        let src_shard = frame.src_shard;
-        let target_shard = frame.target_shard;
-        let row_count = frame.row_count;
-        self.flow_controller
-            .acquire_credit(exchange_id, src_shard, target_shard, row_count)
+        let permit = self
+            .flow_controller
+            .acquire_batch_permit(
+                frame.exchange_id,
+                frame.src_shard,
+                frame.target_shard,
+                frame.payload.len(),
+                frame.row_count,
+            )
             .await?;
-        let result = self.send_frame_after_credit(target_worker, frame).await;
-        if result.is_err() {
-            self.flow_controller
-                .release_credit(exchange_id, src_shard, target_shard, row_count);
-        }
-        result
+        self.send_frame_after_credit(target_worker, frame, Some(permit))
+            .await
     }
 
     async fn send_frame_after_credit(
         &self,
         target_worker: WorkerId,
         frame: ShuffleFrame,
+        mut permit: Option<crate::exchange::flow_control::FlowPermit>,
     ) -> Result<(), String> {
         let route = self.classify_route(target_worker, &frame);
         let encoded_payload =
@@ -294,8 +294,7 @@ impl WorkerStreamMultiplexer {
 
         if matches!(route.transport, ExchangeTransport::SharedMemory) {
             match self.send_shared_memory_frame(target_worker, &frame).await {
-                Ok(ack) => {
-                    self.flow_controller.handle_ack(&ack);
+                Ok(_) => {
                     fast_path_ok = true;
                 }
                 Err(error) => {
@@ -309,14 +308,16 @@ impl WorkerStreamMultiplexer {
             }
         }
 
-        if !fast_path_ok {
+        if !fast_path_ok && !matches!(route.transport, ExchangeTransport::DurableObject) {
             let tx_opt = {
                 let streams = self.streams.lock();
                 streams.get(&target_worker).cloned()
             };
 
             if let Some(tx) = tx_opt {
-                if tx.send(frame.clone()).await.is_ok() {
+                if let Ok(slot) = tx.reserve().await {
+                    permit.take().unwrap().handoff(frame.epoch, frame.seq);
+                    slot.send(frame.clone());
                     fast_path_ok = true;
                 } else {
                     let mut streams = self.streams.lock();
@@ -389,7 +390,9 @@ impl WorkerStreamMultiplexer {
                                     streams.len() as u64,
                                 );
                             }
-                            if tx.send(frame.clone()).await.is_ok() {
+                            if let Ok(slot) = tx.reserve().await {
+                                permit.take().unwrap().handoff(frame.epoch, frame.seq);
+                                slot.send(frame.clone());
                                 fast_path_ok = true;
                             }
                         }
@@ -498,12 +501,6 @@ impl WorkerStreamMultiplexer {
                     e
                 )
             })?;
-            self.flow_controller.release_credit(
-                frame.exchange_id,
-                frame.src_shard,
-                frame.target_shard,
-                frame.row_count,
-            );
 
             // No local outbox to delete: with fast-path WAL elision (v0.51) the
             // outbox is never written; the durable object upload above is the
@@ -641,3 +638,323 @@ impl WorkerStreamMultiplexer {
 #[cfg(test)]
 #[path = "credit_wait_tests.rs"]
 mod credit_wait_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exchange::flow_control::FlowController;
+    use crate::exchange::proto::ShuffleAck;
+    use crate::exchange::serialization::{deserialize_zset, serialize_zset};
+    use rockstream_ops::zset::ArrowZSet;
+    use std::future::Future;
+    use std::time::Duration;
+
+    fn frame(batch: &ArrowZSet, seq: u64) -> ShuffleFrame {
+        ShuffleFrame {
+            exchange_id: 100,
+            src_shard: 0,
+            target_shard: 1,
+            epoch: 1,
+            seq,
+            payload: serialize_zset(batch).unwrap().into(),
+            row_count: batch.num_rows() as u32,
+        }
+    }
+
+    fn sender(
+        controller: &FlowController,
+    ) -> (
+        WorkerStreamMultiplexer,
+        mpsc::Sender<ShuffleFrame>,
+        mpsc::Receiver<ShuffleFrame>,
+    ) {
+        let multiplexer =
+            WorkerStreamMultiplexer::new(ShuffleClientPool::default(), controller.clone());
+        let (tx, rx) = mpsc::channel(1);
+        // Use the production cached-stream path, with queue capacity as the delivery barrier.
+        multiplexer.streams.lock().insert(WorkerId(2), tx.clone());
+        (multiplexer, tx, rx)
+    }
+
+    fn snapshot(controller: &FlowController) -> (u32, u32, usize, usize, usize) {
+        (
+            controller.get_credits(100, 0, 1),
+            controller.rows_in_flight(100, 0, 1),
+            controller.batches_in_flight(100, 0, 1),
+            controller.bytes_in_flight(),
+            controller.pending_requests(),
+        )
+    }
+
+    fn ack(controller: &FlowController, frame: &ShuffleFrame) {
+        controller.handle_ack(&ShuffleAck {
+            exchange_id: frame.exchange_id,
+            src_shard: frame.src_shard,
+            target_shard: frame.target_shard,
+            epoch: frame.epoch,
+            seq: frame.seq,
+            credit_grant: frame.row_count.max(1),
+        });
+    }
+
+    fn assert_batch(received: &ShuffleFrame, expected: &ShuffleFrame, batch: &ArrowZSet) {
+        assert_eq!(received, expected);
+        let decoded = deserialize_zset(&received.payload, batch.data.schema()).unwrap();
+        assert_eq!(decoded.data, batch.data);
+        assert_eq!(decoded.weights, batch.weights);
+    }
+
+    #[tokio::test]
+    async fn production_sender_enforces_each_non_row_limit_until_matching_ack() {
+        let first_batch = ArrowZSet::from_ab_rows(&[(1, 10)], 1);
+        let second_batch = ArrowZSet::from_ab_rows(&[(2, 20)], 1);
+        let first = frame(&first_batch, 1);
+        let second = frame(&second_batch, 2);
+        for controller in [
+            FlowController::with_row_budget(4).with_max_inflight_batches(1),
+            FlowController::with_row_budget(4).with_max_inflight_bytes(first.payload.len()),
+            FlowController::with_row_budget(4).with_max_pending_requests(1),
+        ] {
+            let (multiplexer, _tx, mut rx) = sender(&controller);
+            let baseline = snapshot(&controller);
+            assert_eq!(baseline, (4, 0, 0, 0, 0));
+            multiplexer
+                .send_frame(WorkerId(2), first.clone())
+                .await
+                .unwrap();
+            let received = rx.try_recv().unwrap();
+            assert_batch(&received, &first, &first_batch);
+            assert_eq!(snapshot(&controller), (3, 1, 1, first.payload.len(), 1));
+
+            let second_send = multiplexer.send_frame(WorkerId(2), second.clone());
+            tokio::pin!(second_send);
+            assert!(futures::poll!(&mut second_send).is_pending());
+            assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+            assert_eq!(snapshot(&controller), (3, 1, 1, first.payload.len(), 1));
+
+            ack(&controller, &received);
+            assert_eq!(snapshot(&controller), baseline);
+            tokio::time::timeout(Duration::from_secs(2), second_send)
+                .await
+                .unwrap()
+                .unwrap();
+            let received = rx.try_recv().unwrap();
+            assert_batch(&received, &second, &second_batch);
+            assert_eq!(snapshot(&controller), (3, 1, 1, second.payload.len(), 1));
+            // A stale acknowledgement must not release the second frame's reservation.
+            ack(&controller, &first);
+            assert_eq!(snapshot(&controller), (3, 1, 1, second.payload.len(), 1));
+            ack(&controller, &received);
+            assert_eq!(snapshot(&controller), baseline);
+            assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        }
+    }
+
+    #[tokio::test]
+    async fn production_sender_rejects_oversized_frames_without_reserving_or_delivering() {
+        let batch = ArrowZSet::from_ab_rows(&[(1, 10)], 1);
+        let oversized = frame(&batch, 1);
+        for limit in ["max_batch_bytes", "max_inflight_bytes"] {
+            let bytes = oversized.payload.len() - 1;
+            let controller = if limit == "max_batch_bytes" {
+                FlowController::with_row_budget(4).with_max_batch_bytes(bytes)
+            } else {
+                FlowController::with_row_budget(4).with_max_inflight_bytes(bytes)
+            };
+            let (multiplexer, _tx, mut rx) = sender(&controller);
+            let baseline = snapshot(&controller);
+            assert_eq!(
+                multiplexer.send_frame(WorkerId(2), oversized.clone()).await,
+                Err(format!(
+                    "[RS-3006] exchange frame size ({} bytes) exceeds {limit} ({bytes}) limit. Next steps: split large record batches into smaller chunks within configured transport budget.",
+                    oversized.payload.len()
+                ))
+            );
+            assert_eq!(snapshot(&controller), baseline);
+            assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        }
+    }
+
+    #[tokio::test]
+    async fn production_sender_cancellation_before_delivery_restores_full_budget() {
+        let controller = FlowController::with_row_budget(2);
+        let (multiplexer, tx, mut rx) = sender(&controller);
+        let baseline = snapshot(&controller);
+        let blocked_slot = tx.reserve_owned().await.unwrap();
+        let batch = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], 3);
+        let original = frame(&batch, 1);
+        let (reserved_tx, reserved_rx) = tokio::sync::oneshot::channel();
+        let send_task = tokio::spawn({
+            let multiplexer = multiplexer.clone();
+            let original = original.clone();
+            async move {
+                let send = multiplexer.send_frame(WorkerId(2), original);
+                tokio::pin!(send);
+                std::future::poll_fn(|cx| {
+                    assert!(send.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                reserved_tx.send(()).unwrap();
+                send.await
+            }
+        });
+        reserved_rx.await.unwrap();
+        assert_eq!(snapshot(&controller), (0, 2, 1, original.payload.len(), 1));
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        send_task.abort();
+        assert!(send_task.await.unwrap_err().is_cancelled());
+        assert_eq!(snapshot(&controller), baseline);
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        drop(blocked_slot);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            multiplexer.send_frame(WorkerId(2), original.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let received = rx.try_recv().unwrap();
+        assert_batch(&received, &original, &batch);
+        assert_eq!(snapshot(&controller), (0, 2, 1, original.payload.len(), 1));
+        ack(&controller, &received);
+        assert_eq!(snapshot(&controller), baseline);
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn production_sender_cancellation_after_delivery_keeps_reservation_until_ack() {
+        let controller = FlowController::with_row_budget(2);
+        let (multiplexer, _tx, mut rx) = sender(&controller);
+        let baseline = snapshot(&controller);
+        let batch = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], -2);
+        let original = frame(&batch, 1);
+        let send_task = tokio::spawn({
+            let original = original.clone();
+            async move {
+                multiplexer.send_frame(WorkerId(2), original).await.unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_batch(&received, &original, &batch);
+        assert_eq!(snapshot(&controller), (0, 2, 1, original.payload.len(), 1));
+        send_task.abort();
+        assert!(send_task.await.unwrap_err().is_cancelled());
+        assert_eq!(snapshot(&controller), (0, 2, 1, original.payload.len(), 1));
+        ack(&controller, &received);
+        assert_eq!(snapshot(&controller), baseline);
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn production_sender_teardown_reclaims_delivered_reservations() {
+        let controller = FlowController::with_row_budget(2);
+        let (multiplexer, _tx, mut rx) = sender(&controller);
+        let baseline = snapshot(&controller);
+        let batch = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], 1);
+        let original = frame(&batch, 1);
+        multiplexer
+            .send_frame(WorkerId(2), original.clone())
+            .await
+            .unwrap();
+        assert_batch(&rx.try_recv().unwrap(), &original, &batch);
+        assert_eq!(snapshot(&controller), (0, 2, 1, original.payload.len(), 1));
+        controller.teardown_exchange(100);
+        assert_eq!(snapshot(&controller), baseline);
+        ack(&controller, &original);
+        assert_eq!(snapshot(&controller), baseline);
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn production_sender_accounts_each_overlapping_retransmission() {
+        let controller = FlowController::with_row_budget(2);
+        let (multiplexer, _tx, mut rx) = sender(&controller);
+        let baseline = snapshot(&controller);
+        let batch = ArrowZSet::from_ab_rows(&[(1, 10)], 1);
+        let original = frame(&batch, 1);
+        for _ in 0..2 {
+            multiplexer
+                .send_frame(WorkerId(2), original.clone())
+                .await
+                .unwrap();
+            assert_batch(&rx.try_recv().unwrap(), &original, &batch);
+        }
+        assert_eq!(
+            snapshot(&controller),
+            (0, 2, 2, 2 * original.payload.len(), 2)
+        );
+        ack(&controller, &original);
+        assert_eq!(snapshot(&controller), (1, 1, 1, original.payload.len(), 1));
+        ack(&controller, &original);
+        assert_eq!(snapshot(&controller), baseline);
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn production_sender_failed_delivery_releases_reservation() {
+        let controller = FlowController::with_row_budget(2);
+        let multiplexer =
+            WorkerStreamMultiplexer::new(ShuffleClientPool::default(), controller.clone());
+        let baseline = snapshot(&controller);
+        let batch = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], 1);
+        assert_eq!(
+            multiplexer.send_frame(WorkerId(2), frame(&batch, 1)).await,
+            Err(
+                "[RS-3012] Durable fallback failed: no object store available for multiplexer"
+                    .to_string()
+            )
+        );
+        assert_eq!(snapshot(&controller), baseline);
+    }
+
+    #[tokio::test]
+    async fn production_sender_durable_delivery_releases_reservation_without_ack() {
+        let controller = FlowController::with_row_budget(2);
+        let (multiplexer, _tx, mut rx) = sender(&controller);
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let multiplexer = multiplexer
+            .with_object_store(store.clone())
+            .with_exchange_config(ExchangeConfig {
+                exchange_force_durable: true,
+                ..ExchangeConfig::default()
+            });
+        let baseline = snapshot(&controller);
+        let batch = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], 3);
+        let original = frame(&batch, 1);
+        multiplexer.send_frame(WorkerId(2), original).await.unwrap();
+        assert_eq!(snapshot(&controller), baseline);
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        let path = object_store::path::Path::from("shuffle/100/1/0/2");
+        let footer =
+            crate::exchange::durable::DurableShuffleReader::read_footer(store.as_ref(), &path)
+                .await
+                .unwrap();
+        assert_eq!(
+            footer.entries,
+            vec![crate::exchange::durable::ShuffleIndexEntry {
+                src_shard: 0,
+                target_shard: 1,
+                seq: 1,
+                offset: 0,
+                length: serialize_zset(&batch).unwrap().len() as u64,
+            }]
+        );
+        let entry = footer.entries.first().unwrap();
+        let payload = crate::exchange::durable::DurableShuffleReader::read_frame(
+            store.as_ref(),
+            &path,
+            entry,
+        )
+        .await
+        .unwrap();
+        let recovered = deserialize_zset(&payload, batch.data.schema()).unwrap();
+        assert_eq!(recovered.data, batch.data);
+        assert_eq!(recovered.weights, batch.weights);
+    }
+}

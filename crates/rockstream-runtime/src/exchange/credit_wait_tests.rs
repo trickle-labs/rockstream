@@ -1,5 +1,6 @@
 use super::*;
 use crate::exchange::flow_control::{FlowController, FlowPermit};
+use crate::exchange::proto::ShuffleAck;
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::Barrier;
@@ -11,6 +12,7 @@ const DEADLINE: Duration = Duration::from_secs(2);
 enum Path {
     Send,
     Batch,
+    Rows,
 }
 
 fn frame(seq: u64) -> ShuffleFrame {
@@ -54,13 +56,28 @@ async fn acquire(path: Path, mux: &WorkerStreamMultiplexer, seq: u64) -> Option<
                 .await
                 .unwrap(),
         ),
+        Path::Rows => {
+            mux.flow_controller
+                .acquire_credit(7, 1, 2, 1)
+                .await
+                .unwrap();
+            None
+        }
     }
 }
 
-fn release(path: Path, controller: &FlowController, permit: Option<FlowPermit>) {
+fn release(path: Path, controller: &FlowController, permit: Option<FlowPermit>, seq: u64) {
     match path {
-        Path::Send => controller.release_credit(7, 1, 2, 1),
+        Path::Send => controller.handle_ack(&ShuffleAck {
+            exchange_id: 7,
+            src_shard: 1,
+            target_shard: 2,
+            epoch: 1,
+            seq,
+            credit_grant: 1,
+        }),
         Path::Batch => drop(permit.unwrap()),
+        Path::Rows => controller.release_credit(7, 1, 2, 1),
     }
 }
 
@@ -76,8 +93,8 @@ fn accounting(controller: &FlowController) -> (u32, u32, usize, usize, usize) {
 
 fn busy(path: Path) -> (u32, u32, usize, usize, usize) {
     match path {
-        Path::Send => (1, 0, 0, 0, 0),
-        Path::Batch => (1, 0, 1, 1, 1),
+        Path::Send | Path::Batch => (1, 0, 1, 1, 1),
+        Path::Rows => (1, 0, 0, 0, 0),
     }
 }
 
@@ -96,7 +113,7 @@ fn assert_frames(path: Path, rx: &mut mpsc::Receiver<ShuffleFrame>, seq: u64) {
         frames,
         match path {
             Path::Send => vec![frame(seq)],
-            Path::Batch => vec![],
+            Path::Batch | Path::Rows => vec![],
         }
     );
 }
@@ -113,8 +130,8 @@ async fn single_waiter(path: Path, initial_path: Path) {
     pause_after_failed_check(pending.as_mut(), &barriers).await;
     transcript.push(("blocked", false, accounting(&controller)));
 
-    // Release after the failed check, before the notification future is polled.
-    release(initial_path, &controller, initial);
+    // Release after the failed check, before awaiting the notification future.
+    release(initial_path, &controller, initial, 0);
     transcript.push(("released", false, accounting(&controller)));
     barriers.1.wait().await;
     let acquired = timeout(DEADLINE, pending)
@@ -122,7 +139,7 @@ async fn single_waiter(path: Path, initial_path: Path) {
         .expect("lost credit notification");
     transcript.push(("acquired", true, accounting(&controller)));
     assert_frames(path, &mut rx, 1);
-    release(path, &controller, acquired);
+    release(path, &controller, acquired, 1);
     transcript.push(("idle", true, accounting(&controller)));
 
     assert_eq!(
@@ -151,7 +168,7 @@ async fn two_waiters(path: Path) {
     pause_after_failed_check(second.as_mut(), &barriers2).await;
     let mut transcript = vec![("both blocked", [false, false], accounting(&controller))];
 
-    release(path, &controller, initial);
+    release(path, &controller, initial, 0);
     transcript.push(("released", [false, false], accounting(&controller)));
     barriers1.1.wait().await;
     let acquired1 = timeout(DEADLINE, first)
@@ -166,14 +183,14 @@ async fn two_waiters(path: Path) {
     assert_frames(path, &mut rx1, 1);
     assert_eq!(rx2.try_recv(), Err(mpsc::error::TryRecvError::Empty));
 
-    release(path, &controller, acquired1);
+    release(path, &controller, acquired1, 1);
     transcript.push(("first released", [true, false], accounting(&controller)));
     let acquired2 = timeout(DEADLINE, second)
         .await
         .expect("second waiter stranded");
     transcript.push(("second acquired", [true, true], accounting(&controller)));
     assert_frames(path, &mut rx2, 2);
-    release(path, &controller, acquired2);
+    release(path, &controller, acquired2, 2);
     transcript.push(("idle", [true, true], accounting(&controller)));
 
     assert_eq!(
@@ -191,22 +208,22 @@ async fn two_waiters(path: Path) {
 }
 
 #[tokio::test]
-async fn send_frame_release_before_waiter_registration() {
+async fn send_frame_release_after_failed_capacity_check() {
     timeout(DEADLINE * 3, single_waiter(Path::Send, Path::Send))
         .await
         .unwrap();
 }
 
 #[tokio::test]
-async fn batch_permit_release_before_waiter_registration() {
+async fn batch_permit_release_after_failed_capacity_check() {
     timeout(DEADLINE * 3, single_waiter(Path::Batch, Path::Batch))
         .await
         .unwrap();
 }
 
 #[tokio::test]
-async fn batch_permit_waiter_wakes_on_send_credit_release() {
-    timeout(DEADLINE * 3, single_waiter(Path::Batch, Path::Send))
+async fn batch_permit_waiter_wakes_on_row_credit_release() {
+    timeout(DEADLINE * 3, single_waiter(Path::Batch, Path::Rows))
         .await
         .unwrap();
 }
@@ -221,6 +238,20 @@ async fn send_frame_two_waiters_exact_transcript() {
 #[tokio::test]
 async fn batch_permit_two_waiters_exact_transcript() {
     timeout(DEADLINE * 3, two_waiters(Path::Batch))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn row_credit_release_after_failed_capacity_check() {
+    timeout(DEADLINE * 3, single_waiter(Path::Rows, Path::Rows))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn row_credit_two_waiters_exact_transcript() {
+    timeout(DEADLINE * 3, two_waiters(Path::Rows))
         .await
         .unwrap();
 }
