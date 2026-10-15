@@ -105,6 +105,8 @@ pub struct FlowController {
     aggregate_bytes: Arc<AtomicU64>,
     pending_requests: Arc<AtomicU64>,
     global_notify: Arc<Notify>,
+    #[cfg(test)]
+    pub(super) wait_barriers: Option<Arc<(tokio::sync::Barrier, tokio::sync::Barrier)>>,
 }
 
 impl Default for FlowController {
@@ -132,6 +134,8 @@ impl FlowController {
             aggregate_bytes: Arc::new(AtomicU64::new(0)),
             pending_requests: Arc::new(AtomicU64::new(0)),
             global_notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            wait_barriers: None,
         }
     }
 
@@ -351,6 +355,8 @@ impl FlowController {
         }
 
         loop {
+            // notify_waiters covers futures created before the capacity check, even before polling.
+            let notified = self.global_notify.notified();
             match self.try_acquire_batch_permit(
                 exchange_id,
                 src_shard,
@@ -363,7 +369,9 @@ impl FlowController {
                     if !err.contains("RESOURCE_EXHAUSTED") {
                         return Err(err);
                     }
-                    self.global_notify.notified().await;
+                    #[cfg(test)]
+                    self.pause_before_wait().await;
+                    notified.await;
                 }
             }
         }
@@ -470,11 +478,7 @@ impl FlowController {
             Self::update_credit_metrics(&channels);
         }
 
-        if self.aggregate_bytes.load(Ordering::Relaxed) > 0
-            || self.pending_requests.load(Ordering::Relaxed) > 0
-        {
-            self.global_notify.notify_waiters();
-        }
+        self.global_notify.notify_waiters();
         let notifiers = self.notifiers.lock();
         if let Some(notify) = notifiers.get(&key) {
             notify.notify_waiters();
@@ -544,6 +548,8 @@ impl FlowController {
         };
 
         loop {
+            // notify_waiters covers futures created before the capacity check, even before polling.
+            let notified = notify.notified();
             {
                 let mut channels = self.channels.lock();
                 let state = self.channel_state(&mut channels, key);
@@ -554,7 +560,17 @@ impl FlowController {
                     return Ok(());
                 }
             }
-            notify.notified().await;
+            #[cfg(test)]
+            self.pause_before_wait().await;
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_before_wait(&self) {
+        if let Some((checked, resume)) = self.wait_barriers.as_deref() {
+            checked.wait().await;
+            resume.wait().await;
         }
     }
 }

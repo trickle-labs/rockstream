@@ -637,3 +637,7 @@ impl WorkerStreamMultiplexer {
         rockstream_types::metrics::set_exchange_multiplexer_streams_size(streams.len() as u64);
     }
 }
+
+#[cfg(test)]
+#[path = "credit_wait_tests.rs"]
+mod credit_wait_tests;
