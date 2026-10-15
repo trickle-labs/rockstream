@@ -26,6 +26,25 @@ fn get_rows(response: Option<CatalogResponse>) -> (Vec<String>, Vec<Vec<Option<S
     }
 }
 
+#[test]
+fn test_empty_orm_reflection_catalogs() {
+    let catalog = CatalogStubs::new();
+    let session = SessionInfo::default();
+    for (relation, fields, projected) in [
+        ("table_constraints", "constraint_catalog constraint_schema constraint_name table_catalog table_schema table_name constraint_type is_deferrable initially_deferred", "constraint_type"),
+        ("column_privileges", "grantor grantee table_catalog table_schema table_name column_name privilege_type is_grantable", "privilege_type"),
+    ] {
+        assert_eq!(
+            get_rows(catalog.handle_query(&format!("SELECT * FROM information_schema.{relation}"), &session)),
+            (fields.split_whitespace().map(str::to_owned).collect(), vec![]),
+        );
+        assert_eq!(
+            get_rows(catalog.handle_query(&format!("SELECT {projected} FROM information_schema.{relation} WHERE table_schema = 'public'"), &session)),
+            (vec![projected.to_owned()], vec![]),
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_pg_tables_projection_post_restart() {
     let store = Arc::new(InMemory::new());

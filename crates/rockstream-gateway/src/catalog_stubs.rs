@@ -3114,6 +3114,8 @@ impl CatalogStubs {
             "pg_user" => return Some(self.pg_user(&session.principal_name, &[])),
             "information_schema.tables" => return Some(self.information_schema_tables(&[])),
             "information_schema.columns" => return Some(self.information_schema_columns(&[])),
+            "information_schema.table_constraints" => "constraint_catalog constraint_schema constraint_name table_catalog table_schema table_name constraint_type is_deferrable initially_deferred",
+            "information_schema.column_privileges" => "grantor grantee table_catalog table_schema table_name column_name privilege_type is_grantable",
             "information_schema.key_column_usage" => return Some(self.key_column_usage(&[])),
             "information_schema.referential_constraints" => return Some(self.referential_constraints(&[])),
             "pg_statistic_ext" | "pg_publication" | "pg_publication_rel" | "pg_rewrite" | "pg_tablespace" => "",
