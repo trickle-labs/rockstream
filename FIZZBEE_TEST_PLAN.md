@@ -683,6 +683,25 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #117 closes an implementation-level liveness gap in exchange flow control.
+`FlowController::acquire_credit`, used by `WorkerStreamMultiplexer::send_frame`,
+and the separately reachable `acquire_batch_permit` create their Tokio notification
+future before checking capacity. A release after a failed check but before waiter
+polling must therefore remain observable; row-only releases also notify batch-permit
+waiters sharing the row budget. Capacity is still checked under the channel lock,
+so one released row admits exactly one acquisition even when multiple waiters wake.
+
+The five barrier-controlled regressions in
+`crates/rockstream-runtime/src/exchange/credit_wait_tests.rs` pause the real wait
+loops in that gap, drive production sends through a controlled outgoing queue,
+and compare complete frame and completion/accounting transcripts. With budget one,
+one release must complete the next acquisition within a bounded deadline, leaving
+exactly one outstanding row and zero available credit; its release restores zero
+outstanding rows and one available credit. Two waiters require two successive
+releases, and batch-permit coverage includes a row-only send-credit release.
+These tests cover Tokio notification ordering outside the abstract M1–M7 consensus
+state machines; no new FizzBee transition or liveness proof is claimed.
+
 Issue #114 adds TopK spill/checkpoint recovery conformance at the M1 storage
 boundary. `ShardDb::set_fail_scans` injects a prefix-scan error before returning
 records; it does not change durable storage or the coordination state machine.
