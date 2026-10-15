@@ -1,5 +1,4 @@
 //! #119: real Parse/Bind/Execute/Sync transcripts, storage, and joined server tasks.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,6 +13,8 @@ fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     bytes
 }
 
+// Unexpected wire I/O or a timeout must fail the test at the read boundary.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn read_message(socket: &mut TcpStream) -> (u8, Vec<u8>) {
     tokio::time::timeout(Duration::from_secs(10), async {
         let tag = socket.read_u8().await.unwrap();
@@ -39,6 +40,8 @@ async fn transcript(socket: &mut TcpStream) -> Transcript {
     }
 }
 
+// A failed query write invalidates the protocol fixture.
+#[allow(clippy::unwrap_used)]
 async fn query(socket: &mut TcpStream, sql: &str) -> Transcript {
     let mut body = sql.as_bytes().to_vec();
     body.push(0);
@@ -78,6 +81,8 @@ fn table_state() -> Transcript {
     messages
 }
 
+// Parse/Flush I/O must succeed before testing Bind rejection.
+#[allow(clippy::unwrap_used)]
 async fn prepare(socket: &mut TcpStream, sql: &str, types: &[Type]) {
     let mut body = vec![0]; // unnamed statement
     body.extend_from_slice(sql.as_bytes());
@@ -149,6 +154,7 @@ impl ViewReader for NoopViewReader {
 }
 
 // Accept exactly the connections the test opens and join every process_socket task.
+#[allow(clippy::unwrap_used)]
 async fn connection(
     listener: &TcpListener,
     handler: Arc<GatewayHandler>,
@@ -173,6 +179,8 @@ async fn connection(
     (client, task)
 }
 
+// Shutdown errors and server task panics must fail the test rather than be discarded.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn terminate(mut client: TcpStream, task: tokio::task::JoinHandle<std::io::Result<()>>) {
     client.write_all(&frame(b'X', &[])).await.unwrap();
     client.shutdown().await.unwrap();
@@ -192,6 +200,8 @@ async fn terminate(mut client: TcpStream, task: tokio::task::JoinHandle<std::io:
 }
 
 #[tokio::test]
+// Fixture setup and socket writes must succeed for the transcript assertions to be valid.
+#[allow(clippy::unwrap_used)]
 async fn malformed_binary_bind_rejects_without_mutation_and_recovers() {
     let dir = tempfile::TempDir::new().unwrap();
     let store =
