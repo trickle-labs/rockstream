@@ -458,6 +458,23 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         }
     }
 
+    // Catalog introspection clients such as Prisma bind schema lists to
+    // ANY($1) inside JOIN predicates and derived-table subqueries. The
+    // visitor above traverses only top-level SELECT projections/WHERE, so
+    // such parameters would otherwise be described as scalar TEXT. Preserve
+    // explicit casts and only infer text[] for catalog schema-list filters.
+    if sql.contains("pg_catalog") || sql.contains("information_schema") {
+        let any_array_param = regex::Regex::new(r"(?i)\\bany\\s*\\(\\s*\\$([1-9][0-9]*)\\s*\\)")
+            .expect("static ANY parameter pattern");
+        for matched in any_array_param.captures_iter(sql) {
+            if let Ok(index) = matched[1].parse::<usize>() {
+                if index <= max_idx && !explicit_casts.contains_key(&index) {
+                    inferred_types[index - 1] = Type::TEXT_ARRAY;
+                }
+            }
+        }
+    }
+
     let ctx = SessionContext::new();
     rockstream_sql::frontend::register_session_sql_udf(&ctx);
     for view in catalog.list_views() {
