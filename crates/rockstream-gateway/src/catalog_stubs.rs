@@ -3761,6 +3761,7 @@ impl CatalogStubs {
                     col.name.clone(),
                     i + 1,
                     arrow_type_to_pg_oid(&col.data_type),
+                    arrow_type_to_pg_data_type(&col.data_type),
                 ));
             }
         }
@@ -3771,10 +3772,11 @@ impl CatalogStubs {
                     col.name.clone(),
                     i + 1,
                     arrow_type_to_pg_oid(&col.data_type),
+                    arrow_type_to_pg_data_type(&col.data_type),
                 ));
             }
         }
-        for ((schema, table_name), column_name, pos, oid) in items {
+        for ((schema, table_name), column_name, pos, oid, data_type) in items {
             let (udt_name, precision, scale, radix, datetime_precision) = match oid {
                 PG_OID_INT2 => ("int2", Some("16"), Some("0"), Some("2"), None),
                 PG_OID_INT4 => ("int4", Some("32"), Some("0"), Some("2"), None),
@@ -3808,30 +3810,7 @@ impl CatalogStubs {
                 "table_name" => Some(table_name.clone()),
                 "column_name" => Some(column_name.clone()),
                 "ordinal_position" => Some(pos.to_string()),
-                "data_type" => Some(
-                    match oid {
-                        PG_OID_INT2 => "smallint",
-                        PG_OID_INT4 => "integer",
-                        PG_OID_INT8 => "bigint",
-                        PG_OID_FLOAT4 => "real",
-                        PG_OID_FLOAT8 => "double precision",
-                        PG_OID_BOOL => "boolean",
-                        PG_OID_BYTEA => "bytea",
-                        PG_OID_TIMESTAMP => "timestamp without time zone",
-                        PG_OID_TIMESTAMPTZ => "timestamp with time zone",
-                        PG_OID_TIME => "time without time zone",
-                        PG_OID_DATE => "date",
-                        PG_OID_UUID => "uuid",
-                        PG_OID_NUMERIC => "numeric",
-                        PG_OID_JSON => "json",
-                        PG_OID_JSONB => "jsonb",
-                        PG_OID_VARCHAR => "character varying",
-                        PG_OID_CHAR => "character",
-                        PG_OID_INTERVAL => "interval",
-                        _ => "text",
-                    }
-                    .to_string(),
-                ),
+                "data_type" => Some(data_type.to_string()),
                 "udt_schema" => Some("pg_catalog".to_string()),
                 "udt_name" => Some(udt_name.to_string()),
                 "is_nullable" => Some("YES".to_string()),
