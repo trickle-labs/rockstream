@@ -3804,24 +3804,27 @@ impl CatalogStubs {
                 PG_OID_ARRAY_UUID => ("_uuid", None, None, None, None),
                 _ => ("text", None, None, None, None),
             };
-            let row = cols.iter().map(|c| match c.as_str() {
-                "table_catalog" => Some("rockstream".to_string()),
-                "table_schema" => Some(schema.clone()),
-                "table_name" => Some(table_name.clone()),
-                "column_name" => Some(column_name.clone()),
-                "ordinal_position" => Some(pos.to_string()),
-                "data_type" => Some(data_type.to_string()),
-                "udt_schema" => Some("pg_catalog".to_string()),
-                "udt_name" => Some(udt_name.to_string()),
-                "is_nullable" => Some("YES".to_string()),
-                "is_identity" => Some("NO".to_string()),
-                "numeric_precision" => precision.map(str::to_string),
-                "numeric_scale" => scale.map(str::to_string),
-                "numeric_precision_radix" => radix.map(str::to_string),
-                "datetime_precision" => datetime_precision.map(str::to_string),
-                "character_maximum_length" => None,
-                _ => None,
-            }).collect();
+            let row = cols
+                .iter()
+                .map(|c| match c.as_str() {
+                    "table_catalog" => Some("rockstream".to_string()),
+                    "table_schema" => Some(schema.clone()),
+                    "table_name" => Some(table_name.clone()),
+                    "column_name" => Some(column_name.clone()),
+                    "ordinal_position" => Some(pos.to_string()),
+                    "data_type" => Some(data_type.to_string()),
+                    "udt_schema" => Some("pg_catalog".to_string()),
+                    "udt_name" => Some(udt_name.to_string()),
+                    "is_nullable" => Some("YES".to_string()),
+                    "is_identity" => Some("NO".to_string()),
+                    "numeric_precision" => precision.map(str::to_string),
+                    "numeric_scale" => scale.map(str::to_string),
+                    "numeric_precision_radix" => radix.map(str::to_string),
+                    "datetime_precision" => datetime_precision.map(str::to_string),
+                    "character_maximum_length" => None,
+                    _ => None,
+                })
+                .collect();
             rows.push(row);
         }
         let resp = CatalogResponse::rows(cols, rows);
