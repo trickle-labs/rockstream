@@ -5815,8 +5815,7 @@ mod pgjdbc_reflection_tests {
 
     #[test]
     fn prisma_information_schema_exposes_all_native_column_types() {
-        let CatalogResponse::Rows { columns, rows } =
-            catalog().information_schema_columns(&[])
+        let CatalogResponse::Rows { columns, rows } = catalog().information_schema_columns(&[])
         else {
             panic!("information_schema.columns must return rows");
         };
@@ -5830,7 +5829,7 @@ mod pgjdbc_reflection_tests {
             .map(|row| {
                 assert_eq!(row[native_schema].as_deref(), Some("pg_catalog"));
                 assert_eq!(row[identity].as_deref(), Some("NO"));
-                row[native].as_deref().unwrap().to_string()
+                row[native].as_deref().unwrap()
             })
             .collect::<Vec<_>>();
         assert_eq!(
