@@ -1,0 +1,210 @@
+
+COMMAND ["cargo", "test", "--manifest-path", "tools/r1-local-harness/Cargo.toml", "--all-targets"]
+   Compiling r1-local-harness v0.1.0 (/home/runner/work/rockstream/rockstream/candidate/tools/r1-local-harness)
+    Finished `test` profile [unoptimized] target(s) in 0.39s
+     Running unittests src/lib.rs (tools/r1-local-harness/target/debug/deps/r1_local_harness-a4334cc518f00ccf)
+
+running 7 tests
+test load::tests::inverse_changes_exactly_reverses_a_transaction_sequence ... ok
+test load::tests::inverse_prefix_leaves_the_exact_forward_prefix ... ok
+test load::tests::visibility_query_requests_one_complete_row ... ok
+test metrics::tests::parses_macos_cpu_clock_with_fractional_seconds ... ok
+test metrics::tests::parses_worker_metrics_exactly ... ok
+test oracle::tests::replays_complete_aggregate_and_join_outputs ... ok
+test report::tests::sample_cv_uses_n_minus_one ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (tools/r1-local-harness/target/debug/deps/r1_local_harness-e638c58bf7643a33)
+
+running 1 test
+test tests::shared_arrangement_has_all_three_exact_profiles ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/verify-v072-matrix.rs (tools/r1-local-harness/target/debug/deps/verify_v072_matrix-d48326225e9a633c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/baseline_coordination_tests.rs (tools/r1-local-harness/target/debug/deps/baseline_coordination_tests-8b092eb5525a0ffc)
+
+running 1 test
+test sim_runtime_generator_backpressure_and_timeout_under_delay ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/baseline_durability_tests.rs (tools/r1-local-harness/target/debug/deps/baseline_durability_tests-e2c3829008c7d516)
+
+running 3 tests
+test test_standalone_lfs_baseline_persists_across_restart ... ok
+test test_standalone_minio_baseline_persists_across_restart ... ok
+test test_baseline_cleanup_uses_no_range_delete ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/corpus_determinism.rs (tools/r1-local-harness/target/debug/deps/corpus_determinism-1e66b7a9349b8f9c)
+
+running 1 test
+test fixture_is_byte_exact_and_targets_do_not_overlap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/decision_mutations.rs (tools/r1-local-harness/target/debug/deps/decision_mutations-e4f01354a5657318)
+
+running 1 test
+test rejects_exact_evidence_mutations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/documentation_checks.rs (tools/r1-local-harness/target/debug/deps/documentation_checks-df43d2e8e9b68058)
+
+running 1 test
+test test_r1_local_readme_documents_v0611_baseline_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/harness_matrix_tests.rs (tools/r1-local-harness/target/debug/deps/harness_matrix_tests-94c7be602dbac552)
+
+running 20 tests
+test test_blocked_cell_accounting_4_workers ... ok
+test test_blocked_cell_accounting_2_workers ... ok
+test test_blocked_cell_accounting_8_workers ... ok
+test test_blocked_cell_accounting_beyond_ram ... ok
+test test_blocked_cell_accounting_worker_loss ... ok
+test test_blocked_cell_accounting_migration ... ok
+test test_blocked_cell_accounting_one_key_10m ... ok
+test test_blocked_cell_accounting_shared_views ... ok
+test test_blocked_cells_carry_concrete_blocker_and_owner ... ok
+test test_compaction_and_restart_standalone ... ok
+test test_concurrent_ingestion_and_queries_standalone ... ok
+test test_one_key_100k_standalone ... ok
+test test_matrix_accounting_covers_all_six_areas ... ok
+test test_one_key_1k_standalone ... ok
+test test_runnable_standalone_cells_execute_and_measure ... ok
+test test_standalone_overload_and_backpressure ... ok
+test test_views_standalone_1_view ... ok
+test test_views_standalone_20_views ... ok
+test test_worker_scaling_1_worker_standalone ... ok
+test test_worker_pid_activity_verified ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/metric_decoupling_tests.rs (tools/r1-local-harness/target/debug/deps/metric_decoupling_tests-d1d2362e3ea61820)
+
+running 3 tests
+test test_generator_queue_bounds_and_drop_accounting ... ok
+test test_read_commit_freshness_latency_separation ... ok
+test test_independent_load_schedule_not_completion_throttled ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/negative_qualification_tests.rs (tools/r1-local-harness/target/debug/deps/negative_qualification_tests-9b704d0351bf1604)
+
+running 6 tests
+test test_corrupt_binary_digest_fails ... ok
+test test_inactive_worker_fails_qualification ... ok
+test test_missing_required_cell_fails ... ok
+test test_synthetic_sample_rejected_in_qualification ... ok
+test test_oracle_mismatch_fails_qualification ... ok
+test test_unowned_blocked_cell_fails ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/oracle_validation_tests.rs (tools/r1-local-harness/target/debug/deps/oracle_validation_tests-83ebb6b5b28dbba5)
+
+running 5 tests
+test test_oracle_exact_multiset_match ... ok
+test test_oracle_rejects_duplicate_row ... ok
+test test_oracle_rejects_missing_row ... ok
+test test_oracle_rejects_stale_epoch_output ... ok
+test test_oracle_rejects_wrong_column_value ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/process_isolation.rs (tools/r1-local-harness/target/debug/deps/process_isolation-9ec9535421f653cf)
+
+running 1 test
+test terminate_kills_shell_and_background_descendant ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/profile_contract_tests.rs (tools/r1-local-harness/target/debug/deps/profile_contract_tests-0f9c3e2648716500)
+
+running 3 tests
+test test_write_amplification_rule_frozen_before_measurement ... ok
+test test_historical_v1_contract_remains_intact ... ok
+test test_v0611_profile_and_thresholds_freeze ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/report_metrics_tests.rs (tools/r1-local-harness/target/debug/deps/report_metrics_tests-44da39fa476a1cbd)
+
+running 11 tests
+test test_control_node_load_telemetry ... ok
+test test_cost_per_million_changes_calculation ... ok
+test test_flushes_per_epoch_telemetry ... ok
+test test_network_bytes_per_change_metric ... ok
+test test_object_store_requests_per_change_metric ... ok
+test test_raw_sample_contains_all_required_telemetry_fields ... ok
+test test_intermediate_rows_per_change_metric ... ok
+test test_rss_bytes_telemetry ... ok
+test test_queue_age_telemetry ... ok
+test test_sample_coefficient_of_variation_enforced ... ok
+test test_state_writes_per_change_metric ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/summary_regeneration.rs (tools/r1-local-harness/target/debug/deps/summary_regeneration-950d3add44e2920b)
+
+running 1 test
+test summary_regenerates_byte_for_byte ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/v072_evidence_gate_tests.rs (tools/r1-local-harness/target/debug/deps/v072_evidence_gate_tests-ef965a71ab7d7cc3)
+
+running 4 tests
+test v072_empty_evidence_directory_is_not_qualified ... ok
+test v072_matrix_only_bundle_is_not_qualified ... ok
+test v072_samples_only_bundle_is_not_qualified ... ok
+test v072_frozen_profile_matches_issued_revision_byte_for_byte ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/v072_matrix_cli_tests.rs (tools/r1-local-harness/target/debug/deps/v072_matrix_cli_tests-c0a960562b7256f9)
+
+running 2 tests
+test v072_matrix_plan_does_not_overwrite_or_reuse_existing_evidence ... ok
+test v072_matrix_command_never_fabricates_a_measured_report ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/v072_matrix_gate_tests.rs (tools/r1-local-harness/target/debug/deps/v072_matrix_gate_tests-acd79ed144eed8e1)
+
+running 10 tests
+test v072_matrix_inventory_is_exact ... ok
+test v072_measured_errors_and_blocked_measurements_are_rejected ... ok
+test v072_historical_blockers_are_not_capacity_exemptions ... ok
+test v072_missing_metrics_cannot_skip_validation ... ok
+test v072_ten_million_groups_participates_in_write_comparison ... ok
+test v072_summary_flags_and_counts_are_recomputed ... ok
+test v072_worker_identities_must_be_distinct_and_match_scaling_case ... ok
+test v072_nonfinite_negative_and_zero_denominators_are_rejected ... ok
+test v072_unknown_statuses_and_false_area_are_rejected ... ok
+test v072_every_cell_is_required_exactly_once ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/v072_sample_gate_tests.rs (tools/r1-local-harness/target/debug/deps/v072_sample_gate_tests-6c8317905d142638)
+
+running 4 tests
+test v072_complete_fixture_is_structurally_valid ... ok
+test v072_drops_and_errors_cannot_be_absent_or_nonzero ... ok
+test v072_each_qualification_metric_is_required ... ok
+test v072_each_qualification_metric_must_be_finite_and_nonnegative ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
