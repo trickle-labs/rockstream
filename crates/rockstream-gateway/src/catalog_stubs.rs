@@ -3205,7 +3205,7 @@ impl CatalogStubs {
             "pg_namespace" => "oid nspname nspowner",
             "pg_type" => "oid typname typlen typarray typnamespace typtype typrelid typelem typcollation format_type",
             "pg_proc" => "oid proname pronamespace prorettype proargtypes prokind",
-            "pg_index" => "indexrelid indrelid indisunique indisprimary indisclustered indisvalid indisreplident indkey indexdef",
+            "pg_index" => "indexrelid indrelid indisunique indisprimary indisclustered indisvalid indisreplident indkey indexdef indclass indoption indpred indisexclusion",
             "pg_roles" => "oid rolname rolsuper rolinherit rolcreaterole rolcreatedb rolcanlogin rolconnlimit rolreplication rolbypassrls rolvaliduntil",
             "pg_database" => "oid datname datdba encoding datcollate datctype datacl datistemplate datallowconn",
             "pg_am" => "oid amname",
@@ -3216,6 +3216,9 @@ impl CatalogStubs {
             // pg_sequence lookup even when the relation has no identity.
             // An empty pg_sequence catalog is valid; an absent one is not.
             "pg_sequence" => "seqrelid seqtypid seqstart seqincrement seqmax seqmin seqcache seqcycle",
+            // Prisma LEFT JOINs pg_opclass while reflecting indexes. It is a
+            // known catalog even when RockStream has no index opclass rows.
+            "pg_opclass" => "oid opcname opcdefault opcfamily opcintype opckeytype opcmethod",
             "pg_collation" => "oid collname",
             "pg_auth_members" => "roleid member grantor admin_option",
             "pg_tables" => return Some(self.pg_tables(&[])),
@@ -3949,6 +3952,9 @@ impl CatalogStubs {
                         .into(),
                     ),
                     "indkey" => Some(indkey_vals.join(" ")),
+                    // RockStream's ordinary indexes are not partial or exclusion indexes.
+                    "indpred" => None,
+                    "indisexclusion" => Some("f".into()),
                     "indexdef" => Some(format!(
                         "CREATE INDEX {} ON {} ({})",
                         idx.name,
