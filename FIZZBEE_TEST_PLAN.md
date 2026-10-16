@@ -493,6 +493,18 @@ The naming convention is `<Model>-<S|L><n>`: `S` = safety, `L` = liveness.
   - `CheckBeforeCommit`: query-then-act observes committed-vs-aborted and
     re-runs `pre_commit → commit` only on broker abort, never double-delivering.
 
+Kafka recovery refines `CheckBeforeCommit` with an unknown lookup outcome
+(#121). Consumer setup failures, poll failures, timeouts, and transactions not
+yet stable through the captured high watermark return retryable `RS-4030`.
+Recovery preserves the pending handle and delivery/staging bookkeeping and
+does not publish while that outcome is unknown. Confirmed absence requires a
+complete `read_committed` scan of every partition stable through its captured
+`read_uncommitted` high watermark before scanning; confirmed presence resolves
+the delivered epoch and clears staging. The model abstracts lookup as known:
+unknown retries correspond to taking no recovery action, and progress assumes
+lookup eventually becomes available. The broker fault schedule and lookup
+error taxonomy are checked by the concrete tests mapped in §3.6.
+
 **Liveness**
 
 - **M3-L1 — Delivery progress.** `always eventually`: under `fair` commit and
@@ -931,6 +943,7 @@ check, not just an aspirational claim.
 | COV-M2 | `crates/rockstream-sim/tests/frontier_publisher_election.rs::three_frontier_aggregators_stale_publisher_never_republishes` (v0.45.6 S8): three simulated `FrontierAggregator`s contend for the same `frontier/leader` CAS record; `buggify!("frontier.stale_publish_race", p)` forces a fenced aggregator to attempt a late publish after a new leader's CAS has already succeeded, reaching the `fencing_occurred` coverage-witness state and asserting the stale attempt is always rejected. Spec: `formal/m2_frontier_agg.fizz` COV-M2. | `rockstream-sim` |
 | M3-S1–S4 | Assert idempotency-key uniqueness before `prepare`; assert one external artifact per key after recovery. Specifically: `assert_no_duplicate_delivery` (M3-S1), `assert_no_lost_delivery_after_checkpoint` (M3-S2), `assert_epoch_committed_only_after_cluster_checkpoint` (M3-S3), `assert_recovery_dispatch_idempotent` (M3-S4) — all in `crates/rockstream-connectors/src/sink_connector.rs`. Checkpoint-coupled commit is enforced by the verified adapter boundary (`CoupledBatchDescriptor` / `commit_m3` in `crates/rockstream-connectors/src/source_epoch.rs`), mechanically deriving and validating coupled mutations before delegating to `coupled_commit_is_durable`. | `rockstream-connectors` |
 | COV-M3 | `crates/rockstream-connectors/tests/kafka_tx_timeout_tests.rs::seeded_kafka_tx_timeout_fault_injection_across_seeds` uses `buggify!("kafka.tx_timeout", p)` to force the broker to abort an open transaction between `pre_commit` and `commit`, reaching the coverage-witness state, then drives `CheckBeforeCommit` recovery and asserts exactly-once delivery. Spec: `formal/m3_sink_2pc.fizz` COV-M3. | `rockstream-connectors` |
+| M3-S1, M3-S4 — unknown Kafka delivery | `crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::{kafka_sink_uncertain_broker_response_recovers_exactly_once_within_slo,kafka_sink_crash_before_commit_has_no_visible_payload_and_recovers_exactly}` drop the real EndTxn response or request, restart, and block lookup while another producer remains usable. They assert exact `RS-4030` errors, unchanged full topic key/payload sequences, and one original record plus resolved delivery/staging state after two recovery attempts with lookup restored. `kafka_sink_lookup_timeout_does_not_confirm_absence_before_stable_end` covers unresolved transactions; `crates/rockstream-connectors/src/kafka_sink.rs::tests::lookup_distinguishes_setup_poll_absence_and_presence` checks the other lookup outcomes. | `rockstream-connectors` |
 | M4-S1, M4-S3 | `assert_valid_writer(shard_id, token, current_token, …)` in `crates/rockstream-runtime/src/fence.rs` before every epoch commit; `assert_single_lease_holder(shard_id, count)` checked after every lease `acquire`/`force_acquire` call. Panics with `RS-1702` on stale token. Spec: `formal/m4_self_fencing.fizz` M4-S1, M4-S3. | `rockstream-runtime` |
 | M4-S2 | `SelfFenceGuard::must_self_fence()` / `assert_within_deadline()` in `crates/rockstream-runtime/src/fence.rs`; worker must call `guard.tick(can_reach_control)` on every heartbeat and terminate when `must_self_fence()` returns `true`. Panics with `RS-1702` on deadline exceeded. Spec: `formal/m4_self_fencing.fizz` M4-S2. | `rockstream-runtime` |
 | M4-S4 | No `assert!` fires when an object-store-only partition occurs (worker cannot reach object store but can still reach control plane): the worker blocks (backpressure) rather than self-fencing, because lease validity is determined by control-plane contact alone. Verified by `test_checkpoint_under_slow_input` (object-store stall → backpressure, not panic). Spec: `formal/m4_self_fencing.fizz` M4-S4. | `rockstream-runtime`, `rockstream-sim` |
