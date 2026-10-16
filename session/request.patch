@@ -23,7 +23,7 @@ diff --git a/crates/rockstream-ops/src/group_commit/physical.rs b/crates/rockstr
          drop(state);
          self.ensure_driver();
          self.inner.notify.notify_one();
- diff --git a/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs b/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
+diff --git a/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs b/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
 --- a/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
 +++ b/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
 @@ -187,7 +187,7 @@
@@ -35,7 +35,7 @@ diff --git a/crates/rockstream-ops/src/group_commit/physical.rs b/crates/rockstr
      reopened.commit_epoch(10, batch(b"after-restart")).await.unwrap();
      assert_eq!(reopened.committed_epoch(), Some(10));
      assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"after-restart".to_vec()));
- diff --git a/crates/rockstream-ops/tests/group_commit_timer_tests.rs b/crates/rockstream-ops/tests/group_commit_timer_tests.rs
+diff --git a/crates/rockstream-ops/tests/group_commit_timer_tests.rs b/crates/rockstream-ops/tests/group_commit_timer_tests.rs
 --- a/crates/rockstream-ops/tests/group_commit_timer_tests.rs
 +++ b/crates/rockstream-ops/tests/group_commit_timer_tests.rs
 @@ -203,6 +203,10 @@
