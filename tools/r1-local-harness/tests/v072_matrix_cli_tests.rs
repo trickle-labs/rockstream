@@ -19,10 +19,9 @@ fn v072_matrix_command_never_fabricates_a_measured_report() {
         output.stdout,
         b"Matrix plan written; no benchmark measurements were executed.\n"
     );
-    let plan: serde_json::Value = serde_json::from_slice(
-        &fs::read(directory.path().join("matrix-plan.json")).unwrap(),
-    )
-    .unwrap();
+    let plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.path().join("matrix-plan.json")).unwrap())
+            .unwrap();
     assert_eq!(
         plan,
         json!({

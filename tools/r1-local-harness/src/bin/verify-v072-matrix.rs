@@ -15,7 +15,9 @@ fn run(cli: Cli) -> Result<()> {
     let bytes = std::fs::read(&cli.matrix).context("read matrix report")?;
     let report: MatrixReport = serde_json::from_slice(&bytes).context("parse matrix report")?;
     verify_v072_matrix(&report)?;
-    println!("v0.72 matrix structure is complete; raw process evidence still requires qualification");
+    println!(
+        "v0.72 matrix structure is complete; raw process evidence still requires qualification"
+    );
     Ok(())
 }
 

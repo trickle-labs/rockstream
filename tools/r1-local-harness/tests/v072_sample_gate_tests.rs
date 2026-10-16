@@ -7,18 +7,24 @@ use std::collections::BTreeMap;
 type FloatSetter = fn(&mut RawSample, Option<f64>);
 
 const METRICS: [(&str, FloatSetter); 11] = [
-    ("state_writes_per_change", |s, v| s.state_writes_per_change = v),
+    ("state_writes_per_change", |s, v| {
+        s.state_writes_per_change = v
+    }),
     ("intermediate_rows_per_change", |s, v| {
         s.intermediate_rows_per_change = v
     }),
-    ("network_bytes_per_change", |s, v| s.network_bytes_per_change = v),
+    ("network_bytes_per_change", |s, v| {
+        s.network_bytes_per_change = v
+    }),
     ("object_store_requests_per_change", |s, v| {
         s.object_store_requests_per_change = v
     }),
     ("read_p99_ms", |s, v| s.read_p99_ms = v),
     ("commit_p99_ms", |s, v| s.commit_p99_ms = v),
     ("freshness_p99_ms", |s, v| s.freshness_p99_ms = v),
-    ("generator_delay_p99_ms", |s, v| s.generator_delay_p99_ms = v),
+    ("generator_delay_p99_ms", |s, v| {
+        s.generator_delay_p99_ms = v
+    }),
     ("queue_age_ms", |s, v| s.queue_age_ms = v),
     ("control_node_load", |s, v| s.control_node_load = v),
     ("physical_flushes_per_epoch", |s, v| {

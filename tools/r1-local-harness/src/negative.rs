@@ -27,18 +27,28 @@ pub fn qualify_sample(sample: &RawSample) -> Result<()> {
     sample.validate()?;
     for (name, value) in [
         ("state_writes_per_change", sample.state_writes_per_change),
-        ("intermediate_rows_per_change", sample.intermediate_rows_per_change),
+        (
+            "intermediate_rows_per_change",
+            sample.intermediate_rows_per_change,
+        ),
         ("network_bytes_per_change", sample.network_bytes_per_change),
-        ("object_store_requests_per_change", sample.object_store_requests_per_change),
+        (
+            "object_store_requests_per_change",
+            sample.object_store_requests_per_change,
+        ),
         ("read_p99_ms", sample.read_p99_ms),
         ("commit_p99_ms", sample.commit_p99_ms),
         ("freshness_p99_ms", sample.freshness_p99_ms),
         ("generator_delay_p99_ms", sample.generator_delay_p99_ms),
         ("queue_age_ms", sample.queue_age_ms),
         ("control_node_load", sample.control_node_load),
-        ("physical_flushes_per_epoch", sample.physical_flushes_per_epoch),
+        (
+            "physical_flushes_per_epoch",
+            sample.physical_flushes_per_epoch,
+        ),
     ] {
-        let value = value.with_context(|| format!("raw sample {} missing {name}", sample.run_id))?;
+        let value =
+            value.with_context(|| format!("raw sample {} missing {name}", sample.run_id))?;
         if !value.is_finite() || value < 0.0 {
             bail!("raw sample {} invalid {name}", sample.run_id);
         }
@@ -47,7 +57,8 @@ pub fn qualify_sample(sample: &RawSample) -> Result<()> {
         ("generator_queue_drops", sample.generator_queue_drops),
         ("timeouts_and_errors", sample.timeouts_and_errors),
     ] {
-        let value = value.with_context(|| format!("raw sample {} missing {name}", sample.run_id))?;
+        let value =
+            value.with_context(|| format!("raw sample {} missing {name}", sample.run_id))?;
         if value != 0 {
             bail!("raw sample {} has nonzero {name}: {value}", sample.run_id);
         }

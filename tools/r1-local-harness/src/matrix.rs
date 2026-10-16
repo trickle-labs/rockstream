@@ -254,7 +254,10 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
     }
 
     let defined = default_matrix_cells();
-    let by_id: HashMap<_, _> = defined.iter().map(|cell| (cell.cell_id.as_str(), cell)).collect();
+    let by_id: HashMap<_, _> = defined
+        .iter()
+        .map(|cell| (cell.cell_id.as_str(), cell))
+        .collect();
     let mut reported = HashSet::new();
     for cell in &report.cells {
         if !by_id.contains_key(cell.cell_id.as_str()) {
@@ -288,7 +291,11 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
                     bail!("no worker PIDs recorded for cell {}", cell.cell_id);
                 }
                 let mut pids = HashSet::new();
-                if cell.worker_pids.iter().any(|pid| *pid == 0 || !pids.insert(*pid)) {
+                if cell
+                    .worker_pids
+                    .iter()
+                    .any(|pid| *pid == 0 || !pids.insert(*pid))
+                {
                     bail!("zero or duplicate worker PID in cell {}", cell.cell_id);
                 }
                 let expected_workers = match cell.cell_id.as_str() {
@@ -300,7 +307,10 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
                 };
                 if let Some(expected) = expected_workers {
                     if cell.worker_pids.len() != expected {
-                        bail!("cell {} requires {expected} distinct worker PIDs", cell.cell_id);
+                        bail!(
+                            "cell {} requires {expected} distinct worker PIDs",
+                            cell.cell_id
+                        );
                     }
                 }
                 if cell.error.is_some()
@@ -309,7 +319,12 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
                 {
                     bail!("measured cell {} carries an error or blocker", cell.cell_id);
                 }
-                metric(cell.throughput_rows_per_sec, "throughput_rows_per_sec", &cell.cell_id, true)?;
+                metric(
+                    cell.throughput_rows_per_sec,
+                    "throughput_rows_per_sec",
+                    &cell.cell_id,
+                    true,
+                )?;
                 for (name, value) in [
                     ("read_p99_ms", cell.read_p99_ms),
                     ("commit_p99_ms", cell.commit_p99_ms),
@@ -338,18 +353,35 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
                 measured += 1;
             }
             "BLOCKED" => {
-                let owner = cell.owning_milestone.as_deref().filter(|owner| !owner.trim().is_empty());
+                let owner = cell
+                    .owning_milestone
+                    .as_deref()
+                    .filter(|owner| !owner.trim().is_empty());
                 let Some(owner) = owner else {
-                    bail!("unowned blocked cell {} missing owning milestone", cell.cell_id);
+                    bail!(
+                        "unowned blocked cell {} missing owning milestone",
+                        cell.cell_id
+                    );
                 };
                 if !owner.starts_with("v0.") {
-                    bail!("blocked cell {} has invalid owning milestone {}", cell.cell_id, owner);
+                    bail!(
+                        "blocked cell {} has invalid owning milestone {}",
+                        cell.cell_id,
+                        owner
+                    );
                 }
-                if cell.blocker_description.as_deref().is_none_or(|reason| reason.trim().is_empty()) {
+                if cell
+                    .blocker_description
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty())
+                {
                     bail!("blocked cell {} missing blocker description", cell.cell_id);
                 }
                 if matches!(definition.status, MatrixCellStatus::RunnableStandalone) {
-                    bail!("runnable cell {} cannot use a historical blocker", cell.cell_id);
+                    bail!(
+                        "runnable cell {} cannot use a historical blocker",
+                        cell.cell_id
+                    );
                 }
                 if cell.throughput_rows_per_sec.is_some()
                     || cell.read_p99_ms.is_some()
@@ -361,11 +393,17 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
                     || cell.worker_active
                     || cell.error.is_some()
                 {
-                    bail!("blocked cell {} must not claim measured evidence", cell.cell_id);
+                    bail!(
+                        "blocked cell {} must not claim measured evidence",
+                        cell.cell_id
+                    );
                 }
                 blocked += 1;
             }
-            status => bail!("unsupported matrix cell status {status:?} for {}", cell.cell_id),
+            status => bail!(
+                "unsupported matrix cell status {status:?} for {}",
+                cell.cell_id
+            ),
         }
     }
 

@@ -545,7 +545,9 @@ async fn run_side(
             .collect::<Result<BTreeMap<_, _>>>()?;
         let logical_bytes = loaded.logical_bytes;
         let exchange_bytes = measurement_workers.iter().try_fold(0u64, |total, worker| {
-            total.checked_add(worker.exchange_bytes).context("exchange byte total overflow")
+            total
+                .checked_add(worker.exchange_bytes)
+                .context("exchange byte total overflow")
         })?;
         let sample = RawSample {
             schema_version: 1,
