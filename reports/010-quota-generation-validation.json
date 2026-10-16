@@ -24,6 +24,20 @@
       ],
       "exit_code": 0,
       "log_sha256": "eb268b6e7693d2acd693865a7426f780f69467e635c7fb6d0f85537d03d12e5b"
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "rockstream-types",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 101,
+      "log_sha256": "3ff3cef21deac81e5168b6a5b3f4d6abf52273c2370be457af7ee9fe355b9f3f"
     }
   ],
   "id": "010-quota-generation-validation",

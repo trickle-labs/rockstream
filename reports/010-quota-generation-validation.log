@@ -307,3 +307,544 @@ running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 
 
+
+COMMAND ["cargo", "clippy", "-p", "rockstream-types", "--all-targets", "--", "-D", "warnings"]
+    Checking libc v0.2.186
+    Checking cfg-if v1.0.4
+    Checking libm v0.2.16
+    Checking num-traits v0.2.19
+    Checking serde_core v1.0.228
+    Checking zerocopy v0.8.50
+    Checking serde v1.0.228
+    Checking once_cell v1.21.4
+    Checking getrandom v0.3.4
+    Checking num-integer v0.1.46
+    Checking foldhash v0.2.0
+    Checking allocator-api2 v0.2.21
+    Checking memchr v2.8.1
+    Checking equivalent v1.0.2
+    Checking hashbrown v0.17.1
+    Checking num-bigint v0.4.6
+    Checking bytes v1.11.1
+    Checking half v2.7.1
+    Checking iana-time-zone v0.1.65
+    Checking arrow-schema v58.3.0
+    Checking arrow-buffer v58.3.0
+    Checking chrono v0.4.44
+    Checking arrow-data v58.3.0
+    Checking ahash v0.8.12
+    Checking num-complex v0.4.6
+    Checking itoa v1.0.18
+    Checking lexical-util v1.0.7
+    Checking arrow-array v58.3.0
+    Checking bitflags v2.11.1
+    Checking lexical-parse-integer v1.0.6
+    Checking lexical-write-integer v1.0.6
+    Checking powerfmt v0.2.0
+    Checking regex-syntax v0.8.10
+    Checking arrow-select v58.3.0
+    Checking minimal-lexical v0.2.1
+    Checking nom v7.1.3
+    Checking deranged v0.5.8
+    Checking lexical-write-float v1.0.6
+    Checking lexical-parse-float v1.0.6
+    Checking aho-corasick v1.1.4
+    Checking num-conv v0.2.2
+    Checking typenum v1.20.1
+    Checking time-core v0.1.8
+    Checking ryu v1.0.23
+    Checking time v0.3.47
+    Checking generic-array v0.14.7
+    Checking regex-automata v0.4.14
+    Checking thiserror v1.0.69
+    Checking lexical-core v1.0.6
+    Checking rusticata-macros v4.1.0
+    Checking getrandom v0.4.2
+    Checking arrow-ord v58.3.0
+    Checking indexmap v2.14.0
+    Checking atoi v2.0.0
+    Checking smallvec v1.15.1
+    Checking base64 v0.22.1
+    Checking scopeguard v1.2.0
+    Checking arrow-cast v58.3.0
+    Checking lock_api v0.4.14
+    Checking parking_lot_core v0.9.12
+    Checking asn1-rs v0.6.2
+    Checking regex v1.12.3
+    Checking zmij v1.0.21
+    Checking csv-core v0.1.13
+    Checking rand_core v0.9.5
+    Checking linux-raw-sys v0.12.1
+    Checking serde_json v1.0.150
+    Checking rustix v1.1.4
+    Checking csv v1.4.0
+    Checking flatbuffers v25.12.19
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking toml_datetime v0.6.11
+    Checking serde_spanned v0.6.9
+    Checking errno v0.3.14
+    Checking verus_builtin v0.0.0-2026-09-06-0133
+    Checking toml_write v0.1.2
+    Checking winnow v0.7.15
+    Checking simdutf8 v0.1.5
+    Checking fastrand v2.4.1
+    Checking pin-project-lite v0.2.17
+    Checking tempfile v3.27.0
+    Checking arrow-json v58.3.0
+    Checking vstd v0.0.0-2026-09-06-0133
+    Checking toml_edit v0.22.27
+    Checking signal-hook-registry v1.4.8
+    Checking digest v0.10.7
+    Checking arrow-ipc v58.3.0
+    Checking arrow-csv v58.3.0
+    Checking crossbeam-utils v0.8.21
+    Checking oid-registry v0.7.1
+    Checking arrow-string v58.3.0
+    Checking der-parser v9.0.0
+    Checking parking_lot v0.12.5
+    Checking arrow-row v58.3.0
+    Checking arrow-arith v58.3.0
+    Checking ppv-lite86 v0.2.21
+    Checking tracing-core v0.1.36
+    Checking mio v1.2.1
+    Checking socket2 v0.6.4
+    Checking wait-timeout v0.2.1
+    Checking data-encoding v2.11.0
+    Checking lazy_static v1.5.0
+    Checking fnv v1.0.7
+    Checking cpufeatures v0.2.17
+    Checking quick-error v1.2.3
+    Checking hashbrown v0.14.5
+    Checking bit-vec v0.8.0
+    Checking bit-set v0.8.0
+    Checking x509-parser v0.16.0
+    Checking dashmap v6.2.1
+    Checking rusty-fork v0.3.1
+    Checking sha2 v0.10.9
+    Checking tokio v1.52.3
+    Checking tracing v0.1.44
+    Checking rand_chacha v0.9.0
+    Checking arrow v58.3.0
+    Checking rockstream-verified v0.71.0 (/home/runner/work/rockstream/rockstream/candidate/crates/rockstream-verified)
+    Checking toml v0.8.23
+    Checking rand v0.9.4
+    Checking rand_xorshift v0.4.0
+    Checking uuid v1.23.2
+    Checking lru v0.18.2
+    Checking antichain v0.3.1
+    Checking unarray v0.1.4
+    Checking hex v0.4.3
+    Checking proptest v1.11.0
+    Checking rockstream-types v0.71.0 (/home/runner/work/rockstream/rockstream/candidate/crates/rockstream-types)
+error: variables can be used directly in the `format!` string
+   --> crates/rockstream-types/src/arrangement.rs:137:36
+    |
+137 |             Self::Decimal(p, s) => format!("DECIMAL({},{})", p, s),
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+    = note: `-D clippy::uninlined-format-args` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::uninlined_format_args)]`
+help: change this to
+    |
+137 -             Self::Decimal(p, s) => format!("DECIMAL({},{})", p, s),
+137 +             Self::Decimal(p, s) => format!("DECIMAL({p},{s})"),
+    |
+
+error: variables can be used directly in the `format!` string
+   --> crates/rockstream-types/src/arrangement.rs:585:46
+    |
+585 | ...                   .map_err(|e| format!("Invalid UTF-8 string: {}", e))?
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+585 -                                 .map_err(|e| format!("Invalid UTF-8 string: {}", e))?
+585 +                                 .map_err(|e| format!("Invalid UTF-8 string: {e}"))?
+    |
+
+error: variables can be used directly in the `format!` string
+   --> crates/rockstream-types/src/arrangement.rs:691:26
+    |
+691 |               other => Err(format!(
+    |  __________________________^
+692 | |                 "RS-1021: Unknown CanonicalLiteral tag: 0x{:02X}",
+693 | |                 other
+694 | |             )),
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/config_validation.rs:1048:26
+     |
+1048 |                 message: format!("invalid socket address `{}`", addr),
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+     |
+1048 -                 message: format!("invalid socket address `{}`", addr),
+1048 +                 message: format!("invalid socket address `{addr}`"),
+     |
+
+error: variables can be used directly in the `format!` string
+   --> crates/rockstream-types/src/identity.rs:227:32
+    |
+227 |             || self.node_id == format!("worker-{}", trimmed)
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+227 -             || self.node_id == format!("worker-{}", trimmed)
+227 +             || self.node_id == format!("worker-{trimmed}")
+    |
+
+error: variables can be used directly in the `format!` string
+   --> crates/rockstream-types/src/lifecycle.rs:190:17
+    |
+190 |               Err(format!(
+    |  _________________^
+191 | |                 "[{}] Illegal lifecycle transition from {:?} to {:?}",
+192 | |                 RS_0001, self, next
+193 | |             ))
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+   --> crates/rockstream-types/src/lifecycle.rs:271:17
+    |
+271 |               Err(format!(
+    |  _________________^
+272 | |                 "[{}] Illegal recovery phase transition from {:?} to {:?}",
+273 | |                 RS_0001, self, next
+274 | |             ))
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+   --> crates/rockstream-types/src/lifecycle.rs:589:17
+    |
+589 |               Err(format!(
+    |  _________________^
+590 | |                 "[{}] Illegal lifecycle transition from {:?} to {:?}",
+591 | |                 RS_0001, current, next
+592 | |             ))
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:2557:27
+     |
+2557 |               out.push_str(&format!(
+     |  ___________________________^
+2558 | |                 "write_amplification_ratio{{shard_id=\"{}\"}} {:.6}\n",
+2559 | |                 shard_id, ratio
+2560 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:2593:27
+     |
+2593 |               out.push_str(&format!(
+     |  ___________________________^
+2594 | |                 "segment_cache_hit_ratio{{worker_id=\"{}\"}} {:.6}\n",
+2595 | |                 worker_id, ratio
+2596 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:2618:27
+     |
+2618 |               out.push_str(&format!(
+     |  ___________________________^
+2619 | |                 "pipeline_state_bytes{{pipeline_id=\"{}\"}} {}\n",
+2620 | |                 pipeline_id, bytes
+2621 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:2625:27
+     |
+2625 |               out.push_str(&format!(
+     |  ___________________________^
+2626 | |                 "pipeline_state_bytes{{pipeline_id=\"other\"}} {}\n",
+2627 | |                 other
+2628 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3244:27
+     |
+3244 |               out.push_str(&format!(
+     |  ___________________________^
+3245 | |                 "rockstream_ingest_rows_total{{source=\"{}\",format=\"{}\"}} {}\n",
+3246 | |                 source, format, rows
+3247 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3260:27
+     |
+3260 |               out.push_str(&format!(
+     |  ___________________________^
+3261 | |                 "rockstream_ingest_bytes_total{{source=\"{}\",format=\"{}\"}} {}\n",
+3262 | |                 source, format, bytes
+3263 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3278:27
+     |
+3278 |               out.push_str(&format!(
+     |  ___________________________^
+3279 | |                 "rockstream_execution_rows_total{{view=\"{}\",operator=\"{}\"}} {}\n",
+3280 | |                 view, operator, rows
+3281 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3296:27
+     |
+3296 |               out.push_str(&format!(
+     |  ___________________________^
+3297 | |                 "rockstream_epoch_duration_seconds{{workload=\"{}\",phase=\"{}\"}} {}\n",
+3298 | |                 workload, phase, duration
+3299 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3302:27
+     |
+3302 |             out.push_str(&format!("rockstream_epoch_duration_seconds{{workload=\"__other__\",phase=\"__other__\"}} {}\n", dur));
+     |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+     |
+3302 -             out.push_str(&format!("rockstream_epoch_duration_seconds{{workload=\"__other__\",phase=\"__other__\"}} {}\n", dur));
+3302 +             out.push_str(&format!("rockstream_epoch_duration_seconds{{workload=\"__other__\",phase=\"__other__\"}} {dur}\n"));
+     |
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3311:27
+     |
+3311 |               out.push_str(&format!(
+     |  ___________________________^
+3312 | |                 "rockstream_frontier_lag_seconds{{view=\"{}\"}} {}\n",
+3313 | |                 view, lag
+3314 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3317:27
+     |
+3317 |               out.push_str(&format!(
+     |  ___________________________^
+3318 | |                 "rockstream_frontier_lag_seconds{{view=\"__other__\"}} {}\n",
+3319 | |                 lag
+3320 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3329:27
+     |
+3329 |               out.push_str(&format!(
+     |  ___________________________^
+3330 | |                 "rockstream_state_bytes{{view=\"{}\",backend=\"{}\"}} {}\n",
+3331 | |                 view, backend, bytes
+3332 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3335:27
+     |
+3335 |               out.push_str(&format!(
+     |  ___________________________^
+3336 | |                 "rockstream_state_bytes{{view=\"__other__\",backend=\"__other__\"}} {}\n",
+3337 | |                 b
+3338 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3347:27
+     |
+3347 |               out.push_str(&format!(
+     |  ___________________________^
+3348 | |                 "rockstream_memory_bytes{{worker=\"{}\",category=\"{}\"}} {}\n",
+3349 | |                 worker, category, bytes
+3350 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3353:27
+     |
+3353 |               out.push_str(&format!(
+     |  ___________________________^
+3354 | |                 "rockstream_memory_bytes{{worker=\"__other__\",category=\"__other__\"}} {}\n",
+3355 | |                 b
+3356 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3367:27
+     |
+3367 |               out.push_str(&format!(
+     |  ___________________________^
+3368 | |                 "rockstream_exchange_bytes_total{{sender=\"{}\",receiver=\"{}\"}} {}\n",
+3369 | |                 sender, receiver, bytes
+3370 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3384:27
+     |
+3384 |               out.push_str(&format!(
+     |  ___________________________^
+3385 | |                 "rockstream_exchange_backpressure{{worker=\"{}\",channel=\"{}\"}} {}\n",
+3386 | |                 worker, channel, ratio
+3387 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3390:27
+     |
+3390 |             out.push_str(&format!("rockstream_exchange_backpressure{{worker=\"__other__\",channel=\"__other__\"}} {}\n", r));
+     |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+     |
+3390 -             out.push_str(&format!("rockstream_exchange_backpressure{{worker=\"__other__\",channel=\"__other__\"}} {}\n", r));
+3390 +             out.push_str(&format!("rockstream_exchange_backpressure{{worker=\"__other__\",channel=\"__other__\"}} {r}\n"));
+     |
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3399:27
+     |
+3399 |               out.push_str(&format!(
+     |  ___________________________^
+3400 | |                 "rockstream_checkpoint_duration_seconds{{shard=\"{}\",tier=\"{}\"}} {}\n",
+3401 | |                 shard, tier, duration
+3402 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3405:27
+     |
+3405 |             out.push_str(&format!("rockstream_checkpoint_duration_seconds{{shard=\"__other__\",tier=\"__other__\"}} {}\n", d));
+     |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+     |
+3405 -             out.push_str(&format!("rockstream_checkpoint_duration_seconds{{shard=\"__other__\",tier=\"__other__\"}} {}\n", d));
+3405 +             out.push_str(&format!("rockstream_checkpoint_duration_seconds{{shard=\"__other__\",tier=\"__other__\"}} {d}\n"));
+     |
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3416:27
+     |
+3416 |               out.push_str(&format!(
+     |  ___________________________^
+3417 | |                 "rockstream_migration_rows_copied_total{{migration_id=\"{}\"}} {}\n",
+3418 | |                 migration_id, rows
+3419 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3436:27
+     |
+3436 |               out.push_str(&format!(
+     |  ___________________________^
+3437 | |                 "rockstream_connector_lag_records{{source=\"{}\",partition=\"{}\"}} {}\n",
+3438 | |                 source, partition, records
+3439 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3442:27
+     |
+3442 |             out.push_str(&format!("rockstream_connector_lag_records{{source=\"__other__\",partition=\"__other__\"}} {}\n", l));
+     |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+     |
+3442 -             out.push_str(&format!("rockstream_connector_lag_records{{source=\"__other__\",partition=\"__other__\"}} {}\n", l));
+3442 +             out.push_str(&format!("rockstream_connector_lag_records{{source=\"__other__\",partition=\"__other__\"}} {l}\n"));
+     |
+
+error: variables can be used directly in the `format!` string
+    --> crates/rockstream-types/src/metrics.rs:3451:27
+     |
+3451 |               out.push_str(&format!(
+     |  ___________________________^
+3452 | |                 "rockstream_errors_total{{code=\"{}\"}} {}\n",
+3453 | |                 code, count
+3454 | |             ));
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+
+error: variables can be used directly in the `format!` string
+   --> crates/rockstream-types/src/qualification.rs:507:21
+    |
+507 |             run_id: format!("run_rc1_{}w", worker_count),
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+507 -             run_id: format!("run_rc1_{}w", worker_count),
+507 +             run_id: format!("run_rc1_{worker_count}w"),
+    |
+
+error: could not compile `rockstream-types` (lib) due to 33 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `rockstream-types` (lib test) due to 33 previous errors
+
