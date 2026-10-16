@@ -16,9 +16,9 @@
 //! O(log N) scan via the value-descending sort key for inserts and refills.
 //! Buffer size = 2K (K + epsilon). Fill-level metric = buffer entry count.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -36,6 +36,7 @@ use crate::zset::ArrowZSet;
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 pub const TOPK_BUFFER_LIMIT: usize = 100_000;
+static NEXT_SPILL_ID: AtomicU64 = AtomicU64::new(1);
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -45,7 +46,7 @@ pub const TOPK_BUFFER_LIMIT: usize = 100_000;
 /// `net_weight > 0` are visible in the output. Entries with `net_weight ≤ 0`
 /// represent over-retractions or cancelled rows and are kept until they cancel
 /// out (reach 0, at which point they are removed).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BufferEntry {
     rank_value: i64,
     row_vals: Vec<i64>,
@@ -53,9 +54,12 @@ struct BufferEntry {
 }
 
 /// Per-partition state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PartitionState {
     /// Buffer: row_id → BufferEntry (all entries, up to K + epsilon).
     buffer: HashMap<u128, BufferEntry>,
+    positive_count: usize,
+    spilled: HashSet<u128>,
     /// Currently emitted top-K: row_id → (row_vals, emitted multiplicity).
     emitted: HashMap<u128, (Vec<i64>, i64)>,
 }
@@ -64,11 +68,14 @@ impl PartitionState {
     fn new() -> Self {
         Self {
             buffer: HashMap::new(),
+            positive_count: 0,
+            spilled: HashSet::new(),
             emitted: HashMap::new(),
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TopKState {
     /// partition_key_bytes → partition state.
     partitions: HashMap<Vec<u8>, PartitionState>,
@@ -93,6 +100,7 @@ impl TopKState {
         let mut bytes = 0u64;
         for (pk, part) in &self.partitions {
             bytes += pk.len() as u64;
+            bytes += (part.spilled.len() * 16) as u64;
             for entry in part.buffer.values() {
                 bytes += (32 + entry.row_vals.len() * 8) as u64;
             }
@@ -113,6 +121,7 @@ pub struct TopKOp {
     k: usize,
     rank_col: usize,
     partition_by: Vec<usize>,
+    spill_id: u64,
     db: Mutex<Option<Arc<ShardDb>>>,
     state: Mutex<TopKState>,
     fill_level: Arc<AtomicUsize>,
@@ -128,6 +137,7 @@ impl TopKOp {
             k,
             rank_col,
             partition_by,
+            spill_id: NEXT_SPILL_ID.fetch_add(1, Ordering::Relaxed),
             db: Mutex::new(None),
             state: Mutex::new(TopKState::new()),
             fill_level: Arc::new(AtomicUsize::new(0)),
@@ -157,8 +167,14 @@ impl TopKOp {
             return Ok(ArrowZSet::empty(self.schema.clone()));
         }
 
-        let mut state = self.state.lock().unwrap();
+        let mut accepted = self.state.lock().unwrap();
+        // Stage only touched partitions; failed reads/writes must not publish an epoch.
+        let mut state = TopKState::new();
+        let db_guard = self.db.lock().unwrap();
         let mut dirty_partitions: std::collections::HashSet<Vec<u8>> = Default::default();
+        let mut spills = HashMap::new();
+        let mut writes = WriteBatch::new();
+        let mut spilled_bytes = 0;
 
         // ── Apply delta ──────────────────────────────────────────────────────
         for row_idx in 0..delta.num_rows() {
@@ -175,21 +191,62 @@ impl TopKOp {
             let part_key = self.partition_key_bytes(&row_vals);
             let row_id = row_id_hash(&row_vals);
 
-            let part = state
-                .partitions
-                .entry(part_key.clone())
-                .or_insert_with(PartitionState::new);
+            if !state.partitions.contains_key(&part_key) {
+                let part = accepted
+                    .partitions
+                    .get(&part_key)
+                    .cloned()
+                    .unwrap_or_else(PartitionState::new);
+                spills.insert(
+                    part_key.clone(),
+                    read_spilled(
+                        &part,
+                        db_guard.as_ref(),
+                        &self.spill_partition_prefix(&part_key),
+                        self.n_input_cols,
+                    )?,
+                );
+                state.partitions.insert(part_key.clone(), part);
+            }
+            let spilled_entries = spills.get_mut(&part_key).unwrap();
+
+            let part = state.partitions.get_mut(&part_key).unwrap();
+
+            if part.spilled.contains(&row_id) {
+                let prefix = self.spill_partition_prefix(&part_key);
+                let db_key = [prefix.as_slice(), &row_id.to_be_bytes()].concat();
+                let old_weight = spilled_entries[&row_id].net_weight;
+                let net_weight = old_weight + w;
+                if net_weight == 0 {
+                    writes.delete(&db_key);
+                    spilled_entries.remove(&row_id);
+                    part.spilled.remove(&row_id);
+                } else {
+                    let value = encode_topk_value(rank_value, net_weight, &row_vals);
+                    writes.put(&db_key, &value);
+                    spilled_entries.insert(
+                        row_id,
+                        BufferEntry {
+                            rank_value,
+                            row_vals,
+                            net_weight,
+                        },
+                    );
+                }
+                dirty_partitions.insert(part_key);
+                continue;
+            }
 
             // Update the buffer entry's net_weight (handles over-retractions correctly).
             // All positive-weight entries are kept in the buffer — evicting a live row
             // would cause missing refill candidates if its higher-ranked peers are later
             // deleted. TOPK_BUFFER_LIMIT is a hard safety cap (not a correctness eviction).
-            let positive_count: usize = part.buffer.values().filter(|e| e.net_weight > 0).count();
-
             match part.buffer.entry(row_id) {
                 std::collections::hash_map::Entry::Occupied(mut entry_occ) => {
                     let entry = entry_occ.get_mut();
+                    part.positive_count -= usize::from(entry.net_weight > 0);
                     entry.net_weight += w;
+                    part.positive_count += usize::from(entry.net_weight > 0);
                     entry.rank_value = rank_value;
                     entry.row_vals = row_vals;
                     // Remove entries that cancel to zero.
@@ -208,27 +265,27 @@ impl TopKOp {
                     } else {
                         // New positive-weight entry: always buffer (correctness requirement).
                         // Entries above TOPK_BUFFER_LIMIT trigger an error to prevent unbounded growth.
-                        if positive_count >= TOPK_BUFFER_LIMIT {
-                            let has_db = self.db.lock().unwrap().is_some();
-                            if !has_db {
+                        if part.positive_count >= TOPK_BUFFER_LIMIT {
+                            if db_guard.is_some() {
+                                let prefix = self.spill_partition_prefix(&part_key);
+                                let db_key = [prefix.as_slice(), &row_id.to_be_bytes()].concat();
+                                let v_bytes = encode_topk_value(rank_value, w, &row_vals);
+                                writes.put(&db_key, &v_bytes);
+                                spilled_entries.insert(
+                                    row_id,
+                                    BufferEntry {
+                                        rank_value,
+                                        row_vals,
+                                        net_weight: w,
+                                    },
+                                );
+                                spilled_bytes += (db_key.len() + v_bytes.len()) as u64;
+                                part.spilled.insert(row_id);
+                            } else {
                                 return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
                             }
-                            if let Some(db) = self.db.lock().unwrap().as_ref() {
-                                let db_key = [
-                                    b"topk_spill:".as_slice(),
-                                    &part_key[..],
-                                    &row_id.to_be_bytes()[..],
-                                ]
-                                .concat();
-                                let v_bytes = encode_topk_value(rank_value, w, &row_vals);
-                                crate::spill::block_on_future(db.put(&db_key, &v_bytes)).map_err(
-                                    |e| OpError::storage_error(format!("topk spill put err: {e}")),
-                                )?;
-                                rockstream_types::metrics::inc_spilled_bytes(
-                                    (db_key.len() + v_bytes.len()) as u64,
-                                );
-                            }
                         } else {
+                            part.positive_count += 1;
                             entry_vac.insert(BufferEntry {
                                 rank_value,
                                 row_vals,
@@ -255,9 +312,7 @@ impl TopKOp {
             // rank_value descending, then by full row bytes ascending (stable
             // tiebreaker). Consume each entry's full positive multiplicity so
             // duplicate input rows occupy duplicate Top-K positions.
-            let db_guard = self.db.lock().unwrap();
-            let new_topk =
-                select_topk(part, self.k, db_guard.as_ref(), part_key, self.n_input_cols);
+            let new_topk = select_topk(part, self.k, &spills[part_key]);
 
             // Retract rows no longer in top-K.
             for (rid, (old_vals, old_count)) in &part.emitted {
@@ -278,11 +333,17 @@ impl TopKOp {
             part.emitted = new_topk;
         }
 
-        let total = state.total_entries();
-        drop(state);
+        let output = build_output(&self.schema, output_rows)?;
+        if !writes.is_empty() {
+            crate::spill::block_on_future(db_guard.as_ref().unwrap().write_batch(writes))
+                .map_err(OpError::storage)?;
+        }
+        accepted.partitions.extend(state.partitions);
+        let total = accepted.total_entries();
 
+        rockstream_types::metrics::inc_spilled_bytes(spilled_bytes);
         self.fill_level.store(total, Ordering::Relaxed);
-        build_output(&self.schema, output_rows)
+        Ok(output)
     }
 
     fn partition_key_bytes(&self, row_vals: &[i64]) -> Vec<u8> {
@@ -296,6 +357,15 @@ impl TopKOp {
             key.extend_from_slice(&v.to_be_bytes());
         }
         key
+    }
+
+    fn spill_partition_prefix(&self, part_key: &[u8]) -> Vec<u8> {
+        [
+            b"topk_spill:".as_slice(),
+            &self.spill_id.to_be_bytes(),
+            part_key,
+        ]
+        .concat()
     }
 }
 
@@ -337,16 +407,59 @@ fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i
         .collect()
 }
 
+fn read_spilled(
+    part: &PartitionState,
+    db: Option<&Arc<ShardDb>>,
+    prefix: &[u8],
+    n_input_cols: usize,
+) -> Result<HashMap<u128, BufferEntry>, OpError> {
+    if part.spilled.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let db = db.ok_or_else(|| OpError::storage_error("topk spill database missing"))?;
+    let pairs = crate::spill::block_on_future(db.scan_prefix(prefix)).map_err(OpError::storage)?;
+    let mut entries = HashMap::new();
+    for (key, value) in pairs {
+        if key.len() != prefix.len() + 16 {
+            return Err(topk_corruption());
+        }
+        let row_id = u128::from_be_bytes(key[prefix.len()..].try_into().unwrap());
+        if part.spilled.contains(&row_id) {
+            let (rank_value, net_weight, row_vals) =
+                decode_topk_value(&value, n_input_cols).ok_or_else(topk_corruption)?;
+            if row_id_hash(&row_vals) != row_id {
+                return Err(topk_corruption());
+            }
+            rockstream_types::metrics::inc_spill_faults_total();
+            entries.insert(
+                row_id,
+                BufferEntry {
+                    rank_value,
+                    net_weight,
+                    row_vals,
+                },
+            );
+        }
+    }
+    if entries.keys().copied().collect::<HashSet<_>>() != part.spilled {
+        return Err(topk_corruption());
+    }
+    Ok(entries)
+}
+
+fn topk_corruption() -> OpError {
+    OpError::storage_error("corrupt topk record")
+}
+
 fn select_topk(
     part: &PartitionState,
     k: usize,
-    db_opt: Option<&Arc<ShardDb>>,
-    part_key: &[u8],
-    n_input_cols: usize,
+    spilled: &HashMap<u128, BufferEntry>,
 ) -> HashMap<u128, (Vec<i64>, i64)> {
     let mut sorted: Vec<(i64, u128, Vec<i64>, i64)> = part
         .buffer
         .iter()
+        .chain(spilled.iter())
         .filter(|(_, entry)| entry.net_weight > 0)
         .map(|(&row_id, entry)| {
             (
@@ -357,28 +470,6 @@ fn select_topk(
             )
         })
         .collect();
-
-    if let Some(db) = db_opt {
-        let prefix = [b"topk_spill:".as_slice(), part_key].concat();
-        let raw_pairs = crate::spill::block_on_future(db.scan_prefix(&prefix)).unwrap_or_default();
-        let prefix_len = prefix.len();
-        for (k_buf, v_buf) in raw_pairs {
-            if k_buf.len() >= prefix_len + 16 {
-                let row_id_bytes: [u8; 16] = k_buf[prefix_len..prefix_len + 16]
-                    .try_into()
-                    .unwrap_or([0; 16]);
-                let row_id = u128::from_be_bytes(row_id_bytes);
-                if !part.buffer.contains_key(&row_id) {
-                    if let Some((rank_val, w, row_vals)) = decode_topk_value(&v_buf, n_input_cols) {
-                        if w > 0 {
-                            rockstream_types::metrics::inc_spill_faults_total();
-                            sorted.push((rank_val, row_id, row_vals, w));
-                        }
-                    }
-                }
-            }
-        }
-    }
     sorted.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2)))
@@ -467,7 +558,7 @@ fn encode_topk_value(rank_value: i64, net_weight: i64, row_vals: &[i64]) -> Vec<
 }
 
 fn decode_topk_value(bytes: &[u8], n_input_cols: usize) -> Option<(i64, i64, Vec<i64>)> {
-    if bytes.len() < 16 + n_input_cols * 8 {
+    if bytes.len() != 16 + n_input_cols * 8 {
         return None;
     }
     let rank_value = i64::from_be_bytes(bytes[0..8].try_into().ok()?);
@@ -488,13 +579,37 @@ pub fn append_topk_state(
     op_id: OperatorId,
     target: &mut WriteBatch,
 ) -> Result<(), OpError> {
+    let db = op.db.lock().unwrap().clone();
+    append_topk_state_with_db(op, op_id, target, db.as_deref())
+}
+
+pub(crate) fn append_topk_state_with_db(
+    op: &TopKOp,
+    op_id: OperatorId,
+    target: &mut WriteBatch,
+    db: Option<&ShardDb>,
+) -> Result<(), OpError> {
     let batch = {
         let state = op.state.lock().unwrap();
         let mut batch = WriteBatch::new();
         let oid = op_id.0;
-
+        if let Some(db) = db {
+            let prefix = ShardKeyEncoder::topk_op_prefix(oid);
+            for (key, _) in
+                crate::spill::block_on_future(db.scan_prefix(&prefix)).map_err(OpError::storage)?
+            {
+                batch.delete(&key);
+            }
+        }
+        let spill_db = op.db.lock().unwrap();
         for (part_key, part) in &state.partitions {
-            for (&row_id, entry) in &part.buffer {
+            let spilled = read_spilled(
+                part,
+                spill_db.as_ref(),
+                &op.spill_partition_prefix(part_key),
+                op.n_input_cols,
+            )?;
+            for (&row_id, entry) in part.buffer.iter().chain(spilled.iter()) {
                 let key = ShardKeyEncoder::topk_key(oid, part_key, entry.rank_value, row_id);
                 let value = encode_topk_value(entry.rank_value, entry.net_weight, &entry.row_vals);
                 batch.put(&key, &value);
@@ -513,14 +628,15 @@ pub async fn persist_topk_state(
     op_id: OperatorId,
 ) -> Result<(), OpError> {
     let mut batch = WriteBatch::new();
-    append_topk_state(op, op_id, &mut batch)?;
+    append_topk_state_with_db(op, op_id, &mut batch, Some(db))?;
     if !batch.is_empty() {
         db.write_batch(batch).await.map_err(OpError::storage)?;
     }
     Ok(())
 }
 
-/// Load TopKOp state from a ShardDb.
+/// Load TopKOp state from a ShardDb, including checkpointed spill rows.
+// shortcut: recovery materializes the checkpoint in memory; stream into spills for bounded recovery.
 pub async fn load_topk_state(
     db: &ShardDb,
     schema: SchemaRef,
@@ -538,45 +654,41 @@ pub async fn load_topk_state(
     // Key format: [0x01][TK][op_id:8][part_key:var][value_desc:8][row_id:16]
     let prefix_len = prefix.len(); // 1 + 2 + 8 = 11
 
-    let mut st = op.state.lock().unwrap();
-
+    let mut st = TopKState::new();
     for (key, value) in entries {
-        if key.len() < prefix_len + 8 + 16 {
-            continue;
+        if key.len() != prefix_len + op.partition_by.len() * 8 + 8 + 16 {
+            return Err(topk_corruption());
         }
-        if let Some((rank_value, net_weight, row_vals)) = decode_topk_value(&value, n_input_cols) {
-            let row_id_bytes: [u8; 16] = key[key.len() - 16..].try_into().unwrap_or([0; 16]);
-            let row_id = u128::from_be_bytes(row_id_bytes);
-            // part_key = key[prefix_len .. key.len() - 8 - 16]
-            let part_key_end = key.len() - 8 - 16;
-            let part_key = key[prefix_len..part_key_end].to_vec();
-
-            if net_weight != 0 {
-                st.partitions
-                    .entry(part_key)
-                    .or_insert_with(PartitionState::new)
-                    .buffer
-                    .insert(
-                        row_id,
-                        BufferEntry {
-                            rank_value,
-                            row_vals,
-                            net_weight,
-                        },
-                    );
-            }
+        let (rank_value, net_weight, row_vals) =
+            decode_topk_value(&value, n_input_cols).ok_or_else(topk_corruption)?;
+        let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap());
+        let part_key = op.partition_key_bytes(&row_vals);
+        if key.as_ref() != ShardKeyEncoder::topk_key(oid, &part_key, rank_value, row_id)
+            || row_id_hash(&row_vals) != row_id
+        {
+            return Err(topk_corruption());
         }
-    }
-
-    {
-        let db_guard = op.db.lock().unwrap();
-        for (pk, part) in &mut st.partitions {
-            part.emitted = select_topk(part, k, db_guard.as_ref(), pk, n_input_cols);
+        if net_weight != 0 {
+            st.partitions
+                .entry(part_key)
+                .or_insert_with(PartitionState::new)
+                .buffer
+                .insert(
+                    row_id,
+                    BufferEntry {
+                        rank_value,
+                        row_vals,
+                        net_weight,
+                    },
+                );
         }
     }
-
+    for part in st.partitions.values_mut() {
+        part.positive_count = part.buffer.values().filter(|e| e.net_weight > 0).count();
+        part.emitted = select_topk(part, k, &HashMap::new());
+    }
     let total = st.total_entries();
-    drop(st);
+    *op.state.lock().unwrap() = st;
     op.fill_level.store(total, Ordering::Relaxed);
     Ok(op)
 }
@@ -633,6 +745,139 @@ mod tests {
             .collect();
         vals.sort_by(|a, b| b.cmp(a));
         vals
+    }
+
+    // #114 R4: scan/write/corruption failures preserve every accepted partition and spill.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn topk_storage_failures_leave_full_state_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let db = Arc::new(
+            ShardDb::builder("topk-failures", store)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let op = TopKOp::new(schema_kv(), 2, 0, vec![1]).with_db(db.clone());
+        let mut rows = (1..=100001).map(|rank| (rank, 0, 1)).collect::<Vec<_>>();
+        rows.push((7, 1, 1));
+        op.process_epoch(make_input(&rows), 1).unwrap();
+        let accepted = op.state.lock().unwrap().clone();
+        let fill = op.fill_level();
+        let bytes = op.state_bytes();
+        let persisted = db.scan_prefix(b"topk_spill:").await.unwrap();
+        assert_eq!(
+            accepted.partitions[&0_i64.to_be_bytes().to_vec()].spilled,
+            HashSet::from([row_id_hash(&[100001, 0])])
+        );
+
+        db.set_fail_scans(true);
+        let result = op.process_epoch(make_input(&[(7, 1, -1), (100001, 0, 1)]), 2);
+        assert!(matches!(result, Err(OpError::Storage {
+            source: rockstream_storage::StorageError::Unsupported(ref msg), ..
+        }) if msg == "injected storage scan failure"));
+        assert_eq!(*op.state.lock().unwrap(), accepted);
+        assert_eq!(op.fill_level(), fill);
+        assert_eq!(op.state_bytes(), bytes);
+        db.set_fail_scans(false);
+        assert_eq!(db.scan_prefix(b"topk_spill:").await.unwrap(), persisted);
+
+        db.set_fail_writes(true);
+        let result = op.process_epoch(make_input(&[(7, 1, -1), (100001, 0, 1)]), 2);
+        assert!(matches!(result, Err(OpError::Storage {
+            source: rockstream_storage::StorageError::Unsupported(ref msg), ..
+        }) if msg == "injected storage write failure"));
+        assert_eq!(*op.state.lock().unwrap(), accepted);
+        assert_eq!(op.fill_level(), fill);
+        assert_eq!(op.state_bytes(), bytes);
+        db.set_fail_writes(false);
+        assert_eq!(db.scan_prefix(b"topk_spill:").await.unwrap(), persisted);
+
+        let (key, value) = &persisted[0];
+        db.put(key, &value[..value.len() - 1]).await.unwrap();
+        let corrupted = db.scan_prefix(b"topk_spill:").await.unwrap();
+        let result = op.process_epoch(make_input(&[(7, 1, -1), (100001, 0, 1)]), 2);
+        assert!(matches!(result, Err(OpError::Storage {
+            source: rockstream_storage::StorageError::KeyEncoding(ref msg), ..
+        }) if msg == "corrupt topk record"));
+        assert_eq!(*op.state.lock().unwrap(), accepted);
+        assert_eq!(op.fill_level(), fill);
+        assert_eq!(op.state_bytes(), bytes);
+        assert_eq!(db.scan_prefix(b"topk_spill:").await.unwrap(), corrupted);
+
+        db.put(key, value).await.unwrap();
+        let out = op
+            .process_epoch(make_input(&[(7, 1, -1), (100001, 0, 1)]), 2)
+            .unwrap();
+        assert_eq!(out.data.schema(), schema_kv());
+        let mut expected = HashMap::new();
+        for i in 0..out.num_rows() {
+            let vals = extract_row_vals(&out.data, i, 2);
+            expected.insert(vals, out.weights[i]);
+        }
+        assert_eq!(
+            expected,
+            HashMap::from([
+                (vec![7, 1], -1),
+                (vec![100000, 0], -1),
+                (vec![100001, 0], 1),
+            ])
+        );
+        drop(op);
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
+    }
+
+    // #114 R5: valid records on both sides of a truncated record cannot yield a partial operator.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn topk_truncated_checkpoint_returns_corruption() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let db = ShardDb::builder("topk-corruption", store)
+            .build()
+            .await
+            .unwrap();
+        let op = TopKOp::new(schema_kv(), 2, 0, vec![]);
+        op.process_epoch(make_input(&[(1, 1, 1), (2, 2, 1), (3, 3, 1)]), 1)
+            .unwrap();
+        persist_topk_state(&db, &op, OperatorId(114)).await.unwrap();
+        let prefix = ShardKeyEncoder::topk_op_prefix(114);
+        let records = db.scan_prefix(&prefix).await.unwrap();
+        assert_eq!(
+            records.iter().map(|(_, v)| v.to_vec()).collect::<Vec<_>>(),
+            (1_i64..=3)
+                .rev()
+                .map(|v| encode_topk_value(v, 1, &[v, v]))
+                .collect::<Vec<_>>()
+        );
+        let (key, value) = &records[1];
+        db.put(key, &value[..value.len() - 1]).await.unwrap();
+        db.flush().await.unwrap();
+        db.close().await.unwrap();
+        let store =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let db = ShardDb::builder("topk-corruption", store)
+            .build()
+            .await
+            .unwrap();
+        let before = db.scan_prefix(&prefix).await.unwrap();
+        let result = load_topk_state(&db, schema_kv(), 2, 0, vec![], OperatorId(114)).await;
+        assert!(matches!(result, Err(OpError::Storage {
+            source: rockstream_storage::StorageError::KeyEncoding(ref msg), ..
+        }) if msg == "corrupt topk record"));
+        assert_eq!(db.scan_prefix(&prefix).await.unwrap(), before);
+        db.put(key, value).await.unwrap();
+        let recovered = load_topk_state(&db, schema_kv(), 2, 0, vec![], OperatorId(114))
+            .await
+            .unwrap();
+        assert_eq!(*recovered.state.lock().unwrap(), *op.state.lock().unwrap());
+        db.close().await.unwrap();
     }
 
     #[test]

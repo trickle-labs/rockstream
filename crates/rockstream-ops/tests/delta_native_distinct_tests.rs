@@ -1,117 +1,119 @@
-//! v0.59.5 Slice 4: Delta-Native Distinct Operator Tests & Coverage Matrix.
-//!
-//! Asserts incremental DistinctOp multiplicity tracking and zero-crossing delta emission.
-
-use arrow::array::Int64Array;
+//! Production distinct, TopK, and persistent arrangement qualification (#123 R1, R3–R5).
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use rockstream_ops::distinct::DistinctOp;
-use rockstream_ops::op::Operator;
-use rockstream_ops::zset::ArrowZSet;
+use object_store::local::LocalFileSystem;
+use rockstream_ops::{
+    distinct::DistinctOp, index_arrange::IndexArrangeOp, op::Operator, topk::TopKOp, ArrowZSet,
+};
+use rockstream_storage::ShardDb;
+use rockstream_test_support::typed_output::{assert_weighted_eq, int64_batch};
+use rockstream_types::ids::OperatorId;
 use std::sync::Arc;
 
-fn make_distinct_batch(vals: &[(i64, i64)]) -> ArrowZSet {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let k_vals: Vec<i64> = vals.iter().map(|(k, _)| *k).collect();
-    let weights: Vec<i64> = vals.iter().map(|(_, w)| *w).collect();
-    let data = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(k_vals))]).unwrap();
+fn input(rows: &[(&[Option<i64>], i64)]) -> ArrowZSet {
+    let (data, weights) = int64_batch(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ])),
+        rows,
+    );
     ArrowZSet::new(data, weights)
 }
 
-#[test]
-fn test_delta_native_distinct_zero_crossings() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let op = DistinctOp::new(schema);
-
-    // Epoch 1: Add k=1 (weight +1), k=2 (weight +2)
-    let b1 = make_distinct_batch(&[(1, 1), (2, 2)]);
-    let out1 = op.process_delta(b1).unwrap();
-    assert_eq!(out1.num_rows(), 2);
-    assert_eq!(out1.weights, vec![1, 1]);
-
-    // Epoch 2: Add duplicate k=1 (weight +1) -> no zero crossing, output is empty
-    let b2 = make_distinct_batch(&[(1, 1)]);
-    let out2 = op.process_delta(b2).unwrap();
-    assert_eq!(out2.num_rows(), 0);
-
-    // Epoch 3: Retract one k=2 (weight -1) -> still count 1, no output
-    let b3 = make_distinct_batch(&[(2, -1)]);
-    let out3 = op.process_delta(b3).unwrap();
-    assert_eq!(out3.num_rows(), 0);
-
-    // Epoch 4: Retract remaining k=2 (weight -1) -> count becomes 0, emit retraction -1
-    let b4 = make_distinct_batch(&[(2, -1)]);
-    let out4 = op.process_delta(b4).unwrap();
-    assert_eq!(out4.num_rows(), 1);
-    assert_eq!(out4.weights, vec![-1]);
-}
-
-// ── Coverage Matrix 3.4: Distinct, Top-K & Index Arrangement ─────────────────
-
-#[test]
-fn test_delta_native_distinct_i32() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let op = DistinctOp::new(schema);
-    let out = op.process_delta(make_distinct_batch(&[(1, 1)])).unwrap();
-    assert_eq!(out.num_rows(), 1);
+fn assert_output(out: &ArrowZSet, rows: &[(&[Option<i64>], i64)]) {
+    let expected = input(rows);
+    assert_weighted_eq(&out.data, &out.weights, &expected.data, &expected.weights);
 }
 
 #[test]
-fn test_delta_native_distinct_i64() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let op = DistinctOp::new(schema);
-    let out = op
-        .process_delta(make_distinct_batch(&[(1000000000000i64, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
-#[test]
-fn test_delta_native_distinct_text() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let op = DistinctOp::new(schema);
-    let out = op.process_delta(make_distinct_batch(&[(42, 1)])).unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
-#[test]
-fn test_delta_native_topk_i32() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let op = DistinctOp::new(schema);
-    let out = op.process_delta(make_distinct_batch(&[(10, 1)])).unwrap();
-    assert_eq!(out.num_rows(), 1);
+fn test_delta_native_distinct_i64_zero_crossings() {
+    let op = DistinctOp::new(input(&[]).schema());
+    assert_eq!(op.name(), "DistinctOp");
+    assert_output(
+        &op.process_delta(input(&[
+            (&[Some(1), Some(10)], 1),
+            (&[Some(2), Some(20)], 2),
+        ]))
+        .unwrap(),
+        &[(&[Some(1), Some(10)], 1), (&[Some(2), Some(20)], 1)],
+    );
+    assert_output(
+        &op.process_delta(input(&[(&[Some(1), Some(10)], 1)]))
+            .unwrap(),
+        &[],
+    );
+    assert_output(
+        &op.process_delta(input(&[(&[Some(2), Some(20)], -1)]))
+            .unwrap(),
+        &[],
+    );
+    assert_output(
+        &op.process_delta(input(&[(&[Some(2), Some(20)], -1)]))
+            .unwrap(),
+        &[(&[Some(2), Some(20)], -1)],
+    );
+    assert_output(
+        &op.process_delta(input(&[(&[Some(1), Some(10)], -2)]))
+            .unwrap(),
+        &[(&[Some(1), Some(10)], -1)],
+    );
 }
 
 #[test]
 fn test_delta_native_topk_i64() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let op = DistinctOp::new(schema);
-    let out = op
-        .process_delta(make_distinct_batch(&[(1000000000000i64, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
+    let op = TopKOp::new(input(&[]).schema(), 2, 1, vec![]);
+    assert_eq!(op.name(), "TopKOp");
+    assert_output(
+        &op.process_delta(input(&[
+            (&[Some(1), Some(10)], 1),
+            (&[Some(2), Some(20)], 1),
+            (&[Some(3), Some(30)], 1),
+        ]))
+        .unwrap(),
+        &[(&[Some(3), Some(30)], 1), (&[Some(2), Some(20)], 1)],
+    );
+    assert_output(
+        &op.process_delta(input(&[(&[Some(3), Some(30)], -1)]))
+            .unwrap(),
+        &[(&[Some(3), Some(30)], -1), (&[Some(1), Some(10)], 1)],
+    );
 }
 
-#[test]
-fn test_delta_native_topk_text() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let op = DistinctOp::new(schema);
-    let out = op.process_delta(make_distinct_batch(&[(42, 1)])).unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
-#[test]
-fn test_delta_native_index_arrange_i32_i64() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let op = DistinctOp::new(schema);
-    let out = op.process_delta(make_distinct_batch(&[(1, 1)])).unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
-#[test]
-fn test_delta_native_index_arrange_text_i64() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let op = DistinctOp::new(schema);
-    let out = op.process_delta(make_distinct_batch(&[(2, 1)])).unwrap();
-    assert_eq!(out.num_rows(), 1);
+#[tokio::test(flavor = "multi_thread")]
+async fn test_delta_native_index_arrange_i64_i64() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let db = Arc::new(
+        ShardDb::builder("qualification", store)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let op = IndexArrangeOp::new(db, OperatorId(31), vec![0], vec![1], 100);
+    assert_eq!(op.name(), "IndexArrangeOp");
+    let rows = [
+        (&[Some(1), Some(10)][..], 1),
+        (&[Some(1), Some(20)][..], 1),
+        (&[Some(2), Some(30)][..], 1),
+    ];
+    assert_output(&op.process_delta(input(&rows)).unwrap(), &rows);
+    let encoded = |key: i64, value: i64| [key.to_be_bytes(), value.to_be_bytes()].concat();
+    assert_eq!(
+        op.point_lookup_values(&[1]).await.unwrap(),
+        vec![encoded(1, 10), encoded(1, 20)]
+    );
+    assert_eq!(
+        op.point_lookup_values(&[2]).await.unwrap(),
+        vec![encoded(2, 30)]
+    );
+    let deleted = [(&[Some(1), Some(10)][..], -1)];
+    assert_output(&op.process_delta(input(&deleted)).unwrap(), &deleted);
+    assert_eq!(
+        op.point_lookup_values(&[1]).await.unwrap(),
+        vec![encoded(1, 20)]
+    );
+    assert_eq!(
+        op.point_lookup_values(&[2]).await.unwrap(),
+        vec![encoded(2, 30)]
+    );
 }

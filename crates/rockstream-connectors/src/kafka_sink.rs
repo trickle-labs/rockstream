@@ -4,6 +4,9 @@
 //! Uses `CheckBeforeCommit` idempotency profile: recovery queries the Kafka
 //! topic for the epoch marker before deciding whether to commit.
 //!
+//! Experimental marker transport only: `pre_commit` accepts a row count, not
+//! view records. Snapshot/change row delivery and payload recovery are unsupported.
+//!
 //! ## Bounded resources
 //!
 //! - `staged_epochs_count`: fill-level metric for staged (pre-committed) epochs.
@@ -18,13 +21,14 @@
 //! | During commit | CheckBeforeCommit: query topic; already present → Committed. |
 
 use async_trait::async_trait;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use rdkafka::{
     consumer::{BaseConsumer, Consumer},
+    error::KafkaError,
     producer::{BaseProducer, BaseRecord, Producer},
-    ClientConfig, Message, TopicPartitionList,
+    ClientConfig, Message, Offset, TopicPartitionList,
 };
 
 use rockstream_sim::buggify;
@@ -48,7 +52,7 @@ struct KafkaBroker {
     topic: String,
 }
 
-/// Kafka sink implementing `CheckBeforeCommit` idempotency.
+/// Experimental epoch/count marker sink implementing `CheckBeforeCommit` idempotency.
 pub struct KafkaSink {
     connector_id: ConnectorId,
     /// Epochs that have been delivered to the "external Kafka".
@@ -203,13 +207,15 @@ impl KafkaSink {
         self.staged_epochs_count >= self.max_staged_epochs
     }
 
-    /// Returns whether the durable epoch marker is present in Kafka.
-    pub fn check_epoch_delivered(&self, epoch: Epoch) -> bool {
+    /// Returns presence or confirmed absence; lookup failures leave recovery pending.
+    pub fn check_epoch_delivered(&self, epoch: Epoch) -> Result<bool, SinkError> {
         let Some(broker) = &self.broker else {
-            return self.delivered_epochs.contains(&epoch);
+            return Ok(self.delivered_epochs.contains(&epoch));
         };
-        let consumer: BaseConsumer = match ClientConfig::new()
+        let mut config = ClientConfig::new();
+        config
             .set("bootstrap.servers", &broker.bootstrap)
+            .set("client.id", "rockstream-epoch-check")
             .set(
                 "group.id",
                 format!("rockstream-epoch-check-{}-{epoch}", self.connector_id.0),
@@ -217,29 +223,94 @@ impl KafkaSink {
             .set("auto.offset.reset", "earliest")
             .set("enable.auto.commit", "false")
             .set("isolation.level", "read_committed")
-            .create()
-        {
-            Ok(consumer) => consumer,
-            Err(_) => return false,
-        };
-        if consumer.subscribe(&[&broker.topic]).is_err() {
-            return false;
+            .set("enable.partition.eof", "true");
+        self.lookup_epoch(epoch, &config, Duration::from_secs(5))
+    }
+
+    fn lookup_epoch(
+        &self,
+        epoch: Epoch,
+        config: &ClientConfig,
+        timeout: Duration,
+    ) -> Result<bool, SinkError> {
+        let broker = self
+            .broker
+            .as_ref()
+            .expect("broker lookup requires a broker");
+        let unknown = |reason| SinkError::DeliveryUnknown { epoch, reason };
+        let setup = |error| unknown(format!("consumer setup failed: {error}"));
+        let deadline = Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        let consumer: BaseConsumer = config.create().map_err(setup)?;
+        let metadata = consumer
+            .fetch_metadata(Some(&broker.topic), remaining())
+            .map_err(setup)?;
+        let topic = metadata
+            .topics()
+            .iter()
+            .find(|topic| topic.name() == broker.topic)
+            .ok_or_else(|| unknown("consumer setup failed: topic metadata missing".into()))?;
+        if let Some(error) = topic.error() {
+            return Err(unknown(format!("consumer setup failed: {error:?}")));
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        if topic.partitions().is_empty() {
+            return Err(unknown("consumer setup failed: no topic partitions".into()));
+        }
+        // ListOffsets with read_committed returns the last stable offset, which
+        // can hide an unresolved transaction. Snapshot the actual high watermark.
+        let watermarks: BaseConsumer = config
+            .clone()
+            .set("isolation.level", "read_uncommitted")
+            .create()
+            .map_err(setup)?;
+        let mut partitions = BTreeMap::new();
+        let mut assignment = TopicPartitionList::new();
+        for partition in topic.partitions() {
+            if let Some(error) = partition.error() {
+                return Err(unknown(format!("consumer setup failed: {error:?}")));
+            }
+            let (_, high) = watermarks
+                .fetch_watermarks(&broker.topic, partition.id(), remaining())
+                .map_err(setup)?;
+            let (_, stable) = consumer
+                .fetch_watermarks(&broker.topic, partition.id(), remaining())
+                .map_err(setup)?;
+            partitions.insert(partition.id(), stable >= high);
+            assignment
+                .add_partition_offset(&broker.topic, partition.id(), Offset::Beginning)
+                .map_err(setup)?;
+        }
+        consumer.assign(&assignment).map_err(setup)?;
         while Instant::now() < deadline {
-            if let Some(Ok(message)) = consumer.poll(Duration::from_millis(100)) {
-                if message
-                    .payload_view::<str>()
-                    .and_then(Result::ok)
-                    .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
-                    .and_then(|payload| payload.get("epoch").and_then(serde_json::Value::as_u64))
-                    == Some(epoch)
-                {
-                    return true;
+            match consumer.poll(remaining().min(Duration::from_millis(100))) {
+                Some(Ok(message)) => {
+                    if message
+                        .payload_view::<str>()
+                        .and_then(Result::ok)
+                        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+                        .and_then(|payload| {
+                            payload.get("epoch").and_then(serde_json::Value::as_u64)
+                        })
+                        == Some(epoch)
+                    {
+                        return Ok(true);
+                    }
                 }
+                Some(Err(KafkaError::PartitionEOF(partition))) => {
+                    // EOF proves absence only if the partition was stable through
+                    // the captured high watermark before this scan began.
+                    if partitions.get(&partition) == Some(&true) {
+                        partitions.remove(&partition);
+                    }
+                    if partitions.is_empty() {
+                        return Ok(false);
+                    }
+                }
+                Some(Err(error)) => return Err(unknown(format!("poll failed: {error}"))),
+                None => {}
             }
         }
-        false
+        Err(unknown("lookup timed out".into()))
     }
 
     /// Atomically attach consumed source offsets to the open transaction.
@@ -394,7 +465,8 @@ impl SinkConnector for KafkaSink {
             } => {
                 let epoch = *epoch;
                 // CheckBeforeCommit: query the durable epoch topic first.
-                if self.check_epoch_delivered(epoch) {
+                if self.check_epoch_delivered(epoch)? {
+                    self.delivered_epochs.insert(epoch);
                     // Already delivered; mark as committed (idempotent no-op).
                     // The epoch is resolved: clear any stale staged-epoch
                     // bookkeeping so `backpressure_active()` reflects reality.
@@ -470,6 +542,10 @@ impl KafkaSink {
     pub fn delivered_count_for_test(&self) -> usize {
         self.delivered_epochs.len()
     }
+
+    pub fn delivered_epochs_for_test(&self) -> &BTreeSet<Epoch> {
+        &self.delivered_epochs
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +558,54 @@ mod tests {
         s
     }
 
+    #[test]
+    fn lookup_distinguishes_setup_poll_absence_and_presence() {
+        use rdkafka::mocking::MockCluster;
+        use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
+
+        let cluster = MockCluster::new(1).unwrap();
+        cluster.create_topic("markers", 2, 1).unwrap();
+        let sink =
+            KafkaSink::connect(ConnectorId(1), &cluster.bootstrap_servers(), "markers").unwrap();
+        let broker = sink.broker.as_ref().unwrap();
+        broker.producer.begin_transaction().unwrap();
+        broker
+            .producer
+            .send(
+                BaseRecord::to("markers")
+                    .partition(1)
+                    .key("1")
+                    .payload("{\"epoch\":1,\"rows\":7}"),
+            )
+            .unwrap();
+        broker
+            .producer
+            .commit_transaction(Duration::from_secs(5))
+            .unwrap();
+        assert!(sink.check_epoch_delivered(1).unwrap());
+        assert!(!sink.check_epoch_delivered(2).unwrap());
+
+        let mut config = ClientConfig::new();
+        config
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .set("group.id", "lookup-test")
+            .set("enable.partition.eof", "true")
+            .set("isolation.level", "read_committed");
+        cluster.request_errors(
+            RDKafkaApiKey::Fetch,
+            &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED; 100],
+        );
+        let poll = sink
+            .lookup_epoch(1, &config, Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(poll.to_string(), "RS-4030: sink delivery outcome unknown for epoch 1: poll failed: Message consumption error: TopicAuthorizationFailed (Broker: Topic authorization failed); retry recovery");
+        config.set("socket.timeout.ms", "-1");
+        let setup = sink
+            .lookup_epoch(1, &config, Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(setup.to_string(), "RS-4030: sink delivery outcome unknown for epoch 1: consumer setup failed: Client config error: Configuration property \"socket.timeout.ms\" value -1 is outside allowed range 10..300000\n socket.timeout.ms -1; retry recovery");
+    }
+
     // ── Happy path ────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -492,7 +616,7 @@ mod tests {
         assert_eq!(sink.kafka_sink_staged_epochs_count(), 1);
         sink.commit(1, &state).await.unwrap();
         assert_eq!(sink.kafka_sink_staged_epochs_count(), 0);
-        assert!(sink.check_epoch_delivered(1));
+        assert!(sink.check_epoch_delivered(1).unwrap());
     }
 
     // ── Crash before pre-commit ───────────────────────────────────────────────
@@ -504,7 +628,7 @@ mod tests {
         let action = RecoveryAction::Noop;
         sink.recover(action).await.unwrap();
         // Nothing delivered.
-        assert!(!sink.check_epoch_delivered(1));
+        assert!(!sink.check_epoch_delivered(1).unwrap());
     }
 
     // ── Crash between pre-commit and commit ───────────────────────────────────
@@ -523,7 +647,7 @@ mod tests {
             pending_handle: state.pending_handle().to_vec(),
         };
         sink.recover(action).await.unwrap();
-        assert!(sink.check_epoch_delivered(2));
+        assert!(sink.check_epoch_delivered(2).unwrap());
     }
 
     // ── Crash during commit ───────────────────────────────────────────────────
@@ -542,8 +666,10 @@ mod tests {
         };
         sink.recover(action).await.unwrap();
         // Still exactly one delivery.
-        assert_eq!(sink.delivered_epochs.len(), 1);
-        assert!(sink.check_epoch_delivered(3));
+        assert_eq!(sink.delivered_epochs, BTreeSet::from([3]));
+        assert_eq!(sink.staged_epochs, BTreeSet::new());
+        assert_eq!(sink.staged_epochs_count, 0);
+        assert!(sink.check_epoch_delivered(3).unwrap());
     }
 
     // ── Kafka broker transaction timeout (S3, DESIGN.md §17.8 gap 2) ──────────
@@ -574,7 +700,7 @@ mod tests {
         // below for the exact panic-free error path), leaving `staged_epochs`
         // set but `delivered_epochs` empty — exactly the state after a
         // `SinkError::CommitFailed` from a forced abort.
-        assert!(!sink.check_epoch_delivered(6));
+        assert!(!sink.check_epoch_delivered(6).unwrap());
         let handle = match &state {
             SinkState::PreCommitted { pending_handle, .. } => pending_handle.clone(),
             _ => panic!("expected PreCommitted"),
@@ -588,7 +714,7 @@ mod tests {
             pending_handle: handle,
         };
         sink.recover(action).await.unwrap();
-        assert!(sink.check_epoch_delivered(6));
+        assert!(sink.check_epoch_delivered(6).unwrap());
         assert_eq!(sink.delivered_count_for_test(), 1);
     }
 
@@ -603,7 +729,7 @@ mod tests {
         // probability=1.0 with simulation enabled: the fault always fires.
         let err = sink.commit(8, &state).await;
         assert!(err.is_err(), "expected forced tx-timeout abort");
-        assert!(!sink.check_epoch_delivered(8));
+        assert!(!sink.check_epoch_delivered(8).unwrap());
         buggify_disable();
     }
 
@@ -642,7 +768,7 @@ mod tests {
         assert_eq!(sink.kafka_sink_staged_epochs_count(), 1);
         sink.abort(10).await.unwrap();
         assert_eq!(sink.kafka_sink_staged_epochs_count(), 0);
-        assert!(!sink.check_epoch_delivered(10));
+        assert!(!sink.check_epoch_delivered(10).unwrap());
     }
 
     // ─── Extension trait for test access to pending_handle ───────────────────────

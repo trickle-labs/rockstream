@@ -24,7 +24,7 @@ impl ViewReader for NoopViewReader {
     }
 }
 
-const REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.";
+const REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks. Kafka sink row export is currently unsupported.";
 
 #[tokio::test]
 async fn v0522_removed_connector_catalog_loads_as_removed_exactly() {

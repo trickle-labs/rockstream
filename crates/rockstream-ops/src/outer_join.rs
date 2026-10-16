@@ -6,8 +6,8 @@
 //!
 //! ## NULL encoding
 //!
-//! NULL values in the output (NULL-padding for unmatched rows) are encoded as
-//! `0i64` in the output Int64 columns.  All real column values are non-null.
+//! NULL-padding for unmatched rows is represented as Arrow NULL, preserving
+//! the distinction from a real zero value.
 //!
 //! ## State persistence
 //!
@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
@@ -44,6 +44,33 @@ pub fn outer_join_output_schema_n(left_n_cols: usize, right_n_cols: usize) -> Sc
             .chain((0..right_n_cols).map(|i| Field::new(format!("r_{i}"), DataType::Int64, true)))
             .collect::<Vec<_>>(),
     ))
+}
+
+fn output_schema(kind: OuterJoinKind, left: &Schema, right: &Schema) -> SchemaRef {
+    let left_padded = matches!(kind, OuterJoinKind::Right | OuterJoinKind::Full);
+    let right_padded = matches!(kind, OuterJoinKind::Left | OuterJoinKind::Full);
+    let mut fields = left
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            Field::new(
+                format!("l_{i}"),
+                DataType::Int64,
+                left_padded || field.is_nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !matches!(kind, OuterJoinKind::Semi | OuterJoinKind::Anti) {
+        fields.extend(right.fields().iter().enumerate().map(|(i, field)| {
+            Field::new(
+                format!("r_{i}"),
+                DataType::Int64,
+                right_padded || field.is_nullable(),
+            )
+        }));
+    }
+    Arc::new(Schema::new(fields))
 }
 
 /// Output schema for semi/anti join: left columns only.
@@ -69,6 +96,8 @@ struct StagedDelta {
     rows: Vec<(Vec<u8>, u128, Vec<u8>, i64)>,
     staged_bytes: u64,
 }
+
+type OuterJoinRows = (Vec<Vec<Option<i64>>>, Vec<Vec<Option<i64>>>, Vec<i64>);
 
 impl StagedDelta {
     fn push(&mut self, join_key: Vec<u8>, row_id: u128, row_bytes: Vec<u8>, weight: i64) {
@@ -273,26 +302,51 @@ impl OuterJoinOp {
         let mut bytes = Vec::new();
         for col in batch.columns() {
             let arr = col.as_any().downcast_ref::<Int64Array>().expect("Int64");
-            bytes.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+            let value = if arr.is_null(row_idx) {
+                0
+            } else {
+                arr.value(row_idx)
+            };
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        // Keep all-valid row identities compatible with the legacy encoding.
+        if batch.columns().iter().any(|col| col.is_null(row_idx)) {
+            bytes.extend(
+                batch
+                    .columns()
+                    .iter()
+                    .map(|col| u8::from(col.is_valid(row_idx))),
+            );
         }
         bytes
     }
 
-    fn deserialize_row(bytes: &[u8], n_cols: usize) -> Vec<i64> {
-        bytes
+    fn deserialize_row(bytes: &[u8], n_cols: usize) -> Result<Vec<Option<i64>>, OpError> {
+        let values_len = n_cols * 8;
+        if (bytes.len() != values_len && bytes.len() != values_len + n_cols)
+            || bytes[values_len..].iter().any(|valid| *valid > 1)
+        {
+            return Err(OpError::storage_error("malformed outer join row encoding"));
+        }
+        Ok(bytes[..values_len]
             .as_chunks::<8>()
             .0
             .iter()
-            .take(n_cols)
-            .map(|c| i64::from_be_bytes(*c))
-            .collect()
+            .enumerate()
+            .map(|(i, c)| {
+                bytes
+                    .get(values_len + i)
+                    .is_none_or(|valid| *valid != 0)
+                    .then(|| i64::from_be_bytes(*c))
+            })
+            .collect())
     }
 
     /// Build output RecordBatch from column value vecs.
     /// For LEFT/RIGHT/FULL: left_n_cols + right_n_cols columns.
     fn make_output_batch(
-        left_row_vals: &[Vec<i64>],
-        right_row_vals: &[Vec<i64>],
+        left_row_vals: &[Vec<Option<i64>>],
+        right_row_vals: &[Vec<Option<i64>>],
         schema: &SchemaRef,
         left_is_null: bool,
         right_is_null: bool,
@@ -301,14 +355,14 @@ impl OuterJoinOp {
         for col in left_row_vals {
             let values = col
                 .iter()
-                .map(|value| (!left_is_null).then_some(*value))
+                .map(|value| if left_is_null { None } else { *value })
                 .collect::<Vec<_>>();
             cols.push(Arc::new(Int64Array::from(values)) as ArrayRef);
         }
         for col in right_row_vals {
             let values = col
                 .iter()
-                .map(|value| (!right_is_null).then_some(*value))
+                .map(|value| if right_is_null { None } else { *value })
                 .collect::<Vec<_>>();
             cols.push(Arc::new(Int64Array::from(values)) as ArrayRef);
         }
@@ -317,7 +371,7 @@ impl OuterJoinOp {
 
     /// Build semi/anti output RecordBatch (left columns only).
     fn make_semi_batch(
-        left_row_vals: &[Vec<i64>],
+        left_row_vals: &[Vec<Option<i64>>],
         schema: &SchemaRef,
     ) -> Result<RecordBatch, OpError> {
         let mut cols: Vec<ArrayRef> = Vec::new();
@@ -348,7 +402,8 @@ impl OuterJoinOp {
             let row_bytes = Self::serialize_row(&delta.data, row_idx);
             let row_id = stable_row_id(self.op_id.0, &capsule_key, &row_bytes);
             let join_key = if is_null {
-                [capsule_key, row_id.to_be_bytes().to_vec()].concat()
+                // Opposite sides must never share a NULL-key bucket.
+                [capsule_key, row_id.to_be_bytes().to_vec(), vec![0]].concat()
             } else {
                 capsule_key
             };
@@ -367,7 +422,7 @@ impl OuterJoinOp {
             let row_bytes = Self::serialize_row(&delta.data, row_idx);
             let row_id = stable_row_id(self.op_id.0, &capsule_key, &row_bytes);
             let join_key = if is_null {
-                [capsule_key, row_id.to_be_bytes().to_vec()].concat()
+                [capsule_key, row_id.to_be_bytes().to_vec(), vec![1]].concat()
             } else {
                 capsule_key
             };
@@ -382,7 +437,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         // Compute staged right delta per key.
@@ -421,7 +480,7 @@ impl OuterJoinOp {
             //      old_rw = right_key_weight[k], new_rw = old_rw + delta_rw[k]
             //      If old_rw == 0 && new_rw != 0: retract NULL-pads for L₀[k]
             //      If old_rw != 0 && new_rw == 0: add NULL-pads for L₀[k]
-            let mut null_pad_rows: (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<i64>) = (
+            let mut null_pad_rows: OuterJoinRows = (
                 vec![Vec::new(); self.left_n_cols],
                 vec![Vec::new(); self.right_n_cols],
                 Vec::new(),
@@ -436,8 +495,8 @@ impl OuterJoinOp {
                     // Transition: either match gained or match lost for L₀ rows.
                     let retract = old_rw == 0; // was unmatched, now matched → retract NULL-pad
                     for (l_row_bytes, l_weight) in state.probe_left(key) {
-                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols);
-                        let right_nulls: Vec<i64> = vec![0i64; self.right_n_cols];
+                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols)?;
+                        let right_nulls = vec![None; self.right_n_cols];
                         for (i, v) in left_vals.iter().enumerate() {
                             null_pad_rows.0[i].push(*v);
                         }
@@ -465,7 +524,7 @@ impl OuterJoinOp {
             // 3. For each ΔL row: if effective_rw == 0, emit (row, NULL_right, w).
             {
                 let staged_left = self.left_staged.lock().unwrap();
-                let mut null_new_rows: (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<i64>) = (
+                let mut null_new_rows: OuterJoinRows = (
                     vec![Vec::new(); self.left_n_cols],
                     vec![Vec::new(); self.right_n_cols],
                     Vec::new(),
@@ -475,8 +534,8 @@ impl OuterJoinOp {
                     let delta = delta_rw.get(join_key).copied().unwrap_or(0);
                     let effective_rw = old_rw + delta;
                     if effective_rw == 0 {
-                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols);
-                        let right_nulls: Vec<i64> = vec![0i64; self.right_n_cols];
+                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
+                        let right_nulls = vec![None; self.right_n_cols];
                         for (i, v) in left_vals.iter().enumerate() {
                             null_new_rows.0[i].push(*v);
                         }
@@ -511,7 +570,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_lw: HashMap<Vec<u8>, i64> = {
@@ -544,7 +607,7 @@ impl OuterJoinOp {
             }
 
             // 2. NULL-pad transitions for right rows (symmetric to left).
-            let mut null_pad_rows: (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<i64>) = (
+            let mut null_pad_rows: OuterJoinRows = (
                 vec![Vec::new(); self.left_n_cols],
                 vec![Vec::new(); self.right_n_cols],
                 Vec::new(),
@@ -555,8 +618,8 @@ impl OuterJoinOp {
                 if (old_lw == 0) != (new_lw == 0) {
                     let retract = old_lw == 0;
                     for (r_row_bytes, r_weight) in state.probe_right(key) {
-                        let left_nulls: Vec<i64> = vec![0i64; self.left_n_cols];
-                        let right_vals = Self::deserialize_row(r_row_bytes, self.right_n_cols);
+                        let left_nulls = vec![None; self.left_n_cols];
+                        let right_vals = Self::deserialize_row(r_row_bytes, self.right_n_cols)?;
                         for (i, v) in left_nulls.iter().enumerate() {
                             null_pad_rows.0[i].push(*v);
                         }
@@ -583,7 +646,7 @@ impl OuterJoinOp {
             // 3. For each ΔR row: if effective_lw == 0, emit (NULL_left, row, w).
             {
                 let staged_right = self.right_staged.lock().unwrap();
-                let mut null_new_rows: (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<i64>) = (
+                let mut null_new_rows: OuterJoinRows = (
                     vec![Vec::new(); self.left_n_cols],
                     vec![Vec::new(); self.right_n_cols],
                     Vec::new(),
@@ -593,8 +656,8 @@ impl OuterJoinOp {
                     let delta = delta_lw.get(join_key).copied().unwrap_or(0);
                     let effective_lw = old_lw + delta;
                     if effective_lw == 0 {
-                        let left_nulls: Vec<i64> = vec![0i64; self.left_n_cols];
-                        let right_vals = Self::deserialize_row(row_bytes, self.right_n_cols);
+                        let left_nulls = vec![None; self.left_n_cols];
+                        let right_vals = Self::deserialize_row(row_bytes, self.right_n_cols)?;
                         for (i, v) in left_nulls.iter().enumerate() {
                             null_new_rows.0[i].push(*v);
                         }
@@ -628,7 +691,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_rw: HashMap<Vec<u8>, i64> = {
@@ -670,7 +737,7 @@ impl OuterJoinOp {
             }
 
             // 2. Left-side NULL-pad transitions (same as LEFT JOIN).
-            let mut null_pad_left: (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<i64>) = (
+            let mut null_pad_left: OuterJoinRows = (
                 vec![Vec::new(); self.left_n_cols],
                 vec![Vec::new(); self.right_n_cols],
                 Vec::new(),
@@ -681,8 +748,8 @@ impl OuterJoinOp {
                 if (old_rw == 0) != (new_rw == 0) {
                     let retract = old_rw == 0;
                     for (l_row_bytes, l_weight) in state.probe_left(key) {
-                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols);
-                        let right_nulls: Vec<i64> = vec![0i64; self.right_n_cols];
+                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols)?;
+                        let right_nulls = vec![None; self.right_n_cols];
                         for (i, v) in left_vals.iter().enumerate() {
                             null_pad_left.0[i].push(*v);
                         }
@@ -707,7 +774,7 @@ impl OuterJoinOp {
             }
 
             // 3. Right-side NULL-pad transitions (same as RIGHT JOIN).
-            let mut null_pad_right: (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<i64>) = (
+            let mut null_pad_right: OuterJoinRows = (
                 vec![Vec::new(); self.left_n_cols],
                 vec![Vec::new(); self.right_n_cols],
                 Vec::new(),
@@ -718,8 +785,8 @@ impl OuterJoinOp {
                 if (old_lw == 0) != (new_lw == 0) {
                     let retract = old_lw == 0;
                     for (r_row_bytes, r_weight) in state.probe_right(key) {
-                        let left_nulls: Vec<i64> = vec![0i64; self.left_n_cols];
-                        let right_vals = Self::deserialize_row(r_row_bytes, self.right_n_cols);
+                        let left_nulls = vec![None; self.left_n_cols];
+                        let right_vals = Self::deserialize_row(r_row_bytes, self.right_n_cols)?;
                         for (i, v) in left_nulls.iter().enumerate() {
                             null_pad_right.0[i].push(*v);
                         }
@@ -746,7 +813,7 @@ impl OuterJoinOp {
             // 4. New ΔL rows with no effective right match → NULL-pad right.
             {
                 let staged_left = self.left_staged.lock().unwrap();
-                let mut null_new_left: (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<i64>) = (
+                let mut null_new_left: OuterJoinRows = (
                     vec![Vec::new(); self.left_n_cols],
                     vec![Vec::new(); self.right_n_cols],
                     Vec::new(),
@@ -756,8 +823,8 @@ impl OuterJoinOp {
                     let delta = delta_rw.get(join_key).copied().unwrap_or(0);
                     let effective_rw = old_rw + delta;
                     if effective_rw == 0 {
-                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols);
-                        let right_nulls: Vec<i64> = vec![0i64; self.right_n_cols];
+                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
+                        let right_nulls = vec![None; self.right_n_cols];
                         for (i, v) in left_vals.iter().enumerate() {
                             null_new_left.0[i].push(*v);
                         }
@@ -782,7 +849,7 @@ impl OuterJoinOp {
             // 5. New ΔR rows with no effective left match → NULL-pad left.
             {
                 let staged_right = self.right_staged.lock().unwrap();
-                let mut null_new_right: (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<i64>) = (
+                let mut null_new_right: OuterJoinRows = (
                     vec![Vec::new(); self.left_n_cols],
                     vec![Vec::new(); self.right_n_cols],
                     Vec::new(),
@@ -792,8 +859,8 @@ impl OuterJoinOp {
                     let delta = delta_lw.get(join_key).copied().unwrap_or(0);
                     let effective_lw = old_lw + delta;
                     if effective_lw == 0 {
-                        let left_nulls: Vec<i64> = vec![0i64; self.left_n_cols];
-                        let right_vals = Self::deserialize_row(row_bytes, self.right_n_cols);
+                        let left_nulls = vec![None; self.left_n_cols];
+                        let right_vals = Self::deserialize_row(row_bytes, self.right_n_cols)?;
                         for (i, v) in left_nulls.iter().enumerate() {
                             null_new_right.0[i].push(*v);
                         }
@@ -827,7 +894,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = semi_anti_output_schema_n(self.left_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_rw: HashMap<Vec<u8>, i64> = {
@@ -843,7 +914,7 @@ impl OuterJoinOp {
             let state = self.state.lock().unwrap();
 
             // Emit from L₀ when right-side match status changes for a key.
-            let mut semi_rows: (Vec<Vec<i64>>, Vec<i64>) =
+            let mut semi_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
                 (vec![Vec::new(); self.left_n_cols], Vec::new());
             for (key, delta) in &delta_rw {
                 let old_rw = state.right_key_weight.get(key).copied().unwrap_or(0);
@@ -852,7 +923,7 @@ impl OuterJoinOp {
                     // Status changed: was unmatched → now matched (emit +), or vice versa (emit -).
                     let sign: i64 = if old_rw == 0 { 1 } else { -1 };
                     for (l_row_bytes, l_weight) in state.probe_left(key) {
-                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols);
+                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols)?;
                         for (i, v) in left_vals.iter().enumerate() {
                             semi_rows.0[i].push(*v);
                         }
@@ -868,14 +939,14 @@ impl OuterJoinOp {
             // For each ΔL row: if effective_rw != 0, emit (row, w).
             {
                 let staged_left = self.left_staged.lock().unwrap();
-                let mut new_left_rows: (Vec<Vec<i64>>, Vec<i64>) =
+                let mut new_left_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
                     (vec![Vec::new(); self.left_n_cols], Vec::new());
                 for (join_key, _, row_bytes, w) in &staged_left.rows {
                     let old_rw = state.right_key_weight.get(join_key).copied().unwrap_or(0);
                     let delta = delta_rw.get(join_key).copied().unwrap_or(0);
                     let effective_rw = old_rw + delta;
                     if effective_rw != 0 {
-                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols);
+                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
                         for (i, v) in left_vals.iter().enumerate() {
                             new_left_rows.0[i].push(*v);
                         }
@@ -900,7 +971,11 @@ impl OuterJoinOp {
         self.stage_left(&left)?;
         self.stage_right(&right)?;
 
-        let out_schema = semi_anti_output_schema_n(self.left_n_cols);
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
         let mut outputs: Vec<ArrowZSet> = Vec::new();
 
         let delta_rw: HashMap<Vec<u8>, i64> = {
@@ -916,7 +991,7 @@ impl OuterJoinOp {
             let state = self.state.lock().unwrap();
 
             // Emit from L₀ when right-side match status changes for a key.
-            let mut anti_rows: (Vec<Vec<i64>>, Vec<i64>) =
+            let mut anti_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
                 (vec![Vec::new(); self.left_n_cols], Vec::new());
             for (key, delta) in &delta_rw {
                 let old_rw = state.right_key_weight.get(key).copied().unwrap_or(0);
@@ -926,7 +1001,7 @@ impl OuterJoinOp {
                     // old_rw==0 means was in anti output → now matched, must retract.
                     let sign: i64 = if old_rw == 0 { -1 } else { 1 };
                     for (l_row_bytes, l_weight) in state.probe_left(key) {
-                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols);
+                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols)?;
                         for (i, v) in left_vals.iter().enumerate() {
                             anti_rows.0[i].push(*v);
                         }
@@ -942,14 +1017,14 @@ impl OuterJoinOp {
             // For each ΔL row: if effective_rw == 0, emit (row, w).
             {
                 let staged_left = self.left_staged.lock().unwrap();
-                let mut new_left_rows: (Vec<Vec<i64>>, Vec<i64>) =
+                let mut new_left_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
                     (vec![Vec::new(); self.left_n_cols], Vec::new());
                 for (join_key, _, row_bytes, w) in &staged_left.rows {
                     let old_rw = state.right_key_weight.get(join_key).copied().unwrap_or(0);
                     let delta = delta_rw.get(join_key).copied().unwrap_or(0);
                     let effective_rw = old_rw + delta;
                     if effective_rw == 0 {
-                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols);
+                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
                         for (i, v) in left_vals.iter().enumerate() {
                             new_left_rows.0[i].push(*v);
                         }
@@ -977,8 +1052,8 @@ impl OuterJoinOp {
         right_staged_rows: &HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>>,
         out_schema: &SchemaRef,
     ) -> Result<ArrowZSet, OpError> {
-        let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
-        let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
+        let mut left_cols: Vec<Vec<Option<i64>>> = vec![Vec::new(); self.left_n_cols];
+        let mut right_cols: Vec<Vec<Option<i64>>> = vec![Vec::new(); self.right_n_cols];
         let mut out_weights: Vec<i64> = Vec::new();
 
         let staged_left = self.left_staged.lock().unwrap();
@@ -987,8 +1062,8 @@ impl OuterJoinOp {
         // ΔL ⋈ R₀
         for (join_key, _, row_bytes, w) in &staged_left.rows {
             for (right_row_bytes, r_weight) in state.probe_right(join_key) {
-                let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols);
-                let right_vals = Self::deserialize_row(right_row_bytes, self.right_n_cols);
+                let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
+                let right_vals = Self::deserialize_row(right_row_bytes, self.right_n_cols)?;
                 for (i, v) in left_vals.iter().enumerate() {
                     left_cols[i].push(*v);
                 }
@@ -1002,8 +1077,8 @@ impl OuterJoinOp {
         // L₀ ⋈ ΔR
         for (join_key, _, row_bytes, w) in &staged_right.rows {
             for (left_row_bytes, l_weight) in state.probe_left(join_key) {
-                let left_vals = Self::deserialize_row(left_row_bytes, self.left_n_cols);
-                let right_vals = Self::deserialize_row(row_bytes, self.right_n_cols);
+                let left_vals = Self::deserialize_row(left_row_bytes, self.left_n_cols)?;
+                let right_vals = Self::deserialize_row(row_bytes, self.right_n_cols)?;
                 for (i, v) in left_vals.iter().enumerate() {
                     left_cols[i].push(*v);
                 }
@@ -1018,8 +1093,8 @@ impl OuterJoinOp {
         for (join_key, _, left_bytes, l_w) in &staged_left.rows {
             if let Some(right_rows) = right_staged_rows.get(join_key) {
                 for (right_bytes, r_w) in right_rows {
-                    let left_vals = Self::deserialize_row(left_bytes, self.left_n_cols);
-                    let right_vals = Self::deserialize_row(right_bytes, self.right_n_cols);
+                    let left_vals = Self::deserialize_row(left_bytes, self.left_n_cols)?;
+                    let right_vals = Self::deserialize_row(right_bytes, self.right_n_cols)?;
                     for (i, v) in left_vals.iter().enumerate() {
                         left_cols[i].push(*v);
                     }
@@ -1352,6 +1427,7 @@ impl crate::op::Operator for OuterJoinOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
     use rockstream_types::ids::OperatorId;
     use std::sync::Arc;
 
@@ -1384,7 +1460,7 @@ mod tests {
     }
 
     /// Extract (l_k, l_v, r_v_or_null, weight) from left-join output (4-col).
-    fn extract_left_join_output(batch: &ArrowZSet) -> Vec<(i64, i64, i64, i64)> {
+    fn extract_left_join_output(batch: &ArrowZSet) -> Vec<(i64, i64, Option<i64>, i64)> {
         if batch.is_empty() {
             return vec![];
         }
@@ -1406,8 +1482,15 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        let mut rows: Vec<(i64, i64, i64, i64)> = (0..batch.num_rows())
-            .map(|i| (lk.value(i), lv.value(i), rv.value(i), batch.weights[i]))
+        let mut rows: Vec<(i64, i64, Option<i64>, i64)> = (0..batch.num_rows())
+            .map(|i| {
+                (
+                    lk.value(i),
+                    lv.value(i),
+                    (!rv.is_null(i)).then(|| rv.value(i)),
+                    batch.weights[i],
+                )
+            })
             .collect();
         rows.sort();
         rows
@@ -1440,14 +1523,74 @@ mod tests {
     // ── LEFT JOIN ─────────────────────────────────────────────────────────────
 
     #[test]
+    fn nullable_row_encoding_preserves_validity_and_legacy_rows() {
+        let legacy = [1i64.to_be_bytes(), 0i64.to_be_bytes()].concat();
+        assert_eq!(
+            OuterJoinOp::deserialize_row(&legacy, 2).unwrap(),
+            vec![Some(1), Some(0)]
+        );
+        let expected = [
+            0i64.to_be_bytes().to_vec(),
+            7i64.to_be_bytes().to_vec(),
+            vec![0, 1],
+        ]
+        .concat();
+        for hidden_null_value in [0, 42] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, true),
+                Field::new("v", DataType::Int64, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::new(
+                        vec![hidden_null_value].into(),
+                        Some(vec![false].into()),
+                    )),
+                    Arc::new(Int64Array::from(vec![7])),
+                ],
+            )
+            .unwrap();
+            assert_eq!(OuterJoinOp::serialize_row(&batch, 0), expected);
+        }
+        assert_eq!(
+            OuterJoinOp::deserialize_row(&expected, 2).unwrap(),
+            vec![None, Some(7)]
+        );
+        for malformed in [vec![0], [legacy, vec![2, 0]].concat()] {
+            match OuterJoinOp::deserialize_row(&malformed, 2).unwrap_err() {
+                OpError::Storage {
+                    source: rockstream_storage::StorageError::KeyEncoding(detail),
+                    ..
+                } => assert_eq!(detail, "malformed outer join row encoding"),
+                error => panic!("unexpected error: {error}"),
+            }
+        }
+    }
+
+    #[test]
     fn left_join_unmatched_left_emits_null_padded() {
         let op = OuterJoinOp::new(OperatorId(1), OuterJoinKind::Left, vec![0], vec![0]);
         let left = make_kv_batch(&[(10, 100, 1)]);
         // No right rows.
         let out = op.process_epoch(left, empty_kv()).unwrap();
         let rows = extract_left_join_output(&out);
-        // (k=10, lv=100, rv=NULL=0, w=1)
-        assert!(rows.contains(&(10, 100, 0, 1)), "unmatched left: {rows:?}");
+        assert!(
+            rows.contains(&(10, 100, None, 1)),
+            "unmatched left: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn left_join_keeps_null_distinct_from_zero() {
+        let op = OuterJoinOp::new(OperatorId(23), OuterJoinKind::Left, vec![0], vec![0]);
+        let left = make_kv_batch(&[(7, 70, 1), (8, 80, 1)]);
+        let right = make_kv_batch(&[(7, 0, 1)]);
+        let out = op.process_epoch(left, right).unwrap();
+        assert_eq!(
+            extract_left_join_output(&out),
+            vec![(7, 70, Some(0), 1), (8, 80, None, 1)]
+        );
     }
 
     #[test]
@@ -1458,10 +1601,10 @@ mod tests {
         let out = op.process_epoch(left, right).unwrap();
         let rows = extract_left_join_output(&out);
         // Should include (5, 50, 500, 1) from inner join.
-        assert!(rows.contains(&(5, 50, 500, 1)), "matched: {rows:?}");
+        assert!(rows.contains(&(5, 50, Some(500), 1)), "matched: {rows:?}");
         // Should NOT include NULL-padded row.
         assert!(
-            !rows.contains(&(5, 50, 0, 1)),
+            !rows.contains(&(5, 50, None, 1)),
             "no null pad when matched: {rows:?}"
         );
     }
@@ -1474,20 +1617,23 @@ mod tests {
         let l1 = make_kv_batch(&[(7, 70, 1)]);
         let out1 = op.process_epoch(l1, empty_kv()).unwrap();
         let rows1 = extract_left_join_output(&out1);
-        assert!(rows1.contains(&(7, 70, 0, 1)), "epoch1 null pad: {rows1:?}");
+        assert!(
+            rows1.contains(&(7, 70, None, 1)),
+            "epoch1 null pad: {rows1:?}"
+        );
 
         // Epoch 2: right arrives for same key → retract NULL-pad, add inner.
         let r2 = make_kv_batch(&[(7, 700, 1)]);
         let out2 = op.process_epoch(empty_kv(), r2).unwrap();
         let rows2 = extract_left_join_output(&out2);
-        // Retract NULL-pad: (7, 70, 0, -1).
+        // Retract NULL-pad.
         assert!(
-            rows2.contains(&(7, 70, 0, -1)),
+            rows2.contains(&(7, 70, None, -1)),
             "retract null pad: {rows2:?}"
         );
         // Add inner: (7, 70, 700, +1).
         assert!(
-            rows2.contains(&(7, 70, 700, 1)),
+            rows2.contains(&(7, 70, Some(700), 1)),
             "inner join added: {rows2:?}"
         );
     }
@@ -1507,12 +1653,12 @@ mod tests {
         let rows2 = extract_left_join_output(&out2);
         // Retract inner: (3, 30, 300, -1).
         assert!(
-            rows2.contains(&(3, 30, 300, -1)),
+            rows2.contains(&(3, 30, Some(300), -1)),
             "retract inner: {rows2:?}"
         );
-        // Add NULL-pad: (3, 30, 0, +1).
+        // Add NULL-pad.
         assert!(
-            rows2.contains(&(3, 30, 0, 1)),
+            rows2.contains(&(3, 30, None, 1)),
             "add null pad back: {rows2:?}"
         );
     }

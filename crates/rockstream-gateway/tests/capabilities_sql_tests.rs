@@ -150,11 +150,19 @@ async fn test_show_capabilities_sinks() {
         "SELECT * FROM rockstream_catalog.capabilities WHERE kind = 'sink';",
     )
     .await;
-    assert!(!rows.is_empty());
-    for row in rows {
-        assert_eq!(row[1].as_deref(), Some("sink"));
-        assert_eq!(row[0].as_deref(), Some("sink.kafka"));
-    }
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("sink.kafka".to_string()),
+            Some("sink".to_string()),
+            Some("Kafka sink".to_string()),
+            Some("Experimental".to_string()),
+            Some("Connector runtime".to_string()),
+            Some("1".to_string()),
+            Some("".to_string()),
+            Some("docs/connectors.md#kafka-sink".to_string()),
+        ]],
+    );
 }
 
 #[tokio::test]

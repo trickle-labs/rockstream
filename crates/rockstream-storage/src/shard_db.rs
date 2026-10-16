@@ -161,6 +161,7 @@ pub struct ShardDb {
     cleanup_on_drop: bool,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
     fail_flushes: Arc<std::sync::atomic::AtomicBool>,
+    fail_scans: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Builder for creating a `ShardDb`.
@@ -498,6 +499,7 @@ impl ShardDbBuilder {
             cleanup_on_drop: self.cleanup_on_drop,
             fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_flushes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_scans: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 }
@@ -812,6 +814,11 @@ impl ShardDb {
     /// **Warning:** This materializes the entire result into memory. For large
     /// arrangements, prefer `scan_prefix_bounded` with an explicit byte budget.
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
+        if self.fail_scans.load(Ordering::SeqCst) {
+            return Err(StorageError::Unsupported(
+                "injected storage scan failure".to_string(),
+            ));
+        }
         if (self.format_version == 2 || self.format_version == 3)
             && prefix.first().copied() != Some(0x06)
         {
@@ -1173,6 +1180,11 @@ impl ShardDb {
     /// Inject write failures for testing.
     pub fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::SeqCst);
+    }
+
+    /// Inject prefix-scan failures for testing.
+    pub fn set_fail_scans(&self, fail: bool) {
+        self.fail_scans.store(fail, Ordering::SeqCst);
     }
 
     /// Inject flush failures for testing.

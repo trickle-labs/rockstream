@@ -18,7 +18,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - [24xx: Authentication, mTLS & Secrets](#24xx-authentication-mtls--secrets) (18 codes)
 - [25xx-26xx: Extended Query, Cursors & Transactions](#25xx-26xx-extended-query-cursors--transactions) (9 codes)
 - [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (56 codes)
-- [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (23 codes)
+- [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (24 codes)
 - [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (17 codes)
 - [6xxx: Connector Schema Evolution](#6xxx-connector-schema-evolution) (1 codes)
 - [8xxx: Frontier Aggregation](#8xxx-frontier-aggregation) (4 codes)
@@ -1524,6 +1524,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-4021`](#rs-4021) | `backfill.admission_rejected` | Backfill admission reservation rejected | `Error` | `53200` | `ExponentialBackoff` |
 | [`RS-4022`](#rs-4022) | `backfill.not_published` | Materialized view backfill is not published | `Error` | `55000` | `Immediate` |
 | [`RS-4029`](#rs-4029) | `quota.backpressure_refusal` | Quota or backpressure refusal during ingestion burst | `Warning` | `53200` | `ExponentialBackoff` |
+| [`RS-4030`](#rs-4030) | `sink.delivery_unknown` | Sink delivery outcome is unknown; recovery remains pending | `Warning` | `55000` | `ExponentialBackoff` |
 
 ### <a id="rs-4001"></a> `RS-4001` — Source connection failed or table already exists
 
@@ -1659,7 +1660,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **Severity**: `Error`
 - **SQLSTATE**: `0A000`
 - **Retry Class**: `NonRetryable`
-- **Default Next Steps**: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.
+- **Default Next Steps**: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks. Kafka sink row export is currently unsupported.
 
 ### <a id="rs-4018"></a> `RS-4018` — Source epoch exhausted
 
@@ -1708,6 +1709,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `53200`
 - **Retry Class**: `ExponentialBackoff`
 - **Default Next Steps**: Reduce ingestion rate or increase quota allocation.
+
+### <a id="rs-4030"></a> `RS-4030` — Sink delivery outcome is unknown; recovery remains pending
+
+- **Key**: `sink.delivery_unknown`
+- **Severity**: `Warning`
+- **SQLSTATE**: `55000`
+- **Retry Class**: `ExponentialBackoff`
+- **Default Next Steps**: Restore Kafka delivery lookup and retry recovery with the original pending handle; do not republish while the outcome is unknown.
 
 ---
 

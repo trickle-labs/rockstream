@@ -5598,6 +5598,8 @@ dependencies = [
 name = "rockstream-test-support"
 version = "0.71.0"
 dependencies = [
+ "arrow",
+ "datafusion",
  "hex",
  "hmac 0.12.1",
  "object_store 0.14.2",

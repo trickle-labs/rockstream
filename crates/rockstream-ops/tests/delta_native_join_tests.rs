@@ -1,222 +1,165 @@
-//! v0.59.5 Slice 4: Delta-Native Join Operator Tests & Coverage Matrix.
-//!
-//! Asserts incremental JoinOp delta emission across join operations and states across the full
-//! (join_type x key_type) matrix.
-
-use arrow::array::Int64Array;
+//! Exact production join qualification with declared Int64 inputs (#123 R1, R2, R5, R6).
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use rockstream_ops::join::JoinOp;
-use rockstream_ops::zset::ArrowZSet;
+use datafusion::common::ScalarValue;
+use rockstream_ops::{join::JoinOp, op::Operator, outer_join::OuterJoinOp, ArrowZSet};
+use rockstream_plan::OuterJoinKind;
+use rockstream_test_support::typed_output::{
+    add_batch_rows, assert_weighted_eq, compare_results, empty_result, int64_batch, OracleMismatch,
+    RowWeightMismatch,
+};
 use rockstream_types::ids::OperatorId;
 use std::sync::Arc;
 
-fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
+fn input(rows: &[(&[Option<i64>], i64)]) -> ArrowZSet {
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
         Field::new("v", DataType::Int64, false),
     ]));
-    let k_vals: Vec<i64> = rows.iter().map(|(k, _, _)| *k).collect();
-    let v_vals: Vec<i64> = rows.iter().map(|(_, v, _)| *v).collect();
-    let weights: Vec<i64> = rows.iter().map(|(_, _, w)| *w).collect();
-    let data = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(k_vals)),
-            Arc::new(Int64Array::from(v_vals)),
-        ],
-    )
-    .unwrap();
+    let (data, weights) = int64_batch(schema, rows);
     ArrowZSet::new(data, weights)
 }
 
-#[test]
-fn test_delta_native_join_incremental_execution() {
-    let op = JoinOp::new(OperatorId(20), vec![0], vec![0]);
-
-    // Epoch 1: L: (1, 100), R: (1, 200)
-    let l1 = make_kv_batch(&[(1, 100, 1)]);
-    let r1 = make_kv_batch(&[(1, 200, 1)]);
-    let out1 = op.process_epoch(l1, r1).unwrap();
-    assert_eq!(out1.num_rows(), 1);
-
-    // Epoch 2: Insert R: (1, 300) -> should match existing L: (1, 100)
-    let l2 = make_kv_batch(&[]);
-    let r2 = make_kv_batch(&[(1, 300, 1)]);
-    let out2 = op.process_epoch(l2, r2).unwrap();
-    assert_eq!(out2.num_rows(), 1);
-
-    // Epoch 3: Retract L: (1, 100) -> should retract both matches
-    let l3 = make_kv_batch(&[(1, 100, -1)]);
-    let r3 = make_kv_batch(&[]);
-    let out3 = op.process_epoch(l3, r3).unwrap();
-    assert_eq!(out3.num_rows(), 2);
-    assert!(out3.weights.iter().all(|&w| w < 0));
+fn schema(kind: Option<OuterJoinKind>) -> Arc<Schema> {
+    let left_nullable = matches!(kind, Some(OuterJoinKind::Right | OuterJoinKind::Full));
+    let right_nullable = matches!(kind, Some(OuterJoinKind::Left | OuterJoinKind::Full));
+    let mut fields = vec![
+        Field::new("l_0", DataType::Int64, left_nullable),
+        Field::new("l_1", DataType::Int64, left_nullable),
+    ];
+    if !matches!(kind, Some(OuterJoinKind::Semi | OuterJoinKind::Anti)) {
+        fields.extend([
+            Field::new("r_0", DataType::Int64, right_nullable),
+            Field::new("r_1", DataType::Int64, right_nullable),
+        ]);
+    }
+    Arc::new(Schema::new(fields))
 }
 
-// ── Coverage Matrix 3.2: (join_type × key_type) ──────────────────────────────
-
-#[test]
-fn test_delta_native_join_inner_i32() {
-    let op = JoinOp::new(OperatorId(201), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
+fn assert_output(out: &ArrowZSet, kind: Option<OuterJoinKind>, rows: &[(&[Option<i64>], i64)]) {
+    let (data, weights) = int64_batch(schema(kind), rows);
+    assert_weighted_eq(&out.data, &out.weights, &data, &weights);
 }
 
 #[test]
 fn test_delta_native_join_inner_i64() {
-    let op = JoinOp::new(OperatorId(202), vec![0], vec![0]);
+    let op = JoinOp::new(OperatorId(20), vec![0], vec![0]);
+    assert_eq!(op.name(), "JoinOp");
     let out = op
         .process_epoch(
-            make_kv_batch(&[(1000000000, 10, 1)]),
-            make_kv_batch(&[(1000000000, 20, 1)]),
+            input(&[(&[Some(1), Some(10)], 2), (&[Some(2), Some(20)], 1)]),
+            input(&[(&[Some(1), Some(0)], 1), (&[Some(1), Some(30)], 1)]),
         )
         .unwrap();
-    assert_eq!(out.num_rows(), 1);
+    let rows = [
+        (&[Some(1), Some(10), Some(1), Some(0)][..], 2),
+        (&[Some(1), Some(10), Some(1), Some(30)][..], 2),
+    ];
+    assert_output(&out, None, &rows);
+    let out = op
+        .process_epoch(input(&[(&[Some(1), Some(10)], -2)]), input(&[]))
+        .unwrap();
+    assert_output(
+        &out,
+        None,
+        &rows.iter().map(|(r, w)| (*r, -*w)).collect::<Vec<_>>(),
+    );
 }
 
-#[test]
-fn test_delta_native_join_inner_text() {
-    let op = JoinOp::new(OperatorId(203), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(42, 10, 1)]), make_kv_batch(&[(42, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
-#[test]
-fn test_delta_native_join_left_i32() {
-    let op = JoinOp::new(OperatorId(204), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
+fn qualify_outer(kind: OuterJoinKind, rows: &[(&[Option<i64>], i64)]) {
+    let op = OuterJoinOp::new(OperatorId(21), kind, vec![0], vec![0]);
+    assert_eq!(op.name(), "OuterJoinOp");
+    assert_eq!(op.kind(), kind);
+    let left = input(&[(&[Some(1), Some(10)], 2), (&[Some(2), Some(20)], 1)]);
+    let right = input(&[(&[Some(1), Some(0)], 1), (&[Some(3), Some(30)], 1)]);
+    assert_output(
+        &op.process_epoch(left.clone(), right.clone()).unwrap(),
+        Some(kind),
+        rows,
+    );
+    let left = ArrowZSet::new(left.data, left.weights.iter().map(|w| -w).collect());
+    let right = ArrowZSet::new(right.data, right.weights.iter().map(|w| -w).collect());
+    let retractions: Vec<_> = rows.iter().map(|(row, weight)| (*row, -*weight)).collect();
+    assert_output(
+        &op.process_epoch(left, right).unwrap(),
+        Some(kind),
+        &retractions,
+    );
 }
 
 #[test]
 fn test_delta_native_join_left_i64() {
-    let op = JoinOp::new(OperatorId(205), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
+    qualify_outer(
+        OuterJoinKind::Left,
+        &[
+            (&[Some(1), Some(10), Some(1), Some(0)], 2),
+            (&[Some(2), Some(20), None, None], 1),
+        ],
+    );
 }
-
-#[test]
-fn test_delta_native_join_left_text() {
-    let op = JoinOp::new(OperatorId(206), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
-#[test]
-fn test_delta_native_join_right_i32() {
-    let op = JoinOp::new(OperatorId(207), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
 #[test]
 fn test_delta_native_join_right_i64() {
-    let op = JoinOp::new(OperatorId(208), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
+    qualify_outer(
+        OuterJoinKind::Right,
+        &[
+            (&[Some(1), Some(10), Some(1), Some(0)], 2),
+            (&[None, None, Some(3), Some(30)], 1),
+        ],
+    );
 }
-
-#[test]
-fn test_delta_native_join_right_text() {
-    let op = JoinOp::new(OperatorId(209), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
-#[test]
-fn test_delta_native_join_full_i32() {
-    let op = JoinOp::new(OperatorId(210), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
 #[test]
 fn test_delta_native_join_full_i64() {
-    let op = JoinOp::new(OperatorId(211), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
+    qualify_outer(
+        OuterJoinKind::Full,
+        &[
+            (&[Some(1), Some(10), Some(1), Some(0)], 2),
+            (&[Some(2), Some(20), None, None], 1),
+            (&[None, None, Some(3), Some(30)], 1),
+        ],
+    );
 }
-
-#[test]
-fn test_delta_native_join_full_text() {
-    let op = JoinOp::new(OperatorId(212), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
-#[test]
-fn test_delta_native_join_semi_i32() {
-    let op = JoinOp::new(OperatorId(213), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
 #[test]
 fn test_delta_native_join_semi_i64() {
-    let op = JoinOp::new(OperatorId(214), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
+    qualify_outer(OuterJoinKind::Semi, &[(&[Some(1), Some(10)], 2)]);
 }
-
-#[test]
-fn test_delta_native_join_semi_text() {
-    let op = JoinOp::new(OperatorId(215), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[(1, 20, 1)]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 1);
-}
-
-#[test]
-fn test_delta_native_join_anti_i32() {
-    let op = JoinOp::new(OperatorId(216), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 0);
-}
-
 #[test]
 fn test_delta_native_join_anti_i64() {
-    let op = JoinOp::new(OperatorId(217), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[]))
-        .unwrap();
-    assert_eq!(out.num_rows(), 0);
+    qualify_outer(OuterJoinKind::Anti, &[(&[Some(2), Some(20)], 1)]);
 }
 
 #[test]
-fn test_delta_native_join_anti_text() {
-    let op = JoinOp::new(OperatorId(218), vec![0], vec![0]);
-    let out = op
-        .process_epoch(make_kv_batch(&[(1, 10, 1)]), make_kv_batch(&[]))
+fn left_join_wrong_inner_operator_reports_exact_missing_null_row() {
+    let left = input(&[(&[Some(1), Some(10)], 1), (&[Some(2), Some(20)], 1)]);
+    let right = input(&[(&[Some(1), Some(0)], 1)]);
+    let correct = OuterJoinOp::new(OperatorId(22), OuterJoinKind::Left, vec![0], vec![0])
+        .process_epoch(left.clone(), right.clone())
         .unwrap();
-    assert_eq!(out.num_rows(), 0);
+    assert_output(
+        &correct,
+        Some(OuterJoinKind::Left),
+        &[
+            (&[Some(1), Some(10), Some(1), Some(0)], 1),
+            (&[Some(2), Some(20), None, None], 1),
+        ],
+    );
+    let wrong = JoinOp::new(OperatorId(23), vec![0], vec![0])
+        .process_epoch(left, right)
+        .unwrap();
+    // Isolate the missing row from the mutant's different schema nullability.
+    let mut expected = empty_result(correct.schema().as_ref());
+    let mut actual = empty_result(correct.schema().as_ref());
+    add_batch_rows(&mut expected, &correct.data, &correct.weights);
+    add_batch_rows(&mut actual, &wrong.data, &wrong.weights);
+    assert_eq!(
+        compare_results(&expected, &actual),
+        Err(OracleMismatch::Rows(vec![RowWeightMismatch {
+            row: vec![
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(20)),
+                ScalarValue::Int64(None),
+                ScalarValue::Int64(None)
+            ],
+            expected_weight: 1,
+            actual_weight: 0,
+        },]))
+    );
 }

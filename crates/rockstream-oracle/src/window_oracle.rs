@@ -448,11 +448,11 @@ mod proptest_oracle {
         }
     }
 
-    fn schema_kv_result() -> Arc<Schema> {
+    fn schema_kv_result(result_nullable: bool) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
-            Field::new("result", DataType::Int64, false),
+            Field::new("result", DataType::Int64, result_nullable),
         ]))
     }
 
@@ -695,7 +695,11 @@ mod proptest_oracle {
         window_expr: WindowExpr,
         batch_fn: impl Fn(&BTreeMap<(i64, i64), i64>) -> Vec<(i64, i64, i64)>,
     ) -> Result<(), TestCaseError> {
-        let schema = schema_kv_result();
+        let result_nullable = matches!(
+            &window_expr.func,
+            WindowFunc::Lag { .. } | WindowFunc::Lead { .. }
+        );
+        let schema = schema_kv_result(result_nullable);
         let op = WindowOp::new(schema, vec![window_expr]);
 
         let mut input_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();

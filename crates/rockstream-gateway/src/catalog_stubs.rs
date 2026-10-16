@@ -99,6 +99,7 @@ pub const PG_OID_ARRAY_UUID: i32 = 2951;
 /// Map an Arrow data type name to a Postgres type OID.
 pub fn arrow_type_to_pg_oid(arrow_type: &str) -> i32 {
     match arrow_type {
+        t if t.starts_with("Decimal(") => PG_OID_NUMERIC,
         "Int16" => PG_OID_INT2,
         "Int32" => PG_OID_INT4,
         "Int64" => PG_OID_INT8,
@@ -132,6 +133,7 @@ pub fn arrow_type_to_pg_oid(arrow_type: &str) -> i32 {
 /// `information_schema.columns.data_type`).
 pub fn arrow_type_to_pg_data_type(arrow_type: &str) -> &'static str {
     match arrow_type {
+        t if t.starts_with("Decimal(") => "numeric",
         "Int16" => "smallint",
         "Int32" => "integer",
         "Int64" => "bigint",
@@ -525,7 +527,7 @@ pub struct CatalogStubs {
 }
 
 const V0522_CONNECTOR_CATALOG_KEY: &[u8] = b"rockstream/catalog/connectors/v0522";
-const REMOVED_CONNECTOR_REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.";
+const REMOVED_CONNECTOR_REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks. Kafka sink row export is currently unsupported.";
 
 /// Exact v0.52.2 connector-catalog envelope, read by one bounded key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,6 +674,11 @@ impl CatalogStubs {
         let sources = store.list_sources().await.map_err(|e| e.to_string())?;
         let sinks = store.list_sinks().await.map_err(|e| e.to_string())?;
 
+        let view_deps = store
+            .list_view_dependencies()
+            .await
+            .map_err(|e| e.to_string())?;
+
         let mut inner = self.inner.write().unwrap();
         inner.tables.clear();
         let mut table_id_to_name = std::collections::HashMap::new();
@@ -695,7 +702,34 @@ impl CatalogStubs {
             );
         }
         inner.views.clear();
+        inner.deps.clear();
+        let mut view_id_to_name = std::collections::HashMap::new();
+        for v in &views {
+            view_id_to_name.insert(v.id.0, v.name.clone());
+        }
+        for dep in view_deps {
+            if let Some(parent_name) = view_id_to_name.get(&dep.parent_id) {
+                let child_name = match dep.dependency_kind {
+                    rockstream_storage::catalog::DependencyKind::Table => table_id_to_name
+                        .get(&rockstream_types::ids::TableId(dep.child_id))
+                        .cloned(),
+                    rockstream_storage::catalog::DependencyKind::View => {
+                        view_id_to_name.get(&dep.child_id).cloned()
+                    }
+                };
+                if let Some(child) = child_name {
+                    inner
+                        .deps
+                        .entry(parent_name.clone())
+                        .or_default()
+                        .push(child);
+                }
+            }
+        }
+        let mut view_states = self.view_states.write().unwrap();
+        view_states.clear();
         for v in views {
+            view_states.insert(v.name.clone(), ViewState::Running);
             let cols = v
                 .columns
                 .into_iter()
@@ -715,6 +749,7 @@ impl CatalogStubs {
                 },
             );
         }
+        drop(view_states);
         inner.indexes.clear();
         for idx in indexes {
             let state = match idx.state {
@@ -3232,6 +3267,8 @@ impl CatalogStubs {
             "pg_user" => return Some(self.pg_user(&session.principal_name, &[])),
             "information_schema.tables" => return Some(self.information_schema_tables(&[])),
             "information_schema.columns" => return Some(self.information_schema_columns(&[])),
+            "information_schema.table_constraints" => "constraint_catalog constraint_schema constraint_name table_catalog table_schema table_name constraint_type is_deferrable initially_deferred",
+            "information_schema.column_privileges" => "grantor grantee table_catalog table_schema table_name column_name privilege_type is_grantable",
             "information_schema.key_column_usage" => return Some(self.key_column_usage(&[])),
             "information_schema.referential_constraints" => return Some(self.referential_constraints(&[])),
             "pg_statistic_ext" | "pg_publication" | "pg_publication_rel" | "pg_rewrite" | "pg_tablespace" => "",

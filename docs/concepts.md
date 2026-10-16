@@ -1716,8 +1716,9 @@ more efficient than each view independently inlining and recomputing it.
 
 **"How do I export to a data lake?"**
 
-Use RockStream to Kafka and a downstream writer. The removed connector
-frontends return `RS-4017`; see [connector migration](connector-migration.md).
+Kafka-based row export is currently unsupported: the Experimental Kafka sink
+emits epoch/count markers only. The removed connector frontends return
+`RS-4017`; see [connector migration](connector-migration.md).
 
 **"How tight should my freshness SLO be?"**
 

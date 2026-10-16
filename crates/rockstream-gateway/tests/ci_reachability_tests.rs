@@ -125,11 +125,15 @@ fn simulation_soak_enables_simulation() {
     let workflow = include_str!("../../../.github/workflows/simulation-soak.yml");
     assert_eq!(
         workflow
+            .replace("\\\n", "")
             .lines()
-            .filter(|line| line
-                .contains("cargo test -p rockstream-sim --features simulation --test chaos_tests"))
-            .count(),
-        2
+            .filter(|line| line.contains("cargo test"))
+            .map(|line| line.trim_start().trim_start_matches("run: ").split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>(),
+        vec![
+            "cargo test -p rockstream-sim --features simulation --test chaos_tests -- --nocapture",
+            "cargo test -p rockstream-sim --features simulation --test chaos_tests incremental_chaos::bounded_seed_run -- --exact",
+            "cargo test -p rockstream-sim --features simulation --test chaos_tests proof_seed_corpus_covers_all_registered_laws -- --nocapture",
+        ]
     );
-    assert_eq!(workflow.matches("--features simulation").count(), 2);
 }

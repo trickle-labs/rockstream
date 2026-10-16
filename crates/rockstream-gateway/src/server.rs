@@ -201,8 +201,13 @@ pub struct PreparedStatementCache {
 impl QueryParser for PreparedStatementCache {
     type Statement = PreparedStatement;
 
-    async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<Self::Statement> {
-        let parameter_types = infer_parameter_types(&self.catalog, sql).await;
+    async fn parse_sql(&self, sql: &str, types: &[Type]) -> PgWireResult<Self::Statement> {
+        let mut parameter_types = infer_parameter_types(&self.catalog, sql).await?;
+        for (inferred, supplied) in parameter_types.iter_mut().zip(types) {
+            if *supplied != Type::UNKNOWN {
+                *inferred = supplied.clone();
+            }
+        }
         Ok(PreparedStatement {
             name: String::new(),
             sql: sql.to_string(),
@@ -212,35 +217,15 @@ impl QueryParser for PreparedStatementCache {
 }
 
 // Helper functions for parameter type inference
-async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
-    let mut indices = std::collections::BTreeSet::new();
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-    let mut max_idx = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            i += 1;
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i > start {
-                if let Ok(num_str) = std::str::from_utf8(&bytes[start..i]) {
-                    if let Ok(idx) = num_str.parse::<usize>() {
-                        indices.insert(idx);
-                        if idx > max_idx {
-                            max_idx = idx;
-                        }
-                    }
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
+async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResult<Vec<Type>> {
+    let max_idx = parameter_positions(sql)?
+        .iter()
+        .map(|(_, index)| *index)
+        .max()
+        .unwrap_or(0);
 
     if max_idx == 0 {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let mut inferred_types = vec![Type::TEXT; max_idx];
@@ -612,7 +597,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                 }
             }
         }
-        return inferred_types;
+        return Ok(inferred_types);
     }
 
     let mut df_inferred = std::collections::HashMap::new();
@@ -643,7 +628,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         }
     }
 
-    inferred_types
+    Ok(inferred_types)
 }
 
 fn find_placeholders_in_expr(expr: &sqlparser::ast::Expr, cb: &mut impl FnMut(usize)) {
@@ -798,7 +783,7 @@ fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType 
         .strip_prefix("Decimal(")
         .or_else(|| dt.strip_prefix("DECIMAL("))
         .and_then(|value| value.strip_suffix(')'))
-        .and_then(|value| value.split_once(','))
+        .map(|value| value.split_once(',').unwrap_or((value, "0")))
         .and_then(|(precision, scale)| {
             Some((precision.trim().parse().ok()?, scale.trim().parse().ok()?))
         })
@@ -7076,9 +7061,7 @@ impl GatewayHandler {
                     data_stream,
                 )))]);
             }
-            if let Some(responses) = self.try_datafusion_select(q).await {
-                return Ok(responses);
-            }
+            return Ok(self.try_datafusion_select(q).await);
         }
 
         Ok(vec![promote_response(Response::Execution(Tag::new("OK")))])
@@ -7088,9 +7071,8 @@ impl GatewayHandler {
     /// any catalog view/table (or references tables we can register as empty
     /// MemTables so DataFusion can resolve column types).
     ///
-    /// Returns `Some(responses)` on success, `None` if DataFusion cannot execute
-    /// the query (caller falls through to the `Tag::new("OK")` response).
-    async fn try_datafusion_select(&self, q: &str) -> Option<Vec<Response<'static>>> {
+    /// Return execution failures through the same error path as relation queries.
+    async fn try_datafusion_select(&self, q: &str) -> Vec<Response<'static>> {
         // Build a DataFusion session and register catalog objects as empty MemTables
         // so the planner can resolve any referenced names.
         let ctx = SessionContext::new();
@@ -7132,18 +7114,26 @@ impl GatewayHandler {
 
         let df = match ctx.sql(q).await {
             Ok(df) => df,
-            Err(_) => return None,
+            Err(error) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("plan: {error}"),
+                })
+            }
         };
 
         let output_schema = Arc::new(df.schema().as_arrow().clone());
         let mut batches = match df.collect().await {
             Ok(b) => b,
-            Err(_) => return None,
+            Err(error) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("collect: {error}"),
+                })
+            }
         };
         if batches.is_empty() {
             batches.push(RecordBatch::new_empty(output_schema));
         }
-        Some(datafusion_batches_to_query_response(&batches))
+        datafusion_batches_to_query_response(&batches)
     }
 
     /// Try to serve a SELECT via an index arrangement point lookup.
@@ -8449,6 +8439,23 @@ impl GatewayHandler {
 
         // Parse column list: content between outermost parentheses.
         let parsed = parse_create_table_columns(after);
+
+        for column in &parsed.columns {
+            if column.data_type.starts_with("Decimal(") {
+                let valid = matches!(
+                    string_to_arrow_datatype(&column.data_type),
+                    datafusion::arrow::datatypes::DataType::Decimal128(p, s)
+                        if (1..=38).contains(&p) && s >= 0 && s as u8 <= p
+                );
+                if !valid {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "[RS-1012] Invalid decimal precision or scale".to_owned(),
+                    )))]);
+                }
+            }
+        }
 
         self.catalog.add_table(CatalogTable {
             name: table_name.clone(),
@@ -10084,9 +10091,10 @@ impl GatewayHandler {
             // visible to the ShardReader (DbReader reads from SSTs, not the
             // in-memory WAL buffer; without a flush the SELECT after COMMIT
             // would see stale state until the background 100 ms flush fires).
-            if let Err(e) = shard_db.flush().await {
-                tracing::warn!("post-commit shard flush failed (non-fatal): {e}");
-            }
+            // Flushing also guarantees durable persistence before acknowledging COMMIT.
+            shard_db.flush().await.map_err(|e| {
+                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+            })?;
         }
 
         let table_name = ops
@@ -10594,6 +10602,8 @@ impl GatewayHandler {
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        use datafusion::arrow::datatypes::DataType;
+
         // Parse INSERT INTO <table> [(cols)] VALUES (v1, v2, ...)[, (v1, v2, ...)]* [RETURNING ...]
         let returning = q.to_lowercase().contains(" returning ");
         let (table, cols, rows) = match parse_insert(q) {
@@ -10647,6 +10657,17 @@ impl GatewayHandler {
             .get(&table)
             .map(|entry| entry.value().clone());
 
+        let decimal_columns: Vec<_> = self
+            .catalog
+            .get_table(&table)
+            .into_iter()
+            .flat_map(|table| table.columns)
+            .filter_map(|column| {
+                let datatype = string_to_arrow_datatype(&column.data_type);
+                matches!(datatype, DataType::Decimal128(_, _)).then_some((column.name, datatype))
+            })
+            .collect();
+
         let pk_cols = self
             .catalog
             .get_table(&table)
@@ -10679,6 +10700,26 @@ impl GatewayHandler {
                             .to_string(),
                     };
                     value_map.insert(column.clone(), generated);
+                }
+            }
+
+            // Validate every decimal before buffering any row from this statement.
+            for (column, datatype) in &decimal_columns {
+                if let Some(value) = value_map.get_mut(column).filter(|v| v.as_str() != r"\N") {
+                    use rockstream_sql::dml::{DmlLiteral, DmlScalarExpr};
+                    match DmlScalarExpr::Literal(DmlLiteral::String(value.clone()))
+                        .evaluate_assignment(&HashMap::new(), &HashMap::new(), datatype)
+                    {
+                        Ok(Some(formatted)) => *value = formatted,
+                        Ok(None) => *value = r"\N".to_owned(),
+                        Err(error) => {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "22003".to_owned(),
+                                error.to_string(),
+                            ))));
+                        }
+                    }
                 }
             }
 
@@ -10864,6 +10905,7 @@ impl GatewayHandler {
     fn build_returning_response(
         &self,
         table: &str,
+        command: &str,
         table_columns: &[String],
         returning_cols: &[String],
         rows: Vec<Vec<String>>,
@@ -10921,13 +10963,20 @@ impl GatewayHandler {
                     .get(i)
                     .map(|f| f.datatype())
                     .unwrap_or(&Type::TEXT);
-                encode_typed_field(&mut encoder, dt, Some(v.as_str()))
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                encode_typed_field_with_format(
+                    &mut encoder,
+                    dt,
+                    Some(v.as_str()).filter(|v| *v != r"\N"),
+                    Some(schema_ref[i].format()),
+                )
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             }
             encoder.finish()
         });
         let stream = Box::pin(data_stream);
-        promote_response(Response::Query(QueryResponse::new(schema, stream)))
+        let mut response = QueryResponse::new(schema, stream);
+        response.set_command_tag(command);
+        promote_response(Response::Query(response))
     }
 
     async fn check_pk_exists(
@@ -10990,6 +11039,21 @@ impl GatewayHandler {
         predicate: Option<&rockstream_sql::dml::DmlPredicate>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<(String, Vec<String>)>> {
+        let column_types: HashMap<_, _> = self
+            .catalog
+            .get_table(table)
+            .map(|ct| {
+                ct.columns
+                    .into_iter()
+                    .map(|c| {
+                        (
+                            c.name.to_lowercase(),
+                            string_to_arrow_datatype(&c.data_type),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut live_rows: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
         if let Some(shard_db) = &self.shard_db {
@@ -11061,7 +11125,7 @@ impl GatewayHandler {
                     row_map.insert(col.clone(), val_opt);
                 }
 
-                match pred.evaluate(&row_map) {
+                match pred.evaluate(&row_map, &column_types) {
                     Ok(tri) => {
                         if tri.is_true() {
                             matched.push((row_key, fields));
@@ -11072,7 +11136,11 @@ impl GatewayHandler {
                         let sqlstate = if err_str.contains("RS-1013") {
                             "0A000"
                         } else if err_str.contains("RS-1016") {
-                            "22012"
+                            if err_str.contains("division by zero") {
+                                "22012"
+                            } else {
+                                "22003"
+                            }
                         } else {
                             "42804"
                         };
@@ -11191,6 +11259,20 @@ impl GatewayHandler {
             .as_ref()
             .map(|ct| ct.columns.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_else(|| assignments.iter().map(|(c, _)| c.clone()).collect());
+        let column_types: HashMap<_, _> = table_entry
+            .as_ref()
+            .map(|ct| {
+                ct.columns
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.name.to_lowercase(),
+                            string_to_arrow_datatype(&c.data_type),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let pk_cols = table_entry.map(|ct| ct.pk_cols).unwrap_or_default();
 
         let matched_rows = match self
@@ -11222,6 +11304,7 @@ impl GatewayHandler {
             if let Some(returning_cols) = &returning_cols {
                 return Ok(vec![self.build_returning_response(
                     &table,
+                    "UPDATE",
                     &table_columns,
                     returning_cols,
                     Vec::new(),
@@ -11248,22 +11331,36 @@ impl GatewayHandler {
             }
 
             for (col_name, scalar_expr) in &assignments {
-                let new_val = match scalar_expr.evaluate(&row_map) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        let sqlstate = if err_str.contains("RS-1016") {
-                            "22012"
-                        } else if err_str.contains("RS-1013") {
-                            "0A000"
-                        } else {
-                            "42601"
-                        };
-                        return Ok(vec![promote_response(Response::Error(Box::new(
-                            ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
-                        )))]);
-                    }
+                let Some(target_type) = column_types.get(col_name) else {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "42703".to_owned(),
+                            format!("[RS-1002] Unknown column: {col_name}"),
+                        ),
+                    )))]);
                 };
+                let new_val =
+                    match scalar_expr.evaluate_assignment(&row_map, &column_types, target_type) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            let sqlstate = if err_str.contains("RS-1016") {
+                                if err_str.contains("division by zero") {
+                                    "22012"
+                                } else {
+                                    "22003"
+                                }
+                            } else if err_str.contains("RS-1013") {
+                                "0A000"
+                            } else {
+                                "42601"
+                            };
+                            return Ok(vec![promote_response(Response::Error(Box::new(
+                                ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                            )))]);
+                        }
+                    };
                 row_map.insert(col_name.clone(), new_val);
             }
 
@@ -11353,6 +11450,7 @@ impl GatewayHandler {
         if let Some(returning_cols) = &returning_cols {
             return Ok(vec![self.build_returning_response(
                 &table,
+                "UPDATE",
                 &table_columns,
                 returning_cols,
                 result_rows,
@@ -11475,6 +11573,7 @@ impl GatewayHandler {
             if let Some(returning_cols) = &returning_cols {
                 return Ok(vec![self.build_returning_response(
                     &table,
+                    "DELETE",
                     &table_columns,
                     returning_cols,
                     Vec::new(),
@@ -11527,6 +11626,7 @@ impl GatewayHandler {
         if let Some(returning_cols) = &returning_cols {
             return Ok(vec![self.build_returning_response(
                 &table,
+                "DELETE",
                 &table_columns,
                 returning_cols,
                 captured_rows,
@@ -12391,7 +12491,7 @@ impl ExtendedQueryHandler for GatewayHandler {
             .map(|oid| Type::from_oid(*oid).unwrap_or(Type::UNKNOWN))
             .collect::<Vec<Type>>();
         let parsed_stmt = parser.parse_sql(&message.query, &types).await?;
-
+        let types = parsed_stmt.parameter_types.clone();
         let stmt = StoredStatement::new(
             message
                 .name
@@ -12431,6 +12531,37 @@ impl ExtendedQueryHandler for GatewayHandler {
             .unwrap_or_else(|| "unknown".to_string());
         let portal_name = message.portal_name.clone().unwrap_or_default();
 
+        let statement_name = message
+            .statement_name
+            .as_deref()
+            .unwrap_or(pgwire::api::DEFAULT_NAME);
+        let statement = client
+            .portal_store()
+            .get_statement(statement_name)
+            .ok_or_else(|| PgWireError::StatementNotFound(statement_name.to_owned()))?;
+        if message.parameters.len() != statement.parameter_types.len()
+            || (message.parameter_format_codes.len() > 1
+                && message.parameter_format_codes.len() != message.parameters.len())
+            || message
+                .parameter_format_codes
+                .iter()
+                .any(|code| !matches!(code, 0 | 1))
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "08P01".to_string(),
+                "invalid Bind parameter count or format codes".to_string(),
+            ))));
+        }
+        let portal = Portal::try_new(&message, statement)?;
+        for (i, value) in portal.parameters.iter().enumerate() {
+            if portal.parameter_format.is_binary(i) {
+                if let Some(value) = value {
+                    decode_param_bytes(value, portal.statement.parameter_types.get(i))?;
+                }
+            }
+        }
+
         // Bound portals per connection with LRU eviction (v0.51.6 Slice 1)
         // instead of hard-erroring at the cap.
         {
@@ -12459,11 +12590,6 @@ impl ExtendedQueryHandler for GatewayHandler {
             }
         }
 
-        let statement_name = message
-            .statement_name
-            .as_deref()
-            .unwrap_or(pgwire::api::DEFAULT_NAME);
-
         // Binding a portal to a statement counts as use of that statement —
         // promote it to most-recently-used so it isn't evicted while a live
         // portal still depends on it (v0.51.6 Slice 1).
@@ -12471,18 +12597,13 @@ impl ExtendedQueryHandler for GatewayHandler {
             stmts.get(statement_name);
         }
 
-        if let Some(statement) = client.portal_store().get_statement(statement_name) {
-            let portal = Portal::try_new(&message, statement)?;
-            client.portal_store().put_portal(Arc::new(portal));
-            self.portal_states
-                .remove(&(conn_id.clone(), portal_name.clone()));
-            client
-                .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
-                .await?;
-            Ok(())
-        } else {
-            Err(PgWireError::StatementNotFound(statement_name.to_owned()))
-        }
+        client.portal_store().put_portal(Arc::new(portal));
+        self.portal_states
+            .remove(&(conn_id.clone(), portal_name.clone()));
+        client
+            .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+            .await?;
+        Ok(())
     }
 
     async fn on_close<C>(&self, client: &mut C, message: Close) -> PgWireResult<()>
@@ -12730,7 +12851,12 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let fields = describe_fields_for_query(&self.catalog, &target.statement.sql);
+        let fields = describe_fields_for_query(
+            &self.catalog,
+            &target.statement.sql,
+            &target.statement.parameter_types,
+        )
+        .await;
         Ok(DescribeStatementResponse::new(
             target.statement.parameter_types.clone(),
             fields,
@@ -12749,7 +12875,12 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let fields = describe_fields_for_query(&self.catalog, &target.statement.statement.sql);
+        let fields = describe_fields_for_query(
+            &self.catalog,
+            &target.statement.statement.sql,
+            &target.statement.parameter_types,
+        )
+        .await;
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -12824,7 +12955,8 @@ impl ExtendedQueryHandler for GatewayHandler {
                 query,
                 &portal.parameters,
                 &portal.statement.parameter_types,
-            );
+                &portal.parameter_format,
+            )?;
             &effective_query
         } else {
             query
@@ -14852,10 +14984,13 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                         )
                         .ok()
                     }
-                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => col
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .map(|a| a.value(row_idx).to_string()),
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => {
+                        datafusion::arrow::util::display::array_value_to_string(
+                            col.as_ref(),
+                            row_idx,
+                        )
+                        .ok()
+                    }
                     _ => col
                         .as_any()
                         .downcast_ref::<StringArray>()
@@ -15197,8 +15332,8 @@ fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, 
 /// logic.)
 fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatch, String> {
     use datafusion::arrow::array::{
-        ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryBuilder, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryBuilder, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
@@ -15260,21 +15395,15 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
                         .collect();
                     Arc::new(Float64Array::from(vals)) as ArrayRef
                 }
-                DataType::Decimal128(precision, scale) => {
-                    let vals: Vec<Option<i128>> = col_strs[i]
-                        .iter()
-                        .map(|s| {
-                            let mut value = s.as_deref()?.parse::<rust_decimal::Decimal>().ok()?;
-                            value.rescale((*scale).try_into().ok()?);
-                            Some(value.mantissa())
-                        })
-                        .collect();
-                    Arc::new(
-                        Decimal128Array::from(vals)
-                            .with_precision_and_scale(*precision, *scale)
-                            .map_err(|error| error.to_string())?,
-                    ) as ArrayRef
-                }
+                DataType::Decimal128(_, _) => datafusion::arrow::compute::cast_with_options(
+                    &StringArray::from(col_strs[i].clone()),
+                    field.data_type(),
+                    &datafusion::arrow::compute::CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|error| error.to_string())?,
                 DataType::Boolean => {
                     let vals: Vec<Option<bool>> = col_strs[i]
                         .iter()
@@ -16438,7 +16567,11 @@ fn describe_returning_fields(
 }
 
 /// Build FieldInfo list for a query (for DESCRIBE).
-fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
+async fn describe_fields_for_query(
+    catalog: &CatalogStubs,
+    q: &str,
+    param_types: &[Type],
+) -> Vec<FieldInfo> {
     let ql = q.trim().to_lowercase();
     if let Some(Ok(CatalogResponse::Rows { columns, .. })) = diagnostic_catalog_response(q) {
         return columns
@@ -16528,6 +16661,32 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
     // when try_datafusion_select executes the query.
     let ql = q.trim().to_lowercase();
     if ql.starts_with("select ") {
+        let params = vec![None; param_types.len()];
+        if let Ok(sql) = substitute_params_typed(
+            q,
+            &params,
+            param_types,
+            &pgwire::api::portal::Format::UnifiedText,
+        ) {
+            let ctx = SessionContext::new();
+            rockstream_sql::frontend::register_session_sql_udf(&ctx);
+            if let Ok(df) = ctx.sql(&sql).await {
+                return df
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        FieldInfo::new(
+                            field.name().clone(),
+                            None,
+                            None,
+                            pg_type_from_arrow_datatype(field.data_type()),
+                            FieldFormat::Text,
+                        )
+                    })
+                    .collect();
+            }
+        }
         let cols = infer_select_columns(q);
         if !cols.is_empty() {
             return cols
@@ -16712,7 +16871,7 @@ fn connector_removed_error_response() -> Response<'static> {
     Response::Error(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
         "0A000".to_owned(),
-        "[RS-4017] connector.removed: This connector has been removed. Next steps: use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.".to_string(),
+        "[RS-4017] connector.removed: This connector has been removed. Next steps: use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks. Kafka sink row export is currently unsupported.".to_string(),
     )))
 }
 
@@ -18068,187 +18227,206 @@ fn extract_sql_refs(sql: &str) -> Vec<String> {
     deps
 }
 
+fn parameter_positions(sql: &str) -> PgWireResult<Vec<(std::ops::Range<usize>, usize)>> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|error| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                format!("{error} (RS-2056)"),
+            )))
+        })?;
+    let mut positions = Vec::new();
+    let mut chars = sql.char_indices();
+    let (mut line, mut column) = (1, 1);
+    for token in tokens {
+        if let Token::Placeholder(name) = token.token {
+            let index = name
+                .strip_prefix('$')
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|index| (1..=u16::MAX as usize).contains(index))
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42P02".to_owned(),
+                        format!("invalid parameter {name} (RS-2056)"),
+                    )))
+                })?;
+            for (offset, ch) in chars.by_ref() {
+                let location = (line, column);
+                if ch == '\n' {
+                    line += 1;
+                    column = 1;
+                } else {
+                    column += 1;
+                }
+                if location == (token.span.start.line, token.span.start.column) {
+                    positions.push((offset..offset + name.len(), index));
+                    break;
+                }
+            }
+        }
+    }
+    Ok(positions)
+}
+
 fn substitute_params_typed(
     sql: &str,
     params: &[Option<bytes::Bytes>],
     param_types: &[Type],
-) -> String {
-    let mut result = sql.to_string();
-    // Work from the highest index downward so that replacing `$10` before `$1`
-    // doesn't corrupt earlier replacements.
-    for (i, param) in params.iter().enumerate().rev() {
-        let placeholder = format!("${}", i + 1);
-        let param_type = param_types.get(i);
-        let replacement = match param {
-            None => "NULL".to_string(),
-            Some(bytes) => decode_param_bytes(bytes, param_type),
-        };
-        // Replace `$N::cast_type` as well as bare `$N`.
-        // We do a simple regex-free replacement: find `$N` and strip any
-        // trailing `::identifier` before inserting the replacement.
-        let placeholder_with_cast = format!("{}::", placeholder);
-        // Replace cast variants first (greedy: strip until non-alphanumeric/underscore).
-        let mut new_result = String::with_capacity(result.len());
-        let mut remaining = result.as_str();
-        while let Some(pos) = remaining.find(&placeholder_with_cast) {
-            new_result.push_str(&remaining[..pos]);
-            new_result.push_str(&replacement);
-            let after = &remaining[pos + placeholder_with_cast.len()..];
-            // Skip the cast type name (letters, digits, underscores).
-            let skip = after
-                .find(|c: char| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(after.len());
-            remaining = &after[skip..];
-        }
-        new_result.push_str(remaining);
-        result = new_result;
-        // Now replace bare `$N` placeholders.
-        result = result.replace(&placeholder, &replacement);
-    }
-
-    // Normalize `= ANY(ARRAY[...])` expressions to `IN (...)`
-    while let Some(pos) = result.find("= ANY(ARRAY[") {
-        if let Some(end_bracket) = result[pos..].find(']') {
-            let close_paren = pos + end_bracket + 1;
-            if close_paren < result.len() && result.as_bytes()[close_paren] == b')' {
-                let inner = &result[pos + "= ANY(ARRAY[".len()..pos + end_bracket];
-                let in_expr = if inner.trim().is_empty() {
-                    "IN (NULL)".to_string()
+    format: &pgwire::api::portal::Format,
+) -> PgWireResult<String> {
+    let mut result = String::with_capacity(sql.len());
+    let mut end = 0;
+    // Copy original source between parameter tokens; inserted values are never scanned.
+    for (range, index) in parameter_positions(sql)? {
+        let i = index - 1;
+        let param = params.get(i).ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P02".to_owned(),
+                format!("missing parameter ${index} (RS-2056)"),
+            )))
+        })?;
+        let ty = param_types.get(i).unwrap_or(&Type::TEXT);
+        let value = match param {
+            None => "NULL".to_owned(),
+            Some(bytes) if format.is_text(i) => {
+                let text = std::str::from_utf8(bytes).map_err(|_| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22021".to_owned(),
+                        "invalid UTF-8 parameter (RS-2056)".to_owned(),
+                    )))
+                })?;
+                if matches!(ty.kind(), postgres_types::Kind::Array(_)) {
+                    decode_text_param_bytes(bytes)
                 } else {
-                    format!("IN ({})", inner)
-                };
-                result.replace_range(pos..close_paren + 1, &in_expr);
-                continue;
+                    format!("'{}'", text.replace('\'', "''"))
+                }
             }
-        }
-        break;
+            Some(bytes) => decode_param_bytes(bytes, Some(ty))?,
+        };
+        result.push_str(&sql[end..range.start]);
+        result.push_str(&value);
+        end = range.end;
     }
-
-    result
+    result.push_str(&sql[end..]);
+    Ok(result)
 }
 
-fn decode_param_bytes(bytes: &[u8], param_type: Option<&Type>) -> String {
-    if bytes.len() >= 12 && bytes[..4] == [0, 0, 0, 1] {
-        // 1D PostgreSQL binary array decoding
-        let elem_type = i32::from_be_bytes(bytes[8..12].try_into().unwrap_or_default());
-        let dim = i32::from_be_bytes(bytes[12..16].try_into().unwrap_or_default());
-        let mut offset = 20;
-        let mut elems = Vec::new();
-        for _ in 0..dim.max(0) {
-            if offset + 4 > bytes.len() {
-                break;
-            }
-            let len = i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap_or_default());
-            offset += 4;
-            if len < 0 {
-                elems.push("NULL".to_string());
-            } else if offset + len as usize <= bytes.len() {
-                let elem_bytes = &bytes[offset..offset + len as usize];
-                offset += len as usize;
-                let formatted = match elem_type {
-                    20 => i64::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
-                    23 => i32::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
-                    21 => i16::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
-                    16 => {
-                        if !elem_bytes.is_empty() && elem_bytes[0] != 0 {
-                            "true".to_string()
-                        } else {
-                            "false".to_string()
-                        }
-                    }
-                    700 => {
-                        f32::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string()
-                    }
-                    701 => {
-                        f64::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string()
-                    }
-                    _ => {
-                        if let Ok(s) = std::str::from_utf8(elem_bytes) {
-                            if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-                                s.to_string()
-                            } else {
-                                format!("'{}'", s.replace('\'', "''"))
-                            }
-                        } else {
-                            "NULL".to_string()
-                        }
-                    }
-                };
-                elems.push(formatted);
-            }
-        }
-        return format!("ARRAY[{}]", elems.join(", "));
-    }
-
+fn decode_param_bytes(bytes: &[u8], param_type: Option<&Type>) -> PgWireResult<String> {
+    let invalid = || {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_string(),
+            "22P03".to_string(),
+            format!(
+                "invalid binary representation for type {}",
+                param_type.map_or("unknown", Type::name)
+            ),
+        )))
+    };
     if let Some(ty) = param_type {
-        match *ty {
-            Type::INT8 => {
-                if bytes.len() == 8 {
-                    return i64::from_be_bytes(bytes[..8].try_into().unwrap_or_default())
-                        .to_string();
-                }
+        if let postgres_types::Kind::Array(element_type) = ty.kind() {
+            let mut remaining = bytes;
+            let read_i32 = |remaining: &mut &[u8]| {
+                let (head, tail) = remaining.split_at_checked(4).ok_or_else(invalid)?;
+                *remaining = tail;
+                Ok::<_, PgWireError>(i32::from_be_bytes(head.try_into().map_err(|_| invalid())?))
+            };
+            let dimensions = read_i32(&mut remaining)?;
+            let flags = read_i32(&mut remaining)?;
+            let oid = read_i32(&mut remaining)? as u32;
+            if !matches!(flags, 0 | 1) || oid != element_type.oid() {
+                return Err(invalid());
             }
-            Type::INT4 => {
-                if bytes.len() == 4 {
-                    return i32::from_be_bytes(bytes[..4].try_into().unwrap_or_default())
-                        .to_string();
+            if dimensions == 0 {
+                if !remaining.is_empty() {
+                    return Err(invalid());
                 }
+                return Ok("ARRAY[]".to_string());
             }
-            Type::INT2 => {
-                if bytes.len() == 2 {
-                    return i16::from_be_bytes(bytes[..2].try_into().unwrap_or_default())
-                        .to_string();
-                }
+            if dimensions != 1 {
+                return Err(invalid());
             }
-            Type::FLOAT8 => {
-                if bytes.len() == 8 {
-                    return f64::from_be_bytes(bytes[..8].try_into().unwrap_or_default())
-                        .to_string();
-                }
+            let length = read_i32(&mut remaining)?;
+            let lower_bound = read_i32(&mut remaining)?;
+            if length < 0
+                || (length > 0 && lower_bound.checked_add(length - 1).is_none())
+                || length as usize > remaining.len() / 4
+            {
+                return Err(invalid());
             }
-            Type::FLOAT4 => {
-                if bytes.len() == 4 {
-                    return f32::from_be_bytes(bytes[..4].try_into().unwrap_or_default())
-                        .to_string();
-                }
-            }
-            Type::BOOL => {
-                if bytes.len() == 1 {
-                    return if bytes[0] != 0 { "true" } else { "false" }.to_string();
-                }
-            }
-            Type::UUID => {
-                if bytes.len() == 16 {
-                    return format!(
-                        "'{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}'",
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5],
-                        bytes[6], bytes[7],
-                        bytes[8], bytes[9],
-                        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+            let mut elements = Vec::new();
+            for _ in 0..length {
+                let (head, tail) = remaining.split_at_checked(4).ok_or_else(invalid)?;
+                remaining = tail;
+                let length = i32::from_be_bytes(head.try_into().map_err(|_| invalid())?);
+                if length == -1 {
+                    if flags == 0 {
+                        return Err(invalid());
+                    }
+                    elements.push("NULL".to_string());
+                } else {
+                    let length = usize::try_from(length).map_err(|_| invalid())?;
+                    let (element, tail) = remaining.split_at_checked(length).ok_or_else(invalid)?;
+                    remaining = tail;
+                    elements.push(
+                        decode_param_bytes(element, Some(element_type)).map_err(|_| invalid())?,
                     );
                 }
             }
+            if !remaining.is_empty() {
+                return Err(invalid());
+            }
+            return Ok(format!("ARRAY[{}]", elements.join(", ")));
+        }
+
+        macro_rules! number {
+            ($rust_type:ty) => {
+                Ok(
+                    <$rust_type>::from_be_bytes(bytes.try_into().map_err(|_| invalid())?)
+                        .to_string(),
+                )
+            };
+        }
+        return match *ty {
+            Type::INT8 => number!(i64),
+            Type::INT4 => number!(i32),
+            Type::INT2 => number!(i16),
+            Type::FLOAT8 => number!(f64),
+            Type::FLOAT4 => number!(f32),
+            Type::BOOL => match bytes {
+                [0] => Ok("false".to_string()),
+                [1] => Ok("true".to_string()),
+                _ => Err(invalid()),
+            },
+            Type::UUID => uuid::Uuid::from_slice(bytes)
+                .map(|value| format!("'{value}'"))
+                .map_err(|_| invalid()),
             Type::TIMESTAMP | Type::TIMESTAMPTZ => {
-                if bytes.len() == 8 {
-                    let pg_micros = i64::from_be_bytes(bytes[..8].try_into().unwrap_or_default());
-                    let unix_micros = pg_micros + 946_684_800_000_000i64;
-                    let secs = unix_micros.div_euclid(1_000_000);
-                    let nsecs = (unix_micros.rem_euclid(1_000_000) * 1_000) as u32;
-                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
-                        return format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f"));
-                    }
-                }
+                let pg_micros = i64::from_be_bytes(bytes.try_into().map_err(|_| invalid())?);
+                let unix_micros = pg_micros
+                    .checked_add(946_684_800_000_000)
+                    .ok_or_else(invalid)?;
+                let dt =
+                    chrono::DateTime::from_timestamp_micros(unix_micros).ok_or_else(invalid)?;
+                Ok(format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f")))
             }
             Type::VARCHAR | Type::TEXT => {
-                if let Ok(s) = std::str::from_utf8(bytes) {
-                    return format!("'{}'", s.replace('\'', "''"));
-                }
+                let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+                Ok(format!("'{}'", text.replace('\'', "''")))
             }
-            _ => {}
-        }
+            _ => Ok(decode_text_param_bytes(bytes)),
+        };
     }
+    Ok(decode_text_param_bytes(bytes))
+}
 
+fn decode_text_param_bytes(bytes: &[u8]) -> String {
     // Fallback heuristic decoding
     if bytes
         .iter()
@@ -18966,6 +19144,10 @@ fn parse_value_list(s: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[path = "malformed_bind_tests.rs"]
+mod malformed_bind_tests;
+
+#[cfg(test)]
 // These legacy parser tests intentionally use unwrap/expect for concise fixture assertions.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod s4_tests {
@@ -18977,6 +19159,21 @@ mod s4_tests {
     use rockstream_ops::ColumnValue;
     use rockstream_types::acl::{AclEntry, Role};
     use std::sync::Arc;
+
+    #[test]
+    fn parameter_binding_preserves_original_source() {
+        let sql = "SELECT 'ø $20' AS \"id$30\", /* $40 */\r\n $1::VARCHAR(4) AS v -- $50";
+        assert_eq!(
+            substitute_params_typed(
+                sql,
+                &[Some(bytes::Bytes::from_static(b"x$1"))],
+                &[Type::TEXT],
+                &pgwire::api::portal::Format::UnifiedText,
+            )
+            .unwrap(),
+            "SELECT 'ø $20' AS \"id$30\", /* $40 */\r\n 'x$1'::VARCHAR(4) AS v -- $50",
+        );
+    }
 
     struct NoopViewReader;
 

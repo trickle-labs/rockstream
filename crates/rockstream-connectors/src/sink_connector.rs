@@ -42,7 +42,8 @@ pub trait SinkConnector: Send + Sync {
         true
     }
 
-    /// Stage rows for the given epoch (pre-commit phase).
+    /// Stage epoch/count metadata for the given epoch (pre-commit phase).
+    /// This interface carries no row payload and cannot qualify view row delivery.
     ///
     /// Implementations must:
     /// 1. Begin a connector-specific transaction (Kafka: initTransaction;
@@ -79,6 +80,8 @@ pub enum SinkError {
     PreCommitFailed { epoch: Epoch, reason: String },
     /// Commit failed after pre-commit; recovery required.
     CommitFailed { epoch: Epoch, reason: String },
+    /// Delivery is unresolved; retry recovery without publishing again.
+    DeliveryUnknown { epoch: Epoch, reason: String },
     /// Duplicate delivery detected and blocked (CheckBeforeCommit).
     DuplicateBlocked { epoch: Epoch },
     /// Generic sink I/O error.
@@ -97,6 +100,10 @@ impl std::fmt::Display for SinkError {
             Self::CommitFailed { epoch, reason } => {
                 write!(f, "RS-4004: sink commit failed for epoch {epoch}: {reason}")
             }
+            Self::DeliveryUnknown { epoch, reason } => write!(
+                f,
+                "RS-4030: sink delivery outcome unknown for epoch {epoch}: {reason}; retry recovery"
+            ),
             Self::DuplicateBlocked { epoch } => {
                 write!(f, "RS-4005: duplicate delivery blocked for epoch {epoch}")
             }

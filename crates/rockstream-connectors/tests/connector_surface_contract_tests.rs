@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use rockstream_types::error_code::{
     RS_4001, RS_4002, RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4008, RS_4009, RS_4010,
     RS_4011, RS_4012, RS_4013, RS_4014, RS_4015, RS_4016, RS_4017, RS_4018, RS_4019, RS_4020,
-    RS_4021, RS_4022,
+    RS_4021, RS_4022, RS_4030,
 };
 
 fn root() -> PathBuf {
@@ -14,6 +14,44 @@ fn root() -> PathBuf {
         .nth(2)
         .expect("workspace root")
         .to_path_buf()
+}
+
+#[test]
+fn kafka_sink_row_delivery_is_explicitly_unsupported() {
+    let sink = rockstream_types::capability::CapabilityRegistry::current()
+        .get_by_id("sink.kafka")
+        .expect("Kafka sink capability");
+    assert_eq!(
+        (
+            sink.tier.as_str(),
+            sink.proof_ref(),
+            sink.behavior
+                .iter()
+                .filter(|row| matches!(row.behavior.as_str(), "incremental" | "backfill"))
+                .map(|row| (
+                    row.behavior.as_str(),
+                    row.statement.as_str(),
+                    row.proof.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "Experimental",
+            "",
+            vec![
+                (
+                    "incremental",
+                    "Unsupported: materialized-view change rows are not delivered; only epoch/count markers are emitted.",
+                    Some(""),
+                ),
+                (
+                    "backfill",
+                    "Unsupported: materialized-view snapshot rows and snapshot completion boundaries are not delivered.",
+                    Some(""),
+                ),
+            ],
+        ),
+    );
 }
 
 #[test]
@@ -184,7 +222,7 @@ fn connector_guarantee_document_is_exact_and_all_matrix_tests_exist() {
     let expected_codes = [
         RS_4001, RS_4002, RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4008, RS_4009, RS_4010,
         RS_4011, RS_4012, RS_4013, RS_4014, RS_4015, RS_4016, RS_4017, RS_4018, RS_4019, RS_4020,
-        RS_4021, RS_4022,
+        RS_4021, RS_4022, RS_4030,
     ]
     .into_iter()
     .map(|code| code.to_string())

@@ -8,14 +8,14 @@
 //!
 //! 3. `lfs_topk_no_range_delete` — WriteBatch has no DeleteRange (structural guarantee).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
-use rockstream_ops::topk::{load_topk_state, persist_topk_state, TopKOp};
+use rockstream_ops::topk::{load_topk_state, persist_topk_state, TopKOp, TOPK_BUFFER_LIMIT};
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_storage::{ShardDb, WriteBatch};
 use rockstream_types::ids::OperatorId;
@@ -73,6 +73,223 @@ fn live_vals(state: &HashMap<i64, i64>) -> Vec<i64> {
 async fn open_shard(dir: &TempDir) -> Arc<ShardDb> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     Arc::new(ShardDb::builder("shard", store).build().await.unwrap())
+}
+
+fn weighted_rows(zset: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
+    let values = zset
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ids = zset
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = BTreeMap::new();
+    for (i, weight) in zset.weights.iter().enumerate() {
+        *rows.entry((values.value(i), ids.value(i))).or_insert(0) += weight;
+    }
+    rows.retain(|_, weight| *weight != 0);
+    rows
+}
+
+// #113 R1-R5: real spill, exact weighted deltas/bags, and shared-storage isolation.
+#[tokio::test(flavor = "multi_thread")]
+async fn lfs_topk_spilled_multiplicity_and_operator_isolation() {
+    assert_eq!(TOPK_BUFFER_LIMIT, 100_000);
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let op = TopKOp::new(schema_kv(), 2, 0, vec![1]).with_db(db.clone());
+    let other = TopKOp::new(schema_kv(), 1, 0, vec![1]).with_db(db.clone());
+    let initial: Vec<_> = (1..=100_000).map(|rank| (rank, 0, 1)).collect();
+    let mut bag = weighted_rows(&op.process_epoch(make_input(&initial), 1).unwrap());
+    assert_eq!(bag, BTreeMap::from([((100_000, 0), 1), ((99_999, 0), 1)]));
+    assert_eq!(db.scan_prefix(b"topk_spill:").await.unwrap(), vec![]);
+
+    for (epoch, weight, expected_delta, expected_bag) in [
+        (
+            2,
+            1,
+            vec![((100_001, 0), 1), ((99_999, 0), -1)],
+            vec![((100_001, 0), 1), ((100_000, 0), 1)],
+        ),
+        (
+            3,
+            1,
+            vec![((100_001, 0), 1), ((100_000, 0), -1)],
+            vec![((100_001, 0), 2)],
+        ),
+        (
+            4,
+            -1,
+            vec![((100_001, 0), -1), ((100_000, 0), 1)],
+            vec![((100_001, 0), 1), ((100_000, 0), 1)],
+        ),
+        (
+            5,
+            -1,
+            vec![((100_001, 0), -1), ((99_999, 0), 1)],
+            vec![((100_000, 0), 1), ((99_999, 0), 1)],
+        ),
+    ] {
+        let delta = weighted_rows(
+            &op.process_epoch(make_input(&[(100_001, 0, weight)]), epoch)
+                .unwrap(),
+        );
+        assert_eq!(
+            delta,
+            expected_delta.into_iter().collect(),
+            "epoch {epoch} delta"
+        );
+        for (row, weight) in delta {
+            *bag.entry(row).or_insert(0) += weight;
+        }
+        bag.retain(|_, weight| *weight != 0);
+        assert_eq!(bag, expected_bag.into_iter().collect(), "epoch {epoch} bag");
+
+        let spill_before = db.scan_prefix(b"topk_spill:").await.unwrap();
+        let mut expected_spill_value = Vec::new();
+        for value in [100_001_i64, if epoch == 3 { 2 } else { 1 }, 100_001, 0] {
+            expected_spill_value.extend_from_slice(&value.to_be_bytes());
+        }
+        if epoch < 5 {
+            assert_eq!(
+                spill_before
+                    .iter()
+                    .map(|(_, value)| value.to_vec())
+                    .collect::<Vec<_>>(),
+                vec![expected_spill_value]
+            );
+        } else {
+            assert_eq!(spill_before, vec![]);
+        }
+        let other_delta = weighted_rows(
+            &other
+                .process_epoch(make_input(&[(-1, 0, 1)]), epoch)
+                .unwrap(),
+        );
+        assert_eq!(
+            other_delta,
+            if epoch == 2 {
+                BTreeMap::from([((-1, 0), 1)])
+            } else {
+                BTreeMap::new()
+            }
+        );
+        assert_eq!(db.scan_prefix(b"topk_spill:").await.unwrap(), spill_before);
+    }
+
+    drop(op);
+    drop(other);
+    Arc::try_unwrap(db)
+        .ok()
+        .expect("single owner")
+        .close()
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lfs_topk_shared_spill_updates_and_retraction_debt() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let op = TopKOp::new(schema_kv(), 2, 0, vec![1]).with_db(db.clone());
+    let other = TopKOp::new(schema_kv(), 1, 0, vec![1]).with_db(db.clone());
+    let initial: Vec<_> = (1..=TOPK_BUFFER_LIMIT as i64)
+        .map(|rank| (rank, 0, 1))
+        .collect();
+    let input = make_input(&initial);
+    assert_eq!(
+        weighted_rows(&op.process_epoch(input.clone(), 1).unwrap()),
+        BTreeMap::from([((100_000, 0), 1), ((99_999, 0), 1)])
+    );
+    assert_eq!(
+        weighted_rows(&other.process_epoch(input, 1).unwrap()),
+        BTreeMap::from([((100_000, 0), 1)])
+    );
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&[(100_001, 0, 2)]), 2).unwrap()),
+        BTreeMap::from([((100_001, 0), 2), ((100_000, 0), -1), ((99_999, 0), -1)])
+    );
+    let first_spill = db.scan_prefix(b"topk_spill:").await.unwrap();
+    assert_eq!(
+        weighted_rows(
+            &other
+                .process_epoch(make_input(&[(100_001, 0, 1)]), 2)
+                .unwrap()
+        ),
+        BTreeMap::from([((100_001, 0), 1), ((100_000, 0), -1)])
+    );
+    assert_eq!(
+        db.get(&first_spill[0].0).await.unwrap(),
+        Some(first_spill[0].1.clone())
+    );
+    assert_eq!(
+        weighted_rows(
+            &other
+                .process_epoch(make_input(&[(100_001, 0, -1)]), 3)
+                .unwrap()
+        ),
+        BTreeMap::from([((100_001, 0), -1), ((100_000, 0), 1)])
+    );
+    assert_eq!(db.scan_prefix(b"topk_spill:").await.unwrap(), first_spill);
+
+    // Free a buffer slot; updates must still find the existing spilled weight.
+    assert_eq!(
+        weighted_rows(
+            &op.process_epoch(make_input(&[(100_000, 0, -1)]), 3)
+                .unwrap()
+        ),
+        BTreeMap::new()
+    );
+    for (epoch, weight, expected_delta, stored_weight) in [
+        (
+            4,
+            -3,
+            vec![((100_001, 0), -2), ((99_999, 0), 1), ((99_998, 0), 1)],
+            Some(-1_i64),
+        ),
+        (5, 1, vec![], None),
+        (6, 1, vec![((100_001, 0), 1), ((99_998, 0), -1)], None),
+    ] {
+        assert_eq!(
+            weighted_rows(
+                &op.process_epoch(make_input(&[(100_001, 0, weight)]), epoch)
+                    .unwrap()
+            ),
+            expected_delta.into_iter().collect(),
+            "epoch {epoch}"
+        );
+        let expected_spill = stored_weight
+            .map(|weight| {
+                let mut value = Vec::new();
+                for number in [100_001, weight, 100_001, 0] {
+                    value.extend_from_slice(&number.to_be_bytes());
+                }
+                vec![value]
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            db.scan_prefix(b"topk_spill:")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, value)| value.to_vec())
+                .collect::<Vec<_>>(),
+            expected_spill
+        );
+    }
+    drop(op);
+    drop(other);
+    Arc::try_unwrap(db)
+        .ok()
+        .expect("single owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ─── Test 1: State persists across close/reopen ────────────────────────────
@@ -224,4 +441,14 @@ async fn lfs_topk_no_range_delete() {
     batch.put(b"key1", b"value1");
     batch.delete(b"key2");
     let _ = batch;
+}
+
+#[path = "common/topk_recovery.rs"]
+mod topk_recovery;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lfs_topk_spilled_state_recovers_after_close() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    topk_recovery::spilled_recovery(store, "topk-recovery").await;
 }

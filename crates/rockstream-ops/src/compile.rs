@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use rockstream_plan::{AggregateFunc, Expr, OuterJoinKind, PlanNode};
+use rockstream_plan::{AggregateFunc, Expr, OuterJoinKind, PlanNode, WindowExpr, WindowFunc};
 use rockstream_storage::ShardDb;
 use rockstream_types::{config::JoinStrategy, ids::OperatorId};
 
@@ -325,6 +325,28 @@ fn schema_all_int64(schema: &Schema) -> bool {
         .fields()
         .iter()
         .all(|f| f.data_type() == &DataType::Int64)
+}
+
+fn window_result_nullable(expr: &WindowExpr) -> bool {
+    matches!(&expr.func, WindowFunc::Lag { .. } | WindowFunc::Lead { .. })
+}
+
+fn window_output_schema(input_schema: &SchemaRef, window_exprs: &[WindowExpr]) -> SchemaRef {
+    let input_columns = input_schema.fields().len();
+    Arc::new(Schema::new(
+        input_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .chain(window_exprs.iter().enumerate().map(|(index, expr)| {
+                Field::new(
+                    format!("c{}", input_columns + index),
+                    DataType::Int64,
+                    window_result_nullable(expr),
+                )
+            }))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// Find the single base-table `Source` name reachable from `node` through a
@@ -979,7 +1001,7 @@ pub(crate) fn try_compile_join_shape(
         } => match try_compile_join_shape(input, table_schemas, join_strategy)? {
             Some(mut shape) => {
                 let op = Arc::new(WindowOp::new(
-                    int64_schema(shape.post_n_cols + window_exprs.len()),
+                    window_output_schema(&int64_schema(shape.post_n_cols), window_exprs),
                     window_exprs.clone(),
                 ));
                 shape.post.push(Stage::Window(op, next_stateful_op_id()));
@@ -1402,8 +1424,7 @@ pub(crate) fn compile_node(
                     "Window over a non-Int64/Utf8 input schema (WindowOp only supports Int64 columns, plus Utf8 passthrough)",
                 ));
             }
-            let out_n = packed_schema.fields().len() + window_exprs.len();
-            let packed_out_schema = int64_schema(out_n);
+            let packed_out_schema = window_output_schema(&packed_schema, window_exprs);
             let op = Arc::new(WindowOp::new(packed_out_schema, window_exprs.clone()));
             stages.push(Stage::Window(op, next_stateful_op_id()));
             unpack_utf8_columns(&mut stages, 0, utf8_packers);
@@ -1411,10 +1432,13 @@ pub(crate) fn compile_node(
                 .fields()
                 .iter()
                 .map(|field| field.as_ref().clone())
-                .chain(
-                    (0..window_exprs.len())
-                        .map(|index| Field::new(format!("window_{index}"), DataType::Int64, false)),
-                )
+                .chain(window_exprs.iter().enumerate().map(|(index, expr)| {
+                    Field::new(
+                        format!("window_{index}"),
+                        DataType::Int64,
+                        window_result_nullable(expr),
+                    )
+                }))
                 .collect();
             Ok((stages, Arc::new(Schema::new(fields))))
         }

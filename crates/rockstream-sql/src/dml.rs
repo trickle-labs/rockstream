@@ -14,6 +14,12 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 
+use arrow::compute::CastOptions;
+use arrow::datatypes::DataType;
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer;
+use datafusion::logical_expr::Operator;
+
 use crate::error::SqlError;
 
 /// Maximum allowed size of raw SQL statement in bytes (1 MiB).
@@ -157,6 +163,19 @@ pub enum DmlCompareOp {
     Gte,
 }
 
+impl DmlCompareOp {
+    fn compare<T: PartialOrd>(&self, left: T, right: T) -> bool {
+        match self {
+            Self::Eq => left == right,
+            Self::NotEq => left != right,
+            Self::Lt => left < right,
+            Self::Lte => left <= right,
+            Self::Gt => left > right,
+            Self::Gte => left >= right,
+        }
+    }
+}
+
 /// Arithmetic operators supported in expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmlArithOp {
@@ -170,8 +189,7 @@ pub enum DmlArithOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DmlLiteral {
     Null,
-    Int(i64),
-    Float(f64),
+    Number(String),
     String(String),
     Bool(bool),
 }
@@ -189,82 +207,183 @@ pub enum DmlScalarExpr {
     Parameter(usize),
 }
 
+fn evaluation_error(code: &str, message: impl std::fmt::Display) -> SqlError {
+    SqlError::ParseError {
+        message: format!("[{code}] {message}"),
+    }
+}
+
+fn cast_scalar(value: &ScalarValue, data_type: &DataType) -> Result<ScalarValue, SqlError> {
+    value
+        .cast_to_with_options(
+            data_type,
+            &CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| evaluation_error("RS-1016", e))
+}
+
+fn parse_scalar(value: &str, data_type: &DataType) -> Result<ScalarValue, SqlError> {
+    let data_type = match data_type {
+        DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Boolean => data_type,
+        // Other SQL types retain their existing textual storage representation.
+        _ => &DataType::Utf8,
+    };
+    cast_scalar(&ScalarValue::Utf8(Some(value.to_string())), data_type)
+}
+
+fn scalar_text(value: &ScalarValue) -> Result<Option<String>, SqlError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(cast_scalar(value, &DataType::Utf8)?.to_string()))
+}
+
 impl DmlScalarExpr {
-    /// Evaluate the scalar expression against a row of string fields keyed by column name.
+    fn column_type<'a>(&self, types: &'a HashMap<String, DataType>) -> Option<&'a DataType> {
+        match self {
+            Self::Column(name) => types.get(&name.to_lowercase()),
+            Self::BinaryArith { left, right, .. } => {
+                left.column_type(types).or_else(|| right.column_type(types))
+            }
+            _ => None,
+        }
+    }
+
+    /// Evaluate using declared column types; values stay textual only at the storage boundary.
     pub fn evaluate(
         &self,
         row: &HashMap<String, Option<String>>,
+        types: &HashMap<String, DataType>,
     ) -> Result<Option<String>, SqlError> {
-        match self {
-            Self::Literal(lit) => match lit {
-                DmlLiteral::Null => Ok(None),
-                DmlLiteral::Int(i) => Ok(Some(i.to_string())),
-                DmlLiteral::Float(f) => Ok(Some(f.to_string())),
-                DmlLiteral::String(s) => Ok(Some(s.clone())),
-                DmlLiteral::Bool(b) => Ok(Some(if *b { "true" } else { "false" }.to_string())),
-            },
-            Self::Column(col_name) => {
-                let lookup = col_name.to_lowercase();
-                for (k, v) in row {
-                    if k.to_lowercase() == lookup {
-                        return Ok(v.clone());
-                    }
-                }
-                // If not found in row map, treat as NULL
-                Ok(None)
-            }
-            Self::Parameter(_) => Err(SqlError::ParseError {
-                message: "[RS-1012] Unbound parameter in scalar evaluation".to_string(),
-            }),
-            Self::BinaryArith { op, left, right } => {
-                let l_val = left.evaluate(row)?;
-                let r_val = right.evaluate(row)?;
-                let (Some(l_str), Some(r_str)) = (l_val, r_val) else {
-                    return Ok(None);
-                };
+        let value = self.evaluate_scalar(row, types, None)?;
+        scalar_text(&value)
+    }
 
-                // Check integer arithmetic first
-                if let (Ok(l_int), Ok(r_int)) = (l_str.parse::<i64>(), r_str.parse::<i64>()) {
-                    let res = match op {
-                        DmlArithOp::Add => l_int.checked_add(r_int),
-                        DmlArithOp::Sub => l_int.checked_sub(r_int),
-                        DmlArithOp::Mul => l_int.checked_mul(r_int),
-                        DmlArithOp::Div => {
-                            if r_int == 0 {
-                                return Err(SqlError::ParseError {
-                                    message: "[RS-1016] division by zero".to_string(),
-                                });
-                            }
-                            l_int.checked_div(r_int)
-                        }
-                    };
-                    match res {
-                        Some(val) => Ok(Some(val.to_string())),
-                        None => Err(SqlError::ParseError {
-                            message: "[RS-1016] integer overflow".to_string(),
-                        }),
-                    }
-                } else if let (Ok(l_flt), Ok(r_flt)) = (l_str.parse::<f64>(), r_str.parse::<f64>())
-                {
-                    let res = match op {
-                        DmlArithOp::Add => l_flt + r_flt,
-                        DmlArithOp::Sub => l_flt - r_flt,
-                        DmlArithOp::Mul => l_flt * r_flt,
-                        DmlArithOp::Div => {
-                            if r_flt == 0.0 {
-                                return Err(SqlError::ParseError {
-                                    message: "[RS-1016] division by zero".to_string(),
-                                });
-                            }
-                            l_flt / r_flt
-                        }
-                    };
-                    Ok(Some(res.to_string()))
-                } else {
-                    Err(SqlError::IncompatibleSchemaChange {
-                        reason: "[RS-1002] Incompatible types for arithmetic operation".to_string(),
-                    })
+    /// Validate and format an assignment before any candidate mutations are buffered.
+    pub fn evaluate_assignment(
+        &self,
+        row: &HashMap<String, Option<String>>,
+        types: &HashMap<String, DataType>,
+        target: &DataType,
+    ) -> Result<Option<String>, SqlError> {
+        let value = self.evaluate_scalar(row, types, Some(target))?;
+        let Some(text) = scalar_text(&value)? else {
+            return Ok(None);
+        };
+        // Reparse even when types match: arithmetic kernels can exceed decimal precision.
+        scalar_text(&parse_scalar(&text, target)?)
+    }
+
+    fn evaluate_scalar(
+        &self,
+        row: &HashMap<String, Option<String>>,
+        types: &HashMap<String, DataType>,
+        expected: Option<&DataType>,
+    ) -> Result<ScalarValue, SqlError> {
+        match self {
+            Self::Literal(DmlLiteral::Null) => Ok(ScalarValue::Null),
+            Self::Literal(DmlLiteral::Bool(b)) => Ok(ScalarValue::Boolean(Some(*b))),
+            Self::Literal(DmlLiteral::String(s)) => {
+                parse_scalar(s, expected.unwrap_or(&DataType::Utf8))
+            }
+            Self::Literal(DmlLiteral::Number(n)) => {
+                if let Some(t @ (DataType::Float32 | DataType::Float64)) = expected {
+                    return parse_scalar(n, t);
                 }
+                if let Ok(i) = n.parse::<i64>() {
+                    return Ok(ScalarValue::Int64(Some(i)));
+                }
+                // SQL numeric literals must reach decimal arithmetic without a binary-float round trip.
+                let (mantissa, exponent) = n.split_once(['e', 'E']).unwrap_or((n, "0"));
+                let exponent = exponent
+                    .parse::<i32>()
+                    .map_err(|e| evaluation_error("RS-1012", e))?
+                    as i64;
+                let fraction = mantissa.split_once('.').map_or(0, |(_, f)| f.len() as i64);
+                let scale = (fraction - exponent).max(0);
+                let digits = mantissa.bytes().filter(u8::is_ascii_digit).count() as i64;
+                let precision = (digits + exponent - fraction + scale).max(scale).max(1);
+                if precision > 38 || scale > 38 {
+                    return Err(evaluation_error(
+                        "RS-1016",
+                        "numeric literal exceeds decimal precision",
+                    ));
+                }
+                let coefficient = mantissa
+                    .replace('.', "")
+                    .parse::<i128>()
+                    .map_err(|e| evaluation_error("RS-1016", e))?;
+                let value = coefficient
+                    .checked_mul(10_i128.pow((exponent - fraction).max(0) as u32))
+                    .ok_or_else(|| evaluation_error("RS-1016", "numeric literal overflow"))?;
+                Ok(ScalarValue::Decimal128(
+                    Some(value),
+                    precision as u8,
+                    scale as i8,
+                ))
+            }
+            Self::Column(name) => {
+                let data_type = self.column_type(types).ok_or_else(|| {
+                    evaluation_error("RS-1002", format!("Unknown column: {name}"))
+                })?;
+                match row
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .and_then(|(_, v)| v.as_deref())
+                {
+                    Some(value) => parse_scalar(value, data_type),
+                    None => Ok(ScalarValue::Null),
+                }
+            }
+            Self::Parameter(_) => Err(evaluation_error(
+                "RS-1012",
+                "Unbound parameter in scalar evaluation",
+            )),
+            Self::BinaryArith { op, left, right } => {
+                let expected = self.column_type(types).or(expected);
+                let left = left.evaluate_scalar(row, types, expected)?;
+                let right = right.evaluate_scalar(row, types, expected)?;
+                if left.is_null() || right.is_null() {
+                    return Ok(ScalarValue::Null);
+                }
+                let operator = match op {
+                    DmlArithOp::Add => Operator::Plus,
+                    DmlArithOp::Sub => Operator::Minus,
+                    DmlArithOp::Mul => Operator::Multiply,
+                    DmlArithOp::Div => Operator::Divide,
+                };
+                let (lt, rt) =
+                    BinaryTypeCoercer::new(&left.data_type(), &operator, &right.data_type())
+                        .get_input_types()
+                        .map_err(|e| evaluation_error("RS-1002", e))?;
+                let left = cast_scalar(&left, &lt)?;
+                let right = cast_scalar(&right, &rt)?;
+                if matches!(op, DmlArithOp::Div) {
+                    let is_zero = match &right {
+                        ScalarValue::Float32(Some(v)) => *v == 0.0,
+                        ScalarValue::Float64(Some(v)) => *v == 0.0,
+                        _ => right == parse_scalar("0", &rt)?,
+                    };
+                    if is_zero {
+                        return Err(evaluation_error("RS-1016", "division by zero"));
+                    }
+                }
+                match op {
+                    DmlArithOp::Add => left.add_checked(&right),
+                    DmlArithOp::Sub => left.sub_checked(&right),
+                    DmlArithOp::Mul => left.mul_checked(&right),
+                    DmlArithOp::Div => left.div(&right),
+                }
+                .map_err(|e| evaluation_error("RS-1016", e))
             }
         }
     }
@@ -289,114 +408,54 @@ pub enum DmlPredicate {
 }
 
 impl DmlPredicate {
-    /// Evaluate the predicate against a row of string fields, yielding a `TriBool`.
-    pub fn evaluate(&self, row: &HashMap<String, Option<String>>) -> Result<TriBool, SqlError> {
+    /// Evaluate a predicate using declared SQL column types and three-valued logic.
+    pub fn evaluate(
+        &self,
+        row: &HashMap<String, Option<String>>,
+        types: &HashMap<String, DataType>,
+    ) -> Result<TriBool, SqlError> {
         match self {
             Self::AlwaysTrue => Ok(TriBool::True),
             Self::AlwaysFalse => Ok(TriBool::False),
             Self::AlwaysNull => Ok(TriBool::Null),
-            Self::And(l, r) => {
-                let left_res = l.evaluate(row)?;
-                let right_res = r.evaluate(row)?;
-                Ok(left_res.and(right_res))
-            }
-            Self::Or(l, r) => {
-                let left_res = l.evaluate(row)?;
-                let right_res = r.evaluate(row)?;
-                Ok(left_res.or(right_res))
-            }
-            Self::Not(inner) => {
-                let inner_res = inner.evaluate(row)?;
-                Ok(inner_res.not())
-            }
-            Self::IsNull(expr) => {
-                let val = expr.evaluate(row)?;
-                Ok(if val.is_none() {
-                    TriBool::True
-                } else {
-                    TriBool::False
-                })
-            }
-            Self::IsNotNull(expr) => {
-                let val = expr.evaluate(row)?;
-                Ok(if val.is_some() {
+            Self::And(l, r) => Ok(l.evaluate(row, types)?.and(r.evaluate(row, types)?)),
+            Self::Or(l, r) => Ok(l.evaluate(row, types)?.or(r.evaluate(row, types)?)),
+            Self::Not(inner) => Ok(inner.evaluate(row, types)?.not()),
+            Self::IsNull(expr) | Self::IsNotNull(expr) => {
+                let is_null = expr.evaluate_scalar(row, types, None)?.is_null();
+                Ok(if is_null == matches!(self, Self::IsNull(_)) {
                     TriBool::True
                 } else {
                     TriBool::False
                 })
             }
             Self::Comparison { op, left, right } => {
-                let l_val = left.evaluate(row)?;
-                let r_val = right.evaluate(row)?;
-
-                let (Some(l_str), Some(r_str)) = (l_val, r_val) else {
-                    // SQL three-valued logic: NULL comparison yields NULL
+                let l = left.evaluate_scalar(row, types, right.column_type(types))?;
+                let r = right.evaluate_scalar(row, types, left.column_type(types))?;
+                if l.is_null() || r.is_null() {
                     return Ok(TriBool::Null);
-                };
-
-                // Boolean comparisons
-                let is_l_bool = l_str.eq_ignore_ascii_case("true")
-                    || l_str.eq_ignore_ascii_case("false")
-                    || l_str == "t"
-                    || l_str == "f";
-                let is_r_bool = r_str.eq_ignore_ascii_case("true")
-                    || r_str.eq_ignore_ascii_case("false")
-                    || r_str == "t"
-                    || r_str == "f";
-                if is_l_bool && is_r_bool {
-                    let b_l = l_str.eq_ignore_ascii_case("true") || l_str == "t";
-                    let b_r = r_str.eq_ignore_ascii_case("true") || r_str == "t";
-                    return match op {
-                        DmlCompareOp::Eq => Ok(if b_l == b_r {
-                            TriBool::True
-                        } else {
-                            TriBool::False
-                        }),
-                        DmlCompareOp::NotEq => Ok(if b_l != b_r {
-                            TriBool::True
-                        } else {
-                            TriBool::False
-                        }),
-                        _ => Err(SqlError::IncompatibleSchemaChange {
-                            reason: "[RS-1002] Ordered comparisons not supported on booleans"
-                                .to_string(),
-                        }),
-                    };
                 }
-
-                // Numeric comparisons (try integer first, then float)
-                if let (Ok(l_num), Ok(r_num)) = (l_str.parse::<i64>(), r_str.parse::<i64>()) {
-                    let cmp = match op {
-                        DmlCompareOp::Eq => l_num == r_num,
-                        DmlCompareOp::NotEq => l_num != r_num,
-                        DmlCompareOp::Lt => l_num < r_num,
-                        DmlCompareOp::Lte => l_num <= r_num,
-                        DmlCompareOp::Gt => l_num > r_num,
-                        DmlCompareOp::Gte => l_num >= r_num,
-                    };
-                    return Ok(if cmp { TriBool::True } else { TriBool::False });
+                let (lt, rt) =
+                    BinaryTypeCoercer::new(&l.data_type(), &Operator::Eq, &r.data_type())
+                        .get_input_types()
+                        .map_err(|e| evaluation_error("RS-1002", e))?;
+                let l = cast_scalar(&l, &lt)?;
+                let r = cast_scalar(&r, &rt)?;
+                if lt == DataType::Boolean && !matches!(op, DmlCompareOp::Eq | DmlCompareOp::NotEq)
+                {
+                    return Err(evaluation_error(
+                        "RS-1002",
+                        "Ordered comparisons not supported on booleans",
+                    ));
                 }
-
-                if let (Ok(l_num), Ok(r_num)) = (l_str.parse::<f64>(), r_str.parse::<f64>()) {
-                    let cmp = match op {
-                        DmlCompareOp::Eq => (l_num - r_num).abs() < f64::EPSILON,
-                        DmlCompareOp::NotEq => (l_num - r_num).abs() >= f64::EPSILON,
-                        DmlCompareOp::Lt => l_num < r_num,
-                        DmlCompareOp::Lte => l_num <= r_num,
-                        DmlCompareOp::Gt => l_num > r_num,
-                        DmlCompareOp::Gte => l_num >= r_num,
-                    };
-                    return Ok(if cmp { TriBool::True } else { TriBool::False });
-                }
-
-                // String comparisons
-                let cmp = match op {
-                    DmlCompareOp::Eq => l_str == r_str,
-                    DmlCompareOp::NotEq => l_str != r_str,
-                    DmlCompareOp::Lt => l_str < r_str,
-                    DmlCompareOp::Lte => l_str <= r_str,
-                    DmlCompareOp::Gt => l_str > r_str,
-                    DmlCompareOp::Gte => l_str >= r_str,
+                let cmp = match (&l, &r) {
+                    (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
+                        op.compare(*l, *r)
+                    }
+                    (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => {
+                        op.compare(*l, *r)
+                    }
+                    _ => op.compare(l, r),
                 };
                 Ok(if cmp { TriBool::True } else { TriBool::False })
             }
@@ -416,17 +475,7 @@ pub fn lower_scalar_expr(expr: &SpExpr) -> Result<DmlScalarExpr, SqlError> {
         }
         SpExpr::Value(v) => match &v.value {
             Value::Null => Ok(DmlScalarExpr::Literal(DmlLiteral::Null)),
-            Value::Number(n, _) => {
-                if let Ok(i) = n.parse::<i64>() {
-                    Ok(DmlScalarExpr::Literal(DmlLiteral::Int(i)))
-                } else if let Ok(f) = n.parse::<f64>() {
-                    Ok(DmlScalarExpr::Literal(DmlLiteral::Float(f)))
-                } else {
-                    Err(SqlError::ParseError {
-                        message: format!("[RS-1012] Invalid numeric literal: {n}"),
-                    })
-                }
-            }
+            Value::Number(n, _) => Ok(DmlScalarExpr::Literal(DmlLiteral::Number(n.clone()))),
             Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
                 Ok(DmlScalarExpr::Literal(DmlLiteral::String(s.clone())))
             }
@@ -462,7 +511,7 @@ pub fn lower_scalar_expr(expr: &SpExpr) -> Result<DmlScalarExpr, SqlError> {
             expr,
         } => Ok(DmlScalarExpr::BinaryArith {
             op: DmlArithOp::Sub,
-            left: Box::new(DmlScalarExpr::Literal(DmlLiteral::Int(0))),
+            left: Box::new(DmlScalarExpr::Literal(DmlLiteral::Number("0".to_string()))),
             right: Box::new(lower_scalar_expr(expr)?),
         }),
         SpExpr::UnaryOp {

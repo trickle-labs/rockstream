@@ -408,6 +408,23 @@ pub async fn start_gateway_with_shard_and_catalog(
     shard_path: &str,
     catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    if catalog.get_durable_store().is_none() {
+        let durable_catalog = match rockstream_storage::catalog::DurableCatalogStore::recover(
+            store.clone(),
+            shard_path,
+        )
+        .await
+        {
+            Ok(recovered) => Arc::new(recovered),
+            Err(_) => Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
+                store.clone(),
+                shard_path,
+            )),
+        };
+        catalog.set_durable_store(durable_catalog);
+        let _ = catalog.sync_from_durable_store().await;
+    }
+
     // Flush to create the initial manifest so ShardReader can open on a fresh node.
     shard_db.flush().await.map_err(|e| {
         CliError::new(
@@ -591,7 +608,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         return Err(CliError::new(
             RS_4017,
             "connector.removed: cold-tier configuration has been removed",
-            "Use RockStream to Kafka to a downstream writer for cold-tier output.",
+            "Kafka sink row export is currently unsupported; see docs/connector-migration.md.",
         ));
     }
 
@@ -2695,7 +2712,7 @@ mod tests {
                 control_shared_storage: None, query_time_shard_dirs: Vec::new(),
                 shutdown_timeout_secs: None,
             }).unwrap_err();
-            assert_eq!(err.to_string(), "RS-4017 connector.removed: cold-tier configuration has been removed\n  next steps: Use RockStream to Kafka to a downstream writer for cold-tier output.");
+            assert_eq!(err.to_string(), "RS-4017 connector.removed: cold-tier configuration has been removed\n  next steps: Kafka sink row export is currently unsupported; see docs/connector-migration.md.");
         }
     }
 
