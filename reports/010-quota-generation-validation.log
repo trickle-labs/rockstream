@@ -113,3 +113,197 @@ test v072_cross_category_admission_cannot_oversubscribe_worker ... ok
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
 
 
+
+COMMAND ["cargo", "test", "-p", "rockstream-types", "state_budget"]
+   Compiling rockstream-types v0.71.0 (/home/runner/work/rockstream/rockstream/candidate/crates/rockstream-types)
+    Finished `test` profile [unoptimized] target(s) in 25.25s
+     Running unittests src/lib.rs (target/debug/deps/rockstream_types-986345ae2062aa70)
+
+running 15 tests
+test state_budget::tests::acquire_within_budget_succeeds ... ok
+test state_budget::tests::acquire_over_budget_fails ... ok
+test state_budget::tests::distributed_quota_ledger_bounded_capacity ... ok
+test state_budget::tests::distributed_quota_ledger_parallelism_cap ... ok
+test state_budget::tests::distributed_quota_ledger_prospective_rejection ... ok
+test state_budget::tests::operator_name_in_error ... ok
+test state_budget::tests::exact_budget_boundary_accepted ... ok
+test state_budget::tests::arc_shared_between_threads ... ok
+test state_budget::tests::release_saturates_at_zero ... ok
+test state_budget::tests::release_reduces_counter ... ok
+test state_budget::tests::unlimited_quota_counter_overflow_is_rs5004_and_does_not_wrap ... ok
+test state_budget::tests::utilization_fraction ... ok
+test state_budget::tests::utilization_zero_max_is_infinity ... ok
+test state_budget::tests::workload_budget_enforcement ... ok
+test state_budget::tests::quota_boundary_proptest ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 232 filtered out; finished in 0.01s
+
+     Running tests/arrangement_spec_isolation_tests.rs (target/debug/deps/arrangement_spec_isolation_tests-e17edb2cb3e21656)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/arrangement_spec_unit_tests.rs (target/debug/deps/arrangement_spec_unit_tests-dc5b7bbdef4862b6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/candidate_identity_unit_tests.rs (target/debug/deps/candidate_identity_unit_tests-a9f502078110ffa8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/canonical_type_tests.rs (target/debug/deps/canonical_type_tests-ea41a99e18e020fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/capability_unit_tests.rs (target/debug/deps/capability_unit_tests-b254a177538afdd2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/capacity_guidance_determinism_tests.rs (target/debug/deps/capacity_guidance_determinism_tests-9ce892705fd9180d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/capacity_profile_calibration_tests.rs (target/debug/deps/capacity_profile_calibration_tests-4daedbd8009e4769)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/capacity_release_gate_tests.rs (target/debug/deps/capacity_release_gate_tests-eb8180ee20b19887)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/capacity_threshold_manifest_tests.rs (target/debug/deps/capacity_threshold_manifest_tests-fbc5dfef41d38559)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/config_resolver_tests.rs (target/debug/deps/config_resolver_tests-b8e170e969f576ec)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/config_validation_tests.rs (target/debug/deps/config_validation_tests-e7c3168d828627f5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/diagnostic_bounds_tests.rs (target/debug/deps/diagnostic_bounds_tests-fd1c50bc58f7ceee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/diagnostic_occurrence_tests.rs (target/debug/deps/diagnostic_occurrence_tests-461b712d601ee739)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/diagnostic_redaction_tests.rs (target/debug/deps/diagnostic_redaction_tests-cbd14809b0cab982)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/docs_conformance_tests.rs (target/debug/deps/docs_conformance_tests-a4040c7519c4eba5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/error_catalog_tests.rs (target/debug/deps/error_catalog_tests-bde9e36ccd677379)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 27 filtered out; finished in 0.00s
+
+     Running tests/evidence_manifest_tests.rs (target/debug/deps/evidence_manifest_tests-a58a3b1d9a9199dd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/merge_law_composable_flag_tests.rs (target/debug/deps/merge_law_composable_flag_tests-02828b6d5d109165)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/qualification_harness_mutation_tests.rs (target/debug/deps/qualification_harness_mutation_tests-6054fb49ad482947)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/qualification_identity_tests.rs (target/debug/deps/qualification_identity_tests-f0bcbd8c54fb9a42)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/qualification_metrics_tests.rs (target/debug/deps/qualification_metrics_tests-c59ba6d8ba23c8d9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/qualification_release_gate_tests.rs (target/debug/deps/qualification_release_gate_tests-5364faa4e5cd8be5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/r1_exchange_counter_tests.rs (target/debug/deps/r1_exchange_counter_tests-13eb57fd80f05c27)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/storage_url_tests.rs (target/debug/deps/storage_url_tests-6c7cd875eccdc8a7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/v072_quota_generation_tests.rs (target/debug/deps/v072_quota_generation_tests-519447bb62e03df2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/v072_worker_budget_tests.rs (target/debug/deps/v072_worker_budget_tests-c5cbb258450f7686)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/worker_budget_ledger_tests.rs (target/debug/deps/worker_budget_ledger_tests-c30094f3959edab4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/worker_config_tests.rs (target/debug/deps/worker_config_tests-fc0ef1986d017eb2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+

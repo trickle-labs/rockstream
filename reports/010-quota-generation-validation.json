@@ -13,6 +13,17 @@
       ],
       "exit_code": 0,
       "log_sha256": "55db36bc9f032d78031dab542352ac756cdc9744103983d46a09f02ff39ef845"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "rockstream-types",
+        "state_budget"
+      ],
+      "exit_code": 0,
+      "log_sha256": "eb268b6e7693d2acd693865a7426f780f69467e635c7fb6d0f85537d03d12e5b"
     }
   ],
   "id": "010-quota-generation-validation",
