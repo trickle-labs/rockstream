@@ -1,26 +1,6 @@
 {
-  "checks": [
-    {
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "rockstream-ops",
-        "--test",
-        "v072_commit_bounds_tests",
-        "--test",
-        "group_commit_timer_tests",
-        "--test",
-        "group_commit_durability_lfs_tests"
-      ],
-      "exit_code": 101,
-      "log_sha256": "5a64250c8bd059613d9fd2c0ae7d457d2be63836dd07d9bbc60f5ec5aec065e6"
-    }
-  ],
-  "id": "008-commit-driver-tests",
-  "kind": "test",
-  "request_commit": "9d5dc53f4c5df435381ab0dae55d81493bf459b9",
+  "id": "shutdown",
   "source": "e04f1252b66820a28b4af2fb5c161316ef3789ec",
-  "status": "failed",
+  "status": "bounded-lifetime-ended",
   "workspace_run": "38929758838"
 }
