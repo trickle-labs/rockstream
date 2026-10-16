@@ -78,7 +78,10 @@ fn run(
         };
         let (columns, rows) = run(&cte.query, &resolve, session, outer)?;
         let alias = identifier(&cte.alias.name);
-        if ctes.insert(alias, CatalogResponse::Rows { columns, rows }).is_some() {
+        if ctes
+            .insert(alias, CatalogResponse::Rows { columns, rows })
+            .is_some()
+        {
             return Err("[RS-2026] duplicate catalog CTE alias".into());
         }
     }
