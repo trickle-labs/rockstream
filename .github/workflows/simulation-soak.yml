@@ -1,15 +1,8 @@
 name: Simulation Soak
 
-# Runs a continuous stream of seeded SimRuntime executions against main.
-# Introduced in v0.22 as part of the Chaos and Recovery SLO Gate milestone.
-#
-# Schedule: every 6 hours on main.
-# On push to main: triggered immediately (keeps the corpus fresh).
-#
-# Exit criteria (v0.22):
-#   - ≥100 000 simulation seeds pass per run.
-#   - Corpus includes ≥1 seed per registered merge law.
-#   - Failing seeds are stored as regression seeds and block release.
+# Every six hours and on main: legacy model checks plus a bounded production
+# source M3 + Int64 SUM/COUNT/AVG + pre-ack restart scenario (#125).
+# The legacy 100k seed loop is not production operator/recovery evidence.
 
 on:
   schedule:
@@ -28,8 +21,9 @@ env:
 
 jobs:
   soak:
-    name: Simulation soak (100k seeds)
+    name: Model checks and incremental recovery seeds
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -38,6 +32,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run simulation soak tests
         run: cargo test -p rockstream-sim --features simulation --test chaos_tests -- --nocapture
+      - name: Verify bounded production incremental recovery seeds
+        env:
+          ROCKSTREAM_INCREMENTAL_CHAOS_SEEDS: "32"
+          ROCKSTREAM_INCREMENTAL_CHAOS_ARTIFACT_DIR: ${{ github.workspace }}/target/incremental-chaos
+        run: cargo test -p rockstream-sim --features simulation --test chaos_tests incremental_chaos::bounded_seed_run -- --exact
+      - name: Upload incremental recovery histories and transitions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: incremental-chaos
+          path: target/incremental-chaos/
+          if-no-files-found: error
       - name: Verify seed corpus covers all registered laws
         run: |
           cargo test -p rockstream-sim --features simulation --test chaos_tests \
