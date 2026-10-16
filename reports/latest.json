@@ -1,12 +1,8 @@
 {
-  "changed_files": [
-    "tools/r1-local-harness/tests/summary_regeneration.rs"
-  ],
-  "id": "003-harness-lint",
-  "kind": "patch",
-  "request_commit": "091caca80c3f0564252ca324d527ed1c32177b2c",
+  "id": "004-harness-checks",
+  "kind": "test",
+  "request_commit": "1110d8e5f77a23ae331c7dd80809aa833dcf87b4",
   "source": "68df1307aea53f8a12236a1d48fcdbd2f9cb4c0b",
-  "status": "prepared",
-  "tree": "67caf17025046e725164c2d580b632608ca131dc",
+  "status": "running",
   "workspace_run": "38929758838"
 }

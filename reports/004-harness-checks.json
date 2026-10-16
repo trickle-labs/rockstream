@@ -1,0 +1,8 @@
+{
+  "id": "004-harness-checks",
+  "kind": "test",
+  "request_commit": "1110d8e5f77a23ae331c7dd80809aa833dcf87b4",
+  "source": "68df1307aea53f8a12236a1d48fcdbd2f9cb4c0b",
+  "status": "running",
+  "workspace_run": "38929758838"
+}
