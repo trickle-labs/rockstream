@@ -54,6 +54,7 @@ enum HarnessCommand {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Write a matrix inventory only; this command executes no measurements.
     Matrix {
         #[arg(long)]
         output: PathBuf,
@@ -184,8 +185,9 @@ fn prepare(profile: &Path, corpus: &Path) -> Result<()> {
     let profile_bytes = fs::read(profile).with_context(|| format!("read {}", profile.display()))?;
     let corpus_bytes = fs::read(corpus).with_context(|| format!("read {}", corpus.display()))?;
     let profile_value: toml::Value =
-        toml::from_slice(&profile_bytes).context("parse profile TOML")?;
-    let corpus_value: toml::Value = toml::from_slice(&corpus_bytes).context("parse corpus TOML")?;
+        toml::from_str(std::str::from_utf8(&profile_bytes)?).context("parse profile TOML")?;
+    let corpus_value: toml::Value =
+        toml::from_str(std::str::from_utf8(&corpus_bytes)?).context("parse corpus TOML")?;
     atomic_json(
         &output.join("profile.json"),
         &PreparedArtifact {
@@ -297,82 +299,24 @@ fn structural(output: &Path) -> Result<()> {
 }
 
 fn run_matrix(output: &Path) -> Result<()> {
-    let defined = r1_local_harness::matrix::default_matrix_cells();
-    let mut results = Vec::new();
-    let mut runnable_count = 0;
-    let mut blocked_count = 0;
-
-    for cell in defined {
-        match cell.status {
-            r1_local_harness::matrix::MatrixCellStatus::RunnableStandalone => {
-                runnable_count += 1;
-                results.push(r1_local_harness::matrix::MatrixExecutionResult {
-                    cell_id: cell.cell_id,
-                    area: cell.area,
-                    status: "MEASURED".to_string(),
-                    owning_milestone: None,
-                    blocker_description: None,
-                    throughput_rows_per_sec: Some(5000.0),
-                    read_p99_ms: Some(2.5),
-                    commit_p99_ms: Some(9.0),
-                    freshness_p99_ms: Some(25.0),
-                    state_writes_per_change: Some(1.0),
-                    lookup_cost_ms: if cell.lookup_cost_separated {
-                        Some(0.5)
-                    } else {
-                        None
-                    },
-                    worker_pids: vec![std::process::id()],
-                    worker_active: true,
-                    error: None,
-                });
-            }
-            r1_local_harness::matrix::MatrixCellStatus::Blocked {
-                owning_milestone,
-                blocker_description,
-            } => {
-                blocked_count += 1;
-                results.push(r1_local_harness::matrix::MatrixExecutionResult {
-                    cell_id: cell.cell_id,
-                    area: cell.area,
-                    status: "BLOCKED".to_string(),
-                    owning_milestone: Some(owning_milestone),
-                    blocker_description: Some(blocker_description),
-                    throughput_rows_per_sec: None,
-                    read_p99_ms: None,
-                    commit_p99_ms: None,
-                    freshness_p99_ms: None,
-                    state_writes_per_change: None,
-                    lookup_cost_ms: None,
-                    worker_pids: Vec::new(),
-                    worker_active: false,
-                    error: None,
-                });
-            }
-        }
+    if output.join("matrix-report.json").exists() {
+        bail!("refusing to mix an inventory plan with an existing matrix-report.json");
     }
-
-    let report = r1_local_harness::matrix::MatrixReport {
-        schema_version: 1,
-        cells: results,
-        all_areas_covered: true,
-        runnable_measured_count: runnable_count,
-        blocked_count,
-    };
-
-    r1_local_harness::matrix::verify_matrix(&report)?;
+    let plan = serde_json::json!({
+        "schema_version": 1,
+        "kind": "matrix_plan",
+        "measurements_executed": false,
+        "cells": r1_local_harness::matrix::default_matrix_cells(),
+    });
     fs::create_dir_all(output)?;
-    atomic_json(&output.join("matrix-report.json"), &report)?;
-    println!(
-        "Matrix evaluation complete: {} runnable measured, {} blocked",
-        runnable_count, blocked_count
-    );
+    atomic_json(&output.join("matrix-plan.json"), &plan)?;
+    println!("Matrix plan written; no benchmark measurements were executed.");
     Ok(())
 }
 
 fn qualify_negative(evidence: &Path) -> Result<()> {
     r1_local_harness::negative::qualify_evidence(evidence)?;
-    println!("Negative qualification passed: all failure checks verified");
+    println!("Evidence integrity checks passed; capacity qualification is separate.");
     Ok(())
 }
 
@@ -445,6 +389,8 @@ async fn run_workload(name: &str, workers: usize, output: &Path) -> Result<()> {
                 &thresholds_path,
             )
             .await?;
+            // Exploratory records are not accepted qualification evidence. Missing
+            // optional counters are explicit and qualify_sample rejects them.
             append_jsonl(&output.join("raw-samples.jsonl"), &sample)?;
         }
     }
@@ -523,6 +469,9 @@ async fn run_side(
     let result: Result<RawSample> = async {
         let after = cluster.process_snapshots()?;
         let (observed_workers, operator_counters) = cluster.observed_workers().await?;
+        if before.len() != after.len() {
+            bail!("process inventory changed during repetition");
+        }
         if workers_before
             .iter()
             .map(|worker| (worker.worker_id, worker.pid))
@@ -542,8 +491,14 @@ async fn run_side(
                 Ok(ProcessUsage {
                     role,
                     pid,
-                    user_cpu_ns: after.user_cpu_ns.saturating_sub(before.user_cpu_ns),
-                    system_cpu_ns: after.system_cpu_ns.saturating_sub(before.system_cpu_ns),
+                    user_cpu_ns: after
+                        .user_cpu_ns
+                        .checked_sub(before.user_cpu_ns)
+                        .context("process user CPU counter decreased")?,
+                    system_cpu_ns: after
+                        .system_cpu_ns
+                        .checked_sub(before.system_cpu_ns)
+                        .context("process system CPU counter decreased")?,
                     rss_bytes: after.rss_bytes,
                 })
             })
@@ -551,32 +506,47 @@ async fn run_side(
         let measurement_workers = observed_workers
             .iter()
             .zip(&workers_before)
-            .map(
-                |(after, before)| r1_local_harness::metrics::WorkerActivity {
+            .map(|(after, before)| {
+                Ok(r1_local_harness::metrics::WorkerActivity {
                     worker_id: after.worker_id,
                     pid: after.pid,
                     shards_owned: after.shards_owned,
-                    input_rows: after.input_rows.saturating_sub(before.input_rows),
-                    output_rows: after.output_rows.saturating_sub(before.output_rows),
-                    state_writes: after.state_writes.saturating_sub(before.state_writes),
-                    exchange_bytes: after.exchange_bytes.saturating_sub(before.exchange_bytes),
-                },
-            )
-            .collect::<Vec<_>>();
+                    input_rows: after
+                        .input_rows
+                        .checked_sub(before.input_rows)
+                        .context("worker input counter decreased")?,
+                    output_rows: after
+                        .output_rows
+                        .checked_sub(before.output_rows)
+                        .context("worker output counter decreased")?,
+                    state_writes: after
+                        .state_writes
+                        .checked_sub(before.state_writes)
+                        .context("worker state-write counter decreased")?,
+                    exchange_bytes: after
+                        .exchange_bytes
+                        .checked_sub(before.exchange_bytes)
+                        .context("worker exchange counter decreased")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if operator_counters.keys().ne(operator_counters_before.keys()) {
+            bail!("operator counter inventory changed during repetition");
+        }
         let operator_counters = operator_counters
             .into_iter()
             .map(|(name, after)| {
-                (
-                    name.clone(),
-                    after.saturating_sub(*operator_counters_before.get(&name).unwrap_or(&0)),
-                )
+                let before = operator_counters_before[&name];
+                let delta = after
+                    .checked_sub(before)
+                    .with_context(|| format!("operator counter {name} decreased"))?;
+                Ok((name, delta))
             })
-            .collect();
+            .collect::<Result<BTreeMap<_, _>>>()?;
         let logical_bytes = loaded.logical_bytes;
-        let exchange_bytes = measurement_workers
-            .iter()
-            .map(|worker| worker.exchange_bytes)
-            .sum();
+        let exchange_bytes = measurement_workers.iter().try_fold(0u64, |total, worker| {
+            total.checked_add(worker.exchange_bytes).context("exchange byte total overflow")
+        })?;
         let sample = RawSample {
             schema_version: 1,
             run_id: run_id.to_string(),
@@ -592,7 +562,7 @@ async fn run_side(
             worker_count: if side.candidate.kind == "baseline_rebuild" {
                 0
             } else {
-                workers as u32
+                workers.try_into().context("worker count exceeds u32")?
             },
             seed: workload.seed,
             change_stream_sha256: change_sha256.to_string(),
@@ -611,6 +581,8 @@ async fn run_side(
             logical_bytes,
             lfs_bytes: cluster.lfs_bytes()?,
             exchange_bytes,
+            // Legacy schema requires this field. It remains uninstrumented;
+            // these exploratory samples fail the qualification gate below.
             max_queue_depth: 0,
             operator_counters,
             workers: measurement_workers,
@@ -618,21 +590,20 @@ async fn run_side(
             rockstream_output_sha256: rockstream_sha256.clone(),
             sqlite_oracle_output_sha256: oracle_sha256.clone(),
             outputs_equal: rockstream_sha256 == oracle_sha256,
-            state_writes_per_change: Some(1.0),
-            intermediate_rows_per_change: Some(1.0),
-            network_bytes_per_change: Some(
-                exchange_bytes as f64 / loaded.accepted_changes.max(1) as f64,
-            ),
-            object_store_requests_per_change: Some(0.0),
-            read_p99_ms: Some(2.5),
-            commit_p99_ms: Some(8.5),
-            freshness_p99_ms: Some(20.0),
-            generator_delay_p99_ms: Some(1.0),
-            generator_queue_drops: Some(0),
-            timeouts_and_errors: Some(0),
-            queue_age_ms: Some(0.5),
-            control_node_load: Some(0.1),
-            physical_flushes_per_epoch: Some(1.0),
+            // Do not replace missing measurements with convenient constants.
+            state_writes_per_change: None,
+            intermediate_rows_per_change: None,
+            network_bytes_per_change: None,
+            object_store_requests_per_change: None,
+            read_p99_ms: None,
+            commit_p99_ms: None,
+            freshness_p99_ms: None,
+            generator_delay_p99_ms: None,
+            generator_queue_drops: None,
+            timeouts_and_errors: None,
+            queue_age_ms: None,
+            control_node_load: None,
+            physical_flushes_per_epoch: None,
         };
         sample.validate()?;
         Ok(sample)
