@@ -1,53 +1,223 @@
-diff --git a/crates/rockstream-ops/src/group_commit/physical.rs b/crates/rockstream-ops/src/group_commit/physical.rs
---- a/crates/rockstream-ops/src/group_commit/physical.rs
-+++ b/crates/rockstream-ops/src/group_commit/physical.rs
-@@ -67,6 +67,12 @@
-     max_epochs: usize,
+diff --git a/crates/rockstream-types/src/state_budget.rs b/crates/rockstream-types/src/state_budget.rs
+index 2b2d41b..3e62e24 100644
+--- a/crates/rockstream-types/src/state_budget.rs
++++ b/crates/rockstream-types/src/state_budget.rs
+@@ -137,7 +137,9 @@ impl WorkloadBudget {
+     pub fn try_acquire(&self, bytes: u64) -> Result<(), StateBudgetError> {
+         loop {
+             let current = self.current_bytes.load(Ordering::Relaxed);
+-            let proposed = current.saturating_add(bytes);
++            let proposed = current
++                .checked_add(bytes)
++                .ok_or_else(|| quota_overflow_error("workload-memory", current, bytes))?;
+             if self.max_bytes > 0 && proposed > self.max_bytes {
+                 return Err(StateBudgetError {
+                     operator_name: format!("workload-{}", self.workload_id.0),
+@@ -306,7 +308,12 @@ impl StateBudget {
+         // not both "succeed" and overshoot the budget together.
+         loop {
+             let current = self.current_bytes.load(Ordering::Relaxed);
+-            let proposed = current.saturating_add(bytes);
++            let Some(proposed) = current.checked_add(bytes) else {
++                if let Some(ref wl) = self.workload_budget {
++                    wl.release(bytes);
++                }
++                return Err(quota_overflow_error("operator-memory", current, bytes));
++            };
+             if proposed > self.max_bytes {
+                 if let Some(ref wl) = self.workload_budget {
+                     wl.release(bytes);
+@@ -365,9 +372,6 @@ impl StateBudget {
+     ///
+     /// Saturates at zero rather than wrapping.
+     pub fn release(&self, bytes: u64) {
+-        if let Some(ref wl) = self.workload_budget {
+-            wl.release(bytes);
+-        }
+         // Saturating subtract via compare-exchange loop.
+         loop {
+             let current = self.current_bytes.load(Ordering::Relaxed);
+@@ -379,6 +383,9 @@ impl StateBudget {
+                 Ordering::Relaxed,
+             ) {
+                 Ok(_) => {
++                    if let Some(ref wl) = self.workload_budget {
++                        wl.release(current - proposed);
++                    }
+                     if self.max_bytes > 0 {
+                         let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
+                         if pct < 95.0 {
+@@ -398,17 +405,24 @@ impl StateBudget {
+     /// Reset the usage counter to zero. For use in tests only.
+     #[doc(hidden)]
+     pub fn reset(&self) {
++        let released = self.current_bytes.swap(0, Ordering::Relaxed);
+         if let Some(ref wl) = self.workload_budget {
+-            wl.current_bytes.store(0, Ordering::Relaxed);
+-            wl.notice_emitted_80.store(false, Ordering::Relaxed);
+-            wl.warning_emitted_95.store(false, Ordering::Relaxed);
++            wl.release(released);
+         }
+-        self.current_bytes.store(0, Ordering::Relaxed);
+         self.notice_emitted_80.store(false, Ordering::Relaxed);
+         self.warning_emitted_95.store(false, Ordering::Relaxed);
+     }
  }
  
-+impl Drop for Inner {
++// The final operator owner must not leave a charge in its shared workload.
++impl Drop for StateBudget {
 +    fn drop(&mut self) {
-+        self.notify.notify_one();
++        if let Some(ref wl) = self.workload_budget {
++            wl.release(*self.current_bytes.get_mut());
++        }
 +    }
 +}
 +
- /// Coherent fill observations. Retained quantities include in-flight and retry
- /// storage, not just the visible pending map.
- #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-@@ -221,6 +227,7 @@
-         state.retained_epochs += 1;
-         state.retained_operations = proposed_operations;
--        state.force_flush |= proposed == self.inner.max_bytes || state.retained_epochs == self.inner.max_epochs;
-+        let force_flush = proposed == self.inner.max_bytes || state.retained_epochs == self.inner.max_epochs;
-+        state.force_flush |= force_flush;
-         drop(state);
-         self.ensure_driver();
-         self.inner.notify.notify_one();
-diff --git a/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs b/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
---- a/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
-+++ b/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
-@@ -187,7 +187,7 @@
-     let reopened = PhysicalCommitGroup::open(db.clone()).await.unwrap();
-     assert_eq!(reopened.committed_epoch(), Some(9));
--    assert_eq!(reopened.add_epoch(9, batch(b"wrong")).unwrap_err().to_string(), "[RS-0001] Internal operator error: logical epoch 9 is not newer than the sealed physical frontier Some(9); next_steps: inspect operator invariants and logs");
-+    assert_eq!(reopened.add_epoch(9, batch(b"wrong")).unwrap_err().to_string(), "[RS-0001] Internal error: logical epoch 9 is not newer than the sealed physical frontier Some(9); next_steps: report this issue");
-     assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"before-restart".to_vec()));
-     reopened.commit_epoch(10, batch(b"after-restart")).await.unwrap();
-     assert_eq!(reopened.committed_epoch(), Some(10));
-     assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"after-restart".to_vec()));
-diff --git a/crates/rockstream-ops/tests/group_commit_timer_tests.rs b/crates/rockstream-ops/tests/group_commit_timer_tests.rs
---- a/crates/rockstream-ops/tests/group_commit_timer_tests.rs
-+++ b/crates/rockstream-ops/tests/group_commit_timer_tests.rs
-@@ -203,6 +203,10 @@
-     let start = Instant::now();
--    let big_batch = make_batch("big", 600);
--    assert!(big_batch.byte_size() >= 600);
-+    let oversized = make_batch("big", 600);
-+    let before = group.fill();
-+    assert_eq!(group.add_epoch(1, oversized).unwrap_err().to_string(), "[RS-1015] Consolidation capacity exceeded for physical_commit_bytes (605/500); next_steps: apply backpressure, reduce the complete epoch, or recover the failed physical commit");
-+    assert_eq!(group.fill(), before);
-+    let big_batch = make_batch("big", 495);
-+    assert_eq!(big_batch.byte_size(), 500);
+ /// Alias for `StateBudget` as used by operators.
+ pub type StateBudgetMeter = StateBudget;
  
-     group.commit_epoch(1, big_batch).await.unwrap();
+@@ -437,6 +451,31 @@ impl WorkloadQuotaLedgerEntry {
+             current_parallelism: AtomicU64::new(0),
+         }
+     }
++
++    fn release(&self, bytes: u64, parallelism: u32) {
++        loop {
++            let current = self.current_memory_bytes.load(Ordering::Relaxed);
++            let proposed = current.saturating_sub(bytes);
++            if self
++                .current_memory_bytes
++                .compare_exchange_weak(current, proposed, Ordering::Relaxed, Ordering::Relaxed)
++                .is_ok()
++            {
++                break;
++            }
++        }
++        loop {
++            let current_p = self.current_parallelism.load(Ordering::Relaxed);
++            let proposed_p = current_p.saturating_sub(parallelism as u64);
++            if self
++                .current_parallelism
++                .compare_exchange_weak(current_p, proposed_p, Ordering::Relaxed, Ordering::Relaxed)
++                .is_ok()
++            {
++                break;
++            }
++        }
++    }
+ }
  
+ /// Thread-safe distributed quota ledger for prospective worker-side quota consultation
+@@ -444,6 +483,8 @@ impl WorkloadQuotaLedgerEntry {
+ #[derive(Debug)]
+ pub struct DistributedQuotaLedger {
+     entries: dashmap::DashMap<WorkloadId, Arc<WorkloadQuotaLedgerEntry>>,
++    // Registry mutations share one admission boundary across DashMap shards.
++    registry_lock: parking_lot::Mutex<()>,
+     max_workloads: usize,
+     total_reservations: AtomicU64,
+     total_rejections: AtomicU64,
+@@ -465,6 +506,7 @@ impl DistributedQuotaLedger {
+     pub fn with_capacity(max_workloads: usize) -> Self {
+         Self {
+             entries: dashmap::DashMap::new(),
++            registry_lock: parking_lot::Mutex::new(()),
+             max_workloads,
+             total_reservations: AtomicU64::new(0),
+             total_rejections: AtomicU64::new(0),
+@@ -478,6 +520,7 @@ impl DistributedQuotaLedger {
+         memory_limit_bytes: u64,
+         max_parallelism: u32,
+     ) -> Result<(), StateBudgetError> {
++        let _registry = self.registry_lock.lock();
+         if !self.entries.contains_key(&workload_id) && self.entries.len() >= self.max_workloads {
+             return Err(StateBudgetError {
+                 operator_name: format!("ledger-capacity-{}", workload_id.0),
+@@ -508,6 +551,7 @@ impl DistributedQuotaLedger {
+ 
+     /// Unregister a workload from the ledger.
+     pub fn unregister_workload(&self, workload_id: WorkloadId) {
++        let _registry = self.registry_lock.lock();
+         self.entries.remove(&workload_id);
+     }
+ 
+@@ -525,7 +569,7 @@ impl DistributedQuotaLedger {
+         parallelism: u32,
+     ) -> Result<QuotaGuard, StateBudgetError> {
+         let entry = self.entries.get(&workload_id).map(|r| r.value().clone());
+-        if let Some(entry) = entry {
++        if let Some(ref entry) = entry {
+             let memory_limit = entry.memory_limit_bytes.load(Ordering::Relaxed);
+             if memory_limit > 0 {
+                 loop {
+@@ -660,44 +704,18 @@ impl DistributedQuotaLedger {
+         }
+         self.total_reservations.fetch_add(1, Ordering::Relaxed);
+         Ok(QuotaGuard {
+-            ledger: Some(self.clone()),
+-            workload_id,
++            entry,
+             bytes: requested_bytes,
+             parallelism,
+             released: false,
+         })
+     }
+ 
+-    /// Release batch resources from the ledger.
++    /// Release batch resources for the currently registered workload.
++    /// Reservation guards release their original entry directly, even after removal.
+     pub fn release_batch(&self, workload_id: WorkloadId, bytes: u64, parallelism: u32) {
+         if let Some(entry) = self.entries.get(&workload_id) {
+-            loop {
+-                let current = entry.current_memory_bytes.load(Ordering::Relaxed);
+-                let proposed = current.saturating_sub(bytes);
+-                if entry
+-                    .current_memory_bytes
+-                    .compare_exchange_weak(current, proposed, Ordering::Relaxed, Ordering::Relaxed)
+-                    .is_ok()
+-                {
+-                    break;
+-                }
+-            }
+-            loop {
+-                let current_p = entry.current_parallelism.load(Ordering::Relaxed);
+-                let proposed_p = current_p.saturating_sub(parallelism as u64);
+-                if entry
+-                    .current_parallelism
+-                    .compare_exchange_weak(
+-                        current_p,
+-                        proposed_p,
+-                        Ordering::Relaxed,
+-                        Ordering::Relaxed,
+-                    )
+-                    .is_ok()
+-                {
+-                    break;
+-                }
+-            }
++            entry.release(bytes, parallelism);
+         }
+     }
+ 
+@@ -726,8 +744,8 @@ impl DistributedQuotaLedger {
+ /// RAII Guard for prospective quota batch reservation. Automatically releases resources when dropped.
+ #[derive(Debug)]
+ pub struct QuotaGuard {
+-    ledger: Option<Arc<DistributedQuotaLedger>>,
+-    workload_id: WorkloadId,
++    // Keep the allocation owner, not a reusable workload ID.
++    entry: Option<Arc<WorkloadQuotaLedgerEntry>>,
+     bytes: u64,
+     parallelism: u32,
+     released: bool,
+@@ -737,8 +755,8 @@ impl QuotaGuard {
+     /// Explicitly release quota reservation without dropping.
+     pub fn release(&mut self) {
+         if !self.released {
+-            if let Some(ref ledger) = self.ledger {
+-                ledger.release_batch(self.workload_id, self.bytes, self.parallelism);
++            if let Some(ref entry) = self.entry {
++                entry.release(self.bytes, self.parallelism);
+             }
+             self.released = true;
+         }
