@@ -1,0 +1,14 @@
+diff --git a/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs b/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
+index 411e44d..ec85bb4 100644
+--- a/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
++++ b/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
+@@ -170,7 +170,8 @@ fn v072_unknown_statuses_and_false_area_are_rejected() {
+ 
+ #[test]
+ fn v072_missing_metrics_cannot_skip_validation() {
+-    let mutations: [(&str, fn(&mut MatrixExecutionResult)); 6] = [
++    type Mutation = (&'static str, fn(&mut MatrixExecutionResult));
++    let mutations: [Mutation; 6] = [
+         ("throughput_rows_per_sec", |cell| {
+             cell.throughput_rows_per_sec = None
+         }),
