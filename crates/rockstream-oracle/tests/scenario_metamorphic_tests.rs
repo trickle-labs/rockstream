@@ -263,7 +263,7 @@ async fn scalar_expressions_filter_superset() {
 
 // ── Slice 8 (connector/sink) — replay idempotence ───────────────────────────
 //
-// The 3 connector/sink Core capabilities have no SQL surface, so these use
+// The Core sources and Experimental marker sink have no SQL surface, so these use
 // replay idempotence directly against the real Postgres/Kafka connector
 // types: running the identical scenario twice, each against its own fresh
 // container/state, must yield the same observed outcome.

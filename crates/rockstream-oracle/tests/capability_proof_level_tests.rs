@@ -38,11 +38,33 @@ fn every_core_capability_meets_min_proof_level() {
         .filter(|item| item.get("tier").and_then(|t| t.as_str()) == Some("Core"))
         .collect();
 
+    let mut core_ids: Vec<_> = core_capabilities
+        .iter()
+        .map(|item| {
+            item["id"]
+                .as_str()
+                .expect("Core capability must have an id")
+        })
+        .collect();
+    core_ids.sort_unstable();
     assert_eq!(
-        core_capabilities.len(),
-        15,
-        "expected exactly 15 Core capabilities, found {}",
-        core_capabilities.len()
+        core_ids,
+        [
+            "connector.kafka-source",
+            "connector.postgres-cdc",
+            "language.aggregates.exact",
+            "language.dml",
+            "language.historical-streaming-reads",
+            "language.joins.equi-integer",
+            "language.query-read",
+            "language.scalar-expressions",
+            "language.session-freshness",
+            "language.transaction-semantics",
+            "language.view-on-view-dag",
+            "language.views",
+            "language.window.slide",
+            "language.window.tumble",
+        ]
     );
 
     for item in core_capabilities {

@@ -276,8 +276,8 @@ async fn views_matches_postgres() {
 
 // ── Slice 7 (connector/sink) — differential vs. the real source/sink system ──
 //
-// The 3 connector/sink Core capabilities (`connector.postgres-cdc`,
-// `connector.kafka-source`, `sink.kafka`) have no SQL surface, so they reuse
+// The Core sources (`connector.postgres-cdc`, `connector.kafka-source`) and
+// Experimental marker sink (`sink.kafka`) have no SQL surface, so they reuse
 // the same `ScenarioTranscript`/`Oracle` machinery above but build their two
 // sides directly from connector-level observations rather than through a
 // `ScenarioDriver`: one side drives the real `rockstream_connectors` type
