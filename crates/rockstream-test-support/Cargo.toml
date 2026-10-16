@@ -7,6 +7,8 @@ license.workspace = true
 description = "Shared test helpers for RockStream"
 
 [dependencies]
+arrow.workspace = true
+datafusion.workspace = true
 rcgen = { workspace = true }
 tempfile = { workspace = true }
 rockstream-types = { workspace = true }

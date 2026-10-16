@@ -1,6 +1,7 @@
 pub mod external_harness;
 pub mod minio;
 pub mod pki;
+pub mod typed_output;
 
 pub fn docker_available() -> bool {
     docker_available_when(

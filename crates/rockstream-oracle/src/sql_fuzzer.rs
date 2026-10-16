@@ -8,6 +8,11 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
+use rockstream_test_support::typed_output::{
+    add_batch_rows, compare_results, empty_result, OracleMismatch, TypedResult,
+};
+#[cfg(test)]
+use rockstream_test_support::typed_output::{OracleField, RowWeightMismatch};
 
 use rockstream_ops::aggregate::AggregateOp;
 use rockstream_ops::distinct::DistinctOp;
@@ -925,101 +930,8 @@ pub fn build_exec_node(plan: &PlanNode, next_id: &mut u64) -> ExecNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OracleField {
-    data_type: DataType,
-    nullable: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TypedResult {
-    fields: Vec<OracleField>,
-    rows: HashMap<Vec<ScalarValue>, i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RowWeightMismatch {
-    row: Vec<ScalarValue>,
-    expected_weight: i64,
-    actual_weight: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OracleMismatch {
-    Schema {
-        expected: Vec<OracleField>,
-        actual: Vec<OracleField>,
-    },
-    Rows(Vec<RowWeightMismatch>),
-}
-
-fn empty_result(schema: &Schema) -> TypedResult {
-    TypedResult {
-        // The planner IR carries positional columns but drops projection aliases.
-        fields: schema
-            .fields()
-            .iter()
-            .map(|field| OracleField {
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-            })
-            .collect(),
-        rows: HashMap::new(),
-    }
-}
-
-fn add_batch_rows(result: &mut TypedResult, batch: &RecordBatch, weights: &[i64]) {
-    assert_eq!(weights.len(), batch.num_rows());
-    for (row_idx, &weight) in weights.iter().enumerate() {
-        let row: Vec<ScalarValue> = batch
-            .columns()
-            .iter()
-            .map(|column| ScalarValue::try_from_array(column, row_idx).unwrap())
-            .collect();
-        let net = result.rows.entry(row.clone()).or_insert(0);
-        *net += weight;
-        if *net == 0 {
-            result.rows.remove(&row);
-        }
-    }
-}
-
 fn accumulate_output(out: &ArrowZSet, acc: &mut TypedResult) {
     add_batch_rows(acc, &out.data, &out.weights);
-}
-
-fn compare_results(expected: &TypedResult, actual: &TypedResult) -> Result<(), OracleMismatch> {
-    if expected.fields != actual.fields {
-        return Err(OracleMismatch::Schema {
-            expected: expected.fields.clone(),
-            actual: actual.fields.clone(),
-        });
-    }
-
-    let rows: std::collections::HashSet<_> = expected
-        .rows
-        .keys()
-        .chain(actual.rows.keys())
-        .cloned()
-        .collect();
-    let mut differences: Vec<_> = rows
-        .into_iter()
-        .filter_map(|row| {
-            let expected_weight = expected.rows.get(&row).copied().unwrap_or(0);
-            let actual_weight = actual.rows.get(&row).copied().unwrap_or(0);
-            (expected_weight != actual_weight).then_some(RowWeightMismatch {
-                row,
-                expected_weight,
-                actual_weight,
-            })
-        })
-        .collect();
-    differences.sort_by_key(|difference| format!("{:?}", difference.row));
-    if differences.is_empty() {
-        Ok(())
-    } else {
-        Err(OracleMismatch::Rows(differences))
-    }
 }
 
 async fn run_df_batch(ctx: &SessionContext, query: &str) -> Result<TypedResult, String> {
