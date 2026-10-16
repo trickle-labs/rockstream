@@ -1,0 +1,853 @@
+diff --git a/crates/rockstream-ops/src/group_commit.rs b/crates/rockstream-ops/src/group_commit.rs
+index 0d06e1f..f7a67a4 100644
+--- a/crates/rockstream-ops/src/group_commit.rs
++++ b/crates/rockstream-ops/src/group_commit.rs
+@@ -6,11 +6,14 @@
+ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex};
+ 
+-use rockstream_storage::{ShardDb, WriteBatch};
+ use crate::error::OpError;
++use rockstream_storage::{ShardDb, WriteBatch};
+ 
+ mod physical;
+-pub use physical::{PhysicalCommitFill, PhysicalCommitGroup, GROUP_COMMIT_IO_TIMEOUT_MS, MAX_GROUP_COMMIT_OPERATIONS};
++pub use physical::{
++    PhysicalCommitFill, PhysicalCommitGroup, GROUP_COMMIT_IO_TIMEOUT_MS,
++    MAX_GROUP_COMMIT_OPERATIONS,
++};
+ 
+ /// Maximum pending operator write fragments.
+ pub const GROUP_COMMIT_MAX_BATCHES: usize = 64;
+@@ -55,20 +58,32 @@ impl GroupCommit {
+         Ok(())
+     }
+ 
+-    pub fn add_mutations(&self, mutations: Vec<rockstream_types::state_mutation::StateMutation>) -> Result<(), OpError> {
+-        if mutations.is_empty() { return Ok(()); }
++    pub fn add_mutations(
++        &self,
++        mutations: Vec<rockstream_types::state_mutation::StateMutation>,
++    ) -> Result<(), OpError> {
++        if mutations.is_empty() {
++            return Ok(());
++        }
+         let mut wb = WriteBatch::new();
+         for mutation in mutations {
+             match mutation {
+-                rockstream_types::state_mutation::StateMutation::Put { key, value } => wb.put(&key, &value),
++                rockstream_types::state_mutation::StateMutation::Put { key, value } => {
++                    wb.put(&key, &value)
++                }
+                 rockstream_types::state_mutation::StateMutation::Delete { key } => wb.delete(&key),
+-                rockstream_types::state_mutation::StateMutation::Merge { key, operand, .. } => wb.merge(&key, &operand),
++                rockstream_types::state_mutation::StateMutation::Merge { key, operand, .. } => {
++                    wb.merge(&key, &operand)
++                }
+             }
+         }
+         self.add_batch(wb)
+     }
+ 
+-    pub fn add_epoch_delta(&self, delta: rockstream_types::state_mutation::EpochStateDelta) -> Result<(), OpError> {
++    pub fn add_epoch_delta(
++        &self,
++        delta: rockstream_types::state_mutation::EpochStateDelta,
++    ) -> Result<(), OpError> {
+         self.add_mutations(delta.mutations)
+     }
+ 
+@@ -79,9 +94,13 @@ impl GroupCommit {
+             std::mem::take(&mut *pending)
+         };
+         let count = batches.len();
+-        if count == 0 { return Ok(0); }
++        if count == 0 {
++            return Ok(0);
++        }
+         let mut merged = WriteBatch::new();
+-        for batch in batches.iter().cloned() { merged.merge_from(batch); }
++        for batch in batches.iter().cloned() {
++            merged.merge_from(batch);
++        }
+         if let Err(error) = self.db.write_batch(merged).await {
+             let mut pending = self.pending.lock().expect("GroupCommit mutex poisoned");
+             pending.extend(batches);
+@@ -92,8 +111,12 @@ impl GroupCommit {
+         Ok(count)
+     }
+ 
+-    pub fn fill_level(&self) -> usize { self.fill_level.load(Ordering::Relaxed) }
+-    pub fn commit_count(&self) -> u64 { self.commit_count.load(Ordering::Relaxed) }
++    pub fn fill_level(&self) -> usize {
++        self.fill_level.load(Ordering::Relaxed)
++    }
++    pub fn commit_count(&self) -> u64 {
++        self.commit_count.load(Ordering::Relaxed)
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -107,10 +130,21 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn add_batch_respects_bound() { assert_eq!(GROUP_COMMIT_MAX_BATCHES, 64); }
++    fn add_batch_respects_bound() {
++        assert_eq!(GROUP_COMMIT_MAX_BATCHES, 64);
++    }
+ 
+     #[test]
+     fn physical_group_bound_is_named() {
+-        assert_eq!((PHYSICAL_COMMIT_GROUP_MAX_EPOCHS, MAX_GROUP_COMMIT_PENDING_BYTES, MAX_GROUP_COMMIT_WAITERS, DEFAULT_GROUP_COMMIT_MAX_DELAY_MS, MAX_GROUP_COMMIT_RETRY_COUNT), (64, 8 * 1024 * 1024, 1024, 10, 3));
++        assert_eq!(
++            (
++                PHYSICAL_COMMIT_GROUP_MAX_EPOCHS,
++                MAX_GROUP_COMMIT_PENDING_BYTES,
++                MAX_GROUP_COMMIT_WAITERS,
++                DEFAULT_GROUP_COMMIT_MAX_DELAY_MS,
++                MAX_GROUP_COMMIT_RETRY_COUNT
++            ),
++            (64, 8 * 1024 * 1024, 1024, 10, 3)
++        );
+     }
+ }
+diff --git a/crates/rockstream-ops/src/group_commit/physical.rs b/crates/rockstream-ops/src/group_commit/physical.rs
+index 6c240da..a2c436b 100644
+--- a/crates/rockstream-ops/src/group_commit/physical.rs
++++ b/crates/rockstream-ops/src/group_commit/physical.rs
+@@ -68,6 +68,12 @@ struct Inner {
+     max_epochs: usize,
+ }
+ 
++impl Drop for Inner {
++    fn drop(&mut self) {
++        self.notify.notify_one();
++    }
++}
++
+ /// Coherent fill observations. Retained quantities include in-flight and retry
+ /// storage, not just the visible pending map.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -96,9 +102,18 @@ impl WaiterSlot {
+         let mut current = counter.load(Ordering::Acquire);
+         loop {
+             if current >= MAX_GROUP_COMMIT_WAITERS {
+-                return Err(capacity("physical_commit_waiters", current, MAX_GROUP_COMMIT_WAITERS));
++                return Err(capacity(
++                    "physical_commit_waiters",
++                    current,
++                    MAX_GROUP_COMMIT_WAITERS,
++                ));
+             }
+-            match counter.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
++            match counter.compare_exchange_weak(
++                current,
++                current + 1,
++                Ordering::AcqRel,
++                Ordering::Acquire,
++            ) {
+                 Ok(_) => return Ok(Self(counter.clone())),
+                 Err(actual) => current = actual,
+             }
+@@ -126,7 +141,12 @@ impl Drop for FlushRequest {
+ }
+ 
+ fn capacity(resource: &'static str, current: usize, limit: usize) -> OpError {
+-    OpError::capacity_exceeded(resource, current, limit, "apply backpressure, reduce the complete epoch, or recover the failed physical commit")
++    OpError::capacity_exceeded(
++        resource,
++        current,
++        limit,
++        "apply backpressure, reduce the complete epoch, or recover the failed physical commit",
++    )
+ }
+ 
+ fn diagnostic(error: impl std::fmt::Display) -> String {
+@@ -144,10 +164,20 @@ fn diagnostic(error: impl std::fmt::Display) -> String {
+ impl PhysicalCommitGroup {
+     /// Construct an empty commit owner. Use `open` when reopening persisted state.
+     pub fn new(db: Arc<ShardDb>) -> Self {
+-        Self::with_config(db, DEFAULT_GROUP_COMMIT_MAX_DELAY_MS, MAX_GROUP_COMMIT_PENDING_BYTES, PHYSICAL_COMMIT_GROUP_MAX_EPOCHS)
++        Self::with_config(
++            db,
++            DEFAULT_GROUP_COMMIT_MAX_DELAY_MS,
++            MAX_GROUP_COMMIT_PENDING_BYTES,
++            PHYSICAL_COMMIT_GROUP_MAX_EPOCHS,
++        )
+     }
+ 
+-    pub fn with_config(db: Arc<ShardDb>, max_delay_ms: u64, max_pending_bytes: usize, max_epochs: usize) -> Self {
++    pub fn with_config(
++        db: Arc<ShardDb>,
++        max_delay_ms: u64,
++        max_pending_bytes: usize,
++        max_epochs: usize,
++    ) -> Self {
+         let group = Self {
+             inner: Arc::new(Inner {
+                 db,
+@@ -170,12 +200,24 @@ impl PhysicalCommitGroup {
+         let bytes = tokio::time::timeout(
+             Duration::from_millis(GROUP_COMMIT_IO_TIMEOUT_MS),
+             db.get(&ShardKeyEncoder::frontier_key()),
+-        ).await.map_err(|_| OpError::internal("physical commit frontier read timed out; reopen the shard before admission"))?
+-            .map_err(OpError::storage)?;
+-        let frontier = bytes.map(|bytes| {
+-            let value: [u8; 8] = bytes.as_ref().try_into().map_err(|_| OpError::internal("persisted physical commit frontier must contain exactly eight bytes"))?;
+-            Ok::<_, OpError>(u64::from_be_bytes(value))
+-        }).transpose()?;
++        )
++        .await
++        .map_err(|_| {
++            OpError::internal(
++                "physical commit frontier read timed out; reopen the shard before admission",
++            )
++        })?
++        .map_err(OpError::storage)?;
++        let frontier = bytes
++            .map(|bytes| {
++                let value: [u8; 8] = bytes.as_ref().try_into().map_err(|_| {
++                    OpError::internal(
++                        "persisted physical commit frontier must contain exactly eight bytes",
++                    )
++                })?;
++                Ok::<_, OpError>(u64::from_be_bytes(value))
++            })
++            .transpose()?;
+         let group = Self::new(db);
+         {
+             let mut state = group.inner.state.lock();
+@@ -185,12 +227,24 @@ impl PhysicalCommitGroup {
+         Ok(group)
+     }
+ 
+-    pub fn fill_level(&self) -> usize { self.inner.state.lock().pending.len() }
+-    pub fn pending_epochs(&self) -> usize { self.fill_level() }
+-    pub fn pending_bytes(&self) -> usize { self.inner.state.lock().retained_bytes }
+-    pub fn active_waiters(&self) -> usize { self.inner.active_waiters.load(Ordering::Acquire) }
+-    pub fn last_committed(&self) -> Epoch { self.committed_epoch().unwrap_or(0) }
+-    pub fn committed_epoch(&self) -> Option<Epoch> { self.inner.state.lock().last_committed }
++    pub fn fill_level(&self) -> usize {
++        self.inner.state.lock().pending.len()
++    }
++    pub fn pending_epochs(&self) -> usize {
++        self.fill_level()
++    }
++    pub fn pending_bytes(&self) -> usize {
++        self.inner.state.lock().retained_bytes
++    }
++    pub fn active_waiters(&self) -> usize {
++        self.inner.active_waiters.load(Ordering::Acquire)
++    }
++    pub fn last_committed(&self) -> Epoch {
++        self.committed_epoch().unwrap_or(0)
++    }
++    pub fn committed_epoch(&self) -> Option<Epoch> {
++        self.inner.state.lock().last_committed
++    }
+     pub fn outcome_unknown(&self) -> bool {
+         let state = self.inner.state.lock();
+         state.write_outcome_unknown || !state.uncertain.is_empty()
+@@ -213,40 +267,93 @@ impl PhysicalCommitGroup {
+     }
+ 
+     fn ensure_driver(&self) {
+-        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
+-        if self.inner.driver_started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+-            runtime.spawn(drive(Arc::downgrade(&self.inner), self.inner.notify.clone()));
++        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
++            return;
++        };
++        if self
++            .inner
++            .driver_started
++            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
++            .is_ok()
++        {
++            runtime.spawn(drive(
++                Arc::downgrade(&self.inner),
++                self.inner.notify.clone(),
++            ));
+         }
+     }
+ 
+-    fn stage(&self, epoch: Epoch, batch: WriteBatch, waiter: Option<EpochReply>) -> Result<(), OpError> {
++    fn stage(
++        &self,
++        epoch: Epoch,
++        batch: WriteBatch,
++        waiter: Option<EpochReply>,
++    ) -> Result<(), OpError> {
+         let bytes = batch.byte_size();
+         let operations = batch.len();
+         let mut state = self.inner.state.lock();
+         if state.closing || state.retry_required {
+             return Err(OpError::internal("physical commit admission is stopped; flush recovery or reopen the shard before adding another epoch"));
+         }
+-        if state.sealed_epoch.is_some_and(|sealed| epoch <= sealed) || state.pending.contains_key(&epoch) {
+-            return Err(OpError::internal(format!("logical epoch {epoch} is not newer than the sealed physical frontier {:?}", state.sealed_epoch)));
++        if state.sealed_epoch.is_some_and(|sealed| epoch <= sealed)
++            || state.pending.contains_key(&epoch)
++        {
++            return Err(OpError::internal(format!(
++                "logical epoch {epoch} is not newer than the sealed physical frontier {:?}",
++                state.sealed_epoch
++            )));
+         }
+-        let proposed = state.retained_bytes.checked_add(bytes)
++        let proposed = state
++            .retained_bytes
++            .checked_add(bytes)
+             .ok_or_else(|| capacity("physical_commit_bytes", usize::MAX, self.inner.max_bytes))?;
+         if proposed > self.inner.max_bytes {
+-            return Err(capacity("physical_commit_bytes", proposed, self.inner.max_bytes));
++            return Err(capacity(
++                "physical_commit_bytes",
++                proposed,
++                self.inner.max_bytes,
++            ));
+         }
+         if state.retained_epochs >= self.inner.max_epochs {
+-            return Err(capacity("physical_commit_epochs", state.retained_epochs, self.inner.max_epochs));
++            return Err(capacity(
++                "physical_commit_epochs",
++                state.retained_epochs,
++                self.inner.max_epochs,
++            ));
+         }
+-        let proposed_operations = state.retained_operations.checked_add(operations)
+-            .ok_or_else(|| capacity("physical_commit_operations", usize::MAX, MAX_GROUP_COMMIT_OPERATIONS))?;
++        let proposed_operations = state
++            .retained_operations
++            .checked_add(operations)
++            .ok_or_else(|| {
++                capacity(
++                    "physical_commit_operations",
++                    usize::MAX,
++                    MAX_GROUP_COMMIT_OPERATIONS,
++                )
++            })?;
+         if proposed_operations > MAX_GROUP_COMMIT_OPERATIONS {
+-            return Err(capacity("physical_commit_operations", proposed_operations, MAX_GROUP_COMMIT_OPERATIONS));
++            return Err(capacity(
++                "physical_commit_operations",
++                proposed_operations,
++                MAX_GROUP_COMMIT_OPERATIONS,
++            ));
+         }
+-        state.pending.insert(epoch, Entry { batch, bytes, operations, staged_at: Instant::now(), waiter });
++        state.pending.insert(
++            epoch,
++            Entry {
++                batch,
++                bytes,
++                operations,
++                staged_at: Instant::now(),
++                waiter,
++            },
++        );
+         state.retained_bytes = proposed;
+         state.retained_epochs += 1;
+         state.retained_operations = proposed_operations;
+-        state.force_flush |= proposed == self.inner.max_bytes || state.retained_epochs == self.inner.max_epochs;
++        let force_flush =
++            proposed == self.inner.max_bytes || state.retained_epochs == self.inner.max_epochs;
++        state.force_flush |= force_flush;
+         drop(state);
+         self.ensure_driver();
+         self.inner.notify.notify_one();
+@@ -261,7 +368,9 @@ impl PhysicalCommitGroup {
+         let _slot = WaiterSlot::acquire(&self.inner.active_waiters)?;
+         let (sender, receiver) = oneshot::channel();
+         self.stage(epoch, batch, Some(sender))?;
+-        receiver.await.map_err(|_| OpError::internal("physical commit owner stopped before acknowledgement"))?
++        receiver
++            .await
++            .map_err(|_| OpError::internal("physical commit owner stopped before acknowledgement"))?
+             .map_err(OpError::internal)
+     }
+ 
+@@ -273,14 +382,23 @@ impl PhysicalCommitGroup {
+         let id = {
+             let mut state = self.inner.state.lock();
+             let id = state.next_request;
+-            state.next_request = id.checked_add(1).ok_or_else(|| OpError::internal("physical commit request sequence exhausted; reopen the owner"))?;
++            state.next_request = id.checked_add(1).ok_or_else(|| {
++                OpError::internal("physical commit request sequence exhausted; reopen the owner")
++            })?;
+             state.requests.insert(id, sender);
+             id
+         };
+-        let _request = FlushRequest { owner: Arc::downgrade(&self.inner), id };
++        let _request = FlushRequest {
++            owner: Arc::downgrade(&self.inner),
++            id,
++        };
+         self.ensure_driver();
+         self.inner.notify.notify_one();
+-        receiver.await.map_err(|_| OpError::internal("physical commit owner stopped before flush completion"))?
++        receiver
++            .await
++            .map_err(|_| {
++                OpError::internal("physical commit owner stopped before flush completion")
++            })?
+             .map_err(OpError::internal)
+     }
+ 
+@@ -297,7 +415,9 @@ impl PhysicalCommitGroup {
+ }
+ 
+ impl Drop for PhysicalCommitGroup {
+-    fn drop(&mut self) { self.inner.notify.notify_one(); }
++    fn drop(&mut self) {
++        self.inner.notify.notify_one();
++    }
+ }
+ 
+ struct Flight {
+@@ -314,7 +434,9 @@ impl Drop for Flight {
+         if let Some(mut entries) = self.entries.take() {
+             let error = "physical commit driver stopped during storage I/O; reopen the shard and reconcile the durable frontier".to_owned();
+             for entry in entries.values_mut() {
+-                if let Some(waiter) = entry.waiter.take() { let _ = waiter.send(Err(error.clone())); }
++                if let Some(waiter) = entry.waiter.take() {
++                    let _ = waiter.send(Err(error.clone()));
++                }
+             }
+             let mut state = self.owner.state.lock();
+             state.uncertain.append(&mut entries);
+@@ -322,7 +444,9 @@ impl Drop for Flight {
+             state.retry_required = true;
+             state.write_outcome_unknown = true;
+             for id in &self.requests {
+-                if let Some(reply) = state.requests.remove(id) { let _ = reply.send(Err(error.clone())); }
++                if let Some(reply) = state.requests.remove(id) {
++                    let _ = reply.send(Err(error.clone()));
++                }
+             }
+             self.owner.driver_started.store(false, Ordering::Release);
+             self.owner.notify.notify_one();
+@@ -347,7 +471,9 @@ async fn persist(flight: &Flight) -> Outcome {
+         // are bounded by three payload envelopes. Operation metadata has its own
+         // named bound. SlateDB's internal buffers are accounted separately.
+         let mut merged = WriteBatch::new();
+-        for entry in entries.values() { merged.merge_from(entry.batch.clone()); }
++        for entry in entries.values() {
++            merged.merge_from(entry.batch.clone());
++        }
+         if let Some(last) = entries.keys().next_back() {
+             merged.put(&ShardKeyEncoder::frontier_key(), &last.to_be_bytes());
+         }
+@@ -366,30 +492,49 @@ async fn persist(flight: &Flight) -> Outcome {
+         let error = match tokio::time::timeout(timeout, flight.owner.db.flush()).await {
+             Ok(Ok(())) => return Outcome::Durable,
+             Ok(Err(error)) => diagnostic(error),
+-            Err(_) => "physical flush timed out after a successful write; durability remains unknown".to_owned(),
++            Err(_) => {
++                "physical flush timed out after a successful write; durability remains unknown"
++                    .to_owned()
++            }
+         };
+         if attempt + 1 == MAX_GROUP_COMMIT_RETRY_COUNT {
+-            assert_eq!(persistence::commit_outcome(true, false), persistence::COMMIT_UNKNOWN);
++            assert_eq!(
++                persistence::commit_outcome(true, false),
++                persistence::COMMIT_UNKNOWN
++            );
+             return Outcome::FlushUnknown(error);
+         }
+         tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
+     }
+-    Outcome::WriteUnknown("physical commit retry configuration did not execute an attempt".to_owned())
++    Outcome::WriteUnknown(
++        "physical commit retry configuration did not execute an attempt".to_owned(),
++    )
+ }
+ 
+ fn finish(mut flight: Flight, outcome: Outcome) {
+-    let Some(mut entries) = flight.entries.take() else { return; };
++    let Some(mut entries) = flight.entries.take() else {
++        return;
++    };
+     let epochs = entries.keys().copied().collect::<Vec<_>>();
+-    let waiters = entries.values_mut().filter_map(|entry| entry.waiter.take()).collect::<Vec<_>>();
++    let waiters = entries
++        .values_mut()
++        .filter_map(|entry| entry.waiter.take())
++        .collect::<Vec<_>>();
+     let bytes = entries.values().map(|entry| entry.bytes).sum::<usize>();
+-    let operations = entries.values().map(|entry| entry.operations).sum::<usize>();
++    let operations = entries
++        .values()
++        .map(|entry| entry.operations)
++        .sum::<usize>();
+     let result = match outcome {
+         Outcome::Durable => {
+             // Free the actual retained batches before releasing capacity or acking.
+             drop(entries);
+             let mut state = flight.owner.state.lock();
+             if let Some(last) = epochs.last().copied() {
+-                assert!(state.last_committed.is_none_or(|previous| last >= previous), "M1-S8: physical group committed epoch must be monotonic");
++                assert!(
++                    state.last_committed.is_none_or(|previous| last >= previous),
++                    "M1-S8: physical group committed epoch must be monotonic"
++                );
+                 state.last_committed = Some(last);
+             }
+             state.retained_bytes -= bytes;
+@@ -405,8 +550,14 @@ fn finish(mut flight: Flight, outcome: Outcome) {
+             state.in_flight = false;
+             state.retry_required = true;
+             let error = match failed {
+-                Outcome::WriteFailed(error) => { state.pending.append(&mut entries); error }
+-                Outcome::FlushUnknown(error) => { state.uncertain.append(&mut entries); error }
++                Outcome::WriteFailed(error) => {
++                    state.pending.append(&mut entries);
++                    error
++                }
++                Outcome::FlushUnknown(error) => {
++                    state.uncertain.append(&mut entries);
++                    error
++                }
+                 Outcome::WriteUnknown(error) => {
+                     state.write_outcome_unknown = true;
+                     state.uncertain.append(&mut entries);
+@@ -417,16 +568,22 @@ fn finish(mut flight: Flight, outcome: Outcome) {
+             Err(error)
+         }
+     };
+-    for waiter in waiters { let _ = waiter.send(result.as_ref().map(|_| ()).map_err(Clone::clone)); }
++    for waiter in waiters {
++        let _ = waiter.send(result.as_ref().map(|_| ()).map_err(Clone::clone));
++    }
+     let mut state = flight.owner.state.lock();
+     for id in &flight.requests {
+-        if let Some(reply) = state.requests.remove(id) { let _ = reply.send(result.clone()); }
++        if let Some(reply) = state.requests.remove(id) {
++            let _ = reply.send(result.clone());
++        }
+     }
+ }
+ 
+ async fn drive(owner: Weak<Inner>, notify: Arc<Notify>) {
+     loop {
+-        let Some(inner) = owner.upgrade() else { return; };
++        let Some(inner) = owner.upgrade() else {
++            return;
++        };
+         let (flight, delay) = {
+             let mut state = inner.state.lock();
+             if state.write_outcome_unknown && !state.requests.is_empty() {
+@@ -438,19 +595,42 @@ async fn drive(owner: Weak<Inner>, notify: Arc<Notify>) {
+             let due = oldest.is_some_and(|oldest| oldest.elapsed() >= inner.max_delay);
+             let requested = !state.requests.is_empty();
+             let ready = requested || (!state.retry_required && (due || state.force_flush));
+-            if ready && (!state.pending.is_empty() || !state.uncertain.is_empty()) && !state.write_outcome_unknown {
++            if ready
++                && (!state.pending.is_empty() || !state.uncertain.is_empty())
++                && !state.write_outcome_unknown
++            {
+                 let flush_only = !state.uncertain.is_empty();
+-                let entries = if flush_only { std::mem::take(&mut state.uncertain) } else { std::mem::take(&mut state.pending) };
+-                if let Some(last) = entries.keys().next_back().copied() { state.sealed_epoch = Some(last); }
++                let entries = if flush_only {
++                    std::mem::take(&mut state.uncertain)
++                } else {
++                    std::mem::take(&mut state.pending)
++                };
++                if let Some(last) = entries.keys().next_back().copied() {
++                    state.sealed_epoch = Some(last);
++                }
+                 state.in_flight = true;
+                 state.force_flush = false;
+                 let requests = state.requests.keys().copied().collect();
+-                (Some(Flight { owner: inner.clone(), entries: Some(entries), requests, flush_only }), None)
++                (
++                    Some(Flight {
++                        owner: inner.clone(),
++                        entries: Some(entries),
++                        requests,
++                        flush_only,
++                    }),
++                    None,
++                )
+             } else {
+                 if requested && state.pending.is_empty() && state.uncertain.is_empty() {
+-                    for (_, reply) in std::mem::take(&mut state.requests) { let _ = reply.send(Ok(Vec::new())); }
++                    for (_, reply) in std::mem::take(&mut state.requests) {
++                        let _ = reply.send(Ok(Vec::new()));
++                    }
+                 }
+-                let delay = if state.retry_required { None } else { oldest.map(|oldest| inner.max_delay.saturating_sub(oldest.elapsed())) };
++                let delay = if state.retry_required {
++                    None
++                } else {
++                    oldest.map(|oldest| inner.max_delay.saturating_sub(oldest.elapsed()))
++                };
+                 (None, delay)
+             }
+         };
+diff --git a/crates/rockstream-ops/tests/group_commit_timer_tests.rs b/crates/rockstream-ops/tests/group_commit_timer_tests.rs
+index 4d9eb3f..51abb16 100644
+--- a/crates/rockstream-ops/tests/group_commit_timer_tests.rs
++++ b/crates/rockstream-ops/tests/group_commit_timer_tests.rs
+@@ -198,8 +198,12 @@ async fn test_byte_limit_triggers_immediate_flush() {
+     let group = Arc::new(PhysicalCommitGroup::with_config(db, 5000, 500, 64));
+ 
+     let start = Instant::now();
+-    let big_batch = make_batch("big", 600);
+-    assert!(big_batch.byte_size() >= 600);
++    let oversized = make_batch("big", 600);
++    let before = group.fill();
++    assert_eq!(group.add_epoch(1, oversized).unwrap_err().to_string(), "[RS-1015] Consolidation capacity exceeded for physical_commit_bytes (605/500); next_steps: apply backpressure, reduce the complete epoch, or recover the failed physical commit");
++    assert_eq!(group.fill(), before);
++    let big_batch = make_batch("big", 495);
++    assert_eq!(big_batch.byte_size(), 500);
+ 
+     group.commit_epoch(1, big_batch).await.unwrap();
+ 
+diff --git a/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs b/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
+index 013a115..9a2783d 100644
+--- a/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
++++ b/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
+@@ -3,7 +3,9 @@ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use object_store::local::LocalFileSystem;
+-use rockstream_ops::group_commit::{PhysicalCommitFill, PhysicalCommitGroup, MAX_GROUP_COMMIT_OPERATIONS};
++use rockstream_ops::group_commit::{
++    PhysicalCommitFill, PhysicalCommitGroup, MAX_GROUP_COMMIT_OPERATIONS,
++};
+ use rockstream_storage::{ShardDb, WriteBatch};
+ use tempfile::TempDir;
+ 
+@@ -22,8 +24,12 @@ fn batch(value: &[u8]) -> WriteBatch {
+ 
+ async fn until(mut condition: impl FnMut() -> bool) {
+     tokio::time::timeout(Duration::from_secs(10), async {
+-        while !condition() { tokio::task::yield_now().await; }
+-    }).await.expect("commit owner failed to reach the expected state");
++        while !condition() {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("commit owner failed to reach the expected state");
+ }
+ 
+ fn empty_fill(bytes: usize, epochs: usize) -> PhysicalCommitFill {
+@@ -51,7 +57,10 @@ async fn v072_first_batch_and_zero_capacity_are_hard_bounds() {
+     assert_eq!(error.to_string(), "[RS-1015] Consolidation capacity exceeded for physical_commit_bytes (11/10); next_steps: apply backpressure, reduce the complete epoch, or recover the failed physical commit");
+     assert_eq!(group.fill(), empty_fill(10, 2));
+     group.commit_epoch(1, batch(&[7; 9])).await.unwrap();
+-    assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(vec![7; 9]));
++    assert_eq!(
++        db.get(b"k").await.unwrap().map(|value| value.to_vec()),
++        Some(vec![7; 9])
++    );
+     assert_eq!(group.committed_epoch(), Some(1));
+     assert_eq!(group.fill(), empty_fill(10, 2));
+ 
+@@ -66,61 +75,95 @@ async fn v072_in_flight_and_unknown_bytes_remain_reserved_until_recovery() {
+     let group = Arc::new(PhysicalCommitGroup::with_config(db.clone(), 60_000, 32, 2));
+     db.set_fail_flushes(true);
+     group.add_epoch(1, batch(&[3; 15])).unwrap();
+-    let flushing = { let group = group.clone(); tokio::spawn(async move { group.flush().await }) };
++    let flushing = {
++        let group = group.clone();
++        tokio::spawn(async move { group.flush().await })
++    };
+     until(|| group.fill().in_flight).await;
+-    assert_eq!(group.fill(), PhysicalCommitFill {
+-        retained_epochs: 1,
+-        retained_bytes: 16,
+-        retained_operations: 1,
+-        active_waiters: 1,
+-        in_flight: true,
+-        ..empty_fill(32, 2)
+-    });
++    assert_eq!(
++        group.fill(),
++        PhysicalCommitFill {
++            retained_epochs: 1,
++            retained_bytes: 16,
++            retained_operations: 1,
++            active_waiters: 1,
++            in_flight: true,
++            ..empty_fill(32, 2)
++        }
++    );
+     assert_eq!(group.add_epoch(2, batch(&[4; 16])).unwrap_err().to_string(), "[RS-1015] Consolidation capacity exceeded for physical_commit_bytes (33/32); next_steps: apply backpressure, reduce the complete epoch, or recover the failed physical commit");
+     assert!(flushing.await.unwrap().is_err());
+     assert_eq!(group.committed_epoch(), None);
+-    assert_eq!(group.fill(), PhysicalCommitFill {
+-        retained_epochs: 1,
+-        retained_bytes: 16,
+-        retained_operations: 1,
+-        retry_required: true,
+-        outcome_unknown: true,
+-        ..empty_fill(32, 2)
+-    });
++    assert_eq!(
++        group.fill(),
++        PhysicalCommitFill {
++            retained_epochs: 1,
++            retained_bytes: 16,
++            retained_operations: 1,
++            retry_required: true,
++            outcome_unknown: true,
++            ..empty_fill(32, 2)
++        }
++    );
+     db.set_fail_flushes(false);
+     assert_eq!(group.flush().await.unwrap(), vec![1]);
+     assert_eq!(group.committed_epoch(), Some(1));
+     assert_eq!(group.fill(), empty_fill(32, 2));
+-    assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(vec![3; 15]));
++    assert_eq!(
++        db.get(b"k").await.unwrap().map(|value| value.to_vec()),
++        Some(vec![3; 15])
++    );
+ }
+ 
+ #[tokio::test]
+ async fn v072_cancelling_acknowledgement_does_not_discard_accepted_epoch() {
+     let (_dir, _store, db) = database("cancel-ack").await;
+-    let group = Arc::new(PhysicalCommitGroup::with_config(db.clone(), 60_000, 1024, 8));
+-    let committing = { let group = group.clone(); tokio::spawn(async move { group.commit_epoch(7, batch(b"exact")).await }) };
++    let group = Arc::new(PhysicalCommitGroup::with_config(
++        db.clone(),
++        60_000,
++        1024,
++        8,
++    ));
++    let committing = {
++        let group = group.clone();
++        tokio::spawn(async move { group.commit_epoch(7, batch(b"exact")).await })
++    };
+     until(|| group.fill().pending_epochs == 1).await;
+     committing.abort();
+     assert!(committing.await.unwrap_err().is_cancelled());
+-    assert_eq!(group.fill(), PhysicalCommitFill {
+-        pending_epochs: 1,
+-        retained_epochs: 1,
+-        retained_bytes: 6,
+-        retained_operations: 1,
+-        ..empty_fill(1024, 8)
+-    });
++    assert_eq!(
++        group.fill(),
++        PhysicalCommitFill {
++            pending_epochs: 1,
++            retained_epochs: 1,
++            retained_bytes: 6,
++            retained_operations: 1,
++            ..empty_fill(1024, 8)
++        }
++    );
+     assert_eq!(group.flush().await.unwrap(), vec![7]);
+     assert_eq!(group.fill(), empty_fill(1024, 8));
+-    assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"exact".to_vec()));
++    assert_eq!(
++        db.get(b"k").await.unwrap().map(|value| value.to_vec()),
++        Some(b"exact".to_vec())
++    );
+ }
+ 
+ #[tokio::test]
+ async fn v072_cancelling_flush_does_not_cancel_driver_owned_storage() {
+     let (_dir, _store, db) = database("cancel-flush").await;
+-    let group = Arc::new(PhysicalCommitGroup::with_config(db.clone(), 60_000, 1024, 8));
++    let group = Arc::new(PhysicalCommitGroup::with_config(
++        db.clone(),
++        60_000,
++        1024,
++        8,
++    ));
+     db.set_fail_flushes(true);
+     group.add_epoch(1, batch(b"durable")).unwrap();
+-    let flushing = { let group = group.clone(); tokio::spawn(async move { group.flush().await }) };
++    let flushing = {
++        let group = group.clone();
++        tokio::spawn(async move { group.flush().await })
++    };
+     until(|| group.fill().in_flight).await;
+     flushing.abort();
+     assert!(flushing.await.unwrap_err().is_cancelled());
+@@ -128,7 +171,10 @@ async fn v072_cancelling_flush_does_not_cancel_driver_owned_storage() {
+     db.set_fail_flushes(false);
+     until(|| group.committed_epoch() == Some(1)).await;
+     assert_eq!(group.fill(), empty_fill(1024, 8));
+-    assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"durable".to_vec()));
++    assert_eq!(
++        db.get(b"k").await.unwrap().map(|value| value.to_vec()),
++        Some(b"durable".to_vec())
++    );
+ }
+ 
+ #[tokio::test]
+@@ -155,7 +201,10 @@ async fn v072_failed_write_keeps_exact_bytes_and_requires_explicit_retry() {
+     db.set_fail_writes(false);
+     assert_eq!(group.flush().await.unwrap(), vec![2]);
+     assert_eq!(group.fill(), empty_fill(1024, 8));
+-    assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"recover".to_vec()));
++    assert_eq!(
++        db.get(b"k").await.unwrap().map(|value| value.to_vec()),
++        Some(b"recover".to_vec())
++    );
+ }
+ 
+ #[tokio::test]
+@@ -163,7 +212,9 @@ async fn v072_empty_operations_cannot_bypass_metadata_limit() {
+     let (_dir, _store, db) = database("operation-bound").await;
+     let group = PhysicalCommitGroup::with_config(db, 60_000, 1024, 8);
+     let mut excessive = WriteBatch::new();
+-    for _ in 0..=MAX_GROUP_COMMIT_OPERATIONS { excessive.delete(b""); }
++    for _ in 0..=MAX_GROUP_COMMIT_OPERATIONS {
++        excessive.delete(b"");
++    }
+     assert_eq!(group.add_epoch(1, excessive).unwrap_err().to_string(), "[RS-1015] Consolidation capacity exceeded for physical_commit_operations (131073/131072); next_steps: apply backpressure, reduce the complete epoch, or recover the failed physical commit");
+     assert_eq!(group.fill(), empty_fill(1024, 8));
+ }
+@@ -173,17 +224,34 @@ async fn v072_restart_recovers_frontier_and_rejects_duplicate_epoch() {
+     let (_dir, store, db) = database("restart-frontier").await;
+     let weak = Arc::downgrade(&db);
+     let group = PhysicalCommitGroup::new(db.clone());
+-    group.commit_epoch(9, batch(b"before-restart")).await.unwrap();
++    group
++        .commit_epoch(9, batch(b"before-restart"))
++        .await
++        .unwrap();
+     group.shutdown().await.unwrap();
+     drop(group);
+     drop(db);
+     until(|| weak.upgrade().is_none()).await;
+-    let db = Arc::new(ShardDb::builder("restart-frontier", store).build().await.unwrap());
++    let db = Arc::new(
++        ShardDb::builder("restart-frontier", store)
++            .build()
++            .await
++            .unwrap(),
++    );
+     let reopened = PhysicalCommitGroup::open(db.clone()).await.unwrap();
+     assert_eq!(reopened.committed_epoch(), Some(9));
+-    assert_eq!(reopened.add_epoch(9, batch(b"wrong")).unwrap_err().to_string(), "[RS-0001] Internal operator error: logical epoch 9 is not newer than the sealed physical frontier Some(9); next_steps: inspect operator invariants and logs");
+-    assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"before-restart".to_vec()));
+-    reopened.commit_epoch(10, batch(b"after-restart")).await.unwrap();
++    assert_eq!(reopened.add_epoch(9, batch(b"wrong")).unwrap_err().to_string(), "[RS-0001] Internal error: logical epoch 9 is not newer than the sealed physical frontier Some(9); next_steps: report this issue");
++    assert_eq!(
++        db.get(b"k").await.unwrap().map(|value| value.to_vec()),
++        Some(b"before-restart".to_vec())
++    );
++    reopened
++        .commit_epoch(10, batch(b"after-restart"))
++        .await
++        .unwrap();
+     assert_eq!(reopened.committed_epoch(), Some(10));
+-    assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"after-restart".to_vec()));
++    assert_eq!(
++        db.get(b"k").await.unwrap().map(|value| value.to_vec()),
++        Some(b"after-restart".to_vec())
++    );
+ }

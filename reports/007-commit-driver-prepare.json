@@ -1,8 +1,15 @@
 {
+  "changed_files": [
+    "crates/rockstream-ops/src/group_commit.rs",
+    "crates/rockstream-ops/src/group_commit/physical.rs",
+    "crates/rockstream-ops/tests/group_commit_timer_tests.rs",
+    "crates/rockstream-ops/tests/v072_commit_bounds_tests.rs"
+  ],
   "id": "007-commit-driver-prepare",
   "kind": "patch",
   "request_commit": "7645b85a30fd59debd330c9df8c0725bfb73bfa5",
-  "source": "16b302ed91cd7f8b7580a55359a23879ce66ce07",
-  "status": "running",
+  "source": "e04f1252b66820a28b4af2fb5c161316ef3789ec",
+  "status": "prepared",
+  "tree": "a8b4e2b096a48816173ea7e215dd0a6067fbadec",
   "workspace_run": "38929758838"
 }
