@@ -1,12 +1,8 @@
 {
-  "changed_files": [
-    "tools/r1-local-harness/tests/v072_matrix_gate_tests.rs"
-  ],
-  "id": "005-harness-mutation-type",
-  "kind": "patch",
-  "request_commit": "31b28adab9522354a7aa7436c2e553b2f2dd4ea7",
+  "id": "006-harness-validation",
+  "kind": "test",
+  "request_commit": "71a9a1aa5a61960141e0e69734d04742b97f3138",
   "source": "b3a01c0f225ecf91bd9b45f11b76e7443853771f",
-  "status": "prepared",
-  "tree": "4c01f4c094f8fa861ed188776c7b2e782af98a2d",
+  "status": "running",
   "workspace_run": "38929758838"
 }
