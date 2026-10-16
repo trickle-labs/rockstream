@@ -25,6 +25,17 @@
       ],
       "exit_code": 0,
       "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "tools/r1-local-harness/Cargo.toml",
+        "--all-targets"
+      ],
+      "exit_code": 0,
+      "log_sha256": "3ac89fd2a8d452d0c8347d1c215dc6780218702a04adf9bb16917ec1d7e00419"
     }
   ],
   "id": "006-harness-validation",
