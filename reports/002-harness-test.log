@@ -1,0 +1,444 @@
+
+COMMAND ["cargo", "test", "--manifest-path", "tools/r1-local-harness/Cargo.toml", "--all-targets"]
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded anstyle-query v1.1.5
+  Downloaded anyhow v1.0.104
+  Downloaded block-buffer v0.10.4
+  Downloaded bitflags v2.13.1
+  Downloaded anstyle-parse v1.0.0
+  Downloaded anstyle v1.0.14
+  Downloaded async-trait v0.1.92
+  Downloaded anstream v1.0.0
+  Downloaded find-msvc-tools v0.1.11
+  Downloaded errno v0.3.14
+  Downloaded crypto-common v0.2.2
+  Downloaded block-buffer v0.12.1
+  Downloaded quote v1.0.47
+  Downloaded utf8parse v0.2.2
+  Downloaded serde_core v1.0.229
+  Downloaded clap_lex v1.1.0
+  Downloaded const-oid v0.10.2
+  Downloaded base64 v0.22.1
+  Downloaded version_check v0.9.5
+  Downloaded unicode-ident v1.0.24
+  Downloaded shlex v2.0.1
+  Downloaded stringprep v0.1.5
+  Downloaded slab v0.4.12
+  Downloaded digest v0.11.3
+  Downloaded cpufeatures v0.2.17
+  Downloaded phf_shared v0.13.1
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded hybrid-array v0.4.14
+  Downloaded generic-array v0.14.7
+  Downloaded fastrand v2.5.0
+  Downloaded cfg-if v1.0.4
+  Downloaded tokio-macros v2.7.2
+  Downloaded itoa v1.0.18
+  Downloaded cpufeatures v0.3.0
+  Downloaded whoami v2.1.3
+  Downloaded colorchoice v1.0.5
+  Downloaded byteorder v1.5.0
+  Downloaded futures-task v0.3.34
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded toml_datetime v0.7.5+spec-1.1.0
+  Downloaded crypto-common v0.1.7
+  Downloaded rand_core v0.10.1
+  Downloaded clap_derive v4.6.4
+  Downloaded chacha20 v0.10.1
+  Downloaded pin-project-lite v0.2.17
+  Downloaded toml_parser v1.1.3+spec-1.1.0
+  Downloaded unicode-properties v0.1.4
+  Downloaded socket2 v0.6.5
+  Downloaded serde v1.0.229
+  Downloaded toml v0.9.12+spec-1.1.0
+  Downloaded unicode-bidi v0.3.18
+  Downloaded hashbrown v0.15.5
+  Downloaded typenum v1.20.1
+  Downloaded tokio-util v0.7.19
+  Downloaded tokio-postgres v0.7.18
+  Downloaded hashbrown v0.17.1
+  Downloaded unicode-normalization v0.1.25
+  Downloaded rusqlite v0.37.0
+  Downloaded winnow v1.0.4
+  Downloaded winnow v0.7.15
+  Downloaded vcpkg v0.2.15
+  Downloaded syn v3.0.3
+  Downloaded futures-util v0.3.34
+  Downloaded serde_json v1.0.151
+  Downloaded rand v0.10.2
+  Downloaded rustix v1.1.4
+  Downloaded memchr v2.8.3
+  Downloaded clap_builder v4.6.6
+  Downloaded mio v1.2.2
+  Downloaded indexmap v2.14.0
+  Downloaded cc v1.4.3
+  Downloaded tempfile v3.27.0
+  Downloaded proc-macro2 v1.0.107
+  Downloaded getrandom v0.4.3
+  Downloaded clap v4.6.6
+  Downloaded toml_writer v1.1.2+spec-1.1.0
+  Downloaded tinyvec v1.12.0
+  Downloaded smallvec v1.15.2
+  Downloaded serde_derive v1.0.229
+  Downloaded parking_lot v0.12.5
+  Downloaded once_cell v1.21.4
+  Downloaded log v0.4.33
+  Downloaded futures-channel v0.3.34
+  Downloaded fallible-iterator v0.2.0
+  Downloaded ctutils v0.4.2
+  Downloaded bytes v1.12.1
+  Downloaded hmac v0.13.0
+  Downloaded hashlink v0.10.0
+  Downloaded libc v0.2.189
+  Downloaded tokio v1.53.1
+  Downloaded zmij v1.0.23
+  Downloaded sha2 v0.11.0
+  Downloaded sha2 v0.10.9
+  Downloaded postgres-types v0.2.14
+  Downloaded pkg-config v0.3.34
+  Downloaded parking_lot_core v0.9.12
+  Downloaded md-5 v0.11.0
+  Downloaded lock_api v0.4.14
+  Downloaded hex v0.4.3
+  Downloaded fallible-iterator v0.3.0
+  Downloaded cmov v0.5.4
+  Downloaded scopeguard v1.2.0
+  Downloaded postgres-protocol v0.6.12
+  Downloaded phf v0.13.1
+  Downloaded futures-core v0.3.34
+  Downloaded foldhash v0.1.5
+  Downloaded digest v0.10.7
+  Downloaded strsim v0.11.1
+  Downloaded siphasher v1.0.3
+  Downloaded serde_spanned v1.1.1
+  Downloaded heck v0.5.0
+  Downloaded fallible-streaming-iterator v0.1.9
+  Downloaded futures-sink v0.3.34
+  Downloaded equivalent v1.0.2
+  Downloaded percent-encoding v2.3.2
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded libsqlite3-sys v0.35.0
+   Compiling libc v0.2.189
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.4
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling hybrid-array v0.4.14
+   Compiling syn v3.0.3
+   Compiling cmov v0.5.4
+   Compiling ctutils v0.4.2
+   Compiling block-buffer v0.12.1
+   Compiling crypto-common v0.2.2
+   Compiling rand_core v0.10.1
+   Compiling const-oid v0.10.2
+   Compiling getrandom v0.4.3
+   Compiling version_check v0.9.5
+   Compiling serde_core v1.0.229
+   Compiling generic-array v0.14.7
+   Compiling digest v0.11.3
+   Compiling parking_lot_core v0.9.12
+   Compiling smallvec v1.15.2
+   Compiling cpufeatures v0.3.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.12.0
+   Compiling shlex v2.0.1
+   Compiling bytes v1.12.1
+   Compiling find-msvc-tools v0.1.11
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling cc v1.4.3
+   Compiling unicode-normalization v0.1.25
+   Compiling chacha20 v0.10.1
+   Compiling errno v0.3.14
+   Compiling futures-core v0.3.34
+   Compiling utf8parse v0.2.2
+   Compiling pkg-config v0.3.34
+   Compiling futures-sink v0.3.34
+   Compiling unicode-bidi v0.3.18
+   Compiling pin-project-lite v0.2.17
+   Compiling vcpkg v0.2.15
+   Compiling unicode-properties v0.1.4
+   Compiling memchr v2.8.3
+   Compiling libsqlite3-sys v0.35.0
+   Compiling stringprep v0.1.5
+   Compiling anstyle-parse v1.0.0
+   Compiling signal-hook-registry v1.4.8
+   Compiling rand v0.10.2
+   Compiling parking_lot v0.12.5
+   Compiling tokio-macros v2.7.2
+   Compiling sha2 v0.11.0
+   Compiling hmac v0.13.0
+   Compiling md-5 v0.11.0
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.2
+   Compiling foldhash v0.1.5
+   Compiling anstyle-query v1.1.5
+   Compiling anstyle v1.0.14
+   Compiling byteorder v1.5.0
+   Compiling fallible-iterator v0.2.0
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling zmij v1.0.23
+   Compiling base64 v0.22.1
+   Compiling rustix v1.1.4
+   Compiling siphasher v1.0.3
+   Compiling bitflags v2.13.1
+   Compiling colorchoice v1.0.5
+   Compiling anstream v1.0.0
+   Compiling phf_shared v0.13.1
+   Compiling postgres-protocol v0.6.12
+   Compiling hashbrown v0.15.5
+   Compiling tokio v1.53.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling winnow v1.0.4
+   Compiling serde_json v1.0.151
+   Compiling anyhow v1.0.104
+   Compiling serde v1.0.229
+   Compiling linux-raw-sys v0.12.1
+   Compiling clap_lex v1.1.0
+   Compiling futures-task v0.3.34
+   Compiling heck v0.5.0
+   Compiling strsim v0.11.1
+   Compiling clap_builder v4.6.6
+   Compiling clap_derive v4.6.4
+   Compiling futures-util v0.3.34
+   Compiling toml_parser v1.1.3+spec-1.1.0
+   Compiling digest v0.10.7
+   Compiling tokio-util v0.7.19
+   Compiling hashlink v0.10.0
+   Compiling postgres-types v0.2.14
+   Compiling phf v0.13.1
+   Compiling futures-channel v0.3.34
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling serde_spanned v1.1.1
+   Compiling async-trait v0.1.92
+   Compiling serde_derive v1.0.229
+   Compiling whoami v2.1.3
+   Compiling percent-encoding v2.3.2
+   Compiling toml_writer v1.1.2+spec-1.1.0
+   Compiling fallible-iterator v0.3.0
+   Compiling winnow v0.7.15
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling once_cell v1.21.4
+   Compiling fastrand v2.5.0
+   Compiling log v0.4.33
+   Compiling cpufeatures v0.2.17
+   Compiling itoa v1.0.18
+   Compiling tokio-postgres v0.7.18
+   Compiling sha2 v0.10.9
+   Compiling tempfile v3.27.0
+   Compiling rusqlite v0.37.0
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling clap v4.6.6
+   Compiling hex v0.4.3
+   Compiling r1-local-harness v0.1.0 (/home/runner/work/rockstream/rockstream/candidate/tools/r1-local-harness)
+    Finished `test` profile [unoptimized] target(s) in 29.77s
+     Running unittests src/lib.rs (tools/r1-local-harness/target/debug/deps/r1_local_harness-a4334cc518f00ccf)
+
+running 7 tests
+test load::tests::inverse_changes_exactly_reverses_a_transaction_sequence ... ok
+test load::tests::inverse_prefix_leaves_the_exact_forward_prefix ... ok
+test load::tests::visibility_query_requests_one_complete_row ... ok
+test metrics::tests::parses_macos_cpu_clock_with_fractional_seconds ... ok
+test metrics::tests::parses_worker_metrics_exactly ... ok
+test report::tests::sample_cv_uses_n_minus_one ... ok
+test oracle::tests::replays_complete_aggregate_and_join_outputs ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (tools/r1-local-harness/target/debug/deps/r1_local_harness-e638c58bf7643a33)
+
+running 1 test
+test tests::shared_arrangement_has_all_three_exact_profiles ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/verify-v072-matrix.rs (tools/r1-local-harness/target/debug/deps/verify_v072_matrix-d48326225e9a633c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/baseline_coordination_tests.rs (tools/r1-local-harness/target/debug/deps/baseline_coordination_tests-8b092eb5525a0ffc)
+
+running 1 test
+test sim_runtime_generator_backpressure_and_timeout_under_delay ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/baseline_durability_tests.rs (tools/r1-local-harness/target/debug/deps/baseline_durability_tests-e2c3829008c7d516)
+
+running 3 tests
+test test_standalone_lfs_baseline_persists_across_restart ... ok
+test test_standalone_minio_baseline_persists_across_restart ... ok
+test test_baseline_cleanup_uses_no_range_delete ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/corpus_determinism.rs (tools/r1-local-harness/target/debug/deps/corpus_determinism-1e66b7a9349b8f9c)
+
+running 1 test
+test fixture_is_byte_exact_and_targets_do_not_overlap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/decision_mutations.rs (tools/r1-local-harness/target/debug/deps/decision_mutations-e4f01354a5657318)
+
+running 1 test
+test rejects_exact_evidence_mutations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/documentation_checks.rs (tools/r1-local-harness/target/debug/deps/documentation_checks-df43d2e8e9b68058)
+
+running 1 test
+test test_r1_local_readme_documents_v0611_baseline_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/harness_matrix_tests.rs (tools/r1-local-harness/target/debug/deps/harness_matrix_tests-94c7be602dbac552)
+
+running 20 tests
+test test_blocked_cell_accounting_4_workers ... ok
+test test_blocked_cell_accounting_2_workers ... ok
+test test_blocked_cell_accounting_8_workers ... ok
+test test_blocked_cell_accounting_beyond_ram ... ok
+test test_blocked_cell_accounting_migration ... ok
+test test_blocked_cell_accounting_one_key_10m ... ok
+test test_blocked_cell_accounting_shared_views ... ok
+test test_blocked_cells_carry_concrete_blocker_and_owner ... ok
+test test_compaction_and_restart_standalone ... ok
+test test_matrix_accounting_covers_all_six_areas ... ok
+test test_one_key_100k_standalone ... ok
+test test_blocked_cell_accounting_worker_loss ... ok
+test test_concurrent_ingestion_and_queries_standalone ... ok
+test test_one_key_1k_standalone ... ok
+test test_runnable_standalone_cells_execute_and_measure ... ok
+test test_standalone_overload_and_backpressure ... ok
+test test_views_standalone_1_view ... ok
+test test_views_standalone_20_views ... ok
+test test_worker_scaling_1_worker_standalone ... ok
+test test_worker_pid_activity_verified ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/metric_decoupling_tests.rs (tools/r1-local-harness/target/debug/deps/metric_decoupling_tests-d1d2362e3ea61820)
+
+running 3 tests
+test test_read_commit_freshness_latency_separation ... ok
+test test_generator_queue_bounds_and_drop_accounting ... ok
+test test_independent_load_schedule_not_completion_throttled ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/negative_qualification_tests.rs (tools/r1-local-harness/target/debug/deps/negative_qualification_tests-9b704d0351bf1604)
+
+running 6 tests
+test test_corrupt_binary_digest_fails ... ok
+test test_inactive_worker_fails_qualification ... ok
+test test_oracle_mismatch_fails_qualification ... ok
+test test_missing_required_cell_fails ... ok
+test test_synthetic_sample_rejected_in_qualification ... ok
+test test_unowned_blocked_cell_fails ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/oracle_validation_tests.rs (tools/r1-local-harness/target/debug/deps/oracle_validation_tests-83ebb6b5b28dbba5)
+
+running 5 tests
+test test_oracle_exact_multiset_match ... ok
+test test_oracle_rejects_missing_row ... ok
+test test_oracle_rejects_duplicate_row ... ok
+test test_oracle_rejects_stale_epoch_output ... ok
+test test_oracle_rejects_wrong_column_value ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/process_isolation.rs (tools/r1-local-harness/target/debug/deps/process_isolation-9ec9535421f653cf)
+
+running 1 test
+test terminate_kills_shell_and_background_descendant ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/profile_contract_tests.rs (tools/r1-local-harness/target/debug/deps/profile_contract_tests-0f9c3e2648716500)
+
+running 3 tests
+test test_write_amplification_rule_frozen_before_measurement ... ok
+test test_historical_v1_contract_remains_intact ... ok
+test test_v0611_profile_and_thresholds_freeze ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/report_metrics_tests.rs (tools/r1-local-harness/target/debug/deps/report_metrics_tests-44da39fa476a1cbd)
+
+running 11 tests
+test test_control_node_load_telemetry ... ok
+test test_flushes_per_epoch_telemetry ... ok
+test test_cost_per_million_changes_calculation ... ok
+test test_object_store_requests_per_change_metric ... ok
+test test_intermediate_rows_per_change_metric ... ok
+test test_network_bytes_per_change_metric ... ok
+test test_queue_age_telemetry ... ok
+test test_raw_sample_contains_all_required_telemetry_fields ... ok
+test test_rss_bytes_telemetry ... ok
+test test_state_writes_per_change_metric ... ok
+test test_sample_coefficient_of_variation_enforced ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/summary_regeneration.rs (tools/r1-local-harness/target/debug/deps/summary_regeneration-950d3add44e2920b)
+
+running 1 test
+test summary_regenerates_byte_for_byte ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/v072_evidence_gate_tests.rs (tools/r1-local-harness/target/debug/deps/v072_evidence_gate_tests-ef965a71ab7d7cc3)
+
+running 4 tests
+test v072_empty_evidence_directory_is_not_qualified ... ok
+test v072_matrix_only_bundle_is_not_qualified ... ok
+test v072_samples_only_bundle_is_not_qualified ... ok
+test v072_frozen_profile_matches_issued_revision_byte_for_byte ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/v072_matrix_cli_tests.rs (tools/r1-local-harness/target/debug/deps/v072_matrix_cli_tests-c0a960562b7256f9)
+
+running 2 tests
+test v072_matrix_plan_does_not_overwrite_or_reuse_existing_evidence ... ok
+test v072_matrix_command_never_fabricates_a_measured_report ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/v072_matrix_gate_tests.rs (tools/r1-local-harness/target/debug/deps/v072_matrix_gate_tests-acd79ed144eed8e1)
+
+running 10 tests
+test v072_matrix_inventory_is_exact ... ok
+test v072_measured_errors_and_blocked_measurements_are_rejected ... ok
+test v072_historical_blockers_are_not_capacity_exemptions ... ok
+test v072_missing_metrics_cannot_skip_validation ... ok
+test v072_summary_flags_and_counts_are_recomputed ... ok
+test v072_ten_million_groups_participates_in_write_comparison ... ok
+test v072_unknown_statuses_and_false_area_are_rejected ... ok
+test v072_nonfinite_negative_and_zero_denominators_are_rejected ... ok
+test v072_every_cell_is_required_exactly_once ... ok
+test v072_worker_identities_must_be_distinct_and_match_scaling_case ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/v072_sample_gate_tests.rs (tools/r1-local-harness/target/debug/deps/v072_sample_gate_tests-6c8317905d142638)
+
+running 4 tests
+test v072_complete_fixture_is_structurally_valid ... ok
+test v072_drops_and_errors_cannot_be_absent_or_nonzero ... ok
+test v072_each_qualification_metric_is_required ... ok
+test v072_each_qualification_metric_must_be_finite_and_nonnegative ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
