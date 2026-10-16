@@ -8,6 +8,26 @@ use rockstream_types::state_budget::{
 use rockstream_types::view_lifecycle::ViewState;
 use std::sync::Arc;
 
+/// Owns exactly one allocation-waiter slot for the lifetime of a pending future.
+/// Dropping the future (cancellation, disconnect, or task abort) releases the slot
+/// just like success and timeout. A rejected acquisition owns no slot.
+struct AllocationWaiter<'a> {
+    ledger: &'a WorkerBudgetLedger,
+}
+
+impl<'a> AllocationWaiter<'a> {
+    fn acquire(ledger: &'a WorkerBudgetLedger) -> Result<Self, StateBudgetError> {
+        ledger.increment_waiters()?;
+        Ok(Self { ledger })
+    }
+}
+
+impl Drop for AllocationWaiter<'_> {
+    fn drop(&mut self) {
+        self.ledger.decrement_waiters();
+    }
+}
+
 /// Worker-side prospective quota manager.
 /// Enforces workload memory limits and parallelism bounds BEFORE batch arrangement memory allocation.
 #[derive(Debug, Clone)]
@@ -99,6 +119,7 @@ impl WorkerQuotaManager {
 
     /// Acquire a byte permit, waiting up to `timeout` if memory is currently exhausted.
     /// Rejects with `RS-9001` if waiter limit is exceeded, or `RS-5003` if timeout expires.
+    /// Cancellation releases the waiter slot before the future finishes dropping.
     pub async fn acquire_permit_with_timeout(
         &self,
         category: MemoryCategory,
@@ -110,16 +131,16 @@ impl WorkerQuotaManager {
             return Ok(permit);
         }
 
-        // Enforce waiter queue bound
-        self.budget_ledger.increment_waiters()?;
+        // Keep the reservation in the future; branch-local decrements leak on cancellation.
+        let _waiter = AllocationWaiter::acquire(&self.budget_ledger)?;
 
         let deadline = tokio::time::Instant::now() + timeout;
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
 
         loop {
             tokio::select! {
+                biased;
                 _ = tokio::time::sleep_until(deadline) => {
-                    self.budget_ledger.decrement_waiters();
                     return Err(StateBudgetError {
                         operator_name: format!("waiter-timeout-{}", category.name()),
                         max_bytes: self.budget_ledger.total_budget_bytes(),
@@ -129,7 +150,6 @@ impl WorkerQuotaManager {
                 }
                 _ = interval.tick() => {
                     if let Ok(permit) = self.try_acquire_permit(category, bytes) {
-                        self.budget_ledger.decrement_waiters();
                         return Ok(permit);
                     }
                 }
