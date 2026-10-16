@@ -198,8 +198,12 @@ async fn test_byte_limit_triggers_immediate_flush() {
     let group = Arc::new(PhysicalCommitGroup::with_config(db, 5000, 500, 64));
 
     let start = Instant::now();
-    let big_batch = make_batch("big", 600);
-    assert!(big_batch.byte_size() >= 600);
+    let oversized = make_batch("big", 600);
+    let before = group.fill();
+    assert_eq!(group.add_epoch(1, oversized).unwrap_err().to_string(), "[RS-1015] Consolidation capacity exceeded for physical_commit_bytes (605/500); next_steps: apply backpressure, reduce the complete epoch, or recover the failed physical commit");
+    assert_eq!(group.fill(), before);
+    let big_batch = make_batch("big", 495);
+    assert_eq!(big_batch.byte_size(), 500);
 
     group.commit_epoch(1, big_batch).await.unwrap();
 

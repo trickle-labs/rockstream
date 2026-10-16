@@ -68,6 +68,12 @@ struct Inner {
     max_epochs: usize,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.notify.notify_one();
+    }
+}
+
 /// Coherent fill observations. Retained quantities include in-flight and retry
 /// storage, not just the visible pending map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,9 +102,18 @@ impl WaiterSlot {
         let mut current = counter.load(Ordering::Acquire);
         loop {
             if current >= MAX_GROUP_COMMIT_WAITERS {
-                return Err(capacity("physical_commit_waiters", current, MAX_GROUP_COMMIT_WAITERS));
+                return Err(capacity(
+                    "physical_commit_waiters",
+                    current,
+                    MAX_GROUP_COMMIT_WAITERS,
+                ));
             }
-            match counter.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => return Ok(Self(counter.clone())),
                 Err(actual) => current = actual,
             }
@@ -126,7 +141,12 @@ impl Drop for FlushRequest {
 }
 
 fn capacity(resource: &'static str, current: usize, limit: usize) -> OpError {
-    OpError::capacity_exceeded(resource, current, limit, "apply backpressure, reduce the complete epoch, or recover the failed physical commit")
+    OpError::capacity_exceeded(
+        resource,
+        current,
+        limit,
+        "apply backpressure, reduce the complete epoch, or recover the failed physical commit",
+    )
 }
 
 fn diagnostic(error: impl std::fmt::Display) -> String {
@@ -144,10 +164,20 @@ fn diagnostic(error: impl std::fmt::Display) -> String {
 impl PhysicalCommitGroup {
     /// Construct an empty commit owner. Use `open` when reopening persisted state.
     pub fn new(db: Arc<ShardDb>) -> Self {
-        Self::with_config(db, DEFAULT_GROUP_COMMIT_MAX_DELAY_MS, MAX_GROUP_COMMIT_PENDING_BYTES, PHYSICAL_COMMIT_GROUP_MAX_EPOCHS)
+        Self::with_config(
+            db,
+            DEFAULT_GROUP_COMMIT_MAX_DELAY_MS,
+            MAX_GROUP_COMMIT_PENDING_BYTES,
+            PHYSICAL_COMMIT_GROUP_MAX_EPOCHS,
+        )
     }
 
-    pub fn with_config(db: Arc<ShardDb>, max_delay_ms: u64, max_pending_bytes: usize, max_epochs: usize) -> Self {
+    pub fn with_config(
+        db: Arc<ShardDb>,
+        max_delay_ms: u64,
+        max_pending_bytes: usize,
+        max_epochs: usize,
+    ) -> Self {
         let group = Self {
             inner: Arc::new(Inner {
                 db,
@@ -170,12 +200,24 @@ impl PhysicalCommitGroup {
         let bytes = tokio::time::timeout(
             Duration::from_millis(GROUP_COMMIT_IO_TIMEOUT_MS),
             db.get(&ShardKeyEncoder::frontier_key()),
-        ).await.map_err(|_| OpError::internal("physical commit frontier read timed out; reopen the shard before admission"))?
-            .map_err(OpError::storage)?;
-        let frontier = bytes.map(|bytes| {
-            let value: [u8; 8] = bytes.as_ref().try_into().map_err(|_| OpError::internal("persisted physical commit frontier must contain exactly eight bytes"))?;
-            Ok::<_, OpError>(u64::from_be_bytes(value))
-        }).transpose()?;
+        )
+        .await
+        .map_err(|_| {
+            OpError::internal(
+                "physical commit frontier read timed out; reopen the shard before admission",
+            )
+        })?
+        .map_err(OpError::storage)?;
+        let frontier = bytes
+            .map(|bytes| {
+                let value: [u8; 8] = bytes.as_ref().try_into().map_err(|_| {
+                    OpError::internal(
+                        "persisted physical commit frontier must contain exactly eight bytes",
+                    )
+                })?;
+                Ok::<_, OpError>(u64::from_be_bytes(value))
+            })
+            .transpose()?;
         let group = Self::new(db);
         {
             let mut state = group.inner.state.lock();
@@ -185,12 +227,24 @@ impl PhysicalCommitGroup {
         Ok(group)
     }
 
-    pub fn fill_level(&self) -> usize { self.inner.state.lock().pending.len() }
-    pub fn pending_epochs(&self) -> usize { self.fill_level() }
-    pub fn pending_bytes(&self) -> usize { self.inner.state.lock().retained_bytes }
-    pub fn active_waiters(&self) -> usize { self.inner.active_waiters.load(Ordering::Acquire) }
-    pub fn last_committed(&self) -> Epoch { self.committed_epoch().unwrap_or(0) }
-    pub fn committed_epoch(&self) -> Option<Epoch> { self.inner.state.lock().last_committed }
+    pub fn fill_level(&self) -> usize {
+        self.inner.state.lock().pending.len()
+    }
+    pub fn pending_epochs(&self) -> usize {
+        self.fill_level()
+    }
+    pub fn pending_bytes(&self) -> usize {
+        self.inner.state.lock().retained_bytes
+    }
+    pub fn active_waiters(&self) -> usize {
+        self.inner.active_waiters.load(Ordering::Acquire)
+    }
+    pub fn last_committed(&self) -> Epoch {
+        self.committed_epoch().unwrap_or(0)
+    }
+    pub fn committed_epoch(&self) -> Option<Epoch> {
+        self.inner.state.lock().last_committed
+    }
     pub fn outcome_unknown(&self) -> bool {
         let state = self.inner.state.lock();
         state.write_outcome_unknown || !state.uncertain.is_empty()
@@ -213,40 +267,93 @@ impl PhysicalCommitGroup {
     }
 
     fn ensure_driver(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
-        if self.inner.driver_started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            runtime.spawn(drive(Arc::downgrade(&self.inner), self.inner.notify.clone()));
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self
+            .inner
+            .driver_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            runtime.spawn(drive(
+                Arc::downgrade(&self.inner),
+                self.inner.notify.clone(),
+            ));
         }
     }
 
-    fn stage(&self, epoch: Epoch, batch: WriteBatch, waiter: Option<EpochReply>) -> Result<(), OpError> {
+    fn stage(
+        &self,
+        epoch: Epoch,
+        batch: WriteBatch,
+        waiter: Option<EpochReply>,
+    ) -> Result<(), OpError> {
         let bytes = batch.byte_size();
         let operations = batch.len();
         let mut state = self.inner.state.lock();
         if state.closing || state.retry_required {
             return Err(OpError::internal("physical commit admission is stopped; flush recovery or reopen the shard before adding another epoch"));
         }
-        if state.sealed_epoch.is_some_and(|sealed| epoch <= sealed) || state.pending.contains_key(&epoch) {
-            return Err(OpError::internal(format!("logical epoch {epoch} is not newer than the sealed physical frontier {:?}", state.sealed_epoch)));
+        if state.sealed_epoch.is_some_and(|sealed| epoch <= sealed)
+            || state.pending.contains_key(&epoch)
+        {
+            return Err(OpError::internal(format!(
+                "logical epoch {epoch} is not newer than the sealed physical frontier {:?}",
+                state.sealed_epoch
+            )));
         }
-        let proposed = state.retained_bytes.checked_add(bytes)
+        let proposed = state
+            .retained_bytes
+            .checked_add(bytes)
             .ok_or_else(|| capacity("physical_commit_bytes", usize::MAX, self.inner.max_bytes))?;
         if proposed > self.inner.max_bytes {
-            return Err(capacity("physical_commit_bytes", proposed, self.inner.max_bytes));
+            return Err(capacity(
+                "physical_commit_bytes",
+                proposed,
+                self.inner.max_bytes,
+            ));
         }
         if state.retained_epochs >= self.inner.max_epochs {
-            return Err(capacity("physical_commit_epochs", state.retained_epochs, self.inner.max_epochs));
+            return Err(capacity(
+                "physical_commit_epochs",
+                state.retained_epochs,
+                self.inner.max_epochs,
+            ));
         }
-        let proposed_operations = state.retained_operations.checked_add(operations)
-            .ok_or_else(|| capacity("physical_commit_operations", usize::MAX, MAX_GROUP_COMMIT_OPERATIONS))?;
+        let proposed_operations = state
+            .retained_operations
+            .checked_add(operations)
+            .ok_or_else(|| {
+                capacity(
+                    "physical_commit_operations",
+                    usize::MAX,
+                    MAX_GROUP_COMMIT_OPERATIONS,
+                )
+            })?;
         if proposed_operations > MAX_GROUP_COMMIT_OPERATIONS {
-            return Err(capacity("physical_commit_operations", proposed_operations, MAX_GROUP_COMMIT_OPERATIONS));
+            return Err(capacity(
+                "physical_commit_operations",
+                proposed_operations,
+                MAX_GROUP_COMMIT_OPERATIONS,
+            ));
         }
-        state.pending.insert(epoch, Entry { batch, bytes, operations, staged_at: Instant::now(), waiter });
+        state.pending.insert(
+            epoch,
+            Entry {
+                batch,
+                bytes,
+                operations,
+                staged_at: Instant::now(),
+                waiter,
+            },
+        );
         state.retained_bytes = proposed;
         state.retained_epochs += 1;
         state.retained_operations = proposed_operations;
-        state.force_flush |= proposed == self.inner.max_bytes || state.retained_epochs == self.inner.max_epochs;
+        let force_flush =
+            proposed == self.inner.max_bytes || state.retained_epochs == self.inner.max_epochs;
+        state.force_flush |= force_flush;
         drop(state);
         self.ensure_driver();
         self.inner.notify.notify_one();
@@ -261,7 +368,9 @@ impl PhysicalCommitGroup {
         let _slot = WaiterSlot::acquire(&self.inner.active_waiters)?;
         let (sender, receiver) = oneshot::channel();
         self.stage(epoch, batch, Some(sender))?;
-        receiver.await.map_err(|_| OpError::internal("physical commit owner stopped before acknowledgement"))?
+        receiver
+            .await
+            .map_err(|_| OpError::internal("physical commit owner stopped before acknowledgement"))?
             .map_err(OpError::internal)
     }
 
@@ -273,14 +382,23 @@ impl PhysicalCommitGroup {
         let id = {
             let mut state = self.inner.state.lock();
             let id = state.next_request;
-            state.next_request = id.checked_add(1).ok_or_else(|| OpError::internal("physical commit request sequence exhausted; reopen the owner"))?;
+            state.next_request = id.checked_add(1).ok_or_else(|| {
+                OpError::internal("physical commit request sequence exhausted; reopen the owner")
+            })?;
             state.requests.insert(id, sender);
             id
         };
-        let _request = FlushRequest { owner: Arc::downgrade(&self.inner), id };
+        let _request = FlushRequest {
+            owner: Arc::downgrade(&self.inner),
+            id,
+        };
         self.ensure_driver();
         self.inner.notify.notify_one();
-        receiver.await.map_err(|_| OpError::internal("physical commit owner stopped before flush completion"))?
+        receiver
+            .await
+            .map_err(|_| {
+                OpError::internal("physical commit owner stopped before flush completion")
+            })?
             .map_err(OpError::internal)
     }
 
@@ -297,7 +415,9 @@ impl PhysicalCommitGroup {
 }
 
 impl Drop for PhysicalCommitGroup {
-    fn drop(&mut self) { self.inner.notify.notify_one(); }
+    fn drop(&mut self) {
+        self.inner.notify.notify_one();
+    }
 }
 
 struct Flight {
@@ -314,7 +434,9 @@ impl Drop for Flight {
         if let Some(mut entries) = self.entries.take() {
             let error = "physical commit driver stopped during storage I/O; reopen the shard and reconcile the durable frontier".to_owned();
             for entry in entries.values_mut() {
-                if let Some(waiter) = entry.waiter.take() { let _ = waiter.send(Err(error.clone())); }
+                if let Some(waiter) = entry.waiter.take() {
+                    let _ = waiter.send(Err(error.clone()));
+                }
             }
             let mut state = self.owner.state.lock();
             state.uncertain.append(&mut entries);
@@ -322,7 +444,9 @@ impl Drop for Flight {
             state.retry_required = true;
             state.write_outcome_unknown = true;
             for id in &self.requests {
-                if let Some(reply) = state.requests.remove(id) { let _ = reply.send(Err(error.clone())); }
+                if let Some(reply) = state.requests.remove(id) {
+                    let _ = reply.send(Err(error.clone()));
+                }
             }
             self.owner.driver_started.store(false, Ordering::Release);
             self.owner.notify.notify_one();
@@ -347,7 +471,9 @@ async fn persist(flight: &Flight) -> Outcome {
         // are bounded by three payload envelopes. Operation metadata has its own
         // named bound. SlateDB's internal buffers are accounted separately.
         let mut merged = WriteBatch::new();
-        for entry in entries.values() { merged.merge_from(entry.batch.clone()); }
+        for entry in entries.values() {
+            merged.merge_from(entry.batch.clone());
+        }
         if let Some(last) = entries.keys().next_back() {
             merged.put(&ShardKeyEncoder::frontier_key(), &last.to_be_bytes());
         }
@@ -366,30 +492,49 @@ async fn persist(flight: &Flight) -> Outcome {
         let error = match tokio::time::timeout(timeout, flight.owner.db.flush()).await {
             Ok(Ok(())) => return Outcome::Durable,
             Ok(Err(error)) => diagnostic(error),
-            Err(_) => "physical flush timed out after a successful write; durability remains unknown".to_owned(),
+            Err(_) => {
+                "physical flush timed out after a successful write; durability remains unknown"
+                    .to_owned()
+            }
         };
         if attempt + 1 == MAX_GROUP_COMMIT_RETRY_COUNT {
-            assert_eq!(persistence::commit_outcome(true, false), persistence::COMMIT_UNKNOWN);
+            assert_eq!(
+                persistence::commit_outcome(true, false),
+                persistence::COMMIT_UNKNOWN
+            );
             return Outcome::FlushUnknown(error);
         }
         tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
     }
-    Outcome::WriteUnknown("physical commit retry configuration did not execute an attempt".to_owned())
+    Outcome::WriteUnknown(
+        "physical commit retry configuration did not execute an attempt".to_owned(),
+    )
 }
 
 fn finish(mut flight: Flight, outcome: Outcome) {
-    let Some(mut entries) = flight.entries.take() else { return; };
+    let Some(mut entries) = flight.entries.take() else {
+        return;
+    };
     let epochs = entries.keys().copied().collect::<Vec<_>>();
-    let waiters = entries.values_mut().filter_map(|entry| entry.waiter.take()).collect::<Vec<_>>();
+    let waiters = entries
+        .values_mut()
+        .filter_map(|entry| entry.waiter.take())
+        .collect::<Vec<_>>();
     let bytes = entries.values().map(|entry| entry.bytes).sum::<usize>();
-    let operations = entries.values().map(|entry| entry.operations).sum::<usize>();
+    let operations = entries
+        .values()
+        .map(|entry| entry.operations)
+        .sum::<usize>();
     let result = match outcome {
         Outcome::Durable => {
             // Free the actual retained batches before releasing capacity or acking.
             drop(entries);
             let mut state = flight.owner.state.lock();
             if let Some(last) = epochs.last().copied() {
-                assert!(state.last_committed.is_none_or(|previous| last >= previous), "M1-S8: physical group committed epoch must be monotonic");
+                assert!(
+                    state.last_committed.is_none_or(|previous| last >= previous),
+                    "M1-S8: physical group committed epoch must be monotonic"
+                );
                 state.last_committed = Some(last);
             }
             state.retained_bytes -= bytes;
@@ -405,8 +550,14 @@ fn finish(mut flight: Flight, outcome: Outcome) {
             state.in_flight = false;
             state.retry_required = true;
             let error = match failed {
-                Outcome::WriteFailed(error) => { state.pending.append(&mut entries); error }
-                Outcome::FlushUnknown(error) => { state.uncertain.append(&mut entries); error }
+                Outcome::WriteFailed(error) => {
+                    state.pending.append(&mut entries);
+                    error
+                }
+                Outcome::FlushUnknown(error) => {
+                    state.uncertain.append(&mut entries);
+                    error
+                }
                 Outcome::WriteUnknown(error) => {
                     state.write_outcome_unknown = true;
                     state.uncertain.append(&mut entries);
@@ -417,16 +568,22 @@ fn finish(mut flight: Flight, outcome: Outcome) {
             Err(error)
         }
     };
-    for waiter in waiters { let _ = waiter.send(result.as_ref().map(|_| ()).map_err(Clone::clone)); }
+    for waiter in waiters {
+        let _ = waiter.send(result.as_ref().map(|_| ()).map_err(Clone::clone));
+    }
     let mut state = flight.owner.state.lock();
     for id in &flight.requests {
-        if let Some(reply) = state.requests.remove(id) { let _ = reply.send(result.clone()); }
+        if let Some(reply) = state.requests.remove(id) {
+            let _ = reply.send(result.clone());
+        }
     }
 }
 
 async fn drive(owner: Weak<Inner>, notify: Arc<Notify>) {
     loop {
-        let Some(inner) = owner.upgrade() else { return; };
+        let Some(inner) = owner.upgrade() else {
+            return;
+        };
         let (flight, delay) = {
             let mut state = inner.state.lock();
             if state.write_outcome_unknown && !state.requests.is_empty() {
@@ -438,19 +595,42 @@ async fn drive(owner: Weak<Inner>, notify: Arc<Notify>) {
             let due = oldest.is_some_and(|oldest| oldest.elapsed() >= inner.max_delay);
             let requested = !state.requests.is_empty();
             let ready = requested || (!state.retry_required && (due || state.force_flush));
-            if ready && (!state.pending.is_empty() || !state.uncertain.is_empty()) && !state.write_outcome_unknown {
+            if ready
+                && (!state.pending.is_empty() || !state.uncertain.is_empty())
+                && !state.write_outcome_unknown
+            {
                 let flush_only = !state.uncertain.is_empty();
-                let entries = if flush_only { std::mem::take(&mut state.uncertain) } else { std::mem::take(&mut state.pending) };
-                if let Some(last) = entries.keys().next_back().copied() { state.sealed_epoch = Some(last); }
+                let entries = if flush_only {
+                    std::mem::take(&mut state.uncertain)
+                } else {
+                    std::mem::take(&mut state.pending)
+                };
+                if let Some(last) = entries.keys().next_back().copied() {
+                    state.sealed_epoch = Some(last);
+                }
                 state.in_flight = true;
                 state.force_flush = false;
                 let requests = state.requests.keys().copied().collect();
-                (Some(Flight { owner: inner.clone(), entries: Some(entries), requests, flush_only }), None)
+                (
+                    Some(Flight {
+                        owner: inner.clone(),
+                        entries: Some(entries),
+                        requests,
+                        flush_only,
+                    }),
+                    None,
+                )
             } else {
                 if requested && state.pending.is_empty() && state.uncertain.is_empty() {
-                    for (_, reply) in std::mem::take(&mut state.requests) { let _ = reply.send(Ok(Vec::new())); }
+                    for (_, reply) in std::mem::take(&mut state.requests) {
+                        let _ = reply.send(Ok(Vec::new()));
+                    }
                 }
-                let delay = if state.retry_required { None } else { oldest.map(|oldest| inner.max_delay.saturating_sub(oldest.elapsed())) };
+                let delay = if state.retry_required {
+                    None
+                } else {
+                    oldest.map(|oldest| inner.max_delay.saturating_sub(oldest.elapsed()))
+                };
                 (None, delay)
             }
         };
