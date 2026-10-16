@@ -1,12 +1,8 @@
 {
-  "changed_files": [
-    "crates/rockstream-types/src/state_budget.rs"
-  ],
-  "id": "009-quota-generation",
-  "kind": "patch",
-  "request_commit": "1acd0c25d83dd9c94633d9801939a3814ab5b876",
-  "source": "af992f18ddb293539982029e243b603fa53f4e05",
-  "status": "prepared",
-  "tree": "5a26185e7c8ede9441d447057b06be2aac70766a",
+  "id": "010-quota-generation-validation",
+  "kind": "test",
+  "request_commit": "b6ad74fb43e73accc6244ce730da22278c2c60d8",
+  "source": "601a256307944c3d62b28c904a33a53470dd7441",
+  "status": "running",
   "workspace_run": "38942187359"
 }
