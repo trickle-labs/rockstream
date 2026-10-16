@@ -1,0 +1,51 @@
+name: v0.72 implementation workspace
+
+on:
+  push:
+    branches: [codex/132-session]
+    paths:
+      - .github/workflows/v072-session.yml
+      - session/start.json
+
+permissions:
+  contents: write
+
+concurrency:
+  group: v072-implementation-workspace
+  cancel-in-progress: true
+
+jobs:
+  workspace:
+    name: Bounded implementation workspace (not acceptance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          ref: 336475e252377825e2aaa7ddd60f257b5b9efe28
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: v072-implementation
+          cache-workspace-crates: true
+          cache-on-failure: true
+          workspaces: |
+            candidate
+            candidate/tools/r1-local-harness
+      - name: Process explicit requests on the isolated implementation branch
+        working-directory: candidate
+        run: python3 ../controller/session/worker.py

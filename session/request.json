@@ -1,0 +1,1 @@
+{"id":"001-harness-format","kind":"format","base":"336475e252377825e2aaa7ddd60f257b5b9efe28","harness":true,"message":"style(harness): apply the pinned Rust formatter to the evidence workspace"}
