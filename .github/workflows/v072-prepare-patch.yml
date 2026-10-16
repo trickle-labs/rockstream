@@ -1,0 +1,75 @@
+name: Prepare v0.72 source patch
+
+on:
+  push:
+    branches: [codex/132-workbench]
+    paths:
+      - workbench/**
+      - .github/workflows/v072-prepare-patch.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: v072-prepare-patch
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Apply and format a proposed patch without updating main or a PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: request
+          persist-credentials: false
+      - name: Validate explicit request
+        id: request
+        run: |
+          python3 -c 'import json,os,pathlib,re; p=pathlib.Path("request/workbench"); r=json.loads((p/"request.json").read_text()); assert set(r)=={"base","message","format_harness"}; assert re.fullmatch("[0-9a-f]{40}",r["base"]); assert isinstance(r["format_harness"],bool); assert isinstance(r["message"],str) and 0<len(r["message"])<500 and "\x00" not in r["message"]; (p/"message.txt").write_text(r["message"]+"\n"); f=open(os.environ["GITHUB_OUTPUT"],"a"); print("base="+r["base"],file=f); print("format_harness="+str(r["format_harness"]).lower(),file=f)'
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          ref: ${{ steps.request.outputs.base }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: rustfmt
+      - name: Apply exact patch and format
+        working-directory: candidate
+        env:
+          FORMAT_HARNESS: ${{ steps.request.outputs.format_harness }}
+        run: |
+          set -euo pipefail
+          git apply --check ../request/workbench/request.patch
+          git apply ../request/workbench/request.patch
+          cargo fmt --all
+          if [ "$FORMAT_HARNESS" = true ]; then
+            cargo fmt --manifest-path tools/r1-local-harness/Cargo.toml --all
+          fi
+          git diff --check
+      - name: Publish an isolated prepared commit and source archive
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -F ../request/workbench/message.txt
+          git log -1 --format='%H %s'
+          git push origin "HEAD:refs/heads/codex/132-prepared-${GITHUB_RUN_ID}"
+          mkdir -p "$RUNNER_TEMP/v072-prepared"
+          git rev-parse HEAD > "$RUNNER_TEMP/v072-prepared/revision.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/v072-prepared/tree.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/v072-prepared/source.tar.gz" HEAD
+          git show --format=fuller --stat HEAD > "$RUNNER_TEMP/v072-prepared/commit.txt"
+          git diff HEAD^ HEAD > "$RUNNER_TEMP/v072-prepared/change.patch"
+          cd "$RUNNER_TEMP/v072-prepared"
+          sha256sum source.tar.gz change.patch > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v072-prepared-${{ github.run_id }}
+          path: ${{ runner.temp }}/v072-prepared/
+          retention-days: 7
+          if-no-files-found: error
