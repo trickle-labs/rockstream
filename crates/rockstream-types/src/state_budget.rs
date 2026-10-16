@@ -137,7 +137,9 @@ impl WorkloadBudget {
     pub fn try_acquire(&self, bytes: u64) -> Result<(), StateBudgetError> {
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
-            let proposed = current.saturating_add(bytes);
+            let proposed = current
+                .checked_add(bytes)
+                .ok_or_else(|| quota_overflow_error("workload-memory", current, bytes))?;
             if self.max_bytes > 0 && proposed > self.max_bytes {
                 return Err(StateBudgetError {
                     operator_name: format!("workload-{}", self.workload_id.0),
@@ -306,7 +308,12 @@ impl StateBudget {
         // not both "succeed" and overshoot the budget together.
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
-            let proposed = current.saturating_add(bytes);
+            let Some(proposed) = current.checked_add(bytes) else {
+                if let Some(ref wl) = self.workload_budget {
+                    wl.release(bytes);
+                }
+                return Err(quota_overflow_error("operator-memory", current, bytes));
+            };
             if proposed > self.max_bytes {
                 if let Some(ref wl) = self.workload_budget {
                     wl.release(bytes);
@@ -365,10 +372,8 @@ impl StateBudget {
     ///
     /// Saturates at zero rather than wrapping.
     pub fn release(&self, bytes: u64) {
-        if let Some(ref wl) = self.workload_budget {
-            wl.release(bytes);
-        }
-        // Saturating subtract via compare-exchange loop.
+        // Saturating subtract via compare-exchange loop. Only the bytes removed
+        // from this operator may be released from the shared workload budget.
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
             let proposed = current.saturating_sub(bytes);
@@ -379,6 +384,9 @@ impl StateBudget {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    if let Some(ref wl) = self.workload_budget {
+                        wl.release(current - proposed);
+                    }
                     if self.max_bytes > 0 {
                         let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
                         if pct < 95.0 {
@@ -444,6 +452,9 @@ impl WorkloadQuotaLedgerEntry {
 #[derive(Debug)]
 pub struct DistributedQuotaLedger {
     entries: dashmap::DashMap<WorkloadId, Arc<WorkloadQuotaLedgerEntry>>,
+    // Serialize registry mutations so capacity checks and insertion are atomic.
+    // Steady-state reservations do not take this lock.
+    registration_lock: parking_lot::Mutex<()>,
     max_workloads: usize,
     total_reservations: AtomicU64,
     total_rejections: AtomicU64,
@@ -465,6 +476,7 @@ impl DistributedQuotaLedger {
     pub fn with_capacity(max_workloads: usize) -> Self {
         Self {
             entries: dashmap::DashMap::new(),
+            registration_lock: parking_lot::Mutex::new(()),
             max_workloads,
             total_reservations: AtomicU64::new(0),
             total_rejections: AtomicU64::new(0),
@@ -478,6 +490,7 @@ impl DistributedQuotaLedger {
         memory_limit_bytes: u64,
         max_parallelism: u32,
     ) -> Result<(), StateBudgetError> {
+        let _registration = self.registration_lock.lock();
         if !self.entries.contains_key(&workload_id) && self.entries.len() >= self.max_workloads {
             return Err(StateBudgetError {
                 operator_name: format!("ledger-capacity-{}", workload_id.0),
@@ -508,6 +521,7 @@ impl DistributedQuotaLedger {
 
     /// Unregister a workload from the ledger.
     pub fn unregister_workload(&self, workload_id: WorkloadId) {
+        let _registration = self.registration_lock.lock();
         self.entries.remove(&workload_id);
     }
 
@@ -525,7 +539,7 @@ impl DistributedQuotaLedger {
         parallelism: u32,
     ) -> Result<QuotaGuard, StateBudgetError> {
         let entry = self.entries.get(&workload_id).map(|r| r.value().clone());
-        if let Some(entry) = entry {
+        if let Some(ref entry) = entry {
             let memory_limit = entry.memory_limit_bytes.load(Ordering::Relaxed);
             if memory_limit > 0 {
                 loop {
@@ -660,44 +674,18 @@ impl DistributedQuotaLedger {
         }
         self.total_reservations.fetch_add(1, Ordering::Relaxed);
         Ok(QuotaGuard {
-            ledger: Some(self.clone()),
-            workload_id,
+            entry,
             bytes: requested_bytes,
             parallelism,
-            released: false,
         })
     }
 
-    /// Release batch resources from the ledger.
+    /// Release resources from the current registration for a workload.
+    /// Reservation guards instead retain and release their original entry so
+    /// unregistering and reusing an ID cannot release the replacement's quota.
     pub fn release_batch(&self, workload_id: WorkloadId, bytes: u64, parallelism: u32) {
         if let Some(entry) = self.entries.get(&workload_id) {
-            loop {
-                let current = entry.current_memory_bytes.load(Ordering::Relaxed);
-                let proposed = current.saturating_sub(bytes);
-                if entry
-                    .current_memory_bytes
-                    .compare_exchange_weak(current, proposed, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
-                }
-            }
-            loop {
-                let current_p = entry.current_parallelism.load(Ordering::Relaxed);
-                let proposed_p = current_p.saturating_sub(parallelism as u64);
-                if entry
-                    .current_parallelism
-                    .compare_exchange_weak(
-                        current_p,
-                        proposed_p,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
-            }
+            release_quota_entry(&entry, bytes, parallelism);
         }
     }
 
@@ -723,24 +711,45 @@ impl DistributedQuotaLedger {
     }
 }
 
-/// RAII Guard for prospective quota batch reservation. Automatically releases resources when dropped.
+fn release_quota_entry(entry: &WorkloadQuotaLedgerEntry, bytes: u64, parallelism: u32) {
+    loop {
+        let current = entry.current_memory_bytes.load(Ordering::Relaxed);
+        let proposed = current.saturating_sub(bytes);
+        if entry
+            .current_memory_bytes
+            .compare_exchange_weak(current, proposed, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    loop {
+        let current_p = entry.current_parallelism.load(Ordering::Relaxed);
+        let proposed_p = current_p.saturating_sub(parallelism as u64);
+        if entry
+            .current_parallelism
+            .compare_exchange_weak(current_p, proposed_p, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+/// RAII guard bound to the entry that admitted the reservation, not its reusable ID.
+/// Unregistering a workload never transfers its reservations to a new generation.
 #[derive(Debug)]
 pub struct QuotaGuard {
-    ledger: Option<Arc<DistributedQuotaLedger>>,
-    workload_id: WorkloadId,
+    entry: Option<Arc<WorkloadQuotaLedgerEntry>>,
     bytes: u64,
     parallelism: u32,
-    released: bool,
 }
 
 impl QuotaGuard {
-    /// Explicitly release quota reservation without dropping.
+    /// Release this reservation exactly once, even after its owner is unregistered.
     pub fn release(&mut self) {
-        if !self.released {
-            if let Some(ref ledger) = self.ledger {
-                ledger.release_batch(self.workload_id, self.bytes, self.parallelism);
-            }
-            self.released = true;
+        if let Some(entry) = self.entry.take() {
+            release_quota_entry(&entry, self.bytes, self.parallelism);
         }
     }
 }
