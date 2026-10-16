@@ -19,7 +19,7 @@ fn identifier(id: &Ident) -> String {
 
 pub(crate) fn execute(
     query: &Query,
-    provider: &impl Fn(&str) -> Option<CatalogResponse>,
+    provider: &dyn Fn(&str) -> Option<CatalogResponse>,
     session: &SessionInfo,
 ) -> Option<CatalogResponse> {
     let SetExpr::Select(select) = query.body.as_ref() else {
@@ -28,7 +28,23 @@ pub(crate) fn execute(
     let TableFactor::Table { name, .. } = &select.from.first()?.relation else {
         return None;
     };
-    provider(&name.to_string())?;
+    // A catalog CTE may be the first relation in the outer SELECT. Admit it
+    // only when its definition begins with a known catalog relation, so user
+    // queries are not accidentally redirected into the catalog evaluator.
+    if provider(&name.to_string()).is_none() {
+        let with = query.with.as_ref()?;
+        let cte = with
+            .cte_tables
+            .iter()
+            .find(|cte| identifier(&cte.alias.name) == name.to_string().to_lowercase())?;
+        let SetExpr::Select(cte_select) = cte.query.body.as_ref() else {
+            return None;
+        };
+        let TableFactor::Table { name, .. } = &cte_select.from.first()?.relation else {
+            return None;
+        };
+        provider(&name.to_string())?;
+    }
     Some(match run(query, provider, session, &Row::new()) {
         Ok((columns, rows)) => CatalogResponse::Rows { columns, rows },
         Err(message) => CatalogResponse::Error { message },
@@ -37,7 +53,47 @@ pub(crate) fn execute(
 
 fn run(
     query: &Query,
-    provider: &impl Fn(&str) -> Option<CatalogResponse>,
+    provider: &dyn Fn(&str) -> Option<CatalogResponse>,
+    session: &SessionInfo,
+    outer: &Row,
+) -> Result<QueryRows> {
+    let Some(with) = &query.with else {
+        return run_select(query, provider, session, outer);
+    };
+    if with.recursive {
+        return Err("[RS-2026] recursive catalog CTE is unsupported".into());
+    }
+
+    // Evaluate non-recursive CTEs in declaration order. Their results become
+    // catalog relations visible to the enclosing SELECT and later CTEs.
+    let mut ctes: HashMap<String, CatalogResponse> = HashMap::new();
+    for cte in &with.cte_tables {
+        if !cte.alias.columns.is_empty() {
+            return Err("[RS-2026] catalog CTE column aliases are unsupported".into());
+        }
+        let resolve = |name: &str| {
+            ctes.get(&name.to_lowercase())
+                .cloned()
+                .or_else(|| provider(name))
+        };
+        let (columns, rows) = run(&cte.query, &resolve, session, outer)?;
+        let alias = identifier(&cte.alias.name);
+        if ctes.insert(alias, CatalogResponse::Rows { columns, rows }).is_some() {
+            return Err("[RS-2026] duplicate catalog CTE alias".into());
+        }
+    }
+
+    let resolve = |name: &str| {
+        ctes.get(&name.to_lowercase())
+            .cloned()
+            .or_else(|| provider(name))
+    };
+    run_select(query, &resolve, session, outer)
+}
+
+fn run_select(
+    query: &Query,
+    provider: &dyn Fn(&str) -> Option<CatalogResponse>,
     session: &SessionInfo,
     outer: &Row,
 ) -> Result<QueryRows> {
@@ -240,7 +296,7 @@ fn run(
 
 fn relation(
     source: &TableFactor,
-    provider: &impl Fn(&str) -> Option<CatalogResponse>,
+    provider: &dyn Fn(&str) -> Option<CatalogResponse>,
     session: &SessionInfo,
     outer: &Row,
 ) -> Result<RelationRows> {
@@ -302,7 +358,7 @@ fn join(
     right: &[Row],
     condition: Option<&Expr>,
     outer: bool,
-    provider: &impl Fn(&str) -> Option<CatalogResponse>,
+    provider: &dyn Fn(&str) -> Option<CatalogResponse>,
     session: &SessionInfo,
 ) -> Result<Vec<Row>> {
     let mut result = Vec::new();
@@ -340,7 +396,7 @@ fn boolean(value: bool) -> Option<String> {
 fn eval(
     expr: &Expr,
     row: &Row,
-    provider: &impl Fn(&str) -> Option<CatalogResponse>,
+    provider: &dyn Fn(&str) -> Option<CatalogResponse>,
     session: &SessionInfo,
 ) -> Result<Option<String>> {
     let value = |e| eval(e, row, provider, session);
@@ -675,7 +731,7 @@ fn eval(
 }
 
 fn lookup(
-    provider: &impl Fn(&str) -> Option<CatalogResponse>,
+    provider: &dyn Fn(&str) -> Option<CatalogResponse>,
     table: &str,
     key: &str,
     input: Option<&str>,
@@ -695,6 +751,51 @@ fn lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prisma_index_cte_returns_empty_rows_without_indexes() {
+        use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+        let query = Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "WITH rawindex AS (SELECT indrelid, indexrelid, unnest(indkey) AS indkeyid \
+             FROM pg_index WHERE indpred IS NULL) \
+             SELECT rawindex.indrelid AS relation_oid, c.relname \
+             FROM rawindex JOIN pg_class c ON c.oid = rawindex.indrelid \
+             LEFT JOIN pg_opclass opclass ON opclass.oid = rawindex.indkeyid",
+        )
+        .expect("valid Prisma-style CTE")
+        .remove(0);
+        let Statement::Query(query) = query else {
+            panic!("expected SELECT query");
+        };
+        let provider = |name: &str| -> Option<CatalogResponse> {
+            match name {
+                "pg_index" => Some(CatalogResponse::Rows {
+                    columns: vec!["indrelid".into(), "indexrelid".into(), "indkey".into(), "indpred".into()],
+                    rows: vec![],
+                }),
+                "pg_class" => Some(CatalogResponse::Rows {
+                    columns: vec!["oid".into(), "relname".into()],
+                    rows: vec![],
+                }),
+                "pg_opclass" => Some(CatalogResponse::Rows {
+                    columns: vec!["oid".into(), "opcname".into()],
+                    rows: vec![],
+                }),
+                _ => None,
+            }
+        };
+        let result = execute(&query, &provider, &SessionInfo::default())
+            .expect("catalog CTE must be handled");
+        assert_eq!(
+            result,
+            CatalogResponse::Rows {
+                columns: vec!["relation_oid".into(), "relname".into()],
+                rows: vec![],
+            }
+        );
+    }
 
     #[test]
     fn catalog_any_array_filters_real_relation_kinds() {
