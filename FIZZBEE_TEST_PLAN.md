@@ -683,6 +683,20 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #122 narrows the production Kafka sink qualification to match M3's
+epoch-level abstraction. `SinkConnector::pre_commit` accepts a row count and
+Kafka emits/restores epoch/count markers; neither the interface nor the M3
+model carries view row identities, values, weights, or snapshot boundaries.
+M3's exactly-once epoch invariants therefore do not prove snapshot/change row
+delivery or row payload recovery. Those paths remain explicitly unsupported
+under #122 AC6, and `sink.kafka` is Experimental with no row-delivery proof.
+`kafka_sink_row_delivery_is_explicitly_unsupported` checks the embedded contract;
+the capability-gate mutation tests reject restored Core/payload claims and
+marker proofs. `kafka_sink_emits_epoch_count_marker_only` checks the actual
+consumer's complete marker payload, without qualifying row delivery. This
+scope correction adds no FizzBee transition or new protocol proof; R1–R5 of
+`docs/acceptance-contracts/122.md` must pass before row delivery can qualify.
+
 Issue #117 closes an implementation-level liveness gap in exchange flow control.
 `FlowController::acquire_batch_permit`, used by `WorkerStreamMultiplexer::send_frame`,
 and the separately reachable row-only `acquire_credit` register their Tokio
