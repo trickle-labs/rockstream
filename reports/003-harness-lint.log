@@ -1,0 +1,11 @@
+diff --git a/tools/r1-local-harness/tests/summary_regeneration.rs b/tools/r1-local-harness/tests/summary_regeneration.rs
+index 7603359..ee4fce6 100644
+--- a/tools/r1-local-harness/tests/summary_regeneration.rs
++++ b/tools/r1-local-harness/tests/summary_regeneration.rs
+@@ -115,5 +115,5 @@ fn summary_regenerates_byte_for_byte() {
+     };
+     assert_eq!(evaluate(directory.path()).unwrap(), expected);
+     atomic_json(&directory.path().join("decision.json"), &expected).unwrap();
+-    assert_eq!(verify(directory.path()).unwrap(), ());
++    verify(directory.path()).unwrap();
+ }
