@@ -345,19 +345,19 @@ impl SubscriberHandle {
             return Ok(vec![]);
         };
         let (floor, entries) = registry.snapshot_since_epoch(&self.table_name, next_epoch);
+
+        // Record observed fill even when the replay floor was already lost.
+        // A rejected slow consumer must remain visible to pressure telemetry.
+        let latest = entries.last().map(|e| e.epoch).unwrap_or(0);
+        let backlog = latest.saturating_sub(self.last_sent_epoch);
+        self.backlog_epochs.store(backlog, Ordering::Relaxed);
         if floor.is_some_and(|floor| next_epoch < floor) {
             return Err(SubscribeError::ConsumerTooSlow);
         }
 
         if entries.is_empty() {
-            self.backlog_epochs.store(0, Ordering::Relaxed);
             return Ok(vec![]);
         }
-
-        // Update backlog metric.
-        let latest = entries.last().map(|e| e.epoch).unwrap_or(0);
-        let backlog = latest.saturating_sub(self.last_sent_epoch);
-        self.backlog_epochs.store(backlog, Ordering::Relaxed);
 
         // Check consumer-too-slow bound.
         if backlog as usize > SUBSCRIBE_BACKLOG_MAX {

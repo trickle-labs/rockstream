@@ -106,8 +106,7 @@ use crate::pgoutput_coordinator::{
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::subscribe_handler::{
-    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry,
-    SubscriberHandle,
+    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
 };
 use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -5588,11 +5587,17 @@ impl GatewayHandler {
                         }
                         let timestamp = row.mz_timestamp.to_string();
                         if let Err(error) = encoder.encode_field(&Some(timestamp.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true, stream_slot)));
+                            return Some((
+                                Err(error),
+                                (registry, handle, pending, schema, true, stream_slot),
+                            ));
                         }
                         let diff = row.mz_diff.to_string();
                         if let Err(error) = encoder.encode_field(&Some(diff.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true, stream_slot)));
+                            return Some((
+                                Err(error),
+                                (registry, handle, pending, schema, true, stream_slot),
+                            ));
                         }
                         let encoded = match encoder.finish() {
                             Ok(encoded) => encoded,
@@ -5603,7 +5608,10 @@ impl GatewayHandler {
                                 ));
                             }
                         };
-                        return Some((Ok(encoded), (registry, handle, pending, schema, false, stream_slot)));
+                        return Some((
+                            Ok(encoded),
+                            (registry, handle, pending, schema, false, stream_slot),
+                        ));
                     }
                     match handle.poll(&registry) {
                         Ok(rows) if !rows.is_empty() => pending.extend(rows),
