@@ -458,12 +458,11 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         }
     }
 
-    // Catalog introspection clients such as Prisma bind schema lists to
-    // ANY($1) inside JOIN predicates and derived-table subqueries. The
-    // visitor above traverses only top-level SELECT projections/WHERE, so
-    // such parameters would otherwise be described as scalar TEXT. Preserve
-    // explicit casts and only infer text[] for catalog schema-list filters.
-    if sql.contains("pg_catalog") || sql.contains("information_schema") {
+    // ANY($n) requires an array parameter regardless of whether the table
+    // name is schema-qualified. In particular, Prisma introspection queries
+    // against unqualified pg_namespace use ANY($1) in joins/subqueries that
+    // the top-level AST visitor does not traverse. Preserve explicit casts.
+    {
         if let Ok(any_array_param) = regex::Regex::new(
             r"(?i)\bany\s*\(\s*\$([1-9][0-9]*)(?:::(text|int2|int4|int8|uuid)\[\])?\s*\)",
         ) {
@@ -19710,6 +19709,14 @@ mod catalog_array_parameter_tests {
     async fn prisma_nested_catalog_any_bind_is_text_array() {
         let catalog = CatalogStubs::new();
         let sql = "SELECT info.column_name FROM information_schema.columns info JOIN (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.nspname = ANY($1)) schemas ON schemas.nspname = info.table_schema";
+        let types = infer_parameter_types(&catalog, sql).await;
+        assert_eq!(types, vec![Type::TEXT_ARRAY]);
+    }
+
+    #[tokio::test]
+    async fn unqualified_catalog_any_bind_is_array() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT namespace.nspname FROM pg_namespace AS namespace WHERE namespace.nspname = ANY($1) ORDER BY namespace.nspname";
         let types = infer_parameter_types(&catalog, sql).await;
         assert_eq!(types, vec![Type::TEXT_ARRAY]);
     }
