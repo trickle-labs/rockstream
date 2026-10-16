@@ -772,7 +772,12 @@ mod tests {
         let provider = |name: &str| -> Option<CatalogResponse> {
             match name {
                 "pg_index" => Some(CatalogResponse::Rows {
-                    columns: vec!["indrelid".into(), "indexrelid".into(), "indkey".into(), "indpred".into()],
+                    columns: vec![
+                        "indrelid".into(),
+                        "indexrelid".into(),
+                        "indkey".into(),
+                        "indpred".into(),
+                    ],
                     rows: vec![],
                 }),
                 "pg_class" => Some(CatalogResponse::Rows {
