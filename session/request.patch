@@ -1,0 +1,6 @@
+diff --git a/tools/r1-local-harness/tests/summary_regeneration.rs b/tools/r1-local-harness/tests/summary_regeneration.rs
+--- a/tools/r1-local-harness/tests/summary_regeneration.rs
++++ b/tools/r1-local-harness/tests/summary_regeneration.rs
+@@ -118 +118 @@
+-    assert_eq!(verify(directory.path()).unwrap(), ());
++    verify(directory.path()).unwrap();
