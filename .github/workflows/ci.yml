@@ -118,6 +118,8 @@ jobs:
         run: bash scripts/check-path-coupling.sh
       - name: path-coupling checker self-test
         run: bash scripts/check-path-coupling.test.sh
+      - name: qualification execution gate self-tests
+        run: bash scripts/check-qualification-mutations.test.sh
 
   verus-verify:
     name: Verus verify and qualify (VS6)
@@ -243,6 +245,16 @@ jobs:
       - name: Simulation integration tests
         if: matrix.shard == 'sim-integration'
         run: cargo test -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
+      - name: Qualification helper checks (not release evidence)
+        if: matrix.shard == 'sim-integration'
+        run: bash scripts/run-release-qualification.sh --fast --output target/qualification-helpers.json
+      - name: Upload qualification helper results
+        if: always() && matrix.shard == 'sim-integration'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-helpers
+          path: target/qualification-helpers.json
+          if-no-files-found: error
       - name: Remove Docker test image
         if: always() && matrix.shard == 'gateway'
         run: docker image rm rockstream-tc-test:latest || true
