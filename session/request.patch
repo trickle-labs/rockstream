@@ -1,10 +1,12 @@
-diff --git a/tools/r1-local-harness/tests/summary_regeneration.rs b/tools/r1-local-harness/tests/summary_regeneration.rs
---- a/tools/r1-local-harness/tests/summary_regeneration.rs
-+++ b/tools/r1-local-harness/tests/summary_regeneration.rs
-@@ -115,5 +115,5 @@
-     };
-     assert_eq!(evaluate(directory.path()).unwrap(), expected);
-     atomic_json(&directory.path().join("decision.json"), &expected).unwrap();
--    assert_eq!(verify(directory.path()).unwrap(), ());
-+    verify(directory.path()).unwrap();
- }
+diff --git a/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs b/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
+--- a/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
++++ b/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
+@@ -171,6 +171,7 @@
+ #[test]
+ fn v072_missing_metrics_cannot_skip_validation() {
+-    let mutations: [(&str, fn(&mut MatrixExecutionResult)); 6] = [
++    type Mutation = (&'static str, fn(&mut MatrixExecutionResult));
++    let mutations: [Mutation; 6] = [
+         ("throughput_rows_per_sec", |cell| {
+             cell.throughput_rows_per_sec = None
+         }),
