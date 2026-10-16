@@ -499,6 +499,19 @@ assert 'c_bool' in names",
     )
     .await;
 
+    // This fixture exposes a PostgreSQL view, not a base table. Prisma 6
+    // requires the views preview flag to include it during introspection.
+    run_cmd_checked(
+        &node_container,
+        vec![
+            "sh",
+            "-c",
+            "cd /app && sed -i '/provider *= *\"prisma-client-js\"/a\\  previewFeatures = [\"views\"]' prisma/schema.prisma && grep -Fq 'previewFeatures = [\"views\"]' prisma/schema.prisma",
+        ],
+        "enable Prisma view introspection",
+    )
+    .await;
+
     let pull_cmd = format!(
         "cd /app && DATABASE_URL=postgresql://test:test@{}:{}/test npx prisma db pull",
         host_ip, port
@@ -507,6 +520,15 @@ assert 'c_bool' in names",
         &node_container,
         vec!["sh", "-c", &pull_cmd],
         "prisma db pull",
+    )
+    .await;
+
+    // A successful command alone is insufficient: confirm the actual view
+    // was reflected instead of accepting an empty introspection result.
+    run_cmd_checked(
+        &node_container,
+        vec!["sh", "-c", "grep -Fq 'view numeric_view {' /app/prisma/schema.prisma"],
+        "verify Prisma reflected numeric_view",
     )
     .await;
 
