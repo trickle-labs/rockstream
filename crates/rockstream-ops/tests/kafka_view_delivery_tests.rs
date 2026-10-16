@@ -206,7 +206,7 @@ async fn view_snapshot_changes_and_recovery_match_exact_consumer_stream() {
         .unwrap();
     let mut uninterrupted = None;
     for crash_at in [None, Some(0), Some(1), Some(2), Some(3)] {
-        let topic = format!("view-122-{}", crash_at.map_or(9, |epoch| epoch));
+        let topic = format!("view-122-{}", crash_at.unwrap_or(9));
         assert_eq!(
             admin
                 .create_topics(
