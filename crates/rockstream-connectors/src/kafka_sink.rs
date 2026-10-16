@@ -4,6 +4,9 @@
 //! Uses `CheckBeforeCommit` idempotency profile: recovery queries the Kafka
 //! topic for the epoch marker before deciding whether to commit.
 //!
+//! Experimental marker transport only: `pre_commit` accepts a row count, not
+//! view records. Snapshot/change row delivery and payload recovery are unsupported.
+//!
 //! ## Bounded resources
 //!
 //! - `staged_epochs_count`: fill-level metric for staged (pre-committed) epochs.
@@ -48,7 +51,7 @@ struct KafkaBroker {
     topic: String,
 }
 
-/// Kafka sink implementing `CheckBeforeCommit` idempotency.
+/// Experimental epoch/count marker sink implementing `CheckBeforeCommit` idempotency.
 pub struct KafkaSink {
     connector_id: ConnectorId,
     /// Epochs that have been delivered to the "external Kafka".

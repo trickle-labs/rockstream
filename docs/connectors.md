@@ -13,15 +13,16 @@ connectors.
 
 ## Strategic contract
 
-The retained connector and sink surface is Core: it is release-gated, named in
-the generated [`capability matrix`](capability-matrix.md), and covered by the
-existing exact-transcript proof suites.
+The two source connectors are Core and release-gated. The Kafka sink is
+Experimental and transports epoch/count markers only. Materialized-view row
+delivery is unsupported. The generated
+[`capability matrix`](capability-matrix.md) records these tiers.
 
 | Capability | Tier | Guarantee reference | Named proof |
 | --- | --- | --- | --- |
 | PostgreSQL CDC source | **Core** | [PostgreSQL CDC](#postgresql-cdc) | [`postgres_cdc_snapshot_stream_fence_has_exact_transcript`](../crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs) |
 | Kafka source | **Core** | [Kafka source](#kafka-source) | [`kafka_source_mid_epoch_rebalance_recovers_exact_transcript`](../crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs) |
-| Kafka sink | **Core** | [Kafka sink](#kafka-sink) | [`kafka_sink_crash_before_commit_has_no_visible_payload_and_recovers_exactly`](../crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs) |
+| Kafka sink | **Experimental** | [Kafka sink](#kafka-sink) | Row delivery unsupported; marker tests do not qualify payload delivery. |
 
 These are the only external connector boundaries. Removed Iceberg, Delta,
 object-store, S3, and HTTP webhook surfaces fail closed with `RS-4017`; their
@@ -154,13 +155,28 @@ CREATE SOURCE events_source TYPE kafka (
 
 ## Kafka sink
 
+**Row delivery: unsupported.** The sink accepts only `(epoch, row_count)` and
+emits `{"epoch":1,"rows":2}` markers. It receives no row keys, values, signed
+weights, or snapshot completion boundary. Recovery handles persist the
+transaction identity and count, with no row payload or snapshot progress.
+Equal counts with wrong values, missing deletions, or duplicated changes cannot
+be distinguished. Marker tests are transport checks only.
+
+Core promotion requires the [#122 acceptance contract](acceptance-contracts/122.md):
+an actual consumer of the production view-to-sink path must observe the exact
+snapshot `(1,'a'), (2,'b')`, update key 1 to `c`, delete key 2, and reconstruct
+exactly `(1,'c')`, including transaction boundaries and recovery without gaps or
+duplicates. Value substitution, an omitted deletion, and a duplicate change
+must each fail qualification. R1–R5 remain unsupported; R6 removes the Core
+payload claim until that path exists.
+
 | Axis | Guarantee |
 | --- | --- |
-| Delivery / recovery | Transactional, checkpoint-coupled commit; recovery re-runs safely without a second externally visible epoch. |
+| Delivery / recovery | Experimental transactional epoch/count markers only; snapshot/change row delivery and row recovery are unsupported. |
 | Bound / fill metric / backpressure | `KAFKA_SINK_MAX_STAGED_EPOCHS=5`, `kafka_sink_staged_epochs_count`, and `backpressure_active`; staged-epoch admission rejects overflow. |
 | Degraded states | Pre-commit/commit uncertainty, timeout, staged-epoch backpressure, and idempotent recovery are explicit. |
 | Failure codes | `RS-4002`, `RS-4003`, `RS-4004`, and `RS-4005`; recover with the action in the registry. |
-| Proof matrix | The seven Kafka sink cells below. |
+| Proof matrix | The seven Kafka marker transport cells below; these do not qualify view row delivery. |
 
 ## Failure-code ownership
 
@@ -191,10 +207,9 @@ CREATE SOURCE events_source TYPE kafka (
 
 ## Guarantee matrix
 
-Every row names the exact TestContainers proof. Each proof records the full
-payload/key/weight/LSN or offset transcript before and after recovery, and
-asserts no loss, no duplicate, and recovery within the existing 60-second
-freshness budget.
+The source rows name TestContainers transcript proofs. The Kafka sink rows
+exercise epoch/count marker transport and recovery only; they provide no proof
+of snapshot rows, change rows, or recovered row payloads.
 
 ### PostgreSQL CDC
 
@@ -223,6 +238,8 @@ freshness budget.
 | Transactional source/sink interaction | `kafka_source_sink_transaction_coupling_has_exact_transcript` |
 
 ### Kafka sink
+
+Epoch/count marker transport checks only; row-delivery qualification is unsupported.
 
 | Cell | Test |
 | --- | --- |

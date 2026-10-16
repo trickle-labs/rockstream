@@ -42,7 +42,8 @@ pub trait SinkConnector: Send + Sync {
         true
     }
 
-    /// Stage rows for the given epoch (pre-commit phase).
+    /// Stage epoch/count metadata for the given epoch (pre-commit phase).
+    /// This interface carries no row payload and cannot qualify view row delivery.
     ///
     /// Implementations must:
     /// 1. Begin a connector-specific transaction (Kafka: initTransaction;

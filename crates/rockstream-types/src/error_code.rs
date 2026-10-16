@@ -801,7 +801,7 @@ mod tests {
             (RS_4014, "source.bounds_exceeded", "Source bounded in-flight capacity was exceeded", "Drain the source or reduce transaction and epoch size before increasing the configured bound."),
             (RS_4015, "source.fence_mismatch", "Source checkpoint fence did not advance monotonically", "Recover the highest committed source checkpoint and retry with the next fenced epoch."),
             (RS_4016, "source.acknowledgement_failed", "Source checkpoint acknowledgement failed", "Retain source ownership, recover the committed checkpoint, and retry upstream acknowledgement."),
-            (RS_4017, "connector.removed", "Connector has been removed", "Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output."),
+            (RS_4017, "connector.removed", "Connector has been removed", "Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks. Kafka sink row export is currently unsupported."),
             (RS_4018, "source.epoch_exhausted", "Source epoch exhausted", "Create a new connector before retrying."),
             (RS_4019, "source.backfill_cursor_invalid", "Source backfill cursor or lifecycle is invalid", "Recover or recreate the committed backfill cursor or lifecycle, then retry."),
             (RS_4020, "backfill.live_delta_buffer_full", "Backfill live-delta buffer is full", "Wait for snapshot catch-up or reduce live-delta volume before retrying."),

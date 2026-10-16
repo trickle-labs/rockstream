@@ -608,7 +608,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         return Err(CliError::new(
             RS_4017,
             "connector.removed: cold-tier configuration has been removed",
-            "Use RockStream to Kafka to a downstream writer for cold-tier output.",
+            "Kafka sink row export is currently unsupported; see docs/connector-migration.md.",
         ));
     }
 
@@ -2712,7 +2712,7 @@ mod tests {
                 control_shared_storage: None, query_time_shard_dirs: Vec::new(),
                 shutdown_timeout_secs: None,
             }).unwrap_err();
-            assert_eq!(err.to_string(), "RS-4017 connector.removed: cold-tier configuration has been removed\n  next steps: Use RockStream to Kafka to a downstream writer for cold-tier output.");
+            assert_eq!(err.to_string(), "RS-4017 connector.removed: cold-tier configuration has been removed\n  next steps: Kafka sink row export is currently unsupported; see docs/connector-migration.md.");
         }
     }
 

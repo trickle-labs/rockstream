@@ -103,10 +103,10 @@ def check_documented_tiers(
     expected_rows = {
         "PostgreSQL CDC source": "Core",
         "Kafka source": "Core",
-        "Kafka sink": "Core",
+        "Kafka sink": "Experimental",
     }
     if connector_rows != expected_rows:
-        fail(errors, "connector documentation must list exactly the three Core surfaces")
+        fail(errors, "connector documentation must list two Core sources and the Experimental Kafka sink")
     if "RS-4017" not in connector_text or "connector-migration.md" not in connector_text:
         fail(errors, "connector documentation must retain the RS-4017 migration reference")
     if not (root / "docs/connector-migration.md").is_file():
@@ -137,8 +137,27 @@ def check_external_surface(capabilities: list[dict], errors: list[str]) -> None:
             details.append(f"missing {', '.join(missing)}")
         fail(errors, f"connector/sink inventory mismatch ({'; '.join(details)})")
     for item in capabilities:
-        if item.get("kind") in {"connector", "sink"} and item.get("tier") != "Core":
-            fail(errors, f"{item.get('id')} must be Core")
+        if item.get("kind") not in {"connector", "sink"}:
+            continue
+        expected_tier = "Experimental" if item.get("id") == "sink.kafka" else "Core"
+        if item.get("tier") != expected_tier:
+            fail(errors, f"{item.get('id')} must be {expected_tier}")
+        if item.get("id") == "sink.kafka":
+            if item.get("proof") or item.get("proof_levels_achieved"):
+                fail(errors, "sink.kafka row delivery is unsupported; marker proofs cannot qualify it")
+            rows = item.get("behavior", [])
+            for behavior in ("incremental", "backfill"):
+                unsupported = [
+                    (row.get("statement"), row.get("proof"))
+                    for row in rows if row.get("behavior") == behavior
+                ]
+                expected = (
+                    "Unsupported: materialized-view change rows are not delivered; only epoch/count markers are emitted."
+                    if behavior == "incremental" else
+                    "Unsupported: materialized-view snapshot rows and snapshot completion boundaries are not delivered."
+                )
+                if unsupported != [(expected, "")]:
+                    fail(errors, f"sink.kafka {behavior} must remain explicitly unsupported without a row-delivery proof")
 
 
 def check_proof_levels(capabilities: list[dict], errors: list[str]) -> None:
@@ -270,7 +289,7 @@ def check_full_semantics(
 
 
     for capability in capabilities:
-        if capability.get("tier") != "Core":
+        if capability.get("tier") != "Core" and capability.get("id") != "sink.kafka":
             continue
         rows = capability.get("behavior")
         if not isinstance(rows, list):
@@ -296,7 +315,8 @@ def check_full_semantics(
             statement = row.get("statement")
             if not isinstance(statement, str) or not statement.strip():
                 fail(errors, f"{label} has an empty statement")
-            proof_exists(root, row.get("proof"), label, errors)
+            if capability.get("id") != "sink.kafka" or behavior not in {"incremental", "backfill"}:
+                proof_exists(root, row.get("proof"), label, errors)
             paired_proof = row.get("paired_proof")
             if paired_proof is not None:
                 proof_exists(root, paired_proof, f"{label} paired proof", errors)

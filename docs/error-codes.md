@@ -1659,7 +1659,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **Severity**: `Error`
 - **SQLSTATE**: `0A000`
 - **Retry Class**: `NonRetryable`
-- **Default Next Steps**: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.
+- **Default Next Steps**: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks. Kafka sink row export is currently unsupported.
 
 ### <a id="rs-4018"></a> `RS-4018` — Source epoch exhausted
 

@@ -5000,8 +5000,9 @@ adaptive per-operator parallelism**.
 qualification, not the completed v0.59 engineering gate. Cold-tier Iceberg and
 Delta sinks, external catalog registration, the Iceberg REST Catalog server
 (§13.7), and the DuckLake catalog server (§13.8) are not shipping v1
-capabilities; downstream lakehouse delivery uses the supported Kafka sink and
-an external format-owning writer. The v1.0 positioning rests on
+capabilities; downstream lakehouse delivery requires Kafka view row delivery,
+which is currently unsupported by the Experimental epoch/count marker sink.
+The v1.0 positioning rests on
 object-storage-native IVM, the documented `Core` SQL subset, adaptive
 parallelism, PostgreSQL wire access, direct DML writes, secondary indexes, and
 the PostgreSQL CDC/Kafka connector boundary. Marketing materials must be

@@ -17,6 +17,44 @@ fn root() -> PathBuf {
 }
 
 #[test]
+fn kafka_sink_row_delivery_is_explicitly_unsupported() {
+    let sink = rockstream_types::capability::CapabilityRegistry::current()
+        .get_by_id("sink.kafka")
+        .expect("Kafka sink capability");
+    assert_eq!(
+        (
+            sink.tier.as_str(),
+            sink.proof_ref(),
+            sink.behavior
+                .iter()
+                .filter(|row| matches!(row.behavior.as_str(), "incremental" | "backfill"))
+                .map(|row| (
+                    row.behavior.as_str(),
+                    row.statement.as_str(),
+                    row.proof.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "Experimental",
+            "",
+            vec![
+                (
+                    "incremental",
+                    "Unsupported: materialized-view change rows are not delivered; only epoch/count markers are emitted.",
+                    Some(""),
+                ),
+                (
+                    "backfill",
+                    "Unsupported: materialized-view snapshot rows and snapshot completion boundaries are not delivered.",
+                    Some(""),
+                ),
+            ],
+        ),
+    );
+}
+
+#[test]
 fn connector_source_file_set_is_exact() {
     let mut actual = fs::read_dir(root().join("crates/rockstream-connectors/src"))
         .expect("connector sources")

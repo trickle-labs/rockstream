@@ -503,7 +503,7 @@ pub struct CatalogStubs {
 }
 
 const V0522_CONNECTOR_CATALOG_KEY: &[u8] = b"rockstream/catalog/connectors/v0522";
-const REMOVED_CONNECTOR_REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.";
+const REMOVED_CONNECTOR_REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks. Kafka sink row export is currently unsupported.";
 
 /// Exact v0.52.2 connector-catalog envelope, read by one bounded key.
 #[derive(Debug, Clone, Serialize, Deserialize)]

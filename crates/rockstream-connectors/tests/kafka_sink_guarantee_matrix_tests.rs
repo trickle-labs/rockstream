@@ -241,8 +241,8 @@ async fn kafka_sink_checkpoint_coupling_has_exact_commit_transcript() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn kafka_sink_incremental_payload_matches_view() {
-    let (fixture, topic) = setup("incremental_payload").await;
+async fn kafka_sink_emits_epoch_count_marker_only() {
+    let (fixture, topic) = setup("epoch_count_marker").await;
     let mut sink =
         KafkaSink::connect(ConnectorId(5_408), &fixture.kafka_bootstrap, &topic).unwrap();
     sink.set_cluster_committed(1);
@@ -250,18 +250,6 @@ async fn kafka_sink_incremental_payload_matches_view() {
     sink.commit(1, &state).await.unwrap();
     let received = payloads(&fixture.kafka_bootstrap, &topic, 1).await;
     assert_eq!(received, vec!["{\"epoch\":1,\"rows\":2}".to_string()]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn kafka_sink_initial_snapshot_delivery_exact() {
-    let (fixture, topic) = setup("initial_snapshot").await;
-    let mut sink =
-        KafkaSink::connect(ConnectorId(5_409), &fixture.kafka_bootstrap, &topic).unwrap();
-    sink.set_cluster_committed(1);
-    let state = sink.pre_commit(1, 10).await.unwrap();
-    sink.commit(1, &state).await.unwrap();
-    let received = payloads(&fixture.kafka_bootstrap, &topic, 1).await;
-    assert_eq!(received, vec!["{\"epoch\":1,\"rows\":10}".to_string()]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

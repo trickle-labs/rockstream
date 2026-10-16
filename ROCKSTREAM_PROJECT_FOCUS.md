@@ -578,7 +578,7 @@ For public-facing features, track:
 | Long-lived registry leak closure | Done | v0.51.26 | Core | Yes |
 | HTTP webhook/push source | Removed | Shipped v0.51.16, removed v0.52.3–v0.52.4 | — | No; replacement is an external HTTP→Kafka adapter |
 | Object-store / S3 source & sink | Removed | Shipped v0.27–v0.29, removed v0.52.3–v0.52.4 | — | No; replacement is an external loader via pgwire/Kafka |
-| Iceberg/Delta cold-tier sink, cold-tier GC & catalog registration | Removed | Shipped v0.44, removed v0.52.3–v0.52.4 | — | No; replacement is Rockstream → Kafka → a downstream lakehouse writer |
+| Iceberg/Delta cold-tier sink, cold-tier GC & catalog registration | Removed | Shipped v0.44, removed v0.52.3–v0.52.4 | — | No; Kafka-based row export is unsupported until view row delivery exists (#122) |
 | Secondary indexes | Done | v0.32, v0.51.2 | Maintain | Existing behavior, no automatic expansion |
 | Hot-key virtual buckets & proactive shard splitting | Done | v0.47 | Maintain | Existing behavior, no automatic expansion |
 | Autoscaling signals | Done | v0.47 | Maintain | Tied to IVM SLO only, not general elasticity |

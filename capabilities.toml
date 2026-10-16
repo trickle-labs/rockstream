@@ -25,6 +25,13 @@ new_tier = "Experimental"
 reason = "Unconstrained cross product joins without keys are demoted to experimental."
 evidence = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_cross"
 
+[[contract.tier_decision]]
+capability = "sink.kafka"
+old_tier = "Core"
+new_tier = "Experimental"
+reason = "Only epoch/count markers are emitted and restored; materialized-view snapshot and incremental row delivery are unsupported (#122)."
+evidence = "crates/rockstream-connectors/tests/connector_surface_contract_tests.rs::kafka_sink_row_delivery_is_explicitly_unsupported"
+
 [[dispatch]]
 id = "query_async_entry"
 path = "crates/rockstream-gateway/src/server.rs"
@@ -685,17 +692,17 @@ behavior = [
 id = "sink.kafka"
 kind = "sink"
 name = "Kafka sink"
-tier = "Core"
+tier = "Experimental"
 reachability = "Connector runtime"
 dispatch = ["kafka_sink_runtime"]
-proof = "crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_crash_before_commit_has_no_visible_payload_and_recovers_exactly"
-proof_levels_achieved = ["L0", "L1", "L3", "L4", "L5"]
+proof = ""
+proof_levels_achieved = []
 min_proof_level = ["L0", "L1", "L3", "L4", "L5"]
 documentation = "docs/connectors.md#kafka-sink"
 behavior = [
-  { behavior = "incremental", statement = "Materialized view change records are delivered to the Kafka sink topic matching the incremental output.", proof = "crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_incremental_payload_matches_view" },
-  { behavior = "backfill", statement = "Initial snapshot emission to Kafka sink delivers exactly all existing view records before live deltas.", proof = "crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_initial_snapshot_delivery_exact" },
-  { behavior = "checkpoint_recovery", statement = "A recovery checkpoint persisted to and restored from an object-store backend commits byte-identical output across a simulated restart, in both local and object-store backends.", proof = "crates/rockstream-connectors/tests/connector_scenario_durability_lfs_tests.rs::kafka_sink_checkpoint_restart_lfs_has_byte_identical_commit", paired_proof = "crates/rockstream-connectors/tests/connector_scenario_durability_minio_tests.rs::kafka_sink_checkpoint_restart_minio_has_byte_identical_commit" },
+  { behavior = "incremental", statement = "Unsupported: materialized-view change rows are not delivered; only epoch/count markers are emitted.", proof = "" },
+  { behavior = "backfill", statement = "Unsupported: materialized-view snapshot rows and snapshot completion boundaries are not delivered.", proof = "" },
+  { behavior = "checkpoint_recovery", statement = "Recovery restores epoch/count markers only; row payload and snapshot progress recovery are unsupported.", proof = "crates/rockstream-connectors/tests/connector_scenario_durability_lfs_tests.rs::kafka_sink_checkpoint_restart_lfs_has_byte_identical_commit", paired_proof = "crates/rockstream-connectors/tests/connector_scenario_durability_minio_tests.rs::kafka_sink_checkpoint_restart_minio_has_byte_identical_commit" },
   { behavior = "state_growth", statement = "Kafka sink staging buffer is bounded and exposes its fill metric.", proof = "crates/rockstream-connectors/tests/dlq_backpressure_threshold_tests.rs::kafka_sink_buffer_bounded_with_fill_metric", bound = "configured staging buffer limit", metric = "kafka_sink_buffer_fill_ratio", on_bound = "pre-commit applies backpressure or returns its RS-coded resource error" },
   { behavior = "failure", statement = "A producer communication or broker failure fails closed with an actionable RS-coded error.", proof = "crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_producer_error_fails_closed" },
 ]
