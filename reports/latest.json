@@ -1,49 +1,8 @@
 {
-  "checks": [
-    {
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "rockstream-types",
-        "--test",
-        "v072_quota_generation_tests",
-        "--test",
-        "v072_worker_budget_tests"
-      ],
-      "exit_code": 0,
-      "log_sha256": "55db36bc9f032d78031dab542352ac756cdc9744103983d46a09f02ff39ef845"
-    },
-    {
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "rockstream-types",
-        "state_budget"
-      ],
-      "exit_code": 0,
-      "log_sha256": "eb268b6e7693d2acd693865a7426f780f69467e635c7fb6d0f85537d03d12e5b"
-    },
-    {
-      "command": [
-        "cargo",
-        "clippy",
-        "-p",
-        "rockstream-types",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings"
-      ],
-      "exit_code": 101,
-      "log_sha256": "3ff3cef21deac81e5168b6a5b3f4d6abf52273c2370be457af7ee9fe355b9f3f"
-    }
-  ],
-  "id": "010-quota-generation-validation",
-  "kind": "test",
-  "request_commit": "b6ad74fb43e73accc6244ce730da22278c2c60d8",
-  "source": "601a256307944c3d62b28c904a33a53470dd7441",
-  "status": "failed",
+  "id": "011-worker-durable-frontier",
+  "kind": "patch",
+  "request_commit": "e9a88d769bfc98d1d13f3e06d4547c4e19652777",
+  "source": "8779e1123ae5c56d14d58d0817fe2f418e764632",
+  "status": "running",
   "workspace_run": "38942187359"
 }
