@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +34,7 @@ pub struct MatrixCellDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatrixExecutionResult {
     pub cell_id: String,
     pub area: ExperimentArea,
@@ -52,6 +53,7 @@ pub struct MatrixExecutionResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatrixReport {
     pub schema_version: u32,
     pub cells: Vec<MatrixExecutionResult>,
@@ -235,99 +237,163 @@ pub fn default_matrix_cells() -> Vec<MatrixCellDefinition> {
     ]
 }
 
+fn metric(value: Option<f64>, name: &str, cell: &str, positive: bool) -> Result<f64> {
+    let value = value.ok_or_else(|| anyhow::anyhow!("missing {name} in cell {cell}"))?;
+    if !value.is_finite() || value < 0.0 || (positive && value == 0.0) {
+        bail!("invalid {name} in cell {cell}");
+    }
+    Ok(value)
+}
+
+/// Validate the historical matrix's complete structure and measured values.
+/// Historical blockers remain reportable here, but cannot qualify v0.72.
+/// PIDs and summary metrics alone are not proof of a real process measurement.
 pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
     if report.schema_version != 1 {
         bail!("matrix report schema_version must be 1");
     }
 
-    let defined_cells = default_matrix_cells();
-    let defined_ids: HashSet<String> = defined_cells.iter().map(|c| c.cell_id.clone()).collect();
-    let reported_ids: HashSet<String> = report.cells.iter().map(|c| c.cell_id.clone()).collect();
-
-    for id in &defined_ids {
-        if !reported_ids.contains(id) {
-            bail!("missing required matrix cell: {}", id);
-        }
-    }
-
-    let areas: HashSet<ExperimentArea> = report.cells.iter().map(|c| c.area).collect();
-    if areas.len() < 6 {
-        bail!(
-            "matrix report does not cover all 6 experiment areas (covered: {})",
-            areas.len()
-        );
-    }
-
+    let defined = default_matrix_cells();
+    let by_id: HashMap<_, _> = defined.iter().map(|cell| (cell.cell_id.as_str(), cell)).collect();
+    let mut reported = HashSet::new();
     for cell in &report.cells {
-        if cell.status == "MEASURED" {
-            if !cell.worker_active {
-                bail!("inactive worker process detected in cell {}", cell.cell_id);
-            }
-            if cell.worker_pids.is_empty() {
-                bail!("no worker PIDs recorded for cell {}", cell.cell_id);
-            }
-        } else if cell.status == "BLOCKED" {
-            let owner = match &cell.owning_milestone {
-                Some(o) if !o.is_empty() => o,
-                _ => bail!(
-                    "unowned blocked cell {} missing owning milestone",
-                    cell.cell_id
-                ),
-            };
-            if !owner.starts_with("v0.") {
-                bail!(
-                    "blocked cell {} has invalid owning milestone {}",
-                    cell.cell_id,
-                    owner
-                );
-            }
-            let blocker = match &cell.blocker_description {
-                Some(b) if !b.is_empty() => b,
-                _ => bail!("blocked cell {} missing blocker description", cell.cell_id),
-            };
-            if blocker.trim().is_empty() {
-                bail!(
-                    "blocked cell {} has empty blocker description",
-                    cell.cell_id
-                );
-            }
-            if cell.throughput_rows_per_sec.is_some() {
-                bail!(
-                    "blocked cell {} must not claim measured throughput",
-                    cell.cell_id
-                );
-            }
+        if !by_id.contains_key(cell.cell_id.as_str()) {
+            bail!("unknown matrix cell: {}", cell.cell_id);
+        }
+        if !reported.insert(cell.cell_id.as_str()) {
+            bail!("duplicate matrix cell: {}", cell.cell_id);
+        }
+    }
+    // Report omissions in contract order, not randomized hash-map iteration order.
+    for cell in &defined {
+        if !reported.contains(cell.cell_id.as_str()) {
+            bail!("missing required matrix cell: {}", cell.cell_id);
         }
     }
 
-    // Check write amplification rule between 1K and 100K if both are measured
-    let cell_1k = report
-        .cells
-        .iter()
-        .find(|c| c.cell_id == "one-key-1k-standalone" && c.status == "MEASURED");
-    let cell_100k = report
-        .cells
-        .iter()
-        .find(|c| c.cell_id == "one-key-100k-standalone" && c.status == "MEASURED");
-    if let (Some(c1k), Some(c100k)) = (cell_1k, cell_100k) {
-        if let (Some(w1k), Some(w100k)) =
-            (c1k.state_writes_per_change, c100k.state_writes_per_change)
-        {
-            if w1k > 0.0 && w100k > 0.0 {
-                let ratio = if w100k > w1k {
-                    w100k / w1k
-                } else {
-                    w1k / w100k
-                };
-                if ratio > 1.10 {
-                    bail!(
-                        "write amplification ratio {:.3} between 1K and 100K exceeds frozen threshold 1.10",
-                        ratio
-                    );
+    let mut measured = 0;
+    let mut blocked = 0;
+    let mut writes = Vec::new();
+    for cell in &report.cells {
+        let definition = by_id[cell.cell_id.as_str()];
+        if cell.area != definition.area {
+            bail!("wrong experiment area for cell {}", cell.cell_id);
+        }
+        match cell.status.as_str() {
+            "MEASURED" => {
+                if !cell.worker_active {
+                    bail!("inactive worker process detected in cell {}", cell.cell_id);
                 }
+                if cell.worker_pids.is_empty() {
+                    bail!("no worker PIDs recorded for cell {}", cell.cell_id);
+                }
+                let mut pids = HashSet::new();
+                if cell.worker_pids.iter().any(|pid| *pid == 0 || !pids.insert(*pid)) {
+                    bail!("zero or duplicate worker PID in cell {}", cell.cell_id);
+                }
+                let expected_workers = match cell.cell_id.as_str() {
+                    "worker-scaling-1-worker-standalone" => Some(1),
+                    "worker-scaling-2-workers" => Some(2),
+                    "worker-scaling-4-workers" => Some(4),
+                    "worker-scaling-8-workers" => Some(8),
+                    _ => None,
+                };
+                if let Some(expected) = expected_workers {
+                    if cell.worker_pids.len() != expected {
+                        bail!("cell {} requires {expected} distinct worker PIDs", cell.cell_id);
+                    }
+                }
+                if cell.error.is_some()
+                    || cell.owning_milestone.is_some()
+                    || cell.blocker_description.is_some()
+                {
+                    bail!("measured cell {} carries an error or blocker", cell.cell_id);
+                }
+                metric(cell.throughput_rows_per_sec, "throughput_rows_per_sec", &cell.cell_id, true)?;
+                for (name, value) in [
+                    ("read_p99_ms", cell.read_p99_ms),
+                    ("commit_p99_ms", cell.commit_p99_ms),
+                    ("freshness_p99_ms", cell.freshness_p99_ms),
+                ] {
+                    metric(value, name, &cell.cell_id, false)?;
+                }
+                if definition.lookup_cost_separated {
+                    metric(cell.lookup_cost_ms, "lookup_cost_ms", &cell.cell_id, false)?;
+                    writes.push(metric(
+                        cell.state_writes_per_change,
+                        "state_writes_per_change",
+                        &cell.cell_id,
+                        true,
+                    )?);
+                } else {
+                    for (name, value) in [
+                        ("lookup_cost_ms", cell.lookup_cost_ms),
+                        ("state_writes_per_change", cell.state_writes_per_change),
+                    ] {
+                        if value.is_some() {
+                            metric(value, name, &cell.cell_id, false)?;
+                        }
+                    }
+                }
+                measured += 1;
             }
+            "BLOCKED" => {
+                let owner = cell.owning_milestone.as_deref().filter(|owner| !owner.trim().is_empty());
+                let Some(owner) = owner else {
+                    bail!("unowned blocked cell {} missing owning milestone", cell.cell_id);
+                };
+                if !owner.starts_with("v0.") {
+                    bail!("blocked cell {} has invalid owning milestone {}", cell.cell_id, owner);
+                }
+                if cell.blocker_description.as_deref().is_none_or(|reason| reason.trim().is_empty()) {
+                    bail!("blocked cell {} missing blocker description", cell.cell_id);
+                }
+                if matches!(definition.status, MatrixCellStatus::RunnableStandalone) {
+                    bail!("runnable cell {} cannot use a historical blocker", cell.cell_id);
+                }
+                if cell.throughput_rows_per_sec.is_some()
+                    || cell.read_p99_ms.is_some()
+                    || cell.commit_p99_ms.is_some()
+                    || cell.freshness_p99_ms.is_some()
+                    || cell.state_writes_per_change.is_some()
+                    || cell.lookup_cost_ms.is_some()
+                    || !cell.worker_pids.is_empty()
+                    || cell.worker_active
+                    || cell.error.is_some()
+                {
+                    bail!("blocked cell {} must not claim measured evidence", cell.cell_id);
+                }
+                blocked += 1;
+            }
+            status => bail!("unsupported matrix cell status {status:?} for {}", cell.cell_id),
         }
     }
 
+    let areas: HashSet<_> = report.cells.iter().map(|cell| cell.area).collect();
+    if areas.len() != 6 || !report.all_areas_covered {
+        bail!("matrix report all_areas_covered does not match its cells");
+    }
+    if measured != report.runnable_measured_count || blocked != report.blocked_count {
+        bail!("matrix report counts do not match its cells");
+    }
+    // Every measured one-key case participates, including 10M when supplied.
+    let minimum = writes.iter().copied().fold(f64::INFINITY, f64::min);
+    let maximum = writes.iter().copied().fold(0.0, f64::max);
+    if maximum / minimum > 1.10 {
+        bail!("one-key write amplification ratio exceeds frozen threshold 1.10");
+    }
+    Ok(())
+}
+
+/// v0.72 makes all sixteen named local matrix cells applicable. Earlier
+/// milestone blockers are historical records, not an acceptance exemption.
+/// This checks matrix completeness, not raw-evidence provenance or capacity.
+pub fn verify_v072_matrix(report: &MatrixReport) -> Result<()> {
+    verify_matrix(report)?;
+    for cell in &report.cells {
+        if cell.status != "MEASURED" {
+            bail!("v0.72 applicable cell {} is not measured", cell.cell_id);
+        }
+    }
     Ok(())
 }
