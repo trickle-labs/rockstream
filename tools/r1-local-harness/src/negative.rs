@@ -32,22 +32,32 @@ pub fn qualify_matrix(report: &MatrixReport) -> Result<()> {
     verify_matrix(report)
 }
 
+/// Validate a complete legacy evidence bundle, never an optional subset.
+/// This integrity check is not the v0.72 release-process capacity verdict.
 pub fn qualify_evidence(evidence_dir: &Path) -> Result<()> {
     let matrix_path = evidence_dir.join("matrix-report.json");
-    if matrix_path.exists() {
-        let content =
-            fs::read(&matrix_path).with_context(|| format!("read {}", matrix_path.display()))?;
-        let report: MatrixReport = serde_json::from_slice(&content)
-            .with_context(|| format!("parse {}", matrix_path.display()))?;
-        qualify_matrix(&report)?;
+    let samples_path = evidence_dir.join("raw-samples.jsonl");
+    for (path, name) in [
+        (&matrix_path, "matrix-report.json"),
+        (&samples_path, "raw-samples.jsonl"),
+    ] {
+        if !path.is_file() {
+            bail!("missing required evidence file: {name}");
+        }
     }
 
-    let samples_path = evidence_dir.join("raw-samples.jsonl");
-    if samples_path.exists() {
-        let samples = read_samples(&samples_path)?;
-        for sample in &samples {
-            qualify_sample(sample)?;
-        }
+    let content =
+        fs::read(&matrix_path).with_context(|| format!("read {}", matrix_path.display()))?;
+    let report: MatrixReport = serde_json::from_slice(&content)
+        .with_context(|| format!("parse {}", matrix_path.display()))?;
+    qualify_matrix(&report)?;
+
+    let samples = read_samples(&samples_path)?;
+    if samples.is_empty() {
+        bail!("raw-samples.jsonl contains no runs");
+    }
+    for sample in &samples {
+        qualify_sample(sample)?;
     }
 
     Ok(())

@@ -1,0 +1,55 @@
+name: v0.72 evidence checks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - tools/r1-local-harness/**
+      - benchmarks/r1-local/profile-v072.toml
+      - .github/workflows/v072-evidence-checks.yml
+  push:
+    branches: [main]
+    paths:
+      - tools/r1-local-harness/**
+      - benchmarks/r1-local/profile-v072.toml
+      - .github/workflows/v072-evidence-checks.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v072-evidence-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness:
+    name: Evidence validator regressions (not capacity qualification)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Retain exact tested source and revision
+        run: |
+          mkdir -p "$RUNNER_TEMP/v072-source"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/v072-source/source.tar.gz" HEAD
+          git rev-parse HEAD > "$RUNNER_TEMP/v072-source/revision.txt"
+          sha256sum "$RUNNER_TEMP/v072-source/source.tar.gz" > "$RUNNER_TEMP/v072-source/source.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v072-tested-source-${{ github.run_id }}
+          path: ${{ runner.temp }}/v072-source/
+          retention-days: 14
+          if-no-files-found: error
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/r1-local-harness
+      - name: Run harness regression tests
+        run: cargo test --manifest-path tools/r1-local-harness/Cargo.toml --all-targets
+      - name: Check harness formatting
+        run: cargo fmt --manifest-path tools/r1-local-harness/Cargo.toml --all --check
+      - name: Check harness warnings
+        run: cargo clippy --manifest-path tools/r1-local-harness/Cargo.toml --all-targets -- -D warnings -A clippy::uninlined_format_args
