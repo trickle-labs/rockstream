@@ -860,10 +860,12 @@ pub struct WorkerBudgetLedger {
     total_budget_bytes: u64,
     foreground_reservation_bytes: u64,
     allocator_overhead_pct: u64,
+    // Admission linearizes on this counter, not on independently sampled categories.
+    allocated_bytes: AtomicU64,
     categories: [AtomicU64; 8],
     waiter_count: AtomicU64,
     max_waiters: u64,
-    shared_cache_charged: AtomicBool,
+    shared_cache_charged: parking_lot::Mutex<bool>,
 }
 
 impl WorkerBudgetLedger {
@@ -889,10 +891,11 @@ impl WorkerBudgetLedger {
             total_budget_bytes: total_budget_bytes as u64,
             foreground_reservation_bytes: foreground_reservation_bytes as u64,
             allocator_overhead_pct: Self::DEFAULT_ALLOCATOR_OVERHEAD_PCT,
+            allocated_bytes: AtomicU64::new(0),
             categories: Default::default(),
             waiter_count: AtomicU64::new(0),
             max_waiters: max_waiters as u64,
-            shared_cache_charged: AtomicBool::new(false),
+            shared_cache_charged: parking_lot::Mutex::new(false),
         }
     }
 
@@ -945,41 +948,41 @@ impl WorkerBudgetLedger {
         self.categories[category.index()].load(Ordering::Relaxed)
     }
 
+    /// Reserved bytes, including admissions whose category publication is in flight.
+    /// Category samples reconcile exactly after acquisitions/releases complete;
+    /// admission never relies on an incoherent cross-category snapshot.
     pub fn total_allocated_bytes(&self) -> u64 {
-        self.categories
-            .iter()
-            .map(|c| c.load(Ordering::Relaxed))
-            .sum()
+        self.allocated_bytes.load(Ordering::Acquire)
+    }
+
+    fn gross_bytes(&self, allocated: u64) -> u128 {
+        let allocated = u128::from(allocated);
+        allocated + allocated * u128::from(self.allocator_overhead_pct) / 100
     }
 
     pub fn available_background_bytes(&self) -> u64 {
         let max_bg = self
             .total_budget_bytes
             .saturating_sub(self.foreground_reservation_bytes);
-        let allocated = self.total_allocated_bytes();
-        let overhead = (allocated * self.allocator_overhead_pct) / 100;
-        let gross = allocated.saturating_add(overhead);
-        max_bg.saturating_sub(gross)
+        u128::from(max_bg).saturating_sub(self.gross_bytes(self.total_allocated_bytes())) as u64
     }
 
     pub fn available_foreground_bytes(&self) -> u64 {
-        let allocated = self.total_allocated_bytes();
-        let overhead = (allocated * self.allocator_overhead_pct) / 100;
-        let gross = allocated.saturating_add(overhead);
-        self.total_budget_bytes.saturating_sub(gross)
+        u128::from(self.total_budget_bytes)
+            .saturating_sub(self.gross_bytes(self.total_allocated_bytes())) as u64
     }
 
-    pub fn charge_shared_cache_once(
-        self: &Arc<Self>,
-        bytes: u64,
-    ) -> Result<bool, StateBudgetError> {
-        if !self.shared_cache_charged.swap(true, Ordering::SeqCst) {
-            let permit = self.try_acquire(MemoryCategory::BlockAndMetadataCaches, bytes, false)?;
-            permit.defuse();
-            Ok(true)
-        } else {
-            Ok(false)
+    pub fn charge_shared_cache_once(self: &Arc<Self>, bytes: u64) -> Result<bool, StateBudgetError> {
+        // Serialize initialization, not all allocations. Failed reservations leave
+        // the cache uncharged and retryable; no caller observes a speculative flag.
+        let mut charged = self.shared_cache_charged.lock();
+        if *charged {
+            return Ok(false);
         }
+        let permit = self.try_acquire(MemoryCategory::BlockAndMetadataCaches, bytes, false)?;
+        permit.defuse();
+        *charged = true;
+        Ok(true)
     }
 
     pub fn try_acquire(
@@ -999,7 +1002,8 @@ impl WorkerBudgetLedger {
                 .saturating_sub(self.foreground_reservation_bytes)
         };
 
-        if max_budget > 0 && bytes > max_budget {
+        // Zero capacity is a hard bound, including a fully reserved background budget.
+        if bytes > max_budget {
             return Err(StateBudgetError {
                 operator_name: format!("oversized-{}", category.name()),
                 max_bytes: max_budget,
@@ -1010,11 +1014,10 @@ impl WorkerBudgetLedger {
 
         loop {
             let current_allocated = self.total_allocated_bytes();
-            let proposed_allocated = current_allocated.saturating_add(bytes);
-            let overhead = (proposed_allocated * self.allocator_overhead_pct) / 100;
-            let gross = proposed_allocated.saturating_add(overhead);
-
-            if max_budget > 0 && gross > max_budget {
+            let proposed_allocated = current_allocated
+                .checked_add(bytes)
+                .ok_or_else(|| quota_overflow_error("worker-memory", current_allocated, bytes))?;
+            if self.gross_bytes(proposed_allocated) > u128::from(max_budget) {
                 return Err(StateBudgetError {
                     operator_name: format!("worker-budget-{}", category.name()),
                     max_bytes: max_budget,
@@ -1023,25 +1026,46 @@ impl WorkerBudgetLedger {
                 });
             }
 
-            let cat_idx = category.index();
-            let cur_cat = self.categories[cat_idx].load(Ordering::Relaxed);
-            if self.categories[cat_idx]
+            if self
+                .allocated_bytes
                 .compare_exchange_weak(
-                    cur_cat,
-                    cur_cat + bytes,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
+                    current_allocated,
+                    proposed_allocated,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 )
                 .is_ok()
             {
+                // The global reservation covers this increment, so a category
+                // cannot overflow even when different categories admit concurrently.
+                self.categories[category.index()].fetch_add(bytes, Ordering::Release);
                 return Ok(MemoryPermit::new(self.clone(), category, bytes));
             }
         }
     }
 
+    /// Release only bytes present in the category; never wrap an empty ledger.
     pub fn release(&self, category: MemoryCategory, bytes: u64) {
-        if bytes > 0 {
-            self.categories[category.index()].fetch_sub(bytes, Ordering::SeqCst);
+        let counter = &self.categories[category.index()];
+        loop {
+            let current = counter.load(Ordering::Acquire);
+            let released = current.min(bytes);
+            if released == 0 {
+                return;
+            }
+            if counter
+                .compare_exchange_weak(
+                    current,
+                    current - released,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                // Publish category release first, keeping admission conservative.
+                self.allocated_bytes.fetch_sub(released, Ordering::Release);
+                return;
+            }
         }
     }
 }
