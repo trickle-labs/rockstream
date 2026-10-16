@@ -1,77 +1,95 @@
 //! Fabricated samples exercise validation only; they are not timing evidence.
-use r1_local_harness::evidence::RawSample;
+use r1_local_harness::evidence::{FreshnessHistogram, ProcessUsage, RawSample};
+use r1_local_harness::metrics::WorkerActivity;
 use r1_local_harness::negative::qualify_sample;
-use serde_json::json;
+use std::collections::BTreeMap;
 
 type FloatSetter = fn(&mut RawSample, Option<f64>);
 
 const METRICS: [(&str, FloatSetter); 11] = [
     ("state_writes_per_change", |s, v| s.state_writes_per_change = v),
-    ("intermediate_rows_per_change", |s, v| s.intermediate_rows_per_change = v),
+    ("intermediate_rows_per_change", |s, v| {
+        s.intermediate_rows_per_change = v
+    }),
     ("network_bytes_per_change", |s, v| s.network_bytes_per_change = v),
-    ("object_store_requests_per_change", |s, v| s.object_store_requests_per_change = v),
+    ("object_store_requests_per_change", |s, v| {
+        s.object_store_requests_per_change = v
+    }),
     ("read_p99_ms", |s, v| s.read_p99_ms = v),
     ("commit_p99_ms", |s, v| s.commit_p99_ms = v),
     ("freshness_p99_ms", |s, v| s.freshness_p99_ms = v),
     ("generator_delay_p99_ms", |s, v| s.generator_delay_p99_ms = v),
     ("queue_age_ms", |s, v| s.queue_age_ms = v),
     ("control_node_load", |s, v| s.control_node_load = v),
-    ("physical_flushes_per_epoch", |s, v| s.physical_flushes_per_epoch = v),
+    ("physical_flushes_per_epoch", |s, v| {
+        s.physical_flushes_per_epoch = v
+    }),
 ];
 
 fn fixture() -> RawSample {
-    serde_json::from_value(json!({
-        "schema_version": 1,
-        "run_id": "validator-fixture",
-        "pair_id": "pair-1",
-        "order": "a_then_b",
-        "candidate_id": "current",
-        "binary_sha256": "a".repeat(64),
-        "profile_sha256": "b".repeat(64),
-        "corpus_sha256": "c".repeat(64),
-        "thresholds_sha256": "d".repeat(64),
-        "workload": "uniform-worker-scaling",
-        "strategy": "auto",
-        "worker_count": 1,
-        "seed": 42,
-        "change_stream_sha256": "e".repeat(64),
-        "monotonic_duration_ns": 1_000_000_000u64,
-        "accepted_changes": 100,
-        "visible_changes": 100,
-        "freshness_histogram": {"upper_bounds_ms": [1, 10, 100], "counts": [0, 0, 100]},
-        "processes": [{
-            "role": "worker", "pid": 1234, "user_cpu_ns": 100_000,
-            "system_cpu_ns": 20_000, "rss_bytes": 50_000_000
+    // Typed construction checks schema completeness without recursively expanding
+    // one very large json! invocation on the repository's minimum Rust version.
+    RawSample {
+        schema_version: 1,
+        run_id: "validator-fixture".to_owned(),
+        pair_id: "pair-1".to_owned(),
+        order: "a_then_b".to_owned(),
+        candidate_id: "current".to_owned(),
+        binary_sha256: "a".repeat(64),
+        profile_sha256: "b".repeat(64),
+        corpus_sha256: "c".repeat(64),
+        thresholds_sha256: "d".repeat(64),
+        workload: "uniform-worker-scaling".to_owned(),
+        strategy: "auto".to_owned(),
+        worker_count: 1,
+        seed: 42,
+        change_stream_sha256: "e".repeat(64),
+        monotonic_duration_ns: 1_000_000_000,
+        accepted_changes: 100,
+        visible_changes: 100,
+        freshness_histogram: FreshnessHistogram {
+            upper_bounds_ms: vec![1, 10, 100],
+            counts: vec![0, 0, 100],
+        },
+        processes: vec![ProcessUsage {
+            role: "worker".to_owned(),
+            pid: 1234,
+            user_cpu_ns: 100_000,
+            system_cpu_ns: 20_000,
+            rss_bytes: 50_000_000,
         }],
-        "logical_bytes": 1000,
-        "lfs_bytes": 2000,
-        "exchange_bytes": 500,
-        "max_queue_depth": 1,
-        "operator_counters": {"rows": 100},
-        "workers": [{
-            "worker_id": 1, "pid": 1234, "shards_owned": 1,
-            "input_rows": 100, "output_rows": 100, "state_writes": 50,
-            "exchange_bytes": 500
+        logical_bytes: 1000,
+        lfs_bytes: 2000,
+        exchange_bytes: 500,
+        max_queue_depth: 1,
+        operator_counters: BTreeMap::from([("rows".to_owned(), 100)]),
+        workers: vec![WorkerActivity {
+            worker_id: 1,
+            pid: 1234,
+            shards_owned: 1,
+            input_rows: 100,
+            output_rows: 100,
+            state_writes: 50,
+            exchange_bytes: 500,
         }],
-        "canonical_input_sha256": "f".repeat(64),
-        "rockstream_output_sha256": "0".repeat(64),
-        "sqlite_oracle_output_sha256": "0".repeat(64),
-        "outputs_equal": true,
-        "state_writes_per_change": 0.5,
-        "intermediate_rows_per_change": 1.0,
-        "network_bytes_per_change": 5.0,
-        "object_store_requests_per_change": 0.1,
-        "read_p99_ms": 2.0,
-        "commit_p99_ms": 8.0,
-        "freshness_p99_ms": 20.0,
-        "generator_delay_p99_ms": 1.0,
-        "generator_queue_drops": 0,
-        "timeouts_and_errors": 0,
-        "queue_age_ms": 0.5,
-        "control_node_load": 0.1,
-        "physical_flushes_per_epoch": 1.0
-    }))
-    .unwrap()
+        canonical_input_sha256: "f".repeat(64),
+        rockstream_output_sha256: "0".repeat(64),
+        sqlite_oracle_output_sha256: "0".repeat(64),
+        outputs_equal: true,
+        state_writes_per_change: Some(0.5),
+        intermediate_rows_per_change: Some(1.0),
+        network_bytes_per_change: Some(5.0),
+        object_store_requests_per_change: Some(0.1),
+        read_p99_ms: Some(2.0),
+        commit_p99_ms: Some(8.0),
+        freshness_p99_ms: Some(20.0),
+        generator_delay_p99_ms: Some(1.0),
+        generator_queue_drops: Some(0),
+        timeouts_and_errors: Some(0),
+        queue_age_ms: Some(0.5),
+        control_node_load: Some(0.1),
+        physical_flushes_per_epoch: Some(1.0),
+    }
 }
 
 #[test]
