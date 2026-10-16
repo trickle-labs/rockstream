@@ -1,6 +1,8 @@
 {
-  "id": "startup",
+  "id": "001-harness-format",
+  "kind": "format",
+  "request_commit": "32c8b78b920916e9e4cde9056a5518a17f20a6bb",
   "source": "336475e252377825e2aaa7ddd60f257b5b9efe28",
-  "status": "ready",
+  "status": "running",
   "workspace_run": "38929758838"
 }
