@@ -1,4 +1,20 @@
 {
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "rockstream-types",
+        "--test",
+        "v072_quota_generation_tests",
+        "--test",
+        "v072_worker_budget_tests"
+      ],
+      "exit_code": 0,
+      "log_sha256": "55db36bc9f032d78031dab542352ac756cdc9744103983d46a09f02ff39ef845"
+    }
+  ],
   "id": "010-quota-generation-validation",
   "kind": "test",
   "request_commit": "b6ad74fb43e73accc6244ce730da22278c2c60d8",

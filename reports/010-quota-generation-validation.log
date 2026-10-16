@@ -1,0 +1,115 @@
+
+COMMAND ["cargo", "test", "-p", "rockstream-types", "--test", "v072_quota_generation_tests", "--test", "v072_worker_budget_tests"]
+    Updating crates.io index
+   Compiling syn v2.0.117
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling getrandom v0.3.4
+   Compiling allocator-api2 v0.2.21
+   Compiling hashbrown v0.17.1
+   Compiling arrow-schema v58.3.0
+   Compiling chrono v0.4.44
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.50
+   Compiling zerocopy v0.8.50
+   Compiling bytes v1.11.1
+   Compiling synstructure v0.13.2
+   Compiling thiserror-impl v1.0.69
+   Compiling typenum v1.20.1
+   Compiling half v2.7.1
+   Compiling ahash v0.8.12
+   Compiling arrow-buffer v58.3.0
+   Compiling generic-array v0.14.7
+   Compiling thiserror v1.0.69
+   Compiling flatbuffers v25.12.19
+   Compiling arrow-data v58.3.0
+   Compiling asn1-rs-derive v0.5.1
+   Compiling arrow-array v58.3.0
+   Compiling displaydoc v0.2.6
+   Compiling asn1-rs-impl v0.2.0
+   Compiling indexmap v2.14.0
+   Compiling smallvec v1.15.1
+   Compiling parking_lot_core v0.9.12
+   Compiling arrow-select v58.3.0
+   Compiling arrow-ord v58.3.0
+   Compiling arrow-cast v58.3.0
+   Compiling asn1-rs v0.6.2
+   Compiling regex v1.12.3
+   Compiling rand_core v0.9.5
+   Compiling verus_builtin_macros v0.0.0-2026-09-06-0133
+   Compiling csv v1.4.0
+   Compiling serde_json v1.0.150
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling errno v0.3.14
+   Compiling toml_edit v0.22.27
+   Compiling vstd v0.0.0-2026-09-06-0133
+   Compiling arrow-json v58.3.0
+   Compiling signal-hook-registry v1.4.8
+   Compiling digest v0.10.7
+   Compiling arrow-ipc v58.3.0
+   Compiling arrow-csv v58.3.0
+   Compiling oid-registry v0.7.1
+   Compiling arrow-string v58.3.0
+   Compiling der-parser v9.0.0
+   Compiling parking_lot v0.12.5
+   Compiling arrow-arith v58.3.0
+   Compiling arrow-row v58.3.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling tracing-attributes v0.1.31
+   Compiling tokio-macros v2.7.0
+   Compiling wait-timeout v0.2.1
+   Compiling socket2 v0.6.4
+   Compiling mio v1.2.1
+   Compiling quick-error v1.2.3
+   Compiling bit-vec v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling bit-set v0.8.0
+   Compiling sha2 v0.10.9
+   Compiling x509-parser v0.16.0
+   Compiling dashmap v6.2.1
+   Compiling tokio v1.52.3
+   Compiling tracing v0.1.44
+   Compiling rand_chacha v0.9.0
+   Compiling arrow v58.3.0
+   Compiling rockstream-verified v0.71.0 (/home/runner/work/rockstream/rockstream/candidate/crates/rockstream-verified)
+   Compiling toml v0.8.23
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling uuid v1.23.2
+   Compiling antichain v0.3.1
+   Compiling lru v0.18.2
+   Compiling unarray v0.1.4
+   Compiling proptest v1.11.0
+   Compiling rockstream-types v0.71.0 (/home/runner/work/rockstream/rockstream/candidate/crates/rockstream-types)
+    Finished `test` profile [unoptimized] target(s) in 44.42s
+     Running tests/v072_quota_generation_tests.rs (target/debug/deps/v072_quota_generation_tests-519447bb62e03df2)
+
+running 7 tests
+test operator_release_reset_and_drop_preserve_sibling_charges ... ok
+test explicit_guard_release_after_removal_is_idempotent ... ok
+test removed_guard_releases_original_generation_only ... ok
+test registry_capacity_is_reclaimed_and_existing_workloads_can_be_updated ... ok
+test untracked_guard_cannot_release_a_later_registration ... ok
+test workload_and_operator_overflow_cannot_succeed_via_saturation ... ok
+test concurrent_registration_obeys_capacity_across_map_shards ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/v072_worker_budget_tests.rs (target/debug/deps/v072_worker_budget_tests-c5cbb258450f7686)
+
+running 8 tests
+test v072_all_categories_reconcile_after_acquisition_and_drop ... ok
+test v072_background_pressure_preserves_foreground_reservation ... ok
+test v072_failed_shared_cache_reservation_remains_retryable ... ok
+test v072_empty_category_release_does_not_wrap_or_release_another_owner ... ok
+test v072_large_reservations_do_not_overflow_overhead_or_wrap_total ... ok
+test v072_zero_and_fully_reserved_background_capacity_are_hard_bounds ... ok
+test v072_concurrent_cache_initializers_never_observe_speculative_success ... ok
+test v072_cross_category_admission_cannot_oversubscribe_worker ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
