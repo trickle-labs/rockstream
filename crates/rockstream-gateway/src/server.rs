@@ -5112,6 +5112,11 @@ impl GatewayHandler {
         // COPY OUT: stream CopyData messages directly through the client sink.
         if ql.starts_with("copy ") && ql.contains(" to stdout") {
             if let Some(view_name) = parse_copy_to_stdout_view(query) {
+                // COPY OUT must use the same ACL and namespace checks as SELECT.
+                // Do not read rows or emit a COPY frame before checking access.
+                if let Some(denied) = self.select_access_error_response(&view_name, Some(conn_id)) {
+                    return Ok(denied);
+                }
                 if self.catalog.get_view(&view_name).is_some()
                     && !self.catalog.is_backfill_published(&view_name)
                 {
@@ -5119,9 +5124,25 @@ impl GatewayHandler {
                 }
                 let rows = self
                     .view_reader
-                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
+                    .read_view(
+                        &view_name,
+                        Some(crate::copy_out_budget::MAX_COPY_OUT_ROWS + 1),
+                        ViewReadStrategy::HotOnly,
+                    )
                     .await
                     .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                // Error before any CopyOutResponse or CopyData. The reader's
+                // current materialization implementation remains unbounded;
+                // this is a wire-output guard, not yet full producer admission.
+                if let Err(error) = crate::copy_out_budget::check_copy_out_bounds(&rows) {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "54000".to_owned(),
+                        format!(
+                            "[RS-9001] copy_out.limit_exceeded: {error}. Next steps: narrow the query or use a bounded result page."
+                        ),
+                    )))]);
+                }
                 let row_count = rows.len();
 
                 let col_count = self
