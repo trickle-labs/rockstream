@@ -128,7 +128,7 @@ RockStream labels every public capability by its compatibility commitment. The
 | --- | --- | --- |
 | Core | Release-gated with named proof tests | Reads, scalar expressions, DML, transaction semantics, views and view DAGs, `SUBSCRIBE`, freshness controls, Kafka source, PostgreSQL CDC source |
 | Maintain | Supported and regression-tested, but not a growth area | Secondary indexes, workload quotas, resource visibility, query diagnostics, system catalog SQL |
-| Experimental | Available subsets with no continuity guarantee | Aggregates, joins and set operations, window and time operators, Kafka sink epoch/count markers |
+| Experimental | Available subsets with no continuity guarantee | Aggregates, joins and set operations, window and time operators, bounded Kafka view delivery |
 
 ### Important boundaries
 
@@ -140,16 +140,16 @@ RockStream labels every public capability by its compatibility commitment. The
   particular, floating-point keys and some text-key combinations are rejected.
 - User-defined merge laws and user-visible CRDT column types are post-v1 work.
 - The v1 connector set is Kafka source, PostgreSQL CDC source, and Kafka sink.
-  The Kafka sink is Experimental and emits epoch/count markers only;
-  materialized-view snapshot and change row delivery are unsupported.
+  The Kafka sink is Experimental; its runtime adapter delivers bounded
+  materialized-view snapshots and signed changes with payload recovery.
   Iceberg, Delta, object-store sink, S3 source, and webhook source frontends are
   removed and fail closed.
 
 Read [language features](docs/language-features.md), the
 [SQL support reference](docs/reference/sql-support.md), and
 [known limitations](docs/known-limitations.md) before evaluating a production
-workload. Kafka-based data-lake exports require view row delivery, which is
-currently unsupported; see [connector migration](docs/connector-migration.md).
+workload. Kafka row delivery has explicit runtime and size limits; automatic
+data-lake export is unsupported. See [connector migration](docs/connector-migration.md).
 
 ## Inspiration
 

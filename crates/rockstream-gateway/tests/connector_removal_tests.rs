@@ -128,7 +128,7 @@ fn connector_removal_docs_have_exact_replacements_and_no_live_references() {
     let migration = std::fs::read_to_string(root.join("docs/connector-migration.md")).unwrap();
     assert_eq!(
         migration,
-        "# Connector migration\n\nThe Iceberg, Delta, object-store, S3, and HTTP webhook connector frontends\nwere removed in v0.52.4. RockStream rejects their DDL and webhook ingress with\n`RS-4017 connector.removed`.\n\n| Removed surface | Replacement |\n| --- | --- |\n| S3 source | Use an external loader through pgwire or Kafka. |\n| HTTP webhook source | Use an external HTTP-to-Kafka or HTTP-to-PostgreSQL adapter. |\n| Iceberg, Delta, and object-store sink | No supported row export replacement; Kafka view row delivery is unsupported. |\n| Cold-tier configuration | No supported Kafka-based lakehouse export; view row delivery is unsupported. |\n"
+        "# Connector migration\n\nThe Iceberg, Delta, object-store, S3, and HTTP webhook connector frontends\nwere removed in v0.52.4. RockStream rejects their DDL and webhook ingress with\n`RS-4017 connector.removed`.\n\n| Removed surface | Replacement |\n| --- | --- |\n| S3 source | Use an external loader through pgwire or Kafka. |\n| HTTP webhook source | Use an external HTTP-to-Kafka or HTTP-to-PostgreSQL adapter. |\n| Iceberg, Delta, and object-store sink | Experimental bounded Kafka runtime view delivery; no automatic lakehouse export replacement. |\n| Cold-tier configuration | No automatic Kafka-based lakehouse export; the runtime view adapter has explicit size limits. |\n"
     );
     for path in [
         "README.md",

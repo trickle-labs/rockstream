@@ -144,20 +144,21 @@ def check_external_surface(capabilities: list[dict], errors: list[str]) -> None:
             fail(errors, f"{item.get('id')} must be {expected_tier}")
         if item.get("id") == "sink.kafka":
             if item.get("proof") or item.get("proof_levels_achieved"):
-                fail(errors, "sink.kafka row delivery is unsupported; marker proofs cannot qualify it")
+                fail(errors, "sink.kafka remains Experimental; full Core proof levels are not qualified")
             rows = item.get("behavior", [])
             for behavior in ("incremental", "backfill"):
-                unsupported = [
+                claims = [
                     (row.get("statement"), row.get("proof"))
                     for row in rows if row.get("behavior") == behavior
                 ]
                 expected = (
-                    "Unsupported: materialized-view change rows are not delivered; only epoch/count markers are emitted."
+                    "KafkaViewSink delivers typed view change rows with signed weights in one ordered transaction envelope per nonempty view epoch."
                     if behavior == "incremental" else
-                    "Unsupported: materialized-view snapshot rows and snapshot completion boundaries are not delivered."
+                    "KafkaViewSink delivers one complete materialized snapshot envelope before live change envelopes."
                 )
-                if unsupported != [(expected, "")]:
-                    fail(errors, f"sink.kafka {behavior} must remain explicitly unsupported without a row-delivery proof")
+                proof = "crates/rockstream-ops/tests/kafka_view_delivery_tests.rs::view_snapshot_changes_and_recovery_match_exact_consumer_stream"
+                if claims != [(expected, proof)]:
+                    fail(errors, f"sink.kafka {behavior} requires its exact row-delivery claim and consumer proof")
 
 
 def check_proof_levels(capabilities: list[dict], errors: list[str]) -> None:
@@ -315,8 +316,7 @@ def check_full_semantics(
             statement = row.get("statement")
             if not isinstance(statement, str) or not statement.strip():
                 fail(errors, f"{label} has an empty statement")
-            if capability.get("id") != "sink.kafka" or behavior not in {"incremental", "backfill"}:
-                proof_exists(root, row.get("proof"), label, errors)
+            proof_exists(root, row.get("proof"), label, errors)
             paired_proof = row.get("paired_proof")
             if paired_proof is not None:
                 proof_exists(root, paired_proof, f"{label} paired proof", errors)

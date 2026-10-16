@@ -29,6 +29,7 @@ pub mod governor;
 pub mod group_commit;
 pub mod index_arrange;
 pub mod join;
+pub mod kafka_sink;
 pub mod lateral;
 pub mod live_exec;
 pub mod map;
