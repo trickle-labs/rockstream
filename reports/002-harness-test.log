@@ -442,3 +442,6 @@ test v072_each_qualification_metric_must_be_finite_and_nonnegative ... ok
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 
+
+COMMAND ["cargo", "fmt", "--manifest-path", "tools/r1-local-harness/Cargo.toml", "--all", "--check"]
+
