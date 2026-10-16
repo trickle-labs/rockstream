@@ -1,0 +1,5 @@
+
+COMMAND ["cargo", "clippy", "--manifest-path", "tools/r1-local-harness/Cargo.toml", "--all-targets", "--", "-D", "warnings"]
+    Checking r1-local-harness v0.1.0 (/home/runner/work/rockstream/rockstream/candidate/tools/r1-local-harness)
+    Finished `dev` profile [unoptimized] target(s) in 0.37s
+

@@ -1,4 +1,20 @@
 {
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "--manifest-path",
+        "tools/r1-local-harness/Cargo.toml",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "log_sha256": "e5e8bcd2d57b8add330f149e9d01780ffdec3a95798f3f2736e691b82e1ba98e"
+    }
+  ],
   "id": "006-harness-validation",
   "kind": "test",
   "request_commit": "71a9a1aa5a61960141e0e69734d04742b97f3138",
