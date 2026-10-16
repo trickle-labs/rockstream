@@ -3204,7 +3204,10 @@ impl CatalogStubs {
             "pg_attribute" => "attrelid nspname relname attname atttypid attnotnull atttypmod attlen typtypmod attnum attidentity attgenerated adsrc description typbasetype typtype format_type attisdropped atthasdef attcollation attacl",
             "pg_namespace" => "oid nspname nspowner",
             "pg_type" => "oid typname typlen typarray typnamespace typtype typrelid typelem typcollation format_type",
-            "pg_proc" => "oid proname pronamespace prorettype proargtypes prokind",
+            "pg_proc" => "oid proname pronamespace prorettype proargtypes prokind prolang prosrc",
+            // Prisma joins pg_proc to pg_language when reflecting user-defined
+            // functions. The built-in language OIDs match PostgreSQL.
+            "pg_language" => "oid lanname lanowner lanispl lanpltrusted lanplcallfoid laninline lanvalidator lanacl",
             "pg_index" => "indexrelid indrelid indisunique indisprimary indisclustered indisvalid indisreplident indkey indexdef indclass indoption indpred indisexclusion",
             "pg_roles" => "oid rolname rolsuper rolinherit rolcreaterole rolcreatedb rolcanlogin rolconnlimit rolreplication rolbypassrls rolvaliduntil",
             "pg_database" => "oid datname datdba encoding datcollate datctype datacl datistemplate datallowconn",
@@ -3241,6 +3244,30 @@ impl CatalogStubs {
             "pg_namespace" => self.pg_namespace(&columns),
             "pg_type" => self.pg_type(&columns),
             "pg_proc" => self.pg_proc(&columns),
+            "pg_language" => {
+                let languages = [(12, "internal"), (13, "c"), (14, "sql")];
+                let rows = languages
+                    .into_iter()
+                    .map(|(oid, name)| {
+                        columns
+                            .iter()
+                            .map(|field| match field.as_str() {
+                                "oid" => Some(oid.to_string()),
+                                "lanname" => Some(name.to_string()),
+                                "lanowner" => Some(view_oid("rockstream").to_string()),
+                                "lanispl" => Some("f".to_string()),
+                                "lanpltrusted" => Some("t".to_string()),
+                                "lanplcallfoid" | "laninline" | "lanvalidator" => {
+                                    Some("0".to_string())
+                                }
+                                "lanacl" => None,
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .collect();
+                CatalogResponse::rows(columns, rows)
+            },
             "pg_index" => self.pg_index(&columns),
             "pg_roles" => self.pg_roles(&session.principal_name, &columns),
             "pg_database" => CatalogResponse::rows(
@@ -3871,6 +3898,10 @@ impl CatalogStubs {
                     "prorettype" => Some(prorettype.to_string()),
                     "proargtypes" => Some(proargtypes.to_string()),
                     "prokind" => Some(prokind.to_string()),
+                    // The functions in this stub are PostgreSQL built-ins,
+                    // implemented by the internal language (pg_language.oid=12).
+                    "prolang" => Some("12".to_string()),
+                    "prosrc" => Some(proname.to_string()),
                     _ => Some("".to_string()),
                 };
                 row.push(val);
@@ -5839,6 +5870,49 @@ mod pgjdbc_reflection_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, ["int2", "int4", "int8", "float4", "float8", "bool"]);
+    }
+
+    #[test]
+    fn prisma_function_reflection_resolves_builtin_language() {
+        let catalog = catalog();
+        let Some(CatalogResponse::Rows {
+            columns: language_columns,
+            rows: language_rows,
+        }) = catalog.pg_catalog_rows("pg_language", &SessionInfo::default()) else {
+            panic!("pg_language must be available to PostgreSQL introspection");
+        };
+        let oid = language_columns
+            .iter()
+            .position(|column| column == "oid")
+            .expect("pg_language oid");
+        let name = language_columns
+            .iter()
+            .position(|column| column == "lanname")
+            .expect("pg_language lanname");
+        assert!(language_rows
+            .iter()
+            .any(|row| row[oid].as_deref() == Some("12")
+                && row[name].as_deref() == Some("internal")));
+
+        // Prisma 6 uses a LEFT JOIN against pg_language to describe SQL
+        // functions. The built-in functions must not be mistaken for public
+        // user-defined functions, and the query must not fail with RS-2026.
+        let query = r#"
+            SELECT p.proname AS name, n.nspname AS namespace,
+                CASE WHEN l.lanname = 'internal' THEN p.prosrc
+                     ELSE pg_get_functiondef(p.oid) END AS definition
+            FROM pg_proc p
+            LEFT JOIN pg_namespace n ON p.pronamespace = n.oid
+            LEFT JOIN pg_language l ON p.prolang = l.oid
+            WHERE n.nspname = ANY (ARRAY['public'])
+        "#;
+        let Some(CatalogResponse::Rows { columns, rows }) =
+            catalog.handle_query(query, &SessionInfo::default())
+        else {
+            panic!("Prisma function introspection must return a catalog result");
+        };
+        assert_eq!(columns, vec!["name", "namespace", "definition"]);
+        assert!(rows.is_empty(), "built-ins are not public user functions");
     }
 
     #[test]
