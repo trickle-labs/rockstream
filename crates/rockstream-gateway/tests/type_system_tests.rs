@@ -506,7 +506,7 @@ assert 'c_bool' in names",
         vec![
             "sh",
             "-c",
-            "cd /app && sed -i '/^[[:space:]]*generator[[:space:]]\+client[[:space:]]*{/a\\  previewFeatures = [\"views\"]' prisma/schema.prisma && grep -Fq 'previewFeatures = [\"views\"]' prisma/schema.prisma",
+            "cd /app && sed -i '/^[[:space:]]*generator[[:space:]]\\+client[[:space:]]*{/a\\  previewFeatures = [\"views\"]' prisma/schema.prisma && grep -Fq 'previewFeatures = [\"views\"]' prisma/schema.prisma",
         ],
         "enable Prisma view introspection",
     )
