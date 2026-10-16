@@ -1,12 +1,53 @@
-diff --git a/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs b/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
---- a/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
-+++ b/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
-@@ -171,6 +171,7 @@
- #[test]
- fn v072_missing_metrics_cannot_skip_validation() {
--    let mutations: [(&str, fn(&mut MatrixExecutionResult)); 6] = [
-+    type Mutation = (&'static str, fn(&mut MatrixExecutionResult));
-+    let mutations: [Mutation; 6] = [
-         ("throughput_rows_per_sec", |cell| {
-             cell.throughput_rows_per_sec = None
-         }),
+diff --git a/crates/rockstream-ops/src/group_commit/physical.rs b/crates/rockstream-ops/src/group_commit/physical.rs
+--- a/crates/rockstream-ops/src/group_commit/physical.rs
++++ b/crates/rockstream-ops/src/group_commit/physical.rs
+@@ -67,6 +67,12 @@
+     max_epochs: usize,
+ }
+ 
++impl Drop for Inner {
++    fn drop(&mut self) {
++        self.notify.notify_one();
++    }
++}
++
+ /// Coherent fill observations. Retained quantities include in-flight and retry
+ /// storage, not just the visible pending map.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -221,6 +227,7 @@
+         state.retained_epochs += 1;
+         state.retained_operations = proposed_operations;
+-        state.force_flush |= proposed == self.inner.max_bytes || state.retained_epochs == self.inner.max_epochs;
++        let force_flush = proposed == self.inner.max_bytes || state.retained_epochs == self.inner.max_epochs;
++        state.force_flush |= force_flush;
+         drop(state);
+         self.ensure_driver();
+         self.inner.notify.notify_one();
+ diff --git a/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs b/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
+--- a/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
++++ b/crates/rockstream-ops/tests/v072_commit_bounds_tests.rs
+@@ -187,7 +187,7 @@
+     let reopened = PhysicalCommitGroup::open(db.clone()).await.unwrap();
+     assert_eq!(reopened.committed_epoch(), Some(9));
+-    assert_eq!(reopened.add_epoch(9, batch(b"wrong")).unwrap_err().to_string(), "[RS-0001] Internal operator error: logical epoch 9 is not newer than the sealed physical frontier Some(9); next_steps: inspect operator invariants and logs");
++    assert_eq!(reopened.add_epoch(9, batch(b"wrong")).unwrap_err().to_string(), "[RS-0001] Internal error: logical epoch 9 is not newer than the sealed physical frontier Some(9); next_steps: report this issue");
+     assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"before-restart".to_vec()));
+     reopened.commit_epoch(10, batch(b"after-restart")).await.unwrap();
+     assert_eq!(reopened.committed_epoch(), Some(10));
+     assert_eq!(db.get(b"k").await.unwrap().map(|value| value.to_vec()), Some(b"after-restart".to_vec()));
+ diff --git a/crates/rockstream-ops/tests/group_commit_timer_tests.rs b/crates/rockstream-ops/tests/group_commit_timer_tests.rs
+--- a/crates/rockstream-ops/tests/group_commit_timer_tests.rs
++++ b/crates/rockstream-ops/tests/group_commit_timer_tests.rs
+@@ -203,6 +203,10 @@
+     let start = Instant::now();
+-    let big_batch = make_batch("big", 600);
+-    assert!(big_batch.byte_size() >= 600);
++    let oversized = make_batch("big", 600);
++    let before = group.fill();
++    assert_eq!(group.add_epoch(1, oversized).unwrap_err().to_string(), "[RS-1015] Consolidation capacity exceeded for physical_commit_bytes (605/500); next_steps: apply backpressure, reduce the complete epoch, or recover the failed physical commit");
++    assert_eq!(group.fill(), before);
++    let big_batch = make_batch("big", 495);
++    assert_eq!(big_batch.byte_size(), 500);
+ 
+     group.commit_epoch(1, big_batch).await.unwrap();
+ 
