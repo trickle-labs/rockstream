@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use rockstream_types::error_code::{
     RS_4001, RS_4002, RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4008, RS_4009, RS_4010,
     RS_4011, RS_4012, RS_4013, RS_4014, RS_4015, RS_4016, RS_4017, RS_4018, RS_4019, RS_4020,
-    RS_4021, RS_4022,
+    RS_4021, RS_4022, RS_4030,
 };
 
 fn root() -> PathBuf {
@@ -222,7 +222,7 @@ fn connector_guarantee_document_is_exact_and_all_matrix_tests_exist() {
     let expected_codes = [
         RS_4001, RS_4002, RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4008, RS_4009, RS_4010,
         RS_4011, RS_4012, RS_4013, RS_4014, RS_4015, RS_4016, RS_4017, RS_4018, RS_4019, RS_4020,
-        RS_4021, RS_4022,
+        RS_4021, RS_4022, RS_4030,
     ]
     .into_iter()
     .map(|code| code.to_string())

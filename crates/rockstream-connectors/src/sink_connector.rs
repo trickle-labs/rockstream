@@ -80,6 +80,8 @@ pub enum SinkError {
     PreCommitFailed { epoch: Epoch, reason: String },
     /// Commit failed after pre-commit; recovery required.
     CommitFailed { epoch: Epoch, reason: String },
+    /// Delivery is unresolved; retry recovery without publishing again.
+    DeliveryUnknown { epoch: Epoch, reason: String },
     /// Duplicate delivery detected and blocked (CheckBeforeCommit).
     DuplicateBlocked { epoch: Epoch },
     /// Generic sink I/O error.
@@ -98,6 +100,10 @@ impl std::fmt::Display for SinkError {
             Self::CommitFailed { epoch, reason } => {
                 write!(f, "RS-4004: sink commit failed for epoch {epoch}: {reason}")
             }
+            Self::DeliveryUnknown { epoch, reason } => write!(
+                f,
+                "RS-4030: sink delivery outcome unknown for epoch {epoch}: {reason}; retry recovery"
+            ),
             Self::DuplicateBlocked { epoch } => {
                 write!(f, "RS-4005: duplicate delivery blocked for epoch {epoch}")
             }

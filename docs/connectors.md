@@ -172,10 +172,10 @@ payload claim until that path exists.
 
 | Axis | Guarantee |
 | --- | --- |
-| Delivery / recovery | Experimental transactional epoch/count markers only; snapshot/change row delivery and row recovery are unsupported. |
+| Delivery / recovery | Experimental transactional, checkpoint-coupled epoch/count markers only; snapshot/change row delivery and row recovery are unsupported. Marker recovery checks all topic partitions before republishing. Lookup setup failures, poll failures, and timeouts leave recovery pending; only a complete stable scan confirms absence. |
 | Bound / fill metric / backpressure | `KAFKA_SINK_MAX_STAGED_EPOCHS=5`, `kafka_sink_staged_epochs_count`, and `backpressure_active`; staged-epoch admission rejects overflow. |
 | Degraded states | Pre-commit/commit uncertainty, timeout, staged-epoch backpressure, and idempotent recovery are explicit. |
-| Failure codes | `RS-4002`, `RS-4003`, `RS-4004`, and `RS-4005`; recover with the action in the registry. |
+| Failure codes | `RS-4002`, `RS-4003`, `RS-4004`, `RS-4005`, and `RS-4030`; retry unknown-outcome recovery with the original pending handle after restoring lookup. |
 | Proof matrix | The seven Kafka marker transport cells below; these do not qualify view row delivery. |
 
 ## Failure-code ownership
@@ -204,6 +204,7 @@ payload claim until that path exists.
 | `RS-4020` | Backfill live-delta buffer |
 | `RS-4021` | Backfill admission reservation |
 | `RS-4022` | Backfill publication state |
+| `RS-4030` | Kafka sink delivery lookup is unresolved; retry recovery |
 
 ## Guarantee matrix
 
