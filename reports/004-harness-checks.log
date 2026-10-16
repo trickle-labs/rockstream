@@ -211,3 +211,19 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 COMMAND ["cargo", "fmt", "--manifest-path", "tools/r1-local-harness/Cargo.toml", "--all", "--check"]
 
+
+COMMAND ["cargo", "clippy", "--manifest-path", "tools/r1-local-harness/Cargo.toml", "--all-targets", "--", "-D", "warnings"]
+    Checking r1-local-harness v0.1.0 (/home/runner/work/rockstream/rockstream/candidate/tools/r1-local-harness)
+error: very complex type used. Consider factoring parts into `type` definitions
+   --> tests/v072_matrix_gate_tests.rs:173:20
+    |
+173 |     let mutations: [(&str, fn(&mut MatrixExecutionResult)); 6] = [
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#type_complexity
+    = note: `-D clippy::type-complexity` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::type_complexity)]`
+
+error: could not compile `r1-local-harness` (test "v072_matrix_gate_tests") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+
