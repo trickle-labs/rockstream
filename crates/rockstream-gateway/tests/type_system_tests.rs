@@ -527,7 +527,11 @@ assert 'c_bool' in names",
     // was reflected instead of accepting an empty introspection result.
     run_cmd_checked(
         &node_container,
-        vec!["sh", "-c", "grep -Fq 'view numeric_view {' /app/prisma/schema.prisma"],
+        vec![
+            "sh",
+            "-c",
+            "grep -Fq 'view numeric_view {' /app/prisma/schema.prisma",
+        ],
         "verify Prisma reflected numeric_view",
     )
     .await;
