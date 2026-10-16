@@ -22,6 +22,20 @@
       ],
       "exit_code": 0,
       "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "--manifest-path",
+        "tools/r1-local-harness/Cargo.toml",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 101,
+      "log_sha256": "4bd28ea7a2a0e959f1defb30b3478b05d416adee9573cb566ad90f2e9fce2be2"
     }
   ],
   "id": "002-harness-test",
