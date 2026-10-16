@@ -42,6 +42,6 @@
   "kind": "test",
   "request_commit": "8b0de35d9bd9733ebbda2250aca383a29d055b72",
   "source": "cde61e435b62927a22df8084e79767863a3a8621",
-  "status": "running",
+  "status": "failed",
   "workspace_run": "38929758838"
 }
