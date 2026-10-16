@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/home/runner/work/rockstream/rockstream/candidate/../controller/session/worker.py", line 229, in main
+    record, log = process(request, revision)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/rockstream/rockstream/candidate/../controller/session/worker.py", line 137, in process
+    command(["git", "apply", "--check", "-"], data=patch)
+  File "/home/runner/work/rockstream/rockstream/candidate/../controller/session/worker.py", line 52, in command
+    raise RuntimeError(output.decode("utf-8", "replace"))
+RuntimeError: error: patch failed: crates/rockstream-runtime/tests/concurrency_limits_overload_tests.rs:81
+error: crates/rockstream-runtime/tests/concurrency_limits_overload_tests.rs: patch does not apply
+
