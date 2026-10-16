@@ -10577,6 +10577,8 @@ impl GatewayHandler {
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        use datafusion::arrow::datatypes::DataType;
+
         // Parse INSERT INTO <table> [(cols)] VALUES (v1, v2, ...)[, (v1, v2, ...)]* [RETURNING ...]
         let returning = q.to_lowercase().contains(" returning ");
         let (table, cols, rows) = match parse_insert(q) {
@@ -10630,6 +10632,17 @@ impl GatewayHandler {
             .get(&table)
             .map(|entry| entry.value().clone());
 
+        let decimal_columns: Vec<_> = self
+            .catalog
+            .get_table(&table)
+            .into_iter()
+            .flat_map(|table| table.columns)
+            .filter_map(|column| {
+                let datatype = string_to_arrow_datatype(&column.data_type);
+                matches!(datatype, DataType::Decimal128(_, _)).then_some((column.name, datatype))
+            })
+            .collect();
+
         let pk_cols = self
             .catalog
             .get_table(&table)
@@ -10662,6 +10675,26 @@ impl GatewayHandler {
                             .to_string(),
                     };
                     value_map.insert(column.clone(), generated);
+                }
+            }
+
+            // Validate every decimal before buffering any row from this statement.
+            for (column, datatype) in &decimal_columns {
+                if let Some(value) = value_map.get_mut(column).filter(|v| v.as_str() != r"\N") {
+                    use rockstream_sql::dml::{DmlLiteral, DmlScalarExpr};
+                    match DmlScalarExpr::Literal(DmlLiteral::String(value.clone()))
+                        .evaluate_assignment(&HashMap::new(), &HashMap::new(), datatype)
+                    {
+                        Ok(Some(formatted)) => *value = formatted,
+                        Ok(None) => *value = r"\N".to_owned(),
+                        Err(error) => {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "22003".to_owned(),
+                                error.to_string(),
+                            ))));
+                        }
+                    }
                 }
             }
 
