@@ -1,6 +1,10 @@
 diff --git a/tools/r1-local-harness/tests/summary_regeneration.rs b/tools/r1-local-harness/tests/summary_regeneration.rs
 --- a/tools/r1-local-harness/tests/summary_regeneration.rs
 +++ b/tools/r1-local-harness/tests/summary_regeneration.rs
-@@ -118 +118 @@
+@@ -115,5 +115,5 @@
+     };
+     assert_eq!(evaluate(directory.path()).unwrap(), expected);
+     atomic_json(&directory.path().join("decision.json"), &expected).unwrap();
 -    assert_eq!(verify(directory.path()).unwrap(), ());
 +    verify(directory.path()).unwrap();
+ }
