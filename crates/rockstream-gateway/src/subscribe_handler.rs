@@ -19,11 +19,18 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::time::sleep;
 
-use crate::change_log::{ChangeEntry, ViewChangeLog, CHANGE_LOG_MAX_ENTRIES};
+use crate::change_log::{
+    ChangeEntry, ChangeLogError, ViewChangeLog, CHANGE_LOG_MAX_BUFFER_BYTES,
+    CHANGE_LOG_MAX_ENTRIES, CHANGE_LOG_MAX_EPOCH_BYTES,
+};
 use crate::subscribe_parser::{SubscribeRequest, SubscribeStart};
 
 /// Named upper bound for per-subscriber backlog (epochs behind head).
 pub const SUBSCRIBE_BACKLOG_MAX: usize = CHANGE_LOG_MAX_ENTRIES;
+/// Frozen v0.72 snapshot row ceiling, before any output is returned.
+pub const SUBSCRIBE_SNAPSHOT_MAX_ROWS: usize = 10_000;
+/// Frozen v0.72 simultaneous stream count.
+pub const SUBSCRIBE_MAX_STREAMS: usize = 16;
 
 /// Poll interval for the live-tail loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -37,6 +44,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Default)]
 pub struct SubscribeRegistry {
     logs: Mutex<HashMap<String, ViewChangeLog>>,
+    active_streams: AtomicU64,
+}
+
+/// Drop-owned stream slot. A client disconnect frees its slot automatically.
+pub struct SubscribeStreamPermit {
+    registry: Arc<SubscribeRegistry>,
+}
+
+impl Drop for SubscribeStreamPermit {
+    fn drop(&mut self) {
+        self.registry.active_streams.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl SubscribeRegistry {
@@ -51,6 +70,81 @@ impl SubscribeRegistry {
             .entry(table_name.to_string())
             .or_insert_with(ViewChangeLog::with_default_capacity);
         log.push(entry);
+    }
+
+    /// Publish one complete committed table epoch, never a partially retained unit.
+    /// On oversized epochs the log invalidates replay, requiring resnapshot.
+    pub fn push_epoch(
+        &self,
+        table_name: &str,
+        changes: Vec<ChangeEntry>,
+    ) -> Result<(), ChangeLogError> {
+        let mut logs = self.logs.lock().unwrap();
+        logs.entry(table_name.to_string())
+            .or_insert_with(ViewChangeLog::with_default_capacity)
+            .push_epoch(changes)
+    }
+
+    /// The first safe replay epoch after an eviction or oversized complete unit.
+    pub fn replay_floor(&self, table_name: &str) -> Option<u64> {
+        self.logs
+            .lock()
+            .unwrap()
+            .get(table_name)
+            .and_then(ViewChangeLog::replay_floor)
+    }
+
+    pub fn buffered_bytes(&self, table_name: &str) -> usize {
+        self.logs
+            .lock()
+            .unwrap()
+            .get(table_name)
+            .map_or(0, ViewChangeLog::buffered_bytes)
+    }
+
+    /// Reserve a bounded stream slot before scanning a snapshot.
+    pub fn acquire_stream(self: &Arc<Self>) -> Result<SubscribeStreamPermit, SubscribeError> {
+        loop {
+            let current = self.active_streams.load(Ordering::Acquire);
+            if current >= SUBSCRIBE_MAX_STREAMS as u64 {
+                return Err(SubscribeError::LimitExceeded {
+                    resource: "streams",
+                    current,
+                    limit: SUBSCRIBE_MAX_STREAMS as u64,
+                });
+            }
+            if self
+                .active_streams
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(SubscribeStreamPermit {
+                    registry: Arc::clone(self),
+                });
+            }
+        }
+    }
+
+    pub fn active_streams(&self) -> u64 {
+        self.active_streams.load(Ordering::Acquire)
+    }
+
+    /// Atomically inspect the replay floor and the retained committed changes.
+    /// Without this lock scope, an eviction between the floor check and
+    /// the copied entries could silently omit a complete epoch.
+    pub fn snapshot_since_epoch(
+        &self,
+        table_name: &str,
+        since: u64,
+    ) -> (Option<u64>, Vec<ChangeEntry>) {
+        let logs = self.logs.lock().unwrap();
+        match logs.get(table_name) {
+            Some(log) => (
+                log.replay_floor(),
+                log.since_epoch(since).into_iter().cloned().collect(),
+            ),
+            None => (None, Vec::new()),
+        }
     }
 
     /// Returns a snapshot of all entries with `epoch >= since` for `table_name`.
@@ -70,8 +164,7 @@ impl SubscribeRegistry {
     /// Returns the latest epoch in the log, or `None`.
     pub fn latest_epoch(&self, table_name: &str) -> Option<u64> {
         let logs = self.logs.lock().unwrap();
-        logs.get(table_name)
-            .and_then(|log| log.since_epoch(0).last().map(|e| e.epoch))
+        logs.get(table_name).and_then(ViewChangeLog::latest_epoch)
     }
 
     /// Entry count (fill-level metric) for `table_name`.
@@ -101,6 +194,12 @@ pub enum SubscribeError {
     EpochBeforeRetention { requested: u64, earliest: u64 },
     /// RS-2020: consumer too slow — fell behind the retention window after start.
     ConsumerTooSlow,
+    /// A complete snapshot or committed epoch exceeds a configured producer bound.
+    LimitExceeded {
+        resource: &'static str,
+        current: u64,
+        limit: u64,
+    },
     /// Generic.
     Other(String),
 }
@@ -122,6 +221,14 @@ impl std::fmt::Display for SubscribeError {
                 "[RS-2020] subscribe.consumer_too_slow: \
                  subscriber backlog exceeded SUBSCRIBE_BACKLOG_MAX. \
                  next_steps: Reconnect with AS OF NOW WITH SNAPSHOT."
+            ),
+            Self::LimitExceeded {
+                resource,
+                current,
+                limit,
+            } => write!(
+                f,
+                "[RS-2020] subscribe.resource_limit: {resource} {current} exceeds {limit}; next_steps: Reconnect with AS OF NOW WITH SNAPSHOT after reducing result size."
             ),
             Self::Other(s) => write!(f, "subscribe error: {s}"),
         }
@@ -156,6 +263,44 @@ pub fn deliver_snapshot(
             }
         })
         .collect()
+}
+
+/// Validate snapshot output bounds without emitting a partial snapshot.
+pub fn deliver_snapshot_checked(
+    snapshot_rows: Vec<(Bytes, Bytes)>,
+    current_epoch: u64,
+    req: &SubscribeRequest,
+    col_names: &[&str],
+) -> Result<Vec<SubscribeRow>, SubscribeError> {
+    if snapshot_rows.len() > SUBSCRIBE_SNAPSHOT_MAX_ROWS {
+        return Err(SubscribeError::LimitExceeded {
+            resource: "snapshot_rows",
+            current: snapshot_rows.len() as u64,
+            limit: SUBSCRIBE_SNAPSHOT_MAX_ROWS as u64,
+        });
+    }
+    let mut result = Vec::new();
+    let mut bytes = 0usize;
+    for (_, value) in snapshot_rows {
+        if !passes_where(&value, req.where_clause.as_deref(), col_names) {
+            continue;
+        }
+        let projected = apply_projection(&value, req.projection.as_deref(), col_names);
+        bytes = bytes.checked_add(projected.len()).unwrap_or(usize::MAX);
+        if bytes > CHANGE_LOG_MAX_BUFFER_BYTES {
+            return Err(SubscribeError::LimitExceeded {
+                resource: "snapshot_bytes",
+                current: bytes as u64,
+                limit: CHANGE_LOG_MAX_BUFFER_BYTES as u64,
+            });
+        }
+        result.push(SubscribeRow {
+            mz_timestamp: current_epoch,
+            mz_diff: 1,
+            encoded_row: projected,
+        });
+    }
+    Ok(result)
 }
 
 // ── Live-tail delivery (S4) ───────────────────────────────────────────────────
@@ -195,10 +340,14 @@ impl SubscriberHandle {
         &mut self,
         registry: &SubscribeRegistry,
     ) -> Result<Vec<SubscribeRow>, SubscribeError> {
-        let next_epoch = self.last_sent_epoch + 1;
-        let entries = registry
-            .since_epoch(&self.table_name, next_epoch)
-            .unwrap_or_default();
+        let Some(next_epoch) = self.last_sent_epoch.checked_add(1) else {
+            self.backlog_epochs.store(0, Ordering::Relaxed);
+            return Ok(vec![]);
+        };
+        let (floor, entries) = registry.snapshot_since_epoch(&self.table_name, next_epoch);
+        if floor.is_some_and(|floor| next_epoch < floor) {
+            return Err(SubscribeError::ConsumerTooSlow);
+        }
 
         if entries.is_empty() {
             self.backlog_epochs.store(0, Ordering::Relaxed);
@@ -217,6 +366,8 @@ impl SubscriberHandle {
 
         let col_names_ref: Vec<&str> = self.col_names.iter().map(|s| s.as_str()).collect();
         let mut rows = Vec::with_capacity(entries.len());
+        let mut bytes_in_epoch = 0usize;
+        let mut current_epoch = None;
         for entry in &entries {
             if !passes_where(
                 &entry.encoded_row,
@@ -230,6 +381,20 @@ impl SubscriberHandle {
                 self.req.projection.as_deref(),
                 &col_names_ref,
             );
+            if current_epoch != Some(entry.epoch) {
+                current_epoch = Some(entry.epoch);
+                bytes_in_epoch = 0;
+            }
+            bytes_in_epoch = bytes_in_epoch
+                .checked_add(projected.len())
+                .unwrap_or(usize::MAX);
+            if bytes_in_epoch > CHANGE_LOG_MAX_EPOCH_BYTES {
+                return Err(SubscribeError::LimitExceeded {
+                    resource: "epoch_bytes",
+                    current: bytes_in_epoch as u64,
+                    limit: CHANGE_LOG_MAX_EPOCH_BYTES as u64,
+                });
+            }
             rows.push(SubscribeRow {
                 mz_timestamp: entry.epoch,
                 mz_diff: entry.mz_diff,
@@ -320,7 +485,10 @@ where
                 }
             }
             // Replay entries from log.
-            let replay = registry.since_epoch(&req.view_name, *e).unwrap_or_default();
+            let (floor, replay) = registry.snapshot_since_epoch(&req.view_name, *e);
+            if floor.is_some_and(|floor| *e < floor) {
+                return Err(SubscribeError::ConsumerTooSlow);
+            }
             let mut last = e.saturating_sub(1);
             for entry in &replay {
                 if !passes_where(

@@ -106,7 +106,8 @@ use crate::pgoutput_coordinator::{
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::subscribe_handler::{
-    deliver_snapshot, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
+    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry,
+    SubscriberHandle,
 };
 use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -5481,6 +5482,12 @@ impl GatewayHandler {
             )))]);
         }
 
+        // A drop-owned slot lives inside the returned stream. Reject before
+        // scanning the snapshot rather than accepting unlimited subscriptions.
+        let stream_slot = match self.subscribe_registry.acquire_stream() {
+            Ok(slot) => slot,
+            Err(error) => return Ok(vec![subscribe_error_response(error)]),
+        };
         let col_names = request.projection.clone().unwrap_or_else(|| {
             catalog_columns
                 .iter()
@@ -5510,12 +5517,12 @@ impl GatewayHandler {
                     .map(|(index, row)| (Bytes::from(index.to_string()), Bytes::from(row)))
                     .collect();
                 let column_refs: Vec<&str> = col_names.iter().map(String::as_str).collect();
-                pending.extend(deliver_snapshot(
-                    snapshot,
-                    start_epoch,
-                    &request,
-                    &column_refs,
-                ));
+                let snapshot_rows =
+                    match deliver_snapshot_checked(snapshot, start_epoch, &request, &column_refs) {
+                        Ok(rows) => rows,
+                        Err(error) => return Ok(vec![subscribe_error_response(error)]),
+                    };
+                pending.extend(snapshot_rows);
                 SubscriberHandle::new(
                     request.view_name.clone(),
                     start_epoch,
@@ -5563,8 +5570,8 @@ impl GatewayHandler {
         let stream_schema = schema.clone();
         let registry = self.subscribe_registry.clone();
         let data_stream = Box::pin(stream::unfold(
-            (registry, handle, pending, stream_schema, false),
-            |(registry, mut handle, mut pending, schema, failed)| async move {
+            (registry, handle, pending, stream_schema, false, stream_slot),
+            |(registry, mut handle, mut pending, schema, failed, stream_slot)| async move {
                 if failed {
                     return None;
                 }
@@ -5575,28 +5582,28 @@ impl GatewayHandler {
                             if let Err(error) = encoder.encode_field(&Some(value)) {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true),
+                                    (registry, handle, pending, schema, true, stream_slot),
                                 ));
                             }
                         }
                         let timestamp = row.mz_timestamp.to_string();
                         if let Err(error) = encoder.encode_field(&Some(timestamp.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                            return Some((Err(error), (registry, handle, pending, schema, true, stream_slot)));
                         }
                         let diff = row.mz_diff.to_string();
                         if let Err(error) = encoder.encode_field(&Some(diff.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                            return Some((Err(error), (registry, handle, pending, schema, true, stream_slot)));
                         }
                         let encoded = match encoder.finish() {
                             Ok(encoded) => encoded,
                             Err(error) => {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true),
+                                    (registry, handle, pending, schema, true, stream_slot),
                                 ));
                             }
                         };
-                        return Some((Ok(encoded), (registry, handle, pending, schema, false)));
+                        return Some((Ok(encoded), (registry, handle, pending, schema, false, stream_slot)));
                     }
                     match handle.poll(&registry) {
                         Ok(rows) if !rows.is_empty() => pending.extend(rows),
@@ -5604,7 +5611,7 @@ impl GatewayHandler {
                         Err(error) => {
                             return Some((
                                 Err(PgWireError::ApiError(Box::new(error))),
-                                (registry, handle, pending, schema, true),
+                                (registry, handle, pending, schema, true, stream_slot),
                             ));
                         }
                     }
@@ -9945,6 +9952,12 @@ impl GatewayHandler {
             self.frontier_published_at_ms
                 .store(current_time_ms(), Ordering::SeqCst);
 
+            // Publish a complete committed epoch per table under one registry
+            // lock. Readers cannot poll half an UPDATE or half an epoch.
+            let mut changes: std::collections::HashMap<
+                String,
+                Vec<crate::change_log::ChangeEntry>,
+            > = std::collections::HashMap::new();
             for op in &ops {
                 let (table, row_key, mz_diff, encoded_row) = match op {
                     DmlOp::Insert {
@@ -9970,8 +9983,7 @@ impl GatewayHandler {
                         new_row_key,
                         new_tsv,
                     } => {
-                        self.subscribe_registry.push(
-                            table,
+                        changes.entry(table.clone()).or_default().push(
                             crate::change_log::ChangeEntry {
                                 epoch,
                                 row_key: Bytes::from(old_row_key.clone()),
@@ -9982,15 +9994,22 @@ impl GatewayHandler {
                         (table.clone(), new_row_key.clone(), 1, new_tsv.clone())
                     }
                 };
-                self.subscribe_registry.push(
-                    &table,
-                    crate::change_log::ChangeEntry {
+                changes
+                    .entry(table)
+                    .or_default()
+                    .push(crate::change_log::ChangeEntry {
                         epoch,
                         row_key: Bytes::from(row_key),
                         mz_diff,
                         encoded_row: Bytes::from(encoded_row),
-                    },
-                );
+                    });
+            }
+            for (table, batch) in changes {
+                if let Err(error) = self.subscribe_registry.push_epoch(&table, batch) {
+                    // The DML was already durable: do not claim rejection of that
+                    // transaction. The registry invalidates replay instead.
+                    tracing::warn!(%table, %epoch, %error, "subscription replay requires resnapshot");
+                }
             }
             (epoch, ops)
         };
