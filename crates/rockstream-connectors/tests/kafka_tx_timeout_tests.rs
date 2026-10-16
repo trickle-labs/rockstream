@@ -67,7 +67,7 @@ mod sim_coordination {
                 }
 
                 assert!(
-                    sink.check_epoch_delivered(epoch),
+                    sink.check_epoch_delivered(epoch).unwrap(),
                     "COV-M3: seed {seed} epoch {epoch}: must be delivered after commit/recovery"
                 );
             }

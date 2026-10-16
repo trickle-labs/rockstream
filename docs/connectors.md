@@ -156,10 +156,10 @@ CREATE SOURCE events_source TYPE kafka (
 
 | Axis | Guarantee |
 | --- | --- |
-| Delivery / recovery | Transactional, checkpoint-coupled commit; recovery re-runs safely without a second externally visible epoch. |
+| Delivery / recovery | Transactional, checkpoint-coupled commit; recovery checks all topic partitions before republishing. Lookup setup failures, poll failures, and timeouts leave recovery pending; only a complete stable scan confirms absence. |
 | Bound / fill metric / backpressure | `KAFKA_SINK_MAX_STAGED_EPOCHS=5`, `kafka_sink_staged_epochs_count`, and `backpressure_active`; staged-epoch admission rejects overflow. |
 | Degraded states | Pre-commit/commit uncertainty, timeout, staged-epoch backpressure, and idempotent recovery are explicit. |
-| Failure codes | `RS-4002`, `RS-4003`, `RS-4004`, and `RS-4005`; recover with the action in the registry. |
+| Failure codes | `RS-4002`, `RS-4003`, `RS-4004`, `RS-4005`, and `RS-4030`; retry unknown-outcome recovery with the original pending handle after restoring lookup. |
 | Proof matrix | The seven Kafka sink cells below. |
 
 ## Failure-code ownership
@@ -188,6 +188,7 @@ CREATE SOURCE events_source TYPE kafka (
 | `RS-4020` | Backfill live-delta buffer |
 | `RS-4021` | Backfill admission reservation |
 | `RS-4022` | Backfill publication state |
+| `RS-4030` | Kafka sink delivery lookup is unresolved; retry recovery |
 
 ## Guarantee matrix
 

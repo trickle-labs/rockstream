@@ -183,6 +183,7 @@
 | RS-4021 | backfill.admission_rejected | Backfill admission reservation rejected | ERROR | 53200 | ExponentialBackoff | Wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES before retrying. | rs-4021 |
 | RS-4022 | backfill.not_published | Materialized view backfill is not published | ERROR | 55000 | Immediate | Run SHOW BACKFILL STATUS and retry after the materialized view reaches RUNNING, or create it first. | rs-4022 |
 | RS-4029 | quota.backpressure_refusal | Quota or backpressure refusal during ingestion burst | WARN | 53200 | ExponentialBackoff | Reduce ingestion rate or increase quota allocation. | rs-4029 |
+| RS-4030 | sink.delivery_unknown | Sink delivery outcome is unknown; recovery remains pending | WARN | 55000 | ExponentialBackoff | Restore Kafka delivery lookup and retry recovery with the original pending handle; do not republish while the outcome is unknown. | rs-4030 |
 | RS-5001 | storage.incompatible_format | Incompatible storage format | FATAL | 55000 | NonRetryable | Run rockstream migrate --from=N --to=M --storage=<url> before upgrading the binary. | rs-5001 |
 | RS-5002 | arrangement.unknown_merge_law | Unknown merge law in arrangement header | FATAL | XX000 | NonRetryable | Register the merge law or migrate the arrangement before attaching the shard. | rs-5002 |
 | RS-5003 | legacy.validation_failure | Legacy validation failure | ERROR | XX000 | NonRetryable | Inspect the failing component and its version-specific validation guidance. | rs-5003 |

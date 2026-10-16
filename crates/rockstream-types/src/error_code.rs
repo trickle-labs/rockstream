@@ -648,6 +648,8 @@ pub const RS_4021: ErrorCode = ErrorCode::new(4021);
 pub const RS_4022: ErrorCode = ErrorCode::new(4022);
 /// Quota or backpressure refusal during ingestion burst.
 pub const RS_4029: ErrorCode = ErrorCode::new(4029);
+/// Sink delivery outcome is unknown; recovery remains pending.
+pub const RS_4030: ErrorCode = ErrorCode::new(4030);
 /// Incompatible storage format.
 pub const RS_5001: ErrorCode = ErrorCode::new(5001);
 /// Unknown merge law in arrangement header.
@@ -807,6 +809,7 @@ mod tests {
             (RS_4020, "backfill.live_delta_buffer_full", "Backfill live-delta buffer is full", "Wait for snapshot catch-up or reduce live-delta volume before retrying."),
             (RS_4021, "backfill.admission_rejected", "Backfill admission reservation rejected", "Wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES before retrying."),
             (RS_4022, "backfill.not_published", "Materialized view backfill is not published", "Run SHOW BACKFILL STATUS and retry after the materialized view reaches RUNNING, or create it first."),
+            (RS_4030, "sink.delivery_unknown", "Sink delivery outcome is unknown; recovery remains pending", "Restore Kafka delivery lookup and retry recovery with the original pending handle; do not republish while the outcome is unknown."),
         ];
 
         for (code, expected_slug, expected_description, expected_next_steps) in expected {
@@ -815,6 +818,10 @@ mod tests {
             assert_eq!(description(code), expected_description);
             assert_eq!(next_steps(code), expected_next_steps);
         }
+        assert_eq!(
+            ErrorDescriptor::lookup(RS_4030).unwrap().retry_class,
+            RetryClass::ExponentialBackoff
+        );
     }
 
     #[test]

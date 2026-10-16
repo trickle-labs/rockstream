@@ -1815,6 +1815,16 @@ default_next_steps = "Reduce ingestion rate or increase quota allocation."
 doc_anchor = "rs-4029"
 
 [[error]]
+code = "RS-4030"
+key = "sink.delivery_unknown"
+title = "Sink delivery outcome is unknown; recovery remains pending"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Restore Kafka delivery lookup and retry recovery with the original pending handle; do not republish while the outcome is unknown."
+doc_anchor = "rs-4030"
+
+[[error]]
 code = "RS-5001"
 key = "storage.incompatible_format"
 title = "Incompatible storage format"

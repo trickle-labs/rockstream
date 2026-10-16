@@ -685,7 +685,9 @@ async fn test_partitioned_worker_self_fences_before_sink_commit() {
         .commit(cluster_committed_epoch, &state)
         .await
         .unwrap();
-    assert!(w2_sink.check_epoch_delivered(cluster_committed_epoch));
+    assert!(w2_sink
+        .check_epoch_delivered(cluster_committed_epoch)
+        .unwrap());
 
     buggify_disable();
 }
@@ -725,7 +727,7 @@ async fn test_2pc_crash_before_precommit() {
     // Perform recovery; must not change delivered set.
     sink.recover(recovery_action.clone()).await.unwrap();
     assert!(
-        !sink.check_epoch_delivered(1),
+        !sink.check_epoch_delivered(1).unwrap(),
         "epoch must not be delivered after Noop"
     );
 
@@ -778,7 +780,7 @@ async fn test_2pc_crash_between_precommit_commit() {
 
     sink.recover(recovery_action.clone()).await.unwrap();
     assert!(
-        sink.check_epoch_delivered(3),
+        sink.check_epoch_delivered(3).unwrap(),
         "epoch must be delivered after recovery"
     );
 
@@ -826,7 +828,7 @@ async fn test_2pc_crash_during_commit() {
     // CheckBeforeCommit: query Kafka → epoch already delivered → no duplicate.
     sink.recover(recovery_action.clone()).await.unwrap();
     // Exactly one delivery.
-    assert!(sink.check_epoch_delivered(5));
+    assert!(sink.check_epoch_delivered(5).unwrap());
     assert_eq!(sink.delivered_count_for_test(), 1, "must not duplicate");
 
     // M3-S4: RerunCommit → final state must be Committed.
