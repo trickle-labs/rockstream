@@ -147,7 +147,10 @@ fn v072_failed_shared_cache_reservation_remains_retryable() {
         requested_bytes: 100,
     };
     for _ in 0..2 {
-        assert_eq!(ledger.charge_shared_cache_once(100), Err(expected_error.clone()));
+        assert_eq!(
+            ledger.charge_shared_cache_once(100),
+            Err(expected_error.clone())
+        );
         assert_eq!(snapshot(&ledger), (1000, vec![0, 0, 0, 1000, 0, 0, 0, 0]));
     }
     drop(occupied);
@@ -186,7 +189,10 @@ fn v072_concurrent_cache_initializers_never_observe_speculative_success() {
         ]
     );
     drop(occupied);
-    let mut outcomes = initialize().into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    let mut outcomes = initialize()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     outcomes.sort_unstable();
     let mut expected = vec![false; 15];
     expected.push(true);

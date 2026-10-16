@@ -972,7 +972,10 @@ impl WorkerBudgetLedger {
             .saturating_sub(self.gross_bytes(self.total_allocated_bytes())) as u64
     }
 
-    pub fn charge_shared_cache_once(self: &Arc<Self>, bytes: u64) -> Result<bool, StateBudgetError> {
+    pub fn charge_shared_cache_once(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<bool, StateBudgetError> {
         // Serialize initialization, not all allocations. Failed reservations leave
         // the cache uncharged and retryable; no caller observes a speculative flag.
         let mut charged = self.shared_cache_charged.lock();

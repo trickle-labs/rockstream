@@ -1,6 +1,8 @@
 //! Exact ledger checks for the production allocation-wait future (issue #133).
 use rockstream_runtime::WorkerQuotaManager;
-use rockstream_types::state_budget::{MemoryCategory, MemoryPermit, StateBudgetError, WorkerBudgetLedger};
+use rockstream_types::state_budget::{
+    MemoryCategory, MemoryPermit, StateBudgetError, WorkerBudgetLedger,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,7 +22,11 @@ fn assert_ledger(manager: &WorkerQuotaManager, waiters: u64, source: u64, query:
         .map(|category| (*category, ledger.category_bytes(*category)))
         .collect();
     assert_eq!(
-        (ledger.waiter_count(), ledger.total_allocated_bytes(), categories),
+        (
+            ledger.waiter_count(),
+            ledger.total_allocated_bytes(),
+            categories
+        ),
         (
             waiters,
             source + query,
@@ -60,7 +66,10 @@ async fn v072_unpolled_and_immediate_success_own_no_waiter() {
         .acquire_permit_with_timeout(MemoryCategory::QueryWorkMemory, 1, Duration::ZERO)
         .await
         .unwrap();
-    assert_eq!((permit.category(), permit.bytes()), (MemoryCategory::QueryWorkMemory, 1));
+    assert_eq!(
+        (permit.category(), permit.bytes()),
+        (MemoryCategory::QueryWorkMemory, 1)
+    );
     assert_ledger(&manager, 0, 0, 1);
     drop(permit);
     assert_ledger(&manager, 0, 0, 0);
@@ -69,7 +78,9 @@ async fn v072_unpolled_and_immediate_success_own_no_waiter() {
 #[tokio::test]
 async fn v072_cancellation_releases_waiter_without_releasing_live_bytes() {
     let manager = manager();
-    let occupied = manager.try_acquire_permit(MemoryCategory::SourceBuffers, 100).unwrap();
+    let occupied = manager
+        .try_acquire_permit(MemoryCategory::SourceBuffers, 100)
+        .unwrap();
     for _ in 0..16 {
         let mut future = Box::pin(manager.acquire_permit_with_timeout(
             MemoryCategory::QueryWorkMemory,
@@ -88,7 +99,9 @@ async fn v072_cancellation_releases_waiter_without_releasing_live_bytes() {
 #[tokio::test]
 async fn v072_waiter_overflow_does_not_release_another_future_slot() {
     let manager = manager();
-    let occupied = manager.try_acquire_permit(MemoryCategory::SourceBuffers, 100).unwrap();
+    let occupied = manager
+        .try_acquire_permit(MemoryCategory::SourceBuffers, 100)
+        .unwrap();
     let mut first = Box::pin(manager.acquire_permit_with_timeout(
         MemoryCategory::QueryWorkMemory,
         1,
@@ -99,12 +112,15 @@ async fn v072_waiter_overflow_does_not_release_another_future_slot() {
         .acquire_permit_with_timeout(MemoryCategory::QueryWorkMemory, 1, Duration::ZERO)
         .await
         .unwrap_err();
-    assert_eq!(error, StateBudgetError {
-        operator_name: "allocation-waiters-queue".to_owned(),
-        max_bytes: 1,
-        current_bytes: 1,
-        requested_bytes: 1,
-    });
+    assert_eq!(
+        error,
+        StateBudgetError {
+            operator_name: "allocation-waiters-queue".to_owned(),
+            max_bytes: 1,
+            current_bytes: 1,
+            requested_bytes: 1,
+        }
+    );
     assert_ledger(&manager, 1, 100, 0);
     drop(first);
     assert_ledger(&manager, 0, 100, 0);
@@ -115,17 +131,22 @@ async fn v072_waiter_overflow_does_not_release_another_future_slot() {
 #[tokio::test]
 async fn v072_timeout_releases_its_slot_and_preserves_full_error() {
     let manager = manager();
-    let occupied = manager.try_acquire_permit(MemoryCategory::SourceBuffers, 100).unwrap();
+    let occupied = manager
+        .try_acquire_permit(MemoryCategory::SourceBuffers, 100)
+        .unwrap();
     let error = manager
         .acquire_permit_with_timeout(MemoryCategory::QueryWorkMemory, 1, Duration::ZERO)
         .await
         .unwrap_err();
-    assert_eq!(error, StateBudgetError {
-        operator_name: "waiter-timeout-query_work_memory".to_owned(),
-        max_bytes: 110,
-        current_bytes: 100,
-        requested_bytes: 1,
-    });
+    assert_eq!(
+        error,
+        StateBudgetError {
+            operator_name: "waiter-timeout-query_work_memory".to_owned(),
+            max_bytes: 110,
+            current_bytes: 100,
+            requested_bytes: 1,
+        }
+    );
     assert_ledger(&manager, 0, 100, 0);
     drop(occupied);
     assert_ledger(&manager, 0, 0, 0);
@@ -134,7 +155,9 @@ async fn v072_timeout_releases_its_slot_and_preserves_full_error() {
 #[tokio::test]
 async fn v072_delayed_success_releases_waiter_before_returning_permit() {
     let manager = manager();
-    let occupied = manager.try_acquire_permit(MemoryCategory::SourceBuffers, 100).unwrap();
+    let occupied = manager
+        .try_acquire_permit(MemoryCategory::SourceBuffers, 100)
+        .unwrap();
     let mut future = Box::pin(manager.acquire_permit_with_timeout(
         MemoryCategory::QueryWorkMemory,
         1,
@@ -144,7 +167,10 @@ async fn v072_delayed_success_releases_waiter_before_returning_permit() {
     assert_ledger(&manager, 1, 100, 0);
     drop(occupied);
     let permit = future.await.unwrap();
-    assert_eq!((permit.category(), permit.bytes()), (MemoryCategory::QueryWorkMemory, 1));
+    assert_eq!(
+        (permit.category(), permit.bytes()),
+        (MemoryCategory::QueryWorkMemory, 1)
+    );
     assert_ledger(&manager, 0, 0, 1);
     drop(permit);
     assert_ledger(&manager, 0, 0, 0);
@@ -153,7 +179,9 @@ async fn v072_delayed_success_releases_waiter_before_returning_permit() {
 #[tokio::test]
 async fn v072_task_abort_cleans_up_before_join_completes() {
     let manager = manager();
-    let occupied = manager.try_acquire_permit(MemoryCategory::SourceBuffers, 100).unwrap();
+    let occupied = manager
+        .try_acquire_permit(MemoryCategory::SourceBuffers, 100)
+        .unwrap();
     let worker = manager.clone();
     let (started, observed) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
@@ -171,7 +199,8 @@ async fn v072_task_abort_cleans_up_before_join_completes() {
                 }
             }
             result
-        }).await
+        })
+        .await
     });
     observed.await.unwrap();
     assert_ledger(&manager, 1, 100, 0);
