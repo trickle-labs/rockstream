@@ -1,0 +1,498 @@
+diff --git a/tools/r1-local-harness/src/bin/verify-v072-matrix.rs b/tools/r1-local-harness/src/bin/verify-v072-matrix.rs
+index 06be693..70c8b80 100644
+--- a/tools/r1-local-harness/src/bin/verify-v072-matrix.rs
++++ b/tools/r1-local-harness/src/bin/verify-v072-matrix.rs
+@@ -15,7 +15,9 @@ fn run(cli: Cli) -> Result<()> {
+     let bytes = std::fs::read(&cli.matrix).context("read matrix report")?;
+     let report: MatrixReport = serde_json::from_slice(&bytes).context("parse matrix report")?;
+     verify_v072_matrix(&report)?;
+-    println!("v0.72 matrix structure is complete; raw process evidence still requires qualification");
++    println!(
++        "v0.72 matrix structure is complete; raw process evidence still requires qualification"
++    );
+     Ok(())
+ }
+ 
+diff --git a/tools/r1-local-harness/src/main.rs b/tools/r1-local-harness/src/main.rs
+index 3b762cc..dabcd85 100644
+--- a/tools/r1-local-harness/src/main.rs
++++ b/tools/r1-local-harness/src/main.rs
+@@ -545,7 +545,9 @@ async fn run_side(
+             .collect::<Result<BTreeMap<_, _>>>()?;
+         let logical_bytes = loaded.logical_bytes;
+         let exchange_bytes = measurement_workers.iter().try_fold(0u64, |total, worker| {
+-            total.checked_add(worker.exchange_bytes).context("exchange byte total overflow")
++            total
++                .checked_add(worker.exchange_bytes)
++                .context("exchange byte total overflow")
+         })?;
+         let sample = RawSample {
+             schema_version: 1,
+diff --git a/tools/r1-local-harness/src/matrix.rs b/tools/r1-local-harness/src/matrix.rs
+index 9c6ebab..259a9c3 100644
+--- a/tools/r1-local-harness/src/matrix.rs
++++ b/tools/r1-local-harness/src/matrix.rs
+@@ -254,7 +254,10 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
+     }
+ 
+     let defined = default_matrix_cells();
+-    let by_id: HashMap<_, _> = defined.iter().map(|cell| (cell.cell_id.as_str(), cell)).collect();
++    let by_id: HashMap<_, _> = defined
++        .iter()
++        .map(|cell| (cell.cell_id.as_str(), cell))
++        .collect();
+     let mut reported = HashSet::new();
+     for cell in &report.cells {
+         if !by_id.contains_key(cell.cell_id.as_str()) {
+@@ -288,7 +291,11 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
+                     bail!("no worker PIDs recorded for cell {}", cell.cell_id);
+                 }
+                 let mut pids = HashSet::new();
+-                if cell.worker_pids.iter().any(|pid| *pid == 0 || !pids.insert(*pid)) {
++                if cell
++                    .worker_pids
++                    .iter()
++                    .any(|pid| *pid == 0 || !pids.insert(*pid))
++                {
+                     bail!("zero or duplicate worker PID in cell {}", cell.cell_id);
+                 }
+                 let expected_workers = match cell.cell_id.as_str() {
+@@ -300,7 +307,10 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
+                 };
+                 if let Some(expected) = expected_workers {
+                     if cell.worker_pids.len() != expected {
+-                        bail!("cell {} requires {expected} distinct worker PIDs", cell.cell_id);
++                        bail!(
++                            "cell {} requires {expected} distinct worker PIDs",
++                            cell.cell_id
++                        );
+                     }
+                 }
+                 if cell.error.is_some()
+@@ -309,7 +319,12 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
+                 {
+                     bail!("measured cell {} carries an error or blocker", cell.cell_id);
+                 }
+-                metric(cell.throughput_rows_per_sec, "throughput_rows_per_sec", &cell.cell_id, true)?;
++                metric(
++                    cell.throughput_rows_per_sec,
++                    "throughput_rows_per_sec",
++                    &cell.cell_id,
++                    true,
++                )?;
+                 for (name, value) in [
+                     ("read_p99_ms", cell.read_p99_ms),
+                     ("commit_p99_ms", cell.commit_p99_ms),
+@@ -338,18 +353,35 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
+                 measured += 1;
+             }
+             "BLOCKED" => {
+-                let owner = cell.owning_milestone.as_deref().filter(|owner| !owner.trim().is_empty());
++                let owner = cell
++                    .owning_milestone
++                    .as_deref()
++                    .filter(|owner| !owner.trim().is_empty());
+                 let Some(owner) = owner else {
+-                    bail!("unowned blocked cell {} missing owning milestone", cell.cell_id);
++                    bail!(
++                        "unowned blocked cell {} missing owning milestone",
++                        cell.cell_id
++                    );
+                 };
+                 if !owner.starts_with("v0.") {
+-                    bail!("blocked cell {} has invalid owning milestone {}", cell.cell_id, owner);
++                    bail!(
++                        "blocked cell {} has invalid owning milestone {}",
++                        cell.cell_id,
++                        owner
++                    );
+                 }
+-                if cell.blocker_description.as_deref().is_none_or(|reason| reason.trim().is_empty()) {
++                if cell
++                    .blocker_description
++                    .as_deref()
++                    .is_none_or(|reason| reason.trim().is_empty())
++                {
+                     bail!("blocked cell {} missing blocker description", cell.cell_id);
+                 }
+                 if matches!(definition.status, MatrixCellStatus::RunnableStandalone) {
+-                    bail!("runnable cell {} cannot use a historical blocker", cell.cell_id);
++                    bail!(
++                        "runnable cell {} cannot use a historical blocker",
++                        cell.cell_id
++                    );
+                 }
+                 if cell.throughput_rows_per_sec.is_some()
+                     || cell.read_p99_ms.is_some()
+@@ -361,11 +393,17 @@ pub fn verify_matrix(report: &MatrixReport) -> Result<()> {
+                     || cell.worker_active
+                     || cell.error.is_some()
+                 {
+-                    bail!("blocked cell {} must not claim measured evidence", cell.cell_id);
++                    bail!(
++                        "blocked cell {} must not claim measured evidence",
++                        cell.cell_id
++                    );
+                 }
+                 blocked += 1;
+             }
+-            status => bail!("unsupported matrix cell status {status:?} for {}", cell.cell_id),
++            status => bail!(
++                "unsupported matrix cell status {status:?} for {}",
++                cell.cell_id
++            ),
+         }
+     }
+ 
+diff --git a/tools/r1-local-harness/src/negative.rs b/tools/r1-local-harness/src/negative.rs
+index 3a55ba4..d147ff1 100644
+--- a/tools/r1-local-harness/src/negative.rs
++++ b/tools/r1-local-harness/src/negative.rs
+@@ -27,18 +27,28 @@ pub fn qualify_sample(sample: &RawSample) -> Result<()> {
+     sample.validate()?;
+     for (name, value) in [
+         ("state_writes_per_change", sample.state_writes_per_change),
+-        ("intermediate_rows_per_change", sample.intermediate_rows_per_change),
++        (
++            "intermediate_rows_per_change",
++            sample.intermediate_rows_per_change,
++        ),
+         ("network_bytes_per_change", sample.network_bytes_per_change),
+-        ("object_store_requests_per_change", sample.object_store_requests_per_change),
++        (
++            "object_store_requests_per_change",
++            sample.object_store_requests_per_change,
++        ),
+         ("read_p99_ms", sample.read_p99_ms),
+         ("commit_p99_ms", sample.commit_p99_ms),
+         ("freshness_p99_ms", sample.freshness_p99_ms),
+         ("generator_delay_p99_ms", sample.generator_delay_p99_ms),
+         ("queue_age_ms", sample.queue_age_ms),
+         ("control_node_load", sample.control_node_load),
+-        ("physical_flushes_per_epoch", sample.physical_flushes_per_epoch),
++        (
++            "physical_flushes_per_epoch",
++            sample.physical_flushes_per_epoch,
++        ),
+     ] {
+-        let value = value.with_context(|| format!("raw sample {} missing {name}", sample.run_id))?;
++        let value =
++            value.with_context(|| format!("raw sample {} missing {name}", sample.run_id))?;
+         if !value.is_finite() || value < 0.0 {
+             bail!("raw sample {} invalid {name}", sample.run_id);
+         }
+@@ -47,7 +57,8 @@ pub fn qualify_sample(sample: &RawSample) -> Result<()> {
+         ("generator_queue_drops", sample.generator_queue_drops),
+         ("timeouts_and_errors", sample.timeouts_and_errors),
+     ] {
+-        let value = value.with_context(|| format!("raw sample {} missing {name}", sample.run_id))?;
++        let value =
++            value.with_context(|| format!("raw sample {} missing {name}", sample.run_id))?;
+         if value != 0 {
+             bail!("raw sample {} has nonzero {name}: {value}", sample.run_id);
+         }
+diff --git a/tools/r1-local-harness/tests/v072_matrix_cli_tests.rs b/tools/r1-local-harness/tests/v072_matrix_cli_tests.rs
+index e7a4f00..f0ce4e0 100644
+--- a/tools/r1-local-harness/tests/v072_matrix_cli_tests.rs
++++ b/tools/r1-local-harness/tests/v072_matrix_cli_tests.rs
+@@ -19,10 +19,9 @@ fn v072_matrix_command_never_fabricates_a_measured_report() {
+         output.stdout,
+         b"Matrix plan written; no benchmark measurements were executed.\n"
+     );
+-    let plan: serde_json::Value = serde_json::from_slice(
+-        &fs::read(directory.path().join("matrix-plan.json")).unwrap(),
+-    )
+-    .unwrap();
++    let plan: serde_json::Value =
++        serde_json::from_slice(&fs::read(directory.path().join("matrix-plan.json")).unwrap())
++            .unwrap();
+     assert_eq!(
+         plan,
+         json!({
+diff --git a/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs b/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
+index 291152f..411e44d 100644
+--- a/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
++++ b/tools/r1-local-harness/tests/v072_matrix_gate_tests.rs
+@@ -32,7 +32,11 @@ fn fixture(complete: bool) -> MatrixReport {
+             };
+             cell.worker_pids = (1234..1234 + workers).collect();
+             if !complete {
+-                if let MatrixCellStatus::Blocked { owning_milestone, blocker_description } = definition.status {
++                if let MatrixCellStatus::Blocked {
++                    owning_milestone,
++                    blocker_description,
++                } = definition.status
++                {
+                     cell.status = "BLOCKED".to_owned();
+                     cell.owning_milestone = Some(owning_milestone);
+                     cell.blocker_description = Some(blocker_description);
+@@ -51,7 +55,10 @@ fn fixture(complete: bool) -> MatrixReport {
+         .collect();
+     MatrixReport {
+         schema_version: 1,
+-        runnable_measured_count: cells.iter().filter(|cell| cell.status == "MEASURED").count(),
++        runnable_measured_count: cells
++            .iter()
++            .filter(|cell| cell.status == "MEASURED")
++            .count(),
+         blocked_count: cells.iter().filter(|cell| cell.status == "BLOCKED").count(),
+         cells,
+         all_areas_covered: true,
+@@ -75,26 +82,49 @@ fn v072_historical_blockers_are_not_capacity_exemptions() {
+ 
+ #[test]
+ fn v072_matrix_inventory_is_exact() {
+-    let observed: Vec<_> = default_matrix_cells().into_iter()
+-        .map(|cell| (cell.cell_id, cell.area)).collect();
++    let observed: Vec<_> = default_matrix_cells()
++        .into_iter()
++        .map(|cell| (cell.cell_id, cell.area))
++        .collect();
+     let expected = vec![
+         ("one-key-1k-standalone", ExperimentArea::OneKeyUpdates),
+         ("one-key-100k-standalone", ExperimentArea::OneKeyUpdates),
+         ("one-key-10m-beyond-ram", ExperimentArea::OneKeyUpdates),
+         ("views-1-view-standalone", ExperimentArea::CompatibleViews),
+         ("views-20-views-standalone", ExperimentArea::CompatibleViews),
+-        ("views-shared-execution-benefit", ExperimentArea::CompatibleViews),
+-        ("worker-scaling-1-worker-standalone", ExperimentArea::WorkerScaling),
++        (
++            "views-shared-execution-benefit",
++            ExperimentArea::CompatibleViews,
++        ),
++        (
++            "worker-scaling-1-worker-standalone",
++            ExperimentArea::WorkerScaling,
++        ),
+         ("worker-scaling-2-workers", ExperimentArea::WorkerScaling),
+         ("worker-scaling-4-workers", ExperimentArea::WorkerScaling),
+         ("worker-scaling-8-workers", ExperimentArea::WorkerScaling),
+-        ("concurrent-ingestion-and-queries-standalone", ExperimentArea::ConcurrentLoad),
+-        ("compaction-and-restart-standalone", ExperimentArea::BeyondRamAndCompaction),
+-        ("state-beyond-ram-spillable", ExperimentArea::BeyondRamAndCompaction),
+-        ("standalone-overload-and-backpressure", ExperimentArea::OverloadAndLoss),
++        (
++            "concurrent-ingestion-and-queries-standalone",
++            ExperimentArea::ConcurrentLoad,
++        ),
++        (
++            "compaction-and-restart-standalone",
++            ExperimentArea::BeyondRamAndCompaction,
++        ),
++        (
++            "state-beyond-ram-spillable",
++            ExperimentArea::BeyondRamAndCompaction,
++        ),
++        (
++            "standalone-overload-and-backpressure",
++            ExperimentArea::OverloadAndLoss,
++        ),
+         ("worker-loss-failover", ExperimentArea::OverloadAndLoss),
+         ("shard-migration", ExperimentArea::OverloadAndLoss),
+-    ].into_iter().map(|(id, area)| (id.to_owned(), area)).collect::<Vec<_>>();
++    ]
++    .into_iter()
++    .map(|(id, area)| (id.to_owned(), area))
++    .collect::<Vec<_>>();
+     assert_eq!(observed, expected);
+ }
+ 
+@@ -104,10 +134,16 @@ fn v072_every_cell_is_required_exactly_once() {
+     for index in 0..complete.cells.len() {
+         let mut missing = complete.clone();
+         let removed = missing.cells.remove(index);
+-        assert_eq!(error(&missing), format!("missing required matrix cell: {}", removed.cell_id));
++        assert_eq!(
++            error(&missing),
++            format!("missing required matrix cell: {}", removed.cell_id)
++        );
+         let mut duplicate = complete.clone();
+         duplicate.cells.push(complete.cells[index].clone());
+-        assert_eq!(error(&duplicate), format!("duplicate matrix cell: {}", complete.cells[index].cell_id));
++        assert_eq!(
++            error(&duplicate),
++            format!("duplicate matrix cell: {}", complete.cells[index].cell_id)
++        );
+     }
+     let mut unknown = complete;
+     unknown.cells[0].cell_id = "invented-cell".to_owned();
+@@ -119,27 +155,40 @@ fn v072_unknown_statuses_and_false_area_are_rejected() {
+     for status in ["", "PENDING", "FAILED", "NOT_APPLICABLE", "measured"] {
+         let mut report = fixture(true);
+         report.cells[0].status = status.to_owned();
+-        assert_eq!(error(&report), format!("unsupported matrix cell status {status:?} for one-key-1k-standalone"));
++        assert_eq!(
++            error(&report),
++            format!("unsupported matrix cell status {status:?} for one-key-1k-standalone")
++        );
+     }
+     let mut report = fixture(true);
+     report.cells[0].area = ExperimentArea::WorkerScaling;
+-    assert_eq!(error(&report), "wrong experiment area for cell one-key-1k-standalone");
++    assert_eq!(
++        error(&report),
++        "wrong experiment area for cell one-key-1k-standalone"
++    );
+ }
+ 
+ #[test]
+ fn v072_missing_metrics_cannot_skip_validation() {
+     let mutations: [(&str, fn(&mut MatrixExecutionResult)); 6] = [
+-        ("throughput_rows_per_sec", |cell| cell.throughput_rows_per_sec = None),
++        ("throughput_rows_per_sec", |cell| {
++            cell.throughput_rows_per_sec = None
++        }),
+         ("read_p99_ms", |cell| cell.read_p99_ms = None),
+         ("commit_p99_ms", |cell| cell.commit_p99_ms = None),
+         ("freshness_p99_ms", |cell| cell.freshness_p99_ms = None),
+-        ("state_writes_per_change", |cell| cell.state_writes_per_change = None),
++        ("state_writes_per_change", |cell| {
++            cell.state_writes_per_change = None
++        }),
+         ("lookup_cost_ms", |cell| cell.lookup_cost_ms = None),
+     ];
+     for (name, mutate) in mutations {
+         let mut report = fixture(true);
+         mutate(&mut report.cells[0]);
+-        assert_eq!(error(&report), format!("missing {name} in cell one-key-1k-standalone"));
++        assert_eq!(
++            error(&report),
++            format!("missing {name} in cell one-key-1k-standalone")
++        );
+     }
+ }
+ 
+@@ -148,15 +197,24 @@ fn v072_nonfinite_negative_and_zero_denominators_are_rejected() {
+     for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+         let mut report = fixture(true);
+         report.cells[0].throughput_rows_per_sec = Some(invalid);
+-        assert_eq!(error(&report), "invalid throughput_rows_per_sec in cell one-key-1k-standalone");
++        assert_eq!(
++            error(&report),
++            "invalid throughput_rows_per_sec in cell one-key-1k-standalone"
++        );
+         report = fixture(true);
+         report.cells[0].state_writes_per_change = Some(invalid);
+-        assert_eq!(error(&report), "invalid state_writes_per_change in cell one-key-1k-standalone");
++        assert_eq!(
++            error(&report),
++            "invalid state_writes_per_change in cell one-key-1k-standalone"
++        );
+     }
+     for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+         let mut report = fixture(true);
+         report.cells[0].read_p99_ms = Some(invalid);
+-        assert_eq!(error(&report), "invalid read_p99_ms in cell one-key-1k-standalone");
++        assert_eq!(
++            error(&report),
++            "invalid read_p99_ms in cell one-key-1k-standalone"
++        );
+     }
+ }
+ 
+@@ -165,41 +223,65 @@ fn v072_worker_identities_must_be_distinct_and_match_scaling_case() {
+     for pids in [vec![0], vec![1, 1]] {
+         let mut report = fixture(true);
+         report.cells[0].worker_pids = pids;
+-        assert_eq!(error(&report), "zero or duplicate worker PID in cell one-key-1k-standalone");
++        assert_eq!(
++            error(&report),
++            "zero or duplicate worker PID in cell one-key-1k-standalone"
++        );
+     }
+     let mut report = fixture(true);
+     report.cells[9].worker_pids = vec![1234];
+-    assert_eq!(error(&report), "cell worker-scaling-8-workers requires 8 distinct worker PIDs");
++    assert_eq!(
++        error(&report),
++        "cell worker-scaling-8-workers requires 8 distinct worker PIDs"
++    );
+ }
+ 
+ #[test]
+ fn v072_summary_flags_and_counts_are_recomputed() {
+     let mut report = fixture(true);
+     report.all_areas_covered = false;
+-    assert_eq!(error(&report), "matrix report all_areas_covered does not match its cells");
++    assert_eq!(
++        error(&report),
++        "matrix report all_areas_covered does not match its cells"
++    );
+     report = fixture(true);
+     report.runnable_measured_count -= 1;
+-    assert_eq!(error(&report), "matrix report counts do not match its cells");
++    assert_eq!(
++        error(&report),
++        "matrix report counts do not match its cells"
++    );
+     report = fixture(true);
+     report.blocked_count = 1;
+-    assert_eq!(error(&report), "matrix report counts do not match its cells");
++    assert_eq!(
++        error(&report),
++        "matrix report counts do not match its cells"
++    );
+ }
+ 
+ #[test]
+ fn v072_measured_errors_and_blocked_measurements_are_rejected() {
+     let mut report = fixture(true);
+     report.cells[0].error = Some("flush failed".to_owned());
+-    assert_eq!(error(&report), "measured cell one-key-1k-standalone carries an error or blocker");
++    assert_eq!(
++        error(&report),
++        "measured cell one-key-1k-standalone carries an error or blocker"
++    );
+     report = fixture(false);
+     report.cells[2].read_p99_ms = Some(1.0);
+-    assert_eq!(error(&report), "blocked cell one-key-10m-beyond-ram must not claim measured evidence");
++    assert_eq!(
++        error(&report),
++        "blocked cell one-key-10m-beyond-ram must not claim measured evidence"
++    );
+ }
+ 
+ #[test]
+ fn v072_ten_million_groups_participates_in_write_comparison() {
+     let mut report = fixture(true);
+     report.cells[2].state_writes_per_change = Some(2.0);
+-    assert_eq!(error(&report), "one-key write amplification ratio exceeds frozen threshold 1.10");
++    assert_eq!(
++        error(&report),
++        "one-key write amplification ratio exceeds frozen threshold 1.10"
++    );
+     report.cells[2].state_writes_per_change = Some(1.10);
+     verify_v072_matrix(&report).unwrap();
+ }
+diff --git a/tools/r1-local-harness/tests/v072_sample_gate_tests.rs b/tools/r1-local-harness/tests/v072_sample_gate_tests.rs
+index aa4fb6e..3f9b7ac 100644
+--- a/tools/r1-local-harness/tests/v072_sample_gate_tests.rs
++++ b/tools/r1-local-harness/tests/v072_sample_gate_tests.rs
+@@ -7,18 +7,24 @@ use std::collections::BTreeMap;
+ type FloatSetter = fn(&mut RawSample, Option<f64>);
+ 
+ const METRICS: [(&str, FloatSetter); 11] = [
+-    ("state_writes_per_change", |s, v| s.state_writes_per_change = v),
++    ("state_writes_per_change", |s, v| {
++        s.state_writes_per_change = v
++    }),
+     ("intermediate_rows_per_change", |s, v| {
+         s.intermediate_rows_per_change = v
+     }),
+-    ("network_bytes_per_change", |s, v| s.network_bytes_per_change = v),
++    ("network_bytes_per_change", |s, v| {
++        s.network_bytes_per_change = v
++    }),
+     ("object_store_requests_per_change", |s, v| {
+         s.object_store_requests_per_change = v
+     }),
+     ("read_p99_ms", |s, v| s.read_p99_ms = v),
+     ("commit_p99_ms", |s, v| s.commit_p99_ms = v),
+     ("freshness_p99_ms", |s, v| s.freshness_p99_ms = v),
+-    ("generator_delay_p99_ms", |s, v| s.generator_delay_p99_ms = v),
++    ("generator_delay_p99_ms", |s, v| {
++        s.generator_delay_p99_ms = v
++    }),
+     ("queue_age_ms", |s, v| s.queue_age_ms = v),
+     ("control_node_load", |s, v| s.control_node_load = v),
+     ("physical_flushes_per_epoch", |s, v| {
