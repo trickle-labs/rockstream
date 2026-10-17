@@ -25,7 +25,7 @@ jobs:
       - name: Prove seeded source pause/resume lifecycle
         run: cargo test -p rockstream-connectors --features simulation --test source_coordination_sim_tests seeded_lifecycle_race_never_revives_dropped_or_paused_source -- --exact
       - name: Prove real Kafka and MinIO source baseline
-        run: cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle -- --exact
+        run: cargo test -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests worker_failure_recovery_from_view_and_kafka -- --exact
       - name: Prove real-process LFS churn contract
         env:
           ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "180"

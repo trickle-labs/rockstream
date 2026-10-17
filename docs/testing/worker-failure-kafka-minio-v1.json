@@ -1,0 +1,34 @@
+{
+  "scenario_id": "worker-failure-kafka-minio-v1",
+  "contract": "126/v1",
+  "source_topic": "worker-failure-input",
+  "sink_topic": "worker-failure-output",
+  "connector_id": 126,
+  "view_id": 126,
+  "shard_id": 126,
+  "fault_after_source_epoch": 3,
+  "required_frontier": 5,
+  "limits_ms": {"detection": 5000, "ownership": 30000, "query": 60000},
+  "history": [
+    {"timestamp": 1, "values": [1, "a"], "weight": 1},
+    {"timestamp": 2, "values": [2, "b"], "weight": 1},
+    {"timestamp": 3, "values": [1, "a"], "weight": -1},
+    {"timestamp": 4, "values": [1, "c"], "weight": 1},
+    {"timestamp": 5, "values": [2, "b"], "weight": -1}
+  ],
+  "expected_weighted_output": [
+    [1, 0, [{"Int64": 1}, {"Utf8": "a"}], 1],
+    [2, 0, [{"Int64": 2}, {"Utf8": "b"}], 1],
+    [3, 0, [{"Int64": 1}, {"Utf8": "a"}], -1],
+    [4, 0, [{"Int64": 1}, {"Utf8": "c"}], 1],
+    [5, 0, [{"Int64": 2}, {"Utf8": "b"}], -1]
+  ],
+  "expected_relation": [[[{"Int64": 1}, {"Utf8": "c"}], 1]],
+  "expected_sink": [
+    ["0", {"version": 1, "connector_id": 126, "view": 126, "epoch": 0, "view_epoch": 1, "kind": "snapshot", "rows": [{"values": [{"Int64": 1}, {"Utf8": "a"}], "weight": 1}]}],
+    ["1", {"version": 1, "connector_id": 126, "view": 126, "epoch": 1, "view_epoch": 2, "kind": "changes", "rows": [{"values": [{"Int64": 2}, {"Utf8": "b"}], "weight": 1}]}],
+    ["2", {"version": 1, "connector_id": 126, "view": 126, "epoch": 2, "view_epoch": 3, "kind": "changes", "rows": [{"values": [{"Int64": 1}, {"Utf8": "a"}], "weight": -1}]}],
+    ["3", {"version": 1, "connector_id": 126, "view": 126, "epoch": 3, "view_epoch": 4, "kind": "changes", "rows": [{"values": [{"Int64": 1}, {"Utf8": "c"}], "weight": 1}]}],
+    ["4", {"version": 1, "connector_id": 126, "view": 126, "epoch": 4, "view_epoch": 5, "kind": "changes", "rows": [{"values": [{"Int64": 2}, {"Utf8": "b"}], "weight": -1}]}]
+  ]
+}

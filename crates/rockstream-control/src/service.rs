@@ -3810,6 +3810,13 @@ async fn handle_connection_stream<R, W>(
     // A dropped worker session is a death signal: remove it from live topology
     // and reassign its fenced shard leases to the remaining workers.
     if let Some(worker_id) = connected_worker_id {
+        if let Some(aud) = &audit {
+            let _ = aud.append(&AuditEvent::now(
+                "control",
+                "worker.disconnected",
+                worker_id.to_string(),
+            ));
+        }
         worker_senders.lock().await.remove(&worker_id);
         let scheduler = ShardScheduler::new(catalog.clone(), shard_manager.clone());
         catalog.deregister(worker_id);

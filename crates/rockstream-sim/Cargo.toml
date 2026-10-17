@@ -20,6 +20,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 parking_lot = "0.12"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 rockstream-test-support.workspace = true
@@ -33,11 +34,11 @@ rockstream-sql = { workspace = true }
 rockstream-storage = { workspace = true }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true, features = ["minio"] }
+testcontainers-modules = { workspace = true, features = ["minio", "kafka"] }
+rdkafka = { workspace = true }
 object_store = { workspace = true }
 arrow = { workspace = true }
 hmac = { workspace = true }
-sha2 = { workspace = true }
 hex = { workspace = true }
 rockstream-ops = { workspace = true }
 rockstream-connectors = { workspace = true, features = ["simulation"] }

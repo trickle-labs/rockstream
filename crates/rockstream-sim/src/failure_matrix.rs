@@ -167,8 +167,8 @@ pub const FAILURE_MATRIX_CELLS: &[FailureMatrixCell] = &[
         owning_version: "v0.58.1",
         deterministic_test: "crates/rockstream-sim/tests/failure_matrix_tests.rs::test_fm001_worker_loss_recovery",
         permanent_seeds: FM001_SEEDS,
-        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle"),
-        real_backend_budget_secs: 30,
+        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::worker_failure_recovery_from_view_and_kafka"),
+        real_backend_budget_secs: 60,
         exemption_reason: None,
         absolute_slo_target: "Failure detection <= 5s, reassignment <= 30s, freshness recovery <= 60s, zero loss, zero duplicates",
     },
@@ -182,9 +182,9 @@ pub const FAILURE_MATRIX_CELLS: &[FailureMatrixCell] = &[
         owning_version: "v0.58.1",
         deterministic_test: "crates/rockstream-sim/tests/failure_matrix_tests.rs::test_fm002_control_node_loss_recovery",
         permanent_seeds: FM002_SEEDS,
-        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle"),
+        real_backend_test: None,
         real_backend_budget_secs: 15,
-        exemption_reason: None,
+        exemption_reason: Some("Real-backend evidence pending; removed copied-input chaos case was not proof. Issue #126 covers worker failure only"),
         absolute_slo_target: "Leader failover <= 5s, zero split-brain, epoch progress resumes",
     },
     FailureMatrixCell {
@@ -197,9 +197,9 @@ pub const FAILURE_MATRIX_CELLS: &[FailureMatrixCell] = &[
         owning_version: "v0.58.1",
         deterministic_test: "crates/rockstream-sim/tests/failure_matrix_tests.rs::test_fm003_exchange_interruption_recovery",
         permanent_seeds: FM003_SEEDS,
-        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle"),
+        real_backend_test: None,
         real_backend_budget_secs: 20,
-        exemption_reason: None,
+        exemption_reason: Some("Real-backend evidence pending; removed copied-input chaos case was not proof. Issue #126 covers worker failure only"),
         absolute_slo_target: "Safe epoch abort / backoff retry, zero dropped frames, zero duplicates, freshness recovery <= 60s",
     },
     FailureMatrixCell {
@@ -212,9 +212,9 @@ pub const FAILURE_MATRIX_CELLS: &[FailureMatrixCell] = &[
         owning_version: "v0.58.1",
         deterministic_test: "crates/rockstream-sim/tests/failure_matrix_tests.rs::test_fm004_source_disconnect_offset_recovery",
         permanent_seeds: FM004_SEEDS,
-        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle"),
+        real_backend_test: None,
         real_backend_budget_secs: 30,
-        exemption_reason: None,
+        exemption_reason: Some("Real-backend evidence pending; removed copied-input chaos case was not proof. Issue #126 covers worker failure only"),
         absolute_slo_target: "Exact offset resume from persisted frontier, catchup <= 60s, zero dropped/duplicated records",
     },
     FailureMatrixCell {
@@ -227,9 +227,9 @@ pub const FAILURE_MATRIX_CELLS: &[FailureMatrixCell] = &[
         owning_version: "v0.58.1",
         deterministic_test: "crates/rockstream-sim/tests/failure_matrix_tests.rs::test_fm005_object_store_brownout_recovery",
         permanent_seeds: FM005_SEEDS,
-        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle"),
+        real_backend_test: None,
         real_backend_budget_secs: 45,
-        exemption_reason: None,
+        exemption_reason: Some("Real-backend evidence pending; removed copied-input chaos case was not proof. Issue #126 covers worker failure only"),
         absolute_slo_target: "Local buffer bounded by local_buffer_max_epochs (5), upstream backpressure engaged, zero loss, drain <= 60s",
     },
     FailureMatrixCell {
@@ -257,9 +257,9 @@ pub const FAILURE_MATRIX_CELLS: &[FailureMatrixCell] = &[
         owning_version: "v0.58.1",
         deterministic_test: "crates/rockstream-sim/tests/failure_matrix_tests.rs::test_fm007_checkpoint_interruption_recovery",
         permanent_seeds: FM007_SEEDS,
-        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle"),
+        real_backend_test: None,
         real_backend_budget_secs: 25,
-        exemption_reason: None,
+        exemption_reason: Some("Real-backend evidence pending; removed copied-input chaos case was not proof. Issue #126 covers worker failure only"),
         absolute_slo_target: "Partial checkpoint discarded atomically, restart recovers to prior durable checkpoint without gap",
     },
     FailureMatrixCell {
@@ -272,9 +272,9 @@ pub const FAILURE_MATRIX_CELLS: &[FailureMatrixCell] = &[
         owning_version: "v0.58.1",
         deterministic_test: "crates/rockstream-sim/tests/failure_matrix_tests.rs::test_fm008_sink_failure_commit_recovery",
         permanent_seeds: FM008_SEEDS,
-        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle"),
+        real_backend_test: None,
         real_backend_budget_secs: 30,
-        exemption_reason: None,
+        exemption_reason: Some("Real-backend evidence pending; removed copied-input chaos case was not proof. Issue #126 covers worker failure only"),
         absolute_slo_target: "Exactly-once external output, idempotent retry on restart, rollback of uncommitted staging",
     },
     FailureMatrixCell {
@@ -287,9 +287,9 @@ pub const FAILURE_MATRIX_CELLS: &[FailureMatrixCell] = &[
         owning_version: "v0.58.1",
         deterministic_test: "crates/rockstream-sim/tests/failure_matrix_tests.rs::test_fm009_shard_migration_interruption_recovery",
         permanent_seeds: FM009_SEEDS,
-        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle"),
+        real_backend_test: None,
         real_backend_budget_secs: 30,
-        exemption_reason: Some("Covered via multi-worker reassignment in real cluster and deterministic SimRuntime split tests"),
+        exemption_reason: Some("Real-backend evidence pending; removed copied-input chaos case was not proof. Issue #126 covers worker failure only"),
         absolute_slo_target: "Atomic rollback or completion, zero lost rows, zero duplicate keys",
     },
     FailureMatrixCell {
@@ -317,9 +317,9 @@ pub const FAILURE_MATRIX_CELLS: &[FailureMatrixCell] = &[
         owning_version: "v0.58.1",
         deterministic_test: "crates/rockstream-sim/tests/failure_matrix_tests.rs::test_fm011_resource_exhaustion_recovery",
         permanent_seeds: FM011_SEEDS,
-        real_backend_test: Some("crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle"),
+        real_backend_test: None,
         real_backend_budget_secs: 30,
-        exemption_reason: None,
+        exemption_reason: Some("Real-backend evidence pending; removed copied-input chaos case was not proof. Issue #126 covers worker failure only"),
         absolute_slo_target: "Backpressure or quota refusal with explicit RS-XXXX code, memory reclaimed upon load reduction, sustained throughput >= 2500 rows/s",
     },
 ];
@@ -344,6 +344,7 @@ pub fn all_cells() -> &'static [FailureMatrixCell] {
 pub fn total_real_backend_budget_secs() -> u64 {
     FAILURE_MATRIX_CELLS
         .iter()
+        .filter(|cell| cell.real_backend_test.is_some())
         .map(|c| c.real_backend_budget_secs)
         .sum()
 }
