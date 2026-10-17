@@ -5483,7 +5483,11 @@ impl GatewayHandler {
         None
     }
 
-    async fn handle_subscribe(&self, query: &str) -> PgWireResult<Vec<Response<'static>>> {
+    async fn handle_subscribe(
+        &self,
+        query: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
         let request = match parse_subscribe(query) {
             Ok(request) => request,
             Err(error) => {
@@ -5498,6 +5502,14 @@ impl GatewayHandler {
                 )))]);
             }
         };
+
+        // SUBSCRIBE is a producer read, not a mutation. Authorize the actor
+        // before looking up catalog columns, admitting a stream, or scanning a
+        // snapshot; the same SELECT Viewer/namespace rule must govern both
+        // current snapshots and replay from a committed epoch.
+        if let Some(denied) = self.select_access_error_response(&request.view_name, conn_id) {
+            return Ok(denied);
+        }
 
         let catalog_columns = self
             .catalog
@@ -5692,7 +5704,7 @@ impl GatewayHandler {
         }
 
         if ql == "subscribe" || ql.starts_with("subscribe ") {
-            return self.handle_subscribe(q).await;
+            return self.handle_subscribe(q, conn_id).await;
         }
 
         // ── Aborted-transaction guard ────────────────────────────────────────────
