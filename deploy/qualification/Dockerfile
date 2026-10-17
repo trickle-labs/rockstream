@@ -11,7 +11,9 @@ COPY contracts/ contracts/
 COPY docs/testing/ docs/testing/
 ARG SOURCE_REVISION
 ENV ROCKSTREAM_QUALIFICATION_REVISION=${SOURCE_REVISION} CARGO_PROFILE_DEV_DEBUG=0 CARGO_BUILD_JOBS=2
+# Refresh archived source mtimes before reusing a target cache from another revision.
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/src/rockstream/target \
+    find crates formal contracts docs/testing -type f -exec touch {} + && \
     cargo build --locked -p rockstream-sim --features simulation,docker_tests --example upgrade_worker && \
     cp target/debug/examples/upgrade_worker /upgrade-worker
 
