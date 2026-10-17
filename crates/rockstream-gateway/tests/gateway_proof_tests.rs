@@ -383,7 +383,6 @@ async fn v072_conditional_alter_workload_conflict_and_restart_revision() {
 
     handle.abort();
     drop(client);
-    drop(server);
     drop(catalog);
     drop(workload_catalog);
     drop(db);
