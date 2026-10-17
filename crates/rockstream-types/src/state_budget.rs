@@ -140,7 +140,10 @@ impl WorkloadBudget {
             let proposed = current
                 .checked_add(bytes)
                 .ok_or_else(|| quota_overflow_error("workload-memory", current, bytes))?;
-            if self.max_bytes > 0 && proposed > self.max_bytes {
+            // WorkloadDef::memory_limit=None means unbounded. Some(0) is a
+            // real hard limit, not an unlimited sentinel: only a zero-byte
+            // reservation may be admitted at zero capacity.
+            if proposed > self.max_bytes {
                 return Err(StateBudgetError {
                     operator_name: format!("workload-{}", self.workload_id.0),
                     max_bytes: self.max_bytes,
