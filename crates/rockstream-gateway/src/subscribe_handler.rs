@@ -161,6 +161,35 @@ impl SubscribeRegistry {
         logs.get(table_name).and_then(|log| log.earliest_epoch())
     }
 
+    /// Validate an explicit replay token atomically against retained history.
+    /// No in-memory entries after a gateway restart, process loss, or rejected
+    /// complete epoch are proof of an empty change stream. Such clients must
+    /// resnapshot rather than silently starting a live-only tail.
+    pub fn check_replay_start(
+        &self,
+        table_name: &str,
+        requested: u64,
+    ) -> Result<(), SubscribeError> {
+        let logs = self.logs.lock().unwrap();
+        let Some(log) = logs.get(table_name) else {
+            return Err(SubscribeError::ReplayUnavailable { requested });
+        };
+        if let Some(earliest) = log.earliest_epoch() {
+            if requested < earliest {
+                return Err(SubscribeError::EpochBeforeRetention {
+                    requested,
+                    earliest,
+                });
+            }
+        }
+        if log.entry_count() == 0
+            || log.latest_epoch().is_none_or(|latest| requested > latest)
+        {
+            return Err(SubscribeError::ReplayUnavailable { requested });
+        }
+        Ok(())
+    }
+
     /// Returns the latest epoch in the log, or `None`.
     pub fn latest_epoch(&self, table_name: &str) -> Option<u64> {
         let logs = self.logs.lock().unwrap();
@@ -194,6 +223,9 @@ pub enum SubscribeError {
     EpochBeforeRetention { requested: u64, earliest: u64 },
     /// RS-2020: consumer too slow — fell behind the retention window after start.
     ConsumerTooSlow,
+    /// RS-2006: no independently qualified durable replay exists after a
+    /// restart, missing log, or invalidated in-memory complete epoch.
+    ReplayUnavailable { requested: u64 },
     /// A complete snapshot or committed epoch exceeds a configured producer bound.
     LimitExceeded {
         resource: &'static str,
@@ -221,6 +253,11 @@ impl std::fmt::Display for SubscribeError {
                 "[RS-2020] subscribe.consumer_too_slow: \
                  subscriber backlog exceeded SUBSCRIBE_BACKLOG_MAX. \
                  next_steps: Reconnect with AS OF NOW WITH SNAPSHOT."
+            ),
+            Self::ReplayUnavailable { requested } => write!(
+                f,
+                "[RS-2006] history.replay_unavailable: requested epoch {requested} has no complete retained replay. \
+                 next_steps: Reconnect with AS OF NOW WITH SNAPSHOT; durable replay has not been qualified."
             ),
             Self::LimitExceeded {
                 resource,
@@ -360,7 +397,7 @@ impl SubscriberHandle {
         }
 
         // Check consumer-too-slow bound.
-        if backlog as usize > SUBSCRIBE_BACKLOG_MAX {
+        if backlog > SUBSCRIBE_BACKLOG_MAX as u64 {
             return Err(SubscribeError::ConsumerTooSlow);
         }
 
@@ -422,15 +459,9 @@ pub fn start_from_epoch(
 ) -> Result<SubscriberHandle, SubscribeError> {
     let table_name = req.view_name.clone();
 
-    // Check retention.
-    if let Some(earliest) = registry.earliest_epoch(&table_name) {
-        if start_epoch < earliest {
-            return Err(SubscribeError::EpochBeforeRetention {
-                requested: start_epoch,
-                earliest,
-            });
-        }
-    }
+    // Fail closed if this gateway never observed the requested committed
+    // epoch, including after a restart or complete-epoch buffer reset.
+    registry.check_replay_start(&table_name, start_epoch)?;
     // Replay: start at one epoch before start_epoch so that poll() includes start_epoch.
     let replay_from = start_epoch.saturating_sub(1);
     Ok(SubscriberHandle::new(
@@ -466,58 +497,30 @@ where
 {
     let col_names_ref: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
 
-    let start_epoch = match &req.start {
+    let mut handle = match &req.start {
         SubscribeStart::NowWithSnapshot => {
-            // Deliver snapshot.
-            for row in deliver_snapshot(snapshot_rows, current_epoch, req, &col_names_ref) {
+            // Validate the complete snapshot *before* sending any callback.
+            let rows = deliver_snapshot_checked(snapshot_rows, current_epoch, req, &col_names_ref)?;
+            for row in rows {
                 on_row(row);
             }
-            current_epoch
+            SubscriberHandle::new(req.view_name.clone(), current_epoch, req.clone(), col_names)
         }
-        SubscribeStart::Epoch(e) => {
-            // Validate and set up replay.
-            if let Some(earliest) = registry.earliest_epoch(&req.view_name) {
-                if *e < earliest {
-                    return Err(SubscribeError::EpochBeforeRetention {
-                        requested: *e,
-                        earliest,
-                    });
-                }
+        SubscribeStart::Epoch(epoch) => {
+            // Use the same atomic replay-floor, backlog and per-epoch limits
+            // as the PgWire producer. Iterating registry entries directly
+            // here previously emitted partial results before discovering a
+            // too-slow consumer, and bypassed backlog accounting entirely.
+            let mut handle = start_from_epoch(registry, req, *epoch, col_names)?;
+            let rows = handle.poll(registry)?;
+            for row in rows {
+                on_row(row);
             }
-            // Replay entries from log.
-            let (floor, replay) = registry.snapshot_since_epoch(&req.view_name, *e);
-            if floor.is_some_and(|floor| *e < floor) {
-                return Err(SubscribeError::ConsumerTooSlow);
-            }
-            let mut last = e.saturating_sub(1);
-            for entry in &replay {
-                if !passes_where(
-                    &entry.encoded_row,
-                    req.where_clause.as_deref(),
-                    &col_names_ref,
-                ) {
-                    last = entry.epoch;
-                    continue;
-                }
-                let projected = apply_projection(
-                    &entry.encoded_row,
-                    req.projection.as_deref(),
-                    &col_names_ref,
-                );
-                on_row(SubscribeRow {
-                    mz_timestamp: entry.epoch,
-                    mz_diff: entry.mz_diff,
-                    encoded_row: projected,
-                });
-                last = entry.epoch;
-            }
-            last
+            handle
         }
     };
 
-    // Live-tail loop.
-    let mut handle =
-        SubscriberHandle::new(req.view_name.clone(), start_epoch, req.clone(), col_names);
+    // Live-tail loop: keep the exact handle advanced by the replay poll.
     loop {
         if stop() {
             break;

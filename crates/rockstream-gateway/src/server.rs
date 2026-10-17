@@ -107,6 +107,7 @@ use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::subscribe_handler::{
     deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
+    SUBSCRIBE_SNAPSHOT_MAX_ROWS,
 };
 use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -5483,7 +5484,11 @@ impl GatewayHandler {
         None
     }
 
-    async fn handle_subscribe(&self, query: &str) -> PgWireResult<Vec<Response<'static>>> {
+    async fn handle_subscribe(
+        &self,
+        query: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
         let request = match parse_subscribe(query) {
             Ok(request) => request,
             Err(error) => {
@@ -5498,6 +5503,14 @@ impl GatewayHandler {
                 )))]);
             }
         };
+
+        // SUBSCRIBE is a read operation, not a privileged escape hatch.
+        // Apply the same authoritative ACL and namespace gate as SELECT
+        // before exposing retention metadata, scanning state or reserving a
+        // live-stream slot.
+        if let Some(denied) = self.select_access_error_response(&request.view_name, conn_id) {
+            return Ok(denied);
+        }
 
         let catalog_columns = self
             .catalog
@@ -5551,9 +5564,16 @@ impl GatewayHandler {
         let mut pending = std::collections::VecDeque::new();
         let handle = match &request.start {
             SubscribeStart::NowWithSnapshot => {
+                // Read at most one row beyond the frozen snapshot ceiling.
+                // The extra row is an overflow witness; do not eagerly scan
+                // an unbounded keyspace before applying snapshot admission.
                 let snapshot = self
                     .view_reader
-                    .read_view(&request.view_name, None, ViewReadStrategy::HotOnly)
+                    .read_view(
+                        &request.view_name,
+                        Some(SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1),
+                        ViewReadStrategy::HotOnly,
+                    )
                     .await
                     .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
                 let snapshot = snapshot
@@ -5691,10 +5711,6 @@ impl GatewayHandler {
             return Ok(response);
         }
 
-        if ql == "subscribe" || ql.starts_with("subscribe ") {
-            return self.handle_subscribe(q).await;
-        }
-
         // ── Aborted-transaction guard ────────────────────────────────────────────
         // Any command inside a failed block is bounced with SQLSTATE 25P02, except
         // ROLLBACK (which exits the failed block) and ROLLBACK TO <name> (which
@@ -5722,6 +5738,10 @@ impl GatewayHandler {
             if ql.starts_with("mark index ") {
                 return self.handle_mark_index_ready(q).await;
             }
+        }
+
+        if ql == "subscribe" || ql.starts_with("subscribe ") {
+            return self.handle_subscribe(q, conn_id).await;
         }
 
         // ── BEGIN — with idempotency (already in transaction → silent succeed) ──
@@ -20065,4 +20085,145 @@ mod catalog_array_parameter_tests {
         };
         assert_eq!(types, vec![Type::INT4_ARRAY]);
     }
+}
+
+#[cfg(test)]
+mod v072_subscription_producer_bounds_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BoundedSnapshotReader {
+        seen_limit: AtomicUsize,
+        rows_available: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ViewReader for BoundedSnapshotReader {
+        async fn read_view(
+            &self,
+            _view_name: &str,
+            limit: Option<usize>,
+            _strategy: ViewReadStrategy,
+        ) -> Result<Vec<Vec<u8>>, GatewayError> {
+            self.seen_limit
+                .store(limit.unwrap_or(usize::MAX), Ordering::SeqCst);
+            let count = self.rows_available.min(limit.unwrap_or(usize::MAX));
+            Ok(vec![b"value".to_vec(); count])
+        }
+
+        fn published_frontier(&self) -> Option<u64> {
+            Some(4)
+        }
+    }
+
+    async fn check_snapshot(rows_available: usize) -> (usize, bool) {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_snapshot".to_owned(),
+            sql: "SELECT value FROM base".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        let response = handler
+            .handle_subscribe("SUBSCRIBE v072_snapshot AS OF NOW WITH SNAPSHOT", None)
+            .await
+            .unwrap();
+        let limit = reader.seen_limit.load(Ordering::SeqCst);
+        let rejected = matches!(response.as_slice(), [Response::Error(_)]);
+        (limit, rejected)
+    }
+
+    #[tokio::test]
+    async fn snapshot_reader_receives_one_row_overflow_probe() {
+        let (limit, rejected) = check_snapshot(1).await;
+        assert_eq!(limit, SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1);
+        assert!(!rejected);
+    }
+
+    #[tokio::test]
+    async fn oversized_producer_snapshot_fails_before_stream_formation() {
+        let (limit, rejected) = check_snapshot(SUBSCRIBE_SNAPSHOT_MAX_ROWS + 50).await;
+        assert_eq!(limit, SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1);
+        assert!(rejected);
+    }
+    #[tokio::test]
+    async fn unauthorized_subscriber_cannot_scan_or_reserve_a_live_stream() {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_private".to_owned(),
+            sql: "SELECT value FROM source".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available: 1,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        {
+            let mut session = handler.sessions.entry("viewer".to_owned()).or_default();
+            session.principal = Principal::Jwt {
+                sub: "ungranted-viewer".to_owned(),
+            };
+        }
+        let denied = handler
+            .handle_subscribe(
+                "SUBSCRIBE v072_private AS OF NOW WITH SNAPSHOT",
+                Some("viewer"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(denied.as_slice(), [Response::Error(_)]));
+        assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.subscribe_registry.active_streams(), 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_cannot_escape_failed_explicit_transaction() {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_private".to_owned(),
+            sql: "SELECT value FROM source".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available: 1,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        {
+            let mut session = handler.sessions.entry("aborted".to_owned()).or_default();
+            session.begin_explicit();
+            session.fail_transaction();
+        }
+        let denied = handler
+            .dispatch_async_with_conn(
+                "SUBSCRIBE v072_private AS OF NOW WITH SNAPSHOT",
+                Some("aborted"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(denied.as_slice(), [Response::Error(_)]));
+        assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.subscribe_registry.active_streams(), 0);
+    }
+
 }
