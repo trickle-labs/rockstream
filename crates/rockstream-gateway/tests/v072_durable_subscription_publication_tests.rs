@@ -171,3 +171,155 @@ async fn concurrent_commits_publish_only_whole_ordered_epochs() {
     );
     task.abort();
 }
+
+#[derive(Debug)]
+struct RejectCompactedStore {
+    inner: InMemory,
+    reject_compacted: std::sync::atomic::AtomicBool,
+    rejected_writes: std::sync::atomic::AtomicUsize,
+}
+
+impl std::fmt::Display for RejectCompactedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RejectCompactedStore")
+    }
+}
+
+impl RejectCompactedStore {
+    fn reject(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+        if self
+            .reject_compacted
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && location.as_ref().contains("/compacted/")
+        {
+            self.rejected_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "RejectCompactedStore",
+                source: "injected committed-SST failure".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for RejectCompactedStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        bytes: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.reject(location)?;
+        self.inner.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.reject(location)?;
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, opts).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+#[tokio::test]
+async fn failed_storage_flush_cannot_publish_subscription_epoch() {
+    let store = Arc::new(RejectCompactedStore {
+        inner: InMemory::new(),
+        reject_compacted: std::sync::atomic::AtomicBool::new(false),
+        rejected_writes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let shard = Arc::new(
+        ShardDb::builder("v072-durable-publication-failed-flush", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(EmptyViewReader),
+        shard,
+    );
+    let registry = server.handler().subscribe_registry().clone();
+    let (address, task) = server.serve_background().await.unwrap();
+    let client = open_client(address.port()).await;
+    client
+        .simple_query("CREATE TABLE v072_failed_flush (id BIGINT)")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN").await.unwrap();
+    client
+        .simple_query("INSERT INTO v072_failed_flush (id) VALUES (7)")
+        .await
+        .unwrap();
+    store
+        .reject_compacted
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.simple_query("COMMIT"),
+    )
+    .await
+    .expect("flush should return the injected error without an unbounded stall");
+    assert!(outcome.is_err(), "a rejected durable flush must not acknowledge COMMIT");
+    assert!(
+        store
+            .rejected_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the test must actually inject failure in a committed SST write"
+    );
+    assert_eq!(registry.latest_epoch("v072_failed_flush"), None);
+    assert_eq!(registry.since_epoch("v072_failed_flush", 0), None);
+    task.abort();
+}
