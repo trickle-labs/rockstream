@@ -6587,6 +6587,29 @@ impl GatewayHandler {
                 self.catalog.view_resource_usage(&[]),
             )]);
         }
+        if ql.starts_with("show workload revision for ") {
+            let workload_name = q["show workload revision for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            let Some(workload) = self.catalog.get_workload(workload_name) else {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-1005] workload.not_found: workload '{}' does not exist.",
+                        workload_name
+                    ),
+                ))))]);
+            };
+            return Ok(vec![catalog_resp_to_response(CatalogResponse::Rows {
+                columns: vec!["workload_name".to_owned(), "requested_revision".to_owned()],
+                rows: vec![vec![
+                    Some(workload.name),
+                    Some(workload.revision.to_string()),
+                ]],
+            })]);
+        }
         if ql.trim_end_matches(';') == "show workload status" {
             return Ok(vec![catalog_resp_to_response(
                 self.catalog.workload_status(),
