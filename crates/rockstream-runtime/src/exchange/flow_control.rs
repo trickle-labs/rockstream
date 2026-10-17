@@ -642,3 +642,84 @@ impl FlowController {
         }
     }
 }
+
+#[cfg(test)]
+mod v072_credit_fastpath_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn ack() -> ShuffleAck {
+        ShuffleAck {
+            exchange_id: 7,
+            src_shard: 1,
+            target_shard: 2,
+            epoch: 0,
+            seq: 0,
+            credit_grant: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn v072_immediate_credits_never_allocate_waiter_state() {
+        let controller = FlowController::with_row_budget(2);
+        assert_eq!(controller.notifiers.lock().len(), 0);
+        controller.acquire_credit(7, 1, 2, 1).await.unwrap();
+        assert_eq!(controller.notifiers.lock().len(), 0);
+        assert_eq!(controller.get_credits(7, 1, 2), 1);
+        assert_eq!(controller.rows_in_flight(7, 1, 2), 1);
+        controller.acquire_credit(7, 1, 2, 1).await.unwrap();
+        assert_eq!(controller.notifiers.lock().len(), 0);
+        assert_eq!(controller.get_credits(7, 1, 2), 0);
+        assert_eq!(controller.rows_in_flight(7, 1, 2), 2);
+        controller.handle_ack(&ack());
+        assert_eq!(controller.get_credits(7, 1, 2), 1);
+        assert_eq!(controller.rows_in_flight(7, 1, 2), 1);
+        controller.release_credit(7, 1, 2, 1);
+        assert_eq!(controller.get_credits(7, 1, 2), 2);
+        assert_eq!(controller.rows_in_flight(7, 1, 2), 0);
+        assert_eq!(controller.notifiers.lock().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn v072_waiter_notifier_creation_does_not_lose_racing_ack() {
+        let controller = FlowController::with_row_budget(1);
+        controller.acquire_credit(7, 1, 2, 1).await.unwrap();
+        let waiting = controller.clone();
+        let task = tokio::spawn(async move { waiting.acquire_credit(7, 1, 2, 1).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controller.notifiers.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        controller.handle_ack(&ack());
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(controller.get_credits(7, 1, 2), 0);
+        assert_eq!(controller.rows_in_flight(7, 1, 2), 1);
+        controller.handle_ack(&ack());
+        assert_eq!(controller.get_credits(7, 1, 2), 1);
+        assert_eq!(controller.rows_in_flight(7, 1, 2), 0);
+    }
+
+    #[tokio::test]
+    async fn v072_oversized_request_rejected_without_allocating_any_state() {
+        let controller = FlowController::with_row_budget(1);
+        let error = controller.acquire_credit(7, 1, 2, 2).await.unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "[{RS_3024}] shuffle frame carries 2 rows but worker.max_rows_per_quantum only permits 1. Next steps: reduce exchange batch size/rechunking or raise worker.max_rows_per_quantum."
+            )
+        );
+        assert_eq!(controller.notifiers.lock().len(), 0);
+        assert_eq!(controller.channels.lock().len(), 0);
+        assert_eq!(controller.get_credits(7, 1, 2), 1);
+        assert_eq!(controller.rows_in_flight(7, 1, 2), 0);
+    }
+}
