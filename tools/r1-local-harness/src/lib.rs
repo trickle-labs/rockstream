@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod cluster;
+pub mod comparisons;
 pub mod corpus;
 pub mod evidence;
 pub mod load;
