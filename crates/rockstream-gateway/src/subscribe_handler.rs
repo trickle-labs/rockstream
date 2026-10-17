@@ -499,8 +499,10 @@ where
 
     let start_epoch = match &req.start {
         SubscribeStart::NowWithSnapshot => {
-            // Deliver snapshot.
-            for row in deliver_snapshot(snapshot_rows, current_epoch, req, &col_names_ref) {
+            // Check the *entire* snapshot before invoking any callback.
+            // Otherwise this public helper silently bypasses the same producer
+            // row/encoded-byte ceilings enforced by the PgWire subscription path.
+            for row in deliver_snapshot_checked(snapshot_rows, current_epoch, req, &col_names_ref)? {
                 on_row(row);
             }
             current_epoch
