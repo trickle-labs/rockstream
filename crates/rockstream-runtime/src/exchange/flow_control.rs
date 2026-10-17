@@ -779,4 +779,80 @@ mod v072_credit_fastpath_tests {
         assert_eq!(controller.get_credits(7, 1, 2), 1);
         assert_eq!(controller.rows_in_flight(7, 1, 2), 0);
     }
+
+    #[tokio::test]
+    async fn v072_row_credit_waiters_are_bounded_and_task_abort_frees_slots() {
+        let controller = FlowController::with_row_budget(1).with_max_pending_requests(1);
+        controller.acquire_credit(7, 1, 2, 1).await.unwrap();
+        let waiting = controller.clone();
+        let task = tokio::spawn(async move { waiting.acquire_credit(7, 1, 2, 1).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controller.exchange_waiters() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(controller.exchange_waiters(), 1);
+
+        let err = controller.acquire_credit(7, 1, 2, 1).await.unwrap_err();
+        assert!(err.contains("RESOURCE_EXHAUSTED: max_exchange_waiters (1)"));
+        assert_eq!(controller.exchange_waiters(), 1);
+
+        task.abort();
+        let _ = task.await;
+        assert_eq!(controller.exchange_waiters(), 0);
+        controller.release_credit(7, 1, 2, 1);
+        assert_eq!(controller.get_credits(7, 1, 2), 1);
+        assert_eq!(controller.rows_in_flight(7, 1, 2), 0);
+    }
+
+    #[tokio::test]
+    async fn v072_batch_waiters_are_bounded_and_cancellation_safe() {
+        let controller = FlowController::with_row_budget(1).with_max_pending_requests(1);
+        let permit = controller.try_acquire_batch_permit(7, 1, 2, 32, 1).unwrap();
+        let waiting = controller.clone();
+        let task = tokio::spawn(async move {
+            waiting.acquire_batch_permit(7, 1, 2, 32, 1).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controller.exchange_waiters() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(controller.exchange_waiters(), 1);
+        assert_eq!(controller.pending_requests(), 1);
+
+        let err = controller
+            .acquire_batch_permit(7, 1, 2, 32, 1)
+            .await
+            .unwrap_err();
+        assert!(err.contains("RESOURCE_EXHAUSTED: max_exchange_waiters (1)"));
+        assert_eq!(controller.exchange_waiters(), 1);
+
+        task.abort();
+        let _ = task.await;
+        assert_eq!(controller.exchange_waiters(), 0);
+        drop(permit);
+        assert_eq!(controller.pending_requests(), 0);
+        let next = controller.acquire_batch_permit(7, 1, 2, 32, 1).await.unwrap();
+        assert_eq!(controller.exchange_waiters(), 0);
+        drop(next);
+        assert_eq!(controller.pending_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn v072_uncontended_credit_paths_never_allocate_waiter_slots() {
+        let controller = FlowController::with_row_budget(2).with_max_pending_requests(1);
+        controller.acquire_credit(7, 1, 2, 1).await.unwrap();
+        assert_eq!(controller.exchange_waiters(), 0);
+        controller.release_credit(7, 1, 2, 1);
+
+        let permit = controller.try_acquire_batch_permit(7, 1, 2, 16, 1).unwrap();
+        assert_eq!(controller.exchange_waiters(), 0);
+        drop(permit);
+        assert_eq!(controller.exchange_waiters(), 0);
+    }
 }
