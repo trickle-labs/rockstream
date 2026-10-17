@@ -168,9 +168,7 @@ impl BackfillAdmissionController {
         }
 
         let mut reserved = self.reserved_bytes.lock().unwrap();
-        if requested_bytes > capacity_bytes
-            || reserved.saturating_add(requested_bytes) > capacity_bytes
-        {
+        if *reserved > capacity_bytes || requested_bytes > capacity_bytes - *reserved {
             return BackfillAdmissionDecision::Reject {
                 code: "RS-4021",
                 reason: format!(
@@ -592,6 +590,32 @@ mod tests {
         );
         assert_eq!(catalog.view_state("running_view"), ViewState::Running);
         assert_eq!(admission.reserved_bytes(), 900);
+    }
+
+    #[test]
+    fn v072_backfill_reservations_cannot_overcommit_at_u64_max() {
+        let controller = BackfillAdmissionController::default();
+        assert_eq!(
+            controller.reserve(1, u64::MAX),
+            BackfillAdmissionDecision::Admit
+        );
+        assert!(matches!(
+            controller.reserve(u64::MAX, u64::MAX),
+            BackfillAdmissionDecision::Reject {
+                code: "RS-4021",
+                ..
+            }
+        ));
+        assert_eq!(controller.reserved_bytes(), 1);
+        controller.release(1);
+        assert_eq!(controller.reserved_bytes(), 0);
+        assert!(matches!(
+            controller.reserve(1, 0),
+            BackfillAdmissionDecision::Reject {
+                code: "RS-4021",
+                ..
+            }
+        ));
     }
 
     #[test]
