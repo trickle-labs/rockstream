@@ -105,9 +105,9 @@ impl SourcePressureController {
         let recovery_threshold = u128::from(soft) * 75 / 80;
         let new_state = if self.ledger.total_budget_bytes() == 0 || gross >= u128::from(hard) {
             SourcePressureState::Paused
-        } else if gross >= u128::from(soft) {
-            SourcePressureState::Throttled
-        } else if gross >= recovery_threshold && prev != SourcePressureState::Normal as u8 {
+        } else if gross >= u128::from(soft)
+            || (gross >= recovery_threshold && prev != SourcePressureState::Normal as u8)
+        {
             SourcePressureState::Throttled
         } else {
             SourcePressureState::Normal
