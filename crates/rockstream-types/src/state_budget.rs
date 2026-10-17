@@ -214,11 +214,7 @@ impl WorkloadBudget {
 
 /// Atomically account restored state even when it exceeds the active soft or
 /// hard policy. Recovery must never make usage counters wrap to zero.
-fn checked_force_add(
-    counter: &AtomicU64,
-    bytes: u64,
-    label: &str,
-) -> Result<(), StateBudgetError> {
+fn checked_force_add(counter: &AtomicU64, bytes: u64, label: &str) -> Result<(), StateBudgetError> {
     loop {
         let current = counter.load(Ordering::Relaxed);
         let next = current
