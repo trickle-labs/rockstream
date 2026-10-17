@@ -182,9 +182,7 @@ impl SubscribeRegistry {
                 });
             }
         }
-        if log.entry_count() == 0
-            || log.latest_epoch().is_none_or(|latest| requested > latest)
-        {
+        if log.entry_count() == 0 || log.latest_epoch().is_none_or(|latest| requested > latest) {
             return Err(SubscribeError::ReplayUnavailable { requested });
         }
         Ok(())
