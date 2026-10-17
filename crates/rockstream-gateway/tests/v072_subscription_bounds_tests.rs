@@ -336,6 +336,41 @@ async fn v072_async_replay_checks_backlog_before_emitting_any_row() {
 }
 
 #[tokio::test]
+async fn v072_projected_replay_exceeding_complete_epoch_bytes_emits_nothing() {
+    let registry = SubscribeRegistry::new();
+    // This committed row fits the raw 8 MiB epoch limit. Repeating the same
+    // selected column in the projection would amplify it beyond the output
+    // byte limit; row callbacks must see zero partial results.
+    let raw = "x".repeat(5 * 1024 * 1024);
+    registry
+        .push_epoch("v", vec![row(7, "k", 1, &raw)])
+        .unwrap();
+    let mut request = parse_subscribe("SUBSCRIBE v AS OF EPOCH 7").unwrap();
+    request.projection = Some(vec!["payload".to_owned(), "payload".to_owned()]);
+    let mut observed = Vec::new();
+    let actual = run_subscribe(
+        &request,
+        vec![],
+        7,
+        &registry,
+        vec!["payload".to_owned()],
+        |entry| observed.push(entry),
+        || true,
+    )
+    .await;
+    assert_eq!(
+        actual,
+        Err(SubscribeError::LimitExceeded {
+            resource: "epoch_bytes",
+            current: (10 * 1024 * 1024 + 1) as u64,
+            limit: CHANGE_LOG_MAX_EPOCH_BYTES as u64,
+        })
+    );
+    assert!(observed.is_empty());
+    assert_eq!(registry.entry_count("v"), 1);
+}
+
+#[tokio::test]
 async fn v072_async_replay_preserves_exact_signed_rows_once() {
     let registry = SubscribeRegistry::new();
     registry
