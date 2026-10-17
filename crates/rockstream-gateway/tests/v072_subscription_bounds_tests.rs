@@ -284,6 +284,36 @@ async fn v072_async_replay_rejects_before_emitting_any_row() {
     assert_eq!(output, Vec::<(u64, i8, Bytes)>::new());
 }
 
+#[tokio::test]
+async fn v072_async_snapshot_bound_rejects_before_any_row_callback() {
+    let registry = SubscribeRegistry::new();
+    let request = parse_subscribe("SUBSCRIBE v AS OF NOW WITH SNAPSHOT").unwrap();
+    let rows = vec![
+        (Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1
+    ];
+    let mut observed = Vec::new();
+    let actual = run_subscribe(
+        &request,
+        rows,
+        5,
+        &registry,
+        vec![],
+        |row| observed.push((row.mz_timestamp, row.mz_diff, row.encoded_row)),
+        || true,
+    )
+    .await;
+    assert_eq!(
+        actual,
+        Err(SubscribeError::LimitExceeded {
+            resource: "snapshot_rows",
+            current: 10001,
+            limit: 10000,
+        })
+    );
+    assert_eq!(observed, Vec::<(u64, i8, Bytes)>::new());
+}
+
 #[test]
 fn oversized_snapshot_returns_no_partial_output() {
     let request = parse_subscribe("SUBSCRIBE v").unwrap();
