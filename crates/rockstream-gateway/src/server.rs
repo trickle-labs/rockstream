@@ -5703,10 +5703,6 @@ impl GatewayHandler {
             return Ok(response);
         }
 
-        if ql == "subscribe" || ql.starts_with("subscribe ") {
-            return self.handle_subscribe(q, conn_id).await;
-        }
-
         // ── Aborted-transaction guard ────────────────────────────────────────────
         // Any command inside a failed block is bounced with SQLSTATE 25P02, except
         // ROLLBACK (which exits the failed block) and ROLLBACK TO <name> (which
@@ -5734,6 +5730,12 @@ impl GatewayHandler {
             if ql.starts_with("mark index ") {
                 return self.handle_mark_index_ready(q).await;
             }
+        }
+
+        // SUBSCRIBE cannot bypass the same failed-transaction guard that
+        // applies to ordinary SELECT reads.
+        if ql == "subscribe" || ql.starts_with("subscribe ") {
+            return self.handle_subscribe(q, conn_id).await;
         }
 
         // ── BEGIN — with idempotency (already in transaction → silent succeed) ──
