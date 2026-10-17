@@ -248,18 +248,33 @@ impl AdmissionController {
         global_capacity_bytes: u64,
         audit_log: Option<&FileAuditLog>,
     ) -> AdmissionDecision {
+        let reject = || {
+            if let Some(log) = audit_log {
+                let _ = log.append(&AuditEvent::now(
+                    "system",
+                    "admission_control.rejected",
+                    requesting_workload,
+                ));
+            }
+            AdmissionDecision::Reject
+        };
         let Some(requester) = catalog.get_workload(requesting_workload) else {
-            // Unknown workload: no priority to arbitrate against, admit.
-            return AdmissionDecision::Admit;
+            // Unknown identities cannot bypass the cluster hard bound or its
+            // priority arbitration. An unregistered workload has no claim on
+            // reserved maintenance, read, or control resources.
+            return reject();
         };
 
-        let mut utilization = cluster_utilization(catalog);
-        if utilization.saturating_add(requested_bytes) <= global_capacity_bytes {
+        let utilization = cluster_utilization(catalog);
+        if fits_capacity(utilization, requested_bytes, global_capacity_bytes) {
             return AdmissionDecision::Admit;
         }
 
-        // Lower-priority workloads (strictly greater WorkloadPriority value
-        // than the requester), lowest-priority first.
+        // Plan the entire preemption before pausing anything. The old loop
+        // paused lower-priority views *while* it searched, and could still
+        // reject a request after stranding those unrelated views as Paused.
+        // These are accountancy estimates, not proof that physical RSS fell.
+        let mut projected_utilization = utilization;
         let mut contenders: Vec<_> = catalog
             .list_workloads()
             .into_iter()
@@ -269,44 +284,49 @@ impl AdmissionController {
             .collect();
         contenders.sort_by_key(|c| std::cmp::Reverse(c.priority));
 
-        let mut paused_views = Vec::new();
-        'outer: for contender in &contenders {
+        let mut proposed_pauses = Vec::new();
+        'plan: for contender in &contenders {
             for view_name in catalog.views_for_workload(&contender.name) {
-                if utilization.saturating_add(requested_bytes) <= global_capacity_bytes {
-                    break 'outer;
+                if fits_capacity(
+                    projected_utilization,
+                    requested_bytes,
+                    global_capacity_bytes,
+                ) {
+                    break 'plan;
                 }
                 if catalog.view_state(&view_name) != ViewState::Running {
                     continue;
                 }
-                let freed = read_pipeline_state_bytes(&view_name).unwrap_or(0);
-                catalog.set_view_state(&view_name, ViewState::Paused);
-                utilization = utilization.saturating_sub(freed);
-                if let Some(log) = audit_log {
-                    let _ = log.append(&AuditEvent::now(
-                        "system",
-                        "admission_control.paused",
-                        &view_name,
-                    ));
+                let estimated_freed = read_pipeline_state_bytes(&view_name).unwrap_or(0);
+                if estimated_freed == 0 {
+                    continue;
                 }
-                paused_views.push(view_name);
+                projected_utilization = projected_utilization.saturating_sub(estimated_freed);
+                proposed_pauses.push(view_name);
             }
         }
 
-        if utilization.saturating_add(requested_bytes) <= global_capacity_bytes {
-            if paused_views.is_empty() {
-                AdmissionDecision::Admit
-            } else {
-                AdmissionDecision::AdmitAfterPausing { paused_views }
-            }
-        } else {
+        if !fits_capacity(
+            projected_utilization,
+            requested_bytes,
+            global_capacity_bytes,
+        ) {
+            // A rejected admission has no collateral state transitions.
+            return reject();
+        }
+
+        for view_name in &proposed_pauses {
+            catalog.set_view_state(view_name, ViewState::Paused);
             if let Some(log) = audit_log {
                 let _ = log.append(&AuditEvent::now(
                     "system",
-                    "admission_control.rejected",
-                    requesting_workload,
+                    "admission_control.paused",
+                    view_name,
                 ));
             }
-            AdmissionDecision::Reject
+        }
+        AdmissionDecision::AdmitAfterPausing {
+            paused_views: proposed_pauses,
         }
     }
 
@@ -335,6 +355,11 @@ impl AdmissionController {
     }
 }
 
+/// Reject overflow rather than treating `u64::MAX` saturation as free capacity.
+fn fits_capacity(used: u64, requested: u64, capacity: u64) -> bool {
+    used <= capacity && requested <= capacity - used
+}
+
 /// Sum of `read_pipeline_state_bytes` across every view in the catalog that
 /// is not currently `Paused`. Paused views contribute zero demand.
 fn cluster_utilization(catalog: &CatalogStubs) -> u64 {
@@ -343,7 +368,7 @@ fn cluster_utilization(catalog: &CatalogStubs) -> u64 {
         .into_iter()
         .filter(|view| catalog.view_state(&view.name) != ViewState::Paused)
         .map(|view| read_pipeline_state_bytes(&view.name).unwrap_or(0))
-        .sum()
+        .fold(0u64, u64::saturating_add)
 }
 
 #[cfg(test)]
@@ -429,6 +454,86 @@ mod tests {
             .map(|event| event.action)
             .collect();
         assert!(actions.contains(&"admission_control.rejected".to_string()));
+    }
+
+    #[test]
+    fn v072_rejected_preemption_never_pauses_unrelated_views() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        let tmp = NamedTempFile::new().unwrap();
+        let log = FileAuditLog::open(tmp.path()).unwrap();
+        let catalog = CatalogStubs::new();
+        catalog.add_workload(WorkloadDef::new("interactive").with_priority(WorkloadPriority::HIGH));
+        catalog.add_workload(WorkloadDef::new("batch").with_priority(WorkloadPriority::LOW));
+        catalog.add_workload(WorkloadDef::new("peer").with_priority(WorkloadPriority::HIGH));
+        add_workload_view(&catalog, "batch", "batch_view", 200);
+        add_workload_view(&catalog, "peer", "peer_view", 700);
+        assert_eq!(
+            AdmissionController::evaluate_and_admit(
+                &catalog,
+                "interactive",
+                500,
+                1_000,
+                Some(&log)
+            ),
+            AdmissionDecision::Reject
+        );
+        assert_eq!(catalog.view_state("batch_view"), ViewState::Running);
+        assert_eq!(catalog.view_state("peer_view"), ViewState::Running);
+        assert_eq!(
+            log.read_all()
+                .unwrap()
+                .into_iter()
+                .map(|event| event.action)
+                .collect::<Vec<_>>(),
+            vec!["admission_control.rejected".to_owned()]
+        );
+    }
+
+    #[test]
+    fn v072_successful_preemption_pauses_only_needed_lower_priority_views() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        let catalog = CatalogStubs::new();
+        catalog.add_workload(WorkloadDef::new("interactive").with_priority(WorkloadPriority::HIGH));
+        catalog.add_workload(WorkloadDef::new("batch").with_priority(WorkloadPriority::LOW));
+        add_workload_view(&catalog, "batch", "a_view", 400);
+        add_workload_view(&catalog, "batch", "b_view", 200);
+        assert_eq!(
+            AdmissionController::evaluate_and_admit(&catalog, "interactive", 700, 1_000, None),
+            AdmissionDecision::AdmitAfterPausing {
+                paused_views: vec!["a_view".to_owned()]
+            }
+        );
+        assert_eq!(catalog.view_state("a_view"), ViewState::Paused);
+        assert_eq!(catalog.view_state("b_view"), ViewState::Running);
+    }
+
+    #[test]
+    fn v072_unknown_workload_cannot_bypass_producer_admission() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        let catalog = CatalogStubs::new();
+        assert_eq!(
+            AdmissionController::evaluate_and_admit(&catalog, "unregistered", 100, 1_000, None),
+            AdmissionDecision::Reject
+        );
+    }
+
+    #[test]
+    fn v072_summing_huge_view_accounting_never_overflows_or_pauses() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        let catalog = CatalogStubs::new();
+        catalog.add_workload(WorkloadDef::new("foreground").with_priority(WorkloadPriority::HIGH));
+        add_workload_view(&catalog, "foreground", "big_a", u64::MAX);
+        add_workload_view(&catalog, "foreground", "big_b", u64::MAX);
+        assert_eq!(
+            AdmissionController::evaluate_and_admit(&catalog, "foreground", 1, u64::MAX, None),
+            AdmissionDecision::Reject
+        );
+        assert_eq!(catalog.view_state("big_a"), ViewState::Running);
+        assert_eq!(catalog.view_state("big_b"), ViewState::Running);
     }
 
     #[test]
