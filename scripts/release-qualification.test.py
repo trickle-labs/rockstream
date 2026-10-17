@@ -71,13 +71,21 @@ class QualificationTests(unittest.TestCase):
             (path / "fixture.rs").write_text(source)
             build = subprocess.run(["rustc", "--test", str(path / "fixture.rs"), "-o", str(path / "fixture")],
                                    capture_output=True, text=True, check=False)
-            self.assertEqual((build.returncode, build.stdout, build.stderr), (0, "", ""))
+            self.assertEqual((build.returncode, build.stdout), (0, ""), build.stderr)
             return subprocess.run([str(path / "fixture"), "--format=pretty", "--color=never", "--test-threads=1"],
                                   capture_output=True, text=True, check=False)
 
     def test_empty_selection(self):
         self.assertEqual(Q.make_report((), [], CANDIDATE, SETTINGS),
                          self.expected(errors=("zero mandatory execution",), processes=False))
+
+    def test_toolchain_diagnostics_do_not_change_executed_evidence(self):
+        build = subprocess.CompletedProcess(["rustc"], 0, "", "info: syncing channel updates for 1.88\n")
+        execution = subprocess.CompletedProcess(["fixture"], 0, VALID, "")
+        with patch.object(subprocess, "run", side_effect=[build, execution]):
+            result = self.run_fixture("// compiler diagnostic fixture\n")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, VALID, ""))
+        self.assertEqual(self.report(result.stdout), self.expected(cases=PASSED))
 
     def test_comment_only_input(self):
         result = self.run_fixture("// #[test] fn positive() {}\n// #[test] fn negative_control() {}\n")
