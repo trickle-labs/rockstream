@@ -238,6 +238,7 @@
     },
     "rockstream-sim/test:rolling_upgrade_tests": {
       "features": [
+        "simulation",
         "docker_tests"
       ],
       "services": [
