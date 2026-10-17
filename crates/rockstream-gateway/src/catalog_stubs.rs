@@ -484,6 +484,7 @@ pub enum WorkloadRevisionOutcome {
     Updated(u64),
     NotFound,
     Conflict { expected: u64, actual: u64 },
+    BelowLiveUse { requested: u64, allocated: u64 },
     RevisionExhausted,
 }
 
@@ -1267,6 +1268,17 @@ impl CatalogStubs {
         let Some(next_revision) = current.revision.checked_add(1) else {
             return WorkloadRevisionOutcome::RevisionExhausted;
         };
+        if let Some(limit) = workload.memory_limit {
+            if let Some(budget) = self.workload_budgets.read().unwrap().get(&workload.name) {
+                let allocated = budget.current_bytes();
+                if allocated > limit.bytes {
+                    return WorkloadRevisionOutcome::BelowLiveUse {
+                        requested: limit.bytes,
+                        allocated,
+                    };
+                }
+            }
+        }
         workload.revision = next_revision;
         inner
             .workloads
@@ -1354,6 +1366,17 @@ impl CatalogStubs {
         let Some(next_revision) = current.revision.checked_add(1) else {
             return Ok(WorkloadRevisionOutcome::RevisionExhausted);
         };
+        if let Some(limit) = workload.memory_limit {
+            if let Some(budget) = self.workload_budgets.read().unwrap().get(&workload.name) {
+                let allocated = budget.current_bytes();
+                if allocated > limit.bytes {
+                    return Ok(WorkloadRevisionOutcome::BelowLiveUse {
+                        requested: limit.bytes,
+                        allocated,
+                    });
+                }
+            }
+        }
         let mut updated = workload.clone();
         updated.revision = next_revision;
         if let Some(catalog) = &self.workload_catalog {
@@ -5647,6 +5670,46 @@ mod tests {
             15
         );
         assert_eq!(catalog.get_workload("concurrent").unwrap().revision, 2);
+    }
+
+    #[test]
+    fn v072_conditional_workload_cannot_lower_limit_below_live_reservations() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        set_state_budget(1_000);
+        let catalog = CatalogStubs::new();
+        assert!(catalog.add_workload(
+            WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(100))
+        ));
+        catalog.add_view_in_namespace(CatalogView {
+            name: "live_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+        catalog.assign_view_workload("live_view", "live");
+        catalog.set_view_state_bytes("live_view", 90, None);
+        let attempted = WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(80));
+        assert_eq!(
+            catalog.update_workload_if_revision(attempted, 1),
+            WorkloadRevisionOutcome::BelowLiveUse {
+                requested: 80,
+                allocated: 90
+            }
+        );
+        let unchanged = catalog.get_workload("live").unwrap();
+        assert_eq!(unchanged.revision, 1);
+        assert_eq!(unchanged.memory_limit.unwrap().bytes, 100);
+        catalog.set_view_state_bytes("live_view", 60, None);
+        assert_eq!(
+            catalog.update_workload_if_revision(
+                WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(80)),
+                1
+            ),
+            WorkloadRevisionOutcome::Updated(2)
+        );
+        reset_all();
     }
 
     #[test]
