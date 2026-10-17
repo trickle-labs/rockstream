@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::error_code::{RS_3006, RS_3024};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Notify;
@@ -14,6 +14,40 @@ pub const DEFAULT_MAX_BATCH_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 pub const DEFAULT_MAX_PENDING_REQUESTS: usize = 256;
 
 type CreditKey = (u64, u32, u32);
+
+/// Drop-owned reservation for a waiting exchange operation. A task abort or
+/// timeout releases the slot without relying on a later credit notification.
+struct ExchangeWaiterSlot {
+    count: Arc<AtomicUsize>,
+}
+
+impl ExchangeWaiterSlot {
+    fn acquire(count: Arc<AtomicUsize>, limit: usize) -> Result<Self, String> {
+        let mut current = count.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return Err(format!(
+                    "[{RS_3006}] RESOURCE_EXHAUSTED: max_exchange_waiters ({limit}) exceeded. Next steps: reduce concurrent exchange load or retry after other waiters finish."
+                ));
+            }
+            match count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self { count }),
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+impl Drop for ExchangeWaiterSlot {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 struct ChannelCreditState {
     available_rows: u32,
@@ -116,6 +150,9 @@ pub struct FlowController {
     notifiers: Arc<Mutex<HashMap<CreditKey, Arc<Notify>>>>,
     aggregate_bytes: Arc<AtomicU64>,
     pending_requests: Arc<AtomicU64>,
+    /// Current number of suspended credit/batch waits. Separate from active
+    /// in-flight batch permits reported by `pending_requests`.
+    exchange_waiters: Arc<AtomicUsize>,
     global_notify: Arc<Notify>,
     #[cfg(test)]
     pub(super) wait_barriers: Option<Arc<(tokio::sync::Barrier, tokio::sync::Barrier)>>,
@@ -145,6 +182,7 @@ impl FlowController {
             notifiers: Arc::new(Mutex::new(HashMap::new())),
             aggregate_bytes: Arc::new(AtomicU64::new(0)),
             pending_requests: Arc::new(AtomicU64::new(0)),
+            exchange_waiters: Arc::new(AtomicUsize::new(0)),
             global_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             wait_barriers: None,
@@ -201,6 +239,12 @@ impl FlowController {
 
     pub fn pending_requests(&self) -> usize {
         self.pending_requests.load(Ordering::Relaxed) as usize
+    }
+
+    /// Exact fill level of cancellation-owned exchange waits, including row
+    /// credit and batch permit waiters (not successfully admitted requests).
+    pub fn exchange_waiters(&self) -> usize {
+        self.exchange_waiters.load(Ordering::Acquire)
     }
 
     pub fn batches_in_flight(&self, exchange_id: u64, src_shard: u32, target_shard: u32) -> usize {
@@ -372,6 +416,7 @@ impl FlowController {
             ));
         }
 
+        let mut waiter_slot = None;
         loop {
             let notified = self.global_notify.notified();
             tokio::pin!(notified);
@@ -387,6 +432,12 @@ impl FlowController {
                 Err(err) => {
                     if !err.contains("RESOURCE_EXHAUSTED") {
                         return Err(err);
+                    }
+                    if waiter_slot.is_none() {
+                        waiter_slot = Some(ExchangeWaiterSlot::acquire(
+                            Arc::clone(&self.exchange_waiters),
+                            self.max_pending_requests,
+                        )?);
                     }
                     #[cfg(test)]
                     self.pause_before_wait().await;
@@ -611,9 +662,15 @@ impl FlowController {
             return Ok(());
         }
 
-        // Create waiter state only after admission failed. Register the notify
-        // future *before* rechecking channels to avoid a lost wake when ACK
-        // races against waiter registration, cancellation, or task scheduling.
+        // The immediate fast path never allocates a waiter. On saturation,
+        // reserve exactly one bounded slot before creating the notification;
+        // cancellation or successful admission releases it automatically.
+        let _waiter_slot = ExchangeWaiterSlot::acquire(
+            Arc::clone(&self.exchange_waiters),
+            self.max_pending_requests,
+        )?;
+        // Register the notify future *before* rechecking channels to avoid a
+        // lost wake when ACK races against registration or task scheduling.
         let notify = {
             let mut notifiers = self.notifiers.lock();
             notifiers
