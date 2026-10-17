@@ -5,30 +5,30 @@ import hashlib
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKS = {
     "e2e_qualification_tests": ("rockstream-sim", (
-        "test_qualification_ddl_and_pipeline_setup",
-        "test_qualification_kafka_ingest_and_view_maintenance",
-        "test_qualification_postgres_cdc_ingest",
-        "test_qualification_kafka_sink_2pc_atomicity",
-        "test_qualification_pgwire_query_and_subscription",
-        "test_qualification_batch_oracle_multiset_equivalence",
+        "test_helper_in_memory_topology_lifecycle",
+        "test_helper_generated_kafka_oracle_bookkeeping",
+        "test_helper_generated_cdc_commit_filtering",
+        "test_helper_oracle_sink_history_comparison",
+        "test_helper_supplied_relation_comparison",
+        "test_helper_aggregate_oracle_comparison",
     )),
     "qualification_recovery_tests": ("rockstream-sim", (
-        "test_observe_heartbeat_loss_and_shard_reassignment",
-        "test_observe_control_leader_failover",
-        "test_observe_fencing_epoch_advancement",
-        "test_observe_selected_checkpoint_recovery",
-        "test_observe_source_offset_lsn_recovery",
-        "test_observe_view_frontier_monotonicity",
-        "test_observe_sink_2pc_transaction_atomicity",
-        "test_observe_first_post_recovery_query_correctness",
+        "test_helper_observer_heartbeat_loss_and_shard_reassignment",
+        "test_helper_observer_control_leader_failover",
+        "test_helper_observer_fencing_epoch_advancement",
+        "test_helper_observer_selected_checkpoint_recovery",
+        "test_helper_observer_source_offset_lsn_recovery",
+        "test_helper_observer_view_frontier_monotonicity",
+        "test_helper_observer_sink_2pc_transaction_atomicity",
+        "test_helper_observer_first_post_recovery_query_correctness",
     )),
     "qualification_harness_mutation_tests": ("rockstream-types", (
         "single_process_simulation_rejected",
@@ -51,12 +51,18 @@ SUITES = {
     "recovery": ("qualification_recovery_tests", "qualification_harness_mutation_tests"),
     "mutations": ("qualification_recovery_tests", "qualification_harness_mutation_tests"),
 }
-# shortcut: these checks use in-memory topology; replace omissions when live checks exist.
+# These mandatory claims remain unsupported by the single worker/Kafka/MinIO scenario.
 LIVE_OBSERVATIONS = {
     "e2e_qualification_tests": "live::e2e",
-    "qualification_recovery_tests": "live::recovery",
 }
-SERVICES = {"pgwire": 5432, "kafka": 9092, "minio": 9000, "postgres-cdc": 5433}
+APPLICATION_TARGET = "real_cluster_chaos_soak_tests"
+APPLICATION_CASE = "worker_failure_recovery_from_view_and_kafka"
+CONTROL_FAILURES = {
+    "missing_event": "MissingObservation", "constant_timings": "Timings",
+    "stale_query": "Progress", "changed_value": "ViewOutput",
+    "duplicate_output": "SinkOutput", "helper_only_status": "Ownership",
+}
+UNSUPPORTED = ["general-kafka-recovery", "postgres-cdc", "distributed-control-ha", "pgwire-transport", "recovery-p99"]
 CASE = re.compile(r"test (\S+) \.\.\. (ok|FAILED|ignored)(?:, .*)?")
 SUMMARY = re.compile(
     r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
@@ -64,14 +70,14 @@ SUMMARY = re.compile(
 )
 
 
-def execute(command):
+def execute(command, **kwargs):
     try:
-        return subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+        return subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False, **kwargs)
     except OSError as error:
         return subprocess.CompletedProcess(command, 127, "", str(error))
 
 
-def parse_results(target, output):
+def parse_results(target, output, filtered=0):
     """Validate the complete libtest transcript, including its derived summary."""
     scenarios, errors, summaries, starts = [], [], [], []
     for line in output.splitlines():
@@ -93,15 +99,18 @@ def parse_results(target, output):
     counts = [sum(case["status"] == status for case in scenarios)
               for status in ("passed", "failed", "ignored")]
     if (len(summaries) != 1 or summaries[0] is None
-            or list(map(int, summaries[0].groups()[1:])) != counts + [0, 0]
+            or list(map(int, summaries[0].groups()[1:])) != counts + [0, filtered]
             or summaries[0][1] != ("FAILED" if counts[1] else "ok")
             or starts != [len(scenarios)]):
         errors.append(f"{target}: missing or inconsistent test summary")
     return sorted(scenarios, key=lambda case: case["id"]), errors
 
 
-def make_report(targets, processes, candidate, settings, services=None):
+def make_report(targets, processes, candidate, settings, services=None, application=None):
     expected = sorted(f"{target}::{name}" for target in targets for name in CHECKS[target][1])
+    needs_recovery = not settings["fast"] and "qualification_recovery_tests" in targets
+    if needs_recovery:
+        expected.append(f"{APPLICATION_TARGET}::{APPLICATION_CASE}")
     scenarios, errors = [], []
     for process in processes:
         scenarios.extend(process["scenarios"])
@@ -118,7 +127,12 @@ def make_report(targets, processes, candidate, settings, services=None):
             errors.append(f"{case['id']}: {case['status']}")
     if not settings["fast"]:
         omissions.extend(LIVE_OBSERVATIONS[target] for target in targets if target in LIVE_OBSERVATIONS)
-        errors.append("live qualification observations are unavailable; helper checks cannot qualify a release")
+        if any(target in LIVE_OBSERVATIONS for target in targets):
+            errors.append("live qualification observations are unavailable; helper checks cannot qualify a release")
+        if needs_recovery and application is None:
+            omissions.append("live::worker-failure-kafka-minio-v1")
+        if application is not None:
+            errors.extend(validate_application(application, candidate))
         for name, status in (services or {}).items():
             if status != "available":
                 errors.append(f"required service unavailable: {name}")
@@ -127,11 +141,15 @@ def make_report(targets, processes, candidate, settings, services=None):
     return {
         "status": "FAILED" if errors else "PASSED",
         "evidence_kind": "helper" if settings["fast"] else "release",
-        "release_qualified": False,
+        "release_qualified": not errors and needs_recovery,
+        "qualification_scope": ["worker-failure-kafka-minio-v1"] if needs_recovery and not errors else [],
+        "unsupported_claims": UNSUPPORTED,
+        "application_proof": application,
         "candidate": candidate,
         "settings": settings,
         "services": services or {},
-        "processes": processes,
+        "processes": [{**process, "evidence_kind": "application" if process["target"] == APPLICATION_TARGET
+                       else "helper"} for process in processes],
         "scenarios": sorted(scenarios, key=lambda case: case["id"]),
         "scenarios_passed": sum(case["status"] == "passed" for case in scenarios),
         "scenarios_failed": sum(case["status"] == "failed" for case in scenarios),
@@ -141,6 +159,46 @@ def make_report(targets, processes, candidate, settings, services=None):
                                  for case in scenarios) + len(omissions),
         "errors": errors,
     }
+
+
+def validate_application(records, candidate):
+    """Check the complete records emitted and validated by this run's Rust process."""
+    try:
+        application = records["application"]
+        observations = application["observations"]
+        timings = {
+            "detection": observations["detection"]["timestamp_ms"] - observations["fault_at_ms"],
+            "ownership": observations["ownership_observed_at_ms"] - observations["fault_at_ms"],
+            "query": observations["first_correct_query_at_ms"] - observations["fault_at_ms"],
+        }
+        expected = {"candidate": candidate, "observations": observations,
+                    "recovery_durations_ms": timings, "status": "PASSED", "error": None}
+        controls = {}
+        for name, reason in CONTROL_FAILURES.items():
+            corrupted = json.loads(json.dumps(observations))
+            durations = dict(timings)
+            if name == "missing_event":
+                del corrupted["detection"]
+            elif name == "constant_timings":
+                durations = {key: 0 for key in timings}
+            elif name == "stale_query":
+                corrupted["query_frontier"] = 3
+            elif name == "changed_value":
+                corrupted["query_rows"] = ["1\twrong"]
+            elif name == "duplicate_output":
+                corrupted["sink_records"].append(observations["sink_records"][2])
+            elif name == "helper_only_status":
+                corrupted["after"]["process_id"] = observations["before"]["process_id"]
+            controls[name] = dict(expected, observations=corrupted, recovery_durations_ms=durations,
+                                  status="FAILED", error=reason)
+        manifest = ROOT / "docs/testing/worker-failure-kafka-minio-v1.json"
+        if (records != {"application": expected, "negative_controls": controls}
+                or observations["revision"] != candidate["commit_sha"]
+                or observations["manifest_sha256"] != hashlib.sha256(manifest.read_bytes()).hexdigest()):
+            raise ValueError("inconsistent records")
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return ["invalid executed recovery qualification records"]
+    return []
 
 
 def candidate_identity():
@@ -161,15 +219,8 @@ def candidate_identity():
 
 
 def check_services():
-    services = {"docker": "available" if execute(["docker", "info"]).returncode == 0
-                else "unavailable"}
-    for name, port in SERVICES.items():
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=2):
-                services[name] = "available"
-        except OSError:
-            services[name] = "unavailable"
-    return services
+    # The scenario provisions Kafka and MinIO on dynamic ports; no ambient services count as proof.
+    return {"docker": "available" if execute(["docker", "info"]).returncode == 0 else "unavailable"}
 
 
 def main():
@@ -198,7 +249,7 @@ def main():
     except (ValueError, OSError) as error:
         print(f"RS-0001: {error}", file=sys.stderr)
         return 1
-    processes = []
+    processes, application = [], None
     # An unavailable release service prevents compilation/execution, never a fast fallback.
     if all(status == "available" for status in services.values()):
         for target in SUITES[args.suite]:
@@ -210,7 +261,31 @@ def main():
                               "scenarios": scenarios, "errors": errors})
             if result.returncode or errors:
                 print(result.stdout + result.stderr, file=sys.stderr)
-    report = make_report(SUITES[args.suite], processes, candidate, settings, services)
+        if not settings["fast"] and "qualification_recovery_tests" in SUITES[args.suite]:
+            artifact_root = args.output.parent if args.output else ROOT / "target/qualification"
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            artifact_dir = Path(tempfile.mkdtemp(prefix="recovery-", dir=artifact_root)).resolve()
+            command = ["cargo", "test", "--locked", "-p", "rockstream-sim",
+                       "--features", "simulation,docker_tests", "--test", APPLICATION_TARGET,
+                       APPLICATION_CASE, "--", "--exact", "--format=pretty", "--color=never", "--test-threads=1"]
+            result = execute(command, env={**os.environ,
+                "ROCKSTREAM_CHAOS_ARTIFACT_DIR": str(artifact_dir),
+                "ROCKSTREAM_QUALIFICATION_CANDIDATE": json.dumps(candidate)})
+            scenarios, errors = parse_results(APPLICATION_TARGET, result.stdout, filtered=1)
+            try:
+                application = json.loads((artifact_dir / "qualification-records.json").read_text())
+            except (OSError, ValueError):
+                errors.append("missing or malformed executed recovery qualification records")
+            try:
+                if candidate_identity() != candidate:
+                    errors.append("candidate changed during qualification")
+            except (ValueError, OSError):
+                errors.append("cannot determine final candidate identity")
+            processes.append({"target": APPLICATION_TARGET, "command": command,
+                              "exit_code": result.returncode, "scenarios": scenarios, "errors": errors})
+            if result.returncode or errors:
+                print(result.stdout + result.stderr, file=sys.stderr)
+    report = make_report(SUITES[args.suite], processes, candidate, settings, services, application)
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
