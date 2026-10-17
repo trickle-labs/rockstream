@@ -5603,9 +5603,8 @@ mod tests {
         let catalog = CatalogStubs::new();
         assert!(catalog.add_workload(WorkloadDef::new("fast")));
         assert_eq!(catalog.get_workload("fast").unwrap().revision, 1);
-        let changed = WorkloadDef::new("fast").with_memory_limit(
-            rockstream_types::workload::MemoryLimit::new(1024),
-        );
+        let changed = WorkloadDef::new("fast")
+            .with_memory_limit(rockstream_types::workload::MemoryLimit::new(1024));
         assert_eq!(
             catalog.update_workload_if_revision(changed.clone(), 1),
             WorkloadRevisionOutcome::Updated(2)
@@ -5678,9 +5677,9 @@ mod tests {
         reset_all();
         set_state_budget(1_000);
         let catalog = CatalogStubs::new();
-        assert!(catalog.add_workload(
-            WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(100))
-        ));
+        assert!(
+            catalog.add_workload(WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(100)))
+        );
         catalog.add_view_in_namespace(CatalogView {
             name: "live_view".to_string(),
             sql: "SELECT 1".to_string(),
