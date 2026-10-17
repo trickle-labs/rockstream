@@ -5147,15 +5147,34 @@ impl GatewayHandler {
                 {
                     return Ok(backfill_not_published_response(&view_name));
                 }
-                let rows = self
-                    .view_reader
-                    .read_view(
-                        &view_name,
-                        Some(crate::copy_out_budget::MAX_COPY_OUT_ROWS + 1),
-                        ViewReadStrategy::HotOnly,
-                    )
-                    .await
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                // The frozen v0.72 interactive wall budget is 5 seconds.
+                // Bound the producer read before *any* COPY response frame:
+                // a timeout must never leave a syntactically valid partial
+                // COPY stream or an in-flight reader owned by this future.
+                let read = self.view_reader.read_view(
+                    &view_name,
+                    Some(crate::copy_out_budget::MAX_COPY_OUT_ROWS + 1),
+                    ViewReadStrategy::HotOnly,
+                );
+                let rows = match crate::copy_out_budget::read_with_deadline(
+                    Duration::from_millis(crate::copy_out_budget::MAX_COPY_OUT_READ_MS),
+                    read,
+                )
+                .await
+                {
+                    Ok(Ok(rows)) => rows,
+                    Ok(Err(error)) => return Err(PgWireError::ApiError(Box::new(error))),
+                    Err(_) => {
+                        return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "57014".to_owned(),
+                            format!(
+                                "[RS-9001] copy_out.read_timeout: producer read exceeded {}ms. Next steps: narrow the query or use bounded result pages.",
+                                crate::copy_out_budget::MAX_COPY_OUT_READ_MS
+                            ),
+                        )))]);
+                    }
+                };
                 // Error before any CopyOutResponse or CopyData. The reader's
                 // current materialization implementation remains unbounded;
                 // this is a wire-output guard, not yet full producer admission.

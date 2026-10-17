@@ -710,6 +710,79 @@ async fn v072_copy_out_row_cap_fails_before_streaming() {
     );
 }
 
+/// A read that never returns must be cancelled before COPY OUT framing.
+/// This is intentionally a real PgWire path, not a synthetic API-only test.
+struct HangingCopyReader {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ReadCancelGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ReadCancelGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl ViewReader for HangingCopyReader {
+    async fn read_view(
+        &self,
+        _view_name: &str,
+        _limit: Option<usize>,
+        _strategy: ViewReadStrategy,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        let _guard = ReadCancelGuard(Arc::clone(&self.cancelled));
+        std::future::pending().await
+    }
+
+    fn published_frontier(&self) -> Option<u64> {
+        Some(1)
+    }
+}
+
+#[tokio::test]
+async fn v072_copy_out_read_timeout_emits_error_without_copy_stream() {
+    let catalogue = Arc::new(CatalogStubs::new());
+    catalogue.add_view_in_namespace(CatalogView {
+        name: "slow_mv".to_owned(),
+        sql: "SELECT v FROM base".to_owned(),
+        columns: vec![CatalogColumn {
+            name: "v".to_owned(),
+            data_type: "Utf8".to_owned(),
+        }],
+        namespace: "public".to_owned(),
+        op_id: None,
+    });
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = Arc::new(HangingCopyReader {
+        cancelled: Arc::clone(&cancelled),
+    });
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalogue,
+        reader,
+    );
+    let (addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.simple_query("COPY slow_mv TO STDOUT"),
+    )
+    .await
+    .expect("producer read deadline must terminate the query");
+    let error = result.expect_err("COPY OUT must fail before its first data frame");
+    let db_error = error.as_db_error().expect("typed PostgreSQL timeout error");
+    assert_eq!(db_error.code().code(), "57014");
+    assert!(db_error.message().contains("copy_out.read_timeout"));
+    assert!(db_error.message().contains("5000ms"));
+    assert!(
+        cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "timed-out read must release the producer's owned future"
+    );
+    handle.abort();
+}
+
 /// Build a PostgreSQL startup message for user/dbname.
 fn build_startup_message(user: &str, db: &str) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::new();
