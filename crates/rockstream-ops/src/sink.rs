@@ -407,10 +407,15 @@ pub async fn read_view_output_via_reader(
     num_cols: usize,
 ) -> Result<Vec<ViewOutputRow>, OpError> {
     let prefix = view_output_prefix(op_id);
-    let entries = reader
-        .scan_prefix(&prefix)
+    let (entries, truncated) = reader
+        .scan_prefix_bounded(&prefix, VIEW_OUTPUT_READ_MAX_BYTES)
         .await
         .map_err(OpError::storage)?;
+    if truncated {
+        return Err(OpError::internal(format!(
+            "view output exceeds {VIEW_OUTPUT_READ_MAX_BYTES} byte read limit"
+        )));
+    }
     decode_view_output_entries(entries, num_cols)
 }
 
