@@ -134,6 +134,9 @@
       ],
       "services": [
         "docker"
+      ],
+      "include_ignored_targets": [
+        "rockstream-gateway/test:pg18_differential_conformance_tests"
       ]
     },
     "pr-sim-unit": {

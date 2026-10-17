@@ -50,6 +50,20 @@ class GateSelfTests(unittest.TestCase):
         self.assertEqual(passed, 0)
         self.assertIn("zero selected mandatory tests", errors)
 
+    def test_gateway_runs_required_postgres_differential_ignored_case(self):
+        target = {"package": "rockstream-gateway", "kind": "test",
+                  "name": "pg18_differential_conformance_tests"}
+        key = gate.target_id(**target)
+        self.assertEqual(gate.libtest_flags(key, POLICY["jobs"]["pr-gateway"]),
+                         ["--include-ignored"])
+        self.assertEqual(gate.libtest_flags(self.key, POLICY["jobs"]["pr-gateway"]), [])
+        case = "pg18_reference::tests::pinned_postgres_numeric_and_array_corpus"
+        events = [{"type": "test", "name": case, "event": "ok"}]
+        results, errors, passed = gate.observed_results(target, [case], events, {})
+        self.assertEqual(errors, [])
+        self.assertEqual(passed, 1)
+        self.assertEqual(results[0]["outcome"], "passed")
+
     def test_ignored_mandatory_case(self):
         events = [{"type": "test", "name": "must_run", "event": "ignored"}]
         tests, errors, passed = gate.observed_results(self.target, ["must_run"], events, {})

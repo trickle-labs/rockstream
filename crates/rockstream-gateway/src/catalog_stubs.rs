@@ -3304,7 +3304,7 @@ impl CatalogStubs {
                     })
                     .collect();
                 CatalogResponse::rows(columns, rows)
-            },
+            }
             "pg_index" => self.pg_index(&columns),
             "pg_roles" => self.pg_roles(&session.principal_name, &columns),
             "pg_database" => CatalogResponse::rows(
@@ -5915,7 +5915,8 @@ mod pgjdbc_reflection_tests {
         let Some(CatalogResponse::Rows {
             columns: language_columns,
             rows: language_rows,
-        }) = catalog.pg_catalog_rows("pg_language", &SessionInfo::default()) else {
+        }) = catalog.pg_catalog_rows("pg_language", &SessionInfo::default())
+        else {
             panic!("pg_language must be available to PostgreSQL introspection");
         };
         let oid = language_columns
@@ -5926,10 +5927,9 @@ mod pgjdbc_reflection_tests {
             .iter()
             .position(|column| column == "lanname")
             .expect("pg_language lanname");
-        assert!(language_rows
-            .iter()
-            .any(|row| row[oid].as_deref() == Some("12")
-                && row[name].as_deref() == Some("internal")));
+        assert!(language_rows.iter().any(
+            |row| row[oid].as_deref() == Some("12") && row[name].as_deref() == Some("internal")
+        ));
 
         // Prisma 6 uses a LEFT JOIN against pg_language to describe SQL
         // functions. The built-in functions must not be mistaken for public

@@ -113,6 +113,9 @@ def assignments(targets: dict, packages: dict, policy: dict) -> dict:
         for name in spec.get("cases", {}):
             if name not in spec.get("supplemental_targets", []):
                 errors.append(f"{job}: case filter only allowed for supplemental target {name}")
+        for key in spec.get("include_ignored_targets", []):
+            if owner.get(key) != job:
+                errors.append(f"{job}: include-ignored target is not owned by this job: {key}")
     if errors:
         raise ValueError("\n".join(errors))
     return owner
@@ -214,6 +217,11 @@ def parse_events(stdout: str) -> list[dict]:
         if isinstance(value, dict) and value.get("type") in ("test", "suite"):
             events.append(value)
     return events
+
+
+def libtest_flags(key: str, spec: dict) -> list[str]:
+    """Explicitly run #[ignore] cases only for approved, fully owned targets."""
+    return ["--include-ignored"] if key in spec.get("include_ignored_targets", []) else []
 
 
 def run_cmd(argv: list[str], cwd: Path, env: dict) -> subprocess.CompletedProcess:
@@ -347,6 +355,7 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
                         listed = parse_list(listing.stdout)
                         cases = spec.get("cases", {}).get(t["name"])
                         args = [executable, "-Z", "unstable-options", "--format", "json", "--test-threads=1"]
+                        args += libtest_flags(key, spec)
                         if cases is not None:
                             # Supplemental jobs select explicit expensive cases, one execution per ID.
                             events = []
