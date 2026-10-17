@@ -17,7 +17,24 @@ env:
   ROCKSTREAM_REQUIRE_DOCKER: "1"
 
 jobs:
+  classify-changes:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      scope: ${{ steps.scope.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select CI scope (unknown changes require full CI)
+        id: scope
+        run: python3 scripts/ci-scope.py scope >> "$GITHUB_OUTPUT"
+
   control-plane-ha:
+    needs: classify-changes
+    if: needs.classify-changes.outputs.scope == 'full'
     name: Control-plane HA smoke
     runs-on: ubuntu-latest
     steps:
@@ -61,6 +78,7 @@ jobs:
         run: cargo test -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1 --nocapture
 
   check-quality:
+    needs: classify-changes
     name: Check quality
     runs-on: ubuntu-latest
     permissions:
@@ -69,25 +87,36 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: CI scope and required-check self-tests
+        run: python3 -B scripts/ci-scope.test.py
       - uses: dtolnay/rust-toolchain@master
+        if: needs.classify-changes.outputs.scope == 'full'
         with:
           toolchain: "1.88"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: needs.classify-changes.outputs.scope == 'full'
       - name: Free runner disk space
+        if: needs.classify-changes.outputs.scope == 'full'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: cargo fmt
+        if: needs.classify-changes.outputs.scope == 'full'
         run: cargo fmt --all --check
       - name: cargo clippy
+        if: needs.classify-changes.outputs.scope == 'full'
         run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::uninlined_format_args
       - name: install cargo-deny
+        if: needs.classify-changes.outputs.scope == 'full'
         uses: taiki-e/install-action@cargo-deny
       - name: cargo deny
+        if: needs.classify-changes.outputs.scope == 'full'
         run: cargo deny --all-features check
       - name: install cargo-audit
+        if: needs.classify-changes.outputs.scope == 'full'
         uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
+        if: needs.classify-changes.outputs.scope == 'full'
         run: cargo audit $(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' deny.toml | tr -d '"' | sed 's/^/--ignore /')
       - name: threat-model link check
         run: bash scripts/check-threat-model-links.sh
@@ -142,6 +171,7 @@ jobs:
       - name: CI test-accounting self-tests
         run: python3 scripts/ci-test-inventory.test.py
       - name: Validate Cargo test target assignment
+        if: needs.classify-changes.outputs.scope == 'full'
         run: python3 scripts/ci-test-inventory.py check --out target/ci-test-results/assignment.json
       - name: path-coupling check
         run: bash scripts/check-path-coupling.sh
@@ -151,6 +181,7 @@ jobs:
         run: bash scripts/check-qualification-mutations.test.sh
 
   verus-verify:
+    needs: classify-changes
     name: Verus verify and qualify (VS6)
     strategy:
       fail-fast: false
@@ -165,32 +196,44 @@ jobs:
     env:
       VERUS_QUALIFICATION_TARGET: ${{ matrix.target }}
     steps:
+      - name: Prose-only PR does not require Verus qualification
+        if: needs.classify-changes.outputs.scope == 'prose'
+        run: echo "Verus qualification excluded for allowlisted prose; no qualification evidence produced."
       - uses: actions/checkout@v4
+        if: needs.classify-changes.outputs.scope == 'full'
       - uses: dtolnay/rust-toolchain@master
+        if: needs.classify-changes.outputs.scope == 'full'
         with:
           toolchain: "1.88"
           components: rustfmt, clippy
           targets: ${{ matrix.target }}
       - uses: dtolnay/rust-toolchain@master
+        if: needs.classify-changes.outputs.scope == 'full'
         with:
           toolchain: "1.98.1"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        if: needs.classify-changes.outputs.scope == 'full'
       - name: Cache pinned Verus
+        if: needs.classify-changes.outputs.scope == 'full'
         uses: actions/cache@v4
         with:
           path: .cache/verus
           key: verus-${{ runner.os }}-${{ runner.arch }}-0.2026.09.13.671956e
       - name: Install pinned Verus
+        if: needs.classify-changes.outputs.scope == 'full'
         run: echo "$(bash scripts/install-verus.sh)" >> "$GITHUB_PATH"
       - name: Verify Rust kernels
+        if: needs.classify-changes.outputs.scope == 'full'
         run: make verify-rust
       - name: Verify proof contracts
+        if: needs.classify-changes.outputs.scope == 'full'
         run: make verify-proof-contracts
       - name: Run clean VS6 qualification matrix
+        if: needs.classify-changes.outputs.scope == 'full'
         run: make qualify-verus
       - name: Upload VS6 qualification evidence
-        if: always()
+        if: always() && needs.classify-changes.outputs.scope == 'full'
         uses: actions/upload-artifact@v4
         with:
           name: verus-qualification-${{ matrix.target }}
@@ -198,11 +241,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
       - name: Exercise production wrapper
+        if: needs.classify-changes.outputs.scope == 'full'
         run: cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests
       - name: Build ordinary Cargo consumer
+        if: needs.classify-changes.outputs.scope == 'full'
         run: cargo build --locked --release -p rockstream-cli
 
   check-tests:
+    needs: classify-changes
+    if: needs.classify-changes.outputs.scope == 'full'
     name: Check tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
     strategy:
@@ -287,6 +334,8 @@ jobs:
         run: docker image rm rockstream-tc-test:latest || true
 
   postgres-differential:
+    needs: classify-changes
+    if: needs.classify-changes.outputs.scope == 'full'
     name: PostgreSQL 18.0 differential integration
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -319,6 +368,7 @@ jobs:
     name: Check
     if: always()
     needs:
+      - classify-changes
       - check-quality
       - check-tests
       - postgres-differential
@@ -330,15 +380,15 @@ jobs:
       - docker-build
     runs-on: ubuntu-latest
     steps:
-      - name: Fail if any Check shard failed
-        if: ${{ needs.check-quality.result != 'success' || needs.check-tests.result != 'success' || needs.postgres-differential.result != 'success' || needs.control-plane-ha.result != 'success' || needs.formal-verify.result != 'success' || needs.verus-verify.result != 'success' || needs.nexmark-regression-gate.result != 'success' || needs.benchmark.result != 'success' || needs.docker-build.result != 'success' }}
-        run: |
-          echo "A Check shard did not pass."
-          exit 1
-      - name: Check shards passed
-        run: echo "All Check shards passed."
+      - uses: actions/checkout@v4
+      - name: Require successful checks and explicitly scoped exclusions
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-scope.py check
 
   formal-verify:
+    needs: classify-changes
+    if: needs.classify-changes.outputs.scope == 'full'
     name: Formal verify (M1–M4, M6–M7)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -434,6 +484,8 @@ jobs:
           fizz formal/edge_late_data.fizz
 
   nexmark-regression-gate:
+    needs: classify-changes
+    if: needs.classify-changes.outputs.scope == 'full'
     name: Nexmark regression gate
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -463,6 +515,8 @@ jobs:
           exit 1
 
   benchmark:
+    needs: classify-changes
+    if: needs.classify-changes.outputs.scope == 'full'
     name: Performance-regression gate (ops/storage/runtime/control)
     runs-on: ubuntu-latest
     # Locally measured sum of the four `cargo bench --noplot` wall-clock
@@ -561,6 +615,8 @@ jobs:
           echo "OK: versions match"
 
   docker-build:
+    needs: classify-changes
+    if: needs.classify-changes.outputs.scope == 'full'
     name: Docker image (release binary)
     runs-on: ubuntu-latest
     steps:
