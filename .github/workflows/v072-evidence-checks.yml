@@ -53,3 +53,21 @@ jobs:
         run: cargo fmt --manifest-path tools/r1-local-harness/Cargo.toml --all --check
       - name: Check harness warnings
         run: cargo clippy --manifest-path tools/r1-local-harness/Cargo.toml --all-targets -- -D warnings -A clippy::uninlined_format_args
+
+  harness-macos:
+    name: macOS observed CPU/RSS capture checks (not capacity qualification)
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/r1-local-harness
+      - name: Exercise libproc process counters and real child cleanup
+        run: cargo test --manifest-path tools/r1-local-harness/Cargo.toml --lib capture::tests
+      - name: Check macOS observed process counter build
+        run: cargo clippy --manifest-path tools/r1-local-harness/Cargo.toml --lib -- -D warnings -A clippy::uninlined_format_args

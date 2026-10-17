@@ -63,6 +63,19 @@ enum HarnessCommand {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Capture real release-process counters only; does not qualify a workload.
+    CaptureV072Process {
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        duration_ms: u64,
+        #[arg(long, default_value_t = 100)]
+        sample_interval_ms: u64,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +189,27 @@ async fn run(cli: Cli) -> Result<()> {
         }
         HarnessCommand::Matrix { output } => run_matrix(&output),
         HarnessCommand::QualifyNegative { evidence } => qualify_negative(&evidence),
+        HarnessCommand::CaptureV072Process {
+            binary,
+            output,
+            duration_ms,
+            sample_interval_ms,
+            args,
+        } => {
+            let capture = r1_local_harness::capture::capture_process(
+                &binary,
+                &args,
+                &output,
+                Duration::from_millis(duration_ms),
+                Duration::from_millis(sample_interval_ms),
+            )?;
+            println!(
+                "Observed process {}: {} samples. Observation only; capacity qualification is separate.",
+                capture.pid,
+                capture.samples.len()
+            );
+            Ok(())
+        }
     }
 }
 

@@ -46,6 +46,14 @@ impl ProcessGroup {
         self.pid
     }
 
+    /// Observe child exit without losing process-group cleanup ownership.
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
+        }
+    }
+
     /// Give the group a graceful shutdown interval, then force-stop remaining
     /// members before reaping its leader. An exited leader is not evidence that
     /// the rest of the group has stopped. Descendants that deliberately leave
