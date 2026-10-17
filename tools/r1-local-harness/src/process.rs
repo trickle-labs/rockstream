@@ -140,7 +140,21 @@ fn signal_group(pid: i32, signal: i32) -> io::Result<()> {
     if unsafe { libc::kill(-pid, signal) } == -1 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
+            // On macOS a process group containing only its unreaped,
+            // already-exited leader can reject SIGKILL with EPERM. Do not
+            // mistake EPERM for successful cleanup: the caller must still
+            // reap the leader and prove the entire group is gone.
+            #[cfg(target_os = "macos")]
+            if signal == libc::SIGKILL
+                && error.raw_os_error() == Some(libc::EPERM)
+                && leader_exited(pid)?
+            {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!("signal {signal} to owned group {pid}: {error}"),
+            ));
         }
     }
     Ok(())
