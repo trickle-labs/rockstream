@@ -152,12 +152,22 @@ impl HotOnlyViewReader {
             })?
         else {
             let prefix = format!("view_output/{view_name}/");
+            if let Some(limit) = limit {
+                // Do not materialize a full keyspace for a bounded read.
+                // The producer uses one bounded page channel and drops its
+                // scanner when the requested rows are ready or a budget fails.
+                return crate::bounded_read::scan_bounded_prefix(
+                    Arc::clone(&self.shard_reader),
+                    prefix.as_bytes(),
+                    limit,
+                    crate::bounded_read::LIMITED_SCAN_MAX_BYTES,
+                )
+                .await;
+            }
+            // Unbounded legacy calls retain their existing behavior. The
+            // release-process bounded interactive contract is still pending.
             let kvs = self.shard_reader.scan_prefix(prefix.as_bytes()).await?;
-            return Ok(kvs
-                .into_iter()
-                .take(limit.unwrap_or(usize::MAX))
-                .map(|(_k, v)| v.to_vec())
-                .collect());
+            return Ok(kvs.into_iter().map(|(_k, v)| v.to_vec()).collect());
         };
         let stored =
             rockstream_ops::sink::read_view_output_via_reader(&self.shard_reader, op_id, num_cols)
