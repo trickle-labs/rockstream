@@ -5,7 +5,7 @@ use rockstream_gateway::change_log::{
 };
 use rockstream_gateway::subscribe_handler::{
     deliver_snapshot_checked, run_subscribe, start_from_epoch, SubscribeError, SubscribeRegistry,
-    SubscriberHandle, SUBSCRIBE_MAX_STREAMS, SUBSCRIBE_SNAPSHOT_MAX_ROWS,
+    SubscriberHandle, SUBSCRIBE_BACKLOG_MAX, SUBSCRIBE_MAX_STREAMS, SUBSCRIBE_SNAPSHOT_MAX_ROWS,
 };
 use rockstream_gateway::subscribe_parser::parse_subscribe;
 use std::sync::Arc;
@@ -282,6 +282,75 @@ async fn v072_async_replay_rejects_before_emitting_any_row() {
     ).await;
     assert_eq!(outcome, Err(SubscribeError::ReplayUnavailable { requested: 22 }));
     assert_eq!(output, Vec::<(u64, i8, Bytes)>::new());
+}
+
+#[tokio::test]
+async fn v072_async_replay_checks_backlog_before_emitting_any_row() {
+    let registry = SubscribeRegistry::new();
+    registry
+        .push_epoch("v", vec![row(1, "early", 1, "early")])
+        .unwrap();
+    registry
+        .push_epoch(
+            "v",
+            vec![row(SUBSCRIBE_BACKLOG_MAX as u64 + 2, "late", 1, "late")],
+        )
+        .unwrap();
+    let request = parse_subscribe("SUBSCRIBE v AS OF EPOCH 1").unwrap();
+    let mut observed = Vec::new();
+    let result = run_subscribe(
+        &request,
+        vec![],
+        1,
+        &registry,
+        vec![],
+        |change| observed.push((change.mz_timestamp, change.mz_diff, change.encoded_row)),
+        || true,
+    )
+    .await;
+    assert_eq!(result, Err(SubscribeError::ConsumerTooSlow));
+    assert!(observed.is_empty(), "reject before emitting partial replay");
+    assert_eq!(registry.entry_count("v"), 2);
+}
+
+#[tokio::test]
+async fn v072_async_replay_preserves_exact_signed_rows_once() {
+    let registry = SubscribeRegistry::new();
+    registry
+        .push_epoch(
+            "v",
+            vec![
+                row(7, "same", -1, "old"),
+                row(7, "same", 1, "new"),
+                row(7, "other", 1, "new"),
+            ],
+        )
+        .unwrap();
+    registry
+        .push_epoch("v", vec![row(8, "final", 1, "next")])
+        .unwrap();
+    let request = parse_subscribe("SUBSCRIBE v AS OF EPOCH 7").unwrap();
+    let mut observed = Vec::new();
+    let result = run_subscribe(
+        &request,
+        vec![],
+        8,
+        &registry,
+        vec![],
+        |change| observed.push((change.mz_timestamp, change.mz_diff, change.encoded_row)),
+        || true,
+    )
+    .await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        observed,
+        vec![
+            (7, -1, Bytes::from_static(b"old")),
+            (7, 1, Bytes::from_static(b"new")),
+            (7, 1, Bytes::from_static(b"new")),
+            (8, 1, Bytes::from_static(b"next")),
+        ]
+    );
 }
 
 #[tokio::test]
