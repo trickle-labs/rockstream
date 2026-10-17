@@ -234,7 +234,10 @@ impl object_store::ObjectStore for RejectCompactedStore {
 
     fn delete_stream(
         &self,
-        locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
         self.inner.delete_stream(locations)
     }
