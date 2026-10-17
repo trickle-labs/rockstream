@@ -8,8 +8,6 @@ name: Scheduled Fuzz Soak
 on:
   schedule:
     - cron: "0 */6 * * *"
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:

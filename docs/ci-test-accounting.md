@@ -33,6 +33,8 @@ The first six jobs are called in `ci.yml`. Seeded, Docker and release suites are
 
 **Separate scheduled/release safety reports:** `Test Accounting — Expensive Suites` (`Nightly seeded simulation accounting`, `Nightly Docker test accounting`, `Release rolling-upgrade test accounting`); `Simulation Soak`; `Long-Duration Resource Soak`; `Real Cluster Chaos Soak`; `Coverage`; `Scheduled Fuzz Soak`. These may not run on every PR and are **not implied** by green PR checks. Their own red conclusions block any safety or release claim requiring them; record their run URLs and evidence artifacts explicitly in release sign-off. The issue does not authorize claiming formal, HA, or release proof from absent/skipped jobs.
 
+`Coverage` runs daily; `Simulation Soak` and `Scheduled Fuzz Soak` run every six hours and support manual dispatch. These three workflows do not run on main pushes, so they check scheduled snapshots rather than every merged commit. PR HA coverage is executed once by `pr-ha`, which also records the exact case results.
+
 ## Boundaries
 
 The libtest accounting report proves that tests were selected and reported results, **not** that a test's assertions faithfully exercise production behavior (see [test-suite audit](test-suite-audit-2026-09-21.md)). Benchmarks, doctests, cargo-fuzz engine execution, FizzBee, Verus, and long-lived soak reports are tracked by their separate existing tools; they cannot be inferred from this test-case manifest. A test that silently early-returns without printing a skip cannot be proven to execute its claimed scenario by libtest alone: such tests need explicit scenario assertions and fail-closed prerequisites. CI sets `ROCKSTREAM_REQUIRE_DOCKER=1` on Docker-owned test suites and preflights the daemon.

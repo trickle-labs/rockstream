@@ -47,6 +47,8 @@ jobs:
             sleep "$((attempt * 10))"
           done
       - name: Record HA test case execution
+        env:
+          RS_TC_DEBUG: "1"
         run: python3 scripts/ci-test-inventory.py run --job pr-ha
       - name: Upload HA test evidence
         if: always()
@@ -55,11 +57,6 @@ jobs:
           name: ci-test-accounting-ha
           path: target/ci-test-results/
           if-no-files-found: error
-      - name: Control-plane HA tests
-        env:
-          RS_TC_DEBUG: "1"
-        run: cargo test -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1 --nocapture
-
   check-quality:
     name: Check quality
     runs-on: ubuntu-latest
