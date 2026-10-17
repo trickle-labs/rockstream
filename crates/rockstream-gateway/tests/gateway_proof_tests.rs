@@ -341,6 +341,20 @@ async fn v072_conditional_alter_workload_conflict_and_restart_revision() {
         .await
         .unwrap();
     assert_eq!(catalog.get_workload("fast").unwrap().revision, 1);
+    let revision_rows = client
+        .simple_query("SHOW WORKLOAD REVISION FOR fast")
+        .await
+        .unwrap();
+    let revision_values: Vec<_> = revision_rows
+        .iter()
+        .filter_map(|msg| match msg {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(vec![row.get(0).unwrap_or("").to_owned(), row.get(1).unwrap_or("").to_owned()])
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(revision_values, vec![vec!["fast", "1"]]);
     client
         .simple_query("ALTER WORKLOAD fast IF REVISION 1 SET (MEMORY_LIMIT=2048)")
         .await
