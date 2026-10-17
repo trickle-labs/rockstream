@@ -4,10 +4,8 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use rdkafka::{
     admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
-    consumer::{BaseConsumer, Consumer},
-    error::KafkaError,
     producer::{FutureProducer, FutureRecord},
-    ClientConfig, Message, Offset, TopicPartitionList,
+    ClientConfig,
 };
 use rockstream_connectors::{
     KafkaSink, KafkaSource, OffsetToken, SourceCheckpointStore, SourceRuntimeCoordinator,
@@ -15,17 +13,15 @@ use rockstream_connectors::{
 use rockstream_control::{audit::FileAuditLog, ControlService, ShardManager, TopologyCatalog};
 use rockstream_gateway::view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader};
 use rockstream_ops::{
-    compile_plan_with_sink_id,
-    kafka_sink::KafkaViewSink,
-    sink::{materialize_view_state, read_view_output, write_view_directory_entry, ColumnValue},
+    compile_plan_with_sink_id, kafka_sink::KafkaViewSink, sink::write_view_directory_entry,
     ArrowZSet,
 };
 use rockstream_plan::PlanNode;
-use rockstream_runtime::{exchange::persistence::committed_frontier, start_worker_client};
+use rockstream_runtime::start_worker_client;
 use rockstream_sim::qualification::worker_failure::{
     validate, RecoveryFailure, WorkerObservation, WorkerRecoveryEvidence, MANIFEST,
 };
-use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, ShardReader, WriteBatch};
+use rockstream_storage::{keys::ShardKeyEncoder, ShardReader, WriteBatch};
 use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS, MINIO_USER};
 use rockstream_types::{
     arrow_batch::split_weight_column,
@@ -39,28 +35,17 @@ use std::{
     path::Path,
     process::{Child, Command, Stdio},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::kafka::apache::{self, KAFKA_PORT};
 
+#[path = "common/recovery.rs"]
+mod recovery;
+use recovery::{consume, now_ms, observe, save};
+
 const ID: u64 = 126;
 const WAIT: Duration = Duration::from_secs(60);
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .try_into()
-        .unwrap()
-}
-
-fn save(path: &Path, value: &impl serde::Serialize) {
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(value).unwrap()).unwrap();
-    fs::rename(temporary, path).unwrap();
-}
 
 async fn read_observation(path: &Path, child: &mut Child) -> WorkerObservation {
     let deadline = Instant::now() + WAIT;
@@ -89,54 +74,6 @@ impl Drop for Workers {
             let _ = child.kill();
             let _ = child.wait();
         }
-    }
-}
-
-fn typed(values: &[ColumnValue]) -> Vec<Value> {
-    values
-        .iter()
-        .map(|v| match v {
-            ColumnValue::Int64(n) => json!({"Int64":n}),
-            ColumnValue::Utf8(s) => json!({"Utf8":s}),
-            other => panic!("unexpected scenario type {other:?}"),
-        })
-        .collect()
-}
-
-async fn observe(
-    db: &ShardDb,
-    worker: &rockstream_runtime::WorkerClientHandle,
-    source: &SourceRuntimeCoordinator<KafkaSource>,
-) -> WorkerObservation {
-    let output = read_view_output(db, OperatorId(ID), 2).await.unwrap();
-    let weighted_output = json!(output
-        .iter()
-        .map(|(epoch, row, values, weight)| json!([epoch, row, typed(values), weight]))
-        .collect::<Vec<_>>());
-    let relation = json!(materialize_view_state(output, &[])
-        .into_values()
-        .map(|(values, weight)| json!([typed(&values), weight]))
-        .collect::<Vec<_>>());
-    let metrics = source.metrics().await.unwrap();
-    WorkerObservation {
-        observed_at_ms: now_ms(),
-        process_id: std::process::id(),
-        lease: worker
-            .leases()
-            .into_iter()
-            .find(|l| l.shard_id == ShardId(ID))
-            .unwrap(),
-        source_epoch: source.committed_epoch(),
-        source_offsets: serde_json::from_slice(source.committed_offset().as_bytes()).unwrap(),
-        view_frontier: committed_frontier(db).await.unwrap(),
-        weighted_output,
-        relation,
-        in_flight_epochs: metrics.source_runtime_in_flight_epochs,
-        checkpoint_history_entries: metrics.source_checkpoint_history_entries,
-        sink_progress: serde_json::from_slice(
-            &db.get(b"\x06kafka-view/126").await.unwrap().unwrap(),
-        )
-        .unwrap(),
     }
 }
 
@@ -278,36 +215,6 @@ async fn worker_process_fixture() {
         &observe(&db, &worker, &source).await,
     );
     std::future::pending::<()>().await;
-}
-
-fn consume(bootstrap: &str) -> Value {
-    let consumer: BaseConsumer = ClientConfig::new()
-        .set("bootstrap.servers", bootstrap)
-        .set("group.id", "worker-recovery-oracle")
-        .set("enable.auto.commit", "false")
-        .set("isolation.level", "read_committed")
-        .set("enable.partition.eof", "true")
-        .create()
-        .unwrap();
-    let mut assignment = TopicPartitionList::new();
-    assignment
-        .add_partition_offset("worker-failure-output", 0, Offset::Beginning)
-        .unwrap();
-    consumer.assign(&assignment).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut records = Vec::new();
-    while Instant::now() < deadline {
-        match consumer.poll(Duration::from_millis(100)) {
-            Some(Ok(message)) => records.push(json!([
-                message.key_view::<str>().unwrap().unwrap(),
-                serde_json::from_slice::<Value>(message.payload().unwrap()).unwrap()
-            ])),
-            Some(Err(KafkaError::PartitionEOF(0))) => return json!(records),
-            Some(Err(error)) => panic!("sink consumer: {error}"),
-            None => {}
-        }
-    }
-    panic!("sink progress deadline");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

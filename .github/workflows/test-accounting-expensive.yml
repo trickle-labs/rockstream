@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       run_release_docker:
-        description: "Run rolling-upgrade release validation (requires two pinned image refs)"
+        description: "Build pinned revision fixtures and run rolling-upgrade release validation"
         type: boolean
         required: true
         default: false
@@ -74,27 +74,41 @@ jobs:
 
   release-docker:
     name: Release rolling-upgrade test accounting
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.run_release_docker == true
+    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v') || inputs.run_release_docker == true
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
-      ROCKSTREAM_ROLLING_N_IMAGE: ${{ vars.ROCKSTREAM_ROLLING_N_IMAGE }}
-      ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE: ${{ vars.ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE }}
+      # Earliest source revision containing the reusable #126 production path.
+      ROCKSTREAM_ROLLING_N_REVISION: ${{ vars.ROCKSTREAM_ROLLING_N_REVISION || '996b2c56258c1ad3c3deb30f339c5615dfdbed83' }}
+      ROCKSTREAM_UPGRADE_ARTIFACT_DIR: ${{ github.workspace }}/target/rolling-upgrade
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
       - name: Require Docker
         run: docker info
-      - name: Check pinned release image prerequisites
+      - name: Build old and candidate fixture images from exact source revisions
         run: |
-          test -n "$ROCKSTREAM_ROLLING_N_IMAGE"
-          test -n "$ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE"
-          test "$ROCKSTREAM_ROLLING_N_IMAGE" != "$ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE"
-          docker image inspect "$ROCKSTREAM_ROLLING_N_IMAGE" || docker pull "$ROCKSTREAM_ROLLING_N_IMAGE"
-          docker image inspect "$ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE" || docker pull "$ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE"
+          set -euo pipefail
+          [[ "$ROCKSTREAM_ROLLING_N_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          candidate_revision=$(git rev-parse HEAD)
+          test "$ROCKSTREAM_ROLLING_N_REVISION" != "$candidate_revision"
+          old_root="$RUNNER_TEMP/rolling-upgrade-old"
+          mkdir -p "$old_root" "$ROCKSTREAM_UPGRADE_ARTIFACT_DIR"
+          git archive "$ROCKSTREAM_ROLLING_N_REVISION" | tar -x -C "$old_root"
+          mkdir -p "$old_root/crates/rockstream-sim/examples" "$old_root/crates/rockstream-sim/tests/common"
+          cp crates/rockstream-sim/examples/upgrade_worker.rs "$old_root/crates/rockstream-sim/examples/"
+          cp crates/rockstream-sim/tests/common/recovery.rs "$old_root/crates/rockstream-sim/tests/common/"
+          old_version=$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1],"rb"))["workspace"]["package"]["version"])' "$old_root/Cargo.toml")
+          candidate_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          docker build -f deploy/qualification/Dockerfile --build-arg SOURCE_REVISION="$ROCKSTREAM_ROLLING_N_REVISION" --build-arg SOURCE_VERSION="$old_version" --iidfile "$ROCKSTREAM_UPGRADE_ARTIFACT_DIR/old-image.id" "$old_root"
+          docker build -f deploy/qualification/Dockerfile --build-arg SOURCE_REVISION="$candidate_revision" --build-arg SOURCE_VERSION="$candidate_version" --iidfile "$ROCKSTREAM_UPGRADE_ARTIFACT_DIR/candidate-image.id" .
+          echo "ROCKSTREAM_ROLLING_N_IMAGE=$(cat "$ROCKSTREAM_UPGRADE_ARTIFACT_DIR/old-image.id")" >> "$GITHUB_ENV"
+          echo "ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE=$(cat "$ROCKSTREAM_UPGRADE_ARTIFACT_DIR/candidate-image.id")" >> "$GITHUB_ENV"
       - name: Validate target ownership
         run: python3 scripts/ci-test-inventory.py check
       - name: Run rolling-upgrade verification without retries
@@ -104,5 +118,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-docker-test-evidence
-          path: target/ci-test-results/
+          path: |
+            target/ci-test-results/
+            target/rolling-upgrade/
           if-no-files-found: error
