@@ -134,3 +134,33 @@ async fn cross_namespace_subscription_is_denied_even_with_viewer_grant() {
     assert_eq!(reader.calls.load(Ordering::SeqCst), 0);
     assert_eq!(handler.subscribe_registry().active_streams(), 0);
 }
+
+#[tokio::test]
+async fn failed_transaction_must_reject_subscribe_before_reader_or_stream_admission() {
+    let reader = Arc::new(ObservedReader::default());
+    let handler = GatewayHandler::new(catalog_with_view("public"), reader.clone());
+    attach_viewer(&handler);
+    handler.acl_store.grant(AclEntry {
+        principal: "unprivileged".to_owned(),
+        namespace: "public".to_owned(),
+        view_name: Some("subscribed".to_owned()),
+        role: Role::Viewer,
+    });
+    {
+        let mut session = handler.sessions.entry("viewer".to_owned()).or_default();
+        session.begin_explicit();
+        session.fail_transaction();
+        assert!(session.is_in_failed_block());
+    }
+
+    let responses = handler
+        .dispatch_async_with_conn("SUBSCRIBE subscribed", Some("viewer"))
+        .await
+        .unwrap();
+    let [Response::Error(error)] = responses.as_slice() else {
+        panic!("a failed transaction must not establish a subscription");
+    };
+    assert_eq!(error.code, "25P02");
+    assert_eq!(reader.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(handler.subscribe_registry().active_streams(), 0);
+}
