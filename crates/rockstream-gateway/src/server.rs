@@ -6593,14 +6593,16 @@ impl GatewayHandler {
                 .trim_end_matches(';')
                 .trim_matches('"');
             let Some(workload) = self.catalog.get_workload(workload_name) else {
-                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "42704".to_owned(),
-                    format!(
-                        "[RS-1005] workload.not_found: workload '{}' does not exist.",
-                        workload_name
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42704".to_owned(),
+                        format!(
+                            "[RS-1005] workload.not_found: workload '{}' does not exist.",
+                            workload_name
+                        ),
                     ),
-                ))))]);
+                )))]);
             };
             return Ok(vec![catalog_resp_to_response(CatalogResponse::Rows {
                 columns: vec!["workload_name".to_owned(), "requested_revision".to_owned()],
@@ -18185,7 +18187,10 @@ fn parse_alter_workload(q: &str) -> Option<(String, Option<u64>, WorkloadSetting
     let upper = name_part.to_ascii_uppercase();
     let (workload_name, expected_revision) = if let Some(index) = upper.find(" IF REVISION ") {
         let version = name_part.get(index + " IF REVISION ".len()..)?.trim();
-        (name_part.get(..index)?.trim().trim_matches('"'), Some(version.parse::<u64>().ok()?))
+        (
+            name_part.get(..index)?.trim().trim_matches('"'),
+            Some(version.parse::<u64>().ok()?),
+        )
     } else {
         (name_part.trim_matches('"'), None)
     };
