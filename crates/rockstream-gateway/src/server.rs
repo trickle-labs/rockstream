@@ -8313,6 +8313,18 @@ impl GatewayHandler {
                         ),
                     )))]);
                 }
+                WorkloadRevisionOutcome::BelowLiveUse {
+                    requested,
+                    allocated,
+                } => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "54000".to_owned(),
+                        format!(
+                            "[RS-1006] workload.memory_below_live_use: requested limit {requested} bytes is below {allocated} bytes of live reservations. Next steps: reclaim the live state before reducing the limit."
+                        ),
+                    )))]);
+                }
                 WorkloadRevisionOutcome::RevisionExhausted => {
                     return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                         "ERROR".to_owned(),
