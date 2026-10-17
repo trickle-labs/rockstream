@@ -397,7 +397,7 @@ impl SubscriberHandle {
         }
 
         // Check consumer-too-slow bound.
-        if backlog as usize > SUBSCRIBE_BACKLOG_MAX {
+        if backlog > SUBSCRIBE_BACKLOG_MAX as u64 {
             return Err(SubscribeError::ConsumerTooSlow);
         }
 
@@ -497,59 +497,30 @@ where
 {
     let col_names_ref: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
 
-    let start_epoch = match &req.start {
+    let mut handle = match &req.start {
         SubscribeStart::NowWithSnapshot => {
-            // Check the *entire* snapshot before invoking any callback.
-            // Otherwise this public helper silently bypasses the same producer
-            // row/encoded-byte ceilings enforced by the PgWire subscription path.
-            for row in deliver_snapshot_checked(
-                snapshot_rows,
-                current_epoch,
-                req,
-                &col_names_ref,
-            )? {
+            // Validate the complete snapshot *before* sending any callback.
+            let rows = deliver_snapshot_checked(snapshot_rows, current_epoch, req, &col_names_ref)?;
+            for row in rows {
                 on_row(row);
             }
-            current_epoch
+            SubscriberHandle::new(req.view_name.clone(), current_epoch, req.clone(), col_names)
         }
-        SubscribeStart::Epoch(e) => {
-            // An unknown or lost in-memory history is not an empty durable
-            // stream. Do not invoke the row callback before this check.
-            registry.check_replay_start(&req.view_name, *e)?;
-            // Replay entries from log.
-            let (floor, replay) = registry.snapshot_since_epoch(&req.view_name, *e);
-            if floor.is_some_and(|floor| *e < floor) {
-                return Err(SubscribeError::ConsumerTooSlow);
+        SubscribeStart::Epoch(epoch) => {
+            // Use the same atomic replay-floor, backlog and per-epoch limits
+            // as the PgWire producer. Iterating registry entries directly
+            // here previously emitted partial results before discovering a
+            // too-slow consumer, and bypassed backlog accounting entirely.
+            let mut handle = start_from_epoch(registry, req, *epoch, col_names)?;
+            let rows = handle.poll(registry)?;
+            for row in rows {
+                on_row(row);
             }
-            let mut last = e.saturating_sub(1);
-            for entry in &replay {
-                if !passes_where(
-                    &entry.encoded_row,
-                    req.where_clause.as_deref(),
-                    &col_names_ref,
-                ) {
-                    last = entry.epoch;
-                    continue;
-                }
-                let projected = apply_projection(
-                    &entry.encoded_row,
-                    req.projection.as_deref(),
-                    &col_names_ref,
-                );
-                on_row(SubscribeRow {
-                    mz_timestamp: entry.epoch,
-                    mz_diff: entry.mz_diff,
-                    encoded_row: projected,
-                });
-                last = entry.epoch;
-            }
-            last
+            handle
         }
     };
 
-    // Live-tail loop.
-    let mut handle =
-        SubscriberHandle::new(req.view_name.clone(), start_epoch, req.clone(), col_names);
+    // Live-tail loop: keep the exact handle advanced by the replay poll.
     loop {
         if stop() {
             break;
