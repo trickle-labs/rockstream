@@ -211,38 +211,28 @@ fn parse_linux_proc_stat(
 
 #[cfg(target_os = "macos")]
 fn snapshot_macos(pid: u32) -> Result<ProcessSnapshot> {
-    // macOS libproc PROC_PIDTASKINFO (4) exposes real user/system CPU time
-    // and resident memory, not the ambiguous `ps stime` display keyword.
-    #[link(name = "proc")]
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: libc::c_int,
-            flavor: libc::c_int,
-            arg: u64,
-            buffer: *mut libc::c_void,
-            buffersize: libc::c_int,
-        ) -> libc::c_int;
-    }
+    // The pinned libc bindings define both the Darwin ABI and the libproc
+    // selector. Use their exact proc_taskinfo layout instead of guessed
+    // offsets or the ambiguous `ps stime` display field.
     let pid: libc::c_int = pid.try_into().context("macOS PID out of range")?;
-    // A u64 array is correctly aligned and larger than proc_taskinfo; the
-    // leading members are virtual, resident, user and system nanoseconds.
-    let mut info = [0u64; 16];
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let expected = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
     let returned = unsafe {
-        proc_pidinfo(
+        libc::proc_pidinfo(
             pid,
-            4,
+            libc::PROC_PIDTASKINFO,
             0,
-            info.as_mut_ptr().cast(),
-            std::mem::size_of_val(&info) as libc::c_int,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            expected,
         )
     };
-    if returned < 6 * std::mem::size_of::<u64>() as libc::c_int {
+    if returned != expected {
         bail!("macOS proc_pidinfo returned incomplete task counters for pid {pid}");
     }
     Ok(ProcessSnapshot {
-        user_cpu_ns: info[2],
-        system_cpu_ns: info[3],
-        rss_bytes: info[1],
+        user_cpu_ns: info.pti_total_user,
+        system_cpu_ns: info.pti_total_system,
+        rss_bytes: info.pti_resident_size,
     })
 }
 
