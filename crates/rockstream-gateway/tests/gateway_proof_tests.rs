@@ -556,6 +556,81 @@ async fn copy_out_streams_view_rows() {
     );
 }
 
+/// A rejected COPY OUT must send an error before emitting any COPY frames.
+/// This protects the complete-response contract when a view exceeds the frozen
+/// v0.72 interactive row ceiling; it is not a storage materialization benchmark.
+#[tokio::test]
+async fn v072_copy_out_row_cap_fails_before_streaming() {
+    let store = Arc::new(InMemory::new());
+    let shard_db = ShardDb::builder("copy-overflow-shard", store.clone())
+        .build()
+        .await
+        .unwrap();
+    for i in 0..=rockstream_gateway::copy_out_budget::MAX_COPY_OUT_ROWS {
+        let key = format!("view_output/overfull_view/{i:08}");
+        shard_db.put(key.as_bytes(), b"value").await.unwrap();
+    }
+    shard_db.flush().await.unwrap();
+    let reader = ShardReader::open("copy-overflow-shard", store)
+        .await
+        .unwrap();
+    let catalog = CatalogStubs::new();
+    catalog.add_view(CatalogView {
+        name: "overfull_view".to_string(),
+        sql: "SELECT value FROM source".to_string(),
+        columns: vec![CatalogColumn {
+            name: "value".to_string(),
+            data_type: "Utf8".to_string(),
+        }],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(catalog),
+        Arc::new(HotOnlyViewReader {
+            shard_reader: Arc::new(reader),
+            frontier_epoch: Some(1),
+        }),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("test", "test"))
+        .await
+        .unwrap();
+    drain_until_ready(&mut stream).await;
+    stream
+        .write_all(&build_query_message("COPY overfull_view TO STDOUT"))
+        .await
+        .unwrap();
+    let mut message_types = Vec::new();
+    let mut error_text = None;
+    loop {
+        let ty = read_u8(&mut stream).await;
+        let length = read_u32_be(&mut stream).await as usize;
+        let mut payload = vec![0; length - 4];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut payload)
+            .await
+            .unwrap();
+        message_types.push(ty);
+        if ty == b'E' {
+            error_text = Some(String::from_utf8_lossy(&payload).to_string());
+        }
+        if ty == b'Z' {
+            break;
+        }
+    }
+    assert_eq!(message_types, vec![b'E', b'Z']);
+    assert!(
+        error_text
+            .as_deref()
+            .unwrap()
+            .contains("COPY OUT rows 10001 exceed limit 10000"),
+        "the preflight must reject the entire oversized response"
+    );
+}
+
 /// Build a PostgreSQL startup message for user/dbname.
 fn build_startup_message(user: &str, db: &str) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::new();

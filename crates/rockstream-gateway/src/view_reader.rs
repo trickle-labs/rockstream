@@ -136,7 +136,11 @@ impl HotOnlyViewReader {
     /// a shard it didn't itself write, and the shape a handful of
     /// lower-level protocol tests seed directly), falls back to the legacy
     /// `view_output/{view_name}/` string-keyed prefix scan.
-    async fn materialized_rows(&self, view_name: &str) -> Result<Vec<Vec<u8>>, GatewayError> {
+    async fn materialized_rows(
+        &self,
+        view_name: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
         let Some((op_id, num_cols, pk)) =
             rockstream_ops::sink::read_view_directory_entry_via_reader(
                 &self.shard_reader,
@@ -149,7 +153,11 @@ impl HotOnlyViewReader {
         else {
             let prefix = format!("view_output/{view_name}/");
             let kvs = self.shard_reader.scan_prefix(prefix.as_bytes()).await?;
-            return Ok(kvs.into_iter().map(|(_k, v)| v.to_vec()).collect());
+            return Ok(kvs
+                .into_iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(|(_k, v)| v.to_vec())
+                .collect());
         };
         let stored =
             rockstream_ops::sink::read_view_output_via_reader(&self.shard_reader, op_id, num_cols)
@@ -167,6 +175,9 @@ impl HotOnlyViewReader {
                 })
                 .take(count.max(0) as usize)
             })
+            // Apply the row limit before expanding potentially huge
+            // multiplicities, not after materializing every weighted copy.
+            .take(limit.unwrap_or(usize::MAX))
             .collect())
     }
 
@@ -185,7 +196,7 @@ impl HotOnlyViewReader {
                 detail: format!("read_view_directory_entry({view_name}): {e}"),
             })?
         else {
-            let rows = self.materialized_rows(view_name).await?;
+            let rows = self.materialized_rows(view_name, None).await?;
             return tsv_rows_to_record_batches(&rows);
         };
         let stored =
@@ -212,12 +223,7 @@ impl ViewReader for HotOnlyViewReader {
                 "TwoTier strategy reserved for Phase 9".to_string(),
             ));
         }
-        let rows = self.materialized_rows(view_name).await?;
-        let rows = match limit {
-            Some(n) => rows.into_iter().take(n).collect(),
-            None => rows,
-        };
-        Ok(rows)
+        self.materialized_rows(view_name, limit).await
     }
 
     async fn read_view_batches(
@@ -246,7 +252,7 @@ impl ViewReader for HotOnlyViewReader {
                 "TwoTier strategy reserved for Phase 9".to_string(),
             ));
         }
-        let rows = self.materialized_rows(view_name).await?;
+        let rows = self.materialized_rows(view_name, None).await?;
 
         // Build batches: each batch is at most ROWS_IN_FLIGHT_BATCH rows and
         // at most STREAM_BATCH_BYTES bytes in total per-connection.
@@ -622,6 +628,50 @@ mod tests {
         assert!(
             matches!(err, Err(GatewayError::NotSupported(_))),
             "TwoTier should return NotSupported"
+        );
+    }
+
+    /// v0.72: a small returned-row limit must be applied before expanding
+    /// a committed row with enormous positive multiplicity.
+    #[tokio::test]
+    async fn v072_read_view_limit_bounds_weighted_row_expansion() {
+        let store = Arc::new(InMemory::new());
+        let shard_db = Arc::new(
+            ShardDb::builder("weighted-limit-shard", store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64]))]).unwrap();
+        let zset = ArrowZSet::new(batch, vec![1_000_000_000]);
+        ViewSinkOp::new(shard_db.clone(), OperatorId(7))
+            .write_next_epoch(&zset)
+            .await
+            .unwrap();
+        write_view_directory_entry(&shard_db, "weighted_view", OperatorId(7), 1, &[0])
+            .await
+            .unwrap();
+        shard_db.flush().await.unwrap();
+        let reader = rockstream_storage::ShardReader::open("weighted-limit-shard", store)
+            .await
+            .unwrap();
+        let view_reader = HotOnlyViewReader {
+            shard_reader: Arc::new(reader),
+            frontier_epoch: Some(1),
+        };
+        let rows = view_reader
+            .read_view("weighted_view", Some(3), ViewReadStrategy::HotOnly)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![b"7".to_vec(), b"7".to_vec(), b"7".to_vec()]);
+        assert_eq!(
+            view_reader
+                .read_view("weighted_view", Some(0), ViewReadStrategy::HotOnly)
+                .await
+                .unwrap(),
+            Vec::<Vec<u8>>::new()
         );
     }
 

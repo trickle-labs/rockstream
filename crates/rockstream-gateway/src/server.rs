@@ -106,7 +106,7 @@ use crate::pgoutput_coordinator::{
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::subscribe_handler::{
-    deliver_snapshot, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
+    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
 };
 use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -5112,6 +5112,11 @@ impl GatewayHandler {
         // COPY OUT: stream CopyData messages directly through the client sink.
         if ql.starts_with("copy ") && ql.contains(" to stdout") {
             if let Some(view_name) = parse_copy_to_stdout_view(query) {
+                // COPY OUT must use the same ACL and namespace checks as SELECT.
+                // Do not read rows or emit a COPY frame before checking access.
+                if let Some(denied) = self.select_access_error_response(&view_name, Some(conn_id)) {
+                    return Ok(denied);
+                }
                 if self.catalog.get_view(&view_name).is_some()
                     && !self.catalog.is_backfill_published(&view_name)
                 {
@@ -5119,9 +5124,25 @@ impl GatewayHandler {
                 }
                 let rows = self
                     .view_reader
-                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
+                    .read_view(
+                        &view_name,
+                        Some(crate::copy_out_budget::MAX_COPY_OUT_ROWS + 1),
+                        ViewReadStrategy::HotOnly,
+                    )
                     .await
                     .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                // Error before any CopyOutResponse or CopyData. The reader's
+                // current materialization implementation remains unbounded;
+                // this is a wire-output guard, not yet full producer admission.
+                if let Err(error) = crate::copy_out_budget::check_copy_out_bounds(&rows) {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "54000".to_owned(),
+                        format!(
+                            "[RS-9001] copy_out.limit_exceeded: {error}. Next steps: narrow the query or use a bounded result page."
+                        ),
+                    )))]);
+                }
                 let row_count = rows.len();
 
                 let col_count = self
@@ -5481,6 +5502,12 @@ impl GatewayHandler {
             )))]);
         }
 
+        // A drop-owned slot lives inside the returned stream. Reject before
+        // scanning the snapshot rather than accepting unlimited subscriptions.
+        let stream_slot = match self.subscribe_registry.acquire_stream() {
+            Ok(slot) => slot,
+            Err(error) => return Ok(vec![subscribe_error_response(error)]),
+        };
         let col_names = request.projection.clone().unwrap_or_else(|| {
             catalog_columns
                 .iter()
@@ -5510,12 +5537,12 @@ impl GatewayHandler {
                     .map(|(index, row)| (Bytes::from(index.to_string()), Bytes::from(row)))
                     .collect();
                 let column_refs: Vec<&str> = col_names.iter().map(String::as_str).collect();
-                pending.extend(deliver_snapshot(
-                    snapshot,
-                    start_epoch,
-                    &request,
-                    &column_refs,
-                ));
+                let snapshot_rows =
+                    match deliver_snapshot_checked(snapshot, start_epoch, &request, &column_refs) {
+                        Ok(rows) => rows,
+                        Err(error) => return Ok(vec![subscribe_error_response(error)]),
+                    };
+                pending.extend(snapshot_rows);
                 SubscriberHandle::new(
                     request.view_name.clone(),
                     start_epoch,
@@ -5563,8 +5590,8 @@ impl GatewayHandler {
         let stream_schema = schema.clone();
         let registry = self.subscribe_registry.clone();
         let data_stream = Box::pin(stream::unfold(
-            (registry, handle, pending, stream_schema, false),
-            |(registry, mut handle, mut pending, schema, failed)| async move {
+            (registry, handle, pending, stream_schema, false, stream_slot),
+            |(registry, mut handle, mut pending, schema, failed, stream_slot)| async move {
                 if failed {
                     return None;
                 }
@@ -5575,28 +5602,37 @@ impl GatewayHandler {
                             if let Err(error) = encoder.encode_field(&Some(value)) {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true),
+                                    (registry, handle, pending, schema, true, stream_slot),
                                 ));
                             }
                         }
                         let timestamp = row.mz_timestamp.to_string();
                         if let Err(error) = encoder.encode_field(&Some(timestamp.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                            return Some((
+                                Err(error),
+                                (registry, handle, pending, schema, true, stream_slot),
+                            ));
                         }
                         let diff = row.mz_diff.to_string();
                         if let Err(error) = encoder.encode_field(&Some(diff.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                            return Some((
+                                Err(error),
+                                (registry, handle, pending, schema, true, stream_slot),
+                            ));
                         }
                         let encoded = match encoder.finish() {
                             Ok(encoded) => encoded,
                             Err(error) => {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true),
+                                    (registry, handle, pending, schema, true, stream_slot),
                                 ));
                             }
                         };
-                        return Some((Ok(encoded), (registry, handle, pending, schema, false)));
+                        return Some((
+                            Ok(encoded),
+                            (registry, handle, pending, schema, false, stream_slot),
+                        ));
                     }
                     match handle.poll(&registry) {
                         Ok(rows) if !rows.is_empty() => pending.extend(rows),
@@ -5604,7 +5640,7 @@ impl GatewayHandler {
                         Err(error) => {
                             return Some((
                                 Err(PgWireError::ApiError(Box::new(error))),
-                                (registry, handle, pending, schema, true),
+                                (registry, handle, pending, schema, true, stream_slot),
                             ));
                         }
                     }
@@ -9945,6 +9981,12 @@ impl GatewayHandler {
             self.frontier_published_at_ms
                 .store(current_time_ms(), Ordering::SeqCst);
 
+            // Publish a complete committed epoch per table under one registry
+            // lock. Readers cannot poll half an UPDATE or half an epoch.
+            let mut changes: std::collections::HashMap<
+                String,
+                Vec<crate::change_log::ChangeEntry>,
+            > = std::collections::HashMap::new();
             for op in &ops {
                 let (table, row_key, mz_diff, encoded_row) = match op {
                     DmlOp::Insert {
@@ -9970,8 +10012,7 @@ impl GatewayHandler {
                         new_row_key,
                         new_tsv,
                     } => {
-                        self.subscribe_registry.push(
-                            table,
+                        changes.entry(table.clone()).or_default().push(
                             crate::change_log::ChangeEntry {
                                 epoch,
                                 row_key: Bytes::from(old_row_key.clone()),
@@ -9982,15 +10023,22 @@ impl GatewayHandler {
                         (table.clone(), new_row_key.clone(), 1, new_tsv.clone())
                     }
                 };
-                self.subscribe_registry.push(
-                    &table,
-                    crate::change_log::ChangeEntry {
+                changes
+                    .entry(table)
+                    .or_default()
+                    .push(crate::change_log::ChangeEntry {
                         epoch,
                         row_key: Bytes::from(row_key),
                         mz_diff,
                         encoded_row: Bytes::from(encoded_row),
-                    },
-                );
+                    });
+            }
+            for (table, batch) in changes {
+                if let Err(error) = self.subscribe_registry.push_epoch(&table, batch) {
+                    // The DML was already durable: do not claim rejection of that
+                    // transaction. The registry invalidates replay instead.
+                    tracing::warn!(%table, %epoch, %error, "subscription replay requires resnapshot");
+                }
             }
             (epoch, ops)
         };
@@ -10577,6 +10625,8 @@ impl GatewayHandler {
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        use datafusion::arrow::datatypes::DataType;
+
         // Parse INSERT INTO <table> [(cols)] VALUES (v1, v2, ...)[, (v1, v2, ...)]* [RETURNING ...]
         let returning = q.to_lowercase().contains(" returning ");
         let (table, cols, rows) = match parse_insert(q) {
@@ -10630,6 +10680,17 @@ impl GatewayHandler {
             .get(&table)
             .map(|entry| entry.value().clone());
 
+        let decimal_columns: Vec<_> = self
+            .catalog
+            .get_table(&table)
+            .into_iter()
+            .flat_map(|table| table.columns)
+            .filter_map(|column| {
+                let datatype = string_to_arrow_datatype(&column.data_type);
+                matches!(datatype, DataType::Decimal128(_, _)).then_some((column.name, datatype))
+            })
+            .collect();
+
         let pk_cols = self
             .catalog
             .get_table(&table)
@@ -10662,6 +10723,26 @@ impl GatewayHandler {
                             .to_string(),
                     };
                     value_map.insert(column.clone(), generated);
+                }
+            }
+
+            // Validate every decimal before buffering any row from this statement.
+            for (column, datatype) in &decimal_columns {
+                if let Some(value) = value_map.get_mut(column).filter(|v| v.as_str() != r"\N") {
+                    use rockstream_sql::dml::{DmlLiteral, DmlScalarExpr};
+                    match DmlScalarExpr::Literal(DmlLiteral::String(value.clone()))
+                        .evaluate_assignment(&HashMap::new(), &HashMap::new(), datatype)
+                    {
+                        Ok(Some(formatted)) => *value = formatted,
+                        Ok(None) => *value = r"\N".to_owned(),
+                        Err(error) => {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "22003".to_owned(),
+                                error.to_string(),
+                            ))));
+                        }
+                    }
                 }
             }
 

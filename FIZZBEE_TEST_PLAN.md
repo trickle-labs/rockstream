@@ -1245,6 +1245,30 @@ RockStream usage. (Sourced from the FizzBee design-verification tutorials.)
 > which is the more established mechanism and is mandatory for M2's
 > reordering proof regardless. Test harness and durability assertions align with v0.64.
 
+## v0.72 bounded adaptive epoch windows (issue #134)
+
+The in-memory epoch compactor may adjust only the time when a logical epoch is
+eligible for its existing flush path. It must not change the epoch's identity,
+reorder dependencies, or replace the durability/acknowledgement transition.
+
+Model refinement obligations:
+
+- Reject zero, reversed, or out-of-range lower/upper startup bounds.
+- The chosen window is always inside the validated closed interval. Four
+  inputs are required: ingest rows/s, observed durable-commit latency, state
+  pressure, and target committed-result freshness.
+- Reserve the observed durable commit time before selecting an epoch window.
+  If the target cannot fit the minimum epoch window plus commit time, expose
+  an explicit infeasible decision instead of claiming the target was met.
+- Adaptation can change when work becomes flush-eligible but not its rows,
+  signed weights, epoch number, ordering, or durable acknowledgement.
+- Commit failure, retries, restart, competing workload fairness, queue bounds,
+  and independent result correctness still require separate integrated proof.
+
+The source-level decision and live-expiration regressions are in
+`crates/rockstream-runtime/tests/v072_adaptive_epoch_tests.rs`. They validate
+this local transition, **not** the full #134 durable/fair scheduling contract.
+
 ## v0.72 worker-budget admission and cancellation ownership (issue #133)
 
 The worker quota changes refine the resource-ownership transition used by
