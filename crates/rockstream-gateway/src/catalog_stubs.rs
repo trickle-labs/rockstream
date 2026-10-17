@@ -478,6 +478,15 @@ struct CatalogStubsInner {
 
 use rockstream_types::explain::ArrangementSharingInfo;
 
+/// Result of a workload revision-conditioned catalog mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadRevisionOutcome {
+    Updated(u64),
+    NotFound,
+    Conflict { expected: u64, actual: u64 },
+    RevisionExhausted,
+}
+
 /// In-memory catalog of views exposed to Postgres clients.
 ///
 /// Thread-safe via interior `RwLock` so that `Arc<CatalogStubs>` can be
@@ -486,6 +495,8 @@ use rockstream_types::explain::ArrangementSharingInfo;
 pub struct CatalogStubs {
     inner: RwLock<CatalogStubsInner>,
     workload_catalog: Option<Arc<WorkloadCatalog>>,
+    /// Serializes producer-side async workload mutations, including durable writes.
+    workload_edit_lock: tokio::sync::Mutex<()>,
     // Naturally bounded by the number of catalog-defined workloads.
     workload_budgets: RwLock<HashMap<String, Arc<WorkloadBudget>>>,
     view_budgets: RwLock<HashMap<String, Arc<StateBudget>>>,
@@ -564,6 +575,7 @@ impl CatalogStubs {
         Self {
             inner: RwLock::new(CatalogStubsInner::default()),
             workload_catalog: None,
+            workload_edit_lock: tokio::sync::Mutex::new(()),
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
@@ -583,6 +595,7 @@ impl CatalogStubs {
         let catalog = Self {
             inner: RwLock::new(CatalogStubsInner::default()),
             workload_catalog: Some(Arc::clone(&workload_catalog)),
+            workload_edit_lock: tokio::sync::Mutex::new(()),
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
@@ -1208,11 +1221,16 @@ impl CatalogStubs {
         true
     }
 
-    pub fn update_workload(&self, workload: WorkloadDef) -> bool {
+    pub fn update_workload(&self, mut workload: WorkloadDef) -> bool {
         let mut inner = self.inner.write().unwrap();
-        if !inner.workloads.contains_key(&workload.name) {
+        let Some(next_revision) = inner
+            .workloads
+            .get(&workload.name)
+            .and_then(|current| current.revision.checked_add(1))
+        else {
             return false;
-        }
+        };
+        workload.revision = next_revision;
         inner
             .workloads
             .insert(workload.name.clone(), workload.clone());
@@ -1226,6 +1244,43 @@ impl CatalogStubs {
             rockstream_storage::catalog::CatalogMutation::PutWorkload(workload),
         ]);
         true
+    }
+
+    /// Linearizable compare-and-swap of the in-memory workload definition.
+    /// Conflicting callers never clear the effective budget or persist a stale definition.
+    /// Durable and owner-side acknowledgement require the async control path.
+    pub fn update_workload_if_revision(
+        &self,
+        mut workload: WorkloadDef,
+        expected_revision: u64,
+    ) -> WorkloadRevisionOutcome {
+        let mut inner = self.inner.write().unwrap();
+        let Some(current) = inner.workloads.get(&workload.name) else {
+            return WorkloadRevisionOutcome::NotFound;
+        };
+        if current.revision != expected_revision {
+            return WorkloadRevisionOutcome::Conflict {
+                expected: expected_revision,
+                actual: current.revision,
+            };
+        }
+        let Some(next_revision) = current.revision.checked_add(1) else {
+            return WorkloadRevisionOutcome::RevisionExhausted;
+        };
+        workload.revision = next_revision;
+        inner
+            .workloads
+            .insert(workload.name.clone(), workload.clone());
+        self.workload_budgets
+            .write()
+            .unwrap()
+            .remove(&workload.name);
+        drop(inner);
+        self.invalidate_projection_caches();
+        self.persist_mutations(vec![
+            rockstream_storage::catalog::CatalogMutation::PutWorkload(workload),
+        ]);
+        WorkloadRevisionOutcome::Updated(next_revision)
     }
 
     pub fn remove_workload(&self, workload_name: &str) -> bool {
@@ -1263,13 +1318,48 @@ impl CatalogStubs {
     }
 
     pub async fn update_workload_async(&self, workload: WorkloadDef) -> Result<bool, SqlError> {
-        if !self.update_workload(workload.clone()) {
+        let _edit = self.workload_edit_lock.lock().await;
+        let Some(current) = self.get_workload(&workload.name) else {
             return Ok(false);
-        }
+        };
+        let Some(next_revision) = current.revision.checked_add(1) else {
+            return Ok(false);
+        };
+        let mut updated = workload.clone();
+        updated.revision = next_revision;
         if let Some(catalog) = &self.workload_catalog {
-            catalog.update_workload(&workload).await?;
+            catalog.update_workload(&updated).await?;
         }
-        Ok(true)
+        Ok(self.update_workload(workload))
+    }
+
+    /// Conditional update: never send an outdated policy to durable storage.
+    /// This path serializes other gateway async workload mutations and checks
+    /// the persisted revision before invoking the catalog write.
+    pub async fn update_workload_if_revision_async(
+        &self,
+        workload: WorkloadDef,
+        expected_revision: u64,
+    ) -> Result<WorkloadRevisionOutcome, SqlError> {
+        let _edit = self.workload_edit_lock.lock().await;
+        let Some(current) = self.get_workload(&workload.name) else {
+            return Ok(WorkloadRevisionOutcome::NotFound);
+        };
+        if current.revision != expected_revision {
+            return Ok(WorkloadRevisionOutcome::Conflict {
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        let Some(next_revision) = current.revision.checked_add(1) else {
+            return Ok(WorkloadRevisionOutcome::RevisionExhausted);
+        };
+        let mut updated = workload.clone();
+        updated.revision = next_revision;
+        if let Some(catalog) = &self.workload_catalog {
+            catalog.update_workload(&updated).await?;
+        }
+        Ok(self.update_workload_if_revision(workload, expected_revision))
     }
 
     pub async fn remove_workload_async(&self, workload_name: &str) -> Result<bool, SqlError> {
@@ -5483,6 +5573,93 @@ mod tests {
                 "workload.memory_limit_recovered".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn v072_conditional_workload_edits_conflict_and_preserve_requested_policy() {
+        let catalog = CatalogStubs::new();
+        assert!(catalog.add_workload(WorkloadDef::new("fast")));
+        assert_eq!(catalog.get_workload("fast").unwrap().revision, 1);
+        let changed = WorkloadDef::new("fast").with_memory_limit(
+            rockstream_types::workload::MemoryLimit::new(1024),
+        );
+        assert_eq!(
+            catalog.update_workload_if_revision(changed.clone(), 1),
+            WorkloadRevisionOutcome::Updated(2)
+        );
+        assert_eq!(
+            catalog.update_workload_if_revision(WorkloadDef::new("fast"), 1),
+            WorkloadRevisionOutcome::Conflict {
+                expected: 1,
+                actual: 2
+            }
+        );
+        let actual = catalog.get_workload("fast").unwrap();
+        assert_eq!(actual.revision, 2);
+        assert_eq!(actual.memory_limit.unwrap().bytes, 1024);
+        assert_eq!(
+            catalog.update_workload_if_revision(WorkloadDef::new("missing"), 1),
+            WorkloadRevisionOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn v072_concurrent_conditional_edits_choose_exactly_one_winner() {
+        let catalog = CatalogStubs::new();
+        assert!(catalog.add_workload(WorkloadDef::new("concurrent")));
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|n| {
+                    let catalog = &catalog;
+                    scope.spawn(move || {
+                        catalog.update_workload_if_revision(
+                            WorkloadDef::new("concurrent").with_memory_limit(
+                                rockstream_types::workload::MemoryLimit::new(n + 1),
+                            ),
+                            1,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            results
+                .iter()
+                .filter(|outcome| matches!(outcome, WorkloadRevisionOutcome::Updated(2)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    WorkloadRevisionOutcome::Conflict {
+                        expected: 1,
+                        actual: 2
+                    }
+                ))
+                .count(),
+            15
+        );
+        assert_eq!(catalog.get_workload("concurrent").unwrap().revision, 2);
+    }
+
+    #[test]
+    fn v072_conditional_workload_revision_overflow_is_fail_closed() {
+        let catalog = CatalogStubs::new();
+        let mut workload = WorkloadDef::new("overflow");
+        workload.revision = u64::MAX;
+        assert!(catalog.add_workload(workload.clone()));
+        assert_eq!(
+            catalog.update_workload_if_revision(WorkloadDef::new("overflow"), u64::MAX),
+            WorkloadRevisionOutcome::RevisionExhausted
+        );
+        assert_eq!(catalog.get_workload("overflow").unwrap(), workload);
     }
 
     #[test]

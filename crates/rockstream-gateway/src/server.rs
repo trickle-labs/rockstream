@@ -91,7 +91,7 @@ use crate::auth::{
 };
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
-    CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail,
+    CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail, WorkloadRevisionOutcome,
 };
 
 use crate::copy_state::{
@@ -8254,7 +8254,7 @@ impl GatewayHandler {
     }
 
     async fn handle_alter_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
-        let Some((workload_name, changes)) = parse_alter_workload(q) else {
+        let Some((workload_name, expected_revision, changes)) = parse_alter_workload(q) else {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42601".to_owned(),
@@ -8272,11 +8272,40 @@ impl GatewayHandler {
             )))]);
         };
         apply_workload_settings(&mut workload, &changes);
-        let updated = self
-            .catalog
-            .update_workload_async(workload.clone())
-            .await
-            .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+        let updated = if let Some(expected) = expected_revision {
+            match self
+                .catalog
+                .update_workload_if_revision_async(workload.clone(), expected)
+                .await
+                .map_err(|error| PgWireError::ApiError(Box::new(error)))?
+            {
+                WorkloadRevisionOutcome::Updated(_) => true,
+                WorkloadRevisionOutcome::NotFound => false,
+                WorkloadRevisionOutcome::Conflict { expected, actual } => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "40001".to_owned(),
+                        format!(
+                            "[RS-1006] workload.revision_conflict: expected revision {expected}, actual revision {actual}. Next steps: read the current workload revision and retry the edit."
+                        ),
+                    )))]);
+                }
+                WorkloadRevisionOutcome::RevisionExhausted => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "54000".to_owned(),
+                        "[RS-1006] workload.revision_exhausted: revision counter cannot advance. Next steps: contact the operator.".to_owned(),
+                    )))]);
+                }
+            }
+        } else {
+            // Legacy unconditioned ALTER remains for backwards compatibility;
+            // strict v0.72 revisions use IF REVISION <n>.
+            self.catalog
+                .update_workload_async(workload.clone())
+                .await
+                .map_err(|error| PgWireError::ApiError(Box::new(error)))?
+        };
         if !updated {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -18107,7 +18136,7 @@ fn parse_create_workload(q: &str) -> Option<WorkloadDef> {
     Some(workload)
 }
 
-fn parse_alter_workload(q: &str) -> Option<(String, WorkloadSettings)> {
+fn parse_alter_workload(q: &str) -> Option<(String, Option<u64>, WorkloadSettings)> {
     let after = q
         .trim()
         .strip_prefix("ALTER WORKLOAD ")
@@ -18117,13 +18146,27 @@ fn parse_alter_workload(q: &str) -> Option<(String, WorkloadSettings)> {
     let (name_part, settings_part) = after
         .split_once(" SET ")
         .or_else(|| after.split_once(" set "))?;
-    let workload_name = name_part.trim().trim_matches('"');
+    let name_part = name_part.trim();
+    let upper = name_part.to_ascii_uppercase();
+    let (workload_name, expected_revision) = if let Some(index) = upper.find(" IF REVISION ") {
+        let version = name_part.get(index + " IF REVISION ".len()..)?.trim();
+        (name_part.get(..index)?.trim().trim_matches('"'), Some(version.parse::<u64>().ok()?))
+    } else {
+        (name_part.trim_matches('"'), None)
+    };
+    if workload_name.is_empty() {
+        return None;
+    }
     let body = settings_part
         .trim()
         .strip_prefix('(')?
         .strip_suffix(')')?
         .trim();
-    Some((workload_name.to_string(), parse_workload_settings(body)?))
+    Some((
+        workload_name.to_string(),
+        expected_revision,
+        parse_workload_settings(body)?,
+    ))
 }
 
 fn parse_drop_workload(q: &str) -> Option<String> {

@@ -319,6 +319,66 @@ async fn alter_workload_updates_requested_fields() {
 }
 
 #[tokio::test]
+async fn v072_conditional_alter_workload_conflict_and_restart_revision() {
+    let dir = TempDir::new().unwrap();
+    let db = open_local_shard_db(&dir).await;
+    let workload_catalog = Arc::new(WorkloadCatalog::new(Arc::clone(&db)));
+    let catalog = Arc::new(
+        CatalogStubs::with_workload_catalog(Arc::clone(&workload_catalog))
+            .await
+            .unwrap(),
+    );
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&catalog),
+        Arc::new(NoopViewReader),
+    );
+    let (addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    client
+        .simple_query("CREATE WORKLOAD fast WITH (MEMORY_LIMIT=1024)")
+        .await
+        .unwrap();
+    assert_eq!(catalog.get_workload("fast").unwrap().revision, 1);
+    client
+        .simple_query("ALTER WORKLOAD fast IF REVISION 1 SET (MEMORY_LIMIT=2048)")
+        .await
+        .unwrap();
+    let updated = catalog.get_workload("fast").unwrap();
+    assert_eq!((updated.revision, updated.memory_limit.unwrap().bytes), (2, 2048));
+
+    let error = client
+        .simple_query("ALTER WORKLOAD fast IF REVISION 1 SET (MEMORY_LIMIT=4096)")
+        .await
+        .unwrap_err();
+    let postgres = error.as_db_error().unwrap();
+    assert_eq!(postgres.code().code(), "40001");
+    assert!(postgres.message().contains("expected revision 1, actual revision 2"));
+    let unchanged = catalog.get_workload("fast").unwrap();
+    assert_eq!(
+        (unchanged.revision, unchanged.memory_limit.unwrap().bytes),
+        (2, 2048)
+    );
+
+    handle.abort();
+    drop(client);
+    drop(server);
+    drop(catalog);
+    drop(workload_catalog);
+    drop(db);
+    let reopened = open_local_shard_db(&dir).await;
+    let restarted = CatalogStubs::with_workload_catalog(Arc::new(WorkloadCatalog::new(reopened)))
+        .await
+        .unwrap();
+    let recovered = restarted.get_workload("fast").unwrap();
+    assert_eq!(
+        (recovered.revision, recovered.memory_limit.unwrap().bytes),
+        (2, 2048)
+    );
+}
+
+#[tokio::test]
 async fn alter_workload_nonexistent_returns_rs1005() {
     let server = GatewayServer::with_catalog(
         "127.0.0.1:0".parse().unwrap(),
