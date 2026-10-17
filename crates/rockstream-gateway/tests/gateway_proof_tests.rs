@@ -348,9 +348,10 @@ async fn v072_conditional_alter_workload_conflict_and_restart_revision() {
     let revision_values: Vec<_> = revision_rows
         .iter()
         .filter_map(|msg| match msg {
-            tokio_postgres::SimpleQueryMessage::Row(row) => {
-                Some(vec![row.get(0).unwrap_or("").to_owned(), row.get(1).unwrap_or("").to_owned()])
-            }
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(vec![
+                row.get(0).unwrap_or("").to_owned(),
+                row.get(1).unwrap_or("").to_owned(),
+            ]),
             _ => None,
         })
         .collect();
@@ -360,7 +361,10 @@ async fn v072_conditional_alter_workload_conflict_and_restart_revision() {
         .await
         .unwrap();
     let updated = catalog.get_workload("fast").unwrap();
-    assert_eq!((updated.revision, updated.memory_limit.unwrap().bytes), (2, 2048));
+    assert_eq!(
+        (updated.revision, updated.memory_limit.unwrap().bytes),
+        (2, 2048)
+    );
 
     let error = client
         .simple_query("ALTER WORKLOAD fast IF REVISION 1 SET (MEMORY_LIMIT=4096)")
@@ -368,7 +372,9 @@ async fn v072_conditional_alter_workload_conflict_and_restart_revision() {
         .unwrap_err();
     let postgres = error.as_db_error().unwrap();
     assert_eq!(postgres.code().code(), "40001");
-    assert!(postgres.message().contains("expected revision 1, actual revision 2"));
+    assert!(postgres
+        .message()
+        .contains("expected revision 1, actual revision 2"));
     let unchanged = catalog.get_workload("fast").unwrap();
     assert_eq!(
         (unchanged.revision, unchanged.memory_limit.unwrap().bytes),
