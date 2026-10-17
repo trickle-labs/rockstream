@@ -581,6 +581,35 @@ mod tests {
         assert!(absent.is_empty());
     }
 
+    #[tokio::test]
+    async fn bounded_scan_preserves_migration_v2_shadow_and_rejects_partial_results() {
+        let store = Arc::new(InMemory::new());
+        let db = ShardDb::builder("test/bounded_migration_reader", store.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"v/a", b"legacy").await.unwrap();
+        db.put(&format_v2_key(b"v/a"), b"new").await.unwrap();
+        db.put(&format_v2_key(b"v/b"), b"other").await.unwrap();
+        db.flush().await.unwrap();
+
+        let mut reader = ShardReader::open("test/bounded_migration_reader", store)
+            .await
+            .unwrap();
+        assert_eq!(reader.format_version, 1);
+        reader.migration_pending = true;
+        let expected = reader.scan_prefix(b"v/").await.unwrap();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0].1.as_ref(), b"new");
+        assert_eq!(expected[1].1.as_ref(), b"other");
+        let (bounded, truncated) = reader.scan_prefix_bounded(b"v/", 14).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(bounded, expected);
+        let (missing, truncated) = reader.scan_prefix_bounded(b"v/", 13).await.unwrap();
+        assert!(truncated);
+        assert!(missing.is_empty());
+    }
+
     #[test]
     fn bounded_entry_accounting_rejects_size_overflow() {
         let mut entries = Vec::new();
