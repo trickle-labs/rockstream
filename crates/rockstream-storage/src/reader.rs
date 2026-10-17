@@ -353,6 +353,11 @@ impl ShardReader {
         Ok(results)
     }
 
+    /// Maximum number of entries in a streamed ShardReader scan page.
+    pub const MAX_SCAN_PAGE_ROWS: usize = 4_096;
+    /// Maximum combined key/value payload bytes in a streamed scan page.
+    pub const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
     /// Send prefix-scan pages through a bounded channel.
     ///
     /// Each page contains at most `max_rows` entries and `max_bytes` bytes of
@@ -366,6 +371,20 @@ impl ShardReader {
         max_bytes: usize,
         sender: mpsc::Sender<Result<Vec<(Bytes, Bytes)>, StorageError>>,
     ) {
+        // Zero rows disables the flush condition and a huge max_rows can
+        // allocate an enormous Vec before any I/O. Both are invalid budgets.
+        if max_rows == 0
+            || max_rows > Self::MAX_SCAN_PAGE_ROWS
+            || max_bytes == 0
+            || max_bytes > Self::MAX_SCAN_PAGE_BYTES
+        {
+            let _ = sender
+                .send(Err(StorageError::Unsupported(format!(
+                    "invalid scan page budget rows={max_rows}, bytes={max_bytes}"
+                ))))
+                .await;
+            return;
+        }
         let sender = sender;
         let use_v2 = self.format_version == 2 && prefix.first().copied() != Some(0x06);
         let physical_prefix = if use_v2 {
@@ -406,7 +425,14 @@ impl ShardReader {
             } else {
                 entry.key
             };
-            let entry_bytes = key.len() + entry.value.len();
+            let Some(entry_bytes) = key.len().checked_add(entry.value.len()) else {
+                let _ = sender
+                    .send(Err(StorageError::Unsupported(
+                        "scan page entry byte count overflow".to_string(),
+                    )))
+                    .await;
+                return;
+            };
             if entry_bytes > max_bytes {
                 let _ = sender
                     .send(Err(StorageError::Unsupported(format!(
@@ -608,6 +634,32 @@ mod tests {
         let (missing, truncated) = reader.scan_prefix_bounded(b"v/", 13).await.unwrap();
         assert!(truncated);
         assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamed_scan_rejects_zero_and_oversized_page_limits_before_reading() {
+        let store = Arc::new(InMemory::new());
+        let db = ShardDb::builder("test/invalid_scan_pages", store.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"p/item", b"value").await.unwrap();
+        db.flush().await.unwrap();
+        let reader = ShardReader::open("test/invalid_scan_pages", store)
+            .await
+            .unwrap();
+        for (rows, bytes) in [
+            (0, 10),
+            (1, 0),
+            (ShardReader::MAX_SCAN_PAGE_ROWS + 1, 1),
+            (1, ShardReader::MAX_SCAN_PAGE_BYTES + 1),
+        ] {
+            let (tx, mut rx) = mpsc::channel(1);
+            reader.scan_prefix_pages(b"p/", rows, bytes, tx).await;
+            let error = rx.recv().await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("invalid scan page budget"));
+            assert!(rx.recv().await.is_none());
+        }
     }
 
     #[test]
