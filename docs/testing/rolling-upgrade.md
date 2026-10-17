@@ -29,6 +29,11 @@ separately by the matching durable source checkpoint and complete view/sink effe
 After all replacements, another workload phase must succeed. Every worker is then
 terminated, topology and ownership must empty, and a new candidate process with a
 fresh local directory reopens the durable state and accepts another phase.
+Write checkpoints have a 60-second deadline from the final operation's broker
+acknowledgement. Cold reopen has a separate 60-second deadline from the recorded
+launch attempt after all prior workers and leases are gone. The validator checks
+that this start follows the post-upgrade query and precedes the fresh registration,
+and that post-reopen writes are acknowledged after the successful reopen query.
 
 The second candidate launch injects exit 42 **before registration or state access**.
 It must leave no worker registration, readiness artifact, or state directory.

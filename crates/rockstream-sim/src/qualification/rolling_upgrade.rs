@@ -190,12 +190,31 @@ pub fn validate(e: &Value) -> Result<(), &'static str> {
     {
         return Err("failed replacement safety");
     }
-    if e["reopen_before_launch"] != json!({"workers":[],"leases":[],"local_state_exists":false}) {
+    let reopen_at = e["reopen_before_launch"]["at_ms"]
+        .as_u64()
+        .ok_or("fresh reopen")?;
+    if e["reopen_before_launch"]["workers"] != json!([])
+        || e["reopen_before_launch"]["leases"] != json!([])
+        || e["reopen_before_launch"]["local_state_exists"] != false
+        || reopen_at == 0
+    {
         return Err("fresh reopen");
     }
     let checkpoints = e["checkpoints"].as_array().ok_or("checkpoint sequence")?;
     if checkpoints.len() != 11 {
         return Err("checkpoint sequence");
+    }
+    if reopen_at
+        < checkpoints[8]["query_at_ms"]
+            .as_u64()
+            .ok_or("fresh reopen")?
+        || reopen_at > workers[6]["identity"]["registered_at_ms"].as_u64().unwrap()
+        || acks[29]["ack_at_ms"].as_u64().unwrap()
+            < checkpoints[9]["query_at_ms"]
+                .as_u64()
+                .ok_or("fresh reopen")?
+    {
+        return Err("fresh reopen");
     }
     let active = [
         json!([1, 2, 3]),
@@ -281,8 +300,16 @@ pub fn validate(e: &Value) -> Result<(), &'static str> {
         let query_at = checkpoint["query_at_ms"]
             .as_u64()
             .ok_or("checkpoint deadline")?;
-        let ack_at = acks[(epoch - 1) as usize]["ack_at_ms"].as_u64().unwrap();
-        if query_at < ack_at || query_at < observed || query_at - ack_at > 60_000 {
+        let start = if index == 9 {
+            reopen_at
+        } else {
+            acks[(epoch - 1) as usize]["ack_at_ms"].as_u64().unwrap()
+        };
+        if query_at < start
+            || query_at < observed
+            || query_at - start > m["deadline_ms"].as_u64().unwrap()
+            || (index == 9 && observed < start)
+        {
             return Err("checkpoint deadline");
         }
         if let Some(step) = [1, 3, 6].iter().position(|i| *i == index) {
@@ -313,13 +340,13 @@ mod tests {
         let acks = (0..35)
             .map(|offset| {
                 json!({"operation":operation(offset),"offset":offset,
-            "partition":0,"ack_at_ms":1000+offset*100})
+            "partition":0,"ack_at_ms":1000+offset*100+if offset>=29 {500} else {0}})
             })
             .collect::<Vec<_>>();
         let workers = (1..=7).map(|id| {
             let image = &images[usize::from(id>3)];
             json!({"worker_id":id,"container_id":format!("{id:064x}"),"image_id":image["id"],
-                "identity":{"worker_id":id,"registered_at_ms":if id<=3 {100} else {id*600-350},
+                "identity":{"worker_id":id,"registered_at_ms":if id<=3 {100} else if id==7 {4000} else {id*600-350},
                     "revision":image["revision"],"version":image["version"],"protocol":image["protocol"]}})
         }).collect::<Vec<_>>();
         let active = [
@@ -340,12 +367,13 @@ mod tests {
         let checkpoints = manifest()["checkpoints"].as_array().unwrap().iter().enumerate().map(|(i,c)| {
             let epoch = c[1].as_u64().unwrap();
             let (output,sink) = expected(epoch);
+            let query_at = if i==9 {4100} else if i==10 {5000} else {1000+epoch*100};
             let expected_relation = if epoch % 6 == 1 { manifest()["during_relation"].clone() } else { serde_json::from_str::<Value>(RECOVERY_MANIFEST).unwrap()["expected_relation"].clone() };
             let query_rows = if epoch % 6 == 1 { manifest()["during_query_rows"].clone() } else { manifest()["query_rows"].clone() };
             let lease = json!({"worker_id":owners[i],"shard_id":126,"lease_token":tokens[i]});
             json!({"name":c[0],"active_workers":active[i],"schema":manifest()["schema"],
-                "control_lease":lease,"query_frontier":epoch,"query_rows":query_rows,"query_at_ms":1000+epoch*100,
-                "sink_records":sink,"observation":{"lease":lease,"process_id":1,"observed_at_ms":999+epoch*100,
+                "control_lease":lease,"query_frontier":epoch,"query_rows":query_rows,"query_at_ms":query_at,
+                "sink_records":sink,"observation":{"lease":lease,"process_id":1,"observed_at_ms":query_at-1,
                     "source_epoch":epoch,"source_offsets":{"0":epoch},"view_frontier":epoch,
                     "weighted_output":output,"relation":expected_relation,
                     "in_flight_epochs":0,"checkpoint_history_entries":epoch,
@@ -359,7 +387,7 @@ mod tests {
                 {"old_worker":2,"new_worker":5,"stopped_at_ms":2250},
                 {"old_worker":3,"new_worker":6,"stopped_at_ms":2850}],
             "failed_replacement":{"worker_id":5,"exit_code":42,"registered":false,"created_state_directory":false},
-            "reopen_before_launch":{"workers":[],"leases":[],"local_state_exists":false},
+            "reopen_before_launch":{"workers":[],"leases":[],"local_state_exists":false,"at_ms":3950},
             "downgrade_rejection":"downgrade is not qualified; retry the candidate forward"})
     }
 
@@ -424,6 +452,32 @@ mod tests {
             evidence
         );
         assert_eq!(validate(&evidence), Ok(()));
+    }
+
+    #[test]
+    fn cold_reopen_has_its_own_bounded_clock_and_requires_later_writes() {
+        let mut evidence = fixture();
+        evidence["reopen_before_launch"]["at_ms"] = json!(100000);
+        evidence["workers"][6]["identity"]["registered_at_ms"] = json!(100100);
+        evidence["checkpoints"][9]["observation"]["observed_at_ms"] = json!(100200);
+        evidence["checkpoints"][9]["query_at_ms"] = json!(100201);
+        for ack in evidence["acknowledged_operations"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .skip(29)
+        {
+            ack["ack_at_ms"] = json!(ack["ack_at_ms"].as_u64().unwrap() + 160000);
+        }
+        evidence["checkpoints"][10]["observation"]["observed_at_ms"] = json!(164999);
+        evidence["checkpoints"][10]["query_at_ms"] = json!(165000);
+        assert_eq!(validate(&evidence), Ok(()));
+        evidence["checkpoints"][9]["observation"]["observed_at_ms"] = json!(160000);
+        evidence["checkpoints"][9]["query_at_ms"] = json!(160001);
+        assert_eq!(validate(&evidence), Err("checkpoint deadline"));
+        let mut early = fixture();
+        early["acknowledged_operations"][29]["ack_at_ms"] = json!(4000);
+        assert_eq!(validate(&early), Err("fresh reopen"));
     }
 
     #[test]

@@ -344,6 +344,16 @@ async fn three_worker_n_to_n_plus_1_zero_loss_tc() {
     let new = std::env::var("ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE")
         .expect("pinned candidate image required");
     preflight(&old, &new).unwrap();
+    let revision = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("Git required for provenance");
+    assert!(
+        revision.status.success(),
+        "Git provenance: {}",
+        String::from_utf8_lossy(&revision.stderr)
+    );
+    let revision = String::from_utf8(revision.stdout).unwrap();
     checked(&["info"]);
     let images = vec![image(&old), image(&new)];
     assert_ne!(
@@ -476,23 +486,15 @@ async fn three_worker_n_to_n_plus_1_zero_loss_tc() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let reopen_before_launch = json!({"workers":catalog.healthy_workers(),"leases":manager.leases(),
-        "local_state_exists":root.path().join("worker-7").exists()});
-    assert_eq!(
-        reopen_before_launch,
-        json!({"workers":[],"leases":[],"local_state_exists":false})
-    );
+        "local_state_exists":root.path().join("worker-7").exists(),"at_ms":now_ms()});
+    assert_eq!(reopen_before_launch["local_state_exists"], false);
     cluster.launch(7, &new, false).unwrap();
     workers.push(cluster.ready(7, &images[1]).await);
     checkpoints.push(cluster.checkpoint("reopen", 29, &manager, true).await);
     acks.extend(traffic(bootstrap, 29, 35, None, history).await);
     checkpoints.push(cluster.checkpoint("post-reopen", 35, &manager, false).await);
-    let revision = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap();
-    assert!(revision.status.success());
     let evidence = json!({"scenario_id":manifest()["scenario_id"],"manifest_sha256":manifest_sha256(),
-        "recovery_manifest_sha256":recovery_sha256(),"revision":String::from_utf8(revision.stdout).unwrap().trim(),
+        "recovery_manifest_sha256":recovery_sha256(),"revision":revision.trim(),
         "images":images,"workers":workers,"acknowledged_operations":acks,"replacements":replacements,
         "failed_replacement":failed,"downgrade_rejection":downgrade,"checkpoints":checkpoints,
         "reopen_before_launch":reopen_before_launch});

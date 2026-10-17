@@ -102,5 +102,9 @@
       ],
       1
     ]
-  ]
+  ],
+  "deadline_origin": {
+    "write_checkpoint": "final acknowledged operation",
+    "reopen": "recorded launch attempt after all workers and leases are gone"
+  }
 }
