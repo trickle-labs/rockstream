@@ -107,6 +107,7 @@ use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::subscribe_handler::{
     deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
+    SUBSCRIBE_SNAPSHOT_MAX_ROWS,
 };
 use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -5551,9 +5552,16 @@ impl GatewayHandler {
         let mut pending = std::collections::VecDeque::new();
         let handle = match &request.start {
             SubscribeStart::NowWithSnapshot => {
+                // Read at most one row beyond the frozen snapshot ceiling.
+                // The extra row is an overflow witness; do not eagerly scan
+                // an unbounded keyspace before applying snapshot admission.
                 let snapshot = self
                     .view_reader
-                    .read_view(&request.view_name, None, ViewReadStrategy::HotOnly)
+                    .read_view(
+                        &request.view_name,
+                        Some(SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1),
+                        ViewReadStrategy::HotOnly,
+                    )
                     .await
                     .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
                 let snapshot = snapshot
@@ -20064,5 +20072,75 @@ mod catalog_array_parameter_tests {
             Err(err) => panic!("parameter inference failed: {err}"),
         };
         assert_eq!(types, vec![Type::INT4_ARRAY]);
+    }
+}
+
+#[cfg(test)]
+mod v072_subscription_producer_bounds_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BoundedSnapshotReader {
+        seen_limit: AtomicUsize,
+        rows_available: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ViewReader for BoundedSnapshotReader {
+        async fn read_view(
+            &self,
+            _view_name: &str,
+            limit: Option<usize>,
+            _strategy: ViewReadStrategy,
+        ) -> Result<Vec<Vec<u8>>, GatewayError> {
+            self.seen_limit
+                .store(limit.unwrap_or(usize::MAX), Ordering::SeqCst);
+            let count = self.rows_available.min(limit.unwrap_or(usize::MAX));
+            Ok(vec![b"value".to_vec(); count])
+        }
+
+        fn published_frontier(&self) -> Option<u64> {
+            Some(4)
+        }
+    }
+
+    async fn check_snapshot(rows_available: usize) -> (usize, bool) {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_snapshot".to_owned(),
+            sql: "SELECT value FROM base".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        let response = handler
+            .handle_subscribe("SUBSCRIBE v072_snapshot AS OF NOW WITH SNAPSHOT")
+            .await
+            .unwrap();
+        let limit = reader.seen_limit.load(Ordering::SeqCst);
+        let rejected = matches!(response.as_slice(), [Response::Error(_)]);
+        (limit, rejected)
+    }
+
+    #[tokio::test]
+    async fn snapshot_reader_receives_one_row_overflow_probe() {
+        let (limit, rejected) = check_snapshot(1).await;
+        assert_eq!(limit, SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1);
+        assert!(!rejected);
+    }
+
+    #[tokio::test]
+    async fn oversized_producer_snapshot_fails_before_stream_formation() {
+        let (limit, rejected) = check_snapshot(SUBSCRIBE_SNAPSHOT_MAX_ROWS + 50).await;
+        assert_eq!(limit, SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1);
+        assert!(rejected);
     }
 }
