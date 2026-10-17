@@ -1248,21 +1248,25 @@ impl CatalogStubs {
 
     pub fn update_workload(&self, mut workload: WorkloadDef) -> bool {
         let mut inner = self.inner.write().unwrap();
-        let Some(next_revision) = inner
-            .workloads
-            .get(&workload.name)
-            .and_then(|current| current.revision.checked_add(1))
-        else {
+        let Some(current) = inner.workloads.get(&workload.name) else {
             return false;
         };
+        let Some(next_revision) = current.revision.checked_add(1) else {
+            return false;
+        };
+        // A priority/freshness/parallelism edit must not reset live bytes.
+        // Existing StateBudget objects still own their WorkloadBudget Arc.
+        let preserve_budget = current.memory_limit == workload.memory_limit;
         workload.revision = next_revision;
         inner
             .workloads
             .insert(workload.name.clone(), workload.clone());
-        self.workload_budgets
-            .write()
-            .unwrap()
-            .remove(&workload.name);
+        if !preserve_budget {
+            self.workload_budgets
+                .write()
+                .unwrap()
+                .remove(&workload.name);
+        }
         drop(inner);
         self.invalidate_projection_caches();
         self.persist_mutations(vec![
@@ -1292,6 +1296,9 @@ impl CatalogStubs {
         let Some(next_revision) = current.revision.checked_add(1) else {
             return WorkloadRevisionOutcome::RevisionExhausted;
         };
+        // The existing ledger and each view's StateBudget keep the same
+        // Arc when resource limits have not changed.
+        let preserve_budget = current.memory_limit == workload.memory_limit;
         if let Some(limit) = workload.memory_limit {
             if let Some(budget) = self.workload_budgets.read().unwrap().get(&workload.name) {
                 let allocated = budget.current_bytes();
@@ -1307,10 +1314,12 @@ impl CatalogStubs {
         inner
             .workloads
             .insert(workload.name.clone(), workload.clone());
-        self.workload_budgets
-            .write()
-            .unwrap()
-            .remove(&workload.name);
+        if !preserve_budget {
+            self.workload_budgets
+                .write()
+                .unwrap()
+                .remove(&workload.name);
+        }
         drop(inner);
         self.invalidate_projection_caches();
         self.persist_mutations(vec![
@@ -5781,6 +5790,77 @@ mod tests {
                 None,
             ]]
         );
+    }
+
+    #[test]
+    fn v072_policy_only_edits_preserve_live_workload_reservations() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        set_state_budget(1_000);
+
+        let catalog = CatalogStubs::new();
+        assert!(catalog.add_workload(
+            WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(100))
+        ));
+        for name in ["live_a", "live_b"] {
+            catalog.add_view_in_namespace(CatalogView {
+                name: name.to_owned(),
+                sql: "SELECT 1".to_owned(),
+                columns: vec![],
+                namespace: "public".to_owned(),
+                op_id: None,
+            });
+            catalog.assign_view_workload(name, "live");
+        }
+
+        catalog.set_view_state_bytes("live_a", 70, None);
+        let original = catalog
+            .workload_budgets
+            .read()
+            .unwrap()
+            .get("live")
+            .unwrap()
+            .clone();
+        assert_eq!(original.current_bytes(), 70);
+
+        assert_eq!(
+            catalog.update_workload_if_revision(
+                WorkloadDef::new("live")
+                    .with_memory_limit(MemoryLimit::new(100))
+                    .with_priority(rockstream_types::workload::WorkloadPriority::HIGH),
+                1
+            ),
+            WorkloadRevisionOutcome::Updated(2)
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            catalog.workload_budgets.read().unwrap().get("live").unwrap()
+        ));
+
+        // A second view cannot acquire 50 bytes against a 100-byte
+        // workload that already owns 70. A ledger reset would admit it.
+        catalog.set_view_state_bytes("live_b", 50, None);
+        assert_eq!(original.current_bytes(), 70);
+        assert_eq!(catalog.view_state("live_b"), ViewState::OverBudgetRelaxed);
+
+        assert!(catalog.update_workload(
+            WorkloadDef::new("live")
+                .with_memory_limit(MemoryLimit::new(100))
+                .with_freshness_slo(rockstream_types::workload::FreshnessSlo::new(250))
+        ));
+        assert_eq!(catalog.get_workload("live").unwrap().revision, 3);
+        assert!(Arc::ptr_eq(
+            &original,
+            catalog.workload_budgets.read().unwrap().get("live").unwrap()
+        ));
+
+        catalog.set_view_state_bytes("live_a", 0, None);
+        catalog.set_view_state_bytes("live_b", 50, None);
+        assert_eq!(original.current_bytes(), 50);
+        assert_eq!(catalog.view_state("live_b"), ViewState::Running);
+        catalog.set_view_state_bytes("live_b", 0, None);
+        assert_eq!(original.current_bytes(), 0);
+        reset_all();
     }
 
     #[test]
