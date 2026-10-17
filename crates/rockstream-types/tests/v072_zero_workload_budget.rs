@@ -26,7 +26,8 @@ fn explicit_zero_workload_limit_rejects_positive_reservations() {
 #[test]
 fn zero_workload_limit_propagates_through_operator_and_keeps_ledgers_empty() {
     let workload = Arc::new(WorkloadBudget::new(WorkloadId(734), 0));
-    let operator = StateBudget::new_with_workload("zero-worker", 1_024, Some(Arc::clone(&workload)));
+    let operator =
+        StateBudget::new_with_workload("zero-worker", 1_024, Some(Arc::clone(&workload)));
     let err = operator.try_acquire(1).unwrap_err();
     assert_eq!(
         err,
@@ -49,7 +50,14 @@ fn nonzero_workload_boundary_preserved_without_overflow() {
     let b = StateBudget::new_with_workload("b", 10, Some(Arc::clone(&workload)));
     a.try_acquire(7).unwrap();
     b.try_acquire(3).unwrap();
-    assert_eq!((a.current_bytes(), b.current_bytes(), workload.current_bytes()), (7, 3, 10));
+    assert_eq!(
+        (
+            a.current_bytes(),
+            b.current_bytes(),
+            workload.current_bytes()
+        ),
+        (7, 3, 10)
+    );
     let err = b.try_acquire(1).unwrap_err();
     assert_eq!(
         err,
@@ -62,5 +70,12 @@ fn nonzero_workload_boundary_preserved_without_overflow() {
     );
     b.release(3);
     a.release(7);
-    assert_eq!((a.current_bytes(), b.current_bytes(), workload.current_bytes()), (0, 0, 0));
+    assert_eq!(
+        (
+            a.current_bytes(),
+            b.current_bytes(),
+            workload.current_bytes()
+        ),
+        (0, 0, 0)
+    );
 }
