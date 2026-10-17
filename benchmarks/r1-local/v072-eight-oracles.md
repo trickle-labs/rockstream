@@ -77,3 +77,8 @@ and complete raw measurements for all applicable section 5.2 matrix cells.
 `verify-v072-run-bundle`, the strict matrix validator, and the process-capture
 checks are separate preflight stages. This oracle alone cannot prove their
 input provenance, source ordering, or benchmark performance.
+
+The CLI creates its output report name **exclusively** only after every oracle
+passes. A report file that already exists, including a name resolving to the
+input manifest or any observed result, is rejected without overwrite. Choose
+a fresh output path for each evaluation; do not reuse prior run artifacts.

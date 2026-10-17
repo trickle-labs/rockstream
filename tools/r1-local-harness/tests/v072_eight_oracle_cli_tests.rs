@@ -115,3 +115,20 @@ fn corrupt_observed_multiset_has_nonzero_exit_and_no_success_artifact() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("complete-result oracle mismatch"));
     assert!(!output.exists());
 }
+
+#[test]
+fn existing_report_and_evidence_files_cannot_be_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = fixture(dir.path());
+    let first_report = dir.path().join("oracle-summary.json");
+    assert!(cmd(&manifest, &first_report).status.success());
+    let original = fs::read(&first_report).unwrap();
+    let second = cmd(&manifest, &first_report);
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("report output already exists"));
+    assert_eq!(fs::read(first_report).unwrap(), original);
+
+    let manifest_before = fs::read(&manifest).unwrap();
+    assert!(!cmd(&manifest, &manifest).status.success());
+    assert_eq!(fs::read(manifest).unwrap(), manifest_before);
+}
