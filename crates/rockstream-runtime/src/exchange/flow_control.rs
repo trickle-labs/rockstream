@@ -575,6 +575,21 @@ impl FlowController {
         Self::update_credit_metrics(&channels);
     }
 
+    /// Admit row credits under the channel lock without touching notifier
+    /// state. The common uncontended path needs no waiter allocation or
+    /// notifier-map lock; rejected attempts never consume partial credits.
+    fn try_acquire_rows(&self, key: CreditKey, row_count: u32) -> bool {
+        let mut channels = self.channels.lock();
+        let state = self.channel_state(&mut channels, key);
+        if state.available_rows < row_count {
+            return false;
+        }
+        state.available_rows -= row_count;
+        state.rows_in_flight = state.rows_in_flight.saturating_add(row_count);
+        Self::update_credit_metrics(&channels);
+        true
+    }
+
     /// Acquire row credit for the specified channel, suspending the caller if none are available.
     pub async fn acquire_credit(
         &self,
@@ -592,6 +607,13 @@ impl FlowController {
         }
 
         let key = (exchange_id, src_shard, target_shard);
+        if self.try_acquire_rows(key, row_count) {
+            return Ok(());
+        }
+
+        // Create waiter state only after admission failed. Register the notify
+        // future *before* rechecking channels to avoid a lost wake when ACK
+        // races against waiter registration, cancellation, or task scheduling.
         let notify = {
             let mut notifiers = self.notifiers.lock();
             notifiers
@@ -599,20 +621,12 @@ impl FlowController {
                 .or_insert_with(|| Arc::new(Notify::new()))
                 .clone()
         };
-
         loop {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
-                let mut channels = self.channels.lock();
-                let state = self.channel_state(&mut channels, key);
-                if state.available_rows >= row_count {
-                    state.available_rows -= row_count;
-                    state.rows_in_flight = state.rows_in_flight.saturating_add(row_count);
-                    Self::update_credit_metrics(&channels);
-                    return Ok(());
-                }
+            if self.try_acquire_rows(key, row_count) {
+                return Ok(());
             }
             #[cfg(test)]
             self.pause_before_wait().await;
