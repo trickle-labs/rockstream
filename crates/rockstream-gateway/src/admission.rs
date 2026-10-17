@@ -232,15 +232,13 @@ impl AdmissionController {
     ///    `Paused` (a paused view contributes nothing to demand).
     /// 2. If `utilization + requested_bytes <= global_capacity_bytes`, admit
     ///    outright.
-    /// 3. Otherwise, find workloads whose `WorkloadPriority` is strictly
-    ///    lower-priority than the requester's (a numerically larger
-    ///    priority value — `WorkloadPriority` orders `HIGH < DEFAULT < LOW`),
-    ///    ordered lowest-priority first, and pause their `Running` views one
-    ///    at a time — reducing utilization as each is paused — until the
-    ///    requester's demand fits, or there are no more lower-priority views
-    ///    left to pause.
-    /// 4. If demand still does not fit after exhausting lower-priority
-    ///    views, reject the request (`RS-9001`) and audit the rejection.
+    /// 3. Plan all needed preemptions without changing any view. Find workloads
+    ///    whose `WorkloadPriority` is strictly lower-priority than the
+    ///    requester's (numerically larger: `HIGH < DEFAULT < LOW`),
+    ///    ordered lowest-priority first, and estimate only the necessary pauses.
+    /// 4. If the plan cannot meet capacity, reject with no view-state change.
+    ///    Otherwise, apply the planned pauses and audit each transition.
+    ///    Estimates are not proof that physical memory was reclaimed.
     pub fn evaluate_and_admit(
         catalog: &CatalogStubs,
         requesting_workload: &str,
@@ -301,7 +299,8 @@ impl AdmissionController {
                 if estimated_freed == 0 {
                     continue;
                 }
-                projected_utilization = projected_utilization.saturating_sub(estimated_freed);
+                projected_utilization =
+                    projected_utilization.saturating_sub(u128::from(estimated_freed));
                 proposed_pauses.push(view_name);
             }
         }
@@ -356,19 +355,21 @@ impl AdmissionController {
 }
 
 /// Reject overflow rather than treating `u64::MAX` saturation as free capacity.
-fn fits_capacity(used: u64, requested: u64, capacity: u64) -> bool {
-    used <= capacity && requested <= capacity - used
+fn fits_capacity(used: u128, requested: u64, capacity: u64) -> bool {
+    used <= u128::from(capacity) && u128::from(requested) <= u128::from(capacity) - used
 }
 
 /// Sum of `read_pipeline_state_bytes` across every view in the catalog that
 /// is not currently `Paused`. Paused views contribute zero demand.
-fn cluster_utilization(catalog: &CatalogStubs) -> u64 {
+fn cluster_utilization(catalog: &CatalogStubs) -> u128 {
     catalog
         .list_views()
         .into_iter()
         .filter(|view| catalog.view_state(&view.name) != ViewState::Paused)
         .map(|view| read_pipeline_state_bytes(&view.name).unwrap_or(0))
-        .fold(0u64, u64::saturating_add)
+        .fold(0u128, |total, bytes| {
+            total.saturating_add(u128::from(bytes))
+        })
 }
 
 #[cfg(test)]
@@ -534,6 +535,25 @@ mod tests {
         );
         assert_eq!(catalog.view_state("big_a"), ViewState::Running);
         assert_eq!(catalog.view_state("big_b"), ViewState::Running);
+    }
+
+    #[test]
+    fn v072_oversubscribed_accounting_never_forgets_unpaused_large_views() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        let catalog = CatalogStubs::new();
+        catalog.add_workload(WorkloadDef::new("high").with_priority(WorkloadPriority::HIGH));
+        catalog.add_workload(WorkloadDef::new("low").with_priority(WorkloadPriority::LOW));
+        add_workload_view(&catalog, "low", "huge_a", u64::MAX);
+        add_workload_view(&catalog, "low", "huge_b", u64::MAX);
+        assert_eq!(
+            AdmissionController::evaluate_and_admit(&catalog, "high", 1, u64::MAX, None),
+            AdmissionDecision::AdmitAfterPausing {
+                paused_views: vec!["huge_a".to_owned(), "huge_b".to_owned()]
+            }
+        );
+        assert_eq!(catalog.view_state("huge_a"), ViewState::Paused);
+        assert_eq!(catalog.view_state("huge_b"), ViewState::Paused);
     }
 
     #[test]
