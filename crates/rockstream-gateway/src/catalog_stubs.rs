@@ -5799,9 +5799,9 @@ mod tests {
         set_state_budget(1_000);
 
         let catalog = CatalogStubs::new();
-        assert!(catalog.add_workload(
-            WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(100))
-        ));
+        assert!(
+            catalog.add_workload(WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(100)))
+        );
         for name in ["live_a", "live_b"] {
             catalog.add_view_in_namespace(CatalogView {
                 name: name.to_owned(),
