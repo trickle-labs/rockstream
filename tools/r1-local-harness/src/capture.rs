@@ -80,15 +80,20 @@ pub fn capture_process(
         bail!("capture executable is not a regular file");
     }
     let executable_sha256 = sha256_file(&executable)?;
+    // Atomic directory reservation: two concurrent sessions cannot trample
+    // stdout/stderr or produce a capture spanning different process runs.
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    fs::create_dir(output).with_context(|| {
+        format!(
+            "refusing to reuse a process capture directory {}",
+            output.display()
+        )
+    })?;
     let artifact = output.join("process-capture.json");
-    if artifact.exists() {
-        bail!(
-            "refusing to replace previous process capture {}",
-            artifact.display()
-        );
-    }
-
-    fs::create_dir_all(output).with_context(|| format!("create {}", output.display()))?;
     let stdout = output.join("stdout.log");
     let stderr = output.join("stderr.log");
     let started_unix_ms: u64 = SystemTime::now()
@@ -179,10 +184,11 @@ mod tests {
     fn v072_captures_real_child_counter_series_and_digests() {
         let dir = tempfile::tempdir().unwrap();
         let sleep = Path::new("/bin/sleep");
+        let output = dir.path().join("new-capture");
         let capture = capture_process(
             sleep,
             &["2".to_owned()],
-            dir.path(),
+            &output,
             Duration::from_millis(180),
             Duration::from_millis(30),
         )
@@ -203,7 +209,7 @@ mod tests {
             .all(|w| w[0].monotonic_elapsed_ns < w[1].monotonic_elapsed_ns
                 && w[0].user_cpu_ns <= w[1].user_cpu_ns
                 && w[0].system_cpu_ns <= w[1].system_cpu_ns));
-        let bytes = fs::read(dir.path().join("process-capture.json")).unwrap();
+        let bytes = fs::read(output.join("process-capture.json")).unwrap();
         let decoded: ProcessCapture = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, capture);
         assert_eq!(decoded.stdout_sha256, crate::artifact::sha256(b""));
@@ -240,6 +246,26 @@ mod tests {
             .is_err());
             assert!(!dir.path().join("stdout.log").exists());
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn v072_concurrent_capture_slot_rejects_preexisting_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("used");
+        fs::create_dir(&existing).unwrap();
+        let result = capture_process(
+            Path::new("/bin/sleep"),
+            &["2".to_owned()],
+            &existing,
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to reuse"));
+        assert_eq!(fs::read_dir(existing).unwrap().count(), 0);
     }
 
     #[test]
