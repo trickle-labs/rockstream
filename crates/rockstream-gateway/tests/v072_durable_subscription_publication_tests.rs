@@ -172,6 +172,109 @@ async fn concurrent_commits_publish_only_whole_ordered_epochs() {
     task.abort();
 }
 
+struct PausedSnapshotReader {
+    entered: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl ViewReader for PausedSnapshotReader {
+    async fn read_view(
+        &self,
+        _view_name: &str,
+        _limit: Option<usize>,
+        _strategy: ViewReadStrategy,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        self.entered.notify_one();
+        self.resume.notified().await;
+        Ok(Vec::new())
+    }
+
+    fn published_frontier(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn local_snapshot_scan_blocks_competing_commit_until_epoch_fence_releases() {
+    let storage = Arc::new(InMemory::new());
+    let shard = Arc::new(
+        ShardDb::builder("v072-local-snapshot-epoch-fence", storage)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let reader = Arc::new(PausedSnapshotReader {
+        entered: Arc::clone(&entered),
+        resume: Arc::clone(&resume),
+    });
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        reader,
+        shard,
+    );
+    let registry = server.handler().subscribe_registry().clone();
+    let (address, server_task) = server.serve_background().await.unwrap();
+    let writer = open_client(address.port()).await;
+    let snapshot_client = open_client(address.port()).await;
+    writer
+        .simple_query("CREATE TABLE v072_epoch_fence (id BIGINT)")
+        .await
+        .unwrap();
+
+    let snapshot_task = tokio::spawn(async move {
+        // SUBSCRIBE is intentionally long-lived; the test only needs the
+        // initial snapshot admission and its lock boundary.
+        let _ = snapshot_client
+            .simple_query("SUBSCRIBE v072_epoch_fence AS OF NOW WITH SNAPSHOT")
+            .await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("snapshot must enter the controlled producer reader");
+
+    writer.simple_query("BEGIN").await.unwrap();
+    writer
+        .simple_query("INSERT INTO v072_epoch_fence (id) VALUES (7)")
+        .await
+        .unwrap();
+    let (commit_started_tx, commit_started_rx) = tokio::sync::oneshot::channel();
+    let mut committing = tokio::spawn(async move {
+        let _ = commit_started_tx.send(());
+        writer.simple_query("COMMIT").await
+    });
+    commit_started_rx.await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            &mut committing
+        )
+        .await
+        .is_err(),
+        "a local COMMIT must not pass the snapshot epoch/read boundary"
+    );
+    assert_eq!(registry.latest_epoch("v072_epoch_fence"), None);
+    resume.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), &mut committing)
+        .await
+        .expect("commit must resume once the snapshot finishes")
+        .unwrap()
+        .unwrap();
+    let entries = registry.since_epoch("v072_epoch_fence", 0).unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.mz_diff, entry.encoded_row.clone()))
+            .collect::<Vec<_>>(),
+        vec![(1, bytes::Bytes::from_static(b"7"))]
+    );
+    snapshot_task.abort();
+    server_task.abort();
+}
+
 #[derive(Debug)]
 struct RejectCompactedStore {
     inner: InMemory,
