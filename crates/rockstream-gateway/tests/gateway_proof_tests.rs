@@ -758,11 +758,7 @@ async fn v072_copy_out_read_timeout_emits_error_without_copy_stream() {
     let reader = Arc::new(HangingCopyReader {
         cancelled: Arc::clone(&cancelled),
     });
-    let server = GatewayServer::with_catalog(
-        "127.0.0.1:0".parse().unwrap(),
-        catalogue,
-        reader,
-    );
+    let server = GatewayServer::with_catalog("127.0.0.1:0".parse().unwrap(), catalogue, reader);
     let (addr, handle) = server.serve_background().await.unwrap();
     let client = connect_port(addr.port()).await;
     let result = tokio::time::timeout(
