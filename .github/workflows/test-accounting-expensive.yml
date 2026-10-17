@@ -1,0 +1,108 @@
+name: Test Accounting — Expensive Suites
+
+on:
+  schedule:
+    - cron: "15 2 * * *"
+  workflow_dispatch:
+    inputs:
+      run_release_docker:
+        description: "Run rolling-upgrade release validation (requires two pinned image refs)"
+        type: boolean
+        required: true
+        default: false
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  ROCKSTREAM_REQUIRE_DOCKER: "1"
+
+jobs:
+  nightly-seeds:
+    name: Nightly seeded simulation accounting
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate target ownership and gate self-tests
+        run: |
+          python3 scripts/ci-test-inventory.test.py
+          python3 scripts/ci-test-inventory.py check
+      - name: Run seed and soak targets without retries
+        run: python3 scripts/ci-test-inventory.py run --job nightly-seeds
+      - name: Upload exact test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-seeds-test-evidence
+          path: target/ci-test-results/
+          if-no-files-found: error
+
+  nightly-docker:
+    name: Nightly Docker test accounting
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check required Docker daemon
+        run: docker info
+      - name: Build unified-binary test image
+        run: docker build -t rockstream-tc-test:latest .
+      - name: Validate target ownership
+        run: python3 scripts/ci-test-inventory.py check
+      - name: Run Docker simulation targets without retries
+        run: python3 scripts/ci-test-inventory.py run --job nightly-docker
+      - name: Upload exact test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-docker-test-evidence
+          path: target/ci-test-results/
+          if-no-files-found: error
+
+  release-docker:
+    name: Release rolling-upgrade test accounting
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.run_release_docker == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      ROCKSTREAM_ROLLING_N_IMAGE: ${{ vars.ROCKSTREAM_ROLLING_N_IMAGE }}
+      ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE: ${{ vars.ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Require Docker
+        run: docker info
+      - name: Check pinned release image prerequisites
+        run: |
+          test -n "$ROCKSTREAM_ROLLING_N_IMAGE"
+          test -n "$ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE"
+          test "$ROCKSTREAM_ROLLING_N_IMAGE" != "$ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE"
+          docker image inspect "$ROCKSTREAM_ROLLING_N_IMAGE" || docker pull "$ROCKSTREAM_ROLLING_N_IMAGE"
+          docker image inspect "$ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE" || docker pull "$ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE"
+      - name: Validate target ownership
+        run: python3 scripts/ci-test-inventory.py check
+      - name: Run rolling-upgrade verification without retries
+        run: python3 scripts/ci-test-inventory.py run --job release-docker
+      - name: Upload exact test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-docker-test-evidence
+          path: target/ci-test-results/
+          if-no-files-found: error

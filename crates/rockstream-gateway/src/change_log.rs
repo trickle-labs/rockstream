@@ -18,6 +18,27 @@ use bytes::Bytes;
 
 /// Default maximum number of entries retained in a `ViewChangeLog`.
 pub const CHANGE_LOG_MAX_ENTRIES: usize = 10_000;
+/// Maximum payload bytes retained for a view subscription (16 MiB).
+pub const CHANGE_LOG_MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+/// A complete committed epoch exceeding 8 MiB cannot be buffered for replay.
+pub const CHANGE_LOG_MAX_EPOCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// A bounded log must never retain only a subset of an oversized committed epoch.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChangeLogError {
+    #[error(
+        "committed epoch {epoch} exceeds the subscription envelope ({rows} rows, {bytes} bytes)"
+    )]
+    EpochTooLarge {
+        epoch: u64,
+        rows: usize,
+        bytes: usize,
+    },
+    #[error("subscription epoch must advance: latest {latest}, requested {requested}")]
+    NonMonotoneEpoch { latest: u64, requested: u64 },
+    #[error("subscription batch mixes committed epochs")]
+    MixedEpochs,
+}
 
 /// A single change-log entry.
 #[derive(Debug, Clone)]
@@ -40,6 +61,10 @@ pub struct ViewChangeLog {
     entries: VecDeque<ChangeEntry>,
     /// Named upper bound.
     max_entries: usize,
+    bytes: usize,
+    /// Minimum valid replay position following a retention eviction or overflow.
+    replay_floor: Option<u64>,
+    latest_epoch_seen: Option<u64>,
     /// Shared fill-level metric — updated on every push/eviction.
     entry_count: Arc<AtomicUsize>,
 }
@@ -50,6 +75,9 @@ impl ViewChangeLog {
         Self {
             entries: VecDeque::new(),
             max_entries,
+            bytes: 0,
+            replay_floor: None,
+            latest_epoch_seen: None,
             entry_count: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -59,15 +87,117 @@ impl ViewChangeLog {
         Self::new(CHANGE_LOG_MAX_ENTRIES)
     }
 
-    /// Append an entry.  Evicts the oldest entry when `max_entries` is exceeded
-    /// (VecDeque pop_front — never a range delete).
-    pub fn push(&mut self, entry: ChangeEntry) {
-        while self.entries.len() >= self.max_entries {
-            self.entries.pop_front();
+    fn entry_bytes(entry: &ChangeEntry) -> usize {
+        entry.row_key.len().saturating_add(entry.encoded_row.len())
+    }
+
+    fn discard_oldest_epoch(&mut self) {
+        let Some(epoch) = self.entries.front().map(|entry| entry.epoch) else {
+            return;
+        };
+        while self
+            .entries
+            .front()
+            .is_some_and(|entry| entry.epoch == epoch)
+        {
+            if let Some(entry) = self.entries.pop_front() {
+                self.bytes = self.bytes.saturating_sub(Self::entry_bytes(&entry));
+            }
         }
+        self.replay_floor = Some(self.replay_floor.unwrap_or(0).max(epoch.saturating_add(1)));
+    }
+
+    /// Append one complete durable epoch or reject it without retaining a partial
+    /// epoch. Rejection invalidates replay so lagging clients must resnapshot.
+    pub fn push_epoch(&mut self, batch: Vec<ChangeEntry>) -> Result<(), ChangeLogError> {
+        let Some(epoch) = batch.first().map(|entry| entry.epoch) else {
+            return Ok(());
+        };
+        if batch.iter().any(|entry| entry.epoch != epoch) {
+            return Err(ChangeLogError::MixedEpochs);
+        }
+        if let Some(latest) = self.latest_epoch_seen {
+            if epoch <= latest {
+                return Err(ChangeLogError::NonMonotoneEpoch {
+                    latest,
+                    requested: epoch,
+                });
+            }
+        }
+        let bytes = batch
+            .iter()
+            .try_fold(0usize, |sum, entry| {
+                sum.checked_add(Self::entry_bytes(entry))
+            })
+            .unwrap_or(usize::MAX);
+        self.latest_epoch_seen = Some(epoch);
+
+        if batch.len() > self.max_entries
+            || bytes > CHANGE_LOG_MAX_EPOCH_BYTES
+            || bytes > CHANGE_LOG_MAX_BUFFER_BYTES
+        {
+            self.entries.clear();
+            self.bytes = 0;
+            self.entry_count.store(0, Ordering::Relaxed);
+            self.replay_floor = Some(epoch.saturating_add(1));
+            return Err(ChangeLogError::EpochTooLarge {
+                epoch,
+                rows: batch.len(),
+                bytes,
+            });
+        }
+
+        while !self.entries.is_empty()
+            && (self.entries.len().saturating_add(batch.len()) > self.max_entries
+                || self.bytes.saturating_add(bytes) > CHANGE_LOG_MAX_BUFFER_BYTES)
+        {
+            self.discard_oldest_epoch();
+        }
+        self.bytes += bytes;
+        self.entries.extend(batch);
+        self.entry_count
+            .store(self.entries.len(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Legacy single-row insertion for consumers that do not publish an entire
+    /// epoch. Production commit paths use `push_epoch` instead.
+    pub fn push(&mut self, entry: ChangeEntry) {
+        let epoch = entry.epoch;
+        let bytes = Self::entry_bytes(&entry);
+        self.latest_epoch_seen = Some(self.latest_epoch_seen.unwrap_or(epoch).max(epoch));
+        if self.max_entries == 0 || bytes > CHANGE_LOG_MAX_EPOCH_BYTES {
+            self.entries.clear();
+            self.bytes = 0;
+            self.replay_floor = Some(epoch.saturating_add(1));
+            self.entry_count.store(0, Ordering::Relaxed);
+            return;
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= self.max_entries
+                || self.bytes.saturating_add(bytes) > CHANGE_LOG_MAX_BUFFER_BYTES)
+        {
+            self.discard_oldest_epoch();
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
         self.entries.push_back(entry);
         self.entry_count
             .store(self.entries.len(), Ordering::Relaxed);
+    }
+
+    /// Earliest safely replayable epoch after eviction/overflow.
+    pub fn replay_floor(&self) -> Option<u64> {
+        self.replay_floor
+    }
+
+    /// Most recently published epoch, even if it exceeded buffer bounds.
+    pub fn latest_epoch(&self) -> Option<u64> {
+        self.latest_epoch_seen
+    }
+
+    /// Retained entry payload bytes (does not include VecDeque allocator overhead).
+    pub fn buffered_bytes(&self) -> usize {
+        self.bytes
     }
 
     /// Returns all entries with `epoch >= since` in insertion order.
@@ -77,7 +207,10 @@ impl ViewChangeLog {
 
     /// The earliest epoch still retained, or `None` if the log is empty.
     pub fn earliest_epoch(&self) -> Option<u64> {
-        self.entries.front().map(|e| e.epoch)
+        self.entries
+            .front()
+            .map(|e| e.epoch.max(self.replay_floor.unwrap_or(0)))
+            .or(self.replay_floor)
     }
 
     /// Current number of entries (fill-level metric).

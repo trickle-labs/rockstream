@@ -4,8 +4,9 @@
 //! Uses `CheckBeforeCommit` idempotency profile: recovery queries the Kafka
 //! topic for the epoch marker before deciding whether to commit.
 //!
-//! Experimental marker transport only: `pre_commit` accepts a row count, not
-//! view records. Snapshot/change row delivery and payload recovery are unsupported.
+//! `pre_commit` preserves the legacy epoch/count marker interface.
+//! `pre_commit_payload` stages a complete row envelope and persists its bytes
+//! in the recovery handle. View export is driven by `rockstream_ops::kafka_sink`.
 //!
 //! ## Bounded resources
 //!
@@ -21,6 +22,7 @@
 //! | During commit | CheckBeforeCommit: query topic; already present → Committed. |
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -52,7 +54,15 @@ struct KafkaBroker {
     topic: String,
 }
 
-/// Experimental epoch/count marker sink implementing `CheckBeforeCommit` idempotency.
+#[derive(Serialize, Deserialize)]
+struct PendingPayload {
+    connector_id: u64,
+    topic: String,
+    epoch: Epoch,
+    payload: String,
+}
+
+/// Experimental transactional sink implementing `CheckBeforeCommit` idempotency.
 pub struct KafkaSink {
     connector_id: ConnectorId,
     /// Epochs that have been delivered to the "external Kafka".
@@ -78,6 +88,95 @@ pub struct KafkaSink {
 }
 
 impl KafkaSink {
+    pub fn connector_id(&self) -> ConnectorId {
+        self.connector_id
+    }
+
+    pub fn topic(&self) -> Result<&str, SinkError> {
+        self.broker
+            .as_ref()
+            .map(|broker| broker.topic.as_str())
+            .ok_or_else(|| SinkError::Io("row delivery requires KafkaSink::connect".into()))
+    }
+
+    /// Stage one JSON transaction envelope, retained verbatim for recovery.
+    /// The envelope must identify this connector and epoch. All row envelopes
+    /// use partition zero so snapshot and change transactions remain ordered.
+    pub async fn pre_commit_payload(
+        &mut self,
+        epoch: Epoch,
+        row_count: usize,
+        payload: String,
+    ) -> Result<SinkState, SinkError> {
+        self.validate_payload(epoch, &payload)?;
+        let pending_handle = serde_json::to_vec(&PendingPayload {
+            connector_id: self.connector_id.0,
+            topic: self.topic()?.to_owned(),
+            epoch,
+            payload: payload.clone(),
+        })
+        .map_err(|error| SinkError::Io(error.to_string()))?;
+        self.stage_payload(epoch, row_count, &payload, pending_handle)
+            .await
+    }
+
+    fn validate_payload(&self, epoch: Epoch, payload: &str) -> Result<(), SinkError> {
+        let value: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|error| SinkError::Io(format!("invalid Kafka row envelope: {error}")))?;
+        if value["epoch"].as_u64() != Some(epoch)
+            || value["connector_id"].as_u64() != Some(self.connector_id.0)
+        {
+            return Err(SinkError::Io("Kafka row envelope identity mismatch".into()));
+        }
+        Ok(())
+    }
+
+    async fn stage_payload(
+        &mut self,
+        epoch: Epoch,
+        row_count: usize,
+        payload: &str,
+        pending_handle: Vec<u8>,
+    ) -> Result<SinkState, SinkError> {
+        self.apply_secret_token_at_epoch();
+        if self.backpressure_active() || self.staged_epochs.contains(&epoch) {
+            return Err(SinkError::PreCommitFailed {
+                epoch,
+                reason: format!(
+                    "backpressure or duplicate stage: staged_epochs={}",
+                    self.staged_epochs_count
+                ),
+            });
+        }
+        if let Some(broker) = &self.broker {
+            broker
+                .producer
+                .begin_transaction()
+                .map_err(|error| SinkError::PreCommitFailed {
+                    epoch,
+                    reason: format!("Kafka transaction begin failed: {error}"),
+                })?;
+            if let Err((error, _)) = broker.producer.send(
+                BaseRecord::to(&broker.topic)
+                    .partition(0)
+                    .payload(payload)
+                    .key(&epoch.to_string()),
+            ) {
+                let _ = broker.producer.abort_transaction(Duration::from_secs(10));
+                return Err(SinkError::PreCommitFailed {
+                    epoch,
+                    reason: format!("Kafka transaction produce failed: {error}"),
+                });
+            }
+        }
+        self.staged_epochs.insert(epoch);
+        self.staged_epochs_count += 1;
+        Ok(SinkState::PreCommitted {
+            staged_rows: row_count,
+            pending_handle,
+        })
+    }
+
     /// Connect a transactional producer to the epoch-marker topic.
     pub fn connect(
         connector_id: ConnectorId,
@@ -209,6 +308,14 @@ impl KafkaSink {
 
     /// Returns presence or confirmed absence; lookup failures leave recovery pending.
     pub fn check_epoch_delivered(&self, epoch: Epoch) -> Result<bool, SinkError> {
+        self.check_payload_delivered(epoch, None)
+    }
+
+    fn check_payload_delivered(
+        &self,
+        epoch: Epoch,
+        expected: Option<&str>,
+    ) -> Result<bool, SinkError> {
         let Some(broker) = &self.broker else {
             return Ok(self.delivered_epochs.contains(&epoch));
         };
@@ -224,7 +331,7 @@ impl KafkaSink {
             .set("enable.auto.commit", "false")
             .set("isolation.level", "read_committed")
             .set("enable.partition.eof", "true");
-        self.lookup_epoch(epoch, &config, Duration::from_secs(5))
+        self.lookup_epoch(epoch, &config, Duration::from_secs(5), expected)
     }
 
     fn lookup_epoch(
@@ -232,6 +339,7 @@ impl KafkaSink {
         epoch: Epoch,
         config: &ClientConfig,
         timeout: Duration,
+        expected: Option<&str>,
     ) -> Result<bool, SinkError> {
         let broker = self
             .broker
@@ -289,10 +397,24 @@ impl KafkaSink {
                         .and_then(Result::ok)
                         .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
                         .and_then(|payload| {
+                            let connector = payload
+                                .get("connector_id")
+                                .and_then(serde_json::Value::as_u64);
+                            if connector.is_some_and(|id| id != self.connector_id.0) {
+                                return None;
+                            }
                             payload.get("epoch").and_then(serde_json::Value::as_u64)
                         })
                         == Some(epoch)
                     {
+                        if expected
+                            .is_some_and(|expected| message.payload() != Some(expected.as_bytes()))
+                        {
+                            return Err(SinkError::CommitFailed {
+                                epoch,
+                                reason: "conflicting Kafka payload for transaction".into(),
+                            });
+                        }
                         return Ok(true);
                     }
                 }
@@ -343,44 +465,14 @@ impl SinkConnector for KafkaSink {
     }
 
     async fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError> {
-        self.apply_secret_token_at_epoch();
-        if self.backpressure_active() {
-            return Err(SinkError::PreCommitFailed {
-                epoch,
-                reason: format!(
-                    "backpressure: staged_epochs={} >= max={}",
-                    self.staged_epochs_count, self.max_staged_epochs
-                ),
-            });
-        }
-        if let Some(broker) = &self.broker {
-            broker
-                .producer
-                .begin_transaction()
-                .map_err(|error| SinkError::PreCommitFailed {
-                    epoch,
-                    reason: format!("Kafka transaction begin failed: {error}"),
-                })?;
-            let payload = format!("{{\"epoch\":{epoch},\"rows\":{row_count}}}");
-            broker
-                .producer
-                .send(
-                    BaseRecord::to(&broker.topic)
-                        .payload(&payload)
-                        .key(&epoch.to_string()),
-                )
-                .map_err(|(error, _)| SinkError::PreCommitFailed {
-                    epoch,
-                    reason: format!("Kafka transaction produce failed: {error}"),
-                })?;
-        }
         let txn_id = format!("kafka-txn-{}-epoch-{}", self.connector_id.0, epoch);
-        self.staged_epochs.insert(epoch);
-        self.staged_epochs_count += 1;
-        Ok(SinkState::PreCommitted {
-            staged_rows: row_count,
-            pending_handle: format!("{txn_id}:{row_count}").into_bytes(),
-        })
+        self.stage_payload(
+            epoch,
+            row_count,
+            &format!("{{\"epoch\":{epoch},\"rows\":{row_count}}}"),
+            format!("{txn_id}:{row_count}").into_bytes(),
+        )
+        .await
     }
 
     async fn commit(&mut self, epoch: Epoch, state: &SinkState) -> Result<(), SinkError> {
@@ -464,8 +556,31 @@ impl SinkConnector for KafkaSink {
                 pending_handle,
             } => {
                 let epoch = *epoch;
+                let row_payload = if pending_handle.first() == Some(&b'{') {
+                    assert_epoch_committed_only_after_cluster_checkpoint(
+                        self.connector_id,
+                        epoch,
+                        self.cluster_committed,
+                    );
+                    let pending: PendingPayload =
+                        serde_json::from_slice(pending_handle).map_err(|error| {
+                            SinkError::Io(format!("invalid Kafka pending payload: {error}"))
+                        })?;
+                    if pending.connector_id != self.connector_id.0
+                        || pending.epoch != epoch
+                        || pending.topic != self.topic()?
+                    {
+                        return Err(SinkError::Io(
+                            "Kafka pending payload identity mismatch".into(),
+                        ));
+                    }
+                    self.validate_payload(epoch, &pending.payload)?;
+                    Some(pending.payload)
+                } else {
+                    None
+                };
                 // CheckBeforeCommit: query the durable epoch topic first.
-                if self.check_epoch_delivered(epoch)? {
+                if self.check_payload_delivered(epoch, row_payload.as_deref())? {
                     self.delivered_epochs.insert(epoch);
                     // Already delivered; mark as committed (idempotent no-op).
                     // The epoch is resolved: clear any stale staged-epoch
@@ -489,11 +604,13 @@ impl SinkConnector for KafkaSink {
                             reason: format!("Kafka recovery transaction begin failed: {error}"),
                         }
                     })?;
-                    let payload = format!("{{\"epoch\":{epoch},\"rows\":{rows}}}");
+                    let payload = row_payload
+                        .unwrap_or_else(|| format!("{{\"epoch\":{epoch},\"rows\":{rows}}}"));
                     broker
                         .producer
                         .send(
                             BaseRecord::to(&broker.topic)
+                                .partition(0)
                                 .payload(&payload)
                                 .key(&epoch.to_string()),
                         )
@@ -596,12 +713,12 @@ mod tests {
             &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED; 100],
         );
         let poll = sink
-            .lookup_epoch(1, &config, Duration::from_secs(5))
+            .lookup_epoch(1, &config, Duration::from_secs(5), None)
             .unwrap_err();
         assert_eq!(poll.to_string(), "RS-4030: sink delivery outcome unknown for epoch 1: poll failed: Message consumption error: TopicAuthorizationFailed (Broker: Topic authorization failed); retry recovery");
         config.set("socket.timeout.ms", "-1");
         let setup = sink
-            .lookup_epoch(1, &config, Duration::from_secs(5))
+            .lookup_epoch(1, &config, Duration::from_secs(5), None)
             .unwrap_err();
         assert_eq!(setup.to_string(), "RS-4030: sink delivery outcome unknown for epoch 1: consumer setup failed: Client config error: Configuration property \"socket.timeout.ms\" value -1 is outside allowed range 10..300000\n socket.timeout.ms -1; retry recovery");
     }

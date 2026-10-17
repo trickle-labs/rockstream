@@ -17,7 +17,7 @@ fn root() -> PathBuf {
 }
 
 #[test]
-fn kafka_sink_row_delivery_is_explicitly_unsupported() {
+fn kafka_sink_row_delivery_has_consumer_proofs_and_remains_experimental() {
     let sink = rockstream_types::capability::CapabilityRegistry::current()
         .get_by_id("sink.kafka")
         .expect("Kafka sink capability");
@@ -41,13 +41,13 @@ fn kafka_sink_row_delivery_is_explicitly_unsupported() {
             vec![
                 (
                     "incremental",
-                    "Unsupported: materialized-view change rows are not delivered; only epoch/count markers are emitted.",
-                    Some(""),
+                    "KafkaViewSink delivers typed view change rows with signed weights in one ordered transaction envelope per nonempty view epoch.",
+                    Some("crates/rockstream-ops/tests/kafka_view_delivery_tests.rs::view_snapshot_changes_and_recovery_match_exact_consumer_stream"),
                 ),
                 (
                     "backfill",
-                    "Unsupported: materialized-view snapshot rows and snapshot completion boundaries are not delivered.",
-                    Some(""),
+                    "KafkaViewSink delivers one complete materialized snapshot envelope before live change envelopes.",
+                    Some("crates/rockstream-ops/tests/kafka_view_delivery_tests.rs::view_snapshot_changes_and_recovery_match_exact_consumer_stream"),
                 ),
             ],
         ),

@@ -695,19 +695,19 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
-Issue #122 narrows the production Kafka sink qualification to match M3's
-epoch-level abstraction. `SinkConnector::pre_commit` accepts a row count and
-Kafka emits/restores epoch/count markers; neither the interface nor the M3
-model carries view row identities, values, weights, or snapshot boundaries.
-M3's exactly-once epoch invariants therefore do not prove snapshot/change row
-delivery or row payload recovery. Those paths remain explicitly unsupported
-under #122 AC6, and `sink.kafka` is Experimental with no row-delivery proof.
-`kafka_sink_row_delivery_is_explicitly_unsupported` checks the embedded contract;
-the capability-gate mutation tests reject restored Core/payload claims and
-marker proofs. `kafka_sink_emits_epoch_count_marker_only` checks the actual
-consumer's complete marker payload, without qualifying row delivery. This
-scope correction adds no FizzBee transition or new protocol proof; R1–R5 of
-`docs/acceptance-contracts/122.md` must pass before row delivery can qualify.
+Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
+still abstracts epochs, not row contents. The adapter persists the full pending
+envelope and view cursor before Kafka commit, then finalizes progress. Restart
+fences the old producer and resolves the pending transaction through the existing
+CheckBeforeCommit protocol. A snapshot is one atomic envelope before any live
+epoch; all envelopes use partition zero. No new FizzBee invariant is asserted.
+`view_snapshot_changes_and_recovery_match_exact_consumer_stream` compiles the
+production view, consumes real Kafka records, and compares independently specified
+rows, signed weights, keys, and transaction boundaries. LFS reopen covers crashes
+before snapshot/update/delete commit and after Kafka commit before progress save.
+The exact oracle rejects wrong values, omitted deletions, and duplicate changes.
+`sink.kafka` remains Experimental pending full Core release qualification;
+marker tests alone cannot qualify row delivery.
 
 Issue #117 closes an implementation-level liveness gap in exchange flow control.
 `FlowController::acquire_batch_permit`, used by `WorkerStreamMultiplexer::send_frame`,
@@ -1244,3 +1244,27 @@ RockStream usage. (Sourced from the FizzBee design-verification tutorials.)
 > ([FizzBee msg-delivery-guarantees](https://fizzbee.io/design/tutorials/msg-delivery-guarantees/)),
 > which is the more established mechanism and is mandatory for M2's
 > reordering proof regardless. Test harness and durability assertions align with v0.64.
+
+## v0.72 bounded adaptive epoch windows (issue #134)
+
+The in-memory epoch compactor may adjust only the time when a logical epoch is
+eligible for its existing flush path. It must not change the epoch's identity,
+reorder dependencies, or replace the durability/acknowledgement transition.
+
+Model refinement obligations:
+
+- Reject zero, reversed, or out-of-range lower/upper startup bounds.
+- The chosen window is always inside the validated closed interval. Four
+  inputs are required: ingest rows/s, observed durable-commit latency, state
+  pressure, and target committed-result freshness.
+- Reserve the observed durable commit time before selecting an epoch window.
+  If the target cannot fit the minimum epoch window plus commit time, expose
+  an explicit infeasible decision instead of claiming the target was met.
+- Adaptation can change when work becomes flush-eligible but not its rows,
+  signed weights, epoch number, ordering, or durable acknowledgement.
+- Commit failure, retries, restart, competing workload fairness, queue bounds,
+  and independent result correctness still require separate integrated proof.
+
+The source-level decision and live-expiration regressions are in
+`crates/rockstream-runtime/tests/v072_adaptive_epoch_tests.rs`. They validate
+this local transition, **not** the full #134 durable/fair scheduling contract.

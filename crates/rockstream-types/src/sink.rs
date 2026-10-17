@@ -90,7 +90,7 @@ pub enum SinkState {
         /// Number of rows staged in the sink buffer.
         staged_rows: usize,
         /// Connector-specific opaque pending handle (serialised bytes).
-        /// For Kafka: producer transaction ID. For S3: `_pending/` path prefix.
+        /// For Kafka: exact payload and target identity, or a legacy count handle.
         pending_handle: Vec<u8>,
     },
 

@@ -1,0 +1,63 @@
+name: v0.72 offline reproduction kit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/v072-offline-reproduction.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v072-offline-kit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kit:
+    name: Package public build inputs (not capacity evidence)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - name: Retain pinned toolchain without credentials
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/v072-toolchain"
+          rustc --version --verbose > "$RUNNER_TEMP/v072-toolchain/rustc-version.txt"
+          cargo --version > "$RUNNER_TEMP/v072-toolchain/cargo-version.txt"
+          git rev-parse HEAD > "$RUNNER_TEMP/v072-toolchain/source-revision.txt"
+          tar -C "$(rustc --print sysroot)" -czf "$RUNNER_TEMP/v072-toolchain/rust-1.88-linux-x86_64.tar.gz" bin lib
+          cd "$RUNNER_TEMP/v072-toolchain"
+          sha256sum rust-1.88-linux-x86_64.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v072-rust-toolchain-${{ github.run_id }}
+          path: ${{ runner.temp }}/v072-toolchain/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+      - name: Vendor locked public dependencies for offline replay
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/v072-dependencies"
+          cargo vendor --locked --versioned-dirs --sync tools/r1-local-harness/Cargo.toml "$RUNNER_TEMP/v072-vendor" > "$RUNNER_TEMP/v072-dependencies/vendor-config.toml"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/v072-dependencies/vendor.tar.gz" v072-vendor
+          cp Cargo.lock "$RUNNER_TEMP/v072-dependencies/workspace-Cargo.lock"
+          cp tools/r1-local-harness/Cargo.lock "$RUNNER_TEMP/v072-dependencies/harness-Cargo.lock"
+          cd "$RUNNER_TEMP/v072-dependencies"
+          sha256sum vendor.tar.gz workspace-Cargo.lock harness-Cargo.lock > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v072-locked-dependencies-${{ github.run_id }}
+          path: ${{ runner.temp }}/v072-dependencies/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0

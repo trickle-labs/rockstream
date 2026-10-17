@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Negative-control tests for the fail-closed CI accounting gate (#110)."""
+from __future__ import annotations
+import copy
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("ci_test_inventory", ROOT / "scripts/ci-test-inventory.py")
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
+POLICY = json.loads((ROOT / "scripts/ci-test-matrix.json").read_text())
+
+
+class GateSelfTests(unittest.TestCase):
+    def setUp(self):
+        self.target = {"package": "rockstream-sim", "kind": "test", "name": "chaos_tests"}
+        self.key = gate.target_id(**self.target)
+
+    def assertFails(self, fn, message):
+        with self.assertRaisesRegex(ValueError, message):
+            fn()
+
+    def test_new_simulation_target_unassigned(self):
+        policy = copy.deepcopy(POLICY)
+        targets = {self.key: self.target, "rockstream-sim/test:new_regression": {
+            "package": "rockstream-sim", "kind": "test", "name": "new_regression"
+        }}
+        # Other explicit assignments are removed to create an isolated synthetic metadata fixture.
+        policy["sim_groups"] = {"pr-sim": ["chaos_tests"]}
+        self.assertFails(lambda: gate.assignments(targets, {"rockstream-sim": {}}, policy), "unassigned Cargo target")
+
+    def test_missing_required_feature(self):
+        policy = copy.deepcopy(POLICY)
+        policy["jobs"]["pr-sim"]["features"] = []
+        self.assertTrue(any("missing required feature simulation" in err for err in
+                            gate.check_requirements(self.key, "pr-sim", policy)))
+
+    def test_missing_required_service(self):
+        policy = copy.deepcopy(POLICY)
+        key = "rockstream-sim/test:real_cluster_chaos_soak_tests"
+        self.assertTrue(any("missing required service docker" in err for err in
+                            gate.check_requirements(key, "pr-sim", policy)))
+
+    def test_zero_selected_mandatory(self):
+        tests, errors, passed = gate.observed_results(self.target, [], [], {})
+        self.assertEqual(passed, 0)
+        self.assertIn("zero selected mandatory tests", errors)
+
+    def test_gateway_runs_required_postgres_differential_ignored_case(self):
+        target = {"package": "rockstream-gateway", "kind": "test",
+                  "name": "pg18_differential_conformance_tests"}
+        key = gate.target_id(**target)
+        self.assertEqual(gate.libtest_flags(key, POLICY["jobs"]["pr-gateway"]),
+                         ["--include-ignored"])
+        self.assertEqual(gate.libtest_flags(self.key, POLICY["jobs"]["pr-gateway"]), [])
+        case = "pg18_reference::tests::pinned_postgres_numeric_and_array_corpus"
+        events = [{"type": "test", "name": case, "event": "ok"}]
+        results, errors, passed = gate.observed_results(target, [case], events, {})
+        self.assertEqual(errors, [])
+        self.assertEqual(passed, 1)
+        self.assertEqual(results[0]["outcome"], "passed")
+
+    def test_ignored_mandatory_case(self):
+        events = [{"type": "test", "name": "must_run", "event": "ignored"}]
+        tests, errors, passed = gate.observed_results(self.target, ["must_run"], events, {})
+        self.assertEqual(tests[0]["outcome"], "unexpected_skip")
+        self.assertTrue(any("ignored mandatory case" in e for e in errors))
+        self.assertEqual(passed, 0)
+
+    def test_unexpected_skip_despite_success_event(self):
+        events = [{"type": "test", "name": "must_run", "event": "ok",
+                   "stdout": "SKIP must_run: unavailable Docker"}]
+        tests, errors, passed = gate.observed_results(self.target, ["must_run"], events, {})
+        self.assertEqual(tests[0]["outcome"], "unexpected_skip")
+        self.assertTrue(any("unexpected in-test skip" in e for e in errors))
+        self.assertEqual(passed, 0)
+
+    def test_ignored_declared_limitation_does_not_count(self):
+        cid = gate.case_id("rockstream-sim", "test", "chaos_tests", "old_case")
+        events = [{"type": "test", "name": "old_case", "event": "ignored"},
+                  {"type": "test", "name": "mandatory", "event": "ok"}]
+        tests, errors, passed = gate.observed_results(
+            self.target, ["old_case", "mandatory"], events, {cid: "known unsupported transport"})
+        self.assertEqual(errors, [])
+        self.assertEqual([t["outcome"] for t in tests], ["limitation", "passed"])
+        self.assertEqual(passed, 1)
+
+    def test_empty_selection_with_only_waiver(self):
+        cid = gate.case_id("rockstream-sim", "test", "chaos_tests", "old_case")
+        events = [{"type": "test", "name": "old_case", "event": "ignored"}]
+        _, errors, passed = gate.observed_results(
+            self.target, ["old_case"], events, {cid: "known unsupported transport"})
+        self.assertTrue(any("zero selected mandatory tests" in e for e in errors))
+        self.assertEqual(passed, 0)
+
+    def test_mandatory_missing_terminal_event(self):
+        _, errors, passed = gate.observed_results(self.target, ["mandatory"], [], {})
+        self.assertTrue(any("missing terminal execution event" in e for e in errors))
+        self.assertEqual(passed, 0)
+
+    def test_exact_ids_and_failures(self):
+        events = [{"type": "test", "name": "case_a", "event": "ok"},
+                  {"type": "test", "name": "case_b", "event": "failed", "stdout": "assertion failed"}]
+        tests, errors, passed = gate.observed_results(self.target, ["case_a", "case_b"], events, {})
+        self.assertEqual(tests[0]["id"], "rockstream-sim::test/chaos_tests::case_a")
+        self.assertEqual(tests[1]["outcome"], "failed")
+        self.assertTrue(any("failed mandatory case" in e for e in errors))
+        self.assertEqual(passed, 1)
+
+    def test_real_policy_covers_simulation_fixture(self):
+        for target_list in POLICY["sim_groups"].values():
+            self.assertEqual(len(target_list), len(set(target_list)))
+        self.assertIn("dst_fuzz_harness", POLICY["sim_groups"]["nightly-seeds"])
+        self.assertIn("rolling_upgrade_tests", POLICY["sim_groups"]["release-docker"])
+
+    def test_results_parser(self):
+        raw = '{"type":"test","event":"ok","name":"a"}\nnot json\n{"type":"suite","event":"ok"}\n'
+        self.assertEqual(len(gate.parse_events(raw)), 2)
+        self.assertEqual(gate.parse_list("a: test\nb: benchmark\n"), ["a"])
+
+
+if __name__ == "__main__":
+    unittest.main()

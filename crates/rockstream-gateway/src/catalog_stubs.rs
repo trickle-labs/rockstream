@@ -44,6 +44,30 @@ impl Default for SessionInfo {
 
 static SERVER_START_TIME: OnceLock<SystemTime> = OnceLock::new();
 
+/// Case-sensitive PostgreSQL LIKE matching with backslash escapes.
+fn pgjdbc_like(value: &str, pattern: &str) -> bool {
+    let mut expression = String::from("(?s)^");
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(literal) = chars.next() {
+                    expression.push_str(&regex::escape(&literal.to_string()));
+                } else {
+                    expression.push_str(r"\\");
+                }
+            }
+            '%' => expression.push_str(".*"),
+            '_' => expression.push('.'),
+            other => expression.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    expression.push('$');
+    regex::Regex::new(&expression)
+        .expect("escaped PostgreSQL LIKE expression")
+        .is_match(value)
+}
+
 /// Postgres type OIDs used in RowDescription fields.
 pub const PG_OID_INT2: i32 = 21;
 pub const PG_OID_INT4: i32 = 23;
@@ -2233,6 +2257,10 @@ impl CatalogStubs {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        if let Some(result) = self.pgjdbc_columns_query(q) {
+            return Some(result);
+        }
+
         if let Ok(statements) =
             sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, q)
         {
@@ -3090,22 +3118,145 @@ impl CatalogStubs {
         }
     }
 
+    /// PostgreSQL JDBC 42.7 getColumns() uses a derived SELECT with a
+    /// row_number() window over pg_namespace/pg_class/pg_attribute/pg_type.
+    /// Our small catalog evaluator deliberately does not implement general
+    /// window aggregation, so execute this identifiable metadata query from
+    /// the live catalog entries. Never credit a nonmatching SQL statement.
+    fn pgjdbc_columns_query(&self, query: &str) -> Option<CatalogResponse> {
+        let shape = regex::Regex::new(
+            r"(?is)^select\s+\*\s+from\s*\(\s*select\s+n\.nspname\s*,\s*c\.relname\s*,\s*a\.attname\s*,",
+        )
+        .expect("constant JDBC query signature");
+        if !shape.is_match(query)
+            || !query.contains("pg_catalog.pg_attribute")
+            || !query.contains("pg_catalog.pg_type")
+            || !query.contains("pg_catalog.pg_namespace")
+            || !query.contains("pg_catalog.pg_class")
+            || !query.to_ascii_lowercase().contains("row_number()")
+        {
+            return None;
+        }
+
+        // pgjdbc embeds escaped SQL literals for the caller's metadata
+        // patterns. Apply each literal as a LIKE filter before returning data.
+        let filter =
+            regex::Regex::new(r"(?i)\b(n\.nspname|c\.relname|attname)\s+like\s+'((?:''|[^'])*)'")
+                .expect("constant JDBC filter pattern");
+        let mut schema_pattern = None;
+        let mut table_pattern = None;
+        let mut column_pattern = None;
+        for capture in filter.captures_iter(query) {
+            let pattern = capture[2].replace("''", "'");
+            match capture[1].to_ascii_lowercase().as_str() {
+                "n.nspname" => schema_pattern = Some(pattern),
+                "c.relname" => table_pattern = Some(pattern),
+                "attname" => column_pattern = Some(pattern),
+                _ => unreachable!(),
+            }
+        }
+
+        let mut entries = Vec::new();
+        for table in self.list_tables() {
+            entries.push((catalog_relation_name(&table.name, "public"), table.columns));
+        }
+        for view in self.list_views() {
+            entries.push((
+                catalog_relation_name(&view.name, &view.namespace),
+                view.columns,
+            ));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let columns = [
+            "nspname",
+            "relname",
+            "attname",
+            "atttypid",
+            "attnotnull",
+            "atttypmod",
+            "attlen",
+            "typtypmod",
+            "attnum",
+            "attidentity",
+            "attgenerated",
+            "adsrc",
+            "description",
+            "typbasetype",
+            "typtype",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut rows = Vec::new();
+        for ((schema, name), attributes) in entries {
+            if schema_pattern
+                .as_deref()
+                .is_some_and(|pattern| !pgjdbc_like(&schema, pattern))
+                || table_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| !pgjdbc_like(&name, pattern))
+            {
+                continue;
+            }
+            for (ordinal, attribute) in attributes.iter().enumerate() {
+                if column_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| !pgjdbc_like(&attribute.name, pattern))
+                {
+                    continue;
+                }
+                rows.push(vec![
+                    Some(schema.clone()),
+                    Some(name.clone()),
+                    Some(attribute.name.clone()),
+                    Some(arrow_type_to_pg_oid(&attribute.data_type).to_string()),
+                    Some("f".into()),
+                    Some("-1".into()),
+                    Some("-1".into()),
+                    Some("-1".into()),
+                    Some((ordinal + 1).to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("0".into()),
+                    Some("b".into()),
+                ]);
+                if rows.len() >= MAX_CATALOG_SCAN_ROWS {
+                    return Some(CatalogResponse::Rows { columns, rows });
+                }
+            }
+        }
+        Some(CatalogResponse::Rows { columns, rows })
+    }
+
     fn pg_catalog_rows(&self, relation: &str, session: &SessionInfo) -> Option<CatalogResponse> {
         let relation = relation.to_lowercase().replace('"', "");
         let name = relation.strip_prefix("pg_catalog.").unwrap_or(&relation);
         let fields = match name {
-            "pg_class" => "oid relname relnamespace relkind relowner relchecks relhasindex relhasrules relhastriggers relrowsecurity relforcerowsecurity relhasoids relispartition reltablespace reloftype relpersistence relreplident relam reltoastrelid relacl definition",
+            "pg_class" => "oid relname relnamespace relkind reltype relowner relchecks relhasindex relhasrules relhastriggers relrowsecurity relforcerowsecurity relhasoids relispartition reltablespace reloftype relpersistence relreplident relam reltoastrelid relacl definition",
             "pg_attribute" => "attrelid nspname relname attname atttypid attnotnull atttypmod attlen typtypmod attnum attidentity attgenerated adsrc description typbasetype typtype format_type attisdropped atthasdef attcollation attacl",
             "pg_namespace" => "oid nspname nspowner",
             "pg_type" => "oid typname typlen typarray typnamespace typtype typrelid typelem typcollation format_type",
-            "pg_proc" => "oid proname pronamespace prorettype proargtypes prokind",
-            "pg_index" => "indexrelid indrelid indisunique indisprimary indisclustered indisvalid indisreplident indkey indexdef",
+            "pg_proc" => "oid proname pronamespace prorettype proargtypes prokind prolang prosrc",
+            // Prisma joins pg_proc to pg_language when reflecting user-defined
+            // functions. The built-in language OIDs match PostgreSQL.
+            "pg_language" => "oid lanname lanowner lanispl lanpltrusted lanplcallfoid laninline lanvalidator lanacl",
+            "pg_index" => "indexrelid indrelid indisunique indisprimary indisclustered indisvalid indisreplident indkey indexdef indclass indoption indpred indisexclusion",
             "pg_roles" => "oid rolname rolsuper rolinherit rolcreaterole rolcreatedb rolcanlogin rolconnlimit rolreplication rolbypassrls rolvaliduntil",
             "pg_database" => "oid datname datdba encoding datcollate datctype datacl datistemplate datallowconn",
             "pg_am" => "oid amname",
             "pg_policy" => "oid polname polrelid polpermissive polroles polqual polwithcheck polcmd",
             "pg_inherits" => "inhrelid inhparent inhseqno inhdetachpending",
             "pg_attrdef" => "oid adrelid adnum adbin",
+            // SQLAlchemy reflects identity columns through a correlated
+            // pg_sequence lookup even when the relation has no identity.
+            // An empty pg_sequence catalog is valid; an absent one is not.
+            "pg_sequence" => "seqrelid seqtypid seqstart seqincrement seqmax seqmin seqcache seqcycle",
+            // Prisma LEFT JOINs pg_opclass while reflecting indexes. It is a
+            // known catalog even when RockStream has no index opclass rows.
+            "pg_opclass" => "oid opcname opcdefault opcfamily opcintype opckeytype opcmethod",
             "pg_collation" => "oid collname",
             "pg_auth_members" => "roleid member grantor admin_option",
             "pg_tables" => return Some(self.pg_tables(&[])),
@@ -3130,6 +3281,30 @@ impl CatalogStubs {
             "pg_namespace" => self.pg_namespace(&columns),
             "pg_type" => self.pg_type(&columns),
             "pg_proc" => self.pg_proc(&columns),
+            "pg_language" => {
+                let languages = [(12, "internal"), (13, "c"), (14, "sql")];
+                let rows = languages
+                    .into_iter()
+                    .map(|(oid, name)| {
+                        columns
+                            .iter()
+                            .map(|field| match field.as_str() {
+                                "oid" => Some(oid.to_string()),
+                                "lanname" => Some(name.to_string()),
+                                "lanowner" => Some(view_oid("rockstream").to_string()),
+                                "lanispl" => Some("f".to_string()),
+                                "lanpltrusted" => Some("t".to_string()),
+                                "lanplcallfoid" | "laninline" | "lanvalidator" => {
+                                    Some("0".to_string())
+                                }
+                                "lanacl" => None,
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .collect();
+                CatalogResponse::rows(columns, rows)
+            }
             "pg_index" => self.pg_index(&columns),
             "pg_roles" => self.pg_roles(&session.principal_name, &columns),
             "pg_database" => CatalogResponse::rows(
@@ -3278,6 +3453,16 @@ impl CatalogStubs {
                         "relowner" => Some(view_oid("rockstream").to_string()),
                         "tableowner" => Some("rockstream".into()),
                         "relkind" => Some(kind.into()),
+                        // pg_class.reltype identifies the relation composite type.
+                        // Prisma's catalog introspection filters out reltype = 0.
+                        "reltype" => Some(
+                            if kind == "i" {
+                                0
+                            } else {
+                                view_oid(&format!("type:{full_name}"))
+                            }
+                            .to_string(),
+                        ),
                         "relhasindex" => Some(
                             if indexes.iter().any(|i| i.table == full_name) {
                                 "t"
@@ -3610,6 +3795,9 @@ impl CatalogStubs {
         if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
             return cached.clone();
         }
+        // Prisma introspection consumes udt_name as full_data_type, even for
+        // built-in numeric and boolean types. Keep the complete reflection
+        // schema in the catalog provider so projected columns are not NULL.
         let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
             vec![
                 "table_catalog".to_string(),
@@ -3618,46 +3806,92 @@ impl CatalogStubs {
                 "column_name".to_string(),
                 "ordinal_position".to_string(),
                 "data_type".to_string(),
+                "udt_schema".to_string(),
+                "udt_name".to_string(),
+                "is_nullable".to_string(),
+                "is_identity".to_string(),
+                "numeric_precision".to_string(),
+                "numeric_scale".to_string(),
+                "numeric_precision_radix".to_string(),
+                "datetime_precision".to_string(),
+                "character_maximum_length".to_string(),
             ]
         } else {
             requested_cols.to_vec()
         };
         let mut rows = Vec::new();
         let mut items = Vec::new();
-        for t in self.list_tables() {
-            for (i, col) in t.columns.iter().enumerate() {
+        for table in self.list_tables() {
+            for (i, col) in table.columns.iter().enumerate() {
                 items.push((
-                    catalog_relation_name(&t.name, "public"),
+                    catalog_relation_name(&table.name, "public"),
                     col.name.clone(),
                     i + 1,
+                    arrow_type_to_pg_oid(&col.data_type),
                     arrow_type_to_pg_data_type(&col.data_type),
                 ));
             }
         }
-        for v in self.list_views() {
-            for (i, col) in v.columns.iter().enumerate() {
+        for view in self.list_views() {
+            for (i, col) in view.columns.iter().enumerate() {
                 items.push((
-                    catalog_relation_name(&v.name, &v.namespace),
+                    catalog_relation_name(&view.name, &view.namespace),
                     col.name.clone(),
                     i + 1,
+                    arrow_type_to_pg_oid(&col.data_type),
                     arrow_type_to_pg_data_type(&col.data_type),
                 ));
             }
         }
-        for ((schema, table_name), column_name, pos, data_type) in items {
-            let mut row = Vec::new();
-            for c in &cols {
-                let val = match c.as_str() {
+        for ((schema, table_name), column_name, pos, oid, data_type) in items {
+            let (udt_name, precision, scale, radix, datetime_precision) = match oid {
+                PG_OID_INT2 => ("int2", Some("16"), Some("0"), Some("2"), None),
+                PG_OID_INT4 => ("int4", Some("32"), Some("0"), Some("2"), None),
+                PG_OID_INT8 => ("int8", Some("64"), Some("0"), Some("2"), None),
+                PG_OID_FLOAT4 => ("float4", Some("24"), None, Some("2"), None),
+                PG_OID_FLOAT8 => ("float8", Some("53"), None, Some("2"), None),
+                PG_OID_BOOL => ("bool", None, None, None, None),
+                PG_OID_BYTEA => ("bytea", None, None, None, None),
+                PG_OID_TIMESTAMP => ("timestamp", None, None, None, Some("6")),
+                PG_OID_TIMESTAMPTZ => ("timestamptz", None, None, None, Some("6")),
+                PG_OID_TIME => ("time", None, None, None, Some("6")),
+                PG_OID_DATE => ("date", None, None, None, None),
+                PG_OID_UUID => ("uuid", None, None, None, None),
+                PG_OID_NUMERIC => ("numeric", None, None, Some("10"), None),
+                PG_OID_JSON => ("json", None, None, None, None),
+                PG_OID_JSONB => ("jsonb", None, None, None, None),
+                PG_OID_VARCHAR => ("varchar", None, None, None, None),
+                PG_OID_CHAR => ("bpchar", None, None, None, None),
+                PG_OID_INTERVAL => ("interval", None, None, None, Some("6")),
+                PG_OID_ARRAY_INT4 => ("_int4", None, None, None, None),
+                PG_OID_ARRAY_INT8 => ("_int8", None, None, None, None),
+                PG_OID_ARRAY_TEXT => ("_text", None, None, None, None),
+                PG_OID_ARRAY_FLOAT8 => ("_float8", None, None, None, None),
+                PG_OID_ARRAY_BOOL => ("_bool", None, None, None, None),
+                PG_OID_ARRAY_UUID => ("_uuid", None, None, None, None),
+                _ => ("text", None, None, None, None),
+            };
+            let row = cols
+                .iter()
+                .map(|c| match c.as_str() {
                     "table_catalog" => Some("rockstream".to_string()),
                     "table_schema" => Some(schema.clone()),
                     "table_name" => Some(table_name.clone()),
                     "column_name" => Some(column_name.clone()),
                     "ordinal_position" => Some(pos.to_string()),
                     "data_type" => Some(data_type.to_string()),
-                    _ => Some("".to_string()),
-                };
-                row.push(val);
-            }
+                    "udt_schema" => Some("pg_catalog".to_string()),
+                    "udt_name" => Some(udt_name.to_string()),
+                    "is_nullable" => Some("YES".to_string()),
+                    "is_identity" => Some("NO".to_string()),
+                    "numeric_precision" => precision.map(str::to_string),
+                    "numeric_scale" => scale.map(str::to_string),
+                    "numeric_precision_radix" => radix.map(str::to_string),
+                    "datetime_precision" => datetime_precision.map(str::to_string),
+                    "character_maximum_length" => None,
+                    _ => None,
+                })
+                .collect();
             rows.push(row);
         }
         let resp = CatalogResponse::rows(cols, rows);
@@ -3701,6 +3935,10 @@ impl CatalogStubs {
                     "prorettype" => Some(prorettype.to_string()),
                     "proargtypes" => Some(proargtypes.to_string()),
                     "prokind" => Some(prokind.to_string()),
+                    // The functions in this stub are PostgreSQL built-ins,
+                    // implemented by the internal language (pg_language.oid=12).
+                    "prolang" => Some("12".to_string()),
+                    "prosrc" => Some(proname.to_string()),
                     _ => Some("".to_string()),
                 };
                 row.push(val);
@@ -3782,6 +4020,9 @@ impl CatalogStubs {
                         .into(),
                     ),
                     "indkey" => Some(indkey_vals.join(" ")),
+                    // RockStream's ordinary indexes are not partial or exclusion indexes.
+                    "indpred" => None,
+                    "indisexclusion" => Some("f".into()),
                     "indexdef" => Some(format!(
                         "CREATE INDEX {} ON {} ({})",
                         idx.name,
@@ -5523,5 +5764,238 @@ mod tests {
 
         assert!(catalog.remove_source("kafka_test"));
         assert!(catalog.get_source("kafka_test").is_none());
+    }
+}
+
+#[cfg(test)]
+mod pgjdbc_reflection_tests {
+    use super::*;
+
+    const JDBC_COLUMNS_SQL: &str = r#"
+        SELECT * FROM (
+            SELECT n.nspname,c.relname,a.attname,a.atttypid,
+                   a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) AS attnotnull,
+                   a.atttypmod,a.attlen,t.typtypmod,
+                   row_number() OVER (PARTITION BY a.attrelid ORDER BY a.attnum) AS attnum,
+                   nullif(a.attidentity, '') as attidentity,
+                   nullif(a.attgenerated, '') as attgenerated,
+                   pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS adsrc,
+                   dsc.description,t.typbasetype,t.typtype
+            FROM pg_catalog.pg_namespace n
+            JOIN pg_catalog.pg_class c ON (c.relnamespace = n.oid)
+            JOIN pg_catalog.pg_attribute a ON (a.attrelid=c.oid)
+            JOIN pg_catalog.pg_type t ON (a.atttypid = t.oid)
+            LEFT JOIN pg_catalog.pg_attrdef def ON (a.attrelid=def.adrelid AND a.attnum = def.adnum)
+            LEFT JOIN pg_catalog.pg_description dsc ON (c.oid=dsc.objoid AND a.attnum = dsc.objsubid)
+            WHERE c.relkind in ('r','p','v','f','m') and a.attnum > 0 AND NOT a.attisdropped
+              AND n.nspname LIKE 'public'
+              AND c.relname LIKE 'numeric_view'
+        ) c WHERE true AND attname LIKE '%'
+        ORDER BY nspname,c.relname,attnum
+    "#;
+
+    fn catalog() -> CatalogStubs {
+        let catalog = CatalogStubs::new();
+        catalog.add_view(CatalogView {
+            name: "numeric_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![
+                CatalogColumn {
+                    name: "c_int2".to_string(),
+                    data_type: "Int16".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_int4".to_string(),
+                    data_type: "Int32".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_int8".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_float4".to_string(),
+                    data_type: "Float32".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_float64".to_string(),
+                    data_type: "Float64".to_string(),
+                },
+                CatalogColumn {
+                    name: "c_bool".to_string(),
+                    data_type: "Boolean".to_string(),
+                },
+            ],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+        catalog
+    }
+
+    #[test]
+    fn jdbc_column_metadata_reports_six_real_columns_and_types() {
+        let CatalogResponse::Rows { columns, rows } = catalog()
+            .handle_query(JDBC_COLUMNS_SQL, &SessionInfo::default())
+            .expect("JDBC column metadata query recognized")
+        else {
+            panic!("JDBC reflection must return rows");
+        };
+        assert_eq!(columns.len(), 15);
+        assert_eq!(columns[0], "nspname");
+        assert_eq!(columns[2], "attname");
+        assert_eq!(rows.len(), 6);
+        let expected = [
+            ("c_int2", PG_OID_INT2),
+            ("c_int4", PG_OID_INT4),
+            ("c_int8", PG_OID_INT8),
+            ("c_float4", PG_OID_FLOAT4),
+            ("c_float64", PG_OID_FLOAT8),
+            ("c_bool", PG_OID_BOOL),
+        ];
+        for (i, ((name, oid), row)) in expected.iter().zip(&rows).enumerate() {
+            assert_eq!(row[0].as_deref(), Some("public"));
+            assert_eq!(row[1].as_deref(), Some("numeric_view"));
+            assert_eq!(row[2].as_deref(), Some(*name));
+            assert_eq!(row[3].as_deref(), Some(oid.to_string().as_str()));
+            assert_eq!(row[8].as_deref(), Some((i + 1).to_string().as_str()));
+        }
+    }
+
+    #[test]
+    fn jdbc_column_metadata_respects_requested_patterns() {
+        let cat = catalog();
+        for (query, expected_columns) in [
+            (
+                JDBC_COLUMNS_SQL.replace("LIKE 'public'", "LIKE 'private'"),
+                0,
+            ),
+            (
+                JDBC_COLUMNS_SQL.replace("LIKE 'numeric_view'", "LIKE 'missing'"),
+                0,
+            ),
+            (
+                JDBC_COLUMNS_SQL.replace("attname LIKE '%'", "attname LIKE 'c_int_'"),
+                3,
+            ),
+        ] {
+            let CatalogResponse::Rows { rows, .. } = cat
+                .handle_query(&query, &SessionInfo::default())
+                .expect("filtered JDBC query recognized")
+            else {
+                panic!("JDBC reflection must return rows");
+            };
+            assert_eq!(rows.len(), expected_columns, "{query}");
+        }
+    }
+
+    #[test]
+    fn prisma_information_schema_exposes_all_native_column_types() {
+        let CatalogResponse::Rows { columns, rows } = catalog().information_schema_columns(&[])
+        else {
+            panic!("information_schema.columns must return rows");
+        };
+        let table = columns.iter().position(|c| c == "table_name").unwrap();
+        let native = columns.iter().position(|c| c == "udt_name").unwrap();
+        let native_schema = columns.iter().position(|c| c == "udt_schema").unwrap();
+        let identity = columns.iter().position(|c| c == "is_identity").unwrap();
+        let actual = rows
+            .iter()
+            .filter(|row| row[table].as_deref() == Some("numeric_view"))
+            .map(|row| {
+                assert_eq!(row[native_schema].as_deref(), Some("pg_catalog"));
+                assert_eq!(row[identity].as_deref(), Some("NO"));
+                row[native].as_deref().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, ["int2", "int4", "int8", "float4", "float8", "bool"]);
+    }
+
+    #[test]
+    fn prisma_function_reflection_resolves_builtin_language() {
+        let catalog = catalog();
+        let Some(CatalogResponse::Rows {
+            columns: language_columns,
+            rows: language_rows,
+        }) = catalog.pg_catalog_rows("pg_language", &SessionInfo::default())
+        else {
+            panic!("pg_language must be available to PostgreSQL introspection");
+        };
+        let oid = language_columns
+            .iter()
+            .position(|column| column == "oid")
+            .expect("pg_language oid");
+        let name = language_columns
+            .iter()
+            .position(|column| column == "lanname")
+            .expect("pg_language lanname");
+        assert!(language_rows.iter().any(
+            |row| row[oid].as_deref() == Some("12") && row[name].as_deref() == Some("internal")
+        ));
+
+        // Prisma 6 uses a LEFT JOIN against pg_language to describe SQL
+        // functions. The built-in functions must not be mistaken for public
+        // user-defined functions, and the query must not fail with RS-2026.
+        let query = r#"
+            SELECT p.proname AS name, n.nspname AS namespace,
+                CASE WHEN l.lanname = 'internal' THEN p.prosrc
+                     ELSE pg_get_functiondef(p.oid) END AS definition
+            FROM pg_proc p
+            LEFT JOIN pg_namespace n ON p.pronamespace = n.oid
+            LEFT JOIN pg_language l ON p.prolang = l.oid
+            WHERE n.nspname = ANY (ARRAY['public'])
+        "#;
+        let Some(CatalogResponse::Rows { columns, rows }) =
+            catalog.handle_query(query, &SessionInfo::default())
+        else {
+            panic!("Prisma function introspection must return a catalog result");
+        };
+        assert_eq!(columns, vec!["name", "namespace", "definition"]);
+        assert!(rows.is_empty(), "built-ins are not public user functions");
+    }
+
+    #[test]
+    fn prisma_index_metadata_cte_without_indexes_is_empty() {
+        let sql = r#"
+WITH rawindex AS (
+    SELECT indrelid, indexrelid, indisunique, indisprimary,
+           unnest(indkey) AS indkeyid,
+           generate_subscripts(indkey, 1) AS indkeyidx,
+           unnest(indclass) AS indclass, unnest(indoption) AS indoption
+    FROM pg_index WHERE indpred IS NULL AND NOT indisexclusion
+)
+SELECT schemainfo.nspname AS namespace, indexinfo.relname AS index_name,
+       tableinfo.relname AS table_name, columninfo.attname AS column_name,
+       rawindex.indisunique AS is_unique, rawindex.indisprimary AS is_primary_key,
+       rawindex.indkeyidx AS column_index, opclass.opcname AS opclass,
+       opclass.opcdefault AS opcdefault, indexaccess.amname AS index_algo,
+       CASE rawindex.indoption & 1 WHEN 1 THEN 'DESC' ELSE 'ASC' END AS column_order,
+       CASE rawindex.indoption & 2 WHEN 2 THEN true ELSE false END AS nulls_first,
+       pc.condeferrable AS condeferrable, pc.condeferred AS condeferred
+FROM rawindex
+JOIN pg_class AS tableinfo ON tableinfo.oid = rawindex.indrelid
+JOIN pg_class AS indexinfo ON indexinfo.oid = rawindex.indexrelid
+JOIN pg_namespace AS schemainfo ON schemainfo.oid = tableinfo.relnamespace
+LEFT JOIN pg_attribute AS columninfo ON columninfo.attrelid = tableinfo.oid AND columninfo.attnum = rawindex.indkeyid
+JOIN pg_am AS indexaccess ON indexaccess.oid = indexinfo.relam
+LEFT JOIN pg_opclass AS opclass ON opclass.oid = rawindex.indclass
+LEFT JOIN pg_constraint pc ON rawindex.indexrelid = pc.conindid AND pc.contype <> 'f'
+WHERE schemainfo.nspname = ANY (ARRAY['public'])
+ORDER BY namespace, table_name, index_name, column_index
+"#;
+        let response = catalog()
+            .handle_query(sql, &SessionInfo::default())
+            .expect("Prisma index reflection must use the catalog evaluator");
+        let CatalogResponse::Rows { columns, rows } = response else {
+            panic!("Prisma index reflection must return rows, not an error");
+        };
+        assert_eq!(columns.len(), 14);
+        assert!(rows.is_empty(), "no indexes were registered");
+    }
+
+    #[test]
+    fn jdbc_like_respects_wildcards_and_escaped_literals() {
+        assert!(pgjdbc_like("numeric_view", "numeric\\_view"));
+        assert!(!pgjdbc_like("numericXview", "numeric\\_view"));
+        assert!(pgjdbc_like("c_int2", "c_int_"));
+        assert!(!pgjdbc_like("c_int22", "c_int_"));
     }
 }
