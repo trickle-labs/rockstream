@@ -1,0 +1,17 @@
+name: Load candidate image
+description: Load and verify the production image built by this workflow run
+inputs:
+  image-id:
+    description: Expected Docker image ID from the producer
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: candidate-image-${{ github.sha }}
+        path: target/ci-image
+    - shell: bash
+      env:
+        EXPECTED_IMAGE_ID: ${{ inputs.image-id }}
+      run: bash scripts/ci-load-image.sh

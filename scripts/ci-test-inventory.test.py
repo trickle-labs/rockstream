@@ -2,11 +2,16 @@
 """Negative-control tests for the fail-closed CI accounting gate (#110)."""
 from __future__ import annotations
 import copy
+import contextlib
 import importlib.util
+import io
 import json
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from subprocess import CompletedProcess
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("ci_test_inventory", ROOT / "scripts/ci-test-inventory.py")
@@ -16,6 +21,18 @@ POLICY = json.loads((ROOT / "scripts/ci-test-matrix.json").read_text())
 
 
 class GateSelfTests(unittest.TestCase):
+    def test_gateway_conformance_feature_and_target_matrix(self):
+        manifest = tomllib.loads((ROOT / "crates/rockstream-gateway/Cargo.toml").read_text())
+        self.assertEqual(manifest["features"], {"testcontainers": []})
+        self.assertEqual(POLICY["jobs"]["pr-gateway"]["features"], ["testcontainers"])
+        self.assertEqual(POLICY["jobs"]["pr-gateway"]["conformance_targets"], [
+            "rockstream-gateway/test:" + name for name in (
+                "auth_scram_tests", "gateway_dml_tests", "gateway_extended_query_tests",
+                "gateway_integration_tests", "gateway_proof_tests", "golden_wire_tests",
+                "listen_notify_tests", "transaction_savepoint_tests",
+            )
+        ])
+
     def setUp(self):
         self.target = {"package": "rockstream-sim", "kind": "test", "name": "chaos_tests"}
         self.key = gate.target_id(**self.target)
@@ -54,7 +71,9 @@ class GateSelfTests(unittest.TestCase):
         target = {"package": "rockstream-gateway", "kind": "test",
                   "name": "pg18_differential_conformance_tests"}
         key = gate.target_id(**target)
-        self.assertEqual(gate.libtest_flags(key, POLICY["jobs"]["pr-gateway"]),
+        self.assertEqual(POLICY["target_jobs"][key], "pr-postgres-differential")
+        self.assertEqual(POLICY["jobs"]["pr-postgres-differential"]["features"], [])
+        self.assertEqual(gate.libtest_flags(key, POLICY["jobs"]["pr-postgres-differential"]),
                          ["--include-ignored"])
         self.assertEqual(gate.libtest_flags(self.key, POLICY["jobs"]["pr-gateway"]), [])
         case = "pg18_reference::tests::pinned_postgres_numeric_and_array_corpus"
@@ -121,6 +140,83 @@ class GateSelfTests(unittest.TestCase):
         raw = '{"type":"test","event":"ok","name":"a"}\nnot json\n{"type":"suite","event":"ok"}\n'
         self.assertEqual(len(gate.parse_events(raw)), 2)
         self.assertEqual(gate.parse_list("a: test\nb: benchmark\n"), ["a"])
+
+    def test_single_execution_supplies_both_reports_and_doc_gate(self):
+        for event, returncode, expected_status in (
+            ("ok", 0, "passed"), ("failed", 1, "failed"),
+            (None, 0, "failed"), ("ignored", 0, "failed"), ("ok", 1, "failed"),
+        ):
+            with self.subTest(event=event, returncode=returncode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                report = root / "target/pgwire-test-results.json"
+                report.parent.mkdir()
+                report.write_text("stale passing evidence")
+                package = "rockstream-gateway"
+                names = ["conformance_doc_tests", "wire_tests"]
+                targets = {gate.target_id(package, "test", n): {
+                    "package": package, "kind": "test", "name": n,
+                } for n in names}
+                wire_key = gate.target_id(package, "test", "wire_tests")
+                spec = {"tier": "pull_request", "features": ["testcontainers"],
+                        "conformance_targets": [wire_key], "services": [],
+                        "test_threads": {wire_key: 4}}
+                policy = {"jobs": {"fixture": spec}, "known_limitations": {}}
+                events = [] if event is None else [{"type": "test", "name": "must_run", "event": event}]
+                calls = []
+
+                def run(argv, cwd, env):
+                    calls.append(argv)
+                    self.assertEqual(cwd, root)
+                    self.assertEqual(env["CARGO_MANIFEST_DIR"], str(root))
+                    if argv[1:] == ["--list"]:
+                        return CompletedProcess(argv, 0, "must_run: test\n", "")
+                    threads = 1 if argv[0] == "conformance_doc_tests" else 4
+                    self.assertEqual(argv[1:], ["-Z", "unstable-options", "--format", "json", f"--test-threads={threads}"])
+                    if argv[0] == "conformance_doc_tests":
+                        self.assertEqual(report.read_text(), "".join(json.dumps(e) + "\n" for e in events))
+                        output = [{"type": "test", "name": "must_run", "event": "ok"}]
+                        return CompletedProcess(argv, 0, "\n".join(map(json.dumps, output)), "")
+                    return CompletedProcess(argv, returncode, "\n".join(map(json.dumps, events)), "")
+
+                out = root / "accounting.json"
+                with patch.object(gate, "ROOT", root), patch.object(gate, "run_cmd", side_effect=run), \
+                     patch.object(gate, "build_artifacts", return_value={k: t["name"] for k, t in targets.items()}) as build, \
+                     patch.object(gate.time, "monotonic", return_value=1), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    code = gate.run_job("fixture", {package: {"manifest_path": str(root / "Cargo.toml")}},
+                                        targets, {k: "fixture" for k in targets}, policy, out)
+                self.assertEqual(build.call_args.args[2], ["testcontainers"])
+                self.assertEqual(calls, [
+                    ["wire_tests", "--list"],
+                    ["wire_tests", "-Z", "unstable-options", "--format", "json", "--test-threads=4"],
+                    ["conformance_doc_tests", "--list"],
+                    ["conformance_doc_tests", "-Z", "unstable-options", "--format", "json", "--test-threads=1"],
+                ])
+                result = json.loads(out.read_text())
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(code, int(expected_status == "failed"))
+                self.assertEqual(result["targets"][0]["tests"], [{
+                    "id": "rockstream-gateway::test/wire_tests::must_run",
+                    "outcome": {"ok": "passed", "failed": "failed", None: "not_run", "ignored": "unexpected_skip"}[event],
+                    "reason": {"ok": None, "failed": "test failed", None: "libtest emitted no terminal execution event",
+                               "ignored": "mandatory test is #[ignore]"}[event],
+                }])
+
+    def test_parallel_allowlist_is_explicit_and_owned(self):
+        self.assertEqual(POLICY["jobs"]["pr-workspace"]["test_threads"], {
+            "rockstream-types/test:canonical_type_tests": 4,
+            "rockstream-types/test:arrangement_spec_isolation_tests": 4,
+        })
+        packages, targets = gate.inventory(gate.cargo_metadata())
+        for field, value, message in (
+            ("test_threads", {"rockstream-types/test:canonical_type_tests": 0}, "invalid parallel"),
+            ("test_threads", {"rockstream-gateway/lib:rockstream_gateway": 4}, "invalid parallel"),
+            ("conformance_targets", ["rockstream-gateway/test:nonexistent"], "conformance target"),
+        ):
+            with self.subTest(field=field, value=value):
+                policy = copy.deepcopy(POLICY)
+                policy["jobs"]["pr-workspace"][field] = value
+                self.assertFails(lambda: gate.assignments(targets, packages, policy), message)
 
 
 if __name__ == "__main__":
