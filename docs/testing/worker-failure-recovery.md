@@ -48,3 +48,20 @@ negative controls against the same validator.
 This replaces the former copied-input multi-category chaos result. Other failure
 categories retain their simulation coverage and explicitly lack this real-backend
 evidence; this scenario must not qualify them.
+
+For qualification, run:
+
+```sh
+bash scripts/run-release-qualification.sh --suite recovery \
+  --output target/real-cluster-chaos/qualification.json
+```
+
+This executes the scenario, binds its observations to the runner's complete
+candidate identity, derives durations from the captured events, and embeds both
+the successful record and six deliberately corrupted records. A fresh run
+directory prevents reuse of stale proof. The first query is still fetched by
+the separate production view reader above; the qualification layer never fills
+it from the expected relation. The runner checks every negative record and its
+intended failure reason exactly. A successful manifest qualifies only this
+single-sample worker-failure scenario; the remaining unsupported claims are
+listed explicitly. The fast observer/topology/oracle tests remain helper evidence.
