@@ -21,7 +21,6 @@ pub async fn read_with_deadline<F: std::future::Future>(
     tokio::time::timeout(deadline, read).await
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyOutLimitError {
     Rows { actual: usize, maximum: usize },
@@ -88,11 +87,7 @@ mod tests {
             let _permit = OnDrop(owned);
             std::future::pending::<Vec<u8>>().await
         };
-        let result = read_with_deadline(
-            std::time::Duration::from_millis(20),
-            blocked_read,
-        )
-        .await;
+        let result = read_with_deadline(std::time::Duration::from_millis(20), blocked_read).await;
         assert!(result.is_err());
         assert!(
             released.load(Ordering::SeqCst),
@@ -107,11 +102,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ready, Ok(vec![1, 2, 3]));
-        let error = read_with_deadline(duration, async {
-            Err::<Vec<u8>, &str>("producer failure")
-        })
-        .await
-        .unwrap();
+        let error =
+            read_with_deadline(duration, async { Err::<Vec<u8>, &str>("producer failure") })
+                .await
+                .unwrap();
         assert_eq!(error, Err("producer failure"));
     }
 
