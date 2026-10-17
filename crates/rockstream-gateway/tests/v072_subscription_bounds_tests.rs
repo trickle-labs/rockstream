@@ -199,8 +199,7 @@ fn v072_empty_replay_after_restart_requires_snapshot_instead_of_empty_tail() {
     let restarted = SubscribeRegistry::new();
     let request = parse_subscribe("SUBSCRIBE v AS OF EPOCH 5").unwrap();
     assert_eq!(
-        start_from_epoch(&restarted, &request, 5, vec![])
-            .unwrap_err(),
+        start_from_epoch(&restarted, &request, 5, vec![]).unwrap_err(),
         SubscribeError::ReplayUnavailable { requested: 5 }
     );
     assert_eq!(
@@ -213,12 +212,22 @@ fn v072_empty_replay_after_restart_requires_snapshot_instead_of_empty_tail() {
 #[test]
 fn v072_valid_retained_replay_is_exact_and_future_epochs_are_rejected() {
     let registry = SubscribeRegistry::new();
-    registry.push_epoch("v", vec![row(7, "a", -1, "before"), row(7, "a", 1, "after")]).unwrap();
-    registry.push_epoch("v", vec![row(8, "b", 1, "next")]).unwrap();
+    registry
+        .push_epoch(
+            "v",
+            vec![row(7, "a", -1, "before"), row(7, "a", 1, "after")],
+        )
+        .unwrap();
+    registry
+        .push_epoch("v", vec![row(8, "b", 1, "next")])
+        .unwrap();
     let request = parse_subscribe("SUBSCRIBE v AS OF EPOCH 7").unwrap();
     let mut handle = start_from_epoch(&registry, &request, 7, vec![]).unwrap();
     assert_eq!(
-        handle.poll(&registry).unwrap().into_iter()
+        handle
+            .poll(&registry)
+            .unwrap()
+            .into_iter()
             .map(|item| (item.mz_timestamp, item.mz_diff, item.encoded_row))
             .collect::<Vec<_>>(),
         vec![
@@ -231,8 +240,7 @@ fn v072_valid_retained_replay_is_exact_and_future_epochs_are_rejected() {
     assert_eq!(registry.entry_count("v"), 3);
     let future = parse_subscribe("SUBSCRIBE v AS OF EPOCH 9").unwrap();
     assert_eq!(
-        start_from_epoch(&registry, &future, 9, vec![])
-            .unwrap_err(),
+        start_from_epoch(&registry, &future, 9, vec![]).unwrap_err(),
         SubscribeError::ReplayUnavailable { requested: 9 }
     );
 }
@@ -240,7 +248,9 @@ fn v072_valid_retained_replay_is_exact_and_future_epochs_are_rejected() {
 #[test]
 fn v072_invalidated_complete_epoch_cannot_be_resumed_without_new_history() {
     let registry = SubscribeRegistry::new();
-    registry.push_epoch("v", vec![row(2, "k", 1, "ok")]).unwrap();
+    registry
+        .push_epoch("v", vec![row(2, "k", 1, "ok")])
+        .unwrap();
     let oversized = "x".repeat(CHANGE_LOG_MAX_EPOCH_BYTES + 1);
     assert!(matches!(
         registry.push_epoch("v", vec![row(3, "k", 1, &oversized)]),
@@ -249,17 +259,25 @@ fn v072_invalidated_complete_epoch_cannot_be_resumed_without_new_history() {
     let from_before = parse_subscribe("SUBSCRIBE v AS OF EPOCH 3").unwrap();
     assert_eq!(
         start_from_epoch(&registry, &from_before, 3, vec![]).unwrap_err(),
-        SubscribeError::EpochBeforeRetention { requested: 3, earliest: 4 }
+        SubscribeError::EpochBeforeRetention {
+            requested: 3,
+            earliest: 4
+        }
     );
     let from_missing = parse_subscribe("SUBSCRIBE v AS OF EPOCH 4").unwrap();
     assert_eq!(
         start_from_epoch(&registry, &from_missing, 4, vec![]).unwrap_err(),
         SubscribeError::ReplayUnavailable { requested: 4 }
     );
-    registry.push_epoch("v", vec![row(4, "k", 1, "next")]).unwrap();
+    registry
+        .push_epoch("v", vec![row(4, "k", 1, "next")])
+        .unwrap();
     let mut handle = start_from_epoch(&registry, &from_missing, 4, vec![]).unwrap();
     assert_eq!(
-        handle.poll(&registry).unwrap().into_iter()
+        handle
+            .poll(&registry)
+            .unwrap()
+            .into_iter()
             .map(|item| (item.mz_timestamp, item.mz_diff, item.encoded_row))
             .collect::<Vec<_>>(),
         vec![(4, 1, Bytes::from_static(b"next"))]
@@ -279,8 +297,12 @@ async fn v072_async_replay_rejects_before_emitting_any_row() {
         vec![],
         |item| output.push((item.mz_timestamp, item.mz_diff, item.encoded_row)),
         || true,
-    ).await;
-    assert_eq!(outcome, Err(SubscribeError::ReplayUnavailable { requested: 22 }));
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        Err(SubscribeError::ReplayUnavailable { requested: 22 })
+    );
     assert_eq!(output, Vec::<(u64, i8, Bytes)>::new());
 }
 
@@ -357,10 +379,8 @@ async fn v072_async_replay_preserves_exact_signed_rows_once() {
 async fn v072_async_snapshot_bound_rejects_before_any_row_callback() {
     let registry = SubscribeRegistry::new();
     let request = parse_subscribe("SUBSCRIBE v AS OF NOW WITH SNAPSHOT").unwrap();
-    let rows = vec![
-        (Bytes::from_static(b"k"), Bytes::from_static(b"v"));
-        SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1
-    ];
+    let rows =
+        vec![(Bytes::from_static(b"k"), Bytes::from_static(b"v")); SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1];
     let mut observed = Vec::new();
     let actual = run_subscribe(
         &request,
