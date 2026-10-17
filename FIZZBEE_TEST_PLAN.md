@@ -695,6 +695,24 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #126 observes the existing M4 worker-disconnect and lease-reassignment
+path together with M3 Kafka transaction recovery. `ControlService` emits the
+`worker.disconnected` audit event when the worker session ends, before removing
+the worker and reassigning its leases. This event supplies a failure-detection
+timestamp; it neither grants ownership nor changes fencing or commit decisions.
+The M3/M4 state machines therefore need no new transition or invariant.
+`worker_failure_recovery_from_view_and_kafka` kills a real worker process with a
+durable Kafka transaction pending, observes a replacement owner and higher lease
+token, and compares complete typed weighted view history, source offsets, and
+consumed Kafka records against independent expected results. A separate view
+reader must return the correct relation at frontier 5 within the recovery
+deadline. Corrupted values, duplicate records, suppressed progress, and a missed
+deadline each fail their intended validator check. The versioned manifest and
+actual observations are described in `docs/testing/worker-failure-recovery.md`.
+This is one measured recovery sample, not a p99 estimate or qualification of
+other chaos categories; process scheduling, broker/storage I/O, and elapsed time
+remain implementation evidence outside the abstract FizzBee models.
+
 Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
 still abstracts epochs, not row contents. The adapter persists the full pending
 envelope and view cursor before Kafka commit, then finalizes progress. Restart
