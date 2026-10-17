@@ -106,8 +106,8 @@ use crate::pgoutput_coordinator::{
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::subscribe_handler::{
-    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
-    SUBSCRIBE_SNAPSHOT_MAX_ROWS,
+    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry,
+    SubscriberHandle, SUBSCRIBE_SNAPSHOT_MAX_ROWS,
 };
 use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -20225,5 +20225,4 @@ mod v072_subscription_producer_bounds_tests {
         assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
         assert_eq!(handler.subscribe_registry.active_streams(), 0);
     }
-
 }
