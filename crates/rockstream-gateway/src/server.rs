@@ -16255,7 +16255,8 @@ impl PartitionStream for QueryTimeScatterPartition {
                         reader
                             .scan_prefix_pages(
                                 &prefix,
-                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS,
+                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS
+                                    .min(rockstream_storage::ShardReader::MAX_SCAN_PAGE_ROWS),
                                 QUERY_TIME_SCATTER_MAX_IN_FLIGHT_BYTES,
                                 sender,
                             )
