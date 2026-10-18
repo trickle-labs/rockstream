@@ -695,25 +695,6 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
-Issue #133 distinguishes shared workload quotas from the bytes owned by each
-`StateBudget` operator. A successful reservation is charged to its specific
-operator and shared workload owner; an operator `release`, `reset`, or
-final `Drop` may refund only its remaining own charge. Another operator's
-live reservation cannot be reset, doubly refunded, or lost by destruction of
-a sibling. The exact `reset_and_drop_release_only_the_original_operator_charge`
-regression in `v072_quota_generation_tests` checks those before/after
-ledgers; its predecessor tests check generation-reuse guards and atomic
-registry admission. `v072_quota_lifecycle` checks worker-waiter cancellation
-and complete eight-category worker accounting.
-
-This is an implementation ownership/lifetime rule, **not** an M1–M7
-distributed frontier, lease, or commit transition. The
-`formal/edge_quota_exhaustion.fizz` model covers fixed-owner capacity
-contention/retry, not Rust `Arc` lifetime and generation recycling. These
-named tests are not a FizzBee proof of distributed quota propagation or
-release-process RSS qualification. Cross-worker effective-owner quota
-propagation still needs a separate distributed invariant and release evidence.
-
 Issue #126 observes the existing M4 worker-disconnect and lease-reassignment
 path together with M3 Kafka transaction recovery. `ControlService` emits the
 `worker.disconnected` audit event when the worker session ends, before removing
