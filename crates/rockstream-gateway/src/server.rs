@@ -20136,7 +20136,7 @@ mod v072_subscription_producer_bounds_tests {
         let response = handler
             .handle_subscribe("SUBSCRIBE v072_snapshot AS OF NOW WITH SNAPSHOT", None)
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("subscription test setup failed: {error}"));
         let limit = reader.seen_limit.load(Ordering::SeqCst);
         let rejected = matches!(response.as_slice(), [Response::Error(_)]);
         (limit, rejected)
@@ -20185,7 +20185,7 @@ mod v072_subscription_producer_bounds_tests {
                 Some("viewer"),
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("subscription test setup failed: {error}"));
         assert!(matches!(denied.as_slice(), [Response::Error(_)]));
         assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
         assert_eq!(handler.subscribe_registry.active_streams(), 0);
@@ -20220,7 +20220,7 @@ mod v072_subscription_producer_bounds_tests {
                 Some("aborted"),
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("subscription test setup failed: {error}"));
         assert!(matches!(denied.as_slice(), [Response::Error(_)]));
         assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
         assert_eq!(handler.subscribe_registry.active_streams(), 0);
