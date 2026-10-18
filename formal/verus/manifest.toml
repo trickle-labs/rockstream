@@ -592,7 +592,7 @@ domain = "A logical commit is authoritative only after the complete batch succee
 assumptions = ["SlateDB and ObjectStore provide the documented atomic write, flush, and ambiguous-I/O behavior; cross-process fencing remains an adapter responsibility."]
 implementation = ["crates/rockstream-verified/src/persistence.rs::commit_outcome"]
 theorems = ["crates/rockstream-verified/src/persistence.rs::commit_outcome"]
-production_callers = ["crates/rockstream-connectors/src/source_epoch.rs::commit_m3", "crates/rockstream-ops/src/group_commit.rs::do_flush"]
+production_callers = ["crates/rockstream-connectors/src/source_epoch.rs::commit_m3", "crates/rockstream-ops/src/group_commit/physical.rs::persist", "crates/rockstream-ops/src/group_commit/physical.rs::finish"]
 regression_tests = ["crates/rockstream-verified/src/lib.rs::vs5_kernels_reject_replay_and_protect_boundaries"]
 evidence = [
     "docs/adr/0006-persistence-replay-compaction.md",
