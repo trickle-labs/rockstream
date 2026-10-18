@@ -272,115 +272,9 @@ async fn local_snapshot_scan_blocks_competing_commit_until_epoch_fence_releases(
     server_task.abort();
 }
 
-#[derive(Debug)]
-struct RejectCompactedStore {
-    inner: InMemory,
-    reject_compacted: std::sync::atomic::AtomicBool,
-    rejected_writes: std::sync::atomic::AtomicUsize,
-}
-
-impl std::fmt::Display for RejectCompactedStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RejectCompactedStore")
-    }
-}
-
-impl RejectCompactedStore {
-    fn reject(&self, location: &object_store::path::Path) -> object_store::Result<()> {
-        if self
-            .reject_compacted
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && location.as_ref().contains("/compacted/")
-        {
-            self.rejected_writes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Err(object_store::Error::Generic {
-                store: "RejectCompactedStore",
-                source: "injected committed-SST failure".into(),
-            });
-        }
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl object_store::ObjectStore for RejectCompactedStore {
-    async fn put_opts(
-        &self,
-        location: &object_store::path::Path,
-        bytes: object_store::PutPayload,
-        opts: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
-        self.reject(location)?;
-        self.inner.put_opts(location, bytes, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &object_store::path::Path,
-        opts: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        self.reject(location)?;
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &object_store::path::Path,
-        opts: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
-        self.inner.get_opts(location, opts).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: futures::stream::BoxStream<
-            'static,
-            object_store::Result<object_store::path::Path>,
-        >,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&object_store::path::Path>,
-        offset: &object_store::path::Path,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> object_store::Result<object_store::ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &object_store::path::Path,
-        to: &object_store::path::Path,
-        opts: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, opts).await
-    }
-}
-
 #[tokio::test]
 async fn failed_storage_flush_cannot_publish_subscription_epoch() {
-    let store = Arc::new(RejectCompactedStore {
-        inner: InMemory::new(),
-        reject_compacted: std::sync::atomic::AtomicBool::new(false),
-        rejected_writes: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let store = Arc::new(InMemory::new());
     let shard = Arc::new(
         ShardDb::builder("v072-durable-publication-failed-flush", store.clone())
             .build()
@@ -391,7 +285,7 @@ async fn failed_storage_flush_cannot_publish_subscription_epoch() {
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(CatalogStubs::new()),
         Arc::new(EmptyViewReader),
-        shard,
+        Arc::clone(&shard),
     );
     let registry = server.handler().subscribe_registry().clone();
     let (address, task) = server.serve_background().await.unwrap();
@@ -405,9 +299,15 @@ async fn failed_storage_flush_cannot_publish_subscription_epoch() {
         .simple_query("INSERT INTO v072_failed_flush (id) VALUES (7)")
         .await
         .unwrap();
-    store
-        .reject_compacted
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Inject at the exact ShardDb::flush boundary used by PgWire COMMIT.
+    // SlateDB need not write a "/compacted/" SST for this small transaction,
+    // so an ObjectStore path filter would not reliably exercise this failure.
+    shard.set_fail_flushes(true);
+    let preflight = shard.flush().await.unwrap_err();
+    assert!(
+        preflight.to_string().contains("injected storage flush failure"),
+        "test must actively reject a durable flush"
+    );
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         client.simple_query("COMMIT"),
@@ -418,13 +318,9 @@ async fn failed_storage_flush_cannot_publish_subscription_epoch() {
         outcome.is_err(),
         "a rejected durable flush must not acknowledge COMMIT"
     );
-    assert!(
-        store
-            .rejected_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0,
-        "the test must actually inject failure in a committed SST write"
-    );
+    // Failure was injected at flush, after batch staging but before replay
+    // publication. A failed commit must never advertise a committed epoch.
+    shard.set_fail_flushes(false);
     assert_eq!(registry.latest_epoch("v072_failed_flush"), None);
     assert!(registry.since_epoch("v072_failed_flush", 0).is_none());
     task.abort();
