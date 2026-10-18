@@ -159,6 +159,9 @@ fn observing_exited_leader_does_not_forfeit_descendant_cleanup() {
     let (mut process, descendant) = resistant_descendant(dir.path(), true);
     assert!(process.has_exited().unwrap());
     assert!(process.has_exited().unwrap());
-    assert!(exists(descendant), "resistant descendant exited before cleanup");
+    assert!(
+        exists(descendant),
+        "resistant descendant exited before cleanup"
+    );
     assert_complete_cleanup(&mut process, descendant);
 }
