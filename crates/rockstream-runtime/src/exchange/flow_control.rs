@@ -37,6 +37,39 @@ impl ChannelCreditState {
     }
 }
 
+/// A per-channel notifier exists only while an actual legacy row-credit
+/// waiter owns it. This bounds the notifier registry across many ephemeral
+/// channels instead of retaining a key forever after cancellation.
+struct ChannelNotifier {
+    notify: Arc<Notify>,
+    waiters: usize,
+}
+
+/// Drop-owned subscription to a specific channel. A teardown may remove the
+/// entry while this guard is alive; pointer identity protects a replacement
+/// entry with the same channel key from a stale release.
+struct ChannelWaiterSlot {
+    _quota: CreditWaiterSlot,
+    key: CreditKey,
+    notifiers: Arc<Mutex<HashMap<CreditKey, ChannelNotifier>>>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for ChannelWaiterSlot {
+    fn drop(&mut self) {
+        let mut notifiers = self.notifiers.lock();
+        if let Some(entry) = notifiers.get_mut(&self.key) {
+            if Arc::ptr_eq(&entry.notify, &self.notify) {
+                if entry.waiters <= 1 {
+                    notifiers.remove(&self.key);
+                } else {
+                    entry.waiters -= 1;
+                }
+            }
+        }
+    }
+}
+
 /// A bounded queued exchange waiter, released on every future exit path,
 /// including task abort and dropping a pending future.
 struct CreditWaiterSlot {
@@ -125,7 +158,7 @@ pub struct FlowController {
     max_batch_bytes: usize,
     max_pending_requests: usize,
     channels: Arc<Mutex<HashMap<CreditKey, ChannelCreditState>>>,
-    notifiers: Arc<Mutex<HashMap<CreditKey, Arc<Notify>>>>,
+    notifiers: Arc<Mutex<HashMap<CreditKey, ChannelNotifier>>>,
     aggregate_bytes: Arc<AtomicU64>,
     pending_requests: Arc<AtomicU64>,
     /// Queued futures are distinct from in-flight delivered batch permits.
@@ -243,6 +276,30 @@ impl FlowController {
                 });
             }
         }
+    }
+
+    /// Number of per-channel notifier keys currently owned by live waiters.
+    pub fn queued_notifier_channels(&self) -> usize {
+        self.notifiers.lock().len()
+    }
+
+    fn reserve_channel_waiter(&self, key: CreditKey) -> Result<ChannelWaiterSlot, String> {
+        let quota = self.reserve_credit_waiter()?;
+        let notify = {
+            let mut notifiers = self.notifiers.lock();
+            let channel = notifiers.entry(key).or_insert_with(|| ChannelNotifier {
+                notify: Arc::new(Notify::new()),
+                waiters: 0,
+            });
+            channel.waiters += 1;
+            Arc::clone(&channel.notify)
+        };
+        Ok(ChannelWaiterSlot {
+            _quota: quota,
+            key,
+            notifiers: Arc::clone(&self.notifiers),
+            notify,
+        })
     }
 
     pub fn batches_in_flight(&self, exchange_id: u64, src_shard: u32, target_shard: u32) -> usize {
@@ -473,8 +530,8 @@ impl FlowController {
     fn notify_waiters(&self, key: CreditKey) {
         self.global_notify.notify_waiters();
         let notifiers = self.notifiers.lock();
-        if let Some(notify) = notifiers.get(&key) {
-            notify.notify_waiters();
+        if let Some(channel) = notifiers.get(&key) {
+            channel.notify.notify_waiters();
         }
     }
 
@@ -509,8 +566,8 @@ impl FlowController {
                 .collect();
             let mut list = Vec::new();
             for k in keys {
-                if let Some(n) = notifiers.remove(&k) {
-                    list.push(n);
+                if let Some(channel) = notifiers.remove(&k) {
+                    list.push(channel.notify);
                 }
             }
             list
@@ -656,20 +713,13 @@ impl FlowController {
         if self.try_acquire_rows(key, row_count) {
             return Ok(());
         }
-        // Reservation owns the decrement even if this future is cancelled
-        // before it reaches the Notify await.
-        let _waiter = self.reserve_credit_waiter()?;
+        // Reservation and keyed notifier have the same drop-owned lifetime.
+        // An abort frees both the waiter slot and the channel key.
+        let waiter = self.reserve_channel_waiter(key)?;
+        let notify = Arc::clone(&waiter.notify);
 
-        // Create waiter state only after admission failed. Register the notify
-        // future *before* rechecking channels to avoid a lost wake when ACK
-        // races against waiter registration, cancellation, or task scheduling.
-        let notify = {
-            let mut notifiers = self.notifiers.lock();
-            notifiers
-                .entry(key)
-                .or_insert_with(|| Arc::new(Notify::new()))
-                .clone()
-        };
+        // Register the future *before* rechecking channels to avoid a lost
+        // wake when ACK races against waiter registration or cancellation.
         loop {
             let notified = notify.notified();
             tokio::pin!(notified);
