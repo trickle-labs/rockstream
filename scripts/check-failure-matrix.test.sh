@@ -55,11 +55,11 @@ sed 's#`0x0001_0001_0000_0001`, `0x0001_0001_0000_0002`#---#' "$DOC" >"$TMP_ROOT
 run_bad mutation_missing_seeds "$TMP_ROOT/missing-seeds.md"
 
 # 8. Mutation: missing real-backend test and missing exemption
-sed 's#`crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle` | 30s | Failure detection <= 5s, reassignment <= 30s, freshness recovery <= 60s, zero loss, zero duplicates | Covered (Real Backend: Docker worker kill & rejoin)#--- | 30s | Failure detection <= 5s, reassignment <= 30s, freshness recovery <= 60s, zero loss, zero duplicates | ---#' "$DOC" >"$TMP_ROOT/missing-real-backend-and-exemption.md"
+sed 's#`crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs::worker_failure_recovery_from_view_and_kafka` | 60s | Failure detection <= 5s, reassignment <= 30s, freshness recovery <= 60s, zero loss, zero duplicates | Covered (Real Backend: process worker kill; one sample, no p99)#--- | 30s | Failure detection <= 5s, reassignment <= 30s, freshness recovery <= 60s, zero loss, zero duplicates | ---#' "$DOC" >"$TMP_ROOT/missing-real-backend-and-exemption.md"
 run_bad mutation_missing_real_backend_and_exemption "$TMP_ROOT/missing-real-backend-and-exemption.md"
 
 # 9. Mutation: missing / invalid time budget
-sed 's#| 30s | Failure detection <= 5s#| 0s | Failure detection <= 5s#' "$DOC" >"$TMP_ROOT/invalid-budget.md"
+sed 's#| 60s | Failure detection <= 5s#| 0s | Failure detection <= 5s#' "$DOC" >"$TMP_ROOT/invalid-budget.md"
 run_bad mutation_invalid_budget "$TMP_ROOT/invalid-budget.md"
 
 # 10. Mutation: vacuous absolute SLO target

@@ -8,5 +8,5 @@ were removed in v0.52.4. RockStream rejects their DDL and webhook ingress with
 | --- | --- |
 | S3 source | Use an external loader through pgwire or Kafka. |
 | HTTP webhook source | Use an external HTTP-to-Kafka or HTTP-to-PostgreSQL adapter. |
-| Iceberg, Delta, and object-store sink | No supported row export replacement; Kafka view row delivery is unsupported. |
-| Cold-tier configuration | No supported Kafka-based lakehouse export; view row delivery is unsupported. |
+| Iceberg, Delta, and object-store sink | Experimental bounded Kafka runtime view delivery; no automatic lakehouse export replacement. |
+| Cold-tier configuration | No automatic Kafka-based lakehouse export; the runtime view adapter has explicit size limits. |

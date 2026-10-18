@@ -168,11 +168,14 @@ async fn test_ivm_join_arrangement_scale_hit_rate_and_p99_latency() {
         }
         shard_db.flush().await.expect("flush");
 
-        // Warm the cache by probing one key to load SST metadata
-        let _ = join_op
-            .point_lookup_arrangement(JoinSide::Right, &0i64.to_be_bytes(), 0)
-            .await
-            .unwrap();
+        // Warm every block to be measured: probing only key zero does not
+        // establish a warm-cache hit rate across newly flushed SSTs.
+        for i in 0..scale as i64 {
+            let _ = join_op
+                .point_lookup_arrangement(JoinSide::Right, &i.to_be_bytes(), i as u128)
+                .await
+                .expect("warm arrangement block");
+        }
 
         let gets_before_benchmark = get_counter.load(Ordering::SeqCst);
 

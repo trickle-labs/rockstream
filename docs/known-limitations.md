@@ -19,8 +19,9 @@ Temporal sliding-window queries with dynamic wall-clock predicates (e.g. `WHERE 
 ## 3. Quarantined Third-Party Sinks
 
 Kafka source and PostgreSQL CDC source are Core. The Kafka sink is Experimental:
-it emits epoch/count markers only, with no materialized-view snapshot rows,
-incremental change rows, or row payload recovery. Legacy or unmaintained
+its runtime view adapter emits snapshot/change envelopes up to 900 KiB and
+reads retained view logs up to 64 MiB. SQL sink wiring, chunked snapshots, and
+automatic log compaction are unsupported. Legacy or unmaintained
 third-party connectors are rejected at admission with `RS-4017`.
 
 ---

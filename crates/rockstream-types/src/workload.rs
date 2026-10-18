@@ -68,6 +68,10 @@ impl MemoryLimit {
 pub struct WorkloadDef {
     /// Human-readable workload name (unique within a namespace).
     pub name: String,
+    /// Persisted policy revision for revision-conditioned updates.
+    /// Legacy workload rows without a revision start at revision 1.
+    #[serde(default = "initial_workload_revision")]
+    pub revision: u64,
     /// Target maximum staleness for all views in this workload.
     pub freshness_slo: Option<FreshnessSlo>,
     /// Maximum aggregate memory budget for all views in this workload.
@@ -78,11 +82,16 @@ pub struct WorkloadDef {
     pub priority: WorkloadPriority,
 }
 
+const fn initial_workload_revision() -> u64 {
+    1
+}
+
 impl WorkloadDef {
     /// Create a new workload definition with default priority and no limits.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            revision: initial_workload_revision(),
             freshness_slo: None,
             memory_limit: None,
             max_parallelism: None,
@@ -146,6 +155,22 @@ mod tests {
     fn workload_priority_ordering() {
         assert!(WorkloadPriority::HIGH < WorkloadPriority::DEFAULT);
         assert!(WorkloadPriority::DEFAULT < WorkloadPriority::LOW);
+    }
+
+    #[test]
+    fn v072_revision_roundtrip_and_legacy_compatibility() {
+        let workload = WorkloadDef::new("critical");
+        assert_eq!(workload.revision, 1);
+        let legacy = r#"{"name":"critical","freshness_slo":null,"memory_limit":null,"max_parallelism":null,"priority":128}"#;
+        let restored: WorkloadDef = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored, workload);
+        let mut updated = workload.clone();
+        updated.revision = 2;
+        let wire = serde_json::to_string(&updated).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadDef>(&wire).unwrap().revision,
+            2
+        );
     }
 
     #[test]

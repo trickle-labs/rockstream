@@ -372,7 +372,8 @@ impl StateBudget {
     ///
     /// Saturates at zero rather than wrapping.
     pub fn release(&self, bytes: u64) {
-        // Saturating subtract via compare-exchange loop.
+        // Saturating subtract via compare-exchange loop. Only the bytes removed
+        // from this operator may be released from the shared workload budget.
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
             let proposed = current.saturating_sub(bytes);
@@ -402,7 +403,8 @@ impl StateBudget {
         }
     }
 
-    /// Reset the usage counter to zero. For use in tests only.
+    /// Reset only this operator's charge. Shared workload owners and other
+    /// operators must retain their outstanding reservations.
     #[doc(hidden)]
     pub fn reset(&self) {
         let released = self.current_bytes.swap(0, Ordering::Relaxed);
@@ -414,7 +416,8 @@ impl StateBudget {
     }
 }
 
-// The final operator owner must not leave a charge in its shared workload.
+// On final operator destruction, release only bytes still owned by this
+// meter. A shared workload budget can outlive any one operator.
 impl Drop for StateBudget {
     fn drop(&mut self) {
         if let Some(ref wl) = self.workload_budget {
@@ -451,31 +454,6 @@ impl WorkloadQuotaLedgerEntry {
             current_parallelism: AtomicU64::new(0),
         }
     }
-
-    fn release(&self, bytes: u64, parallelism: u32) {
-        loop {
-            let current = self.current_memory_bytes.load(Ordering::Relaxed);
-            let proposed = current.saturating_sub(bytes);
-            if self
-                .current_memory_bytes
-                .compare_exchange_weak(current, proposed, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-        loop {
-            let current_p = self.current_parallelism.load(Ordering::Relaxed);
-            let proposed_p = current_p.saturating_sub(parallelism as u64);
-            if self
-                .current_parallelism
-                .compare_exchange_weak(current_p, proposed_p, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
 }
 
 /// Thread-safe distributed quota ledger for prospective worker-side quota consultation
@@ -483,8 +461,9 @@ impl WorkloadQuotaLedgerEntry {
 #[derive(Debug)]
 pub struct DistributedQuotaLedger {
     entries: dashmap::DashMap<WorkloadId, Arc<WorkloadQuotaLedgerEntry>>,
-    // Registry mutations share one admission boundary across DashMap shards.
-    registry_lock: parking_lot::Mutex<()>,
+    // Serialize registry mutations so capacity checks and insertion are atomic.
+    // Steady-state reservations do not take this lock.
+    registration_lock: parking_lot::Mutex<()>,
     max_workloads: usize,
     total_reservations: AtomicU64,
     total_rejections: AtomicU64,
@@ -506,7 +485,7 @@ impl DistributedQuotaLedger {
     pub fn with_capacity(max_workloads: usize) -> Self {
         Self {
             entries: dashmap::DashMap::new(),
-            registry_lock: parking_lot::Mutex::new(()),
+            registration_lock: parking_lot::Mutex::new(()),
             max_workloads,
             total_reservations: AtomicU64::new(0),
             total_rejections: AtomicU64::new(0),
@@ -520,7 +499,7 @@ impl DistributedQuotaLedger {
         memory_limit_bytes: u64,
         max_parallelism: u32,
     ) -> Result<(), StateBudgetError> {
-        let _registry = self.registry_lock.lock();
+        let _registration = self.registration_lock.lock();
         if !self.entries.contains_key(&workload_id) && self.entries.len() >= self.max_workloads {
             return Err(StateBudgetError {
                 operator_name: format!("ledger-capacity-{}", workload_id.0),
@@ -551,7 +530,7 @@ impl DistributedQuotaLedger {
 
     /// Unregister a workload from the ledger.
     pub fn unregister_workload(&self, workload_id: WorkloadId) {
-        let _registry = self.registry_lock.lock();
+        let _registration = self.registration_lock.lock();
         self.entries.remove(&workload_id);
     }
 
@@ -707,15 +686,15 @@ impl DistributedQuotaLedger {
             entry,
             bytes: requested_bytes,
             parallelism,
-            released: false,
         })
     }
 
-    /// Release batch resources for the currently registered workload.
-    /// Reservation guards release their original entry directly, even after removal.
+    /// Release resources from the current registration for a workload.
+    /// Reservation guards instead retain and release their original entry so
+    /// unregistering and reusing an ID cannot release the replacement's quota.
     pub fn release_batch(&self, workload_id: WorkloadId, bytes: u64, parallelism: u32) {
         if let Some(entry) = self.entries.get(&workload_id) {
-            entry.release(bytes, parallelism);
+            release_quota_entry(&entry, bytes, parallelism);
         }
     }
 
@@ -741,24 +720,45 @@ impl DistributedQuotaLedger {
     }
 }
 
-/// RAII Guard for prospective quota batch reservation. Automatically releases resources when dropped.
+fn release_quota_entry(entry: &WorkloadQuotaLedgerEntry, bytes: u64, parallelism: u32) {
+    loop {
+        let current = entry.current_memory_bytes.load(Ordering::Relaxed);
+        let proposed = current.saturating_sub(bytes);
+        if entry
+            .current_memory_bytes
+            .compare_exchange_weak(current, proposed, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    loop {
+        let current_p = entry.current_parallelism.load(Ordering::Relaxed);
+        let proposed_p = current_p.saturating_sub(parallelism as u64);
+        if entry
+            .current_parallelism
+            .compare_exchange_weak(current_p, proposed_p, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+/// RAII guard bound to the entry that admitted the reservation, not its reusable ID.
+/// Unregistering a workload never transfers its reservations to a new generation.
 #[derive(Debug)]
 pub struct QuotaGuard {
-    // Keep the allocation owner, not a reusable workload ID.
     entry: Option<Arc<WorkloadQuotaLedgerEntry>>,
     bytes: u64,
     parallelism: u32,
-    released: bool,
 }
 
 impl QuotaGuard {
-    /// Explicitly release quota reservation without dropping.
+    /// Release this reservation exactly once, even after its owner is unregistered.
     pub fn release(&mut self) {
-        if !self.released {
-            if let Some(ref entry) = self.entry {
-                entry.release(self.bytes, self.parallelism);
-            }
-            self.released = true;
+        if let Some(entry) = self.entry.take() {
+            release_quota_entry(&entry, self.bytes, self.parallelism);
         }
     }
 }

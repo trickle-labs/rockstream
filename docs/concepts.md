@@ -1716,8 +1716,8 @@ more efficient than each view independently inlining and recomputing it.
 
 **"How do I export to a data lake?"**
 
-Kafka-based row export is currently unsupported: the Experimental Kafka sink
-emits epoch/count markers only. The removed connector frontends return
+The Experimental Kafka runtime adapter exports bounded snapshot/change row
+envelopes; automatic lakehouse export is unsupported. The removed connector frontends return
 `RS-4017`; see [connector migration](connector-migration.md).
 
 **"How tight should my freshness SLO be?"**

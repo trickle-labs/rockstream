@@ -1,14 +1,8 @@
-//! PostgreSQL 18.0 differential and SQL semantic conformance tests (DOC-001, v0.59.19).
-//!
-//! Verifies exact SQL semantics against PostgreSQL 18.0 differential reference standard:
-//! - Numeric precision and scale bounds
-//! - ANSI three-valued logic (3VL) and NULL propagation
-//! - Multiset/bag semantics with duplicate rows and retractions
-//! - Unmatched DML behavior (0 rows affected without error)
-//! - Identifier folding (lowercase unquoted, preserved quoted)
-//! - rockstream_binary_v1 collation ordering
-//! - Timestamp ISO 8601 parsing and UTC normalization
-//! - Prepared statement array parameter binding and ANY($1) membership
+//! Bounded PostgreSQL 18.0 differential corpus plus Rockstream semantic regressions.
+//! See docs/testing/pg18-differential.md for execution and metadata differences.
+
+#[path = "support/pg18_reference.rs"]
+mod pg18_reference;
 
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -41,6 +35,20 @@ impl ViewReader for NoopViewReader {
 }
 
 async fn start_gateway() -> (tokio_postgres::Client, tokio::task::JoinHandle<()>, TempDir) {
+    let (addr, handle, dir) = start_gateway_server().await;
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=test dbname=test", addr.port()),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    (client, handle, dir)
+}
+
+async fn start_gateway_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, TempDir) {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let shard_db = Arc::new(
@@ -56,16 +64,7 @@ async fn start_gateway() -> (tokio_postgres::Client, tokio::task::JoinHandle<()>
         shard_db,
     );
     let (addr, handle) = server.serve_background().await.unwrap();
-    let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=test dbname=test", addr.port()),
-        NoTls,
-    )
-    .await
-    .unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    (client, handle, dir)
+    (addr, handle, dir)
 }
 
 #[tokio::test]
@@ -89,7 +88,35 @@ async fn test_numeric_precision_and_overflow_semantics() {
         .simple_query("SELECT id, amount FROM t_numeric ORDER BY id")
         .await
         .unwrap();
-    assert!(!rows.is_empty());
+    let values = |messages: &[tokio_postgres::SimpleQueryMessage]| {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(vec![
+                    row.get(0).map(str::to_owned),
+                    row.get(1).map(str::to_owned),
+                ]),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        values(&rows),
+        vec![
+            vec![Some("1".to_owned()), Some("1234.5678".to_owned())],
+            vec![Some("2".to_owned()), Some("9999.0000".to_owned())],
+        ]
+    );
+    let overflow = client
+        .simple_query("INSERT INTO t_numeric VALUES (3, 100000000000000.0000)")
+        .await
+        .unwrap_err();
+    assert_eq!(overflow.code().unwrap().code(), "22003");
+    let after = client
+        .simple_query("SELECT id, amount FROM t_numeric ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(values(&after), values(&rows));
 
     handle.abort();
 }

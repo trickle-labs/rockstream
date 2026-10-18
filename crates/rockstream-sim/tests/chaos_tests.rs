@@ -62,9 +62,9 @@
 //! 12. **`proof_regression_seeds_replay_deterministically`** — Every regression
 //!     seed in the corpus produces the same `ChaosResult` on two independent runs.
 //!
-//! 13. **`proof_chaos_output_matches_reference_run`** — The 32-shard 24-hour chaos
-//!     run commits the same total epochs and rows as a non-faulty reference run,
-//!     proving zero data loss under fault injection.
+//! 13. **`proof_chaos_output_matches_reference_run`** — Production source commits,
+//!     aggregate state, persisted typed weighted output, and source progress are
+//!     checked at every frontier, including a restart before acknowledgement.
 //!
 //! 14. **`proof_recovery_slos_all_met`** — Under a 32-shard 24-hour chaos run,
 //!     the p99 recovery timings satisfy: failure detection ≤ 5 000 ms, shard
@@ -75,10 +75,10 @@
 //!     p99 remains ≤ 60 000 ms.
 
 use rockstream_sim::{
-    build_initial_corpus, negotiate_version, run_chaos_reference, run_chaos_scenario,
-    BrownoutStatus, ChaosConfig, DegradedState, LivenessChecker, LivenessStatus, NegotiationResult,
-    ObjectStoreBrownoutGuard, ProtocolVersion, RecoveryTimings, Runtime, SeedOutcome, SimRuntime,
-    SoakRunner, SupportedVersionRange, TwoPcPhase, TwoPcSinkState, LOCAL_BUFFER_MAX_EPOCHS,
+    build_initial_corpus, negotiate_version, run_chaos_scenario, BrownoutStatus, ChaosConfig,
+    DegradedState, LivenessChecker, LivenessStatus, NegotiationResult, ObjectStoreBrownoutGuard,
+    ProtocolVersion, RecoveryTimings, Runtime, SeedOutcome, SimRuntime, SoakRunner,
+    SupportedVersionRange, TwoPcPhase, TwoPcSinkState, LOCAL_BUFFER_MAX_EPOCHS,
 };
 
 // ─── Test 1: 100k seeds all pass ─────────────────────────────────────────────
@@ -418,27 +418,12 @@ fn proof_regression_seeds_replay_deterministically() {
 
 // ─── Test 13: Chaos output matches non-faulty reference run (P1) ─────────────
 
-#[test]
-fn proof_chaos_output_matches_reference_run() {
-    // A chaos run must commit the same total epochs and rows as a fault-free
-    // reference run from the same seed. This proves zero data loss: every
-    // epoch staged is eventually committed despite injected faults.
-    let config = ChaosConfig::thirty_two_shard_24h();
+#[path = "support/incremental_chaos.rs"]
+mod incremental_chaos;
 
-    let chaos = run_chaos_scenario(&SimRuntime::new(0xDEAD_BEEF_CAFE_1234), &config);
-    let reference = run_chaos_reference(&SimRuntime::new(0xDEAD_BEEF_CAFE_1234), &config);
-
-    assert!(
-        chaos.is_clean(),
-        "chaos run must have zero data loss and zero duplicates: {chaos:?}"
-    );
-    assert!(
-        chaos.output_matches(&reference),
-        "chaos run epoch count must match non-faulty reference (proves zero dropped epochs): \
-         chaos epochs={}; reference epochs={}",
-        chaos.epochs_committed,
-        reference.epochs_committed,
-    );
+#[tokio::test]
+async fn proof_chaos_output_matches_reference_run() {
+    incremental_chaos::regression().await;
 }
 
 // ─── Test 14: Recovery SLO budgets all met (P3) ───────────────────────────────

@@ -1,9 +1,12 @@
 #[test]
 fn ci_workspace_test_runs_explicit_feature_matrix() {
     let workflow = include_str!("../../../.github/workflows/ci.yml");
-    assert!(workflow
-        .lines()
-        .any(|line| line == "          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql"));
+    // The accounting runner supersedes the old hard-coded Cargo command.
+    // Require both live Cargo discovery and an explicit workspace execution.
+    assert!(workflow.contains("python3 scripts/ci-test-inventory.py check"));
+    assert!(workflow.contains("python3 scripts/ci-test-inventory.py run --job pr-workspace"));
+    let matrix = include_str!("../../../scripts/ci-test-matrix.json");
+    assert!(matrix.contains("\"pr-workspace\""));
     assert!(workflow.lines().any(|line| line.contains(
         "cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json"
     )));
@@ -105,9 +108,14 @@ fn ci_workspace_test_runs_explicit_feature_matrix() {
             .to_str()
             .unwrap();
         assert!(
-            workflow.contains(&format!("--features {feature}"))
-                && workflow.contains(&format!("--test {target}")),
-            "{path} must be compiled and run by the {feature} CI matrix",
+            matrix.contains(&format!("\"{target}\""))
+                || (path.starts_with("crates/rockstream-gateway/")
+                    && matrix.contains("\"rockstream-gateway\"")),
+            "{path} must have an explicit CI assignment",
+        );
+        assert!(
+            matrix.contains(&format!("\"{feature}\"")),
+            "{path} requires its feature to be declared in the CI matrix",
         );
     }
 }
@@ -117,11 +125,15 @@ fn simulation_soak_enables_simulation() {
     let workflow = include_str!("../../../.github/workflows/simulation-soak.yml");
     assert_eq!(
         workflow
+            .replace("\\\n", "")
             .lines()
-            .filter(|line| line
-                .contains("cargo test -p rockstream-sim --features simulation --test chaos_tests"))
-            .count(),
-        2
+            .filter(|line| line.contains("cargo test"))
+            .map(|line| line.trim_start().trim_start_matches("run: ").split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>(),
+        vec![
+            "cargo test -p rockstream-sim --features simulation --test chaos_tests -- --nocapture",
+            "cargo test -p rockstream-sim --features simulation --test chaos_tests incremental_chaos::bounded_seed_run -- --exact",
+            "cargo test -p rockstream-sim --features simulation --test chaos_tests proof_seed_corpus_covers_all_registered_laws -- --nocapture",
+        ]
     );
-    assert_eq!(workflow.matches("--features simulation").count(), 2);
 }

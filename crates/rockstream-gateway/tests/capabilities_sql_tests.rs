@@ -158,7 +158,7 @@ async fn test_show_capabilities_sinks() {
             Some("Kafka sink".to_string()),
             Some("Experimental".to_string()),
             Some("Connector runtime".to_string()),
-            Some("1".to_string()),
+            Some("2".to_string()),
             Some("".to_string()),
             Some("docs/connectors.md#kafka-sink".to_string()),
         ]],

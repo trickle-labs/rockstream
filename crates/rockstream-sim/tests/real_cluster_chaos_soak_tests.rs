@@ -1,468 +1,519 @@
-//! Real Kafka/MinIO multi-process chaos proof for v0.58.1.
-//!
-//! This test is deliberately compiled only for the dedicated Docker workflow:
-//! Docker/image absence is a failing assertion there, never a passing skip.
-
+//! #126: one real worker loss, with independently checked view and Kafka output.
 #![cfg(feature = "docker_tests")]
 
-use std::collections::BTreeSet;
-use std::fs;
-use std::io::Write;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
-
+use arrow::datatypes::{DataType, Field, Schema};
+use rdkafka::{
+    admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
+    consumer::{BaseConsumer, Consumer},
+    error::KafkaError,
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message, Offset, TopicPartitionList,
+};
+use rockstream_connectors::{
+    KafkaSink, KafkaSource, OffsetToken, SourceCheckpointStore, SourceRuntimeCoordinator,
+};
+use rockstream_control::{audit::FileAuditLog, ControlService, ShardManager, TopologyCatalog};
+use rockstream_gateway::view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader};
+use rockstream_ops::{
+    compile_plan_with_sink_id,
+    kafka_sink::KafkaViewSink,
+    sink::{materialize_view_state, read_view_output, write_view_directory_entry, ColumnValue},
+    ArrowZSet,
+};
+use rockstream_plan::PlanNode;
+use rockstream_runtime::{exchange::persistence::committed_frontier, start_worker_client};
+use rockstream_sim::qualification::worker_failure::{
+    validate, RecoveryFailure, WorkerObservation, WorkerRecoveryEvidence, MANIFEST,
+};
+use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, ShardReader, WriteBatch};
+use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS, MINIO_USER};
+use rockstream_types::{
+    arrow_batch::split_weight_column,
+    ids::{ConnectorId, OperatorId, ShardId, WorkerId},
+};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use testcontainers::core::{ContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use testcontainers::{runners::AsyncRunner, ImageExt};
+use testcontainers_modules::kafka::apache::{self, KAFKA_PORT};
 
-const IMAGE_NAME: &str = "rockstream-tc-test";
-const IMAGE_TAG: &str = "latest";
-const SEED: u64 = 0x0581_C0A5;
-const RECORD_COUNT: u64 = 128;
-const WORKER_COUNT: usize = 2;
-const MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC: u64 = 1;
-const FAILURE_DETECTION_LIMIT: Duration = Duration::from_secs(5);
-const SHARD_REASSIGNMENT_LIMIT: Duration = Duration::from_secs(30);
-const FRESHNESS_RECOVERY_LIMIT: Duration = Duration::from_secs(60);
-const SUITE_TOTAL_RUNTIME_BUDGET: Duration = Duration::from_secs(300);
+const ID: u64 = 126;
+const WAIT: Duration = Duration::from_secs(60);
 
-fn docker(args: &[&str]) {
-    let status = std::process::Command::new("docker")
-        .args(args)
-        .status()
-        .unwrap_or_else(|error| panic!("Docker is required for real-cluster chaos proof: {error}"));
-    if !status.success() && args.first() == Some(&"kill") {
-        if let Some(name) = args.get(1) {
-            let state = std::process::Command::new("docker")
-                .args(["inspect", "--format", "{{.State.Running}}", name])
-                .output();
-            if state.is_ok_and(|output| {
-                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "false"
-            }) {
-                return;
-            }
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
+}
+
+fn save(path: &Path, value: &impl serde::Serialize) {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    fs::rename(temporary, path).unwrap();
+}
+
+async fn read_observation(path: &Path, child: &mut Child) -> WorkerObservation {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Ok(bytes) = fs::read(path) {
+            return serde_json::from_slice(&bytes).unwrap();
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "worker exited before {} (see worker log)",
+            path.display()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "progress deadline waiting for {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+struct Workers(Vec<Child>);
+impl Drop for Workers {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
-    assert!(status.success(), "docker {} failed", args.join(" "));
 }
 
-fn docker_output(args: &[&str]) -> String {
-    let output = std::process::Command::new("docker")
-        .args(args)
-        .output()
-        .unwrap_or_else(|error| panic!("docker {} could not start: {error}", args.join(" ")));
-    assert!(
-        output.status.success(),
-        "docker {} failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap()
-}
-
-fn produce_kafka_load(kafka_name: &str, topic: &str, rows: &[String]) {
-    docker(&[
-        "exec",
-        kafka_name,
-        "rpk",
-        "topic",
-        "create",
-        topic,
-        "--brokers",
-        "127.0.0.1:9092",
-        "--partitions",
-        "1",
-    ]);
-    let mut producer = std::process::Command::new("docker")
-        .args([
-            "exec",
-            "-i",
-            kafka_name,
-            "rpk",
-            "topic",
-            "produce",
-            topic,
-            "--brokers",
-            "127.0.0.1:9092",
-        ])
-        .stdin(Stdio::piped())
-        .spawn()
-        .expect("Kafka producer command must start");
-    producer
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("{}\n", rows.join("\n")).as_bytes())
-        .unwrap();
-    assert!(producer.wait().unwrap().success(), "Kafka load must commit");
-}
-
-async fn start_role(
-    network: &str,
-    name: &str,
-    role: &str,
-    control_addr: &str,
-    wait: WaitFor,
-) -> ContainerAsync<GenericImage> {
-    GenericImage::new(IMAGE_NAME, IMAGE_TAG)
-        .with_wait_for(wait)
-        .with_cmd(vec![
-            "start".to_string(),
-            "--storage=/data".to_string(),
-            "--daemon".to_string(),
-            format!("--role={role}"),
-            format!("--control={control_addr}"),
-        ])
-        .with_env_var("ROCKSTREAM_E2E_SLEEP_MS", "300000")
-        .with_container_name(name)
-        .with_network(network)
-        .start()
-        .await
-        .unwrap_or_else(|error| panic!("failed to start {role} container {name}: {error}"))
-}
-
-fn p99(samples: &[u64]) -> u64 {
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    sorted[((sorted.len() - 1) * 99) / 100]
-}
-
-struct ChaosMetrics {
-    failure_detection_ms: u64,
-    shard_reassignment_ms: u64,
-    freshness_recovery_ms: u64,
-    throughput_rows_per_sec: u64,
-    total_elapsed_ms: u64,
-    cell_runtimes_ms: Vec<(&'static str, u64, u64)>, // (name, measured_ms, budget_ms)
-}
-
-fn write_artifacts(
-    seed: u64,
-    rows_submitted: u64,
-    rows_committed: u64,
-    output_digest: &str,
-    metrics: ChaosMetrics,
-) {
-    let directory = std::env::var("ROCKSTREAM_CHAOS_ARTIFACT_DIR")
-        .unwrap_or_else(|_| "target/real-cluster-chaos".to_string());
-    fs::create_dir_all(&directory).unwrap();
-    let cell_details: Vec<_> = metrics
-        .cell_runtimes_ms
+fn typed(values: &[ColumnValue]) -> Vec<Value> {
+    values
         .iter()
-        .map(|(name, measured, budget)| {
-            serde_json::json!({
-                "cell": name,
-                "measured_ms": measured,
-                "budget_ms": budget,
-                "within_budget": measured <= budget,
-            })
+        .map(|v| match v {
+            ColumnValue::Int64(n) => json!({"Int64":n}),
+            ColumnValue::Utf8(s) => json!({"Utf8":s}),
+            other => panic!("unexpected scenario type {other:?}"),
         })
-        .collect();
-
-    let result = serde_json::json!({
-        "seed": seed,
-        "contract_version": "v0.58.1",
-        "schedule": [
-            "FM-004:source_disconnect_and_offset_resume",
-            "FM-001:worker_loss_and_reassignment",
-            "FM-003:exchange_interruption_and_restore",
-            "FM-005:minio_brownout_and_freshness_recovery",
-            "FM-008:sink_failure_and_idempotent_commit",
-            "FM-002:control_kill_and_leader_failover",
-            "FM-011:resource_exhaustion_and_throughput_recovery"
-        ],
-        "rows_submitted": rows_submitted,
-        "rows_committed": rows_committed,
-        "complete_output_digest": output_digest,
-        "failure_detection_p99_ms": metrics.failure_detection_ms,
-        "shard_reassignment_p99_ms": metrics.shard_reassignment_ms,
-        "freshness_recovery_p99_ms": metrics.freshness_recovery_ms,
-        "steady_state_throughput_rows_per_sec": metrics.throughput_rows_per_sec,
-        "total_suite_runtime_ms": metrics.total_elapsed_ms,
-        "total_suite_runtime_budget_ms": SUITE_TOTAL_RUNTIME_BUDGET.as_millis(),
-        "cell_runtimes": cell_details,
-        "targets": {
-            "failure_detection_ms": FAILURE_DETECTION_LIMIT.as_millis(),
-            "shard_reassignment_ms": SHARD_REASSIGNMENT_LIMIT.as_millis(),
-            "freshness_recovery_ms": FRESHNESS_RECOVERY_LIMIT.as_millis(),
-            "zero_loss": true,
-            "zero_duplicates": true,
-            "minimum_sustained_throughput_rows_per_sec": MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC,
-            "suite_total_runtime_budget_secs": SUITE_TOTAL_RUNTIME_BUDGET.as_secs(),
-        },
-        "fixed_load": { "record_count": RECORD_COUNT, "worker_count": WORKER_COUNT },
-    });
-    fs::write(
-        format!("{directory}/real-cluster-chaos-summary.json"),
-        serde_json::to_vec_pretty(&result).unwrap(),
-    )
-    .unwrap();
-
-    let mut markdown = format!(
-        "# Real-cluster chaos SLO summary (v0.58.1)\n\nseed: `{seed}`\n\n| metric | measured | target |\n| --- | ---: | ---: |\n| rows submitted / committed | {rows_submitted} / {rows_committed} | exact / exact |\n| output digest | `{output_digest}` | batch oracle match |\n| failure detection p99 | {} ms | ≤ 5000 ms |\n| shard reassignment p99 | {} ms | ≤ 30000 ms |\n| freshness recovery p99 | {} ms | ≤ 60000 ms |\n| sustained throughput | {} rows/s | ≥ {MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC} rows/s |\n| total suite runtime | {} ms | ≤ {} ms |\n\n### Per-Cell Runtime Breakdown\n\n| Failure Mode | Measured | Budget | Status |\n| --- | ---: | ---: | --- |\n",
-        metrics.failure_detection_ms,
-        metrics.shard_reassignment_ms,
-        metrics.freshness_recovery_ms,
-        metrics.throughput_rows_per_sec,
-        metrics.total_elapsed_ms,
-        SUITE_TOTAL_RUNTIME_BUDGET.as_millis(),
-    );
-    for (name, measured, budget) in &metrics.cell_runtimes_ms {
-        let status = if measured <= budget {
-            "PASS"
-        } else {
-            "EXCEEDED"
-        };
-        markdown.push_str(&format!(
-            "| `{name}` | {measured} ms | {budget} ms | {status} |\n"
-        ));
-    }
-
-    fs::write(
-        format!("{directory}/real-cluster-chaos-summary.md"),
-        markdown,
-    )
-    .unwrap();
+        .collect()
 }
 
-#[tokio::test]
-async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
-    docker(&["info"]);
-    docker(&["image", "inspect", &format!("{IMAGE_NAME}:{IMAGE_TAG}")]);
-
-    let network = format!("rs-v0581-chaos-{SEED:x}");
-    docker(&["network", "create", &network]);
-    let control_name = format!("{network}-control");
-    let worker_a_name = format!("{network}-worker-a");
-    let worker_b_name = format!("{network}-worker-b");
-    let gateway_name = format!("{network}-gateway");
-    let kafka_name = format!("{network}-kafka");
-    let minio_name = format!("{network}-minio");
-    let shared_dir = tempfile::tempdir().unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(shared_dir.path(), std::fs::Permissions::from_mode(0o777));
+async fn observe(
+    db: &ShardDb,
+    worker: &rockstream_runtime::WorkerClientHandle,
+    source: &SourceRuntimeCoordinator<KafkaSource>,
+) -> WorkerObservation {
+    let output = read_view_output(db, OperatorId(ID), 2).await.unwrap();
+    let weighted_output = json!(output
+        .iter()
+        .map(|(epoch, row, values, weight)| json!([epoch, row, typed(values), weight]))
+        .collect::<Vec<_>>());
+    let relation = json!(materialize_view_state(output, &[])
+        .into_values()
+        .map(|(values, weight)| json!([typed(&values), weight]))
+        .collect::<Vec<_>>());
+    let metrics = source.metrics().await.unwrap();
+    WorkerObservation {
+        observed_at_ms: now_ms(),
+        process_id: std::process::id(),
+        lease: worker
+            .leases()
+            .into_iter()
+            .find(|l| l.shard_id == ShardId(ID))
+            .unwrap(),
+        source_epoch: source.committed_epoch(),
+        source_offsets: serde_json::from_slice(source.committed_offset().as_bytes()).unwrap(),
+        view_frontier: committed_frontier(db).await.unwrap(),
+        weighted_output,
+        relation,
+        in_flight_epochs: metrics.source_runtime_in_flight_epochs,
+        checkpoint_history_entries: metrics.source_checkpoint_history_entries,
+        sink_progress: serde_json::from_slice(
+            &db.get(b"\x06kafka-view/126").await.unwrap().unwrap(),
+        )
+        .unwrap(),
     }
+}
 
-    let control = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
-        .with_wait_for(WaitFor::message_on_stdout("control service listening"))
-        .with_cmd(vec![
-            "start".to_string(),
-            "--storage=/data".to_string(),
-            "--role=control".to_string(),
-            "--daemon".to_string(),
-            "--control-bind=0.0.0.0:8000".to_string(),
-            "--control-shared-storage=/shared".to_string(),
-        ])
-        .with_container_name(control_name.clone())
-        .with_network(network.clone())
-        .with_mount(Mount::bind_mount(
-            shared_dir.path().to_str().unwrap().to_string(),
-            "/shared".to_string(),
-        ))
-        .start()
+// A subprocess entry point around production APIs, not an alternative source,
+// storage, view, lease manager, or sink implementation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_fixture() {
+    let Ok(root) = std::env::var("ROCKSTREAM_RECOVERY_WORKER_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let id: u64 = std::env::var("ROCKSTREAM_RECOVERY_WORKER_ID")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let control = std::env::var("ROCKSTREAM_RECOVERY_CONTROL").unwrap();
+    let bootstrap = std::env::var("ROCKSTREAM_RECOVERY_KAFKA").unwrap();
+    let (worker, _task) = start_worker_client(id, &control, &root.join(format!("worker-{id}")))
         .await
-        .expect("control must start in the real-cluster network");
-    let control_addr = format!("{control_name}:8000");
-    let worker_a = start_role(
-        &network,
-        &worker_a_name,
-        "frontier",
-        &control_addr,
-        WaitFor::seconds(1),
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while worker.worker_id().is_none() {
+        assert!(Instant::now() < deadline, "registration deadline");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if id == 1 {
+        worker.request_shard(ShardId(ID)).await.unwrap();
+    }
+    let db = loop {
+        if let Some(db) = worker.get_shard_db(ShardId(ID)) {
+            break Arc::new(db);
+        }
+        assert!(Instant::now() < deadline, "ownership deadline");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    save(
+        &root.join(format!("worker-{id}-lease.json")),
+        &json!({"at_ms":now_ms(),"lease":worker.leases()}),
+    );
+    let deadline = Instant::now() + WAIT;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    let source = KafkaSource::connect(
+        ConnectorId(ID),
+        schema.clone(),
+        &bootstrap,
+        "worker-failure-input",
+        "worker-failure-source",
     )
-    .await;
-    let worker_b = start_role(
-        &network,
-        &worker_b_name,
-        "frontier",
-        &control_addr,
-        WaitFor::seconds(1),
+    .unwrap();
+    let mut source = SourceRuntimeCoordinator::new(
+        source,
+        ConnectorId(ID),
+        OffsetToken::new(Vec::new()),
+        SourceCheckpointStore::new(db.clone(), ID as u128, ConnectorId(ID)),
+    );
+    source.recover().await.unwrap();
+    let owner = source.acquire_owner(format!("worker-{id}")).unwrap();
+    let plan = PlanNode::ViewSink {
+        view_name: "letters".into(),
+        pk: vec![],
+        child: Box::new(PlanNode::Source {
+            name: "letters_source".into(),
+        }),
+    };
+    let compiled = compile_plan_with_sink_id(
+        &plan,
+        db.clone(),
+        &HashMap::from([("letters_source".into(), schema)]),
+        OperatorId(ID),
     )
-    .await;
-    let gateway = start_role(
-        &network,
-        &gateway_name,
-        "gateway",
-        &control_addr,
-        WaitFor::message_on_stdout("PostgreSQL wire gateway ready"),
-    )
-    .await;
-    let kafka = GenericImage::new("docker.redpanda.com/redpandadata/redpanda", "v24.2.1")
-        .with_wait_for(WaitFor::seconds(5))
-        .with_exposed_port(ContainerPort::Tcp(9092))
-        .with_cmd(vec![
-            "redpanda".to_string(),
-            "start".to_string(),
-            "--overprovisioned".to_string(),
-            "--smp".to_string(),
-            "1".to_string(),
-            "--memory".to_string(),
-            "512M".to_string(),
-            "--reserve-memory".to_string(),
-            "0M".to_string(),
-            "--node-id".to_string(),
-            "0".to_string(),
-            "--check=false".to_string(),
-            "--kafka-addr".to_string(),
-            "PLAINTEXT://0.0.0.0:9092".to_string(),
-            "--advertise-kafka-addr".to_string(),
-            format!("PLAINTEXT://{kafka_name}:9092"),
-        ])
-        .with_container_name(kafka_name.clone())
-        .with_network(network.clone())
-        .start()
+    .unwrap();
+    compiled.pipeline.restore(&db).await.unwrap();
+    write_view_directory_entry(&db, "letters", OperatorId(ID), 2, &[])
         .await
-        .expect("Kafka-compatible broker must start for the chaos proof");
-    let minio = GenericImage::new("codemowers/minio", "RELEASE.2025-09-07T16-13-09Z")
-        .with_wait_for(WaitFor::message_on_stderr("API:"))
-        .with_exposed_port(ContainerPort::Tcp(9000))
-        .with_cmd(vec!["server".to_string(), "/data".to_string()])
-        .with_env_var("MINIO_ROOT_USER", "minioadmin")
-        .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-        .with_container_name(minio_name.clone())
-        .with_network(network.clone())
-        .start()
-        .await
-        .expect("MinIO must start for the chaos proof");
-
-    let started = Instant::now();
-    let mut cell_runtimes_ms = Vec::new();
-
-    // FM-004: Source disconnect & offset resume (budget: 30s)
-    let fm004_start = Instant::now();
-    let submitted = (0..RECORD_COUNT)
-        .map(|offset| format!("seed={SEED};offset={offset};value={}", offset % 17))
-        .collect::<Vec<_>>();
-    produce_kafka_load(&kafka_name, "rockstream-chaos", &submitted);
-    let committed_offsets = docker_output(&[
-        "exec",
-        &kafka_name,
-        "rpk",
-        "topic",
-        "consume",
-        "rockstream-chaos",
-        "--brokers",
-        "127.0.0.1:9092",
-        "--num",
-        &RECORD_COUNT.to_string(),
-        "--format",
-        "%o\\n",
-    ])
-    .lines()
-    .map(str::parse::<u64>)
-    .collect::<Result<BTreeSet<_>, _>>()
-    .expect("Kafka source offsets must be numeric");
-    assert_eq!(
-        committed_offsets,
-        (0..RECORD_COUNT).collect(),
-        "real Kafka source offsets must contain each submitted record exactly once"
+        .unwrap();
+    let mut sink = KafkaViewSink::new(
+        KafkaSink::connect(ConnectorId(ID), &bootstrap, "worker-failure-output").unwrap(),
+        db.clone(),
+        OperatorId(ID),
+        2,
     );
-    let mut committed = BTreeSet::new();
-    committed.extend(submitted.iter().cloned());
-    let fm004_elapsed_ms = fm004_start.elapsed().as_millis() as u64;
-    cell_runtimes_ms.push(("FM-004", fm004_elapsed_ms, 30_000));
-
-    // FM-001: Worker loss and reassignment (budget: 30s)
-    let fm001_start = Instant::now();
-    let worker_kill_started = Instant::now();
-    docker(&["kill", &worker_a_name]);
-    let failure_detection_ms = worker_kill_started.elapsed().as_millis() as u64;
-    docker(&["start", &worker_a_name]);
-    let shard_reassignment_ms = worker_kill_started.elapsed().as_millis() as u64;
-    let fm001_elapsed_ms = fm001_start.elapsed().as_millis() as u64;
-    cell_runtimes_ms.push(("FM-001", fm001_elapsed_ms, 30_000));
-
-    // FM-003: Exchange interruption & retry budget (budget: 20s)
-    let fm003_start = Instant::now();
-    docker(&["network", "disconnect", &network, &worker_b_name]);
-    docker(&["network", "connect", &network, &worker_b_name]);
-    let fm003_elapsed_ms = fm003_start.elapsed().as_millis() as u64;
-    cell_runtimes_ms.push(("FM-003", fm003_elapsed_ms, 20_000));
-
-    // FM-005: MinIO brownout and throttling (budget: 45s)
-    let fm005_start = Instant::now();
-    docker(&["kill", &minio_name]);
-    let buffered_epochs = 5usize;
-    assert_eq!(
-        buffered_epochs, 5,
-        "brownout must exhaust the named epoch cap"
+    if id == 2 {
+        assert!(
+            sink.deliver_next().await.unwrap(),
+            "recover durable staged update"
+        );
+    }
+    while source.committed_epoch() < 5 {
+        assert!(Instant::now() < deadline, "source progress deadline");
+        let delta = source.poll_delta(64 * 1024, 1).await.unwrap();
+        if delta.batches.is_empty() {
+            continue;
+        }
+        let epoch = source.next_epoch().unwrap();
+        let lease = worker
+            .leases()
+            .into_iter()
+            .find(|l| l.shard_id == ShardId(ID))
+            .unwrap();
+        assert!(worker
+            .check_fence_write(ShardId(ID), lease.lease_token)
+            .await
+            .unwrap());
+        let mut writes = WriteBatch::new();
+        for batch in delta.batches {
+            let (data, weights) = split_weight_column(&batch).unwrap();
+            let output = compiled
+                .pipeline
+                .process(ArrowZSet::new(data, weights))
+                .unwrap();
+            compiled.sink.append_epoch(&mut writes, &output, epoch);
+        }
+        compiled
+            .pipeline
+            .append_state(&db, &mut writes)
+            .await
+            .unwrap();
+        writes.put(&ShardKeyEncoder::frontier_key(), &epoch.to_be_bytes());
+        source
+            .commit_epoch(&owner, epoch, delta.new_offset, writes)
+            .await
+            .unwrap();
+        if id == 1 && epoch == 3 {
+            assert!(sink.stage_next().await.unwrap());
+            save(
+                &root.join("staged.json"),
+                &observe(&db, &worker, &source).await,
+            );
+            // Keep the production transaction active until the parent kills us.
+            std::future::pending::<()>().await;
+        }
+        assert!(sink.deliver_next().await.unwrap());
+    }
+    save(
+        &root.join("recovered.json"),
+        &observe(&db, &worker, &source).await,
     );
-    docker(&["start", &minio_name]);
-    let freshness_recovery_ms = worker_kill_started.elapsed().as_millis() as u64;
-    let fm005_elapsed_ms = fm005_start.elapsed().as_millis() as u64;
-    cell_runtimes_ms.push(("FM-005", fm005_elapsed_ms, 45_000));
+    std::future::pending::<()>().await;
+}
 
-    // FM-008: Sink failure during 2PC commit and recovery (budget: 30s)
-    let fm008_start = Instant::now();
-    // Simulate 2PC sink participant staging and verify idempotent commit
-    let staged_rows = committed.len();
-    assert_eq!(staged_rows, RECORD_COUNT as usize, "2PC staging complete");
-    let fm008_elapsed_ms = fm008_start.elapsed().as_millis() as u64;
-    cell_runtimes_ms.push(("FM-008", fm008_elapsed_ms, 30_000));
+fn consume(bootstrap: &str) -> Value {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", "worker-recovery-oracle")
+        .set("enable.auto.commit", "false")
+        .set("isolation.level", "read_committed")
+        .set("enable.partition.eof", "true")
+        .create()
+        .unwrap();
+    let mut assignment = TopicPartitionList::new();
+    assignment
+        .add_partition_offset("worker-failure-output", 0, Offset::Beginning)
+        .unwrap();
+    consumer.assign(&assignment).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut records = Vec::new();
+    while Instant::now() < deadline {
+        match consumer.poll(Duration::from_millis(100)) {
+            Some(Ok(message)) => records.push(json!([
+                message.key_view::<str>().unwrap().unwrap(),
+                serde_json::from_slice::<Value>(message.payload().unwrap()).unwrap()
+            ])),
+            Some(Err(KafkaError::PartitionEOF(0))) => return json!(records),
+            Some(Err(error)) => panic!("sink consumer: {error}"),
+            None => {}
+        }
+    }
+    panic!("sink progress deadline");
+}
 
-    // FM-002: Control-node loss during active epoch coordination (budget: 15s)
-    let fm002_start = Instant::now();
-    docker(&["kill", &control_name]);
-    docker(&["start", &control_name]);
-    let fm002_elapsed_ms = fm002_start.elapsed().as_millis() as u64;
-    cell_runtimes_ms.push(("FM-002", fm002_elapsed_ms, 15_000));
-
-    // FM-011: Resource exhaustion with recovery (budget: 30s)
-    let fm011_start = Instant::now();
-    let elapsed_ms = started.elapsed().as_millis().max(1) as u64;
-    let throughput_rows_per_sec = RECORD_COUNT.saturating_mul(1_000) / elapsed_ms;
-    let fm011_elapsed_ms = fm011_start.elapsed().as_millis() as u64;
-    cell_runtimes_ms.push(("FM-011", fm011_elapsed_ms, 30_000));
-
-    let output_digest = format!("{:x}", Sha256::digest(submitted.join("\n").as_bytes()));
-    let oracle = submitted.iter().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(
-        committed, oracle,
-        "exact final Z-set and source offsets match the batch oracle"
-    );
-    assert_eq!(
-        submitted.len() as u64,
-        RECORD_COUNT,
-        "fixed load must be complete"
-    );
-
-    let total_elapsed_ms = started.elapsed().as_millis() as u64;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_failure_recovery_from_view_and_kafka() {
+    let docker_started = Instant::now();
+    let info = Command::new("docker")
+        .arg("info")
+        .output()
+        .expect("Docker required");
     assert!(
-        started.elapsed() <= SUITE_TOTAL_RUNTIME_BUDGET,
-        "Total chaos suite runtime exceeded 300s budget (took {}s)",
-        started.elapsed().as_secs()
+        info.status.success(),
+        "Docker required: {}",
+        String::from_utf8_lossy(&info.stderr)
     );
-
-    assert!(p99(&[failure_detection_ms]) <= FAILURE_DETECTION_LIMIT.as_millis() as u64);
-    assert!(p99(&[shard_reassignment_ms]) <= SHARD_REASSIGNMENT_LIMIT.as_millis() as u64);
-    assert!(p99(&[freshness_recovery_ms]) <= FRESHNESS_RECOVERY_LIMIT.as_millis() as u64);
-    assert!(throughput_rows_per_sec >= MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC);
-
-    write_artifacts(
-        SEED,
-        RECORD_COUNT,
-        committed.len() as u64,
-        &output_digest,
-        ChaosMetrics {
-            failure_detection_ms,
-            shard_reassignment_ms,
-            freshness_recovery_ms,
-            throughput_rows_per_sec,
-            total_elapsed_ms,
-            cell_runtimes_ms,
-        },
+    let docker_command_ms = docker_started.elapsed().as_millis() as u64;
+    let artifact_dir = std::env::var_os("ROCKSTREAM_CHAOS_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/real-cluster-chaos")
+        });
+    fs::create_dir_all(&artifact_dir).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let m: Value = serde_json::from_str(MANIFEST).unwrap();
+    let broker = apache::Kafka::default()
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .start()
+        .await
+        .unwrap();
+    let bootstrap = format!(
+        "127.0.0.1:{}",
+        broker.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
     );
-
-    let _ = kafka.rm().await;
-    let _ = minio.rm().await;
-    let _ = gateway.rm().await;
-    let _ = worker_b.rm().await;
-    let _ = worker_a.rm().await;
-    let _ = control.rm().await;
-    let _ = std::process::Command::new("docker")
-        .args(["network", "rm", &network])
-        .status();
+    let (_minio, port) = start_minio("worker-recovery")
+        .await
+        .expect("MinIO required");
+    let admin: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    for topic in ["worker-failure-input", "worker-failure-output"] {
+        assert_eq!(
+            admin
+                .create_topics(
+                    &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
+                    &AdminOptions::new()
+                )
+                .await
+                .unwrap(),
+            vec![Ok(topic.to_string())]
+        );
+    }
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    for row in m["history"].as_array().unwrap() {
+        producer
+            .send(
+                FutureRecord::to("worker-failure-input")
+                    .key("")
+                    .payload(&row.to_string()),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+    }
+    let manager = ShardManager::new();
+    let audit = Arc::new(FileAuditLog::open(root.path().join("audit.jsonl")).unwrap());
+    let catalog = TopologyCatalog::new();
+    let control = ControlService::new(catalog.clone())
+        .with_shard_manager(manager.clone())
+        .with_audit(audit.clone())
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
+    let mut workers = Workers(Vec::new());
+    for id in [1, 2] {
+        let log = fs::File::create(artifact_dir.join(format!("worker-{id}.log"))).unwrap();
+        workers.0.push(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["worker_process_fixture", "--exact", "--nocapture"])
+                .env("ROCKSTREAM_RECOVERY_WORKER_ROOT", root.path())
+                .env("ROCKSTREAM_RECOVERY_WORKER_ID", id.to_string())
+                .env("ROCKSTREAM_RECOVERY_CONTROL", control.addr.to_string())
+                .env("ROCKSTREAM_RECOVERY_KAFKA", &bootstrap)
+                .env(
+                    "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
+                    format!("http://127.0.0.1:{port}"),
+                )
+                .env("ROCKSTREAM_OBJECT_STORE_BUCKET", "worker-recovery")
+                .env("ROCKSTREAM_OBJECT_STORE_REGION", "us-east-1")
+                .env("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY", MINIO_USER)
+                .env("ROCKSTREAM_OBJECT_STORE_SECRET_KEY", MINIO_PASS)
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let before = read_observation(&root.path().join("staged.json"), &mut workers.0[0]).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while catalog.get(WorkerId(2)).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "replacement worker must be registered before fault"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    save(&artifact_dir.join("before-fault.json"), &before);
+    let sink_records_before = consume(&bootstrap);
+    assert_eq!(
+        sink_records_before,
+        json!(&m["expected_sink"].as_array().unwrap()[..2]),
+        "staged update must be invisible"
+    );
+    let fault_at_ms = now_ms();
+    let kill_started = Instant::now();
+    workers.0[0].kill().unwrap();
+    workers.0[0].wait().unwrap();
+    let worker_kill_command_ms = kill_started.elapsed().as_millis();
+    let after = read_observation(&root.path().join("recovered.json"), &mut workers.0[1]).await;
+    save(&artifact_dir.join("after-recovery.json"), &after);
+    let store = Arc::new(object_store::prefix::PrefixStore::new(
+        minio_object_store(port, "worker-recovery"),
+        "shards/126",
+    ));
+    let reader = Arc::new(ShardReader::open("db", store).await.unwrap());
+    let frontier = reader
+        .get(&ShardKeyEncoder::frontier_key())
+        .await
+        .unwrap()
+        .unwrap();
+    let query_frontier = u64::from_be_bytes(frontier.as_ref().try_into().unwrap());
+    let view_reader = HotOnlyViewReader {
+        shard_reader: reader,
+        frontier_epoch: Some(query_frontier),
+    };
+    let query_rows = view_reader
+        .read_view("letters", None, ViewReadStrategy::HotOnly)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| String::from_utf8(row).unwrap())
+        .collect();
+    let first_correct_query_at_ms = now_ms();
+    let detection = audit
+        .read_all()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.action == "worker.disconnected")
+        .expect("control must detect real disconnect");
+    let lease_event: Value =
+        serde_json::from_slice(&fs::read(root.path().join("worker-2-lease.json")).unwrap())
+            .unwrap();
+    let revision = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let evidence = WorkerRecoveryEvidence {
+        scenario_id: m["scenario_id"].as_str().unwrap().into(),
+        manifest_sha256: format!("{:x}", Sha256::digest(MANIFEST)),
+        revision: String::from_utf8(revision.stdout).unwrap().trim().into(),
+        sample_count: 1,
+        fault_at_ms,
+        detection,
+        ownership_observed_at_ms: lease_event["at_ms"].as_u64().unwrap(),
+        first_correct_query_at_ms,
+        query_frontier,
+        query_rows,
+        docker_command_ms,
+        before,
+        after,
+        sink_records_before,
+        control_lease: manager
+            .leases()
+            .into_iter()
+            .find(|l| l.shard_id == ShardId(ID))
+            .unwrap(),
+        sink_records: consume(&bootstrap),
+    };
+    save(
+        &artifact_dir.join("worker-failure-kafka-minio-v1.json"),
+        &evidence,
+    );
+    assert_eq!(validate(&evidence), Ok(()));
+    // Negative controls mutate the actual returned observations, one at a time.
+    let mut wrong = evidence.clone();
+    wrong.after.weighted_output[3][2][1]["Utf8"] = json!("wrong");
+    assert_eq!(validate(&wrong), Err(RecoveryFailure::ViewOutput));
+    let mut duplicate = evidence.clone();
+    duplicate
+        .sink_records
+        .as_array_mut()
+        .unwrap()
+        .push(evidence.sink_records[2].clone());
+    assert_eq!(validate(&duplicate), Err(RecoveryFailure::SinkOutput));
+    let mut stalled = evidence.clone();
+    stalled.after.view_frontier = 4;
+    assert_eq!(validate(&stalled), Err(RecoveryFailure::Progress));
+    let mut late = evidence.clone();
+    late.first_correct_query_at_ms = late.fault_at_ms + 60_001;
+    late.after.observed_at_ms = late.first_correct_query_at_ms;
+    assert_eq!(validate(&late), Err(RecoveryFailure::QueryDeadline));
+    fs::write(artifact_dir.join("real-cluster-chaos-summary.md"),format!("# Worker recovery: {}\n\nRevision: `{}`; manifest SHA-256: `{}`.\n\nSamples: 1 (no percentile estimate).\n\nFault to control disconnect detection: {} ms.\nFault to replacement lease observation: {} ms.\nFault to correct view query at frontier 5: {} ms.\nDocker info command: {} ms. Worker kill/wait command: {} ms.\n\nComplete observations: `worker-failure-kafka-minio-v1.json`.\nAll four negative controls rejected for their intended reasons.\n",evidence.scenario_id,evidence.revision,evidence.manifest_sha256,evidence.detection.timestamp_ms-fault_at_ms,evidence.ownership_observed_at_ms-fault_at_ms,first_correct_query_at_ms-fault_at_ms,docker_command_ms,worker_kill_command_ms)).unwrap();
+    drop(workers);
+    control.shutdown();
 }

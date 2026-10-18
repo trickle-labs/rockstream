@@ -37,6 +37,9 @@ fn contributor_workflows_name_executable_commands() {
             "cargo audit",
             "bash scripts/check-documentation.test.sh",
             "cargo test -p rockstream-cli --test documentation_transcript_tests",
+            "bash scripts/check-qualification-mutations.test.sh",
+            "bash scripts/check-qualification-mutations.sh --output target/qualification-mutations.json",
+            "bash scripts/run-release-qualification.sh --fast --output target/qualification-helpers.json",
         ]
     );
 }

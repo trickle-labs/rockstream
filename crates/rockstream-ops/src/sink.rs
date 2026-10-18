@@ -48,6 +48,9 @@ pub enum ColumnValue {
     Float64(f64),
 }
 
+/// One persisted view change: (epoch, row index, column values, signed weight).
+pub type ViewOutputRow = (u64, u64, Vec<ColumnValue>, i64);
+
 impl ColumnValue {
     /// Returns the inner `i64` if this is `ColumnValue::Int64`, else `None`.
     pub fn as_i64(&self) -> Option<i64> {
@@ -320,9 +323,7 @@ impl ViewSinkOp {
 }
 
 /// Decode one row's value bytes into `num_cols` type-tagged `ColumnValue`s
-/// plus the trailing weight. Returns `None` on truncated/malformed input
-/// (the row is skipped by the caller rather than causing a panic on
-/// corrupt/partial data).
+/// plus the trailing weight. Returns `None` on truncated/malformed input.
 pub(crate) fn decode_row(vb: &[u8], num_cols: usize) -> Option<(Vec<ColumnValue>, i64)> {
     let mut pos = 0usize;
     let mut cols = Vec::with_capacity(num_cols);
@@ -348,6 +349,9 @@ pub(crate) fn decode_row(vb: &[u8], num_cols: usize) -> Option<(Vec<ColumnValue>
             }
             TAG_BOOLEAN => {
                 let v = *vb.get(pos)?;
+                if v > 1 {
+                    return None;
+                }
                 pos += 1;
                 cols.push(ColumnValue::Boolean(v != 0));
             }
@@ -361,6 +365,9 @@ pub(crate) fn decode_row(vb: &[u8], num_cols: usize) -> Option<(Vec<ColumnValue>
         }
     }
     let end = pos.checked_add(8)?;
+    if end != vb.len() {
+        return None;
+    }
     let weight = i64::from_be_bytes(vb.get(pos..end)?.try_into().ok()?);
     Some((cols, weight))
 }
@@ -375,7 +382,7 @@ pub async fn read_view_output(
     db: &ShardDb,
     op_id: OperatorId,
     num_cols: usize,
-) -> Result<Vec<(u64, u64, Vec<ColumnValue>, i64)>, OpError> {
+) -> Result<Vec<ViewOutputRow>, OpError> {
     let prefix = view_output_prefix(op_id);
     let (entries, truncated) = db
         .scan_prefix_bounded(&prefix, VIEW_OUTPUT_READ_MAX_BYTES)
@@ -386,7 +393,7 @@ pub async fn read_view_output(
             "view output exceeds {VIEW_OUTPUT_READ_MAX_BYTES} byte read limit"
         )));
     }
-    Ok(decode_view_output_entries(entries, num_cols))
+    decode_view_output_entries(entries, num_cols)
 }
 
 /// Same as [`read_view_output`] but reads through a read-only `ShardReader`
@@ -398,13 +405,13 @@ pub async fn read_view_output_via_reader(
     reader: &rockstream_storage::ShardReader,
     op_id: OperatorId,
     num_cols: usize,
-) -> Result<Vec<(u64, u64, Vec<ColumnValue>, i64)>, OpError> {
+) -> Result<Vec<ViewOutputRow>, OpError> {
     let prefix = view_output_prefix(op_id);
     let entries = reader
         .scan_prefix(&prefix)
         .await
         .map_err(OpError::storage)?;
-    Ok(decode_view_output_entries(entries, num_cols))
+    decode_view_output_entries(entries, num_cols)
 }
 
 fn view_output_prefix(op_id: OperatorId) -> Vec<u8> {
@@ -423,25 +430,27 @@ fn view_output_epoch_key(op_id: OperatorId) -> Vec<u8> {
 fn decode_view_output_entries(
     entries: Vec<(bytes::Bytes, bytes::Bytes)>,
     num_cols: usize,
-) -> Vec<(u64, u64, Vec<ColumnValue>, i64)> {
+) -> Result<Vec<ViewOutputRow>, OpError> {
     let mut rows = Vec::new();
     for (key, value) in entries {
         // key: [prefix:1][op_id:8][epoch:8][row:8] = 25 bytes
-        if key.len() < 25 {
+        if key.len() == 14 && &key[9..] == b"epoch" {
             continue;
+        }
+        if key.len() != 25 {
+            return Err(OpError::internal("invalid view output row key"));
         }
         let kb: &[u8] = &key;
         let vb: &[u8] = &value;
         let epoch = u64::from_be_bytes(kb[9..17].try_into().unwrap());
         let row_idx = u64::from_be_bytes(kb[17..25].try_into().unwrap());
 
-        let Some((cols, weight)) = decode_row(vb, num_cols) else {
-            continue;
-        };
+        let (cols, weight) = decode_row(vb, num_cols)
+            .ok_or_else(|| OpError::internal("invalid view output row payload"))?;
         rows.push((epoch, row_idx, cols, weight));
     }
     rows.sort_by_key(|(epoch, row_idx, ..)| (*epoch, *row_idx));
-    rows
+    Ok(rows)
 }
 
 fn serialize_column_value(value: &ColumnValue) -> String {
@@ -614,6 +623,40 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use object_store::memory::InMemory;
     use rockstream_storage::BatchOp;
+
+    #[test]
+    fn view_output_rejects_corruption_instead_of_omitting_rows() {
+        let mut key = view_output_prefix(OperatorId(7));
+        key.extend_from_slice(&0_u64.to_be_bytes());
+        key.extend_from_slice(&0_u64.to_be_bytes());
+        let row = [
+            vec![TAG_INT64],
+            1_i64.to_be_bytes().to_vec(),
+            1_i64.to_be_bytes().to_vec(),
+        ]
+        .concat();
+        assert_eq!(
+            decode_view_output_entries(vec![(key.clone().into(), row.clone().into())], 1).unwrap(),
+            vec![(0, 0, vec![ColumnValue::Int64(1)], 1)]
+        );
+        for bytes in [
+            vec![],
+            row[..row.len() - 1].to_vec(),
+            [row, vec![0]].concat(),
+            [vec![TAG_BOOLEAN, 2], 1_i64.to_be_bytes().to_vec()].concat(),
+        ] {
+            let error = decode_view_output_entries(vec![(key.clone().into(), bytes.into())], 1)
+                .unwrap_err();
+            assert_eq!(error.to_string(), "[RS-0001] Internal error: invalid view output row payload; next_steps: report this issue");
+        }
+        key.push(0);
+        assert_eq!(
+            decode_view_output_entries(vec![(key.into(), vec![].into())], 1)
+                .unwrap_err()
+                .to_string(),
+            "[RS-0001] Internal error: invalid view output row key; next_steps: report this issue"
+        );
+    }
 
     #[tokio::test]
     async fn append_epoch_records_empty_epoch_marker() {

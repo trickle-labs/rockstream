@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::process::Command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -143,35 +142,101 @@ pub fn operator_counters(metrics: &[Metric]) -> BTreeMap<String, u64> {
     counters
 }
 
+/// Read actual per-process user/system CPU and resident bytes. `ps stime` is
+/// the *start time*, not system CPU time; never treat it as a CPU counter.
 pub fn process_snapshot(pid: u32) -> Result<ProcessSnapshot> {
-    let output = Command::new("ps")
-        .args([
-            "-o",
-            "utime=",
-            "-o",
-            "stime=",
-            "-o",
-            "rss=",
-            "-p",
-            &pid.to_string(),
-        ])
-        .output()
-        .context("run ps for process counters")?;
-    if !output.status.success() {
-        bail!("ps could not observe pid {pid}");
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .with_context(|| format!("read Linux process stat for {pid}"))?;
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if ticks <= 0 || page_size <= 0 {
+            bail!("Linux process counter conversion has invalid clock/page scale");
+        }
+        parse_linux_proc_stat(&stat, ticks as u64, page_size as u64)
     }
-    let text = String::from_utf8(output.stdout).context("ps returned non-UTF-8 output")?;
-    let fields = text.split_whitespace().collect::<Vec<_>>();
-    if fields.len() != 3 {
-        bail!("ps returned incomplete counters for pid {pid}: {text:?}");
+    #[cfg(target_os = "macos")]
+    {
+        snapshot_macos(pid)
     }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("v0.72 measured process counters unsupported on this operating system (pid={pid})")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_stat(
+    stat: &str,
+    ticks_per_second: u64,
+    page_size: u64,
+) -> Result<ProcessSnapshot> {
+    if ticks_per_second == 0 || page_size == 0 {
+        bail!("invalid Linux process counter scale");
+    }
+    // /proc/<pid>/stat field 2 is a parenthesized command containing spaces
+    // and parentheses. Find the final ') ' rather than splitting the command.
+    let close = stat
+        .rfind(") ")
+        .context("missing Linux process name terminator")?;
+    let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
+    // The first remaining field is state (#3); utime is #14, stime #15,
+    // resident pages #24, therefore remaining indices 11, 12 and 21.
+    if fields.len() <= 21 {
+        bail!("incomplete Linux process stat");
+    }
+    let user_ticks = fields[11]
+        .parse::<u64>()
+        .context("parse Linux user CPU ticks")?;
+    let system_ticks = fields[12]
+        .parse::<u64>()
+        .context("parse Linux system CPU ticks")?;
+    let resident_pages = fields[21]
+        .parse::<u64>()
+        .context("parse Linux resident pages")?;
+    let cpu_ns = |ticks: u64| -> Result<u64> {
+        (u128::from(ticks) * 1_000_000_000 / u128::from(ticks_per_second))
+            .try_into()
+            .context("Linux CPU nanoseconds overflow")
+    };
     Ok(ProcessSnapshot {
-        user_cpu_ns: parse_cpu_time(fields[0])?,
-        system_cpu_ns: parse_cpu_time(fields[1])?,
-        rss_bytes: fields[2].parse::<u64>().context("parse RSS KiB")? * 1024,
+        user_cpu_ns: cpu_ns(user_ticks)?,
+        system_cpu_ns: cpu_ns(system_ticks)?,
+        rss_bytes: resident_pages
+            .checked_mul(page_size)
+            .context("Linux resident bytes overflow")?,
     })
 }
 
+#[cfg(target_os = "macos")]
+fn snapshot_macos(pid: u32) -> Result<ProcessSnapshot> {
+    // The pinned libc bindings define both the Darwin ABI and the libproc
+    // selector. Use their exact proc_taskinfo layout instead of guessed
+    // offsets or the ambiguous `ps stime` display field.
+    let pid: libc::c_int = pid.try_into().context("macOS PID out of range")?;
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let expected = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let returned = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            expected,
+        )
+    };
+    if returned != expected {
+        bail!("macOS proc_pidinfo returned incomplete task counters for pid {pid}");
+    }
+    Ok(ProcessSnapshot {
+        user_cpu_ns: info.pti_total_user,
+        system_cpu_ns: info.pti_total_system,
+        rss_bytes: info.pti_resident_size,
+    })
+}
+
+#[cfg(test)]
 fn parse_cpu_time(value: &str) -> Result<u64> {
     let (days, clock) = match value.split_once('-') {
         Some((days, clock)) => (days.parse::<u64>().context("parse CPU days")?, clock),
@@ -225,6 +290,41 @@ mod tests {
                 exchange_bytes: 44,
             }
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parses_actual_linux_user_system_cpu_and_resident_bytes() {
+        let mut fields = vec!["0"; 22];
+        fields[0] = "S";
+        fields[11] = "123";
+        fields[12] = "22";
+        fields[21] = "8";
+        let fixture = format!("123 (nested) process name) {}", fields.join(" "));
+        assert_eq!(
+            parse_linux_proc_stat(&fixture, 100, 4096).unwrap(),
+            ProcessSnapshot {
+                user_cpu_ns: 1_230_000_000,
+                system_cpu_ns: 220_000_000,
+                rss_bytes: 32768,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn proc_stat_rejects_incomplete_and_unrepresentable_counters() {
+        assert!(parse_linux_proc_stat("1 (short) S", 100, 4096).is_err());
+        let mut fields = vec!["0"; 22];
+        fields[0] = "S";
+        fields[11] = "123";
+        fields[12] = "22";
+        fields[21] = "8";
+        let fixture = format!("123 (cmd) {}", fields.join(" "));
+        assert!(parse_linux_proc_stat(&fixture, 0, 4096).is_err());
+        fields[21] = "18446744073709551615";
+        let overflow = format!("123 (cmd) {}", fields.join(" "));
+        assert!(parse_linux_proc_stat(&overflow, 100, 4096).is_err());
     }
 
     #[test]

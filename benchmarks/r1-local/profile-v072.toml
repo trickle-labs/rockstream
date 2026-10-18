@@ -1,0 +1,100 @@
+# v0.72 acceptance decisions, frozen before candidate comparison.
+# Local claims only. A different host or backend needs a new profile revision.
+profile_id = "v072-m5pro-48gb-v1"
+revision = 1
+state = "frozen"
+contract = "issue-132-v2"
+baseline_profile = "profile-v0611.toml"
+
+[machine]
+chip = "Apple M5 Pro"
+memory_bytes = 51539607552
+backend = "native_lfs"
+
+[load]
+payload_bytes = 128
+durability_mode = "Durable"
+offered_rows_per_sec = [250, 500, 1000, 2000, 4000, 8000, 16000]
+live_groups = [1000, 100000, 10000000]
+view_counts = [1, 20]
+worker_counts = [1, 2, 4, 8]
+warm_up_seconds = 10
+measurement_seconds = 60
+repetitions = 5
+max_sample_cv = 0.15
+
+[workloads]
+priority_high = 0
+priority_default = 128
+priority_low = 255
+worker_hard_bytes = 2147483648
+foreground_reserved_bytes = 429496729
+workload_soft_bytes = 429496729
+workload_hard_bytes = 536870912
+max_parallelism = 4
+freshness_slo_ms = 100
+max_runnable_wait_ms = 1000
+max_queue_age_ms = 1000
+max_waiters = 1024
+max_rss_over_worker_budget_percent = 15
+max_storage_backlog_bytes = 4294967296
+max_disk_bytes_per_worker = 34359738368
+max_spill_and_compaction_io_bytes_per_change = 16384
+overload_seconds = 1800
+recovery_seconds = 900
+owner_ack_deadline_ms = 5000
+
+[epochs]
+min_ms = 10
+max_ms = 50
+
+[latency]
+read_p99_ms = 10
+durable_commit_p99_ms = 25
+correct_committed_result_freshness_p99_ms = 100
+max_generator_delay_ms = 5
+
+[comparisons]
+max_one_key_write_ratio = 1.10
+max_shared_20_to_private_20_state_ratio = 0.20
+max_shared_20_to_private_20_write_ratio = 0.20
+max_shared_20_to_private_20_cpu_ratio = 0.85
+min_two_to_one_worker_throughput_ratio = 1.25
+min_four_to_one_worker_throughput_ratio = 2.00
+min_eight_to_one_worker_throughput_ratio = 2.00
+
+[interactive]
+max_compilation_ms = 2000
+max_intermediate_bytes = 67108864
+max_queued_queries = 64
+max_queue_wait_ms = 1000
+max_returned_rows = 10000
+max_encoded_bytes = 8388608
+max_wall_ms = 5000
+max_concurrent_queries = 16
+max_snapshot_ms = 30000
+
+[subscriptions]
+max_snapshot_rows = 10000
+max_epoch_bytes = 8388608
+max_buffer_bytes = 16777216
+max_streams = 16
+max_slow_client_ms = 30000
+
+[regression]
+filter_projection = "standard"
+group_aggregate = "standard"
+high_cardinality_aggregate = "standard"
+two_way_join = "standard"
+window = "standard"
+postgres_cdc = "standard"
+kafka_ingestion = "standard"
+distributed_exchange = "standard"
+
+[regression_budgets.standard]
+max_sample_cv = 0.15
+min_throughput_ratio = 0.85
+max_read_p99_ratio = 1.15
+max_commit_p99_ratio = 1.15
+max_freshness_p99_ratio = 1.15
+max_rss_ratio = 1.15

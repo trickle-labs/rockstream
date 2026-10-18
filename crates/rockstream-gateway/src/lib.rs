@@ -16,9 +16,11 @@
 
 pub mod admission;
 pub mod auth;
+pub mod bounded_read;
 mod catalog_query;
 pub mod catalog_stubs;
 pub mod change_log;
+pub mod copy_out_budget;
 pub mod copy_state;
 pub mod error;
 pub mod multi_shard_reader;

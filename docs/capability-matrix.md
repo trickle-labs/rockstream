@@ -61,7 +61,7 @@ The matrix is generated from `capabilities.toml`. `Core` records are release-gat
 | `language.window.slide` | language | Sliding hopping time windows | Core | SQL over pgwire | `query_async_entry`, `sql_lowering`, `plan_compilation` | `crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_sliding` | `docs/language-features.md#implemented-today` |
 | `language.window.tumble` | language | Fixed tumbling time windows | Core | SQL over pgwire | `query_async_entry`, `sql_lowering`, `plan_compilation` | `crates/rockstream-gateway/tests/live_exec_tumble_window_durability_lfs_tests.rs::compiled_tumble_window_state_persists_across_restart_lfs` | `docs/language-features.md#implemented-today` |
 | `language.write-classification` | language | Write classification | Experimental | Not SQL-reachable | — | — | `docs/language-features.md#documented-planned-surface` |
-| `sink.kafka` | sink | Kafka sink | Experimental | Connector runtime | `kafka_sink_runtime` | — | `docs/connectors.md#kafka-sink` |
+| `sink.kafka` | sink | Kafka sink | Experimental | Connector runtime | `kafka_sink_runtime`, `kafka_view_sink_runtime` | — | `docs/connectors.md#kafka-sink` |
 
 ## Core dispatch inventory
 

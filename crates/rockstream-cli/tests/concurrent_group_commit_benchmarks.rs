@@ -238,9 +238,24 @@ async fn bench_twenty_views_light_load() {
         Ok(ArrowZSet::from_ab_rows(&[(1, 100)], 1))
     }));
 
-    // Warmup 1 op
+    // Warm up the same 20-view compute and commit path as the measured
+    // epochs. Warming only v1 made the first timed epoch include cold-start
+    // scheduler and storage work; with ten samples, p99 is the maximum.
+    let mut warmup_deltas = HashMap::new();
+    warmup_deltas.insert(
+        "src_table".to_string(),
+        ArrowZSet::from_ab_rows(&[(1, 100)], 1),
+    );
+    let warmup_computed = scheduler
+        .execute_epoch(&graph, warmup_deltas, executor.clone())
+        .await
+        .unwrap();
+    assert_eq!(warmup_computed.len(), num_views);
+
     let mut warmup_batch = WriteBatch::new();
-    warmup_batch.put(b"v1:warmup", b"v");
+    for i in 1..=num_views {
+        warmup_batch.put(format!("v{i}:warmup").as_bytes(), b"v");
+    }
     group.add_epoch(1, warmup_batch).unwrap();
     let _ = group.flush().await.unwrap();
 

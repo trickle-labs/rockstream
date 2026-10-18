@@ -13,4 +13,6 @@ fuzz_target!(|data: &[u8]| {
 
     let mut wal_source = PostgresCdcSource::new(ConnectorId(2), schema, CdcWireFormat::Wal2Json);
     let _ = wal_source.decode_and_enqueue(data);
+    // Keep decoder iterations independent of process-global DLQ retention.
+    rockstream_types::dlq::get_global_dlq().lock().clear();
 });

@@ -29,6 +29,7 @@ pub struct SourcePressureController {
     ledger: Arc<WorkerBudgetLedger>,
     base_credits: u32,
     last_state: AtomicU8,
+    configured_limits: Option<(u64, u64)>,
 }
 
 impl SourcePressureController {
@@ -38,7 +39,44 @@ impl SourcePressureController {
             ledger,
             base_credits: base_credits.max(1),
             last_state: AtomicU8::new(SourcePressureState::Normal as u8),
+            configured_limits: None,
         }
+    }
+
+    /// Attach workload/worker soft and hard pressure thresholds in bytes.
+    /// Invalid or nonsensical bounds fail before a controller is published.
+    pub fn with_limits(
+        mut self,
+        soft_limit_bytes: u64,
+        hard_limit_bytes: u64,
+    ) -> Result<Self, StateBudgetError> {
+        if soft_limit_bytes == 0
+            || soft_limit_bytes >= hard_limit_bytes
+            || hard_limit_bytes > self.ledger.total_budget_bytes()
+        {
+            return Err(StateBudgetError {
+                operator_name: "source-pressure-bounds".to_string(),
+                max_bytes: self.ledger.total_budget_bytes(),
+                current_bytes: soft_limit_bytes,
+                requested_bytes: hard_limit_bytes,
+            });
+        }
+        self.configured_limits = Some((soft_limit_bytes, hard_limit_bytes));
+        Ok(self)
+    }
+
+    /// Effective pressure ceilings, including a recovery threshold below soft.
+    /// The default thresholds preserve the earlier 80% / 95% worker behavior.
+    pub fn pressure_limits(&self) -> (u64, u64) {
+        self.configured_limits.unwrap_or_else(|| {
+            let total = u128::from(self.ledger.total_budget_bytes());
+            ((total * 80 / 100) as u64, (total * 95 / 100) as u64)
+        })
+    }
+
+    fn gross_reserved_bytes(&self) -> u128 {
+        let allocated = u128::from(self.ledger.total_allocated_bytes());
+        allocated * u128::from(100 + self.ledger.allocator_overhead_pct()) / 100
     }
 
     pub fn base_credits(&self) -> u32 {
@@ -49,12 +87,9 @@ impl SourcePressureController {
     pub fn utilization_ratio(&self) -> f64 {
         let total = self.ledger.total_budget_bytes();
         if total == 0 {
-            return 0.0;
+            return f64::INFINITY;
         }
-        let allocated = self.ledger.total_allocated_bytes();
-        let overhead = (allocated * self.ledger.allocator_overhead_pct()) / 100;
-        let gross = allocated.saturating_add(overhead);
-        gross as f64 / total as f64
+        self.gross_reserved_bytes() as f64 / total as f64
     }
 
     /// Return the current pressure state evaluated against the worker budget ledger.
@@ -63,15 +98,16 @@ impl SourcePressureController {
     /// - `Throttled`: utilization >= 80% (retained until clearing below 75%)
     /// - `Paused`: utilization >= 95%
     pub fn pressure_state(&self) -> SourcePressureState {
-        let ratio = self.utilization_ratio();
+        let gross = self.gross_reserved_bytes();
+        let (soft, hard) = self.pressure_limits();
         let prev = self.last_state.load(Ordering::Relaxed);
-
-        let new_state = if ratio >= 0.95 {
+        // Zero capacity is not a source-ingestion entitlement.
+        let recovery_threshold = u128::from(soft) * 75 / 80;
+        let new_state = if self.ledger.total_budget_bytes() == 0 || gross >= u128::from(hard) {
             SourcePressureState::Paused
-        } else if ratio >= 0.80 {
-            SourcePressureState::Throttled
-        } else if ratio >= 0.75 && prev != SourcePressureState::Normal as u8 {
-            // Hysteresis: remain throttled until recovering below 75%
+        } else if gross >= u128::from(soft)
+            || (gross >= recovery_threshold && prev != SourcePressureState::Normal as u8)
+        {
             SourcePressureState::Throttled
         } else {
             SourcePressureState::Normal
