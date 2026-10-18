@@ -3,6 +3,7 @@
 use crate::audit::{AuditEvent, FileAuditLog};
 use crate::kek::{
     envelope_decrypt_secret, envelope_encrypt_secret, rotate_secret_kek, KekError, KekProvider,
+    RetainedKekProvider,
 };
 use parking_lot::RwLock;
 use rockstream_types::error_code::{
@@ -11,12 +12,12 @@ use rockstream_types::error_code::{
 use rockstream_types::secret::{
     EncryptedSecret, Secret, SecretMetadata, SecretRotation, SecretToken, SecretType,
 };
-use slatedb::Db;
+use slatedb::{Db, WriteBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock as AsyncRwLock};
 
 type SecretReferenceKey = (u128, String);
 type SecretReferences = HashMap<SecretReferenceKey, HashSet<String>>;
@@ -217,6 +218,7 @@ pub fn secrets_namespace_prefix(namespace_id: u128) -> Vec<u8> {
 pub struct SecretStore {
     db: Option<Arc<Db>>,
     kek_provider: Arc<RwLock<Arc<dyn KekProvider>>>,
+    rotation_lock: Arc<AsyncRwLock<()>>,
     audit_log: Option<Arc<FileAuditLog>>,
     in_memory: Arc<RwLock<HashMap<(u128, String), EncryptedSecret>>>,
     references: Arc<RwLock<SecretReferences>>,
@@ -231,6 +233,7 @@ impl SecretStore {
         Self {
             db,
             kek_provider: Arc::new(RwLock::new(kek_provider)),
+            rotation_lock: Arc::new(AsyncRwLock::new(())),
             audit_log: None,
             in_memory: Arc::new(RwLock::new(HashMap::new())),
             references: Arc::new(RwLock::new(HashMap::new())),
@@ -387,15 +390,23 @@ impl SecretStore {
         namespace_id: u128,
         name: &str,
         encrypted: &EncryptedSecret,
+        rotation: OwnedRwLockReadGuard<()>,
     ) -> Result<(), SecretStoreError> {
         let key = secret_key(namespace_id, name);
         let serialized = serde_json::to_vec(encrypted)
             .map_err(|e| SecretStoreError::storage(format!("serialize failed: {e}")))?;
 
         if let Some(db) = &self.db {
-            db.put(&key, &serialized)
-                .await
-                .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+            let db = db.clone();
+            // A cancelled writer must finish before rotation scans the catalog.
+            tokio::spawn(async move {
+                let _rotation = rotation;
+                db.put(&key, &serialized)
+                    .await
+                    .map_err(|e| SecretStoreError::storage(e.to_string()))
+            })
+            .await
+            .map_err(|e| SecretStoreError::storage(e.to_string()))??;
         } else {
             let mut map = self.in_memory.write();
             map.insert((namespace_id, name.to_string()), encrypted.clone());
@@ -464,6 +475,7 @@ impl SecretStore {
         payload: HashMap<String, String>,
         actor: &str,
     ) -> Result<SecretMetadata, SecretStoreError> {
+        let rotation = self.rotation_lock.clone().read_owned().await;
         let trimmed_name = name.trim();
         if trimmed_name.is_empty() {
             return Err(SecretStoreError::ddl_invalid("secret name cannot be empty"));
@@ -507,7 +519,7 @@ impl SecretStore {
         )
         .await?;
 
-        self.put_encrypted_raw(namespace_id, trimmed_name, &encrypted)
+        self.put_encrypted_raw(namespace_id, trimmed_name, &encrypted, rotation)
             .await?;
         self.record_audit(actor, "secret.created", trimmed_name, None);
 
@@ -522,6 +534,7 @@ impl SecretStore {
         payload: HashMap<String, String>,
         actor: &str,
     ) -> Result<SecretMetadata, SecretStoreError> {
+        let rotation = self.rotation_lock.clone().read_owned().await;
         let trimmed_name = name.trim();
         let existing = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
             Some(e) => e,
@@ -549,7 +562,7 @@ impl SecretStore {
         )
         .await?;
 
-        self.put_encrypted_raw(namespace_id, trimmed_name, &encrypted)
+        self.put_encrypted_raw(namespace_id, trimmed_name, &encrypted, rotation)
             .await?;
         self.record_audit(actor, "secret.altered", trimmed_name, None);
         let _ = self.rotation_tx.send(Some(SecretRotation {
@@ -569,6 +582,7 @@ impl SecretStore {
         name: &str,
         actor: &str,
     ) -> Result<(), SecretStoreError> {
+        let _rotation = self.rotation_lock.read().await;
         let trimmed_name = name.trim();
         let _ = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
             Some(e) => e,
@@ -597,6 +611,7 @@ impl SecretStore {
         namespace_id: u128,
         name: &str,
     ) -> Result<Secret, SecretStoreError> {
+        let _rotation = self.rotation_lock.read().await;
         let trimmed_name = name.trim();
         let encrypted = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
             Some(e) => e,
@@ -685,15 +700,19 @@ impl SecretStore {
     }
 
     /// Re-wrap all secrets with a new KEK provider (dynamic rotation).
+    /// Retain both providers until this succeeds durably; after an interruption,
+    /// reopen with `RetainedKekProvider` and retry with the replacement provider.
     pub async fn rotate_kek(
         &self,
         new_kek_provider: Arc<dyn KekProvider>,
         actor: &str,
     ) -> Result<usize, SecretStoreError> {
+        let rotation = self.rotation_lock.clone().write_owned().await;
         let old_kek = self.kek_provider();
         let mut rotated_count = 0;
 
         if let Some(db) = &self.db {
+            let mut batch = WriteBatch::new();
             let prefix = CATALOG_SECRETS_PREFIX;
             let mut iter = db
                 .scan_prefix(&prefix, ..)
@@ -711,16 +730,41 @@ impl SecretStore {
                         .await?;
                 let serialized = serde_json::to_vec(&rotated)
                     .map_err(|e| SecretStoreError::storage(format!("serialize failed: {e}")))?;
-                db.put(&entry.key, &serialized)
-                    .await
-                    .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+                batch.put(&entry.key, &serialized);
                 rotated_count += 1;
                 self.metrics
                     .secret_scan_fill_level
                     .store(rotated_count, Ordering::Relaxed);
             }
+            if rotated_count > 0 {
+                let db = db.clone();
+                let provider = self.kek_provider.clone();
+                let audit_log = self.audit_log.clone();
+                let event = AuditEvent::now(actor, "secret.rotated", "cluster_kek");
+                // Cancellation must not separate a submitted batch from its provider switch.
+                return tokio::spawn(async move {
+                    let _rotation = rotation;
+                    *provider.write() =
+                        Arc::new(RetainedKekProvider::new(old_kek, new_kek_provider.clone()));
+                    let write = db
+                        .write(batch)
+                        .await
+                        .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+                    write
+                        .await_durable()
+                        .await
+                        .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+                    *provider.write() = new_kek_provider;
+                    if let Some(log) = audit_log {
+                        let _ = log.append(&event);
+                    }
+                    Ok(rotated_count)
+                })
+                .await
+                .map_err(|e| SecretStoreError::rotation_failed(e.to_string()))?;
+            }
         } else {
-            let entries: Vec<_> = {
+            let mut entries: Vec<_> = {
                 let map = self.in_memory.read();
                 map.iter()
                     .map(|(key, encrypted)| (key.clone(), encrypted.clone()))
@@ -731,15 +775,14 @@ impl SecretStore {
                     "in-memory secret rotation window limit reached",
                 ));
             }
-            for (key, enc) in entries {
-                let rotated =
-                    rotate_secret_kek(&enc, old_kek.as_ref(), new_kek_provider.as_ref()).await?;
-                self.in_memory.write().insert(key, rotated);
+            for (_, enc) in &mut entries {
+                *enc = rotate_secret_kek(enc, old_kek.as_ref(), new_kek_provider.as_ref()).await?;
                 rotated_count += 1;
                 self.metrics
                     .secret_scan_fill_level
                     .store(rotated_count, Ordering::Relaxed);
             }
+            *self.in_memory.write() = entries.into_iter().collect();
         }
 
         *self.kek_provider.write() = new_kek_provider;
