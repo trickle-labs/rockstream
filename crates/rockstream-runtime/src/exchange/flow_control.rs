@@ -603,7 +603,6 @@ impl FlowController {
         loop {
             let notified = notify.notified();
             tokio::pin!(notified);
-            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock();
                 let state = self.channel_state(&mut channels, key);
@@ -613,6 +612,8 @@ impl FlowController {
                     Self::update_credit_metrics(&channels);
                     return Ok(());
                 }
+                // Register under the accounting lock so a credit release cannot race the failed check.
+                notified.as_mut().enable();
             }
             #[cfg(test)]
             self.pause_before_wait().await;
