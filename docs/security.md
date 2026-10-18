@@ -4,8 +4,43 @@
 
 `CREATE SECRET`, `ALTER SECRET`, `DROP SECRET`, and `SHOW SECRETS` store only
 AES-256-GCM envelopes under `catalog/secrets/`. The control plane uses
-`RS_SECRET_KEK` by default; AWS KMS-compatible provider wiring is available
-for deployments that supply a KMS ARN. `SHOW SECRETS` returns metadata only.
+`RS_SECRET_KEK` by default. `SHOW SECRETS` returns metadata only.
+
+Applications can inject an `AwsKmsKekProvider::new(key_arn, region)` into a
+`SecretStore` and supply that store through `ControlService::with_secret_store`.
+Supplying an ARN alone does not select this provider in the default services.
+The provider sends SigV4-signed KMS `Encrypt` and `Decrypt` requests with the
+configured `KeyId` on both operations. The control-plane identity needs
+`kms:Encrypt` and `kms:Decrypt` permission on that symmetric KMS key. DEKs are
+generated locally; only their wrapping and unwrapping use KMS.
+
+AWS credential discovery reuses the storage layer's refreshable credential
+chain: environment credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+and optional `AWS_SESSION_TOKEN`), web identity, ECS task credentials, or EC2
+instance credentials. Shared AWS profile files are not loaded. Applications
+can supply another credential provider with `with_credentials`.
+`with_endpoint` supports HTTPS KMS-compatible endpoints; plaintext HTTP is
+restricted to numeric loopback addresses for local fixtures. Redirects are
+disabled, requests time out after ten seconds, and failures return `RS-2422`
+without request/response bodies or local encryption fallback.
+
+**Compatibility:** envelopes created by the former ARN/region-derived local
+placeholder are not KMS ciphertext and will fail to decrypt with this provider.
+Any such data needs a controlled offline migration before upgrading. That
+placeholder provided no KMS authorization boundary; this implementation never
+falls back to decrypting its envelopes.
+
+Local KMS protocol fixtures verify signed requests, denial, unavailability,
+wrong-key handling, and env/KMS rewrapping. They do not qualify AWS enforcement.
+The ignored `real_kms_enforces_key_and_principal_permissions` test requires a
+scoped AWS fixture: `ROCKSTREAM_TEST_KMS_KEY_ARN`,
+`ROCKSTREAM_TEST_KMS_WRONG_KEY_ARN` (a different usable key),
+`ROCKSTREAM_TEST_KMS_REGION`, and a denied principal's
+`ROCKSTREAM_TEST_KMS_DENIED_ACCESS_KEY_ID`,
+`ROCKSTREAM_TEST_KMS_DENIED_SECRET_ACCESS_KEY`, and optional
+`ROCKSTREAM_TEST_KMS_DENIED_SESSION_TOKEN`. The ordinary AWS credential chain
+must identify an authorized principal. Run explicitly with
+`cargo test -p rockstream-control --test aws_kms_tests real_kms_enforces_key_and_principal_permissions -- --ignored --exact`.
 
 Workers receive short-lived tokens over authenticated mTLS. Decrypted payloads
 remain in the worker process memory and are refreshed at the next epoch after

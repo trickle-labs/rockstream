@@ -1,11 +1,18 @@
 //! Conformance tests for KEK providers and envelope encryption (v0.55.1).
 
+use base64::{engine::general_purpose::STANDARD, Engine};
+use object_store::aws::AwsCredential;
+use object_store::StaticCredentialProvider;
 use rockstream_control::kek::{
     envelope_decrypt_secret, envelope_encrypt_secret, rotate_secret_kek, AwsKmsKekProvider,
     EnvKekProvider, KekProvider,
 };
-use rockstream_types::secret::{SecretMetadata, SecretType};
+use rockstream_types::secret::{Secret, SecretMetadata, SecretType};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+#[path = "support/kms.rs"]
+mod kms;
 
 async fn assert_kek_provider_contract(provider: &dyn KekProvider) {
     let dek = [42u8; 32];
@@ -54,26 +61,56 @@ async fn assert_kek_provider_contract(provider: &dyn KekProvider) {
         .await
         .expect("envelope decryption must succeed");
 
-    assert_eq!(decrypted.name, "kafka_prod_auth");
-    assert_eq!(decrypted.secret_type, SecretType::SaslPlain);
     assert_eq!(
-        decrypted.payload.get("username").unwrap(),
-        "kafka_client_app"
+        decrypted,
+        Secret {
+            name: "kafka_prod_auth".into(),
+            secret_type: SecretType::SaslPlain,
+            payload,
+            metadata,
+        }
     );
-    assert_eq!(
-        decrypted.payload.get("password").unwrap(),
-        "SuperSecretPassword!99"
-    );
-    assert_eq!(decrypted.metadata, metadata);
 }
 
 #[tokio::test]
 async fn test_kek_providers_interchangeable_conformance_and_rotation() {
     let env_provider = EnvKekProvider::from_passphrase("test-cluster-kek-master-key-1");
+    // The endpoint owns opaque wrapped keys independently of the public provider.
+    let keys = Mutex::new(HashMap::<String, String>::new());
+    let fixture = kms::KmsFixture::start(move |request| {
+        assert_eq!(request.method, "POST / HTTP/1.1");
+        assert_eq!(
+            request.body["KeyId"],
+            "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"
+        );
+        let mut keys = keys.lock().unwrap();
+        match request.headers["x-amz-target"].as_str() {
+            "TrentService.Encrypt" => {
+                let ciphertext = STANDARD.encode(format!("server-owned-key-{}", keys.len()));
+                keys.insert(
+                    ciphertext.clone(),
+                    request.body["Plaintext"].as_str().unwrap().into(),
+                );
+                (200, serde_json::json!({"CiphertextBlob": ciphertext}))
+            }
+            "TrentService.Decrypt" => {
+                let ciphertext = request.body["CiphertextBlob"].as_str().unwrap();
+                (200, serde_json::json!({"Plaintext": keys[ciphertext]}))
+            }
+            target => panic!("unexpected target: {target}"),
+        }
+    })
+    .await;
     let aws_provider = AwsKmsKekProvider::new(
         "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012",
         "us-east-1",
-    );
+    )
+    .with_endpoint(&fixture.endpoint)
+    .with_credentials(Arc::new(StaticCredentialProvider::new(AwsCredential {
+        key_id: "fixture-access".into(),
+        secret_key: "fixture-secret".into(),
+        token: None,
+    })));
 
     // 1. Both providers satisfy contract
     assert_kek_provider_contract(&env_provider).await;
@@ -82,19 +119,45 @@ async fn test_kek_providers_interchangeable_conformance_and_rotation() {
     // 2. KEK rotation: create secret under env KEK, rotate to aws_kms KEK, then rotate to new env KEK
     let mut payload = HashMap::new();
     payload.insert("api_key".to_string(), "rk_live_abcdef123456".to_string());
+    payload.insert("scope".to_string(), "synthetic-scope-secret".to_string());
 
     let meta = SecretMetadata::default();
     let initial_encrypted = envelope_encrypt_secret(
         "api_secret",
         SecretType::BearerToken,
         &payload,
-        meta,
+        meta.clone(),
         &env_provider,
     )
     .await
     .expect("initial encrypt must succeed");
 
     assert_eq!(initial_encrypted.kek_provider, "env");
+    let expected = Secret {
+        name: "api_secret".into(),
+        secret_type: SecretType::BearerToken,
+        payload,
+        metadata: meta,
+    };
+    let untouched_payload = HashMap::from([
+        ("username".into(), "untouched-user".into()),
+        ("password".into(), "untouched-password-secret".into()),
+    ]);
+    let untouched = envelope_encrypt_secret(
+        "untouched",
+        SecretType::SaslPlain,
+        &untouched_payload,
+        SecretMetadata::default(),
+        &env_provider,
+    )
+    .await
+    .unwrap();
+    let expected_untouched = Secret {
+        name: "untouched".into(),
+        secret_type: SecretType::SaslPlain,
+        payload: untouched_payload,
+        metadata: SecretMetadata::default(),
+    };
 
     // Rotate to AWS KMS
     let rotated_to_aws = rotate_secret_kek(&initial_encrypted, &env_provider, &aws_provider)
@@ -110,9 +173,12 @@ async fn test_kek_providers_interchangeable_conformance_and_rotation() {
     let decrypted_aws = envelope_decrypt_secret(&rotated_to_aws, &aws_provider)
         .await
         .expect("decryption after rotation must succeed");
+    assert_eq!(decrypted_aws, expected);
     assert_eq!(
-        decrypted_aws.payload.get("api_key").unwrap(),
-        "rk_live_abcdef123456"
+        envelope_decrypt_secret(&untouched, &env_provider)
+            .await
+            .unwrap(),
+        expected_untouched
     );
 
     // Rotate to new Env KEK
@@ -125,9 +191,54 @@ async fn test_kek_providers_interchangeable_conformance_and_rotation() {
     let decrypted_new_env = envelope_decrypt_secret(&rotated_to_new_env, &new_env_provider)
         .await
         .expect("decryption with new env KEK must succeed");
+    assert_eq!(decrypted_new_env, expected);
     assert_eq!(
-        decrypted_new_env.payload.get("api_key").unwrap(),
-        "rk_live_abcdef123456"
+        envelope_decrypt_secret(&untouched, &env_provider)
+            .await
+            .unwrap(),
+        expected_untouched
+    );
+    assert_eq!(rotated_to_new_env.nonce, initial_encrypted.nonce);
+    assert_eq!(rotated_to_new_env.ciphertext, initial_encrypted.ciphertext);
+    for envelope in [
+        &initial_encrypted,
+        &rotated_to_aws,
+        &rotated_to_new_env,
+        &untouched,
+    ] {
+        let catalog = serde_json::to_string(envelope).unwrap();
+        let diagnostics = format!("{envelope:?}");
+        for literal in expected
+            .payload
+            .values()
+            .chain(expected_untouched.payload.values())
+        {
+            assert!(!catalog.contains(literal));
+            assert!(!diagnostics.contains(literal));
+            for bytes in [&envelope.ciphertext, &envelope.wrapped_dek] {
+                assert!(!bytes
+                    .windows(literal.len())
+                    .any(|window| window == literal.as_bytes()));
+            }
+        }
+    }
+    assert_eq!(
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.headers["x-amz-target"].as_str())
+            .collect::<Vec<_>>(),
+        [
+            "TrentService.Encrypt",
+            "TrentService.Decrypt",
+            "TrentService.Encrypt",
+            "TrentService.Decrypt",
+            "TrentService.Encrypt",
+            "TrentService.Decrypt",
+            "TrentService.Decrypt",
+        ]
     );
 }
 

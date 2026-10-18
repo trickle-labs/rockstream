@@ -302,6 +302,7 @@
     }
   },
   "known_limitations": {
+    "rockstream-control::test/aws_kms_tests::real_kms_enforces_key_and_principal_permissions": "Requires explicitly provisioned authorized and denied AWS principals plus two KMS keys (#203). Local protocol tests run in ordinary CI; this ignored integration is not executed and does not qualify real KMS enforcement.",
     "rockstream-cli::test/r1_real_worker_data_plane_tests::real_workers_execute_aggregate_join_and_fenced_failover": "Unimplemented direct gateway-to-worker source transport; #110 audit A1. This ignored case is not executed and does not count as a mandatory pass.",
     "rockstream-sql::test/lfs_catalog::register_workload_survives_restart_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
     "rockstream-sql::test/lfs_catalog::index_point_lookup_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
