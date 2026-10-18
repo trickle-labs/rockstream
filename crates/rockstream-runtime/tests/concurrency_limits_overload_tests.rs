@@ -48,15 +48,27 @@ async fn test_group_commit_pending_bytes_bounded() {
     // Second batch pushes total beyond 1024 bytes -> rejected with RS-1015 backpressure
     let mut batch2 = WriteBatch::new();
     batch2.put(b"k2", &vec![b'b'; 600]);
+    let batch2_bytes = batch2.byte_size();
+    let retained_before = group.pending_bytes();
     let res = group.add_epoch(2, batch2);
     match res {
-        Err(OpError::GroupCommitFull { code, .. }) => {
+        Err(OpError::CapacityExceeded {
+            code,
+            resource,
+            current,
+            limit,
+            ..
+        }) => {
             assert_eq!(code, RS_1015);
+            assert_eq!(resource, "physical_commit_bytes");
+            assert_eq!(current, retained_before + batch2_bytes);
+            assert_eq!(limit, max_bytes);
         }
-        other => panic!("expected GroupCommitFull RS-1015, got {:?}", other),
+        other => panic!("expected bounded physical commit bytes RS-1015, got {other:?}"),
     }
 
-    // Pending bytes stays within limit
+    // Rejected complete epochs must leave retained bytes untouched.
+    assert_eq!(group.pending_bytes(), retained_before);
     assert!(group.pending_bytes() <= max_bytes);
 }
 
@@ -86,13 +98,21 @@ async fn test_physical_group_max_epochs_bounded() {
     overflow_batch.put(b"k_overflow", b"v");
     let res = group.add_epoch(max_epochs as u64 + 1, overflow_batch);
     match res {
-        Err(OpError::GroupCommitFull { code, current, max }) => {
+        Err(OpError::CapacityExceeded {
+            code,
+            resource,
+            current,
+            limit,
+            ..
+        }) => {
             assert_eq!(code, RS_1015);
+            assert_eq!(resource, "physical_commit_epochs");
             assert_eq!(current, max_epochs);
-            assert!(max >= max_epochs);
+            assert_eq!(limit, max_epochs);
         }
-        other => panic!("expected GroupCommitFull RS-1015, got {:?}", other),
+        other => panic!("expected bounded physical epochs RS-1015, got {other:?}"),
     }
+    assert_eq!(group.pending_epochs(), max_epochs);
 }
 
 /// Matrix E: Max waiters bounded admission.
