@@ -256,7 +256,7 @@ async fn gateway_mutation_authorization_minio_tc() {
             return;
         }
     };
-    use object_store::{path::Path as ObjectPath, ObjectStore};
+    use object_store::{path::Path as ObjectPath, ObjectStoreExt};
 
     let temp = tempfile::tempdir().unwrap();
     let audit_path = temp.path().join("audit.jsonl");

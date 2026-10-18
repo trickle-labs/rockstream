@@ -1,5 +1,7 @@
 pub mod artifact;
+pub mod capture;
 pub mod cluster;
+pub mod comparisons;
 pub mod corpus;
 pub mod evidence;
 pub mod load;
@@ -7,5 +9,6 @@ pub mod matrix;
 pub mod metrics;
 pub mod negative;
 pub mod oracle;
+pub mod overload;
 pub mod process;
 pub mod report;

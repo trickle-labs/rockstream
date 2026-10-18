@@ -29,7 +29,32 @@ jobs:
       - name: Require Docker
         run: docker info
       - name: Build unified-binary test image
-        run: docker build -t rockstream-tc-test:latest .
+        run: |
+          set -o pipefail
+          for attempt in 1 2 3; do
+            if docker build -t rockstream-tc-test:latest . 2>&1 | tee docker-build.log; then
+              exit 0
+            fi
+            # Retry only transient registry/network responses. Compilation or
+            # test-image construction errors must fail without retry masking.
+            if ! grep -Eqi '502 Bad Gateway|503 Service Unavailable|429 Too Many Requests|unexpected status code|TLS handshake timeout' docker-build.log; then
+              exit 1
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "Transient registry error: retrying image build ($attempt/3)"
+            sleep "$((attempt * 10))"
+          done
+      - name: Record HA test case execution
+        run: python3 scripts/ci-test-inventory.py run --job pr-ha
+      - name: Upload HA test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-accounting-ha
+          path: target/ci-test-results/
+          if-no-files-found: error
       - name: Control-plane HA tests
         env:
           RS_TC_DEBUG: "1"
@@ -114,10 +139,16 @@ jobs:
         run: bash scripts/check-operator-state-bytes.sh
       - name: operator-state-bytes checker self-test
         run: bash scripts/check-operator-state-bytes.test.sh
+      - name: CI test-accounting self-tests
+        run: python3 scripts/ci-test-inventory.test.py
+      - name: Validate Cargo test target assignment
+        run: python3 scripts/ci-test-inventory.py check --out target/ci-test-results/assignment.json
       - name: path-coupling check
         run: bash scripts/check-path-coupling.sh
       - name: path-coupling checker self-test
         run: bash scripts/check-path-coupling.test.sh
+      - name: qualification execution gate self-tests
+        run: bash scripts/check-qualification-mutations.test.sh
 
   verus-verify:
     name: Verus verify and qualify (VS6)
@@ -214,38 +245,75 @@ jobs:
             --cache-from type=gha,scope=rockstream-tc-test-check \
             --cache-to type=gha,mode=max,scope=rockstream-tc-test-check \
             .
-      - name: Workspace tests
-        if: matrix.shard == 'workspace'
-        run: |
-          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql
-      - name: Crate tests
-        if: matrix.shard == 'crates'
-        run: |
-          cargo test -p rockstream-connectors --lib --tests -- --test-threads=1
-          cargo test -p rockstream-control --lib --tests -- --test-threads=1
-          cargo test -p rockstream-ops --lib --tests -- --test-threads=1
-          cargo test -p rockstream-runtime --lib --tests -- --test-threads=1
-          cargo test -p rockstream-storage --lib --tests -- --test-threads=1
-          cargo test -p rockstream-sql --lib --tests -- --test-threads=1
-      - name: Gateway tests
+      - name: Preserve PGWire conformance JSON proof
         if: matrix.shard == 'gateway'
         run: |
           mkdir -p target
-          rm -f target/pgwire-test-results.json
           ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
-          cargo test -p rockstream-gateway --lib --tests -- --test-threads=1
-          cargo test -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
-          cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
-          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS=60 ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS=10 cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
-      - name: Simulation unit tests
+      - name: Record workspace test case execution
+        if: matrix.shard == 'workspace'
+        run: python3 scripts/ci-test-inventory.py run --job pr-workspace
+      - name: Record crate test case execution
+        if: matrix.shard == 'crates'
+        run: python3 scripts/ci-test-inventory.py run --job pr-crates
+      - name: Record gateway test case execution
+        if: matrix.shard == 'gateway'
+        run: python3 scripts/ci-test-inventory.py run --job pr-gateway
+      - name: Record simulation unit case execution
         if: matrix.shard == 'sim-unit'
-        run: cargo test -p rockstream-sim --features simulation --lib -- --test-threads=1
-      - name: Simulation integration tests
+        run: python3 scripts/ci-test-inventory.py run --job pr-sim-unit
+      - name: Record all ordinary simulation integration cases
         if: matrix.shard == 'sim-integration'
-        run: cargo test -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
+        run: python3 scripts/ci-test-inventory.py run --job pr-sim
+      - name: Qualification helper checks (not release evidence)
+        if: matrix.shard == 'sim-integration'
+        run: bash scripts/run-release-qualification.sh --fast --output target/qualification-helpers.json
+      - name: Upload qualification helper results
+        if: always() && matrix.shard == 'sim-integration'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-helpers
+          path: target/qualification-helpers.json
+          if-no-files-found: error
+      - name: Upload exact test execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-accounting-${{ matrix.shard }}
+          path: target/ci-test-results/
+          if-no-files-found: warn
       - name: Remove Docker test image
         if: always() && matrix.shard == 'gateway'
         run: docker image rm rockstream-tc-test:latest || true
+
+  postgres-differential:
+    name: PostgreSQL 18.0 differential integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Require reference infrastructure
+        run: |
+          docker info
+          docker pull postgres:18.0
+      - name: Compare numeric and array corpus with actual PostgreSQL
+        run: |
+          set -o pipefail
+          cargo test --locked -p rockstream-gateway --test pg18_differential_conformance_tests -- --include-ignored --nocapture 2>&1 | tee pg18-differential.log
+      - name: Upload differential transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg18-differential-transcript
+          path: pg18-differential.log
+          if-no-files-found: error
 
   check:
     name: Check
@@ -253,10 +321,17 @@ jobs:
     needs:
       - check-quality
       - check-tests
+      - postgres-differential
+      - control-plane-ha
+      - formal-verify
+      - verus-verify
+      - nexmark-regression-gate
+      - benchmark
+      - docker-build
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any Check shard failed
-        if: needs.check-quality.result != 'success' || needs.check-tests.result != 'success'
+        if: ${{ needs.check-quality.result != 'success' || needs.check-tests.result != 'success' || needs.postgres-differential.result != 'success' || needs.control-plane-ha.result != 'success' || needs.formal-verify.result != 'success' || needs.verus-verify.result != 'success' || needs.nexmark-regression-gate.result != 'success' || needs.benchmark.result != 'success' || needs.docker-build.result != 'success' }}
         run: |
           echo "A Check shard did not pass."
           exit 1

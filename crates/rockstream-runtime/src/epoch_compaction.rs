@@ -40,6 +40,32 @@ pub enum EpochCompactionError {
     WindowDurationBelowMinimum { actual: Duration, minimum: Duration },
     #[error("Epoch window duration {actual:?} is above maximum {maximum:?}")]
     WindowDurationAboveMaximum { actual: Duration, maximum: Duration },
+    #[error("Epoch window bounds are inconsistent: minimum {minimum:?}, maximum {maximum:?}")]
+    InvalidBounds {
+        minimum: Duration,
+        maximum: Duration,
+    },
+    #[error("Epoch window minimum must be positive")]
+    ZeroMinimum,
+    #[error("State pressure percentage must be between 0 and 100: got {0}")]
+    InvalidPressure(u8),
+}
+
+/// Four observable scheduling inputs for a bounded epoch window adjustment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochAdaptationSignals {
+    pub ingest_rows_per_second: u64,
+    pub durable_commit_latency: Duration,
+    pub state_pressure_percent: u8,
+    pub freshness_target: Duration,
+}
+
+/// Report a selection separately from whether the requested target was feasible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochWindowDecision {
+    pub selected_window: Duration,
+    pub reserved_commit_time: Duration,
+    pub freshness_feasible: bool,
 }
 
 /// Key extraction strategy for identifying identical or primary-key-matched rows.
@@ -149,6 +175,46 @@ impl EpochCompactionConfig {
         self
     }
 
+    /// Choose a window from all four signals without spending the time
+    /// reserved for durable commit. An infeasible target is reported explicitly.
+    pub fn choose_adaptive_window(
+        &self,
+        signals: EpochAdaptationSignals,
+    ) -> Result<EpochWindowDecision, EpochCompactionError> {
+        self.validate()?;
+        if signals.state_pressure_percent > 100 {
+            return Err(EpochCompactionError::InvalidPressure(
+                signals.state_pressure_percent,
+            ));
+        }
+        let remaining = signals
+            .freshness_target
+            .saturating_sub(signals.durable_commit_latency);
+        let feasible = remaining >= self.min_window_duration;
+        let ceiling = self
+            .max_window_duration
+            .min(remaining.max(self.min_window_duration));
+        let storage_slow = signals.durable_commit_latency >= signals.freshness_target / 2;
+        let selected_window = if signals.ingest_rows_per_second == 0
+            || signals.state_pressure_percent >= 80
+            || storage_slow
+            || !feasible
+        {
+            self.min_window_duration
+        } else if signals.ingest_rows_per_second >= 10_000 {
+            ceiling
+        } else if signals.ingest_rows_per_second >= 1_000 {
+            self.min_window_duration + (ceiling - self.min_window_duration) / 2
+        } else {
+            self.min_window_duration
+        };
+        Ok(EpochWindowDecision {
+            selected_window,
+            reserved_commit_time: signals.durable_commit_latency,
+            freshness_feasible: feasible,
+        })
+    }
+
     /// Configure key extraction strategy.
     pub fn with_key_strategy(mut self, strategy: KeyExtractionStrategy) -> Self {
         self.key_strategy = strategy;
@@ -169,6 +235,15 @@ impl EpochCompactionConfig {
 
     /// Validate the current configuration against bounds.
     pub fn validate(&self) -> Result<(), EpochCompactionError> {
+        if self.min_window_duration.is_zero() {
+            return Err(EpochCompactionError::ZeroMinimum);
+        }
+        if self.min_window_duration > self.max_window_duration {
+            return Err(EpochCompactionError::InvalidBounds {
+                minimum: self.min_window_duration,
+                maximum: self.max_window_duration,
+            });
+        }
         if self.window_duration < self.min_window_duration {
             return Err(EpochCompactionError::WindowDurationBelowMinimum {
                 actual: self.window_duration,
@@ -324,6 +399,7 @@ pub struct EpochCompactor {
     config: EpochCompactionConfig,
     metrics: Arc<EpochCompactionMetrics>,
     active_epochs: Mutex<BTreeMap<Epoch, ActiveEpochState>>,
+    adaptive_window: Arc<Mutex<Duration>>,
 }
 
 impl Clone for EpochCompactor {
@@ -332,6 +408,7 @@ impl Clone for EpochCompactor {
             config: self.config.clone(),
             metrics: self.metrics.clone(),
             active_epochs: Mutex::new(self.active_epochs.lock().clone()),
+            adaptive_window: self.adaptive_window.clone(),
         }
     }
 }
@@ -351,11 +428,19 @@ impl Default for EpochCompactor {
 impl EpochCompactor {
     /// Create a new compactor with the provided configuration.
     pub fn new(config: EpochCompactionConfig) -> Self {
+        let initial_window = config.window_duration;
         Self {
             config,
             metrics: Arc::new(EpochCompactionMetrics::default()),
             active_epochs: Mutex::new(BTreeMap::new()),
+            adaptive_window: Arc::new(Mutex::new(initial_window)),
         }
+    }
+
+    /// Construct with startup validation rather than accepting inconsistent bounds.
+    pub fn try_new(config: EpochCompactionConfig) -> Result<Self, EpochCompactionError> {
+        config.validate()?;
+        Ok(Self::new(config))
     }
 
     /// Create a compactor with a specific window duration, validating against standard bounds.
@@ -367,6 +452,23 @@ impl EpochCompactor {
     /// Access the configuration.
     pub fn config(&self) -> &EpochCompactionConfig {
         &self.config
+    }
+
+    /// The actual expiration window, potentially updated between epochs.
+    pub fn current_window_duration(&self) -> Duration {
+        *self.adaptive_window.lock()
+    }
+
+    /// Apply all four scheduling signals to the live epoch expiration path.
+    /// This changes only when an epoch becomes eligible to flush; it never
+    /// changes its logical ID or permits non-durable acknowledgement.
+    pub fn adapt_window(
+        &self,
+        signals: EpochAdaptationSignals,
+    ) -> Result<EpochWindowDecision, EpochCompactionError> {
+        let decision = self.config.choose_adaptive_window(signals)?;
+        *self.adaptive_window.lock() = decision.selected_window;
+        Ok(decision)
     }
 
     /// Access the shared metrics.
@@ -504,7 +606,7 @@ impl EpochCompactor {
     /// Check if an epoch's micro-batch window has expired relative to a provided instant.
     pub fn is_epoch_expired_at(&self, epoch: Epoch, now: Instant) -> bool {
         match self.epoch_age_at(epoch, now) {
-            Some(age) => age >= self.config.window_duration,
+            Some(age) => age >= self.current_window_duration(),
             None => false,
         }
     }
@@ -516,12 +618,13 @@ impl EpochCompactor {
 
     /// Returns IDs of all active epochs whose window has expired relative to `now`.
     pub fn expired_epochs_at(&self, now: Instant) -> Vec<Epoch> {
+        let window = self.current_window_duration();
         self.active_epochs
             .lock()
             .iter()
             .filter_map(|(&epoch, state)| {
                 let age = now.saturating_duration_since(state.opened_at);
-                if age >= self.config.window_duration {
+                if age >= window {
                     Some(epoch)
                 } else {
                     None

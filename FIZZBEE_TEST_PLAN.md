@@ -695,19 +695,37 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
-Issue #122 narrows the production Kafka sink qualification to match M3's
-epoch-level abstraction. `SinkConnector::pre_commit` accepts a row count and
-Kafka emits/restores epoch/count markers; neither the interface nor the M3
-model carries view row identities, values, weights, or snapshot boundaries.
-M3's exactly-once epoch invariants therefore do not prove snapshot/change row
-delivery or row payload recovery. Those paths remain explicitly unsupported
-under #122 AC6, and `sink.kafka` is Experimental with no row-delivery proof.
-`kafka_sink_row_delivery_is_explicitly_unsupported` checks the embedded contract;
-the capability-gate mutation tests reject restored Core/payload claims and
-marker proofs. `kafka_sink_emits_epoch_count_marker_only` checks the actual
-consumer's complete marker payload, without qualifying row delivery. This
-scope correction adds no FizzBee transition or new protocol proof; R1–R5 of
-`docs/acceptance-contracts/122.md` must pass before row delivery can qualify.
+Issue #126 observes the existing M4 worker-disconnect and lease-reassignment
+path together with M3 Kafka transaction recovery. `ControlService` emits the
+`worker.disconnected` audit event when the worker session ends, before removing
+the worker and reassigning its leases. This event supplies a failure-detection
+timestamp; it neither grants ownership nor changes fencing or commit decisions.
+The M3/M4 state machines therefore need no new transition or invariant.
+`worker_failure_recovery_from_view_and_kafka` kills a real worker process with a
+durable Kafka transaction pending, observes a replacement owner and higher lease
+token, and compares complete typed weighted view history, source offsets, and
+consumed Kafka records against independent expected results. A separate view
+reader must return the correct relation at frontier 5 within the recovery
+deadline. Corrupted values, duplicate records, suppressed progress, and a missed
+deadline each fail their intended validator check. The versioned manifest and
+actual observations are described in `docs/testing/worker-failure-recovery.md`.
+This is one measured recovery sample, not a p99 estimate or qualification of
+other chaos categories; process scheduling, broker/storage I/O, and elapsed time
+remain implementation evidence outside the abstract FizzBee models.
+
+Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
+still abstracts epochs, not row contents. The adapter persists the full pending
+envelope and view cursor before Kafka commit, then finalizes progress. Restart
+fences the old producer and resolves the pending transaction through the existing
+CheckBeforeCommit protocol. A snapshot is one atomic envelope before any live
+epoch; all envelopes use partition zero. No new FizzBee invariant is asserted.
+`view_snapshot_changes_and_recovery_match_exact_consumer_stream` compiles the
+production view, consumes real Kafka records, and compares independently specified
+rows, signed weights, keys, and transaction boundaries. LFS reopen covers crashes
+before snapshot/update/delete commit and after Kafka commit before progress save.
+The exact oracle rejects wrong values, omitted deletions, and duplicate changes.
+`sink.kafka` remains Experimental pending full Core release qualification;
+marker tests alone cannot qualify row delivery.
 
 Issue #117 closes an implementation-level liveness gap in exchange flow control.
 `FlowController::acquire_batch_permit`, used by `WorkerStreamMultiplexer::send_frame`,
@@ -1244,3 +1262,88 @@ RockStream usage. (Sourced from the FizzBee design-verification tutorials.)
 > ([FizzBee msg-delivery-guarantees](https://fizzbee.io/design/tutorials/msg-delivery-guarantees/)),
 > which is the more established mechanism and is mandatory for M2's
 > reordering proof regardless. Test harness and durability assertions align with v0.64.
+
+## v0.72 bounded adaptive epoch windows (issue #134)
+
+The in-memory epoch compactor may adjust only the time when a logical epoch is
+eligible for its existing flush path. It must not change the epoch's identity,
+reorder dependencies, or replace the durability/acknowledgement transition.
+
+Model refinement obligations:
+
+- Reject zero, reversed, or out-of-range lower/upper startup bounds.
+- The chosen window is always inside the validated closed interval. Four
+  inputs are required: ingest rows/s, observed durable-commit latency, state
+  pressure, and target committed-result freshness.
+- Reserve the observed durable commit time before selecting an epoch window.
+  If the target cannot fit the minimum epoch window plus commit time, expose
+  an explicit infeasible decision instead of claiming the target was met.
+- Adaptation can change when work becomes flush-eligible but not its rows,
+  signed weights, epoch number, ordering, or durable acknowledgement.
+- Commit failure, retries, restart, competing workload fairness, queue bounds,
+  and independent result correctness still require separate integrated proof.
+
+The source-level decision and live-expiration regressions are in
+`crates/rockstream-runtime/tests/v072_adaptive_epoch_tests.rs`. They validate
+this local transition, **not** the full #134 durable/fair scheduling contract.
+
+## v0.72 worker-budget admission and cancellation ownership (issue #133)
+
+The worker quota changes refine the resource-ownership transition used by
+the control/data-plane models. They do not change the durable epoch or
+lease-fencing protocol, and this note is **not** a formal proof or v0.72
+acceptance verdict.
+
+The resource ledger abstraction for future FizzBee refinement is:
+
+- **Admit:** under the worker hard bound (including documented allocator
+  overhead), reserve one global byte total atomically before publishing
+  category ownership. Admission must reject rather than wrap arithmetic or
+  consume protected foreground capacity for background work.
+- **Release:** each acquired permit releases exactly its charged category and
+  workload *generation*. A stale permit may not decrement a replacement
+  workload that happens to reuse its identifier.
+- **Waiter:** increment the bounded waiter count before waiting; cancellation,
+  disconnect, timeout and success drop the same owning guard exactly once.
+  A rejected waiter does not own a decrement.
+- **Shared cache:** charge at most once after successful reservation; a failed
+  reservation leaves initialization retryable.
+- **Safety oracle:** after every quiescent transition, the global reserved total
+  equals the sum of category reservations, no counter underflows, all admitted
+  bytes fit the hard envelope, and cancelled work holds no waiter reservation.
+
+These transitions are exercised by
+`crates/rockstream-types/tests/v072_worker_budget_tests.rs` and
+`crates/rockstream-runtime/tests/v072_quota_lifecycle.rs`. Subsequent
+modeling must include shard-removal/restart cleanup, quota propagation, and
+fair competing-workload liveness before v0.72 can claim integrated proof.
+
+## v0.72 exchange row-credit fast admission (issue #134)
+
+`FlowController::acquire_credit` now attempts its existing channel-lock
+reservation before accessing or creating the per-key notifier. This preserves
+the same credit transition while eliminating waiter bookkeeping on the
+immediate-admission path; it does **not** alter epoch order, the shard lease,
+acknowledgement identity, or durable commit semantics.
+
+The protocol transitions for subsequent FizzBee refinement are:
+
+- **Fast admission:** while holding the channel state lock, grant only if
+  `available_rows >= requested_rows`. Subtract once and add exactly the same
+  count to `rows_in_flight`. A failed attempt performs neither mutation and
+  does not register a waiter. Oversized requests reject before creating state.
+- **Waiter registration:** on insufficient credit, find/create the per-key
+  notifier, enable the notification future, then **recheck** channel credits
+  under the same lock. An ACK racing with registration must either expose
+  available credits to that recheck or notify an enabled waiter.
+- **Release:** an acknowledged row reservation returns at most its recorded
+  credit to the same channel, preserving the hard window. Aborted waiters do
+  not consume credits or leave phantom in-flight reservations.
+- **Teardown:** concurrent exchange destruction must not strand pending work
+  or allow stale acknowledgements to grant a different exchange credit.
+
+Three regression tests in `crates/rockstream-runtime/src/exchange/flow_control.rs`
+check the uncontended ledger, waiter ACK race, and pre-admission rejection.
+The repository's frozen exchange-flow performance gate must still be measured
+and pass; these unit tests and this transition mapping are **not** formal
+model checking or complete #134/#132 capacity qualification.

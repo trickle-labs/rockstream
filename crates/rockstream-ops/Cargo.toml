@@ -31,6 +31,7 @@ name = "join_arrangement_bench"
 harness = false
 
 [dependencies]
+rockstream-connectors = { workspace = true }
 rockstream-types = { workspace = true }
 rockstream-verified = { workspace = true }
 rockstream-plan = { workspace = true }
@@ -48,6 +49,7 @@ async-trait = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+rdkafka = { workspace = true }
 rockstream-test-support.workspace = true
 criterion = { workspace = true }
 proptest = { workspace = true }
@@ -70,6 +72,7 @@ workspace = true
 
 [dev-dependencies.testcontainers-modules]
 workspace = true
+features = ["kafka"]
 
 [dev-dependencies.reqwest]
 workspace = true

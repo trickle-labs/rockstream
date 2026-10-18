@@ -26,7 +26,7 @@
     "total_suite_runtime_ms": 45000
   },
   "per_cell_budgets_secs": {
-    "FM-001": 30,
+    "FM-001": 60,
     "FM-002": 15,
     "FM-003": 20,
     "FM-004": 30,

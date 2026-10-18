@@ -74,9 +74,9 @@ fn test_failure_matrix_doc_schema() {
 fn test_failure_matrix_time_budgets() {
     use rockstream_sim::failure_matrix::total_real_backend_budget_secs;
     let total_budget = total_real_backend_budget_secs();
-    assert!(
-        total_budget <= 400,
-        "Total real backend time budget across all cells ({total_budget}s) must not exceed 400s"
+    assert_eq!(
+        total_budget, 180,
+        "only runnable real-backend cases have a budget"
     );
     for cell in all_cells() {
         assert!(

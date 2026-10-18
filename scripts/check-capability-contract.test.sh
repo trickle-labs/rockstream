@@ -117,19 +117,19 @@ run_bad "missing sink state growth proof" "proof target does not resolve"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
 python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("id = \"sink.kafka\"\nkind = \"sink\"\nname = \"Kafka sink\"\ntier = \"Experimental\"", "id = \"sink.kafka\"\nkind = \"sink\"\nname = \"Kafka sink\"\ntier = \"Core\""); p.write_text(s)'
-run_bad "marker sink promoted to Core" "sink.kafka must be Experimental"
+run_bad "sink promoted without Core qualification" "sink.kafka must be Experimental"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
-python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("Unsupported: materialized-view change rows are not delivered; only epoch/count markers are emitted.", "Materialized-view change rows are delivered."); p.write_text(s)'
-run_bad "unsupported incremental claim removed" "sink.kafka incremental must remain explicitly unsupported"
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("KafkaViewSink delivers typed view change rows with signed weights in one ordered transaction envelope per nonempty view epoch.", "Materialized-view change rows are delivered."); p.write_text(s)'
+run_bad "incremental claim drift" "sink.kafka incremental requires its exact row-delivery claim and consumer proof"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
-python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("Unsupported: materialized-view snapshot rows and snapshot completion boundaries are not delivered.", "Snapshot rows are delivered."); p.write_text(s)'
-run_bad "unsupported snapshot claim removed" "sink.kafka backfill must remain explicitly unsupported"
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("KafkaViewSink delivers one complete materialized snapshot envelope before live change envelopes.", "Snapshot rows are delivered."); p.write_text(s)'
+run_bad "snapshot claim drift" "sink.kafka backfill requires its exact row-delivery claim and consumer proof"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
 python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("proof = \"\"\nproof_levels_achieved = []", "proof = \"crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_emits_epoch_count_marker_only\"\nproof_levels_achieved = [\"L0\"]"); p.write_text(s)'
-run_bad "marker proof qualifies row delivery" "sink.kafka row delivery is unsupported; marker proofs cannot qualify it"
+run_bad "marker proof qualifies full Core delivery" "sink.kafka remains Experimental; full Core proof levels are not qualified"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
 if ! python3 "$ROOT/scripts/check-capability-contract.py" "$ROOT" >"$OUT" 2>&1; then

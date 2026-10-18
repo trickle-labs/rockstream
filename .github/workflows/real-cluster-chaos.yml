@@ -1,24 +1,4 @@
-# Real Cluster Chaos Soak Workflow (v0.58.1)
-# Enforces production failure matrix real-backend counterparts against absolute SLOs:
-# - Failure detection: <= 5s p99
-# - Shard reassignment: <= 30s p99
-# - Freshness recovery: <= 60s p99
-# - Sustained throughput: >= 1 rows/s
-# - Zero loss & zero duplicates
-#
-# Documented Per-Cell Time Budgets:
-# - FM-001 (Worker loss): 30s
-# - FM-002 (Control-node loss): 15s
-# - FM-003 (Exchange interruption): 20s
-# - FM-004 (Source disconnect): 30s
-# - FM-005 (MinIO brownout): 45s
-# - FM-006 (Spill/compaction): 60s (Reasoned Exemption / real binary soak)
-# - FM-007 (Checkpoint interruption): 25s
-# - FM-008 (Sink 2PC failure): 30s
-# - FM-009 (Shard migration): 30s (Reasoned Exemption / multi-worker test)
-# - FM-010 (Rolling upgrade): 60s
-# - FM-011 (Resource exhaustion): 30s
-# Total Suite Runtime Budget: <= 300s (5m)
+# One worker failure against real Kafka and MinIO; one sample, no p99 claim.
 
 name: Real Cluster Chaos Soak
 
@@ -47,6 +27,8 @@ on:
       - "crates/rockstream-test-support/**"
       - "formal/edge_*.fizz"
       - "Dockerfile"
+      - "docs/testing/worker-failure-kafka-minio-v1.json"
+      - ".github/workflows/real-cluster-chaos.yml"
 
 concurrency:
   group: real-cluster-chaos-${{ github.event.pull_request.number || github.ref }}
@@ -55,6 +37,7 @@ concurrency:
 jobs:
   chaos:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       ROCKSTREAM_REQUIRE_DOCKER: "1"
     steps:
@@ -64,12 +47,10 @@ jobs:
           toolchain: "1.88"
       - name: Require Docker
         run: docker info
-      - name: Build unified-binary test image
-        run: docker build -t rockstream-tc-test:latest .
-      - name: Run Kafka/MinIO recovery SLO proof
+      - name: Run worker-failure recovery proof
         env:
           ROCKSTREAM_CHAOS_ARTIFACT_DIR: ${{ github.workspace }}/target/real-cluster-chaos
-        run: cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle -- --exact
+        run: cargo test -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests worker_failure_recovery_from_view_and_kafka -- --exact
       - name: Upload real-cluster chaos artifacts
         if: always()
         uses: actions/upload-artifact@v4

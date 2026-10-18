@@ -97,16 +97,13 @@ impl ArrowZSet {
 
     /// Create an empty `ArrowZSet` with the given schema.
     pub fn empty(schema: SchemaRef) -> Self {
-        use arrow::array::{BooleanArray, Float64Array, StringArray};
+        // Build a zero-length array of the precise declared Arrow type.
+        // Falling back to Int64 for types such as Int32 makes the empty
+        // RecordBatch invalid and can panic during legitimate empty epochs.
         let columns: Vec<ArrayRef> = schema
             .fields()
             .iter()
-            .map(|f| match f.data_type() {
-                DataType::Utf8 => Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
-                DataType::Boolean => Arc::new(BooleanArray::from(Vec::<bool>::new())) as ArrayRef,
-                DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
-                _ => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-            })
+            .map(|field| arrow::array::new_empty_array(field.data_type()))
             .collect();
         let data = RecordBatch::try_new(schema, columns).expect("empty batch");
         Self::try_new(data, Vec::new()).expect("empty ArrowZSet")
@@ -304,6 +301,21 @@ mod tests {
         assert_eq!(zs.weights, vec![1, 1]);
         assert_eq!(zs.schema().field(0).name(), "a");
         assert_eq!(zs.schema().field(1).name(), "b");
+    }
+
+    #[test]
+    fn empty_preserves_non_int64_arrow_types() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, true),
+            Field::new("count", DataType::UInt64, false),
+        ]));
+        let empty = ArrowZSet::empty(schema.clone());
+        assert_eq!(empty.num_rows(), 0);
+        assert_eq!(empty.schema(), schema);
+        assert_eq!(empty.data.column(0).data_type(), &DataType::Int32);
+        assert_eq!(empty.data.column(1).data_type(), &DataType::Utf8);
+        assert_eq!(empty.data.column(2).data_type(), &DataType::UInt64);
     }
 
     #[test]

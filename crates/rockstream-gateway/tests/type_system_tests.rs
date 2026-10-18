@@ -441,8 +441,10 @@ async fn test_orm_conformance() {
 
     let python_script = format!(
         "import sqlalchemy as sa
-engine = sa.create_engine('postgresql+psycopg2://test:test@{}:{}/test')
+engine = sa.create_engine('postgresql+psycopg2://test:test@{}:{}/test', echo=True)
 insp = sa.inspect(engine)
+print('REFLECTION DEBUG: tables', insp.get_table_names())
+print('REFLECTION DEBUG: views', insp.get_view_names())
 cols = insp.get_columns('numeric_view')
 print('COLS:', cols)
 assert len(cols) == 6, f'Expected 6 columns, got {{len(cols)}}'
@@ -497,6 +499,19 @@ assert 'c_bool' in names",
     )
     .await;
 
+    // This fixture exposes a PostgreSQL view, not a base table. Prisma 6
+    // requires the views preview flag to include it during introspection.
+    run_cmd_checked(
+        &node_container,
+        vec![
+            "sh",
+            "-c",
+            "cd /app && sed -i '/^[[:space:]]*generator[[:space:]]\\+client[[:space:]]*{/a\\  previewFeatures = [\"views\"]' prisma/schema.prisma && grep -Fq 'previewFeatures = [\"views\"]' prisma/schema.prisma",
+        ],
+        "enable Prisma view introspection",
+    )
+    .await;
+
     let pull_cmd = format!(
         "cd /app && DATABASE_URL=postgresql://test:test@{}:{}/test npx prisma db pull",
         host_ip, port
@@ -505,6 +520,19 @@ assert 'c_bool' in names",
         &node_container,
         vec!["sh", "-c", &pull_cmd],
         "prisma db pull",
+    )
+    .await;
+
+    // A successful command alone is insufficient: confirm the actual view
+    // was reflected instead of accepting an empty introspection result.
+    run_cmd_checked(
+        &node_container,
+        vec![
+            "sh",
+            "-c",
+            "grep -Fq 'view numeric_view {' /app/prisma/schema.prisma",
+        ],
+        "verify Prisma reflected numeric_view",
     )
     .await;
 

@@ -1,0 +1,50 @@
+# Worker-failure recovery evidence
+
+Run the fixed scenario with Docker available:
+
+```sh
+ROCKSTREAM_CHAOS_ARTIFACT_DIR="$PWD/target/real-cluster-chaos" \
+  cargo test -p rockstream-sim --features simulation,docker_tests \
+  --test real_cluster_chaos_soak_tests \
+  worker_failure_recovery_from_view_and_kafka -- --exact
+```
+
+The canonical scenario identity is `worker-failure-kafka-minio-v1`. Its immutable
+workload and independent expected results are in
+[`worker-failure-kafka-minio-v1.json`](worker-failure-kafka-minio-v1.json).
+Changing its history, fault boundary, expected rows, or deadlines requires a new
+scenario version. Qualification consumers use the scenario ID, manifest SHA-256,
+and source Git revision together, and deserialize `WorkerRecoveryEvidence` through
+`rockstream_sim::qualification::worker_failure::validate`.
+
+The runner starts the production control service and two separate worker fixture
+processes. Each fixture uses the production worker lease client, Kafka source,
+compiled view pipeline, checkpoint-coupled M3 commit, MinIO-backed ShardDb, and
+transactional Kafka view exporter. The fixture supplies scheduling around those
+APIs; this is not a test of the standalone CLI's gateway-to-worker transport.
+The first worker stops at a durable pending Kafka transaction after the update
+retraction, with source records still outstanding, and the parent kills it.
+The control service detects the actual dropped connection and assigns a higher
+lease token to worker 2. That worker recovers the source checkpoint and pending
+sink transaction, then completes the fixed history.
+
+The parent queries through the production `HotOnlyViewReader` against a separate
+ShardReader at the stored frontier, and consumes Kafka with `read_committed` to
+the partition end. The validator compares the entire typed weighted view log,
+materialized relation, sink keys and envelopes, independently reconstructed sink
+relation, source offsets, ownership, runtime fill levels, and durable sink cursor.
+The source in-flight metric and sink pending state are observed, not assigned
+buffer literals. No storage-brownout buffer-exhaustion claim is made.
+
+The artifact directory contains `worker-failure-kafka-minio-v1.json` (actual
+observations), `real-cluster-chaos-summary.md`, and both worker logs. Event times
+measure fault to control disconnect detection, replacement ownership observation,
+and the first correct view query at frontier 5. Docker's `info` command and worker
+kill/wait durations are reported separately. A run is one recovery sample and
+does not estimate p99. Corrupting a returned value, duplicating a consumed record,
+suppressing frontier progress, and missing the query deadline are independent
+negative controls against the same validator.
+
+This replaces the former copied-input multi-category chaos result. Other failure
+categories retain their simulation coverage and explicitly lack this real-backend
+evidence; this scenario must not qualify them.

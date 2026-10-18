@@ -91,7 +91,7 @@ use crate::auth::{
 };
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
-    CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail,
+    CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail, WorkloadRevisionOutcome,
 };
 
 use crate::copy_state::{
@@ -106,7 +106,7 @@ use crate::pgoutput_coordinator::{
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::subscribe_handler::{
-    deliver_snapshot, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
+    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
 };
 use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -440,6 +440,31 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
     for (idx, ty) in &explicit_casts {
         if *idx > 0 && *idx <= max_idx {
             inferred_types[*idx - 1] = ty.clone();
+        }
+    }
+
+    // ANY($n) requires an array parameter regardless of whether the table
+    // name is schema-qualified. In particular, Prisma introspection queries
+    // against unqualified pg_namespace use ANY($1) in joins/subqueries that
+    // the top-level AST visitor does not traverse. Preserve explicit casts.
+    {
+        if let Ok(any_array_param) = regex::Regex::new(
+            r"(?i)\bany\s*\(\s*\$([1-9][0-9]*)(?:::(text|int2|int4|int8|uuid)\[\])?\s*\)",
+        ) {
+            for matched in any_array_param.captures_iter(sql) {
+                if let Ok(index) = matched[1].parse::<usize>() {
+                    if index <= max_idx && !explicit_casts.contains_key(&index) {
+                        let cast = matched.get(2).map(|m| m.as_str().to_ascii_lowercase());
+                        inferred_types[index - 1] = match cast.as_deref() {
+                            Some("int2") => Type::INT2_ARRAY,
+                            Some("int4") => Type::INT4_ARRAY,
+                            Some("int8") => Type::INT8_ARRAY,
+                            Some("uuid") => Type::UUID_ARRAY,
+                            _ => Type::TEXT_ARRAY,
+                        };
+                    }
+                }
+            }
         }
     }
 
@@ -5112,16 +5137,56 @@ impl GatewayHandler {
         // COPY OUT: stream CopyData messages directly through the client sink.
         if ql.starts_with("copy ") && ql.contains(" to stdout") {
             if let Some(view_name) = parse_copy_to_stdout_view(query) {
+                // COPY OUT must use the same ACL and namespace checks as SELECT.
+                // Do not read rows or emit a COPY frame before checking access.
+                if let Some(denied) = self.select_access_error_response(&view_name, Some(conn_id)) {
+                    return Ok(denied);
+                }
                 if self.catalog.get_view(&view_name).is_some()
                     && !self.catalog.is_backfill_published(&view_name)
                 {
                     return Ok(backfill_not_published_response(&view_name));
                 }
-                let rows = self
-                    .view_reader
-                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
-                    .await
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                // The frozen v0.72 interactive wall budget is 5 seconds.
+                // Bound the producer read before *any* COPY response frame:
+                // a timeout must never leave a syntactically valid partial
+                // COPY stream or an in-flight reader owned by this future.
+                let read = self.view_reader.read_view(
+                    &view_name,
+                    Some(crate::copy_out_budget::MAX_COPY_OUT_ROWS + 1),
+                    ViewReadStrategy::HotOnly,
+                );
+                let rows = match crate::copy_out_budget::read_with_deadline(
+                    Duration::from_millis(crate::copy_out_budget::MAX_COPY_OUT_READ_MS),
+                    read,
+                )
+                .await
+                {
+                    Ok(Ok(rows)) => rows,
+                    Ok(Err(error)) => return Err(PgWireError::ApiError(Box::new(error))),
+                    Err(_) => {
+                        return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "57014".to_owned(),
+                            format!(
+                                "[RS-9001] copy_out.read_timeout: producer read exceeded {}ms. Next steps: narrow the query or use bounded result pages.",
+                                crate::copy_out_budget::MAX_COPY_OUT_READ_MS
+                            ),
+                        )))]);
+                    }
+                };
+                // Error before any CopyOutResponse or CopyData. The reader's
+                // current materialization implementation remains unbounded;
+                // this is a wire-output guard, not yet full producer admission.
+                if let Err(error) = crate::copy_out_budget::check_copy_out_bounds(&rows) {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "54000".to_owned(),
+                        format!(
+                            "[RS-9001] copy_out.limit_exceeded: {error}. Next steps: narrow the query or use a bounded result page."
+                        ),
+                    )))]);
+                }
                 let row_count = rows.len();
 
                 let col_count = self
@@ -5481,6 +5546,12 @@ impl GatewayHandler {
             )))]);
         }
 
+        // A drop-owned slot lives inside the returned stream. Reject before
+        // scanning the snapshot rather than accepting unlimited subscriptions.
+        let stream_slot = match self.subscribe_registry.acquire_stream() {
+            Ok(slot) => slot,
+            Err(error) => return Ok(vec![subscribe_error_response(error)]),
+        };
         let col_names = request.projection.clone().unwrap_or_else(|| {
             catalog_columns
                 .iter()
@@ -5510,12 +5581,12 @@ impl GatewayHandler {
                     .map(|(index, row)| (Bytes::from(index.to_string()), Bytes::from(row)))
                     .collect();
                 let column_refs: Vec<&str> = col_names.iter().map(String::as_str).collect();
-                pending.extend(deliver_snapshot(
-                    snapshot,
-                    start_epoch,
-                    &request,
-                    &column_refs,
-                ));
+                let snapshot_rows =
+                    match deliver_snapshot_checked(snapshot, start_epoch, &request, &column_refs) {
+                        Ok(rows) => rows,
+                        Err(error) => return Ok(vec![subscribe_error_response(error)]),
+                    };
+                pending.extend(snapshot_rows);
                 SubscriberHandle::new(
                     request.view_name.clone(),
                     start_epoch,
@@ -5563,8 +5634,8 @@ impl GatewayHandler {
         let stream_schema = schema.clone();
         let registry = self.subscribe_registry.clone();
         let data_stream = Box::pin(stream::unfold(
-            (registry, handle, pending, stream_schema, false),
-            |(registry, mut handle, mut pending, schema, failed)| async move {
+            (registry, handle, pending, stream_schema, false, stream_slot),
+            |(registry, mut handle, mut pending, schema, failed, stream_slot)| async move {
                 if failed {
                     return None;
                 }
@@ -5575,28 +5646,37 @@ impl GatewayHandler {
                             if let Err(error) = encoder.encode_field(&Some(value)) {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true),
+                                    (registry, handle, pending, schema, true, stream_slot),
                                 ));
                             }
                         }
                         let timestamp = row.mz_timestamp.to_string();
                         if let Err(error) = encoder.encode_field(&Some(timestamp.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                            return Some((
+                                Err(error),
+                                (registry, handle, pending, schema, true, stream_slot),
+                            ));
                         }
                         let diff = row.mz_diff.to_string();
                         if let Err(error) = encoder.encode_field(&Some(diff.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                            return Some((
+                                Err(error),
+                                (registry, handle, pending, schema, true, stream_slot),
+                            ));
                         }
                         let encoded = match encoder.finish() {
                             Ok(encoded) => encoded,
                             Err(error) => {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true),
+                                    (registry, handle, pending, schema, true, stream_slot),
                                 ));
                             }
                         };
-                        return Some((Ok(encoded), (registry, handle, pending, schema, false)));
+                        return Some((
+                            Ok(encoded),
+                            (registry, handle, pending, schema, false, stream_slot),
+                        ));
                     }
                     match handle.poll(&registry) {
                         Ok(rows) if !rows.is_empty() => pending.extend(rows),
@@ -5604,7 +5684,7 @@ impl GatewayHandler {
                         Err(error) => {
                             return Some((
                                 Err(PgWireError::ApiError(Box::new(error))),
-                                (registry, handle, pending, schema, true),
+                                (registry, handle, pending, schema, true, stream_slot),
                             ));
                         }
                     }
@@ -6550,6 +6630,31 @@ impl GatewayHandler {
             return Ok(vec![catalog_resp_to_response(
                 self.catalog.view_resource_usage(&[]),
             )]);
+        }
+        if ql.starts_with("show workload revision for ") {
+            let workload_name = q["show workload revision for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            let Some(workload) = self.catalog.get_workload(workload_name) else {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42704".to_owned(),
+                        format!(
+                            "[RS-1005] workload.not_found: workload '{}' does not exist.",
+                            workload_name
+                        ),
+                    ),
+                )))]);
+            };
+            return Ok(vec![catalog_resp_to_response(CatalogResponse::Rows {
+                columns: vec!["workload_name".to_owned(), "requested_revision".to_owned()],
+                rows: vec![vec![
+                    Some(workload.name),
+                    Some(workload.revision.to_string()),
+                ]],
+            })]);
         }
         if ql.trim_end_matches(';') == "show workload status" {
             return Ok(vec![catalog_resp_to_response(
@@ -8218,7 +8323,7 @@ impl GatewayHandler {
     }
 
     async fn handle_alter_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
-        let Some((workload_name, changes)) = parse_alter_workload(q) else {
+        let Some((workload_name, expected_revision, changes)) = parse_alter_workload(q) else {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42601".to_owned(),
@@ -8236,11 +8341,52 @@ impl GatewayHandler {
             )))]);
         };
         apply_workload_settings(&mut workload, &changes);
-        let updated = self
-            .catalog
-            .update_workload_async(workload.clone())
-            .await
-            .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+        let updated = if let Some(expected) = expected_revision {
+            match self
+                .catalog
+                .update_workload_if_revision_async(workload.clone(), expected)
+                .await
+                .map_err(|error| PgWireError::ApiError(Box::new(error)))?
+            {
+                WorkloadRevisionOutcome::Updated(_) => true,
+                WorkloadRevisionOutcome::NotFound => false,
+                WorkloadRevisionOutcome::Conflict { expected, actual } => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "40001".to_owned(),
+                        format!(
+                            "[RS-1006] workload.revision_conflict: expected revision {expected}, actual revision {actual}. Next steps: read the current workload revision and retry the edit."
+                        ),
+                    )))]);
+                }
+                WorkloadRevisionOutcome::BelowLiveUse {
+                    requested,
+                    allocated,
+                } => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "54000".to_owned(),
+                        format!(
+                            "[RS-1006] workload.memory_below_live_use: requested limit {requested} bytes is below {allocated} bytes of live reservations. Next steps: reclaim the live state before reducing the limit."
+                        ),
+                    )))]);
+                }
+                WorkloadRevisionOutcome::RevisionExhausted => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "54000".to_owned(),
+                        "[RS-1006] workload.revision_exhausted: revision counter cannot advance. Next steps: contact the operator.".to_owned(),
+                    )))]);
+                }
+            }
+        } else {
+            // Legacy unconditioned ALTER remains for backwards compatibility;
+            // strict v0.72 revisions use IF REVISION <n>.
+            self.catalog
+                .update_workload_async(workload.clone())
+                .await
+                .map_err(|error| PgWireError::ApiError(Box::new(error)))?
+        };
         if !updated {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -9945,6 +10091,12 @@ impl GatewayHandler {
             self.frontier_published_at_ms
                 .store(current_time_ms(), Ordering::SeqCst);
 
+            // Publish a complete committed epoch per table under one registry
+            // lock. Readers cannot poll half an UPDATE or half an epoch.
+            let mut changes: std::collections::HashMap<
+                String,
+                Vec<crate::change_log::ChangeEntry>,
+            > = std::collections::HashMap::new();
             for op in &ops {
                 let (table, row_key, mz_diff, encoded_row) = match op {
                     DmlOp::Insert {
@@ -9970,8 +10122,7 @@ impl GatewayHandler {
                         new_row_key,
                         new_tsv,
                     } => {
-                        self.subscribe_registry.push(
-                            table,
+                        changes.entry(table.clone()).or_default().push(
                             crate::change_log::ChangeEntry {
                                 epoch,
                                 row_key: Bytes::from(old_row_key.clone()),
@@ -9982,15 +10133,22 @@ impl GatewayHandler {
                         (table.clone(), new_row_key.clone(), 1, new_tsv.clone())
                     }
                 };
-                self.subscribe_registry.push(
-                    &table,
-                    crate::change_log::ChangeEntry {
+                changes
+                    .entry(table)
+                    .or_default()
+                    .push(crate::change_log::ChangeEntry {
                         epoch,
                         row_key: Bytes::from(row_key),
                         mz_diff,
                         encoded_row: Bytes::from(encoded_row),
-                    },
-                );
+                    });
+            }
+            for (table, batch) in changes {
+                if let Err(error) = self.subscribe_registry.push_epoch(&table, batch) {
+                    // The DML was already durable: do not claim rejection of that
+                    // transaction. The registry invalidates replay instead.
+                    tracing::warn!(%table, %epoch, %error, "subscription replay requires resnapshot");
+                }
             }
             (epoch, ops)
         };
@@ -10577,6 +10735,8 @@ impl GatewayHandler {
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        use datafusion::arrow::datatypes::DataType;
+
         // Parse INSERT INTO <table> [(cols)] VALUES (v1, v2, ...)[, (v1, v2, ...)]* [RETURNING ...]
         let returning = q.to_lowercase().contains(" returning ");
         let (table, cols, rows) = match parse_insert(q) {
@@ -10630,6 +10790,17 @@ impl GatewayHandler {
             .get(&table)
             .map(|entry| entry.value().clone());
 
+        let decimal_columns: Vec<_> = self
+            .catalog
+            .get_table(&table)
+            .into_iter()
+            .flat_map(|table| table.columns)
+            .filter_map(|column| {
+                let datatype = string_to_arrow_datatype(&column.data_type);
+                matches!(datatype, DataType::Decimal128(_, _)).then_some((column.name, datatype))
+            })
+            .collect();
+
         let pk_cols = self
             .catalog
             .get_table(&table)
@@ -10662,6 +10833,26 @@ impl GatewayHandler {
                             .to_string(),
                     };
                     value_map.insert(column.clone(), generated);
+                }
+            }
+
+            // Validate every decimal before buffering any row from this statement.
+            for (column, datatype) in &decimal_columns {
+                if let Some(value) = value_map.get_mut(column).filter(|v| v.as_str() != r"\N") {
+                    use rockstream_sql::dml::{DmlLiteral, DmlScalarExpr};
+                    match DmlScalarExpr::Literal(DmlLiteral::String(value.clone()))
+                        .evaluate_assignment(&HashMap::new(), &HashMap::new(), datatype)
+                    {
+                        Ok(Some(formatted)) => *value = formatted,
+                        Ok(None) => *value = r"\N".to_owned(),
+                        Err(error) => {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "22003".to_owned(),
+                                error.to_string(),
+                            ))));
+                        }
+                    }
                 }
             }
 
@@ -18026,7 +18217,7 @@ fn parse_create_workload(q: &str) -> Option<WorkloadDef> {
     Some(workload)
 }
 
-fn parse_alter_workload(q: &str) -> Option<(String, WorkloadSettings)> {
+fn parse_alter_workload(q: &str) -> Option<(String, Option<u64>, WorkloadSettings)> {
     let after = q
         .trim()
         .strip_prefix("ALTER WORKLOAD ")
@@ -18036,13 +18227,30 @@ fn parse_alter_workload(q: &str) -> Option<(String, WorkloadSettings)> {
     let (name_part, settings_part) = after
         .split_once(" SET ")
         .or_else(|| after.split_once(" set "))?;
-    let workload_name = name_part.trim().trim_matches('"');
+    let name_part = name_part.trim();
+    let upper = name_part.to_ascii_uppercase();
+    let (workload_name, expected_revision) = if let Some(index) = upper.find(" IF REVISION ") {
+        let version = name_part.get(index + " IF REVISION ".len()..)?.trim();
+        (
+            name_part.get(..index)?.trim().trim_matches('"'),
+            Some(version.parse::<u64>().ok()?),
+        )
+    } else {
+        (name_part.trim_matches('"'), None)
+    };
+    if workload_name.is_empty() {
+        return None;
+    }
     let body = settings_part
         .trim()
         .strip_prefix('(')?
         .strip_suffix(')')?
         .trim();
-    Some((workload_name.to_string(), parse_workload_settings(body)?))
+    Some((
+        workload_name.to_string(),
+        expected_revision,
+        parse_workload_settings(body)?,
+    ))
 }
 
 fn parse_drop_workload(q: &str) -> Option<String> {
@@ -19837,5 +20045,43 @@ mod source_batch_tests {
             ),
             ("10.25".to_string(), "5.50".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_array_parameter_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prisma_nested_catalog_any_bind_is_text_array() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT info.column_name FROM information_schema.columns info JOIN (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.nspname = ANY($1)) schemas ON schemas.nspname = info.table_schema";
+        let types = match infer_parameter_types(&catalog, sql).await {
+            Ok(types) => types,
+            Err(err) => panic!("parameter inference failed: {err}"),
+        };
+        assert_eq!(types, vec![Type::TEXT_ARRAY]);
+    }
+
+    #[tokio::test]
+    async fn unqualified_catalog_any_bind_is_array() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT namespace.nspname FROM pg_namespace AS namespace WHERE namespace.nspname = ANY($1) ORDER BY namespace.nspname";
+        let types = match infer_parameter_types(&catalog, sql).await {
+            Ok(types) => types,
+            Err(err) => panic!("parameter inference failed: {err}"),
+        };
+        assert_eq!(types, vec![Type::TEXT_ARRAY]);
+    }
+
+    #[tokio::test]
+    async fn explicitly_cast_catalog_any_bind_keeps_declared_type() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT c.relname FROM pg_catalog.pg_class c WHERE c.oid = ANY($1::int4[])";
+        let types = match infer_parameter_types(&catalog, sql).await {
+            Ok(types) => types,
+            Err(err) => panic!("parameter inference failed: {err}"),
+        };
+        assert_eq!(types, vec![Type::INT4_ARRAY]);
     }
 }

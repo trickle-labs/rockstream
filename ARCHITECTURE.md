@@ -432,7 +432,7 @@ RS-coded errors.
 — a `SourceConnector` trait for bringing data in and a `SinkConnector` trait for
 writing results out. The supported connector set is **Kafka source, PostgreSQL
 CDC source and Kafka sink**. The sources are Core; the sink is Experimental
-and supports epoch/count markers only, with no view row delivery.
+and supports bounded view snapshot/change delivery through `KafkaViewSink`.
 
 The interesting engineering here is all about exactly-once correctness across the
 boundary. On the source side, a `SourceEpochRegistry` records exactly which input
@@ -443,8 +443,8 @@ handoff and transaction boundaries, including shared replication-slot consumers.
 Replay can occur; durable identities and committed progress prevent it from
 becoming duplicate visible output.
 
-The Kafka sink prepares transactional epoch/count markers and commits them according
-to the checkpoint protocol. Marker visibility depends on the documented producer,
+The Kafka sink prepares transactional row envelopes (or legacy count markers)
+and commits them according to the checkpoint protocol. Visibility depends on the documented producer,
 broker and consumer settings. The connector guarantee matrices exercise crash
 boundaries, restart, replay, lag and bounded buffering, with external-service
 tests where required. See [connectors](docs/connectors.md) for configuration and
@@ -452,8 +452,8 @@ the capability matrix for named proofs.
 
 Iceberg, Delta, object-store sink, S3 source and webhook source frontends have
 been removed and fail closed. Catalog compatibility records do not make them
-active connectors. Kafka-based lakehouse exports remain unsupported until the
-sink delivers view rows; see [connector migration](docs/connector-migration.md).
+active connectors. Automatic lakehouse exports remain unsupported; the bounded
+Kafka runtime adapter is documented in [connector migration](docs/connector-migration.md).
 
 ---
 
