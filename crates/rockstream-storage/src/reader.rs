@@ -230,6 +230,91 @@ impl ShardReader {
         self.scan_physical_prefix(prefix, false).await
     }
 
+    /// Scan the published snapshot with a strict cumulative key/value-byte budget.
+    ///
+    /// Unlike scan_prefix, stop *before* retaining the first over-budget
+    /// entry. This returns (entries, truncated) so the caller can reject an
+    /// incomplete result rather than incorrectly treat it as a complete view.
+    /// The migration path merges legacy and v2 keys exactly as scan_prefix
+    /// does, without materializing an unbounded intermediate set.
+    pub async fn scan_prefix_bounded(
+        &self,
+        prefix: &[u8],
+        max_bytes: usize,
+    ) -> Result<(Vec<(Bytes, Bytes)>, bool), StorageError> {
+        let mut results = Vec::new();
+        let mut total_bytes = 0usize;
+        let is_logical = prefix.first().copied() != Some(0x06);
+        let use_v2 = self.format_version == 2 && is_logical;
+
+        if self.migration_pending && is_logical && !use_v2 {
+            // During conversion, v2 shadows legacy values for the same key.
+            // Filter duplicates while streaming instead of sorting an
+            // unbounded legacy/new union in memory.
+            let mut old_iter = self.reader.scan_prefix(prefix, ..).await?;
+            while let Some(entry) = old_iter.next().await? {
+                if self.reader.get(format_v2_key(&entry.key)).await?.is_some() {
+                    continue;
+                }
+                if !append_bounded_scan_entry(
+                    &mut results,
+                    &mut total_bytes,
+                    entry.key,
+                    entry.value,
+                    max_bytes,
+                ) {
+                    return Ok((Vec::new(), true));
+                }
+            }
+            let mut new_iter = self
+                .reader
+                .scan_prefix(format_v2_prefix(prefix), ..)
+                .await?;
+            while let Some(entry) = new_iter.next().await? {
+                let key = logical_key_from_format_v2(&entry.key).ok_or_else(|| {
+                    StorageError::Unsupported("invalid v2 storage key".to_string())
+                })?;
+                if !append_bounded_scan_entry(
+                    &mut results,
+                    &mut total_bytes,
+                    Bytes::copy_from_slice(key),
+                    entry.value,
+                    max_bytes,
+                ) {
+                    return Ok((Vec::new(), true));
+                }
+            }
+            results.sort_by(|a, b| a.0.cmp(&b.0));
+            return Ok((results, false));
+        }
+
+        let physical_prefix = if use_v2 {
+            format_v2_prefix(prefix)
+        } else {
+            prefix.to_vec()
+        };
+        let mut iter = self.reader.scan_prefix(physical_prefix, ..).await?;
+        while let Some(entry) = iter.next().await? {
+            let key = if use_v2 {
+                Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(|| {
+                    StorageError::Unsupported("invalid v2 storage key".to_string())
+                })?)
+            } else {
+                entry.key
+            };
+            if !append_bounded_scan_entry(
+                &mut results,
+                &mut total_bytes,
+                key,
+                entry.value,
+                max_bytes,
+            ) {
+                return Ok((Vec::new(), true));
+            }
+        }
+        Ok((results, false))
+    }
+
     async fn scan_pending_prefix(
         &self,
         prefix: &[u8],
@@ -279,6 +364,11 @@ impl ShardReader {
         Ok(results)
     }
 
+    /// Maximum number of entries in a streamed ShardReader scan page.
+    pub const MAX_SCAN_PAGE_ROWS: usize = 4_096;
+    /// Maximum combined key/value payload bytes in a streamed scan page.
+    pub const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
     /// Send prefix-scan pages through a bounded channel.
     ///
     /// Each page contains at most `max_rows` entries and `max_bytes` bytes of
@@ -292,6 +382,20 @@ impl ShardReader {
         max_bytes: usize,
         sender: mpsc::Sender<Result<Vec<(Bytes, Bytes)>, StorageError>>,
     ) {
+        // Zero rows disables the flush condition and a huge max_rows can
+        // allocate an enormous Vec before any I/O. Both are invalid budgets.
+        if max_rows == 0
+            || max_rows > Self::MAX_SCAN_PAGE_ROWS
+            || max_bytes == 0
+            || max_bytes > Self::MAX_SCAN_PAGE_BYTES
+        {
+            let _ = sender
+                .send(Err(StorageError::Unsupported(format!(
+                    "invalid scan page budget rows={max_rows}, bytes={max_bytes}"
+                ))))
+                .await;
+            return;
+        }
         let sender = sender;
         let use_v2 = self.format_version == 2 && prefix.first().copied() != Some(0x06);
         let physical_prefix = if use_v2 {
@@ -332,7 +436,14 @@ impl ShardReader {
             } else {
                 entry.key
             };
-            let entry_bytes = key.len() + entry.value.len();
+            let Some(entry_bytes) = key.len().checked_add(entry.value.len()) else {
+                let _ = sender
+                    .send(Err(StorageError::Unsupported(
+                        "scan page entry byte count overflow".to_string(),
+                    )))
+                    .await;
+                return;
+            };
             if entry_bytes > max_bytes {
                 let _ = sender
                     .send(Err(StorageError::Unsupported(format!(
@@ -399,6 +510,29 @@ impl ShardReader {
     }
 }
 
+/// Store a key/value pair only if the entire byte count fits the budget.
+/// Checked addition ensures no wrapped byte count can admit more state.
+fn append_bounded_scan_entry(
+    result: &mut Vec<(Bytes, Bytes)>,
+    total: &mut usize,
+    key: Bytes,
+    value: Bytes,
+    budget: usize,
+) -> bool {
+    let Some(next) = total
+        .checked_add(key.len())
+        .and_then(|sum| sum.checked_add(value.len()))
+    else {
+        return false;
+    };
+    if next > budget {
+        return false;
+    }
+    *total = next;
+    result.push((key, value));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +587,108 @@ mod tests {
             }
             _ => panic!("expected EpochPruned error"),
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_bounded_scan_never_retains_partial_overflow_entries() {
+        let store = Arc::new(InMemory::new());
+        let db = ShardDb::builder("test/bounded_snapshot_reader", store.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"v/a", b"aaa").await.unwrap();
+        db.put(b"v/b", b"bbb").await.unwrap();
+        db.put(b"v/c", b"ccc").await.unwrap();
+        db.flush().await.unwrap();
+        let reader = ShardReader::open("test/bounded_snapshot_reader", store)
+            .await
+            .unwrap();
+
+        let (exact, cut) = reader.scan_prefix_bounded(b"v/", 18).await.unwrap();
+        assert!(!cut);
+        assert_eq!(exact, reader.scan_prefix(b"v/").await.unwrap());
+        let (partial, cut) = reader.scan_prefix_bounded(b"v/", 12).await.unwrap();
+        assert!(cut);
+        assert!(
+            partial.is_empty(),
+            "partial snapshots must not appear complete"
+        );
+        let (zero, cut) = reader.scan_prefix_bounded(b"v/", 0).await.unwrap();
+        assert!(cut);
+        assert!(zero.is_empty());
+        let (absent, cut) = reader.scan_prefix_bounded(b"absent/", 0).await.unwrap();
+        assert!(!cut);
+        assert!(absent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_preserves_migration_v2_shadow_and_rejects_partial_results() {
+        let store = Arc::new(InMemory::new());
+        let db = ShardDb::builder("test/bounded_migration_reader", store.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"v/a", b"legacy").await.unwrap();
+        db.put(&format_v2_key(b"v/a"), b"new").await.unwrap();
+        db.put(&format_v2_key(b"v/b"), b"other").await.unwrap();
+        db.flush().await.unwrap();
+
+        let mut reader = ShardReader::open("test/bounded_migration_reader", store)
+            .await
+            .unwrap();
+        assert_eq!(reader.format_version, 1);
+        reader.migration_pending = true;
+        let expected = reader.scan_prefix(b"v/").await.unwrap();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0].1.as_ref(), b"new");
+        assert_eq!(expected[1].1.as_ref(), b"other");
+        let (bounded, truncated) = reader.scan_prefix_bounded(b"v/", 14).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(bounded, expected);
+        let (missing, truncated) = reader.scan_prefix_bounded(b"v/", 13).await.unwrap();
+        assert!(truncated);
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamed_scan_rejects_zero_and_oversized_page_limits_before_reading() {
+        let store = Arc::new(InMemory::new());
+        let db = ShardDb::builder("test/invalid_scan_pages", store.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"p/item", b"value").await.unwrap();
+        db.flush().await.unwrap();
+        let reader = ShardReader::open("test/invalid_scan_pages", store)
+            .await
+            .unwrap();
+        for (rows, bytes) in [
+            (0, 10),
+            (1, 0),
+            (ShardReader::MAX_SCAN_PAGE_ROWS + 1, 1),
+            (1, ShardReader::MAX_SCAN_PAGE_BYTES + 1),
+        ] {
+            let (tx, mut rx) = mpsc::channel(1);
+            reader.scan_prefix_pages(b"p/", rows, bytes, tx).await;
+            let error = rx.recv().await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("invalid scan page budget"));
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[test]
+    fn bounded_entry_accounting_rejects_size_overflow() {
+        let mut entries = Vec::new();
+        let mut total = usize::MAX;
+        assert!(!append_bounded_scan_entry(
+            &mut entries,
+            &mut total,
+            Bytes::from_static(b"x"),
+            Bytes::from_static(b"y"),
+            usize::MAX,
+        ));
+        assert!(entries.is_empty());
+        assert_eq!(total, usize::MAX);
     }
 
     #[tokio::test]

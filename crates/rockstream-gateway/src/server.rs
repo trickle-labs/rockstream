@@ -5523,8 +5523,8 @@ impl GatewayHandler {
             }
         };
 
-        // Authenticate reads before exposing retention metadata, allocating
-        // a stream or reading an initial snapshot.
+        // Authorize reads before exposing retention metadata, scanning
+        // a snapshot or reserving a stream slot.
         if let Some(denied) = self.select_access_error_response(&request.view_name, conn_id) {
             return Ok(denied);
         }
@@ -5581,8 +5581,7 @@ impl GatewayHandler {
         let mut pending = std::collections::VecDeque::new();
         let handle = match &request.start {
             SubscribeStart::NowWithSnapshot => {
-                // Bound source work before materializing a snapshot.
-                // The extra row is an explicit overflow witness.
+                // Preflight the producer at one row beyond the exact bound.
                 let snapshot = self
                     .view_reader
                     .read_view(
@@ -5756,7 +5755,7 @@ impl GatewayHandler {
             }
         }
 
-        // SUBSCRIBE also obeys the explicit failed-transaction guard.
+        // SUBSCRIBE must obey the same failed-transaction fence as SELECT.
         if ql == "subscribe" || ql.starts_with("subscribe ") {
             return self.handle_subscribe(q, conn_id).await;
         }
@@ -16292,7 +16291,8 @@ impl PartitionStream for QueryTimeScatterPartition {
                         reader
                             .scan_prefix_pages(
                                 &prefix,
-                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS,
+                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS
+                                    .min(rockstream_storage::ShardReader::MAX_SCAN_PAGE_ROWS),
                                 QUERY_TIME_SCATTER_MAX_IN_FLIGHT_BYTES,
                                 sender,
                             )
