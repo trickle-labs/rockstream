@@ -46,6 +46,9 @@ pub struct WorkerRecoveryEvidence {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RecoveryFailure {
+    MissingObservation,
+    Candidate,
+    Timings,
     Identity,
     Ownership,
     Progress,
@@ -55,6 +58,85 @@ pub enum RecoveryFailure {
     DetectionDeadline,
     OwnershipDeadline,
     QueryDeadline,
+}
+
+/// Durations are derived from captured application events, never supplied SLO samples.
+pub fn recovery_durations(e: &WorkerRecoveryEvidence) -> Value {
+    json!({
+        "detection": e.detection.timestamp_ms.checked_sub(e.fault_at_ms),
+        "ownership": e.ownership_observed_at_ms.checked_sub(e.fault_at_ms),
+        "query": e.first_correct_query_at_ms.checked_sub(e.fault_at_ms),
+    })
+}
+
+pub fn qualification_record(observations: Value, candidate: &Value, durations: Value) -> Value {
+    let result = serde_json::from_value::<WorkerRecoveryEvidence>(observations.clone())
+        .map_err(|_| RecoveryFailure::MissingObservation)
+        .and_then(|e| {
+            if candidate["commit_sha"] != e.revision {
+                return Err(RecoveryFailure::Candidate);
+            }
+            validate(&e)?;
+            if durations != recovery_durations(&e) {
+                return Err(RecoveryFailure::Timings);
+            }
+            Ok(())
+        });
+    json!({
+        "candidate": candidate,
+        "observations": observations,
+        "recovery_durations_ms": durations,
+        "status": if result.is_ok() { "PASSED" } else { "FAILED" },
+        "error": result.err().map(|error| format!("{error:?}")),
+    })
+}
+
+/// Apply qualification controls to the same complete observations used for proof.
+pub fn qualification_records(e: &WorkerRecoveryEvidence, candidate: &Value) -> Value {
+    let observations = serde_json::to_value(e).unwrap();
+    let durations = recovery_durations(e);
+    let application = qualification_record(observations.clone(), candidate, durations.clone());
+    let mut controls = serde_json::Map::new();
+    for name in [
+        "missing_event",
+        "constant_timings",
+        "stale_query",
+        "changed_value",
+        "duplicate_output",
+        "helper_only_status",
+    ] {
+        let mut corrupted = observations.clone();
+        let mut timings = durations.clone();
+        match name {
+            "missing_event" => {
+                corrupted.as_object_mut().unwrap().remove("detection");
+            }
+            "constant_timings" => {
+                timings = json!({"detection":0,"ownership":0,"query":0});
+            }
+            "stale_query" => {
+                corrupted["query_frontier"] = json!(3);
+            }
+            "changed_value" => {
+                corrupted["query_rows"] = json!(["1\twrong"]);
+            }
+            "duplicate_output" => {
+                corrupted["sink_records"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(e.sink_records[2].clone());
+            }
+            "helper_only_status" => {
+                corrupted["after"]["process_id"] = json!(e.before.process_id);
+            }
+            _ => unreachable!(),
+        }
+        controls.insert(
+            name.into(),
+            qualification_record(corrupted, candidate, timings),
+        );
+    }
+    json!({"application": application, "negative_controls": controls})
 }
 
 /// Reconstruct independently of the production view materializer.
@@ -243,6 +325,87 @@ mod tests {
             serde_json::to_value(&decoded).unwrap()
         );
         assert_eq!(validate(&decoded), Ok(()));
+    }
+
+    #[test]
+    fn complete_qualification_records_reject_substituted_observations() {
+        let e = fixture();
+        let candidate = json!({"commit_sha":"a".repeat(40),"tracked_diff_sha256":"fixture"});
+        let observations = serde_json::to_value(&e).unwrap();
+        let expected = json!({
+            "candidate": candidate, "observations": observations,
+            "recovery_durations_ms": {"detection":100,"ownership":200,"query":500},
+            "status":"PASSED", "error":null,
+        });
+        assert_eq!(
+            qualification_record(observations.clone(), &candidate, recovery_durations(&e)),
+            expected
+        );
+        let mut missing = observations.clone();
+        missing.as_object_mut().unwrap().remove("detection");
+        let mut stale = observations.clone();
+        stale["query_frontier"] = json!(3);
+        let mut changed = observations.clone();
+        changed["query_rows"] = json!(["1\twrong"]);
+        let mut duplicate = observations.clone();
+        duplicate["sink_records"]
+            .as_array_mut()
+            .unwrap()
+            .push(e.sink_records[2].clone());
+        let mut helper = observations.clone();
+        helper["after"]["process_id"] = json!(11);
+        let mut controls = serde_json::Map::new();
+        for (name, data, timings, reason) in [
+            (
+                "missing_event",
+                missing,
+                recovery_durations(&e),
+                "MissingObservation",
+            ),
+            (
+                "constant_timings",
+                observations.clone(),
+                json!({"detection":0,"ownership":0,"query":0}),
+                "Timings",
+            ),
+            ("stale_query", stale, recovery_durations(&e), "Progress"),
+            (
+                "changed_value",
+                changed,
+                recovery_durations(&e),
+                "ViewOutput",
+            ),
+            (
+                "duplicate_output",
+                duplicate,
+                recovery_durations(&e),
+                "SinkOutput",
+            ),
+            (
+                "helper_only_status",
+                helper,
+                recovery_durations(&e),
+                "Ownership",
+            ),
+        ] {
+            let record = json!({"candidate":candidate,"observations":data,
+                "recovery_durations_ms":timings,"status":"FAILED","error":reason});
+            assert_eq!(qualification_record(data, &candidate, timings), record);
+            controls.insert(name.into(), record);
+        }
+        assert_eq!(
+            qualification_records(&e, &candidate),
+            json!({"application":expected,"negative_controls":controls})
+        );
+        let wrong_candidate = json!({"commit_sha":"b".repeat(40)});
+        let mut rejected = expected;
+        rejected["candidate"] = wrong_candidate.clone();
+        rejected["status"] = json!("FAILED");
+        rejected["error"] = json!("Candidate");
+        assert_eq!(
+            qualification_record(observations, &wrong_candidate, recovery_durations(&e)),
+            rejected
+        );
     }
 
     #[test]

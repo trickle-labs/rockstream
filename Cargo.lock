@@ -5270,8 +5270,9 @@ name = "rockstream-fuzz"
 version = "0.71.0"
 dependencies = [
  "arrow",
- "async-trait",
+ "bytes",
  "libfuzzer-sys",
+ "pgwire",
  "rockstream-connectors",
  "rockstream-gateway",
  "rockstream-sql",
