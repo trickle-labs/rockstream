@@ -9,7 +9,19 @@ use std::time::{Duration, Instant};
 
 fn exists(pid: i32) -> bool {
     let status = unsafe { libc::kill(pid, 0) };
-    status == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    if status == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return false;
+    }
+    // Zombies can remain orphaned under PID 1 in container environments.
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if let Some((_, fields)) = stat.rsplit_once(") ") {
+            if matches!(fields.split_whitespace().next(), Some("Z" | "X" | "x")) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn wait_until(mut check: impl FnMut() -> bool) -> bool {
