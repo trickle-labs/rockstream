@@ -5365,6 +5365,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "object_store 0.14.2",
+ "parking_lot",
  "proptest",
  "rand 0.8.6",
  "rdkafka",
