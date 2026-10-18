@@ -45,6 +45,7 @@ serde_json = { workspace = true }
 regex = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 rockstream-test-support.workspace = true
