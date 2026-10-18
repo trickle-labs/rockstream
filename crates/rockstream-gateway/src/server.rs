@@ -8341,51 +8341,47 @@ impl GatewayHandler {
             )))]);
         };
         apply_workload_settings(&mut workload, &changes);
-        let updated = if let Some(expected) = expected_revision {
-            match self
-                .catalog
-                .update_workload_if_revision_async(workload.clone(), expected)
-                .await
-                .map_err(|error| PgWireError::ApiError(Box::new(error)))?
-            {
-                WorkloadRevisionOutcome::Updated(_) => true,
-                WorkloadRevisionOutcome::NotFound => false,
-                WorkloadRevisionOutcome::Conflict { expected, actual } => {
-                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "40001".to_owned(),
-                        format!(
-                            "[RS-1006] workload.revision_conflict: expected revision {expected}, actual revision {actual}. Next steps: read the current workload revision and retry the edit."
-                        ),
-                    )))]);
-                }
-                WorkloadRevisionOutcome::BelowLiveUse {
-                    requested,
-                    allocated,
-                } => {
-                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "54000".to_owned(),
-                        format!(
-                            "[RS-1006] workload.memory_below_live_use: requested limit {requested} bytes is below {allocated} bytes of live reservations. Next steps: reclaim the live state before reducing the limit."
-                        ),
-                    )))]);
-                }
-                WorkloadRevisionOutcome::RevisionExhausted => {
-                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "54000".to_owned(),
-                        "[RS-1006] workload.revision_exhausted: revision counter cannot advance. Next steps: contact the operator.".to_owned(),
-                    )))]);
-                }
+        // Legacy SQL retains its syntax, but never bypasses live-use admission
+        // or race detection. A request without IF REVISION uses the revision
+        // observed when this producer read its policy; a competing edit must
+        // return a retryable conflict rather than overwrite the winner.
+        let expected = expected_revision.unwrap_or(workload.revision);
+        let updated = match self
+            .catalog
+            .update_workload_if_revision_async(workload.clone(), expected)
+            .await
+            .map_err(|error| PgWireError::ApiError(Box::new(error)))?
+        {
+            WorkloadRevisionOutcome::Updated(_) => true,
+            WorkloadRevisionOutcome::NotFound => false,
+            WorkloadRevisionOutcome::Conflict { expected, actual } => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "40001".to_owned(),
+                    format!(
+                        "[RS-1006] workload.revision_conflict: expected revision {expected}, actual revision {actual}. Next steps: read the current workload revision and retry the edit."
+                    ),
+                )))]);
             }
-        } else {
-            // Legacy unconditioned ALTER remains for backwards compatibility;
-            // strict v0.72 revisions use IF REVISION <n>.
-            self.catalog
-                .update_workload_async(workload.clone())
-                .await
-                .map_err(|error| PgWireError::ApiError(Box::new(error)))?
+            WorkloadRevisionOutcome::BelowLiveUse {
+                requested,
+                allocated,
+            } => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "54000".to_owned(),
+                    format!(
+                        "[RS-1006] workload.memory_below_live_use: requested limit {requested} bytes is below {allocated} bytes of live reservations. Next steps: reclaim the live state before reducing the limit."
+                    ),
+                )))]);
+            }
+            WorkloadRevisionOutcome::RevisionExhausted => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "54000".to_owned(),
+                    "[RS-1006] workload.revision_exhausted: revision counter cannot advance. Next steps: contact the operator.".to_owned(),
+                )))]);
+            }
         };
         if !updated {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
