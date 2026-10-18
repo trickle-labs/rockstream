@@ -695,6 +695,33 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #133 changes *worker-local quota owner lifetimes*, not the M1–M7
+distributed frontier, lease, or commit transitions. The distributed quota
+registry can unregister and then reuse the same numeric workload ID while a
+reservation from its previous generation remains alive. The safety obligation
+is that each accepted `QuotaGuard` retains the exact `Arc` allocation entry
+that admitted it: releasing or dropping the old guard must reduce only the
+old generation's memory/parallelism counters, never the new generation's.
+Admission for a live entry must check both dimensions atomically, reject
+arithmetic overflow, and leave all counters unchanged on denial. An
+unregistered-workload (untracked) guard must not debit later registrations.
+An operator allocation released twice or reset must never refund a sibling's
+live charge. For the separate worker-memory waiter path, cancellation, abort,
+timeout, and successful admission must each release the precise queued-waiter
+slot; a failed admission owns no slot.
+
+`crates/rockstream-types/tests/v072_quota_generation_tests.rs` exercises
+generation reuse, untracked guards, concurrent registry saturation, overflow,
+and operator sibling ownership with exact before/after ledgers;
+`crates/rockstream-runtime/tests/v072_quota_lifecycle.rs` checks cancellation
+and the complete eight-category worker ledger. These are implementation
+interleaving regressions, not distributed state-machine proofs: the existing
+`formal/edge_quota_exhaustion.fizz` covers contention and retry under a
+single fixed reservation owner, **not** identity reuse or an `Arc` lifetime.
+No M1–M7 model proof, process-level RSS qualification, or #132 acceptance is
+claimed by these tests. Future cross-worker propagation of generation-aware
+quotas will need an explicit distributed coordination model before acceptance.
+
 Issue #122 narrows the production Kafka sink qualification to match M3's
 epoch-level abstraction. `SinkConnector::pre_commit` accepts a row count and
 Kafka emits/restores epoch/count markers; neither the interface nor the M3
