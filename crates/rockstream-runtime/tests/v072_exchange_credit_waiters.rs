@@ -41,6 +41,7 @@ async fn legacy_row_waiter_is_bounded_and_abort_releases_slot() {
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(controller.queued_credit_waiters(), 0);
+    assert_eq!(controller.queued_notifier_channels(), 0);
     controller.release_credit(7, 1, 2, 1);
     controller.acquire_credit(7, 1, 2, 1).await.unwrap();
     assert_eq!(controller.queued_credit_waiters(), 0);
@@ -61,8 +62,12 @@ async fn woken_legacy_row_waiter_releases_own_slot() {
         .unwrap()
         .unwrap();
     assert_eq!(controller.queued_credit_waiters(), 0);
+    assert_eq!(controller.queued_notifier_channels(), 0);
     assert_eq!(
-        (controller.get_credits(7, 1, 2), controller.rows_in_flight(7, 1, 2)),
+        (
+            controller.get_credits(7, 1, 2),
+            controller.rows_in_flight(7, 1, 2)
+        ),
         (0, 1)
     );
     controller.release_credit(7, 1, 2, 1);
@@ -75,11 +80,12 @@ async fn batch_credit_waiters_share_bounded_raii_cleanup() {
     assert_eq!(controller.pending_requests(), 1);
     assert_eq!(controller.queued_credit_waiters(), 0);
     let waiting = controller.clone();
-    let task = tokio::spawn(async move {
-        waiting.acquire_batch_permit(7, 1, 2, 64, 1).await
-    });
+    let task = tokio::spawn(async move { waiting.acquire_batch_permit(7, 1, 2, 64, 1).await });
     wait_for_one_waiter(&controller).await;
-    let error = controller.acquire_batch_permit(7, 1, 2, 64, 1).await.unwrap_err();
+    let error = controller
+        .acquire_batch_permit(7, 1, 2, 64, 1)
+        .await
+        .unwrap_err();
     assert!(error.contains("RESOURCE_EXHAUSTED: queued exchange credit waiters"));
     assert_eq!(controller.queued_credit_waiters(), 1);
     task.abort();
@@ -87,7 +93,10 @@ async fn batch_credit_waiters_share_bounded_raii_cleanup() {
     assert_eq!(controller.queued_credit_waiters(), 0);
     drop(first);
     assert_eq!(controller.pending_requests(), 0);
-    let next = controller.acquire_batch_permit(7, 1, 2, 64, 1).await.unwrap();
+    let next = controller
+        .acquire_batch_permit(7, 1, 2, 64, 1)
+        .await
+        .unwrap();
     assert_eq!(controller.queued_credit_waiters(), 0);
     drop(next);
     assert_eq!(controller.pending_requests(), 0);
@@ -98,8 +107,28 @@ async fn rejecting_unsatisfiable_credit_request_does_not_own_waiter_slot() {
     let controller = FlowController::with_row_budget(1).with_max_pending_requests(1);
     let err = controller.acquire_credit(7, 1, 2, 2).await.unwrap_err();
     assert!(err.contains("RS-3024"));
-    let err = controller.acquire_batch_permit(7, 1, 2, 64, 2).await.unwrap_err();
+    let err = controller
+        .acquire_batch_permit(7, 1, 2, 64, 2)
+        .await
+        .unwrap_err();
     assert!(err.contains("RS-3024"));
     assert_eq!(controller.queued_credit_waiters(), 0);
     assert_eq!(controller.pending_requests(), 0);
+}
+
+#[tokio::test]
+async fn repeated_aborted_channels_do_not_accumulate_notifier_entries() {
+    let controller = FlowController::with_row_budget(1).with_max_pending_requests(2);
+    for shard in 0..32 {
+        controller.acquire_credit(7, shard, 2, 1).await.unwrap();
+        let waiting = controller.clone();
+        let task = tokio::spawn(async move { waiting.acquire_credit(7, shard, 2, 1).await });
+        wait_for_one_waiter(&controller).await;
+        assert_eq!(controller.queued_notifier_channels(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(controller.queued_credit_waiters(), 0);
+        assert_eq!(controller.queued_notifier_channels(), 0);
+        controller.release_credit(7, shard, 2, 1);
+    }
 }
