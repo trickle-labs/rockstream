@@ -17,8 +17,9 @@ rockstream-connectors = { workspace = true }
 rockstream-types = { workspace = true }
 arrow = { workspace = true }
 tokio = { workspace = true }
-async-trait = { workspace = true }
 serde_json = { workspace = true }
+bytes = { workspace = true }
+pgwire = { workspace = true }
 
 [[bin]]
 name = "fuzz_sql_parser"

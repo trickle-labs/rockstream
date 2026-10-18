@@ -16,6 +16,7 @@
 
 pub mod admission;
 pub mod auth;
+pub mod bounded_read;
 mod catalog_query;
 pub mod catalog_stubs;
 pub mod change_log;
