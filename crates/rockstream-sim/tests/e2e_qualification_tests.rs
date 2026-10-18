@@ -1,12 +1,5 @@
-//! End-to-End Distributed Qualification Tests (Slice 1 & Slice 2).
-//!
-//! Verifies:
-//! - Multi-node distributed qualification topology
-//! - Kafka streaming ingest & view maintenance
-//! - PostgreSQL CDC transaction ingest
-//! - Kafka 2PC sink atomicity and exact multiset delivery
-//! - PGWire query and subscription serving
-//! - External batch oracle multiset equivalence
+//! Synthetic topology, workload-generator, and oracle bookkeeping tests.
+//! No broker, CDC source, PGWire service, or distributed application is executed.
 
 use std::collections::BTreeMap;
 
@@ -16,7 +9,7 @@ use rockstream_sim::qualification::{
 };
 
 #[tokio::test]
-async fn test_qualification_ddl_and_pipeline_setup() {
+async fn test_helper_in_memory_topology_lifecycle() {
     let report = check_prerequisites(true);
     assert!(
         report.is_ready,
@@ -58,7 +51,7 @@ async fn test_qualification_ddl_and_pipeline_setup() {
 }
 
 #[tokio::test]
-async fn test_qualification_kafka_ingest_and_view_maintenance() {
+async fn test_helper_generated_kafka_oracle_bookkeeping() {
     let mut workload = QualificationWorkloadGenerator::new(0xCAFE_0001);
     let mut oracle = OracleAuditor::new();
 
@@ -74,13 +67,10 @@ async fn test_qualification_kafka_ingest_and_view_maintenance() {
     let expected = oracle.expected_view_state().clone();
     assert!(!expected.is_empty());
 
-    // In a live execution, live view state matches oracle state exactly
-    let live_state = expected.clone();
-    let diff = oracle.verify_multiset(&live_state);
-    assert!(
-        diff.is_ok(),
-        "Live view state must match batch oracle exactly"
-    );
+    // Supplied oracle copy exercises comparison bookkeeping only.
+    let fixture_state = expected.clone();
+    let diff = oracle.verify_multiset(&fixture_state);
+    assert!(diff.is_ok(), "Supplied fixture state must match the oracle");
 
     let watermark_res = oracle.verify_watermark_monotone(3);
     assert!(watermark_res.is_ok());
@@ -88,7 +78,7 @@ async fn test_qualification_kafka_ingest_and_view_maintenance() {
 }
 
 #[tokio::test]
-async fn test_qualification_postgres_cdc_ingest() {
+async fn test_helper_generated_cdc_commit_filtering() {
     let mut workload = QualificationWorkloadGenerator::new(0xCAFE_0002);
     let mut oracle = OracleAuditor::new();
 
@@ -106,16 +96,16 @@ async fn test_qualification_postgres_cdc_ingest() {
     let expected = oracle.expected_view_state().clone();
     assert!(!expected.is_empty());
 
-    let live_state = expected.clone();
-    let diff = oracle.verify_multiset(&live_state);
+    let fixture_state = expected.clone();
+    let diff = oracle.verify_multiset(&fixture_state);
     assert!(
         diff.is_ok(),
-        "PostgreSQL CDC committed view state must match batch oracle"
+        "Generated committed records must match the oracle"
     );
 }
 
 #[tokio::test]
-async fn test_qualification_kafka_sink_2pc_atomicity() {
+async fn test_helper_oracle_sink_history_comparison() {
     let mut workload = QualificationWorkloadGenerator::new(0xCAFE_0003);
     let mut oracle = OracleAuditor::new();
 
@@ -128,12 +118,12 @@ async fn test_qualification_kafka_sink_2pc_atomicity() {
     let sink_verify = oracle.verify_sink_records(&expected_sink);
     assert!(
         sink_verify.is_ok(),
-        "Sink records must match 2PC staged and committed records exactly"
+        "Supplied sink-history copy must match the oracle"
     );
 }
 
 #[tokio::test]
-async fn test_qualification_pgwire_query_and_subscription() {
+async fn test_helper_supplied_relation_comparison() {
     let mut oracle = OracleAuditor::new();
     let records = vec![
         WorkloadRecord {
@@ -170,12 +160,12 @@ async fn test_qualification_pgwire_query_and_subscription() {
     let diff = oracle.verify_multiset(&expected_map);
     assert!(
         diff.is_ok(),
-        "PGWire point/range query results must match oracle multiset exactly"
+        "Supplied relation must match the oracle multiset"
     );
 }
 
 #[tokio::test]
-async fn test_qualification_batch_oracle_multiset_equivalence() {
+async fn test_helper_aggregate_oracle_comparison() {
     let mut workload = QualificationWorkloadGenerator::new(0xCAFE_0004);
     let mut oracle = OracleAuditor::new();
 

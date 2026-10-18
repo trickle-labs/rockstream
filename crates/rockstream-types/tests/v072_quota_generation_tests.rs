@@ -153,7 +153,7 @@ fn saturated_operator_release_does_not_remove_sibling_workload_charges() {
 
 #[test]
 fn workload_and_operator_counter_overflow_rejects_without_saturating() {
-    let workload = WorkloadBudget::new(WorkloadId(76), 0);
+    let workload = WorkloadBudget::new(WorkloadId(76), u64::MAX);
     workload.try_acquire(u64::MAX).unwrap();
     assert_eq!(
         workload.try_acquire(1),

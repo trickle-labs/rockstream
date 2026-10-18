@@ -23,7 +23,8 @@ use rockstream_ops::{
 use rockstream_plan::PlanNode;
 use rockstream_runtime::{exchange::persistence::committed_frontier, start_worker_client};
 use rockstream_sim::qualification::worker_failure::{
-    validate, RecoveryFailure, WorkerObservation, WorkerRecoveryEvidence, MANIFEST,
+    qualification_records, validate, RecoveryFailure, WorkerObservation, WorkerRecoveryEvidence,
+    MANIFEST,
 };
 use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, ShardReader, WriteBatch};
 use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS, MINIO_USER};
@@ -495,6 +496,23 @@ async fn worker_failure_recovery_from_view_and_kafka() {
         &evidence,
     );
     assert_eq!(validate(&evidence), Ok(()));
+    if let Ok(candidate) = std::env::var("ROCKSTREAM_QUALIFICATION_CANDIDATE") {
+        let candidate = serde_json::from_str(&candidate).unwrap();
+        let records = qualification_records(&evidence, &candidate);
+        assert_eq!(records["application"]["status"], "PASSED");
+        for (name, reason) in [
+            ("missing_event", "MissingObservation"),
+            ("constant_timings", "Timings"),
+            ("stale_query", "Progress"),
+            ("changed_value", "ViewOutput"),
+            ("duplicate_output", "SinkOutput"),
+            ("helper_only_status", "Ownership"),
+        ] {
+            assert_eq!(records["negative_controls"][name]["status"], "FAILED");
+            assert_eq!(records["negative_controls"][name]["error"], reason);
+        }
+        save(&artifact_dir.join("qualification-records.json"), &records);
+    }
     // Negative controls mutate the actual returned observations, one at a time.
     let mut wrong = evidence.clone();
     wrong.after.weighted_output[3][2][1]["Utf8"] = json!("wrong");
