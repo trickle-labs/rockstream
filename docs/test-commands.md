@@ -30,6 +30,7 @@ Qualification execution checks:
 $ bash scripts/check-qualification-mutations.test.sh
 $ bash scripts/check-qualification-mutations.sh --output target/qualification-mutations.json
 $ bash scripts/run-release-qualification.sh --fast --output target/qualification-helpers.json
+$ bash scripts/run-release-qualification.sh --suite recovery --output target/real-cluster-chaos/qualification.json
 ```
 
 The first command tests the runner with compiled libtest fixtures, including
@@ -51,12 +52,32 @@ test targets, and the unused CLI binary cannot contribute qualification evidence
 `ROCKSTREAM_QUALIFY_MOCK_ENV` select **helper evidence only**, recorded as
 `evidence_kind: helper` and `release_qualified: false`. CI runs these helpers
 separately from release qualification. The current qualification targets use
-in-memory topology and supplied observations. Without fast mode, the runner
-checks Docker and the local PGWire/Kafka/MinIO/PostgreSQL CDC endpoints, rejects
-unavailable services before compilation, and reports missing `live::e2e` and
-`live::recovery` observations. Even reachable services plus passing helper
-tests cannot qualify a release. Wiring live observation checks is required
-before this entry point can produce successful release evidence.
+in-memory topology and supplied observations; their `test_helper_*` names
+describe bookkeeping, never application recovery, Kafka atomicity, CDC, or PGWire
+proof. Capability references must use the actual scenario for application claims.
+
+Without fast mode, the runner requires Docker before compilation. For `recovery`
+(or `mutations`), it provisions Kafka and MinIO through the fixed
+[`worker-failure-kafka-minio-v1` scenario](testing/worker-failure-recovery.md).
+The manifest embeds the entire observed view, sink, source offsets, authority
+transition, first query, event timestamps, derived recovery durations, and exact
+candidate identity. Each run uses a fresh artifact directory, and a candidate
+change during execution fails qualification. Reachable ambient services and
+old artifacts cannot satisfy the requirement.
+
+The same executed Rust validator checks six complete corrupted records: missing
+detection event, substituted constant durations, stale query frontier, changed
+query value, duplicate consumed sink output, and a helper-only status transition
+with no new worker process. The runner compares the complete records and their
+specific failure reasons, rather than accepting a passing test name alone.
+
+Successful `release_qualified: true` applies only to the listed
+`qualification_scope: [worker-failure-kafka-minio-v1]`. `unsupported_claims`
+explicitly excludes general Kafka recovery, PostgreSQL CDC, distributed control
+HA, PGWire transport, and p99 recovery. `all` and `e2e` still fail with missing
+`live::e2e` evidence; helper coverage cannot satisfy those mandatory claims.
+The real-cluster chaos CI job runs the integrated recovery suite and uploads the
+complete successful and corrupted records along with worker logs.
 
 `--check-prerequisites` only reports prerequisite availability; it never runs
 scenarios or qualifies a release.
