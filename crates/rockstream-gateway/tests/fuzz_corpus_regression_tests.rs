@@ -4,23 +4,19 @@
 //! to assert zero panics across code updates.
 
 use arrow::datatypes::Schema;
+use bytes::BytesMut;
+use pgwire::messages::{startup::Startup, Message, PgWireFrontendMessage};
 use rockstream_connectors::kafka_source::decode_kafka_payload;
 use rockstream_connectors::postgres_cdc::{CdcWireFormat, PostgresCdcSource};
 use rockstream_gateway::auth::JwtVerifier;
-use rockstream_gateway::{
-    catalog_stubs::CatalogStubs, view_reader::ViewReadStrategy, GatewayError, GatewayServer,
-    ViewReader,
-};
 use rockstream_sql::frontend::SqlFrontend;
 use rockstream_types::raft::RaftRpcRequest;
 use rockstream_types::topology::WorkerMessage;
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-struct TestViewReader;
 
 const MAX_CORPUS_FILES_PER_TARGET: usize = 1024;
 const MAX_CORPUS_FILE_BYTES: u64 = 1024 * 1024;
@@ -39,22 +35,6 @@ const FUZZ_TARGETS: [&str; 7] = [
 struct CorpusStats {
     files: usize,
     bytes: u64,
-}
-
-#[async_trait::async_trait]
-impl ViewReader for TestViewReader {
-    async fn read_view(
-        &self,
-        _view_name: &str,
-        _limit: Option<usize>,
-        _strategy: ViewReadStrategy,
-    ) -> Result<Vec<Vec<u8>>, GatewayError> {
-        Ok(vec![])
-    }
-
-    fn published_frontier(&self) -> Option<u64> {
-        None
-    }
 }
 
 fn get_corpus_dir(target_name: &str) -> PathBuf {
@@ -182,16 +162,9 @@ async fn run_fuzz_sql_parser_corpus() {
 }
 
 async fn run_fuzz_pgwire_decoder_corpus() {
-    let catalog = Arc::new(CatalogStubs::new());
-    let view_reader = Arc::new(TestViewReader);
-    let server = GatewayServer::with_catalog("127.0.0.1:0".parse().unwrap(), catalog, view_reader);
-    let (addr, _handle) = server.serve_background().await.unwrap();
-
     replay_corpus("fuzz_pgwire_decoder", |data| {
-        if let Ok(mut socket) = std::net::TcpStream::connect(addr) {
-            let _ = socket.write_all(data);
-            let _ = socket.shutdown(std::net::Shutdown::Both);
-        }
+        let _ = Startup::decode(&mut BytesMut::from(data));
+        let _ = PgWireFrontendMessage::decode(&mut BytesMut::from(data));
     });
 }
 
@@ -279,6 +252,93 @@ async fn replay_fuzz_kafka_payload_decoder_corpus() {
 #[tokio::test]
 async fn replay_fuzz_oidc_jwt_decoder_corpus() {
     run_fuzz_oidc_jwt_decoder_corpus().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn known_valid_fuzz_seeds_decode_exactly() {
+    use rockstream_connectors::postgres_cdc::{CdcChange, CdcOperation, PgLsn};
+    use rockstream_sql::frontend::DdlStatement;
+
+    let seed = |target, file: &str| fs::read(get_corpus_dir(target).join(file)).unwrap();
+    let sql = seed("fuzz_sql_parser", "valid-create-index.sql");
+    assert_eq!(
+        SqlFrontend::new()
+            .parse_ddl(std::str::from_utf8(&sql).unwrap())
+            .unwrap(),
+        DdlStatement::CreateIndex {
+            index_name: "idx".into(),
+            table: "t".into(),
+            index_cols: vec!["a".into()],
+            where_pred: None,
+        }
+    );
+    let startup = seed("fuzz_pgwire_decoder", "valid-startup.bin");
+    let mut expected = Startup::new();
+    expected
+        .parameters
+        .insert("user".into(), "rockstream".into());
+    expected.parameters.insert("database".into(), "test".into());
+    assert_eq!(
+        Startup::decode(&mut BytesMut::from(startup.as_slice())).unwrap(),
+        Some(expected)
+    );
+    let query = seed("fuzz_pgwire_decoder", "valid-query.bin");
+    let decoded = PgWireFrontendMessage::decode(&mut BytesMut::from(query.as_slice()))
+        .unwrap()
+        .unwrap();
+    let mut encoded = BytesMut::new();
+    decoded.encode(&mut encoded).unwrap();
+    assert_eq!(encoded.as_ref(), query.as_slice());
+
+    for (format, file) in [
+        (CdcWireFormat::PgOutput, "valid-pgoutput.txt"),
+        (CdcWireFormat::Wal2Json, "valid-wal2json.json"),
+    ] {
+        let mut source = PostgresCdcSource::new(
+            rockstream_types::ids::ConnectorId(1),
+            Arc::new(Schema::empty()),
+            format,
+        );
+        source
+            .decode_and_enqueue(&seed("fuzz_postgres_cdc", file))
+            .unwrap();
+        assert_eq!(
+            source.queued_changes().cloned().collect::<Vec<_>>(),
+            vec![CdcChange {
+                lsn: PgLsn(1),
+                table_id: 1,
+                primary_key: b"1".to_vec(),
+                row_id: CdcChange::row_id_for(1, b"1"),
+                operation: CdcOperation::Insert,
+                old_values: None,
+                new_values: Some(vec![42]),
+            }]
+        );
+    }
+    let control: WorkerMessage = serde_json::from_slice(&seed(
+        "fuzz_control_worker_decoder",
+        "valid-deregister.json",
+    ))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(control).unwrap(),
+        serde_json::json!({"type":"deregister", "worker_id":1})
+    );
+    let raft: RaftRpcRequest =
+        serde_json::from_slice(&seed("fuzz_raft_rpc_decoder", "valid-request-vote.json")).unwrap();
+    assert_eq!(
+        serde_json::to_value(raft).unwrap(),
+        serde_json::json!({"RequestVote":{"term":1,"candidate_id":1}})
+    );
+    assert_eq!(
+        decode_kafka_payload(&seed("fuzz_kafka_payload_decoder", "valid-row.json")).unwrap(),
+        (1, vec![serde_json::json!(1), serde_json::json!("ok")], 1)
+    );
+    let jwt = seed("fuzz_oidc_jwt_decoder", "valid-hs256.txt");
+    let claims = JwtVerifier::with_hs256_key(b"fuzz-corpus-key".to_vec())
+        .verify(std::str::from_utf8(&jwt).unwrap())
+        .unwrap();
+    assert_eq!((claims.sub, claims.exp), ("fuzz".to_string(), None));
 }
 
 #[tokio::test(flavor = "multi_thread")]

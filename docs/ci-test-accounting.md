@@ -33,7 +33,12 @@ The first six jobs are called in `ci.yml`. Seeded, Docker and release suites are
 
 **Separate scheduled/release safety reports:** `Test Accounting — Expensive Suites` (`Nightly seeded simulation accounting`, `Nightly Docker test accounting`, `Release rolling-upgrade test accounting`); `Simulation Soak`; `Long-Duration Resource Soak`; `Real Cluster Chaos Soak`; `Coverage`; `Scheduled Fuzz Soak`. These may not run on every PR and are **not implied** by green PR checks. Their own red conclusions block any safety or release claim requiring them; record their run URLs and evidence artifacts explicitly in release sign-off. The issue does not authorize claiming formal, HA, or release proof from absent/skipped jobs.
 
-`Coverage` runs daily; `Simulation Soak` and `Scheduled Fuzz Soak` run every six hours and support manual dispatch. These three workflows do not run on main pushes, so they check scheduled snapshots rather than every merged commit. PR HA coverage is executed once by `pr-ha`, which also records the exact case results.
+Coverage runs daily; Simulation Soak and Scheduled Fuzz Soak run every six
+hours, plus manual dispatch. These three no longer run on main pushes; their
+scheduled snapshots cannot prove every merged commit individually. The new
+fuzz-runner self-test (from #196) also runs for PRs, but full fuzz engine soaks
+remain scheduled/manual. PR HA executes once through the existing `pr-ha`
+case-accounting runner, preserving the per-case transcript and debug setting.
 
 ## Boundaries
 
