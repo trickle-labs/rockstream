@@ -325,9 +325,8 @@ async fn v072_legacy_alter_cannot_reduce_memory_below_live_reservations() {
     set_state_budget(1_000);
 
     let catalog = Arc::new(CatalogStubs::new());
-    assert!(
-        catalog.add_workload(WorkloadDef::new("protected").with_memory_limit(MemoryLimit::new(100)))
-    );
+    assert!(catalog
+        .add_workload(WorkloadDef::new("protected").with_memory_limit(MemoryLimit::new(100))));
     catalog.add_view_in_namespace(CatalogView {
         name: "protected_view".to_owned(),
         sql: "SELECT 1".to_owned(),
@@ -352,7 +351,9 @@ async fn v072_legacy_alter_cannot_reduce_memory_below_live_reservations() {
         .expect_err("legacy ALTER must not bypass the reserved memory ceiling");
     let db_error = err.as_db_error().expect("SQLSTATE response");
     assert_eq!(db_error.code().code(), "54000");
-    assert!(db_error.message().contains("requested limit 80 bytes is below 90 bytes"));
+    assert!(db_error
+        .message()
+        .contains("requested limit 80 bytes is below 90 bytes"));
 
     let requested = catalog.get_workload("protected").unwrap();
     assert_eq!(requested.revision, 1);
