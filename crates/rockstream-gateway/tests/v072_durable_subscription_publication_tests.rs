@@ -73,7 +73,7 @@ async fn acknowledged_commit_publishes_complete_epoch_with_exact_rows() {
         .simple_query("INSERT INTO v072_orders (id, amount) VALUES (2, 20)")
         .await
         .unwrap();
-    assert_eq!(registry.since_epoch("v072_orders", 0), None);
+    assert!(registry.since_epoch("v072_orders", 0).is_none());
     client.simple_query("COMMIT").await.unwrap();
 
     let entries = registry.since_epoch("v072_orders", 0).unwrap();
