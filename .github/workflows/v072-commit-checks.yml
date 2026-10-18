@@ -49,4 +49,7 @@ jobs:
       - name: Focused production commit tests
         run: cargo test -p rockstream-ops --test v072_commit_bounds_tests --test group_commit_timer_tests --test group_commit_durability_lfs_tests
       - name: Ops library Clippy
-        run: cargo clippy -p rockstream-ops --lib -- -D warnings
+        # Align with the repository-wide strict Clippy command. This warning
+        # is already exempted there; unrelated formatting diagnostics in
+        # dependencies must not mask the focused commit-driver regressions.
+        run: cargo clippy -p rockstream-ops --lib -- -D warnings -A clippy::uninlined_format_args
