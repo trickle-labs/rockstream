@@ -37,6 +37,18 @@ impl ChannelCreditState {
     }
 }
 
+/// A bounded queued exchange waiter, released on every future exit path,
+/// including task abort and dropping a pending future.
+struct CreditWaiterSlot {
+    count: Arc<AtomicU64>,
+}
+
+impl Drop for CreditWaiterSlot {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// An RAII guard permit for exchange batch flow control.
 /// Automatically releases backpressure permits on Drop or explicit `release()`.
 pub struct FlowPermit {
@@ -116,6 +128,8 @@ pub struct FlowController {
     notifiers: Arc<Mutex<HashMap<CreditKey, Arc<Notify>>>>,
     aggregate_bytes: Arc<AtomicU64>,
     pending_requests: Arc<AtomicU64>,
+    /// Queued futures are distinct from in-flight delivered batch permits.
+    queued_credit_waiters: Arc<AtomicU64>,
     global_notify: Arc<Notify>,
     #[cfg(test)]
     pub(super) wait_barriers: Option<Arc<(tokio::sync::Barrier, tokio::sync::Barrier)>>,
@@ -145,6 +159,7 @@ impl FlowController {
             notifiers: Arc::new(Mutex::new(HashMap::new())),
             aggregate_bytes: Arc::new(AtomicU64::new(0)),
             pending_requests: Arc::new(AtomicU64::new(0)),
+            queued_credit_waiters: Arc::new(AtomicU64::new(0)),
             global_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             wait_barriers: None,
@@ -201,6 +216,33 @@ impl FlowController {
 
     pub fn pending_requests(&self) -> usize {
         self.pending_requests.load(Ordering::Relaxed) as usize
+    }
+
+    /// Queued exchange-credit futures (not in-flight delivered batch permits).
+    /// This is a separate bounded class sharing the same configured ceiling.
+    pub fn queued_credit_waiters(&self) -> usize {
+        self.queued_credit_waiters.load(Ordering::Acquire) as usize
+    }
+
+    fn reserve_credit_waiter(&self) -> Result<CreditWaiterSlot, String> {
+        loop {
+            let current = self.queued_credit_waiters.load(Ordering::Acquire);
+            if current >= self.max_pending_requests as u64 {
+                return Err(format!(
+                    "[{RS_3006}] RESOURCE_EXHAUSTED: queued exchange credit waiters exceed max_pending_requests ({}). Next steps: reduce concurrent shuffle demand or raise the configured limit.",
+                    self.max_pending_requests
+                ));
+            }
+            if self
+                .queued_credit_waiters
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(CreditWaiterSlot {
+                    count: Arc::clone(&self.queued_credit_waiters),
+                });
+            }
+        }
     }
 
     pub fn batches_in_flight(&self, exchange_id: u64, src_shard: u32, target_shard: u32) -> usize {
@@ -372,6 +414,7 @@ impl FlowController {
             ));
         }
 
+        let mut waiter = None;
         loop {
             let notified = self.global_notify.notified();
             tokio::pin!(notified);
@@ -387,6 +430,9 @@ impl FlowController {
                 Err(err) => {
                     if !err.contains("RESOURCE_EXHAUSTED") {
                         return Err(err);
+                    }
+                    if waiter.is_none() {
+                        waiter = Some(self.reserve_credit_waiter()?);
                     }
                     #[cfg(test)]
                     self.pause_before_wait().await;
@@ -610,6 +656,9 @@ impl FlowController {
         if self.try_acquire_rows(key, row_count) {
             return Ok(());
         }
+        // Reservation owns the decrement even if this future is cancelled
+        // before it reaches the Notify await.
+        let _waiter = self.reserve_credit_waiter()?;
 
         // Create waiter state only after admission failed. Register the notify
         // future *before* rechecking channels to avoid a lost wake when ACK
