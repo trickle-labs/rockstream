@@ -305,7 +305,9 @@ async fn failed_storage_flush_cannot_publish_subscription_epoch() {
     shard.set_fail_flushes(true);
     let preflight = shard.flush().await.unwrap_err();
     assert!(
-        preflight.to_string().contains("injected storage flush failure"),
+        preflight
+            .to_string()
+            .contains("injected storage flush failure"),
         "test must actively reject a durable flush"
     );
     let outcome = tokio::time::timeout(
