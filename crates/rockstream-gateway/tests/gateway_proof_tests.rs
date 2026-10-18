@@ -325,9 +325,9 @@ async fn v072_legacy_alter_cannot_reduce_memory_below_live_reservations() {
     set_state_budget(1_000);
 
     let catalog = Arc::new(CatalogStubs::new());
-    assert!(catalog.add_workload(
-        WorkloadDef::new("protected").with_memory_limit(MemoryLimit::new(100))
-    ));
+    assert!(
+        catalog.add_workload(WorkloadDef::new("protected").with_memory_limit(MemoryLimit::new(100)))
+    );
     catalog.add_view_in_namespace(CatalogView {
         name: "protected_view".to_owned(),
         sql: "SELECT 1".to_owned(),
