@@ -318,52 +318,59 @@ async fn alter_workload_updates_requested_fields() {
     handle.abort();
 }
 
-#[tokio::test]
-async fn v072_legacy_alter_cannot_reduce_memory_below_live_reservations() {
+#[test]
+fn v072_legacy_alter_cannot_reduce_memory_below_live_reservations() {
+    // Keep the global metrics test lock in synchronous scope throughout the
+    // test runtime, rather than holding a std::sync::MutexGuard across awaits.
     let _guard = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
-    rockstream_types::metrics::reset_all();
-    set_state_budget(1_000);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        rockstream_types::metrics::reset_all();
+        set_state_budget(1_000);
 
-    let catalog = Arc::new(CatalogStubs::new());
-    assert!(catalog
-        .add_workload(WorkloadDef::new("protected").with_memory_limit(MemoryLimit::new(100))));
-    catalog.add_view_in_namespace(CatalogView {
-        name: "protected_view".to_owned(),
-        sql: "SELECT 1".to_owned(),
-        columns: vec![],
-        namespace: "public".to_owned(),
-        op_id: None,
+        let catalog = Arc::new(CatalogStubs::new());
+        assert!(catalog
+            .add_workload(WorkloadDef::new("protected").with_memory_limit(MemoryLimit::new(100))));
+        catalog.add_view_in_namespace(CatalogView {
+            name: "protected_view".to_owned(),
+            sql: "SELECT 1".to_owned(),
+            columns: vec![],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        catalog.assign_view_workload("protected_view", "protected");
+        catalog.set_view_state_bytes("protected_view", 90, None);
+        assert_eq!(catalog.view_state("protected_view"), ViewState::Running);
+
+        let server = GatewayServer::with_catalog(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&catalog),
+            Arc::new(NoopViewReader),
+        );
+        let (address, handle) = server.serve_background().await.unwrap();
+        let client = connect_port(address.port()).await;
+        let err = client
+            .simple_query("ALTER WORKLOAD protected SET (MEMORY_LIMIT=80)")
+            .await
+            .expect_err("legacy ALTER must not bypass the reserved memory ceiling");
+        let db_error = err.as_db_error().expect("SQLSTATE response");
+        assert_eq!(db_error.code().code(), "54000");
+        assert!(db_error
+            .message()
+            .contains("requested limit 80 bytes is below 90 bytes"));
+
+        let requested = catalog.get_workload("protected").unwrap();
+        assert_eq!(requested.revision, 1);
+        assert_eq!(requested.memory_limit.unwrap().bytes, 100);
+        assert_eq!(catalog.view_state("protected_view"), ViewState::Running);
+        handle.abort();
+        drop(client);
+        rockstream_types::metrics::reset_all();
     });
-    catalog.assign_view_workload("protected_view", "protected");
-    catalog.set_view_state_bytes("protected_view", 90, None);
-    assert_eq!(catalog.view_state("protected_view"), ViewState::Running);
-
-    let server = GatewayServer::with_catalog(
-        "127.0.0.1:0".parse().unwrap(),
-        Arc::clone(&catalog),
-        Arc::new(NoopViewReader),
-    );
-    let (address, handle) = server.serve_background().await.unwrap();
-    let client = connect_port(address.port()).await;
-    let err = client
-        .simple_query("ALTER WORKLOAD protected SET (MEMORY_LIMIT=80)")
-        .await
-        .expect_err("legacy ALTER must not bypass the reserved memory ceiling");
-    let db_error = err.as_db_error().expect("SQLSTATE response");
-    assert_eq!(db_error.code().code(), "54000");
-    assert!(db_error
-        .message()
-        .contains("requested limit 80 bytes is below 90 bytes"));
-
-    let requested = catalog.get_workload("protected").unwrap();
-    assert_eq!(requested.revision, 1);
-    assert_eq!(requested.memory_limit.unwrap().bytes, 100);
-    assert_eq!(catalog.view_state("protected_view"), ViewState::Running);
-    handle.abort();
-    drop(client);
-    rockstream_types::metrics::reset_all();
 }
-
 #[tokio::test]
 async fn v072_conditional_alter_workload_conflict_and_restart_revision() {
     let dir = TempDir::new().unwrap();
