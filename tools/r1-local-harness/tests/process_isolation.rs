@@ -40,7 +40,10 @@ fn terminate_kills_shell_and_background_descendant() {
     {
         let stat = std::fs::read_to_string(format!("/proc/{descendant}/stat"));
         if let Ok(stat) = stat {
-            assert_eq!(stat.rsplit_once(") ").unwrap().1.split_whitespace().next(), Some("Z"));
+            assert_eq!(
+                stat.rsplit_once(") ").unwrap().1.split_whitespace().next(),
+                Some("Z")
+            );
         }
     }
     #[cfg(not(target_os = "linux"))]
