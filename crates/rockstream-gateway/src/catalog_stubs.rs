@@ -5834,7 +5834,12 @@ mod tests {
         );
         assert!(Arc::ptr_eq(
             &original,
-            catalog.workload_budgets.read().unwrap().get("live").unwrap()
+            catalog
+                .workload_budgets
+                .read()
+                .unwrap()
+                .get("live")
+                .unwrap()
         ));
 
         // A second view cannot acquire 50 bytes against a 100-byte
@@ -5851,7 +5856,12 @@ mod tests {
         assert_eq!(catalog.get_workload("live").unwrap().revision, 3);
         assert!(Arc::ptr_eq(
             &original,
-            catalog.workload_budgets.read().unwrap().get("live").unwrap()
+            catalog
+                .workload_budgets
+                .read()
+                .unwrap()
+                .get("live")
+                .unwrap()
         ));
 
         catalog.set_view_state_bytes("live_a", 0, None);
