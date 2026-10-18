@@ -257,12 +257,19 @@ impl ShardReader {
                     continue;
                 }
                 if !append_bounded_scan_entry(
-                    &mut results, &mut total_bytes, entry.key, entry.value, max_bytes,
+                    &mut results,
+                    &mut total_bytes,
+                    entry.key,
+                    entry.value,
+                    max_bytes,
                 ) {
                     return Ok((Vec::new(), true));
                 }
             }
-            let mut new_iter = self.reader.scan_prefix(format_v2_prefix(prefix), ..).await?;
+            let mut new_iter = self
+                .reader
+                .scan_prefix(format_v2_prefix(prefix), ..)
+                .await?;
             while let Some(entry) = new_iter.next().await? {
                 let key = logical_key_from_format_v2(&entry.key).ok_or_else(|| {
                     StorageError::Unsupported("invalid v2 storage key".to_string())
@@ -296,7 +303,11 @@ impl ShardReader {
                 entry.key
             };
             if !append_bounded_scan_entry(
-                &mut results, &mut total_bytes, key, entry.value, max_bytes,
+                &mut results,
+                &mut total_bytes,
+                key,
+                entry.value,
+                max_bytes,
             ) {
                 return Ok((Vec::new(), true));
             }
@@ -598,7 +609,10 @@ mod tests {
         assert_eq!(exact, reader.scan_prefix(b"v/").await.unwrap());
         let (partial, cut) = reader.scan_prefix_bounded(b"v/", 12).await.unwrap();
         assert!(cut);
-        assert!(partial.is_empty(), "partial snapshots must not appear complete");
+        assert!(
+            partial.is_empty(),
+            "partial snapshots must not appear complete"
+        );
         let (zero, cut) = reader.scan_prefix_bounded(b"v/", 0).await.unwrap();
         assert!(cut);
         assert!(zero.is_empty());
