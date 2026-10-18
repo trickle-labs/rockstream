@@ -248,12 +248,9 @@ async fn local_snapshot_scan_blocks_competing_commit_until_epoch_fence_releases(
     });
     commit_started_rx.await.unwrap();
     assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            &mut committing
-        )
-        .await
-        .is_err(),
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut committing)
+            .await
+            .is_err(),
         "a local COMMIT must not pass the snapshot epoch/read boundary"
     );
     assert_eq!(registry.latest_epoch("v072_epoch_fence"), None);
@@ -417,7 +414,10 @@ async fn failed_storage_flush_cannot_publish_subscription_epoch() {
     )
     .await
     .expect("flush should return the injected error without an unbounded stall");
-    assert!(outcome.is_err(), "a rejected durable flush must not acknowledge COMMIT");
+    assert!(
+        outcome.is_err(),
+        "a rejected durable flush must not acknowledge COMMIT"
+    );
     assert!(
         store
             .rejected_writes
@@ -426,6 +426,6 @@ async fn failed_storage_flush_cannot_publish_subscription_epoch() {
         "the test must actually inject failure in a committed SST write"
     );
     assert_eq!(registry.latest_epoch("v072_failed_flush"), None);
-    assert_eq!(registry.since_epoch("v072_failed_flush", 0), None);
+    assert!(registry.since_epoch("v072_failed_flush", 0).is_none());
     task.abort();
 }
