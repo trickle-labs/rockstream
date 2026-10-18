@@ -40,6 +40,7 @@ fn contributor_workflows_name_executable_commands() {
             "bash scripts/check-qualification-mutations.test.sh",
             "bash scripts/check-qualification-mutations.sh --output target/qualification-mutations.json",
             "bash scripts/run-release-qualification.sh --fast --output target/qualification-helpers.json",
+            "bash scripts/run-release-qualification.sh --suite recovery --output target/real-cluster-chaos/qualification.json",
         ]
     );
 }
