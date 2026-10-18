@@ -812,9 +812,7 @@ mod v072_credit_fastpath_tests {
         let controller = FlowController::with_row_budget(1).with_max_pending_requests(1);
         let permit = controller.try_acquire_batch_permit(7, 1, 2, 32, 1).unwrap();
         let waiting = controller.clone();
-        let task = tokio::spawn(async move {
-            waiting.acquire_batch_permit(7, 1, 2, 32, 1).await
-        });
+        let task = tokio::spawn(async move { waiting.acquire_batch_permit(7, 1, 2, 32, 1).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while controller.exchange_waiters() == 0 {
                 tokio::task::yield_now().await;
@@ -837,7 +835,10 @@ mod v072_credit_fastpath_tests {
         assert_eq!(controller.exchange_waiters(), 0);
         drop(permit);
         assert_eq!(controller.pending_requests(), 0);
-        let next = controller.acquire_batch_permit(7, 1, 2, 32, 1).await.unwrap();
+        let next = controller
+            .acquire_batch_permit(7, 1, 2, 32, 1)
+            .await
+            .unwrap();
         assert_eq!(controller.exchange_waiters(), 0);
         drop(next);
         assert_eq!(controller.pending_requests(), 0);
