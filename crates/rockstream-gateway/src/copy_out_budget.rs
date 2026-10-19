@@ -7,6 +7,19 @@
 pub const MAX_COPY_OUT_ROWS: usize = 10_000;
 /// Frozen v0.72 interactive maximum for encoded result bytes.
 pub const MAX_COPY_OUT_BYTES: usize = 8 * 1024 * 1024;
+/// Frozen v0.72 interactive wall-time ceiling (milliseconds).
+/// Applied to the producer read stage; it does not timebox network streaming.
+pub const MAX_COPY_OUT_READ_MS: u64 = 5_000;
+
+/// Bound the lifetime of one cancel-safe asynchronous producer read.
+/// On expiry, dropping the future releases owned reservations; detached
+/// producers must still implement their own cancellation/cleanup guarantees.
+pub async fn read_with_deadline<F: std::future::Future>(
+    deadline: std::time::Duration,
+    read: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout(deadline, read).await
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyOutLimitError {
@@ -55,6 +68,46 @@ pub fn check_copy_out_bounds(rows: &[Vec<u8>]) -> Result<(), CopyOutLimitError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn v072_read_deadline_drops_blocked_producer_before_any_result() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let owned = Arc::clone(&released);
+        let blocked_read = async move {
+            let _permit = OnDrop(owned);
+            std::future::pending::<Vec<u8>>().await
+        };
+        let result = read_with_deadline(std::time::Duration::from_millis(20), blocked_read).await;
+        assert!(result.is_err());
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the timeout must drop the reader's owned resources"
+        );
+    }
+
+    #[tokio::test]
+    async fn v072_read_deadline_keeps_ready_results_and_producer_errors() {
+        let duration = std::time::Duration::from_millis(100);
+        let ready = read_with_deadline(duration, async { Ok::<_, &str>(vec![1, 2, 3]) })
+            .await
+            .unwrap();
+        assert_eq!(ready, Ok(vec![1, 2, 3]));
+        let error =
+            read_with_deadline(duration, async { Err::<Vec<u8>, &str>("producer failure") })
+                .await
+                .unwrap();
+        assert_eq!(error, Err("producer failure"));
+    }
 
     #[test]
     fn copy_out_valid_rows_include_newline_in_encoded_budget() {

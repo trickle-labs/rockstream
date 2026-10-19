@@ -18,8 +18,8 @@ PROSE_DIRS = (
     "docs/implementation-plans/", "sign-offs/",
 )
 HEAVY_JOBS = (
-    "check-tests", "postgres-differential", "control-plane-ha", "formal-verify",
-    "nexmark-regression-gate", "benchmark", "docker-build",
+    "check-tests", "gateway", "postgres-differential",
+    "control-plane-ha", "formal-verify", "docker-build",
 )
 
 
@@ -50,14 +50,19 @@ def scope_for_event(event_name: str, event: dict) -> str:
 
 
 def check_results(needs: dict) -> str:
-    classification = needs.get("classify-changes", {})
-    scope = classification.get("outputs", {}).get("scope")
-    if classification.get("result") != "success" or scope not in ("full", "prose"):
+    classification = needs.get("ci-policy", {})
+    outputs = classification.get("outputs", {})
+    scope = outputs.get("scope")
+    expected_expensive = {"full": "true", "prose": "false"}.get(scope)
+    if (classification.get("result") != "success"
+            or expected_expensive is None
+            or outputs.get("expensive") != expected_expensive):
         raise ValueError("CI classification did not succeed with a valid scope")
-    expected = {"classify-changes", "check-quality", "verus-verify", *HEAVY_JOBS}
+    expected = {"ci-policy", "check-quality", "verus-verify",
+                "nexmark-regression-gate", "benchmark", *HEAVY_JOBS}
     if set(needs) != expected:
         raise ValueError("CI dependency set differs from the required jobs")
-    for job in sorted(expected - {"classify-changes"}):
+    for job in sorted(expected - {"ci-policy"}):
         allowed = {"success", "skipped"} if scope == "prose" and job in HEAVY_JOBS else {"success"}
         result = needs[job].get("result")
         if result not in allowed:

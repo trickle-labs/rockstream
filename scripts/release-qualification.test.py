@@ -42,10 +42,13 @@ class QualificationTests(unittest.TestCase):
             "status": "FAILED" if errors else "PASSED",
             "evidence_kind": "helper" if settings["fast"] else "release",
             "release_qualified": False,
+            "qualification_scope": [],
+            "unsupported_claims": Q.UNSUPPORTED,
+            "application_proof": None,
             "candidate": CANDIDATE,
             "settings": settings,
             "services": services or {},
-            "processes": [{"target": "fixture", "command": ["fixture"], "exit_code": exit_code,
+            "processes": [{"target": "fixture", "evidence_kind": "helper", "command": ["fixture"], "exit_code": exit_code,
                            "scenarios": scenarios, "errors": list(process_errors)}] if processes else [],
             "scenarios": scenarios,
             "scenarios_passed": sum(status == "passed" for _, status in cases),
@@ -68,13 +71,21 @@ class QualificationTests(unittest.TestCase):
             (path / "fixture.rs").write_text(source)
             build = subprocess.run(["rustc", "--test", str(path / "fixture.rs"), "-o", str(path / "fixture")],
                                    capture_output=True, text=True, check=False)
-            self.assertEqual((build.returncode, build.stdout, build.stderr), (0, "", ""))
+            self.assertEqual((build.returncode, build.stdout), (0, ""), build.stderr)
             return subprocess.run([str(path / "fixture"), "--format=pretty", "--color=never", "--test-threads=1"],
                                   capture_output=True, text=True, check=False)
 
     def test_empty_selection(self):
         self.assertEqual(Q.make_report((), [], CANDIDATE, SETTINGS),
                          self.expected(errors=("zero mandatory execution",), processes=False))
+
+    def test_toolchain_diagnostics_do_not_change_executed_evidence(self):
+        build = subprocess.CompletedProcess(["rustc"], 0, "", "info: syncing channel updates for 1.88\n")
+        execution = subprocess.CompletedProcess(["fixture"], 0, VALID, "")
+        with patch.object(subprocess, "run", side_effect=[build, execution]):
+            result = self.run_fixture("// compiler diagnostic fixture\n")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, VALID, ""))
+        self.assertEqual(self.report(result.stdout), self.expected(cases=PASSED))
 
     def test_comment_only_input(self):
         result = self.run_fixture("// #[test] fn positive() {}\n// #[test] fn negative_control() {}\n")
@@ -229,6 +240,167 @@ class QualificationTests(unittest.TestCase):
                 self.assertEqual(path.read_text(), json.dumps(expected, indent=2, sort_keys=True) + "\n")
                 self.assertEqual(stdout.getvalue(), path.read_text())
                 execute.assert_called_once_with(command)
+
+
+class RecoveryQualificationTests(unittest.TestCase):
+    def setUp(self):
+        self.target = "qualification_recovery_tests"
+        self.settings = dict(SETTINGS, suite="recovery", fast=False)
+        manifest_bytes = (Q.ROOT / "docs/testing/worker-failure-kafka-minio-v1.json").read_bytes()
+        manifest = json.loads(manifest_bytes)
+        # Synthetic report-shape fixture; application correctness is checked by the Rust validator.
+        observations = {
+            "scenario_id": "worker-failure-kafka-minio-v1",
+            "manifest_sha256": Q.hashlib.sha256(manifest_bytes).hexdigest(),
+            "revision": CANDIDATE["commit_sha"], "fault_at_ms": 1000,
+            "detection": {"timestamp_ms": 1100}, "ownership_observed_at_ms": 1200,
+            "first_correct_query_at_ms": 1500, "query_frontier": 5, "query_rows": ["1\tc"],
+            "before": {"process_id": 11}, "after": {"process_id": 22},
+            "sink_records": manifest["expected_sink"],
+        }
+        application = {"candidate": CANDIDATE, "observations": observations,
+                       "recovery_durations_ms": {"detection": 100, "ownership": 200, "query": 500},
+                       "status": "PASSED", "error": None}
+        controls = {}
+        for name, reason in Q.CONTROL_FAILURES.items():
+            record = json.loads(json.dumps(application))
+            record.update(status="FAILED", error=reason)
+            data = record["observations"]
+            if name == "missing_event":
+                del data["detection"]
+            elif name == "constant_timings":
+                record["recovery_durations_ms"] = {"detection": 0, "ownership": 0, "query": 0}
+            elif name == "stale_query":
+                data["query_frontier"] = 3
+            elif name == "changed_value":
+                data["query_rows"] = ["1\twrong"]
+            elif name == "duplicate_output":
+                data["sink_records"].append(data["sink_records"][2])
+            elif name == "helper_only_status":
+                data["after"]["process_id"] = 11
+            controls[name] = record
+        self.records = {"application": application, "negative_controls": controls}
+        registry = patch.object(Q, "CHECKS", {self.target: ("fixture-package", ("helper",))})
+        registry.start()
+        self.addCleanup(registry.stop)
+        self.processes = [
+            {"target": self.target, "command": ["helper"], "exit_code": 0,
+             "scenarios": [{"id": f"{self.target}::helper", "status": "passed"}], "errors": []},
+            {"target": Q.APPLICATION_TARGET, "command": ["application"], "exit_code": 0,
+             "scenarios": [{"id": f"{Q.APPLICATION_TARGET}::{Q.APPLICATION_CASE}", "status": "passed"}],
+             "errors": []},
+        ]
+
+    def expected(self, records, errors=(), omissions=()):
+        return {
+            "status": "FAILED" if errors else "PASSED", "evidence_kind": "release",
+            "release_qualified": not errors,
+            "qualification_scope": [] if errors else ["worker-failure-kafka-minio-v1"],
+            "unsupported_claims": Q.UNSUPPORTED, "application_proof": records,
+            "candidate": CANDIDATE, "settings": self.settings, "services": {"docker": "available"},
+            "processes": [{**process, "evidence_kind": "application" if process["target"] == Q.APPLICATION_TARGET
+                           else "helper"} for process in self.processes],
+            "scenarios": sorted([case for process in self.processes for case in process["scenarios"]],
+                                key=lambda case: case["id"]),
+            "scenarios_passed": 2, "scenarios_failed": 0, "scenarios_ignored": 0,
+            "mandatory_omissions": list(omissions), "mandatory_skipped": len(omissions), "errors": list(errors),
+        }
+
+    def report(self, records):
+        return Q.make_report((self.target,), self.processes, CANDIDATE, self.settings,
+                             {"docker": "available"}, records)
+
+    def test_complete_success_and_each_corrupted_qualification_report(self):
+        self.assertEqual(self.report(self.records), self.expected(self.records))
+        for name, rejected in self.records["negative_controls"].items():
+            with self.subTest(control=name):
+                records = dict(self.records, application=rejected)
+                self.assertEqual(self.report(records), self.expected(
+                    records, errors=("invalid executed recovery qualification records",)))
+
+    def test_missing_observations_controls_and_wrong_candidate_fail_closed(self):
+        self.assertEqual(self.report(None), self.expected(None,
+            errors=("mandatory checks or observations omitted",), omissions=("live::worker-failure-kafka-minio-v1",)))
+        for field in ("negative_controls", "application"):
+            records = dict(self.records)
+            del records[field]
+            self.assertEqual(self.report(records), self.expected(
+                records, errors=("invalid executed recovery qualification records",)))
+        records = json.loads(json.dumps(self.records))
+        records["application"]["candidate"]["commit_sha"] = "f" * 40
+        self.assertEqual(self.report(records), self.expected(
+            records, errors=("invalid executed recovery qualification records",)))
+        for malformed in (None, {}, "not records"):
+            records = json.loads(json.dumps(self.records))
+            records["application"]["observations"]["sink_records"] = malformed
+            self.assertEqual(self.report(records), self.expected(
+                records, errors=("invalid executed recovery qualification records",)))
+
+    def test_application_transcript_requires_exact_selection_and_success(self):
+        output = (f"running 1 test\ntest {Q.APPLICATION_CASE} ... ok\n"
+                  "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0s\n")
+        expected = ([{"id": f"{Q.APPLICATION_TARGET}::{Q.APPLICATION_CASE}", "status": "passed"}], [])
+        self.assertEqual(Q.parse_results(Q.APPLICATION_TARGET, output, filtered=1), expected)
+        self.assertEqual(Q.parse_results(Q.APPLICATION_TARGET, output.replace("1 filtered", "2 filtered"), filtered=1),
+                         (expected[0], [f"{Q.APPLICATION_TARGET}: missing or inconsistent test summary"]))
+
+    def test_entrypoint_executes_application_in_fresh_directory(self):
+        self.run_entrypoint()
+
+    def test_entrypoint_rejects_absent_artifact_despite_passing_test(self):
+        self.run_entrypoint(publish=False)
+
+    def test_entrypoint_rejects_candidate_change_during_execution(self):
+        self.run_entrypoint(changed=True)
+
+    def run_entrypoint(self, publish=True, changed=False):
+        helper_output = ("running 1 test\ntest helper ... ok\n"
+                         "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n")
+        application_output = (f"running 1 test\ntest {Q.APPLICATION_CASE} ... ok\n"
+                              "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0s\n")
+        def execute(command, **kwargs):
+            if kwargs:
+                env = kwargs["env"]
+                self.assertEqual(json.loads(env["ROCKSTREAM_QUALIFICATION_CANDIDATE"]), CANDIDATE)
+                path = Path(env["ROCKSTREAM_CHAOS_ARTIFACT_DIR"]) / "qualification-records.json"
+                self.assertFalse(path.exists())
+                if publish:
+                    path.write_text(json.dumps(self.records))
+                self.processes[1]["command"] = command
+                return subprocess.CompletedProcess(command, 0, application_output, "")
+            self.processes[0]["command"] = command
+            return subprocess.CompletedProcess(command, 0, helper_output, "")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True), \
+                patch.object(Q, "SUITES", {"recovery": (self.target,)}), \
+                patch.object(Q, "candidate_identity", side_effect=[CANDIDATE, dict(CANDIDATE, commit_sha="f" * 40)
+                                                                  if changed else CANDIDATE]), \
+                patch.object(Q, "check_services", return_value={"docker": "available"}), \
+                patch.object(Q, "execute", side_effect=execute) as execution:
+            path = Path(directory) / "report.json"
+            with patch.object(sys, "argv", ["qualification", "--suite", "recovery", "--output", str(path)]), \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(Q.main(), int(not publish or changed))
+            errors = []
+            if not publish:
+                errors.append("missing or malformed executed recovery qualification records")
+            if changed:
+                errors.append("candidate changed during qualification")
+            self.processes[1]["errors"] = list(errors)
+            if not publish:
+                errors.append("mandatory checks or observations omitted")
+            expected = self.expected(self.records if publish else None, errors=errors,
+                                     omissions=() if publish else ("live::worker-failure-kafka-minio-v1",))
+            self.assertEqual(path.read_text(), json.dumps(expected, indent=2, sort_keys=True) + "\n")
+            self.assertEqual(stdout.getvalue(), path.read_text())
+            self.assertEqual(stderr.getvalue(), application_output + "\n" if errors else "")
+            self.assertEqual([call.args[0] for call in execution.call_args_list], [
+                ["cargo", "test", "--locked", "-p", "fixture-package", "--test", self.target,
+                 "--", "--format=pretty", "--color=never", "--test-threads=1"],
+                ["cargo", "test", "--locked", "-p", "rockstream-sim", "--features", "simulation,docker_tests",
+                 "--test", Q.APPLICATION_TARGET, Q.APPLICATION_CASE, "--", "--exact", "--format=pretty",
+                 "--color=never", "--test-threads=1"],
+            ])
 
 
 if __name__ == "__main__":

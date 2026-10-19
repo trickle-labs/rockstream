@@ -2,6 +2,8 @@
 
 # Release workflows and prompts
 /.github/workflows/ @rockstream-maintainers
+/.github/actions/ @rockstream-maintainers
+/scripts/ci-* @rockstream-maintainers
 /.github/prompts/ @rockstream-maintainers
 
 # Formal verification specifications and plans

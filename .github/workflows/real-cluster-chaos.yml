@@ -28,6 +28,8 @@ on:
       - "formal/edge_*.fizz"
       - "Dockerfile"
       - "docs/testing/worker-failure-kafka-minio-v1.json"
+      - "scripts/release-qualification*"
+      - "scripts/run-release-qualification.sh"
       - ".github/workflows/real-cluster-chaos.yml"
 
 concurrency:
@@ -47,10 +49,12 @@ jobs:
           toolchain: "1.88"
       - name: Require Docker
         run: docker info
-      - name: Run worker-failure recovery proof
-        env:
-          ROCKSTREAM_CHAOS_ARTIFACT_DIR: ${{ github.workspace }}/target/real-cluster-chaos
-        run: cargo test -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests worker_failure_recovery_from_view_and_kafka -- --exact
+      - name: Test qualification record validation
+        run: |
+          bash scripts/check-qualification-mutations.test.sh
+          cargo test --locked -p rockstream-sim --lib qualification::worker_failure
+      - name: Qualify observed worker-failure recovery and corrupted records
+        run: bash scripts/run-release-qualification.sh --suite recovery --output target/real-cluster-chaos/qualification.json
       - name: Upload real-cluster chaos artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -60,4 +64,4 @@ jobs:
           if-no-files-found: error
       - name: Append chaos summary to job summary
         if: always()
-        run: cat "${{ github.workspace }}/target/real-cluster-chaos/real-cluster-chaos-summary.md" >> "$GITHUB_STEP_SUMMARY"
+        run: cat target/real-cluster-chaos/recovery-*/real-cluster-chaos-summary.md >> "$GITHUB_STEP_SUMMARY"

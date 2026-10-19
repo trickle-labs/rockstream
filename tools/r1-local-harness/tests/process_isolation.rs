@@ -34,5 +34,18 @@ fn terminate_kills_shell_and_background_descendant() {
     process.terminate(Duration::from_millis(100)).unwrap();
     thread::sleep(Duration::from_millis(20));
     assert!(unsafe { libc::kill(process.pid(), 0) } == -1);
+    // An orphaned Linux child may remain as a zombie awaiting PID 1.
+    // A zombie is no longer executing; other Unix platforms reap normally.
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{descendant}/stat"));
+        if let Ok(stat) = stat {
+            assert_eq!(
+                stat.rsplit_once(") ").unwrap().1.split_whitespace().next(),
+                Some("Z")
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     assert!(unsafe { libc::kill(descendant, 0) } == -1);
 }

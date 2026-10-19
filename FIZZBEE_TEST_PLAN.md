@@ -695,6 +695,26 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #202 preserves secret readability across failed or interrupted KEK
+rotation in `crates/rockstream-control`. Rotation excludes secret reads and
+mutations, stages every rewrapped envelope, and publishes one atomic SlateDB
+batch or in-memory catalog replacement. Staging failures leave stored envelopes
+unchanged. Submitted writes retain their synchronization guards after caller
+cancellation, and rotation acknowledges success only after durable storage
+completes. Both providers remain available around ambiguous commits; restart
+recovery uses `RetainedKekProvider` and retries with the replacement provider.
+These local synchronization, encryption-provider, and storage-I/O guarantees
+are outside the M1–M7 FizzBee state machines and rely on SlateDB atomicity and
+durability as described in ADR 0006. Runtime assertions live in
+`crates/rockstream-control/tests/secrets_rotation_failure_tests.rs`:
+`failed_second_wrap_preserves_every_secret_and_allows_retry` compares complete
+same-named secrets across namespaces and verifies unchanged catalog bytes after
+staging failure; `submitted_rotation_survives_cancellation_and_wal_errors`
+checks cancellation, WAL faults, exact reopened envelopes, and complete payloads
+after retained-key recovery. The suite also covers concurrent operations,
+successful rotation, legacy mixed generations, and catalog/audit redaction.
+These tests do not claim live KMS or abrupt process-termination qualification.
+
 Issue #126 observes the existing M4 worker-disconnect and lease-reassignment
 path together with M3 Kafka transaction recovery. `ControlService` emits the
 `worker.disconnected` audit event when the worker session ends, before removing
@@ -1317,3 +1337,33 @@ These transitions are exercised by
 `crates/rockstream-runtime/tests/v072_quota_lifecycle.rs`. Subsequent
 modeling must include shard-removal/restart cleanup, quota propagation, and
 fair competing-workload liveness before v0.72 can claim integrated proof.
+
+## v0.72 exchange row-credit fast admission (issue #134)
+
+`FlowController::acquire_credit` now attempts its existing channel-lock
+reservation before accessing or creating the per-key notifier. This preserves
+the same credit transition while eliminating waiter bookkeeping on the
+immediate-admission path; it does **not** alter epoch order, the shard lease,
+acknowledgement identity, or durable commit semantics.
+
+The protocol transitions for subsequent FizzBee refinement are:
+
+- **Fast admission:** while holding the channel state lock, grant only if
+  `available_rows >= requested_rows`. Subtract once and add exactly the same
+  count to `rows_in_flight`. A failed attempt performs neither mutation and
+  does not register a waiter. Oversized requests reject before creating state.
+- **Waiter registration:** on insufficient credit, find/create the per-key
+  notifier, enable the notification future, then **recheck** channel credits
+  under the same lock. An ACK racing with registration must either expose
+  available credits to that recheck or notify an enabled waiter.
+- **Release:** an acknowledged row reservation returns at most its recorded
+  credit to the same channel, preserving the hard window. Aborted waiters do
+  not consume credits or leave phantom in-flight reservations.
+- **Teardown:** concurrent exchange destruction must not strand pending work
+  or allow stale acknowledgements to grant a different exchange credit.
+
+Three regression tests in `crates/rockstream-runtime/src/exchange/flow_control.rs`
+check the uncontended ledger, waiter ACK race, and pre-admission rejection.
+The repository's frozen exchange-flow performance gate must still be measured
+and pass; these unit tests and this transition mapping are **not** formal
+model checking or complete #134/#132 capacity qualification.

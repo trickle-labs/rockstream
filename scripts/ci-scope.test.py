@@ -24,9 +24,12 @@ EVENT = {"pull_request": {"base": {"sha": BASE}, "head": {"sha": HEAD}}}
 
 def needs_for(lane):
     return {
-        "classify-changes": {"result": "success", "outputs": {"scope": lane}},
+        "ci-policy": {"result": "success", "outputs": {
+            "scope": lane, "expensive": "false" if lane == "prose" else "true"}},
         "check-quality": {"result": "success"},
         "verus-verify": {"result": "success"},
+        "nexmark-regression-gate": {"result": "success"},
+        "benchmark": {"result": "success"},
         **{job: {"result": "skipped" if lane == "prose" else "success"}
            for job in scope.HEAVY_JOBS},
     }
@@ -155,7 +158,7 @@ class ScopeTests(unittest.TestCase):
 
     def test_gate_rejects_failed_cancelled_or_unexpectedly_skipped_jobs(self):
         for lane in ("full", "prose"):
-            for job in ("check-quality", "verus-verify", *scope.HEAVY_JOBS):
+            for job in ("check-quality", "verus-verify", "nexmark-regression-gate", "benchmark", *scope.HEAVY_JOBS):
                 for result in ("failure", "cancelled", "skipped", "", "pending"):
                     with self.subTest(lane=lane, job=job, result=result):
                         needs = needs_for(lane)
@@ -173,7 +176,7 @@ class ScopeTests(unittest.TestCase):
         for job in needs_for("full"):
             needs = needs_for("full")
             del needs[job]
-            message = ("CI classification did not succeed with a valid scope" if job == "classify-changes"
+            message = ("CI classification did not succeed with a valid scope" if job == "ci-policy"
                        else "CI dependency set differs from the required jobs")
             with self.subTest(missing=job):
                 self.assertEqual(self.run_main("check", {"CI_NEEDS": json.dumps(needs)}),
@@ -186,7 +189,7 @@ class ScopeTests(unittest.TestCase):
                                {"result": "cancelled", "outputs": {"scope": "prose"}},
                                {"result": "success", "outputs": {"scope": "unknown"}}):
             needs = needs_for("prose")
-            needs["classify-changes"] = classification
+            needs["ci-policy"] = classification
             with self.subTest(classification=classification):
                 self.assertEqual(self.run_main("check", {"CI_NEEDS": json.dumps(needs)}),
                                  (1, "", "::error::CI classification did not succeed with a valid scope\n"))
