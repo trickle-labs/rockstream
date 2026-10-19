@@ -985,8 +985,15 @@ impl WorkerBudgetLedger {
         }
     }
 
+    /// Release a waiter slot without wrapping an empty queue to u64::MAX.
+    ///
+    /// A duplicate release cannot permanently make the queue appear full.
     pub fn decrement_waiters(&self) {
-        self.waiter_count.fetch_sub(1, Ordering::SeqCst);
+        let _ = self
+            .waiter_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            });
     }
 
     pub fn category_bytes(&self, category: MemoryCategory) -> u64 {
