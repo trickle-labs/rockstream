@@ -2,6 +2,9 @@
 
 This document outlines the authoritative sequencing, shard mobility semantics, and state compatibility rules for executing zero-downtime rolling upgrades across RockStream clusters.
 
+The exact worker replacement qualification and its supported boundaries are
+documented in [Rolling-upgrade qualification](testing/rolling-upgrade.md).
+
 ---
 
 ## 1. Rolling Upgrade Sequencing

@@ -153,7 +153,7 @@ fn saturated_operator_release_does_not_remove_sibling_workload_charges() {
 
 #[test]
 fn workload_and_operator_counter_overflow_rejects_without_saturating() {
-    let workload = WorkloadBudget::new(WorkloadId(76), 0);
+    let workload = WorkloadBudget::new(WorkloadId(76), u64::MAX);
     workload.try_acquire(u64::MAX).unwrap();
     assert_eq!(
         workload.try_acquire(1),
@@ -181,4 +181,49 @@ fn workload_and_operator_counter_overflow_rejects_without_saturating() {
     assert_eq!(operator.current_bytes(), u64::MAX);
     operator.release(u64::MAX);
     assert_eq!(operator.current_bytes(), 0);
+}
+
+#[test]
+fn reset_and_drop_release_only_the_original_operator_charge() {
+    let workload = Arc::new(WorkloadBudget::new(WorkloadId(77), 1000));
+    let first = StateBudget::new_with_workload("first", 800, Some(workload.clone()));
+    let second = StateBudget::new_with_workload("second", 800, Some(workload.clone()));
+
+    first.try_acquire(300).unwrap();
+    second.try_acquire(400).unwrap();
+    assert_eq!(
+        (
+            first.current_bytes(),
+            second.current_bytes(),
+            workload.current_bytes()
+        ),
+        (300, 400, 700)
+    );
+    first.release(u64::MAX);
+    assert_eq!(
+        (
+            first.current_bytes(),
+            second.current_bytes(),
+            workload.current_bytes()
+        ),
+        (0, 400, 400)
+    );
+    first.try_acquire(100).unwrap();
+    first.reset();
+    assert_eq!(
+        (
+            first.current_bytes(),
+            second.current_bytes(),
+            workload.current_bytes()
+        ),
+        (0, 400, 400)
+    );
+    first.try_acquire(100).unwrap();
+    drop(first);
+    assert_eq!(
+        (second.current_bytes(), workload.current_bytes()),
+        (400, 400)
+    );
+    drop(second);
+    assert_eq!(workload.current_bytes(), 0);
 }

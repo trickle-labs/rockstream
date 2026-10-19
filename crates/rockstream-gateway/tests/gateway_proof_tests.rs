@@ -318,6 +318,59 @@ async fn alter_workload_updates_requested_fields() {
     handle.abort();
 }
 
+#[test]
+fn v072_legacy_alter_cannot_reduce_memory_below_live_reservations() {
+    // Keep the global metrics test lock in synchronous scope throughout the
+    // test runtime, rather than holding a std::sync::MutexGuard across awaits.
+    let _guard = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        rockstream_types::metrics::reset_all();
+        set_state_budget(1_000);
+
+        let catalog = Arc::new(CatalogStubs::new());
+        assert!(catalog
+            .add_workload(WorkloadDef::new("protected").with_memory_limit(MemoryLimit::new(100))));
+        catalog.add_view_in_namespace(CatalogView {
+            name: "protected_view".to_owned(),
+            sql: "SELECT 1".to_owned(),
+            columns: vec![],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        catalog.assign_view_workload("protected_view", "protected");
+        catalog.set_view_state_bytes("protected_view", 90, None);
+        assert_eq!(catalog.view_state("protected_view"), ViewState::Running);
+
+        let server = GatewayServer::with_catalog(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&catalog),
+            Arc::new(NoopViewReader),
+        );
+        let (address, handle) = server.serve_background().await.unwrap();
+        let client = connect_port(address.port()).await;
+        let err = client
+            .simple_query("ALTER WORKLOAD protected SET (MEMORY_LIMIT=80)")
+            .await
+            .expect_err("legacy ALTER must not bypass the reserved memory ceiling");
+        let db_error = err.as_db_error().expect("SQLSTATE response");
+        assert_eq!(db_error.code().code(), "54000");
+        assert!(db_error
+            .message()
+            .contains("requested limit 80 bytes is below 90 bytes"));
+
+        let requested = catalog.get_workload("protected").unwrap();
+        assert_eq!(requested.revision, 1);
+        assert_eq!(requested.memory_limit.unwrap().bytes, 100);
+        assert_eq!(catalog.view_state("protected_view"), ViewState::Running);
+        handle.abort();
+        drop(client);
+        rockstream_types::metrics::reset_all();
+    });
+}
 #[tokio::test]
 async fn v072_conditional_alter_workload_conflict_and_restart_revision() {
     let dir = TempDir::new().unwrap();
@@ -708,6 +761,75 @@ async fn v072_copy_out_row_cap_fails_before_streaming() {
             .contains("COPY OUT rows 10001 exceed limit 10000"),
         "the preflight must reject the entire oversized response"
     );
+}
+
+/// A read that never returns must be cancelled before COPY OUT framing.
+/// This is intentionally a real PgWire path, not a synthetic API-only test.
+struct HangingCopyReader {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ReadCancelGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ReadCancelGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl ViewReader for HangingCopyReader {
+    async fn read_view(
+        &self,
+        _view_name: &str,
+        _limit: Option<usize>,
+        _strategy: ViewReadStrategy,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        let _guard = ReadCancelGuard(Arc::clone(&self.cancelled));
+        std::future::pending().await
+    }
+
+    fn published_frontier(&self) -> Option<u64> {
+        Some(1)
+    }
+}
+
+#[tokio::test]
+async fn v072_copy_out_read_timeout_emits_error_without_copy_stream() {
+    let catalogue = Arc::new(CatalogStubs::new());
+    catalogue.add_view_in_namespace(CatalogView {
+        name: "slow_mv".to_owned(),
+        sql: "SELECT v FROM base".to_owned(),
+        columns: vec![CatalogColumn {
+            name: "v".to_owned(),
+            data_type: "Utf8".to_owned(),
+        }],
+        namespace: "public".to_owned(),
+        op_id: None,
+    });
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = Arc::new(HangingCopyReader {
+        cancelled: Arc::clone(&cancelled),
+    });
+    let server = GatewayServer::with_catalog("127.0.0.1:0".parse().unwrap(), catalogue, reader);
+    let (addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.simple_query("COPY slow_mv TO STDOUT"),
+    )
+    .await
+    .expect("producer read deadline must terminate the query");
+    let error = result.expect_err("COPY OUT must fail before its first data frame");
+    let db_error = error.as_db_error().expect("typed PostgreSQL timeout error");
+    assert_eq!(db_error.code().code(), "57014");
+    assert!(db_error.message().contains("copy_out.read_timeout"));
+    assert!(db_error.message().contains("5000ms"));
+    assert!(
+        cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "timed-out read must release the producer's owned future"
+    );
+    handle.abort();
 }
 
 /// Build a PostgreSQL startup message for user/dbname.

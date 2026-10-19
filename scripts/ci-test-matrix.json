@@ -21,6 +21,9 @@
     "rockstream-gateway": "pr-gateway"
   },
   "sim_lib_job": "pr-sim-unit",
+  "target_jobs": {
+    "rockstream-gateway/test:pg18_differential_conformance_tests": "pr-postgres-differential"
+  },
   "sim_groups": {
     "pr-sim": [
       "accounting_gate_tests",
@@ -106,7 +109,11 @@
     "pr-workspace": {
       "tier": "pull_request",
       "features": [],
-      "services": []
+      "services": [],
+      "test_threads": {
+        "rockstream-types/test:canonical_type_tests": 4,
+        "rockstream-types/test:arrangement_spec_isolation_tests": 4
+      }
     },
     "pr-crates": {
       "tier": "pull_request",
@@ -135,6 +142,21 @@
       "services": [
         "docker"
       ],
+      "conformance_targets": [
+        "rockstream-gateway/test:auth_scram_tests",
+        "rockstream-gateway/test:gateway_dml_tests",
+        "rockstream-gateway/test:gateway_extended_query_tests",
+        "rockstream-gateway/test:gateway_integration_tests",
+        "rockstream-gateway/test:gateway_proof_tests",
+        "rockstream-gateway/test:golden_wire_tests",
+        "rockstream-gateway/test:listen_notify_tests",
+        "rockstream-gateway/test:transaction_savepoint_tests"
+      ]
+    },
+    "pr-postgres-differential": {
+      "tier": "pull_request",
+      "features": [],
+      "services": ["docker"],
       "include_ignored_targets": [
         "rockstream-gateway/test:pg18_differential_conformance_tests"
       ]
@@ -238,6 +260,7 @@
     },
     "rockstream-sim/test:rolling_upgrade_tests": {
       "features": [
+        "simulation",
         "docker_tests"
       ],
       "services": [

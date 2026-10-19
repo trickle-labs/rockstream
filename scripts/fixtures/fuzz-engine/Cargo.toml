@@ -1,0 +1,31 @@
+[package]
+name = "fuzz-engine-fixtures"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+
+[[bin]]
+name = "deliberate_failure"
+path = "deliberate_failure.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "healthy"
+path = "healthy.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "zero_execution"
+path = "zero_execution.rs"
+test = false
+doc = false

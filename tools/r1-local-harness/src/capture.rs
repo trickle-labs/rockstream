@@ -114,8 +114,8 @@ pub fn capture_process(
         .context("capture deadline overflow")?;
     let mut samples: Vec<ProcessCounterSample> = Vec::new();
     while Instant::now() < deadline {
-        if let Some(status) = child.try_wait()? {
-            bail!("observed process {pid} exited before the capture ended: {status}");
+        if child.has_exited()? {
+            bail!("observed process {pid} exited before the capture ended");
         }
         let point =
             process_snapshot(pid).with_context(|| format!("sample spawned process {pid}"))?;
@@ -142,8 +142,8 @@ pub fn capture_process(
     if samples.len() < 2 {
         bail!("fewer than two observed process samples");
     }
-    if let Some(status) = child.try_wait()? {
-        bail!("observed process {pid} exited before the capture completed: {status}");
+    if child.has_exited()? {
+        bail!("observed process {pid} exited before the capture completed");
     }
     let measurement_duration_ns = start
         .elapsed()

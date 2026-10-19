@@ -140,7 +140,10 @@ impl WorkloadBudget {
             let proposed = current
                 .checked_add(bytes)
                 .ok_or_else(|| quota_overflow_error("workload-memory", current, bytes))?;
-            if self.max_bytes > 0 && proposed > self.max_bytes {
+            // WorkloadDef::memory_limit=None means unbounded. Some(0) is a
+            // real hard limit, not an unlimited sentinel: only a zero-byte
+            // reservation may be admitted at zero capacity.
+            if proposed > self.max_bytes {
                 return Err(StateBudgetError {
                     operator_name: format!("workload-{}", self.workload_id.0),
                     max_bytes: self.max_bytes,
@@ -208,6 +211,23 @@ impl WorkloadBudget {
 }
 
 // ─── StateBudget ─────────────────────────────────────────────────────────────
+
+/// Atomically account restored state even when it exceeds the active soft or
+/// hard policy. Recovery must never make usage counters wrap to zero.
+fn checked_force_add(counter: &AtomicU64, bytes: u64, label: &str) -> Result<(), StateBudgetError> {
+    loop {
+        let current = counter.load(Ordering::Relaxed);
+        let next = current
+            .checked_add(bytes)
+            .ok_or_else(|| quota_overflow_error(label, current, bytes))?;
+        if counter
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+}
 
 /// An operator-scoped state budget: tracks how many bytes of arrangement state
 /// are in use and rejects acquisitions that would exceed the declared limit.
@@ -356,16 +376,23 @@ impl StateBudget {
         }
     }
 
-    /// Unconditionally acquire `bytes` without enforcing the budget limit.
+    /// Record existing state on restart, bypassing the configured limit but
+    /// **never** overflowing the accounted workload or operator total.
     ///
-    /// Use this for pre-existing state loaded on restart (where enforcement
-    /// has already been applied previously). Also used in tests to set up
-    /// a pre-filled budget.
-    pub fn force_acquire(&self, bytes: u64) {
-        if let Some(ref wl) = self.workload_budget {
-            wl.current_bytes.fetch_add(bytes, Ordering::Relaxed);
+    /// A budget reduction may leave pre-existing state over its new ceiling:
+    /// keep its actual charge visible while refusing *new* admissions. Return
+    /// an error rather than wrapping an AtomicU64 back to a tiny number.
+    pub fn force_acquire(&self, bytes: u64) -> Result<(), StateBudgetError> {
+        if let Some(ref workload) = self.workload_budget {
+            checked_force_add(&workload.current_bytes, bytes, "workload-recovery")?;
         }
-        self.current_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let Err(error) = checked_force_add(&self.current_bytes, bytes, "operator-recovery") {
+            if let Some(ref workload) = self.workload_budget {
+                workload.release(bytes);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Release `bytes` of state (e.g., on tombstone GC or operator shutdown).
@@ -403,17 +430,26 @@ impl StateBudget {
         }
     }
 
-    /// Reset the usage counter to zero. For use in tests only.
+    /// Reset only this operator's charge. Shared workload owners and other
+    /// operators must retain their outstanding reservations.
     #[doc(hidden)]
     pub fn reset(&self) {
+        let released = self.current_bytes.swap(0, Ordering::Relaxed);
         if let Some(ref wl) = self.workload_budget {
-            wl.current_bytes.store(0, Ordering::Relaxed);
-            wl.notice_emitted_80.store(false, Ordering::Relaxed);
-            wl.warning_emitted_95.store(false, Ordering::Relaxed);
+            wl.release(released);
         }
-        self.current_bytes.store(0, Ordering::Relaxed);
         self.notice_emitted_80.store(false, Ordering::Relaxed);
         self.warning_emitted_95.store(false, Ordering::Relaxed);
+    }
+}
+
+// On final operator destruction, release only bytes still owned by this
+// meter. A shared workload budget can outlive any one operator.
+impl Drop for StateBudget {
+    fn drop(&mut self) {
+        if let Some(ref wl) = self.workload_budget {
+            wl.release(*self.current_bytes.get_mut());
+        }
     }
 }
 
@@ -1101,7 +1137,7 @@ mod tests {
     #[test]
     fn acquire_over_budget_fails() {
         let b = StateBudget::new("op", 1024);
-        b.force_acquire(900);
+        b.force_acquire(900).unwrap();
         let err = b.try_acquire(200).unwrap_err();
         assert_eq!(err.max_bytes, 1024);
         assert_eq!(err.current_bytes, 900);
@@ -1114,7 +1150,7 @@ mod tests {
     #[test]
     fn release_reduces_counter() {
         let b = StateBudget::new("op", 1024);
-        b.force_acquire(800);
+        b.force_acquire(800).unwrap();
         b.release(300);
         assert_eq!(b.current_bytes(), 500);
     }
@@ -1129,7 +1165,7 @@ mod tests {
     #[test]
     fn utilization_fraction() {
         let b = StateBudget::new("op", 1000);
-        b.force_acquire(250);
+        b.force_acquire(250).unwrap();
         let u = b.utilization();
         assert!((u - 0.25).abs() < 1e-9, "utilization={u}");
     }
@@ -1173,7 +1209,7 @@ mod tests {
     #[test]
     fn operator_name_in_error() {
         let b = StateBudget::new("aggregate_sum", 100);
-        b.force_acquire(90);
+        b.force_acquire(90).unwrap();
         let err = b.try_acquire(20).unwrap_err();
         assert_eq!(err.operator_name, "aggregate_sum");
     }
