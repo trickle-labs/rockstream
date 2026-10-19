@@ -106,7 +106,8 @@ use crate::pgoutput_coordinator::{
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::subscribe_handler::{
-    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
+    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry,
+    SubscriberHandle, SUBSCRIBE_SNAPSHOT_MAX_ROWS,
 };
 use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -5502,7 +5503,11 @@ impl GatewayHandler {
         None
     }
 
-    async fn handle_subscribe(&self, query: &str) -> PgWireResult<Vec<Response<'static>>> {
+    async fn handle_subscribe(
+        &self,
+        query: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
         let request = match parse_subscribe(query) {
             Ok(request) => request,
             Err(error) => {
@@ -5517,6 +5522,12 @@ impl GatewayHandler {
                 )))]);
             }
         };
+
+        // Authorize reads before exposing retention metadata, scanning
+        // a snapshot or reserving a stream slot.
+        if let Some(denied) = self.select_access_error_response(&request.view_name, conn_id) {
+            return Ok(denied);
+        }
 
         let catalog_columns = self
             .catalog
@@ -5570,9 +5581,14 @@ impl GatewayHandler {
         let mut pending = std::collections::VecDeque::new();
         let handle = match &request.start {
             SubscribeStart::NowWithSnapshot => {
+                // Preflight the producer at one row beyond the exact bound.
                 let snapshot = self
                     .view_reader
-                    .read_view(&request.view_name, None, ViewReadStrategy::HotOnly)
+                    .read_view(
+                        &request.view_name,
+                        Some(SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1),
+                        ViewReadStrategy::HotOnly,
+                    )
                     .await
                     .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
                 let snapshot = snapshot
@@ -5710,10 +5726,6 @@ impl GatewayHandler {
             return Ok(response);
         }
 
-        if ql == "subscribe" || ql.starts_with("subscribe ") {
-            return self.handle_subscribe(q).await;
-        }
-
         // ── Aborted-transaction guard ────────────────────────────────────────────
         // Any command inside a failed block is bounced with SQLSTATE 25P02, except
         // ROLLBACK (which exits the failed block) and ROLLBACK TO <name> (which
@@ -5741,6 +5753,11 @@ impl GatewayHandler {
             if ql.starts_with("mark index ") {
                 return self.handle_mark_index_ready(q).await;
             }
+        }
+
+        // SUBSCRIBE must obey the same failed-transaction fence as SELECT.
+        if ql == "subscribe" || ql.starts_with("subscribe ") {
+            return self.handle_subscribe(q, conn_id).await;
         }
 
         // ── BEGIN — with idempotency (already in transaction → silent succeed) ──
@@ -8341,51 +8358,47 @@ impl GatewayHandler {
             )))]);
         };
         apply_workload_settings(&mut workload, &changes);
-        let updated = if let Some(expected) = expected_revision {
-            match self
-                .catalog
-                .update_workload_if_revision_async(workload.clone(), expected)
-                .await
-                .map_err(|error| PgWireError::ApiError(Box::new(error)))?
-            {
-                WorkloadRevisionOutcome::Updated(_) => true,
-                WorkloadRevisionOutcome::NotFound => false,
-                WorkloadRevisionOutcome::Conflict { expected, actual } => {
-                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "40001".to_owned(),
-                        format!(
-                            "[RS-1006] workload.revision_conflict: expected revision {expected}, actual revision {actual}. Next steps: read the current workload revision and retry the edit."
-                        ),
-                    )))]);
-                }
-                WorkloadRevisionOutcome::BelowLiveUse {
-                    requested,
-                    allocated,
-                } => {
-                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "54000".to_owned(),
-                        format!(
-                            "[RS-1006] workload.memory_below_live_use: requested limit {requested} bytes is below {allocated} bytes of live reservations. Next steps: reclaim the live state before reducing the limit."
-                        ),
-                    )))]);
-                }
-                WorkloadRevisionOutcome::RevisionExhausted => {
-                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "54000".to_owned(),
-                        "[RS-1006] workload.revision_exhausted: revision counter cannot advance. Next steps: contact the operator.".to_owned(),
-                    )))]);
-                }
+        // Legacy SQL retains its syntax, but never bypasses live-use admission
+        // or race detection. A request without IF REVISION uses the revision
+        // observed when this producer read its policy; a competing edit must
+        // return a retryable conflict rather than overwrite the winner.
+        let expected = expected_revision.unwrap_or(workload.revision);
+        let updated = match self
+            .catalog
+            .update_workload_if_revision_async(workload.clone(), expected)
+            .await
+            .map_err(|error| PgWireError::ApiError(Box::new(error)))?
+        {
+            WorkloadRevisionOutcome::Updated(_) => true,
+            WorkloadRevisionOutcome::NotFound => false,
+            WorkloadRevisionOutcome::Conflict { expected, actual } => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "40001".to_owned(),
+                    format!(
+                        "[RS-1006] workload.revision_conflict: expected revision {expected}, actual revision {actual}. Next steps: read the current workload revision and retry the edit."
+                    ),
+                )))]);
             }
-        } else {
-            // Legacy unconditioned ALTER remains for backwards compatibility;
-            // strict v0.72 revisions use IF REVISION <n>.
-            self.catalog
-                .update_workload_async(workload.clone())
-                .await
-                .map_err(|error| PgWireError::ApiError(Box::new(error)))?
+            WorkloadRevisionOutcome::BelowLiveUse {
+                requested,
+                allocated,
+            } => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "54000".to_owned(),
+                    format!(
+                        "[RS-1006] workload.memory_below_live_use: requested limit {requested} bytes is below {allocated} bytes of live reservations. Next steps: reclaim the live state before reducing the limit."
+                    ),
+                )))]);
+            }
+            WorkloadRevisionOutcome::RevisionExhausted => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "54000".to_owned(),
+                    "[RS-1006] workload.revision_exhausted: revision counter cannot advance. Next steps: contact the operator.".to_owned(),
+                )))]);
+            }
         };
         if !updated {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
@@ -16274,7 +16287,8 @@ impl PartitionStream for QueryTimeScatterPartition {
                         reader
                             .scan_prefix_pages(
                                 &prefix,
-                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS,
+                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS
+                                    .min(rockstream_storage::ShardReader::MAX_SCAN_PAGE_ROWS),
                                 QUERY_TIME_SCATTER_MAX_IN_FLIGHT_BYTES,
                                 sender,
                             )
@@ -20083,5 +20097,145 @@ mod catalog_array_parameter_tests {
             Err(err) => panic!("parameter inference failed: {err}"),
         };
         assert_eq!(types, vec![Type::INT4_ARRAY]);
+    }
+}
+
+#[cfg(test)]
+mod v072_subscription_producer_bounds_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BoundedSnapshotReader {
+        seen_limit: AtomicUsize,
+        rows_available: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ViewReader for BoundedSnapshotReader {
+        async fn read_view(
+            &self,
+            _view_name: &str,
+            limit: Option<usize>,
+            _strategy: ViewReadStrategy,
+        ) -> Result<Vec<Vec<u8>>, GatewayError> {
+            self.seen_limit
+                .store(limit.unwrap_or(usize::MAX), Ordering::SeqCst);
+            let count = self.rows_available.min(limit.unwrap_or(usize::MAX));
+            Ok(vec![b"value".to_vec(); count])
+        }
+
+        fn published_frontier(&self) -> Option<u64> {
+            Some(4)
+        }
+    }
+
+    async fn check_snapshot(rows_available: usize) -> (usize, bool) {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_snapshot".to_owned(),
+            sql: "SELECT value FROM base".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        let response = handler
+            .handle_subscribe("SUBSCRIBE v072_snapshot AS OF NOW WITH SNAPSHOT", None)
+            .await
+            .unwrap_or_else(|error| panic!("subscription test setup failed: {error}"));
+        let limit = reader.seen_limit.load(Ordering::SeqCst);
+        let rejected = matches!(response.as_slice(), [Response::Error(_)]);
+        (limit, rejected)
+    }
+
+    #[tokio::test]
+    async fn snapshot_reader_receives_one_row_overflow_probe() {
+        let (limit, rejected) = check_snapshot(1).await;
+        assert_eq!(limit, SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1);
+        assert!(!rejected);
+    }
+
+    #[tokio::test]
+    async fn oversized_producer_snapshot_fails_before_stream_formation() {
+        let (limit, rejected) = check_snapshot(SUBSCRIBE_SNAPSHOT_MAX_ROWS + 50).await;
+        assert_eq!(limit, SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1);
+        assert!(rejected);
+    }
+    #[tokio::test]
+    async fn unauthorized_subscriber_cannot_scan_or_reserve_a_live_stream() {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_private".to_owned(),
+            sql: "SELECT value FROM source".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available: 1,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        {
+            let mut session = handler.sessions.entry("viewer".to_owned()).or_default();
+            session.principal = Principal::Jwt {
+                sub: "ungranted-viewer".to_owned(),
+            };
+        }
+        let denied = handler
+            .handle_subscribe(
+                "SUBSCRIBE v072_private AS OF NOW WITH SNAPSHOT",
+                Some("viewer"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("subscription test setup failed: {error}"));
+        assert!(matches!(denied.as_slice(), [Response::Error(_)]));
+        assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.subscribe_registry.active_streams(), 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_cannot_escape_failed_explicit_transaction() {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_private".to_owned(),
+            sql: "SELECT value FROM source".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available: 1,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        {
+            let mut session = handler.sessions.entry("aborted".to_owned()).or_default();
+            session.begin_explicit();
+            session.fail_transaction();
+        }
+        let denied = handler
+            .dispatch_async_with_conn(
+                "SUBSCRIBE v072_private AS OF NOW WITH SNAPSHOT",
+                Some("aborted"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("subscription test setup failed: {error}"));
+        assert!(matches!(denied.as_slice(), [Response::Error(_)]));
+        assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.subscribe_registry.active_streams(), 0);
     }
 }

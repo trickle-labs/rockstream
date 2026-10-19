@@ -46,11 +46,22 @@ impl ProcessGroup {
         self.pid
     }
 
-    /// Observe child exit without losing process-group cleanup ownership.
-    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        match self.child.as_mut() {
-            Some(child) => child.try_wait(),
-            None => Ok(None),
+    /// Observe leader exit without reaping it or releasing its process-group ID.
+    ///
+    /// On Unix, Child::try_wait would reap an exited leader immediately. A still
+    /// running descendant could then outlive its owner, and signalling the old
+    /// group ID during Drop could target an unrelated reused ID.
+    pub fn has_exited(&mut self) -> io::Result<bool> {
+        if self.child.is_none() {
+            return Ok(true);
+        }
+        #[cfg(unix)]
+        {
+            leader_exited(self.pid)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(self.child.as_mut().unwrap().try_wait()?.is_some())
         }
     }
 
@@ -186,6 +197,13 @@ fn leader_exited(pid: i32) -> io::Result<bool> {
 fn group_gone(pid: i32) -> io::Result<bool> {
     // Read-only probing after reaping cannot signal an unrelated reused PID.
     if unsafe { libc::kill(-pid, 0) } == 0 {
+        // Linux keeps orphaned zombies in a process group until their adoptive
+        // parent reaps them. Zombies cannot execute or retain live resources;
+        // kill(-pgid, 0) nevertheless reports that the group exists.
+        #[cfg(target_os = "linux")]
+        if only_zombies_remain(pid)? {
+            return Ok(true);
+        }
         return Ok(false);
     }
     let error = io::Error::last_os_error();
@@ -194,4 +212,43 @@ fn group_gone(pid: i32) -> io::Result<bool> {
     } else {
         Err(error)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn only_zombies_remain(pgid: i32) -> io::Result<bool> {
+    let mut found = false;
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.parse::<u32>().is_err() {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // /proc entries can disappear between directory listing and read.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            // If /proc hides a process, never infer that the group is drained.
+            Err(_) => return Ok(false),
+        };
+        // The command name in /proc/PID/stat can itself contain ')' and spaces.
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            return Ok(false);
+        };
+        let mut fields = fields.split_whitespace();
+        let state = fields.next();
+        fields.next(); // PPID
+        let member_group = fields.next().and_then(|value| value.parse::<i32>().ok());
+        if member_group == Some(pgid) {
+            if !matches!(state, Some("Z" | "X" | "x")) {
+                return Ok(false);
+            }
+            found = true;
+        }
+    }
+    // An empty scan may race process exit. Recheck after the next poll instead
+    // of treating an unobserved group as proof of completed cleanup.
+    Ok(found)
 }

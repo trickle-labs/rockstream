@@ -406,11 +406,28 @@ pub async fn read_view_output_via_reader(
     op_id: OperatorId,
     num_cols: usize,
 ) -> Result<Vec<ViewOutputRow>, OpError> {
+    read_view_output_via_reader_with_budget(reader, op_id, num_cols, VIEW_OUTPUT_READ_MAX_BYTES)
+        .await
+}
+
+/// Private budget seam so release tests can demonstrate rejection without
+/// constructing a 64 MiB fixture. Production always uses the named ceiling.
+async fn read_view_output_via_reader_with_budget(
+    reader: &rockstream_storage::ShardReader,
+    op_id: OperatorId,
+    num_cols: usize,
+    budget: usize,
+) -> Result<Vec<ViewOutputRow>, OpError> {
     let prefix = view_output_prefix(op_id);
-    let entries = reader
-        .scan_prefix(&prefix)
+    let (entries, truncated) = reader
+        .scan_prefix_bounded(&prefix, budget)
         .await
         .map_err(OpError::storage)?;
+    if truncated {
+        return Err(OpError::internal(format!(
+            "view output exceeds {budget} byte read limit"
+        )));
+    }
     decode_view_output_entries(entries, num_cols)
 }
 
@@ -656,6 +673,39 @@ mod tests {
                 .to_string(),
             "[RS-0001] Internal error: invalid view output row key; next_steps: report this issue"
         );
+    }
+
+    #[tokio::test]
+    async fn cross_process_view_output_budget_rejects_before_partial_decode() {
+        let store = Arc::new(InMemory::new());
+        let db = ShardDb::builder("bounded-compiled-view", store.clone())
+            .build()
+            .await
+            .unwrap();
+        let op_id = OperatorId(7);
+        let mut key = view_output_prefix(op_id);
+        key.extend_from_slice(&0_u64.to_be_bytes());
+        key.extend_from_slice(&0_u64.to_be_bytes());
+        let row = [
+            vec![TAG_INT64],
+            1_i64.to_be_bytes().to_vec(),
+            1_i64.to_be_bytes().to_vec(),
+        ]
+        .concat();
+        db.put(&key, &row).await.unwrap();
+        db.flush().await.unwrap();
+        let reader = rockstream_storage::ShardReader::open("bounded-compiled-view", store)
+            .await
+            .unwrap();
+        let exact_budget = key.len() + row.len();
+        let output = read_view_output_via_reader_with_budget(&reader, op_id, 1, exact_budget)
+            .await
+            .unwrap();
+        assert_eq!(output, vec![(0, 0, vec![ColumnValue::Int64(1)], 1)]);
+        let error = read_view_output_via_reader_with_budget(&reader, op_id, 1, exact_budget - 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("view output exceeds"));
     }
 
     #[tokio::test]

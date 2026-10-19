@@ -7,9 +7,7 @@ fn ci_workspace_test_runs_explicit_feature_matrix() {
     assert!(workflow.contains("python3 scripts/ci-test-inventory.py run --job pr-workspace"));
     let matrix = include_str!("../../../scripts/ci-test-matrix.json");
     assert!(matrix.contains("\"pr-workspace\""));
-    assert!(workflow.lines().any(|line| line.contains(
-        "cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json"
-    )));
+    assert!(workflow.contains("python3 scripts/ci-test-inventory.py run --job pr-gateway"));
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let gated_files = [
