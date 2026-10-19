@@ -1246,6 +1246,21 @@ impl CatalogStubs {
         true
     }
 
+    /// Preserve all live view allocations on a single workload quota owner.
+    fn reconfigure_workload_budget(
+        &self,
+        workload: &WorkloadDef,
+    ) -> Result<(), rockstream_types::state_budget::StateBudgetError> {
+        if let Some(owner) = self.workload_budgets.read().unwrap().get(&workload.name) {
+            let limit = workload
+                .memory_limit
+                .map(|limit| limit.bytes)
+                .unwrap_or(u64::MAX);
+            owner.reconfigure_max_bytes(limit)?;
+        }
+        Ok(())
+    }
+
     pub fn update_workload(&self, mut workload: WorkloadDef) -> bool {
         let mut inner = self.inner.write().unwrap();
         let Some(current) = inner.workloads.get(&workload.name) else {
@@ -1254,19 +1269,16 @@ impl CatalogStubs {
         let Some(next_revision) = current.revision.checked_add(1) else {
             return false;
         };
-        // A priority/freshness/parallelism edit must not reset live bytes.
-        // Existing StateBudget objects still own their WorkloadBudget Arc.
-        let preserve_budget = current.memory_limit == workload.memory_limit;
+        // Keep the existing owner; an edited cap must reach existing views.
+        if current.memory_limit != workload.memory_limit
+            && self.reconfigure_workload_budget(&workload).is_err()
+        {
+            return false;
+        }
         workload.revision = next_revision;
         inner
             .workloads
             .insert(workload.name.clone(), workload.clone());
-        if !preserve_budget {
-            self.workload_budgets
-                .write()
-                .unwrap()
-                .remove(&workload.name);
-        }
         drop(inner);
         self.invalidate_projection_caches();
         self.persist_mutations(vec![
@@ -1296,30 +1308,23 @@ impl CatalogStubs {
         let Some(next_revision) = current.revision.checked_add(1) else {
             return WorkloadRevisionOutcome::RevisionExhausted;
         };
-        // The existing ledger and each view's StateBudget keep the same
-        // Arc when resource limits have not changed.
-        let preserve_budget = current.memory_limit == workload.memory_limit;
-        if let Some(limit) = workload.memory_limit {
-            if let Some(budget) = self.workload_budgets.read().unwrap().get(&workload.name) {
-                let allocated = budget.current_bytes();
-                if allocated > limit.bytes {
-                    return WorkloadRevisionOutcome::BelowLiveUse {
-                        requested: limit.bytes,
-                        allocated,
-                    };
-                }
+        // Guard a live owner while changing its cap, keeping existing views
+        // charged to the owner rather than creating an empty replacement.
+        if current.memory_limit != workload.memory_limit {
+            if let Err(error) = self.reconfigure_workload_budget(&workload) {
+                return WorkloadRevisionOutcome::BelowLiveUse {
+                    requested: workload
+                        .memory_limit
+                        .map(|limit| limit.bytes)
+                        .unwrap_or(u64::MAX),
+                    allocated: error.current_bytes,
+                };
             }
         }
         workload.revision = next_revision;
         inner
             .workloads
             .insert(workload.name.clone(), workload.clone());
-        if !preserve_budget {
-            self.workload_budgets
-                .write()
-                .unwrap()
-                .remove(&workload.name);
-        }
         drop(inner);
         self.invalidate_projection_caches();
         self.persist_mutations(vec![
@@ -3119,9 +3124,12 @@ impl CatalogStubs {
         let Some(workload) = self.get_workload(&workload_name) else {
             return;
         };
-        let Some(memory_limit) = workload.memory_limit.map(|limit| limit.bytes) else {
-            return;
-        };
+        // Charge real state even while unlimited, so a later limit change
+        // cannot start from a misleading empty ledger.
+        let memory_limit = workload
+            .memory_limit
+            .map(|limit| limit.bytes)
+            .unwrap_or(u64::MAX);
 
         let workload_budget = self
             .workload_budgets
