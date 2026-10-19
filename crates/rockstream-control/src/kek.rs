@@ -9,6 +9,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rockstream_types::error_code::{ErrorCode, RS_2422};
 use rockstream_types::secret::{EncryptedSecret, Secret, SecretMetadata, SecretType};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -67,6 +68,37 @@ pub trait KekProvider: Send + Sync {
 
     /// Unwrap (decrypt) a wrapped DEK using the provider's KEK.
     async fn unwrap_dek(&self, wrapped_dek: &[u8]) -> Result<Vec<u8>, KekError>;
+}
+
+/// Retain the previous KEK while recovering an interrupted rotation.
+/// New DEKs use `current`; unwrapping accepts either retained provider.
+pub struct RetainedKekProvider {
+    current: Arc<dyn KekProvider>,
+    previous: Arc<dyn KekProvider>,
+}
+
+impl RetainedKekProvider {
+    pub fn new(current: Arc<dyn KekProvider>, previous: Arc<dyn KekProvider>) -> Self {
+        Self { current, previous }
+    }
+}
+
+#[async_trait]
+impl KekProvider for RetainedKekProvider {
+    fn provider_name(&self) -> &str {
+        self.current.provider_name()
+    }
+
+    async fn wrap_dek(&self, dek: &[u8]) -> Result<Vec<u8>, KekError> {
+        self.current.wrap_dek(dek).await
+    }
+
+    async fn unwrap_dek(&self, wrapped_dek: &[u8]) -> Result<Vec<u8>, KekError> {
+        match self.current.unwrap_dek(wrapped_dek).await {
+            Ok(dek) => Ok(dek),
+            Err(_) => self.previous.unwrap_dek(wrapped_dek).await,
+        }
+    }
 }
 
 /// KEK provider backed by environment variable or raw 256-bit key.

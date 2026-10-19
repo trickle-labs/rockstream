@@ -430,17 +430,26 @@ impl StateBudget {
         }
     }
 
-    /// Reset the usage counter to zero. For use in tests only.
+    /// Reset only this operator's charge. Shared workload owners and other
+    /// operators must retain their outstanding reservations.
     #[doc(hidden)]
     pub fn reset(&self) {
+        let released = self.current_bytes.swap(0, Ordering::Relaxed);
         if let Some(ref wl) = self.workload_budget {
-            wl.current_bytes.store(0, Ordering::Relaxed);
-            wl.notice_emitted_80.store(false, Ordering::Relaxed);
-            wl.warning_emitted_95.store(false, Ordering::Relaxed);
+            wl.release(released);
         }
-        self.current_bytes.store(0, Ordering::Relaxed);
         self.notice_emitted_80.store(false, Ordering::Relaxed);
         self.warning_emitted_95.store(false, Ordering::Relaxed);
+    }
+}
+
+// On final operator destruction, release only bytes still owned by this
+// meter. A shared workload budget can outlive any one operator.
+impl Drop for StateBudget {
+    fn drop(&mut self) {
+        if let Some(ref wl) = self.workload_budget {
+            wl.release(*self.current_bytes.get_mut());
+        }
     }
 }
 

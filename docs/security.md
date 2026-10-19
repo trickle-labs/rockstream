@@ -42,6 +42,25 @@ scoped AWS fixture: `ROCKSTREAM_TEST_KMS_KEY_ARN`,
 must identify an authorized principal. Run explicitly with
 `cargo test -p rockstream-control --test aws_kms_tests real_kms_enforces_key_and_principal_permissions -- --ignored --exact`.
 
+`SecretStore::rotate_kek` stages all rewrapped envelopes before publishing one
+atomic SlateDB batch (or replacing the in-memory catalog). Secret reads and
+mutations wait for rotation; once the batch is submitted, cancelling the caller
+does not cancel its commit. Success waits for durable storage before retiring
+the store's old provider. A provider or decode failure during staging leaves
+every stored envelope unchanged.
+
+Keep both KEKs available until rotation has returned success and the replacement
+provider has been configured for restart. After an interruption or storage error,
+the durable batch may contain either generation. Reopen the catalog using
+`Arc::new(RetainedKekProvider::new(replacement.clone(), previous.clone()))` from
+`rockstream_control::kek` as the `SecretStore::new` provider, then call
+`rotate_kek(replacement, actor)` again. This also recovers mixed generations left
+by older releases. The retained provider encrypts with its first provider and
+tries both providers for decryption; it never writes key material to the catalog.
+Only retire the previous key after successful recovery and durable rotation.
+Use one shared `SecretStore` for a catalog; independent instances must not mutate
+that catalog during rotation. Rotation stages memory proportional to the catalog.
+
 Workers receive short-lived tokens over authenticated mTLS. Decrypted payloads
 remain in the worker process memory and are refreshed at the next epoch after
 an `ALTER SECRET`; they are never written to worker storage.
