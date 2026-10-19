@@ -240,3 +240,35 @@ fn v072_empty_category_release_does_not_wrap_or_release_another_owner() {
     ledger.release(MemoryCategory::SourceBuffers, u64::MAX);
     assert_eq!(snapshot(&ledger), (0, vec![0; 8]));
 }
+
+#[test]
+fn v072_duplicate_waiter_release_never_wraps_or_blocks_admission() {
+    let ledger = WorkerBudgetLedger::new_with_max_waiters(1100, 0, 2);
+
+    // A release with no live waiter must not wrap the quota counter.
+    ledger.decrement_waiters();
+    assert_eq!(ledger.waiter_count(), 0);
+    assert_eq!(ledger.increment_waiters(), Ok(()));
+    assert_eq!(ledger.increment_waiters(), Ok(()));
+    assert_eq!(
+        ledger.increment_waiters(),
+        Err(StateBudgetError {
+            operator_name: "allocation-waiters-queue".to_owned(),
+            max_bytes: 2,
+            current_bytes: 2,
+            requested_bytes: 1,
+        })
+    );
+
+    ledger.decrement_waiters();
+    assert_eq!(ledger.waiter_count(), 1);
+    ledger.decrement_waiters();
+    ledger.decrement_waiters();
+    assert_eq!(ledger.waiter_count(), 0);
+
+    // Capacity remains available after the duplicate release.
+    assert_eq!(ledger.increment_waiters(), Ok(()));
+    assert_eq!(ledger.waiter_count(), 1);
+    ledger.decrement_waiters();
+    assert_eq!(ledger.waiter_count(), 0);
+}
