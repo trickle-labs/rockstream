@@ -1,0 +1,55 @@
+name: v0.72 durable commit checks
+
+on:
+  pull_request:
+    paths:
+      - 'crates/rockstream-ops/**'
+      - 'crates/rockstream-storage/**'
+      - '.github/workflows/v072-commit-checks.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v072-commit-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  commit-regressions:
+    name: Durable commit regressions (not capacity qualification)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Retain exact source before running checks
+        run: |
+          mkdir -p "$RUNNER_TEMP/v072-commit-source"
+          git rev-parse HEAD > "$RUNNER_TEMP/v072-commit-source/revision.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/v072-commit-source/source.tar.gz"
+          sha256sum "$RUNNER_TEMP/v072-commit-source/source.tar.gz" > "$RUNNER_TEMP/v072-commit-source/source.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v072-commit-source-${{ github.run_id }}
+          path: ${{ runner.temp }}/v072-commit-source
+          retention-days: 14
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.88'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: v072-commit-regressions
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Focused production commit tests
+        run: cargo test -p rockstream-ops --test v072_commit_bounds_tests --test group_commit_timer_tests --test group_commit_durability_lfs_tests
+      - name: Ops library Clippy
+        # Align with the repository-wide strict Clippy command. This warning
+        # is already exempted there; unrelated formatting diagnostics in
+        # dependencies must not mask the focused commit-driver regressions.
+        run: cargo clippy -p rockstream-ops --lib -- -D warnings -A clippy::uninlined_format_args

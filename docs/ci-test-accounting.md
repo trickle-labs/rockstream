@@ -60,6 +60,13 @@ The successful [baseline run 39044539905](https://github.com/trickle-labs/rockst
 
 These are measured baseline costs, not measured savings. Image transfer, cache state and the new image dependency can affect latency. The PR's hosted run must supply the candidate measurement before claiming end-to-end savings: compare job creation/start/completion timestamps, Cargo `Finished` compilation timings in logs, per-target execution timings, and the union of exact case IDs/outcomes in gateway and differential accounting artifacts. The union must retain all baseline IDs; feature changes are the intentional differential ownership change above. Preserve run URLs and account for added/removed tests if main advances. Raw baseline libtest output did not separate target execution time, so do not infer that split from aggregate accounting duration. No GitHub rate-limit improvement is claimed.
 
+Coverage runs daily; Simulation Soak and Scheduled Fuzz Soak run every six
+hours, plus manual dispatch. These three no longer run on main pushes; their
+scheduled snapshots cannot prove every merged commit individually. The
+fuzz-runner self-test (from #196) continues on PRs, but full fuzz engine soaks
+remain scheduled/manual. PR HA executes once through the existing `pr-ha`
+case-accounting runner, preserving the per-case transcript and debug setting.
+
 ### Explicit prose-only CI scope (partial CI-cost optimization)
 
 `ci-policy` now shares the conservative path allowlist in `scripts/ci-scope.py`.

@@ -54,6 +54,8 @@ jobs:
         with:
           image-id: ${{ needs.docker-build.outputs.image-id }}
       - name: Record HA test case execution
+        env:
+          RS_TC_DEBUG: "1"
         run: python3 scripts/ci-test-inventory.py run --job pr-ha
       - name: Upload HA test evidence
         if: always()

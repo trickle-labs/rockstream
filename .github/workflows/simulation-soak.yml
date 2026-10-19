@@ -1,14 +1,12 @@
 name: Simulation Soak
 
-# Every six hours and on main: legacy model checks plus a bounded production
+# Every six hours: legacy model checks plus a bounded production
 # source M3 + Int64 SUM/COUNT/AVG + pre-ack restart scenario (#125).
 # The legacy 100k seed loop is not production operator/recovery evidence.
 
 on:
   schedule:
     - cron: "0 0,6,12,18 * * *"
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:

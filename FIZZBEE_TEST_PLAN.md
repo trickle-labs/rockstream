@@ -747,6 +747,31 @@ The exact oracle rejects wrong values, omitted deletions, and duplicate changes.
 `sink.kafka` remains Experimental pending full Core release qualification;
 marker tests alone cannot qualify row delivery.
 
+Issue #133 / v0.72 R6 additionally bounds *suspended* worker-local exchange
+credit waiters, separately from accepted in-flight batches and bytes.
+`FlowController::acquire_credit` and `acquire_batch_permit` reserve one
+atomic `CreditWaiterSlot` only after immediate row/batch admission fails,
+up to `max_pending_requests`; saturation returns `RS-3006` before a new
+queued request can retain state. A pending future's cancellation, task abort,
+successful wakeup, or error drops its own reservation. For legacy row credits,
+`ChannelWaiterSlot` also owns its per-channel `Notify` map reference and
+reclaims the key after the last waiter, with pointer-identity fencing so
+teardown and replacement cannot lose another channel's notifier.
+
+`crates/rockstream-runtime/tests/v072_exchange_credit_waiters.rs` asserts
+the actual quota/overflow/release state for immediate admission, saturated
+row and batch waits, abort and successful wakeup, oversized rejections, and
+32 cancelled distinct channels without retained notifier keys. Three
+targeted `flow_control` unit regressions exercise notify-before-recheck
+ordering and zero-reservation fast paths. These are local Tokio-future and
+resource-owner invariants: they do **not** change the abstract M1–M7
+frontier, lease, or durable-commit transitions and cannot prove fairness or
+RSS limits. The fixed-owner capacity/retry behavior in
+`formal/edge_quota_exhaustion.fizz` remains an abstraction, not a model of
+futures or per-channel notifier identity. This documents the formal boundary
+required by DC.2; the v0.72 resource inventory, physical memory bounds,
+producer-side pressure and release-process evidence remain incomplete.
+
 Issue #117 closes an implementation-level liveness gap in exchange flow control.
 `FlowController::acquire_batch_permit`, used by `WorkerStreamMultiplexer::send_frame`,
 and the separately reachable row-only `acquire_credit` register their Tokio

@@ -5569,6 +5569,18 @@ impl GatewayHandler {
                 .map(|column| column.name.clone())
                 .collect()
         });
+        // Local snapshot and its epoch token must be read from the same
+        // commit boundary. Without this lock a concurrent COMMIT could
+        // advance the token while the snapshot scans an older frontier (or
+        // modify rows while an already-captured token is being scanned).
+        // Distributed view-reader tokens require separate owner-side fencing.
+        let local_snapshot_guard = if matches!(&request.start, SubscribeStart::NowWithSnapshot)
+            && self.shard_db.is_some()
+        {
+            Some(self.shard_commit_lock.lock().await)
+        } else {
+            None
+        };
         let start_epoch = match &request.start {
             SubscribeStart::NowWithSnapshot => self
                 .shard_db
@@ -5627,6 +5639,10 @@ impl GatewayHandler {
                 handle
             }
         };
+
+        // Release the producer read boundary before creating a potentially
+        // long-lived stream; only snapshot construction is serialized.
+        drop(local_snapshot_guard);
 
         let mut fields: Vec<FieldInfo> = col_names
             .iter()
@@ -10063,8 +10079,11 @@ impl GatewayHandler {
 
         let ops = entry.drain();
         drop(entry); // release DashMap entry guard before await
-        let (epoch, ops) = {
-            let _commit_guard = self.shard_commit_lock.lock().await;
+                     // Serialize the entire local commit through materialized-view refresh,
+                     // durable flush and subscription publication. Releasing this guard
+                     // before flushing allowed a later epoch to publish out of order.
+        let _commit_guard = self.shard_commit_lock.lock().await;
+        let (epoch, ops, changes) = {
             let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
@@ -10156,14 +10175,9 @@ impl GatewayHandler {
                         encoded_row: Bytes::from(encoded_row),
                     });
             }
-            for (table, batch) in changes {
-                if let Err(error) = self.subscribe_registry.push_epoch(&table, batch) {
-                    // The DML was already durable: do not claim rejection of that
-                    // transaction. The registry invalidates replay instead.
-                    tracing::warn!(%table, %epoch, %error, "subscription replay requires resnapshot");
-                }
-            }
-            (epoch, ops)
+            // Do not expose this epoch yet. The table write is staged, but
+            // dependent materialized view writes and the durable flush follow.
+            (epoch, ops, changes)
         };
         let affected = ops.len();
 
@@ -10242,6 +10256,19 @@ impl GatewayHandler {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
         }
+
+        // Only successfully flushed commits may become visible in the
+        // bounded subscription replay log. Publish the entire epoch per
+        // table while holding the same shard commit lock that protected the
+        // write and refresh, preserving ordering against concurrent commits.
+        for (table, batch) in changes {
+            if let Err(error) = self.subscribe_registry.push_epoch(&table, batch) {
+                // Persistence already succeeded. Invalidate bounded replay,
+                // requiring resnapshot; never roll back a durable transaction.
+                tracing::warn!(%table, %epoch, %error, "subscription replay requires resnapshot");
+            }
+        }
+        drop(_commit_guard);
 
         let table_name = ops
             .iter()
