@@ -5943,7 +5943,12 @@ mod tests {
         );
         assert!(Arc::ptr_eq(
             &shared,
-            catalog.workload_budgets.read().unwrap().get("live").unwrap()
+            catalog
+                .workload_budgets
+                .read()
+                .unwrap()
+                .get("live")
+                .unwrap()
         ));
         assert_eq!((shared.current_bytes(), shared.max_bytes()), (50, 60));
 
@@ -5963,7 +5968,12 @@ mod tests {
         );
         assert!(Arc::ptr_eq(
             &shared,
-            catalog.workload_budgets.read().unwrap().get("live").unwrap()
+            catalog
+                .workload_budgets
+                .read()
+                .unwrap()
+                .get("live")
+                .unwrap()
         ));
         assert_eq!(shared.max_bytes(), u64::MAX);
         catalog.set_view_state_bytes("live_b", 100, None);
