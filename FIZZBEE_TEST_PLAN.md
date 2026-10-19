@@ -695,6 +695,26 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #202 preserves secret readability across failed or interrupted KEK
+rotation in `crates/rockstream-control`. Rotation excludes secret reads and
+mutations, stages every rewrapped envelope, and publishes one atomic SlateDB
+batch or in-memory catalog replacement. Staging failures leave stored envelopes
+unchanged. Submitted writes retain their synchronization guards after caller
+cancellation, and rotation acknowledges success only after durable storage
+completes. Both providers remain available around ambiguous commits; restart
+recovery uses `RetainedKekProvider` and retries with the replacement provider.
+These local synchronization, encryption-provider, and storage-I/O guarantees
+are outside the M1–M7 FizzBee state machines and rely on SlateDB atomicity and
+durability as described in ADR 0006. Runtime assertions live in
+`crates/rockstream-control/tests/secrets_rotation_failure_tests.rs`:
+`failed_second_wrap_preserves_every_secret_and_allows_retry` compares complete
+same-named secrets across namespaces and verifies unchanged catalog bytes after
+staging failure; `submitted_rotation_survives_cancellation_and_wal_errors`
+checks cancellation, WAL faults, exact reopened envelopes, and complete payloads
+after retained-key recovery. The suite also covers concurrent operations,
+successful rotation, legacy mixed generations, and catalog/audit redaction.
+These tests do not claim live KMS or abrupt process-termination qualification.
+
 Issue #126 observes the existing M4 worker-disconnect and lease-reassignment
 path together with M3 Kafka transaction recovery. `ControlService` emits the
 `worker.disconnected` audit event when the worker session ends, before removing
