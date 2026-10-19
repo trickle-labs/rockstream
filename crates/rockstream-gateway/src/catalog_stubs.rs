@@ -1368,19 +1368,16 @@ impl CatalogStubs {
     }
 
     pub async fn update_workload_async(&self, workload: WorkloadDef) -> Result<bool, SqlError> {
-        let _edit = self.workload_edit_lock.lock().await;
         let Some(current) = self.get_workload(&workload.name) else {
             return Ok(false);
         };
-        let Some(next_revision) = current.revision.checked_add(1) else {
-            return Ok(false);
-        };
-        let mut updated = workload.clone();
-        updated.revision = next_revision;
-        if let Some(catalog) = &self.workload_catalog {
-            catalog.update_workload(&updated).await?;
-        }
-        Ok(self.update_workload(workload))
+        // Reuse the same fenced revision and live-budget path as explicit CAS
+        // mutations; the compatibility API must not persist an ineffective cap.
+        Ok(matches!(
+            self.update_workload_if_revision_async(workload, current.revision)
+                .await?,
+            WorkloadRevisionOutcome::Updated(_)
+        ))
     }
 
     /// Conditional update: never send an outdated policy to durable storage.
