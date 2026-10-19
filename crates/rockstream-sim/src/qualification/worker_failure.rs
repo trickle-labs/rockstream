@@ -140,7 +140,7 @@ pub fn qualification_records(e: &WorkerRecoveryEvidence, candidate: &Value) -> V
 }
 
 /// Reconstruct independently of the production view materializer.
-fn relation(records: &Value) -> Option<Value> {
+pub(super) fn relation(records: &Value) -> Option<Value> {
     let mut weights = BTreeMap::<String, (Value, i64)>::new();
     for record in records.as_array()? {
         for row in record.get(1)?.get("rows")?.as_array()? {

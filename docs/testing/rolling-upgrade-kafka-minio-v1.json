@@ -1,0 +1,110 @@
+{
+  "scenario_id": "rolling-upgrade-kafka-minio-v1",
+  "contract": "129/v1",
+  "recovery_scenario_id": "worker-failure-kafka-minio-v1",
+  "reset": {
+    "timestamp": 6,
+    "values": [
+      1,
+      "c"
+    ],
+    "weight": -1
+  },
+  "reset_output": [
+    6,
+    0,
+    [
+      {
+        "Int64": 1
+      },
+      {
+        "Utf8": "c"
+      }
+    ],
+    -1
+  ],
+  "checkpoints": [
+    [
+      "initial",
+      5
+    ],
+    [
+      "during-replace-1",
+      7
+    ],
+    [
+      "replace-1",
+      11
+    ],
+    [
+      "during-replace-2",
+      13
+    ],
+    [
+      "failed-replacement",
+      17
+    ],
+    [
+      "replace-2",
+      17
+    ],
+    [
+      "during-replace-3",
+      19
+    ],
+    [
+      "replace-3",
+      23
+    ],
+    [
+      "post-upgrade",
+      29
+    ],
+    [
+      "reopen",
+      29
+    ],
+    [
+      "post-reopen",
+      35
+    ]
+  ],
+  "schema": [
+    [
+      "id",
+      "Int64",
+      false
+    ],
+    [
+      "value",
+      "Utf8",
+      false
+    ]
+  ],
+  "query_rows": [
+    "1\tc"
+  ],
+  "replacement_failure": "exit 42 before registration; survivors finish acknowledged traffic; retry candidate forward",
+  "downgrade_policy": "unsupported by this qualification; reject before launch",
+  "deadline_ms": 60000,
+  "during_query_rows": [
+    "1\ta"
+  ],
+  "during_relation": [
+    [
+      [
+        {
+          "Int64": 1
+        },
+        {
+          "Utf8": "a"
+        }
+      ],
+      1
+    ]
+  ],
+  "deadline_origin": {
+    "write_checkpoint": "final acknowledged operation",
+    "reopen": "recorded launch attempt after all workers and leases are gone"
+  }
+}

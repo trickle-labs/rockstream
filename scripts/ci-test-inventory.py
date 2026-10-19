@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -96,6 +97,7 @@ def assignments(targets: dict, packages: dict, policy: dict) -> dict:
                 job = policy["sim_lib_job"]
         else:
             job = policy["package_jobs"].get(t["package"])
+        job = policy.get("target_jobs", {}).get(key, job)
         if not job:
             errors.append(f"unassigned Cargo target {key}")
         else:
@@ -103,6 +105,9 @@ def assignments(targets: dict, packages: dict, policy: dict) -> dict:
             errors.extend(check_requirements(key, job, policy))
     for name in sorted(set(declared_sim) - live_sim):
         errors.append(f"stale simulation assignment for nonexistent Cargo target {name}")
+    for key, job in policy.get("target_jobs", {}).items():
+        if key not in targets or job not in defined_jobs:
+            errors.append(f"invalid explicit target owner: {key}: {job}")
     for job, spec in policy["jobs"].items():
         for name in spec.get("supplemental_targets", []):
             key = target_id("rockstream-sim", "test", name)
@@ -116,6 +121,12 @@ def assignments(targets: dict, packages: dict, policy: dict) -> dict:
         for key in spec.get("include_ignored_targets", []):
             if owner.get(key) != job:
                 errors.append(f"{job}: include-ignored target is not owned by this job: {key}")
+        for key, threads in spec.get("test_threads", {}).items():
+            if owner.get(key) != job or type(threads) is not int or not 1 <= threads <= 4:
+                errors.append(f"{job}: invalid parallel target or thread count: {key}")
+        for key in spec.get("conformance_targets", []):
+            if owner.get(key) != job:
+                errors.append(f"{job}: conformance target is not owned by this job: {key}")
     if errors:
         raise ValueError("\n".join(errors))
     return owner
@@ -311,6 +322,11 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
         "default_features": spec.get("features", []),
     }
     errors = result["errors"]
+    conformance_targets = spec.get("conformance_targets", [])
+    conformance_path = ROOT / "target/pgwire-test-results.json"
+    if conformance_targets:
+        conformance_path.parent.mkdir(parents=True, exist_ok=True)
+        conformance_path.write_text("")
     if not selected:
         errors.append(f"zero Cargo targets selected by {job}")
     try:
@@ -330,6 +346,7 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
             passed = 0
             for package_name, pts in sorted(by_package.items()):
                 features = spec.get("package_features", {}).get(package_name, spec.get("features", []))
+                build_started = time.monotonic()
                 try:
                     harnesses = build_artifacts(packages[package_name], pts, features, env)
                 except (RuntimeError, OSError) as exc:
@@ -338,23 +355,28 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
                         result["targets"].append({**t, "status": "blocked", "reason": str(exc),
                                                   "features": features, "services": spec.get("services", []), "tests": []})
                     continue
+                build_seconds = time.monotonic() - build_started
                 cwd = Path(packages[package_name]["manifest_path"]).parent
                 # Cargo normally supplies these when it executes a test harness.
                 # Direct binary execution must preserve that execution contract.
                 package_env = env.copy()
                 package_env["CARGO_MANIFEST_DIR"] = str(cwd)
-                for t in pts:
+                # The doc gate consumes the report from the same accounted execution.
+                for t in sorted(pts, key=lambda t: t["name"] == "conformance_doc_tests"):
                     key = target_id(t["package"], t["kind"], t["name"])
                     executable = harnesses[key]
+                    threads = spec.get("test_threads", {}).get(key, 1)
                     record = {**t, "features": features, "services": spec.get("services", []),
-                              "executable": executable, "tests": [], "status": "failed"}
+                              "executable": executable, "test_threads": threads,
+                              "package_build_seconds": build_seconds, "tests": [], "status": "failed"}
+                    started = time.monotonic()
                     try:
                         listing = run_cmd([executable, "--list"], cwd, package_env)
                         if listing.returncode:
                             raise RuntimeError(f"--list failed: {listing.stderr[-1000:]}")
                         listed = parse_list(listing.stdout)
                         cases = spec.get("cases", {}).get(t["name"])
-                        args = [executable, "-Z", "unstable-options", "--format", "json", "--test-threads=1"]
+                        args = [executable, "-Z", "unstable-options", "--format", "json", f"--test-threads={threads}"]
                         args += libtest_flags(key, spec)
                         if cases is not None:
                             # Supplemental jobs select explicit expensive cases, one execution per ID.
@@ -370,6 +392,10 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
                             proc = run_cmd(args, cwd, package_env)
                             events = parse_events(proc.stdout)
                             execution_error = f"libtest exit {proc.returncode}: {proc.stderr[-800:]}" if proc.returncode else ""
+                        if key in conformance_targets:
+                            with conformance_path.open("a") as report:
+                                for event in events:
+                                    report.write(json.dumps(event) + "\n")
                         tests, violations, n_passed = observed_results(
                             t, listed, events, policy["known_limitations"], cases
                         )
@@ -384,6 +410,7 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
                     except (RuntimeError, OSError) as exc:
                         record["reason"] = str(exc)
                         errors.append(f"{key}: {exc}")
+                    record["execution_seconds"] = time.monotonic() - started
                     result["targets"].append(record)
                     print(f"{key}: {record['status']}", flush=True)
             if not passed:
