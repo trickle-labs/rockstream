@@ -10079,9 +10079,9 @@ impl GatewayHandler {
 
         let ops = entry.drain();
         drop(entry); // release DashMap entry guard before await
-        // Serialize the entire local commit through materialized-view refresh,
-        // durable flush and subscription publication. Releasing this guard
-        // before flushing allowed a later epoch to publish out of order.
+                     // Serialize the entire local commit through materialized-view refresh,
+                     // durable flush and subscription publication. Releasing this guard
+                     // before flushing allowed a later epoch to publish out of order.
         let _commit_guard = self.shard_commit_lock.lock().await;
         let (epoch, ops, changes) = {
             let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
