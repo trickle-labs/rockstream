@@ -5909,6 +5909,89 @@ mod tests {
     }
 
     #[test]
+    fn v072_live_memory_limit_edits_keep_existing_views_on_new_cap() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        set_state_budget(1_000);
+
+        let catalog = CatalogStubs::new();
+        assert!(
+            catalog.add_workload(WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(100)))
+        );
+        for name in ["live_a", "live_b"] {
+            catalog.add_view_in_namespace(CatalogView {
+                name: name.to_owned(),
+                sql: "SELECT 1".to_owned(),
+                columns: vec![],
+                namespace: "public".to_owned(),
+                op_id: None,
+            });
+            catalog.assign_view_workload(name, "live");
+        }
+        catalog.set_view_state_bytes("live_a", 50, None);
+        let shared = catalog
+            .workload_budgets
+            .read()
+            .unwrap()
+            .get("live")
+            .unwrap()
+            .clone();
+
+        assert_eq!(
+            catalog.update_workload_if_revision(
+                WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(60)),
+                1,
+            ),
+            WorkloadRevisionOutcome::Updated(2)
+        );
+        assert!(Arc::ptr_eq(
+            &shared,
+            catalog.workload_budgets.read().unwrap().get("live").unwrap()
+        ));
+        assert_eq!((shared.current_bytes(), shared.max_bytes()), (50, 60));
+
+        // Both old and newly created view meters charge the original owner.
+        catalog.set_view_state_bytes("live_b", 20, None);
+        assert_eq!(catalog.view_state("live_b"), ViewState::OverBudgetRelaxed);
+        assert_eq!(shared.current_bytes(), 50);
+        catalog.set_view_state_bytes("live_a", 30, None);
+        catalog.set_view_state_bytes("live_b", 20, None);
+        assert_eq!(catalog.view_state("live_b"), ViewState::Running);
+        assert_eq!(shared.current_bytes(), 50);
+
+        // Raising/removing the cap must not reset accounting either.
+        assert_eq!(
+            catalog.update_workload_if_revision(WorkloadDef::new("live"), 2),
+            WorkloadRevisionOutcome::Updated(3)
+        );
+        assert!(Arc::ptr_eq(
+            &shared,
+            catalog.workload_budgets.read().unwrap().get("live").unwrap()
+        ));
+        assert_eq!(shared.max_bytes(), u64::MAX);
+        catalog.set_view_state_bytes("live_b", 100, None);
+        assert_eq!(shared.current_bytes(), 130);
+
+        assert_eq!(
+            catalog.update_workload_if_revision(
+                WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(120)),
+                3,
+            ),
+            WorkloadRevisionOutcome::BelowLiveUse {
+                requested: 120,
+                allocated: 130,
+            }
+        );
+        assert_eq!(catalog.get_workload("live").unwrap().revision, 3);
+        assert_eq!(shared.max_bytes(), u64::MAX);
+
+        catalog.set_view_state_bytes("live_a", 0, None);
+        catalog.set_view_state_bytes("live_b", 0, None);
+        assert_eq!(shared.current_bytes(), 0);
+        reset_all();
+    }
+
+    #[test]
     fn workload_memory_limit_transitions_views_and_audits() {
         let _guard = METRICS_TEST_LOCK.lock().unwrap();
         reset_all();
