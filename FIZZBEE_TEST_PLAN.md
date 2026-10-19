@@ -695,6 +695,26 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #203 replaces the public `aws_kms` provider's ARN/region-derived local
+encryption with signed KMS `Encrypt` and `Decrypt` requests. Both operations
+must send the configured `KeyId`; denied, unavailable, and wrong-key operations
+must fail with `RS-2422` without local fallback. This external authorization
+boundary changes no M1–M7 coordination transition or invariant, so its concrete
+protocol obligations are covered by implementation tests rather than a FizzBee
+cryptography or IAM model.
+
+`crates/rockstream-control/tests/aws_kms_tests.rs` checks independently supplied
+key/ciphertext outputs, full request bodies and SigV4 signatures, denial,
+unavailability, wrong-key rejection, malformed responses, redirects, and invalid
+credential headers. `secrets_kek_conformance_tests.rs` verifies complete secret
+identity, type, metadata and credential maps across env/KMS/env rewrapping,
+including an untouched second secret and encrypted-artifact scans. The existing
+`secrets_lifecycle_tests.rs` and `secrets_redaction_tests.rs` cover env-backed
+persistence, lifecycle and audit redaction. Local protocol fixtures do not prove
+AWS authorization enforcement: `real_kms_enforces_key_and_principal_permissions`
+requires scoped live AWS fixtures and remains explicitly ignored and recorded
+as unexecuted in `scripts/ci-test-matrix.json` until those fixtures are supplied.
+
 Issue #126 observes the existing M4 worker-disconnect and lease-reassignment
 path together with M3 Kafka transaction recovery. `ControlService` emits the
 `worker.disconnected` audit event when the worker session ends, before removing
