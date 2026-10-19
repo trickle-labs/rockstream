@@ -100,7 +100,9 @@ use std::sync::atomic::AtomicBool;
 #[derive(Debug)]
 pub struct WorkloadBudget {
     workload_id: WorkloadId,
-    max_bytes: u64,
+    // The original owner stays shared with existing views across policy edits.
+    // A read lock fences admissions against concurrent limit reductions.
+    max_bytes: parking_lot::RwLock<u64>,
     current_bytes: AtomicU64,
     notice_emitted_80: AtomicBool,
     warning_emitted_95: AtomicBool,
@@ -111,7 +113,7 @@ impl WorkloadBudget {
     pub fn new(workload_id: WorkloadId, max_bytes: u64) -> Self {
         Self {
             workload_id,
-            max_bytes,
+            max_bytes: parking_lot::RwLock::new(max_bytes),
             current_bytes: AtomicU64::new(0),
             notice_emitted_80: AtomicBool::new(false),
             warning_emitted_95: AtomicBool::new(false),
@@ -125,7 +127,29 @@ impl WorkloadBudget {
 
     /// Retrieve the maximum bytes.
     pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
+        *self.max_bytes.read()
+    }
+
+    /// Change the enforced limit without replacing the shared allocation owner.
+    ///
+    /// The exclusive lock serializes this check with every prospective
+    /// acquisition; lowering below currently charged bytes fails atomically.
+    /// An unlimited workload uses u64::MAX (distinct from the hard limit 0).
+    pub fn reconfigure_max_bytes(&self, max_bytes: u64) -> Result<(), StateBudgetError> {
+        let mut limit = self.max_bytes.write();
+        let allocated = self.current_bytes.load(Ordering::Relaxed);
+        if allocated > max_bytes {
+            return Err(StateBudgetError {
+                operator_name: format!("workload-{}", self.workload_id.0),
+                max_bytes,
+                current_bytes: allocated,
+                requested_bytes: 0,
+            });
+        }
+        *limit = max_bytes;
+        self.notice_emitted_80.store(false, Ordering::Relaxed);
+        self.warning_emitted_95.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Retrieve current bytes.
@@ -135,6 +159,10 @@ impl WorkloadBudget {
 
     /// Charge/acquire bytes against the workload budget.
     pub fn try_acquire(&self, bytes: u64) -> Result<(), StateBudgetError> {
+        // Hold the read guard through the successful CAS. Otherwise a policy
+        // reduction could race a reservation checked against the old limit.
+        let limit = self.max_bytes.read();
+        let max_bytes = *limit;
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
             let proposed = current
@@ -143,10 +171,10 @@ impl WorkloadBudget {
             // WorkloadDef::memory_limit=None means unbounded. Some(0) is a
             // real hard limit, not an unlimited sentinel: only a zero-byte
             // reservation may be admitted at zero capacity.
-            if proposed > self.max_bytes {
+            if proposed > max_bytes {
                 return Err(StateBudgetError {
                     operator_name: format!("workload-{}", self.workload_id.0),
-                    max_bytes: self.max_bytes,
+                    max_bytes,
                     current_bytes: current,
                     requested_bytes: bytes,
                 });
@@ -158,8 +186,8 @@ impl WorkloadBudget {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    if self.max_bytes > 0 {
-                        let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
+                    if max_bytes > 0 {
+                        let pct = (proposed as f64 / max_bytes as f64) * 100.0;
                         if pct >= 95.0 && !self.warning_emitted_95.swap(true, Ordering::Relaxed) {
                             tracing::warn!(
                                 "RS-5019: Workload {} is at {:.1}% memory utilization (current={}, limit={})",
@@ -183,6 +211,7 @@ impl WorkloadBudget {
 
     /// Release bytes from the workload budget.
     pub fn release(&self, bytes: u64) {
+        let max_bytes = self.max_bytes();
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
             let proposed = current.saturating_sub(bytes);
@@ -193,8 +222,8 @@ impl WorkloadBudget {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    if self.max_bytes > 0 {
-                        let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
+                    if max_bytes > 0 {
+                        let pct = (proposed as f64 / max_bytes as f64) * 100.0;
                         if pct < 95.0 {
                             self.warning_emitted_95.store(false, Ordering::Relaxed);
                         }
