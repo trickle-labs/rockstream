@@ -1417,8 +1417,35 @@ impl CatalogStubs {
         }
         let mut updated = workload.clone();
         updated.revision = next_revision;
+        let previous_limit = current
+            .memory_limit
+            .map(|limit| limit.bytes)
+            .unwrap_or(u64::MAX);
+        let next_limit = workload
+            .memory_limit
+            .map(|limit| limit.bytes)
+            .unwrap_or(u64::MAX);
+
+        // A reduction must fence new reservations before awaiting a durable
+        // catalog write; otherwise in-flight admissions may win the race and
+        // leave the persisted policy lower than actual live usage.
+        let reduced = next_limit < previous_limit;
+        if reduced {
+            if let Err(error) = self.reconfigure_workload_budget(&workload) {
+                return Ok(WorkloadRevisionOutcome::BelowLiveUse {
+                    requested: next_limit,
+                    allocated: error.current_bytes,
+                });
+            }
+        }
         if let Some(catalog) = &self.workload_catalog {
-            catalog.update_workload(&updated).await?;
+            if let Err(error) = catalog.update_workload(&updated).await {
+                if reduced {
+                    // Reverting a reduction only widens the original cap.
+                    let _ = self.reconfigure_workload_budget(&current);
+                }
+                return Err(error);
+            }
         }
         Ok(self.update_workload_if_revision(workload, expected_revision))
     }
