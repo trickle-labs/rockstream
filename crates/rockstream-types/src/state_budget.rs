@@ -191,14 +191,14 @@ impl WorkloadBudget {
                         if pct >= 95.0 && !self.warning_emitted_95.swap(true, Ordering::Relaxed) {
                             tracing::warn!(
                                 "RS-5019: Workload {} is at {:.1}% memory utilization (current={}, limit={})",
-                                self.workload_id, pct, proposed, self.max_bytes
+                                self.workload_id, pct, proposed, max_bytes
                             );
                         } else if pct >= 80.0
                             && !self.notice_emitted_80.swap(true, Ordering::Relaxed)
                         {
                             tracing::info!(
                                 "RS-5018: Workload {} is at {:.1}% memory utilization (current={}, limit={})",
-                                self.workload_id, pct, proposed, self.max_bytes
+                                self.workload_id, pct, proposed, max_bytes
                             );
                         }
                     }
