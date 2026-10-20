@@ -121,9 +121,9 @@ impl ShardScheduler {
 
     /// Assign an initial set of shards to healthy workers.
     ///
-    /// Each shard is assigned to the healthy worker with the highest
-    /// `capacity_headroom`.  If no healthy workers are available, the shard is
-    /// skipped and not included in the result.
+    /// Assign shards across healthy compatible workers by current lease count.
+    /// Higher reported headroom breaks ties. Counts include the new leases
+    /// made in this call, so a batch does not pile onto one static winner.
     ///
     /// Shards that are already assigned to a *healthy* worker are left alone.
     /// Shards held by an *unhealthy* worker are force-reassigned.
@@ -153,6 +153,10 @@ impl ShardScheduler {
             })
             .cloned()
             .collect();
+        let mut owned: HashMap<WorkerId, usize> = HashMap::new();
+        for lease in self.manager.leases() {
+            *owned.entry(lease.worker_id).or_default() += 1;
+        }
         for &shard_id in shard_ids {
             // Skip shards already held by a healthy worker.
             if let Some(existing) = self.manager.get(shard_id) {
@@ -173,9 +177,21 @@ impl ShardScheduler {
                 }
             }
 
-            // Pick best worker and force-acquire (evicts any stale holder).
-            if let Some(winner) = PlacementAlgorithm::choose(&compatible_workers) {
+            // Prefer the least-loaded workers; use headroom only for ties.
+            let least_owned = compatible_workers
+                .iter()
+                .map(|worker| owned.get(&worker.worker_id).copied().unwrap_or(0))
+                .min();
+            let candidates: Vec<_> = compatible_workers
+                .iter()
+                .filter(|worker| {
+                    Some(owned.get(&worker.worker_id).copied().unwrap_or(0)) == least_owned
+                })
+                .cloned()
+                .collect();
+            if let Some(winner) = PlacementAlgorithm::choose(&candidates) {
                 let (lease, evicted) = self.manager.force_acquire(shard_id, winner.worker_id);
+                *owned.entry(winner.worker_id).or_default() += 1;
                 assignments.push(ShardAssignment { lease, evicted });
             }
         }
@@ -313,12 +329,10 @@ mod tests {
 
         // All three shards should be assigned (workers are healthy).
         assert_eq!(assignments.len(), 3);
-        // The best worker (highest headroom = worker 1) should get all shards
-        // because placement picks max headroom each time and headroom doesn't
-        // decrease in our test catalog.
-        for a in &assignments {
-            assert_eq!(a.worker_id(), WorkerId(1));
-        }
+        assert_eq!(
+            assignments.iter().map(|a| a.worker_id()).collect::<Vec<_>>(),
+            vec![WorkerId(1), WorkerId(2), WorkerId(1)]
+        );
     }
 
     #[test]
