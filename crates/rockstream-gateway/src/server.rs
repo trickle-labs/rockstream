@@ -10486,33 +10486,141 @@ impl GatewayHandler {
             }
         }
 
-        // Execute the inner query to collect rows
-        let rows: Vec<Vec<u8>> = if let Some(view_name) = extract_view_name_from_select(inner_sql) {
-            if self.catalog.get_view(&view_name).is_some()
-                && !self.catalog.is_backfill_published(&view_name)
-            {
-                return Ok(backfill_not_published_response(&view_name));
-            }
+        // Cursors are read-only and must not bypass the SELECT dispatcher ACL.
+        // Parsing exactly one SQL query also blocks statement stacking.
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let valid_query = sqlparser::parser::Parser::parse_sql(&dialect, inner_sql)
+            .ok()
+            .is_some_and(|statements| {
+                statements.len() == 1
+                    && matches!(statements.first(), Some(sqlparser::ast::Statement::Query(_)))
+            });
+        if !valid_query {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "0A000".to_string(),
+                    "DECLARE CURSOR supports one read-only SELECT statement".to_string(),
+                ),
+            )))]);
+        }
+        let Some(view_name) = extract_view_name_from_select(inner_sql) else {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "0A000".to_string(),
+                    "DECLARE CURSOR requires a readable view".to_string(),
+                ),
+            )))]);
+        };
+        if let Some(denied) = self.select_access_error_response(&view_name, conn_id) {
+            return Ok(denied);
+        }
+        if self.catalog.get_view(&view_name).is_some()
+            && !self.catalog.is_backfill_published(&view_name)
+        {
+            return Ok(backfill_not_published_response(&view_name));
+        }
+
+        // An eager cursor is a producer materialization, not a streaming
+        // result. Bound it before session insertion, including wait time,
+        // failed scans and connection-level cumulative retained bytes.
+        const CURSOR_MAX_ROWS: usize = crate::copy_out_budget::MAX_COPY_OUT_ROWS;
+        const CURSOR_MAX_BYTES: usize = crate::copy_out_budget::MAX_COPY_OUT_BYTES;
+        let read = async {
             if let Some(shard_db) = &self.shard_db {
                 let prefix = format!("view_output/{view_name}/");
-                shard_db
-                    .scan_prefix(prefix.as_bytes())
+                let (kvs, truncated) = shard_db
+                    .scan_prefix_bounded(prefix.as_bytes(), CURSOR_MAX_BYTES)
                     .await
-                    .map(|kvs| kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
-                    .unwrap_or_default()
+                    .map_err(|error| error.to_string())?;
+                if truncated {
+                    return Err("cursor storage scan exceeded byte budget".to_string());
+                }
+                Ok::<Vec<Vec<u8>>, String>(kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
             } else {
                 self.view_reader
-                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
+                    .read_view(
+                        &view_name,
+                        Some(CURSOR_MAX_ROWS + 1),
+                        ViewReadStrategy::HotOnly,
+                    )
                     .await
-                    .unwrap_or_default()
+                    .map_err(|error| error.to_string())
             }
-        } else {
-            vec![]
         };
+        let rows = match tokio::time::timeout(
+            Duration::from_millis(crate::copy_out_budget::MAX_COPY_OUT_READ_MS),
+            read,
+        )
+        .await
+        {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "54000".to_string(),
+                        format!("[RS-3006] cursor.read_failed: {error}"),
+                    ),
+                )))]);
+            }
+            Err(_) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "57014".to_string(),
+                        "[RS-9001] cursor.read_timeout: producer read timed out".to_string(),
+                    ),
+                )))]);
+            }
+        };
+        let cursor_bytes = rows
+            .iter()
+            .fold(0usize, |bytes, row| bytes.saturating_add(row.len()));
+        if rows.len() > CURSOR_MAX_ROWS || cursor_bytes > CURSOR_MAX_BYTES {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "54000".to_string(),
+                    format!(
+                        "[RS-3006] cursor.result_budget_exceeded: {} rows / {} bytes (max {} rows / {} bytes)",
+                        rows.len(), cursor_bytes, CURSOR_MAX_ROWS, CURSOR_MAX_BYTES
+                    ),
+                ),
+            )))]);
+        }
 
-        // Store in session
+        // Enforce a per-connection retained-byte ceiling, not just the
+        // count of cursors. Recheck admission under the session lock because
+        // another concurrent DECLARE may have inserted while we awaited I/O.
         {
             let mut session = self.sessions.entry(conn_id_str.to_string()).or_default();
+            if session.cursors.len() >= MAX_CURSORS_PER_CONNECTION
+                || session.cursors.contains_key(&cursor_name)
+            {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42P03".to_string(),
+                        "[RS-2052] cursor.already_exists: cursor count or name conflict".to_string(),
+                    ),
+                )))]);
+            }
+            let retained_bytes = session
+                .cursors
+                .values()
+                .flat_map(|cursor| cursor.rows.iter())
+                .fold(0usize, |sum, row| sum.saturating_add(row.len()));
+            if retained_bytes.saturating_add(cursor_bytes) > CURSOR_MAX_BYTES {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "54000".to_string(),
+                        "[RS-3006] cursor.session_budget_exceeded: close existing cursors before declaring another".to_string(),
+                    ),
+                )))]);
+            }
             session
                 .cursors
                 .insert(cursor_name.clone(), CursorState { rows, position: 0 });
