@@ -5869,6 +5869,78 @@ mod tests {
     }
 
     #[test]
+    fn v072_application_status_does_not_invent_worker_acknowledgements() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        set_state_budget(1_000);
+        let catalog = CatalogStubs::new();
+
+        assert_eq!(catalog.workload_application_status("unknown"), None);
+        assert!(
+            catalog.add_workload(WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(100)))
+        );
+        let columns = vec![
+            "workload_name".to_string(),
+            "requested_revision".to_string(),
+            "requested_memory_limit_bytes".to_string(),
+            "gateway_effective_memory_limit_bytes".to_string(),
+            "gateway_live_memory_bytes".to_string(),
+            "worker_effective_revision".to_string(),
+            "worker_application_state".to_string(),
+        ];
+        assert_eq!(
+            catalog.workload_application_status("live"),
+            Some(CatalogResponse::Rows {
+                columns: columns.clone(),
+                rows: vec![vec![
+                    Some("live".to_string()),
+                    Some("1".to_string()),
+                    Some("100".to_string()),
+                    None,
+                    None,
+                    None,
+                    Some("no_assigned_views".to_string()),
+                ]],
+            })
+        );
+
+        catalog.add_view_in_namespace(CatalogView {
+            name: "live_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+        catalog.assign_view_workload("live_view", "live");
+        catalog.set_view_state_bytes("live_view", 40, None);
+        assert_eq!(
+            catalog.update_workload_if_revision(
+                WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(60)),
+                1,
+            ),
+            WorkloadRevisionOutcome::Updated(2)
+        );
+        assert_eq!(
+            catalog.workload_application_status("live"),
+            Some(CatalogResponse::Rows {
+                columns,
+                rows: vec![vec![
+                    Some("live".to_string()),
+                    Some("2".to_string()),
+                    Some("60".to_string()),
+                    Some("60".to_string()),
+                    Some("40".to_string()),
+                    None,
+                    Some("worker_ack_unavailable".to_string()),
+                ]],
+            })
+        );
+
+        catalog.set_view_state_bytes("live_view", 0, None);
+        reset_all();
+    }
+
+    #[test]
     fn v072_policy_only_edits_preserve_live_workload_reservations() {
         let _guard = METRICS_TEST_LOCK.lock().unwrap();
         reset_all();
