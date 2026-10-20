@@ -10549,28 +10549,31 @@ impl GatewayHandler {
         let read = async {
             if let Some(view_name) = view_name.as_deref() {
                 if let Some(shard_db) = &self.shard_db {
-                let prefix = format!("view_output/{view_name}/");
-                let (kvs, truncated) = shard_db
-                    .scan_prefix_bounded(prefix.as_bytes(), CURSOR_MAX_BYTES)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if truncated {
-                    return Err("[RS-3006] cursor storage scan exceeded byte budget".to_string());
-                }
-                Ok::<Vec<Vec<u8>>, String>(kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
-            } else {
-                self.view_reader
-                    .read_view(
-                        &view_name,
-                        Some(CURSOR_MAX_ROWS + 1),
-                        ViewReadStrategy::HotOnly,
+                    let prefix = format!("view_output/{view_name}/");
+                    let (kvs, truncated) = shard_db
+                        .scan_prefix_bounded(prefix.as_bytes(), CURSOR_MAX_BYTES)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if truncated {
+                        return Err(
+                            "[RS-3006] cursor storage scan exceeded byte budget".to_string(),
+                        );
+                    }
+                    Ok::<Vec<Vec<u8>>, String>(
+                        kvs.into_iter().map(|(_, v)| v.to_vec()).collect(),
                     )
-                    .await
-                    .map_err(|error| error.to_string())
+                } else {
+                    self.view_reader
+                        .read_view(
+                            view_name,
+                            Some(CURSOR_MAX_ROWS + 1),
+                            ViewReadStrategy::HotOnly,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
                 }
             } else {
-                // Preserve the previous empty materialization for simple
-                // relation-free SELECTs. No storage or view reader is called.
+                // Maintain the old empty result for relation-free SELECT.
                 Ok::<Vec<Vec<u8>>, String>(Vec::new())
             }
         };
