@@ -2157,6 +2157,8 @@ pub struct GatewayHandler {
     join_strategy: JoinStrategy,
     pub is_draining: Arc<std::sync::atomic::AtomicBool>,
     pub in_flight_queries: Arc<AtomicUsize>,
+    /// Bound concurrent eager cursor producers across all connections.
+    cursor_producer_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl GatewayHandler {
@@ -2344,6 +2346,7 @@ impl GatewayHandler {
             join_strategy: JoinStrategy::Auto,
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
+            cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
@@ -2394,6 +2397,7 @@ impl GatewayHandler {
             join_strategy: JoinStrategy::Auto,
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
+            cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
@@ -10530,6 +10534,20 @@ impl GatewayHandler {
         // failed scans and connection-level cumulative retained bytes.
         const CURSOR_MAX_ROWS: usize = crate::copy_out_budget::MAX_COPY_OUT_ROWS;
         const CURSOR_MAX_BYTES: usize = crate::copy_out_budget::MAX_COPY_OUT_BYTES;
+        // Fail fast before invoking any producer. The owned permit releases on
+        // success, read failure, deadline expiry or request cancellation.
+        let _producer_slot = match self.cursor_producer_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "54000".to_string(),
+                        "[RS-3006] cursor.producer_busy: too many concurrent cursor reads".to_string(),
+                    ),
+                )))]);
+            }
+        };
         let read = async {
             if let Some(shard_db) = &self.shard_db {
                 let prefix = format!("view_output/{view_name}/");
