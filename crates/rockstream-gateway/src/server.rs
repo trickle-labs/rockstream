@@ -10543,7 +10543,8 @@ impl GatewayHandler {
                     ErrorInfo::new(
                         "ERROR".to_string(),
                         "54000".to_string(),
-                        "[RS-3006] cursor.producer_busy: too many concurrent cursor reads".to_string(),
+                        "[RS-3006] cursor.producer_busy: too many concurrent cursor reads"
+                            .to_string(),
                     ),
                 )))]);
             }
