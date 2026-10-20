@@ -63,7 +63,9 @@ async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows(
     )
     .await
     .unwrap();
-    let connection_task = tokio::spawn(async move { let _ = connection.await; });
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
 
     let too_many = client
         .simple_query("DECLARE huge CURSOR FOR SELECT * FROM big_view")
