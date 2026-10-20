@@ -10511,22 +10511,19 @@ impl GatewayHandler {
                 ),
             )))]);
         }
-        let Some(view_name) = extract_view_name_from_select(inner_sql) else {
-            return Ok(vec![promote_response(Response::Error(Box::new(
-                ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "0A000".to_string(),
-                    "DECLARE CURSOR requires a readable view".to_string(),
-                ),
-            )))]);
-        };
-        if let Some(denied) = self.select_access_error_response(&view_name, conn_id) {
-            return Ok(denied);
-        }
-        if self.catalog.get_view(&view_name).is_some()
-            && !self.catalog.is_backfill_published(&view_name)
-        {
-            return Ok(backfill_not_published_response(&view_name));
+        // Relation-free SELECT (for example SELECT 1 AS n) was accepted by
+        // the pre-v0.72 cursor dispatcher and is used by supported drivers.
+        // Retain that compatibility path; only relation reads need view ACL.
+        let view_name = extract_view_name_from_select(inner_sql);
+        if let Some(name) = view_name.as_deref() {
+            if let Some(denied) = self.select_access_error_response(name, conn_id) {
+                return Ok(denied);
+            }
+            if self.catalog.get_view(name).is_some()
+                && !self.catalog.is_backfill_published(name)
+            {
+                return Ok(backfill_not_published_response(name));
+            }
         }
 
         // An eager cursor is a producer materialization, not a streaming
@@ -10550,7 +10547,8 @@ impl GatewayHandler {
             }
         };
         let read = async {
-            if let Some(shard_db) = &self.shard_db {
+            if let Some(view_name) = view_name.as_deref() {
+                if let Some(shard_db) = &self.shard_db {
                 let prefix = format!("view_output/{view_name}/");
                 let (kvs, truncated) = shard_db
                     .scan_prefix_bounded(prefix.as_bytes(), CURSOR_MAX_BYTES)
@@ -10569,6 +10567,11 @@ impl GatewayHandler {
                     )
                     .await
                     .map_err(|error| error.to_string())
+                }
+            } else {
+                // Preserve the previous empty materialization for simple
+                // relation-free SELECTs. No storage or view reader is called.
+                Ok::<Vec<Vec<u8>>, String>(Vec::new())
             }
         };
         let rows = match tokio::time::timeout(
