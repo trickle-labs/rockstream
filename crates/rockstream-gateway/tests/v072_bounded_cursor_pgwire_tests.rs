@@ -286,6 +286,6 @@ async fn cursor_producers_have_shared_fail_fast_admission_and_release() {
         matches!(responses.as_slice(), [Response::Error(error)] if error.code == "54000" && error.message.contains("cursor.producer_busy"))
     }).count();
     assert_eq!(rejected, 1, "exactly the fifth concurrent producer must be rejected");
-    let retried = handler.dispatch_async_with_conn(sql, Some("conn_e")).await.unwrap();
+    let retried = handler.dispatch_async_with_conn(sql, Some("conn_f")).await.unwrap();
     assert!(retried.iter().all(|response| !matches!(response, Response::Error(_))), "permit must be released after producer completes");
 }
