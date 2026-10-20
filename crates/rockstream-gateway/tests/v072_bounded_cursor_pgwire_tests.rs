@@ -281,13 +281,7 @@ async fn cursor_producers_have_shared_fail_fast_admission_and_release() {
         handler.dispatch_async_with_conn(sql, Some("conn_d")),
         handler.dispatch_async_with_conn(sql, Some("conn_e")),
     );
-    let results = [
-        a.unwrap(),
-        b.unwrap(),
-        c.unwrap(),
-        d.unwrap(),
-        e.unwrap(),
-    ];
+    let results = [a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap(), e.unwrap()];
     let rejected = results
         .iter()
         .filter(|responses| {
