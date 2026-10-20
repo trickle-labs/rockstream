@@ -10519,9 +10519,7 @@ impl GatewayHandler {
             if let Some(denied) = self.select_access_error_response(name, conn_id) {
                 return Ok(denied);
             }
-            if self.catalog.get_view(name).is_some()
-                && !self.catalog.is_backfill_published(name)
-            {
+            if self.catalog.get_view(name).is_some() && !self.catalog.is_backfill_published(name) {
                 return Ok(backfill_not_published_response(name));
             }
         }
@@ -10556,12 +10554,10 @@ impl GatewayHandler {
                         .map_err(|error| error.to_string())?;
                     if truncated {
                         return Err(
-                            "[RS-3006] cursor storage scan exceeded byte budget".to_string(),
+                            "[RS-3006] cursor storage scan exceeded byte budget".to_string()
                         );
                     }
-                    Ok::<Vec<Vec<u8>>, String>(
-                        kvs.into_iter().map(|(_, v)| v.to_vec()).collect(),
-                    )
+                    Ok::<Vec<Vec<u8>>, String>(kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
                 } else {
                     self.view_reader
                         .read_view(
