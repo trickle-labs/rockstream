@@ -14,3 +14,19 @@ Authoritative operational, architectural, protocol, and parser limits enforced a
 | `MAX_DECIMAL_PRECISION` | Decimal Precision Limit | 38 | digits | SQL type checker | `sql_type_errors_total` | `RS-1016` | Maximum digits of precision for DECIMAL/NUMERIC types |
 | `MAX_VIEW_DAG_DEPTH` | View Dependency DAG Depth | 16 | levels | View compiler DAG validator | `view_compilation_errors_total` | `RS-1011` | Maximum depth of materialized view-on-view dependency hierarchy |
 
+
+## Eager named cursor admission (v0.72)
+
+`DECLARE <name> CURSOR FOR SELECT ...` is an eager query producer.
+It authorizes the target view using the ordinary SELECT policy and accepts
+exactly one read-only SQL query. It admits at most 10,000 returned rows,
+8 MiB of encoded row values **across all retained cursors in one connection**,
+and a 5-second producer-read deadline. A failed/oversized read creates no cursor.
+The storage scan has its own 8 MiB bounded-key/value scan ceiling, and view
+readers are asked for at most 10,001 rows to detect truncation.
+Exhausted budgets return SQLSTATE `54000` / `RS-3006`, timed-out reads
+return `57014` / `RS-9001`. Existing named-cursor count and duplicate-name
+limits still apply.
+
+This bounds the legacy eager cursor lifecycle; it does not claim that all
+SQL query plans and intermediate operators are producer-bounded.
