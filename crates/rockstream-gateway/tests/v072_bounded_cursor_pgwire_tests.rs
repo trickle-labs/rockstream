@@ -112,3 +112,59 @@ async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows(
     connection_task.abort();
     task.abort();
 }
+
+struct DeniedReader;
+
+#[async_trait::async_trait]
+impl ViewReader for DeniedReader {
+    async fn read_view(
+        &self,
+        _name: &str,
+        _limit: Option<usize>,
+        _strategy: ViewReadStrategy,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        panic!("unauthorized cursor must not invoke a producer");
+    }
+
+    fn published_frontier(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn unauthorized_cursor_is_rejected_before_producer_admission() {
+    use pgwire::api::results::Response;
+    use rockstream_gateway::auth::Principal;
+    use rockstream_gateway::server::GatewayHandler;
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_view(CatalogView {
+        name: "private_cursor_view".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![CatalogColumn {
+            name: "value".to_string(),
+            data_type: "Utf8".to_string(),
+        }],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    let handler = GatewayHandler::new(catalog, Arc::new(DeniedReader));
+    {
+        let mut session = handler.sessions.entry("viewer".to_string()).or_default();
+        session.principal = Principal::Jwt {
+            sub: "unprivileged".to_string(),
+        };
+    }
+
+    let responses = handler
+        .dispatch_async_with_conn(
+            "DECLARE denied CURSOR FOR SELECT * FROM private_cursor_view",
+            Some("viewer"),
+        )
+        .await
+        .unwrap();
+    let [Response::Error(error)] = responses.as_slice() else {
+        panic!("cursor must fail before producer read");
+    };
+    assert_eq!(error.code, "42501");
+}
