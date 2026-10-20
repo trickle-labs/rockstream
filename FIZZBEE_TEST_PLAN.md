@@ -1412,3 +1412,17 @@ check the uncontended ledger, waiter ACK race, and pre-admission rejection.
 The repository's frozen exchange-flow performance gate must still be measured
 and pass; these unit tests and this transition mapping are **not** formal
 model checking or complete #134/#132 capacity qualification.
+
+## v0.72 practical shard-placement balancing (issue #134)
+
+`ShardScheduler::assign_initial_shards` now counts existing live leases and
+each assignment completed in a batch, choosing among the *least-loaded
+compatible* healthy workers and retaining the existing capacity-headroom
+tie-break. Reusing an already healthy compatible shard lease remains a no-op.
+This changes only initial placement preference, not the coordination protocol:
+leader gating, a unique lease holder, fencing-token generation and worker-loss
+reassignment remain owned by the existing shard lease/raft models. Existing
+`crates/rockstream-control/src/scheduler.rs` tests exercise placement across
+multiple workers, pre-existing leases and fencing stability. Placement counts
+are advisory; they are not a global memory reservation, throughput guarantee
+or proof of starvation freedom under sustained workload contention.
