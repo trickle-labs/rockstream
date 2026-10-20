@@ -464,6 +464,39 @@ mod tests {
     }
 
     #[test]
+    fn worker_loss_spreads_recovered_shards_across_two_healthy_survivors() {
+        let sched = make_scheduler();
+        register(&sched, 1, 0.9);
+        register(&sched, 2, 0.8);
+        register(&sched, 3, 0.7);
+        let failed = [
+            ShardId(10),
+            ShardId(11),
+            ShardId(12),
+            ShardId(13),
+        ];
+        for shard in failed {
+            sched.manager.acquire(shard, WorkerId(1)).unwrap();
+        }
+        let result = sched.on_worker_dead(WorkerId(1)).unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|item| (item.lease.shard_id, item.worker_id(), item.evicted))
+                .collect::<Vec<_>>(),
+            vec![
+                (ShardId(10), WorkerId(2), Some(WorkerId(1))),
+                (ShardId(11), WorkerId(3), Some(WorkerId(1))),
+                (ShardId(12), WorkerId(2), Some(WorkerId(1))),
+                (ShardId(13), WorkerId(3), Some(WorkerId(1))),
+            ]
+        );
+        for item in &result {
+            assert!(sched.manager.is_valid_writer(item.lease.shard_id, item.lease.lease_token));
+        }
+    }
+
+    #[test]
     fn worker_death_with_no_remaining_workers_frees_shards() {
         let sched = make_scheduler();
         register(&sched, 1, 1.0);
