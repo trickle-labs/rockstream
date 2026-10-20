@@ -58,7 +58,10 @@ async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows(
     );
     let (address, task) = server.serve_background().await.unwrap();
     let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=test dbname=test", address.port()),
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
         NoTls,
     )
     .await
@@ -72,7 +75,10 @@ async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows(
         .await
         .unwrap_err();
     assert_eq!(too_many.code().map(|code| code.code()), Some("54000"));
-    let absent = client.simple_query("FETCH ALL FROM huge").await.unwrap_err();
+    let absent = client
+        .simple_query("FETCH ALL FROM huge")
+        .await
+        .unwrap_err();
     assert_eq!(absent.code().map(|code| code.code()), Some("34000"));
 
     let stacked = client

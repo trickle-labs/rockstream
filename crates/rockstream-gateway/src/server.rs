@@ -10493,7 +10493,10 @@ impl GatewayHandler {
             .ok()
             .is_some_and(|statements| {
                 statements.len() == 1
-                    && matches!(statements.first(), Some(sqlparser::ast::Statement::Query(_)))
+                    && matches!(
+                        statements.first(),
+                        Some(sqlparser::ast::Statement::Query(_))
+                    )
             });
         if !valid_query {
             return Ok(vec![promote_response(Response::Error(Box::new(
@@ -10603,7 +10606,8 @@ impl GatewayHandler {
                     ErrorInfo::new(
                         "ERROR".to_string(),
                         "42P03".to_string(),
-                        "[RS-2052] cursor.already_exists: cursor count or name conflict".to_string(),
+                        "[RS-2052] cursor.already_exists: cursor count or name conflict"
+                            .to_string(),
                     ),
                 )))]);
             }
