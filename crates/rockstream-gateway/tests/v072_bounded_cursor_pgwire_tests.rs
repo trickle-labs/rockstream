@@ -234,3 +234,58 @@ async fn unauthorized_cursor_is_rejected_before_producer_admission() {
     };
     assert_eq!(error.code, "42501");
 }
+
+// One gateway admits at most four concurrent eager producers, regardless of
+// connection identity. Dropping a read releases the RAII permit.
+struct SlowCursorReader;
+
+#[async_trait::async_trait]
+impl ViewReader for SlowCursorReader {
+    async fn read_view(
+        &self,
+        _name: &str,
+        _limit: Option<usize>,
+        _strategy: ViewReadStrategy,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        Ok(vec![b"ok".to_vec()])
+    }
+
+    fn published_frontier(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn cursor_producers_have_shared_fail_fast_admission_and_release() {
+    use pgwire::api::results::Response;
+    use rockstream_gateway::server::GatewayHandler;
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_view(CatalogView {
+        name: "small_view".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![CatalogColumn {
+            name: "value".to_string(),
+            data_type: "Utf8".to_string(),
+        }],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    let handler = GatewayHandler::new(catalog, Arc::new(SlowCursorReader));
+    let sql = "DECLARE active CURSOR FOR SELECT * FROM small_view";
+    let (a, b, c, d, e) = tokio::join!(
+        handler.dispatch_async_with_conn(sql, Some("conn_a")),
+        handler.dispatch_async_with_conn(sql, Some("conn_b")),
+        handler.dispatch_async_with_conn(sql, Some("conn_c")),
+        handler.dispatch_async_with_conn(sql, Some("conn_d")),
+        handler.dispatch_async_with_conn(sql, Some("conn_e")),
+    );
+    let results = [a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap(), e.unwrap()];
+    let rejected = results.iter().filter(|responses| {
+        matches!(responses.as_slice(), [Response::Error(error)] if error.code == "54000" && error.message.contains("cursor.producer_busy"))
+    }).count();
+    assert_eq!(rejected, 1, "exactly the fifth concurrent producer must be rejected");
+    let retried = handler.dispatch_async_with_conn(sql, Some("conn_e")).await.unwrap();
+    assert!(retried.iter().all(|response| !matches!(response, Response::Error(_))), "permit must be released after producer completes");
+}
