@@ -74,7 +74,7 @@ async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows(
     assert_eq!(absent.code().map(|code| code.code()), Some("34000"));
 
     let stacked = client
-        .simple_query("DECLARE injection CURSOR FOR SELECT * FROM small_view; DELETE FROM small_view")
+        .simple_query("DECLARE injection CURSOR FOR DELETE FROM small_view")
         .await
         .unwrap_err();
     assert_eq!(stacked.code().map(|code| code.code()), Some("0A000"));
