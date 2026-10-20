@@ -336,6 +336,36 @@ mod tests {
     }
 
     #[test]
+    fn initial_placement_counts_existing_leases_and_never_double_assigns_shards() {
+        let sched = make_scheduler();
+        register(&sched, 1, 0.9);
+        register(&sched, 2, 0.3);
+        let previous = sched.manager.acquire(ShardId(99), WorkerId(1)).unwrap();
+
+        let assignments = sched
+            .assign_initial_shards(&[ShardId(1), ShardId(2), ShardId(99)])
+            .unwrap();
+        assert_eq!(
+            assignments
+                .iter()
+                .map(|assignment| (assignment.lease.shard_id, assignment.worker_id()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ShardId(1), WorkerId(2)),
+                (ShardId(2), WorkerId(1)),
+            ]
+        );
+        // Do not disturb a healthy owner's existing fencing token.
+        assert_eq!(
+            sched.manager.get(ShardId(99)).unwrap().lease_token,
+            previous.lease_token
+        );
+        for id in [ShardId(1), ShardId(2), ShardId(99)] {
+            assert!(sched.manager.get(id).is_some());
+        }
+    }
+
+    #[test]
     fn mixed_versions_choose_a_compatible_worker() {
         let sched = make_scheduler();
         register(&sched, 1, 0.3);
