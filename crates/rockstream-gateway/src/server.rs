@@ -10557,7 +10557,7 @@ impl GatewayHandler {
                     .await
                     .map_err(|error| error.to_string())?;
                 if truncated {
-                    return Err("cursor storage scan exceeded byte budget".to_string());
+                    return Err("[RS-3006] cursor storage scan exceeded byte budget".to_string());
                 }
                 Ok::<Vec<Vec<u8>>, String>(kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
             } else {
