@@ -303,3 +303,54 @@ async fn cursor_producers_have_shared_fail_fast_admission_and_release() {
         "permit must be released after producer completes"
     );
 }
+
+#[tokio::test]
+async fn cancelled_parallel_cursor_reads_release_producer_slots() {
+    use pgwire::api::results::Response;
+    use rockstream_gateway::server::GatewayHandler;
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_view(CatalogView {
+        name: "small_view".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![CatalogColumn {
+            name: "value".to_string(),
+            data_type: "Utf8".to_string(),
+        }],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    let handler = GatewayHandler::new(catalog, Arc::new(SlowCursorReader));
+    let sql = "DECLARE active CURSOR FOR SELECT * FROM small_view";
+    let blocked = {
+        let reads = async {
+            tokio::join!(
+                handler.dispatch_async_with_conn(sql, Some("one")),
+                handler.dispatch_async_with_conn(sql, Some("two")),
+                handler.dispatch_async_with_conn(sql, Some("three")),
+                handler.dispatch_async_with_conn(sql, Some("four")),
+            )
+        };
+        tokio::pin!(reads);
+        tokio::select! {
+            _ = &mut reads => panic!("the producer test fixture must remain blocked"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                handler.dispatch_async_with_conn(sql, Some("five")).await.unwrap()
+            }
+        }
+    };
+    assert!(matches!(
+        blocked.as_slice(),
+        [Response::Error(error)] if error.code == "54000"
+            && error.message.contains("cursor.producer_busy")
+    ));
+    // The four in-flight futures were dropped by leaving the scope.
+    // Their owned semaphore permits must no longer count against admission.
+    let retried = handler
+        .dispatch_async_with_conn(sql, Some("six"))
+        .await
+        .unwrap();
+    assert!(retried
+        .iter()
+        .all(|response| !matches!(response, Response::Error(_))));
+}
