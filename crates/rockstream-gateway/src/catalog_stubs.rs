@@ -3126,6 +3126,50 @@ impl CatalogStubs {
         rows
     }
 
+    /// Inspect the requested policy without pretending that a catalog write
+    /// acknowledged delivery to remote worker owners.
+    ///
+    /// A local workload budget is the actual admission owner for this gateway.
+    /// This reports its current cap/charge independently of the requested
+    /// definition. Worker-effective revision remains NULL until a real owner
+    /// acknowledgement mechanism exists; never infer it from catalog revision.
+    pub fn workload_application_status(&self, workload_name: &str) -> Option<CatalogResponse> {
+        let requested = self.get_workload(workload_name)?;
+        let local_owner = self
+            .workload_budgets
+            .read()
+            .unwrap()
+            .get(workload_name)
+            .cloned();
+        let local_limit = local_owner.as_ref().map(|owner| owner.max_bytes());
+        let local_usage = local_owner.as_ref().map(|owner| owner.current_bytes());
+        let assigned_views = self.views_for_workload(workload_name);
+        let owner_state = if assigned_views.is_empty() {
+            "no_assigned_views"
+        } else {
+            "worker_ack_unavailable"
+        };
+        let columns = vec![
+            "workload_name".to_string(),
+            "requested_revision".to_string(),
+            "requested_memory_limit_bytes".to_string(),
+            "gateway_effective_memory_limit_bytes".to_string(),
+            "gateway_live_memory_bytes".to_string(),
+            "worker_effective_revision".to_string(),
+            "worker_application_state".to_string(),
+        ];
+        let rows = vec![vec![
+            Some(requested.name),
+            Some(requested.revision.to_string()),
+            requested.memory_limit.map(|limit| limit.bytes.to_string()),
+            local_limit.and_then(|value| (value != u64::MAX).then(|| value.to_string())),
+            local_usage.map(|usage| usage.to_string()),
+            None,
+            Some(owner_state.to_string()),
+        ]];
+        Some(CatalogResponse::Rows { columns, rows })
+    }
+
     pub fn workload_status(&self) -> CatalogResponse {
         let columns = workload_status_columns();
         let rows = self
