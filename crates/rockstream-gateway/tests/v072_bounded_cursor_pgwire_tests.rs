@@ -1,0 +1,112 @@
+//! Normal-client cursor admission must not bypass producer budgets or SELECT ACL.
+use std::sync::Arc;
+use tokio_postgres::{NoTls, SimpleQueryMessage};
+
+use rockstream_gateway::{
+    catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView},
+    view_reader::{ViewReadStrategy, ViewReader},
+    GatewayError, GatewayServer,
+};
+
+struct CursorReader;
+
+#[async_trait::async_trait]
+impl ViewReader for CursorReader {
+    async fn read_view(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+        _strategy: ViewReadStrategy,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        // The producer must always receive a real row limit, not None.
+        assert_eq!(
+            limit,
+            Some(rockstream_gateway::copy_out_budget::MAX_COPY_OUT_ROWS + 1)
+        );
+        Ok(match name {
+            "big_view" => vec![b"x".to_vec(); 10_001],
+            "medium_view" => vec![vec![b'a'; 5 * 1024 * 1024]],
+            "small_view" => vec![b"first".to_vec(), b"second".to_vec()],
+            _ => Vec::new(),
+        })
+    }
+
+    fn published_frontier(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows() {
+    let catalog = Arc::new(CatalogStubs::new());
+    for name in ["big_view", "medium_view", "small_view"] {
+        catalog.add_view(CatalogView {
+            name: name.to_string(),
+            sql: "SELECT 'x'".to_string(),
+            columns: vec![CatalogColumn {
+                name: "value".to_string(),
+                data_type: "Utf8".to_string(),
+            }],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+    }
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(CursorReader),
+    );
+    let (address, task) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=test dbname=test", address.port()),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    let connection_task = tokio::spawn(async move { let _ = connection.await; });
+
+    let too_many = client
+        .simple_query("DECLARE huge CURSOR FOR SELECT * FROM big_view")
+        .await
+        .unwrap_err();
+    assert_eq!(too_many.code().map(|code| code.code()), Some("54000"));
+    let absent = client.simple_query("FETCH ALL FROM huge").await.unwrap_err();
+    assert_eq!(absent.code().map(|code| code.code()), Some("34000"));
+
+    let stacked = client
+        .simple_query("DECLARE injection CURSOR FOR SELECT * FROM small_view; DELETE FROM small_view")
+        .await
+        .unwrap_err();
+    assert_eq!(stacked.code().map(|code| code.code()), Some("0A000"));
+
+    client
+        .simple_query("DECLARE active CURSOR FOR SELECT * FROM medium_view")
+        .await
+        .unwrap();
+    let budget = client
+        .simple_query("DECLARE second CURSOR FOR SELECT * FROM medium_view")
+        .await
+        .unwrap_err();
+    assert_eq!(budget.code().map(|code| code.code()), Some("54000"));
+    client.simple_query("CLOSE active").await.unwrap();
+
+    client
+        .simple_query("DECLARE ok CURSOR FOR SELECT * FROM small_view")
+        .await
+        .unwrap();
+    let rows: Vec<_> = client
+        .simple_query("FETCH ALL FROM ok")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, vec!["first".to_string(), "second".to_string()]);
+    client.simple_query("CLOSE ok").await.unwrap();
+
+    connection_task.abort();
+    task.abort();
+}
