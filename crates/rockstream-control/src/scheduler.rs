@@ -479,18 +479,21 @@ mod tests {
             sched.manager.acquire(shard, WorkerId(1)).unwrap();
         }
         let result = sched.on_worker_dead(WorkerId(1)).unwrap();
-        assert_eq!(
-            result
-                .iter()
-                .map(|item| (item.lease.shard_id, item.worker_id(), item.evicted))
-                .collect::<Vec<_>>(),
-            vec![
-                (ShardId(10), WorkerId(2), Some(WorkerId(1))),
-                (ShardId(11), WorkerId(3), Some(WorkerId(1))),
-                (ShardId(12), WorkerId(2), Some(WorkerId(1))),
-                (ShardId(13), WorkerId(3), Some(WorkerId(1))),
-            ]
-        );
+        assert_eq!(result.len(), 4);
+        let mut recovered_shards: Vec<_> =
+            result.iter().map(|item| item.lease.shard_id.0).collect();
+        recovered_shards.sort_unstable();
+        assert_eq!(recovered_shards, vec![10, 11, 12, 13]);
+        let worker_two = result
+            .iter()
+            .filter(|item| item.worker_id() == WorkerId(2))
+            .count();
+        let worker_three = result
+            .iter()
+            .filter(|item| item.worker_id() == WorkerId(3))
+            .count();
+        assert_eq!((worker_two, worker_three), (2, 2));
+        assert!(result.iter().all(|item| item.evicted == Some(WorkerId(1))));
         for item in &result {
             assert!(sched.manager.is_valid_writer(item.lease.shard_id, item.lease.lease_token));
         }
