@@ -115,7 +115,6 @@ async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows(
     assert_eq!(rows, vec!["first".to_string(), "second".to_string()]);
     client.simple_query("CLOSE ok").await.unwrap();
 
-
     // Cursor page order must survive pipelined normal-client reads.
     client
         .simple_query("DECLARE pipelined CURSOR FOR SELECT * FROM small_view")
