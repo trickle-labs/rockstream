@@ -774,7 +774,7 @@ mod data_plane_tests {
         assert_eq!(compactor.config().window_duration, custom_window);
 
         let new_config = EpochCompactionConfig::new(Duration::from_millis(150)).unwrap();
-        client.set_compaction_config(new_config.clone());
+        client.set_compaction_config(new_config.clone()).unwrap();
         assert_eq!(
             client.compaction_config().window_duration,
             Duration::from_millis(150)
@@ -815,8 +815,13 @@ impl WorkerClientHandle {
     }
 
     /// Set the worker-wide epoch compaction config.
-    pub fn set_compaction_config(&self, config: EpochCompactionConfig) {
+    pub fn set_compaction_config(
+        &self,
+        config: EpochCompactionConfig,
+    ) -> Result<(), crate::epoch_compaction::EpochCompactionError> {
+        config.validate()?;
         *self.compaction_config.write() = config;
+        Ok(())
     }
 
     /// Get active deployment for a workload and shard.
