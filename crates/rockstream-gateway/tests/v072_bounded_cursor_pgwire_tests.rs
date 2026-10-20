@@ -115,6 +115,26 @@ async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows(
     assert_eq!(rows, vec!["first".to_string(), "second".to_string()]);
     client.simple_query("CLOSE ok").await.unwrap();
 
+
+    // Cursor page order must survive pipelined normal-client reads.
+    client
+        .simple_query("DECLARE pipelined CURSOR FOR SELECT * FROM small_view")
+        .await
+        .unwrap();
+    let (page_one, page_two) = tokio::join!(
+        client.simple_query("FETCH 1 FROM pipelined"),
+        client.simple_query("FETCH 1 FROM pipelined"),
+    );
+    assert!(page_one
+        .unwrap()
+        .iter()
+        .any(|row| matches!(row, SimpleQueryMessage::Row(r) if r.get(0) == Some("first"))));
+    assert!(page_two
+        .unwrap()
+        .iter()
+        .any(|row| matches!(row, SimpleQueryMessage::Row(r) if r.get(0) == Some("second"))));
+    client.simple_query("CLOSE pipelined").await.unwrap();
+
     // A large explicit count must clamp to the remaining rows, even after
     // the cursor position is nonzero (usize arithmetic must not overflow).
     client

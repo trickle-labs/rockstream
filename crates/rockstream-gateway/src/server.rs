@@ -10689,24 +10689,24 @@ impl GatewayHandler {
             count_str.parse().unwrap_or(0)
         };
 
-        // Get session rows
-        let session_opt = self.sessions.get(conn_id_str);
-        let cursor_data = match &session_opt {
-            Some(session) => session.cursors.get(&cursor_name).map(|c| {
-                let start = c.position;
+        // Fetch and advance under one lock so concurrent cursor operations
+        // cannot duplicate pages or reposition a cursor reopened by CLOSE.
+        let cursor_data = self.sessions.get_mut(conn_id_str).and_then(|mut session| {
+            session.cursors.get_mut(&cursor_name).map(|cursor| {
+                let start = cursor.position.min(cursor.rows.len());
                 let end = if fetch_all {
-                    c.rows.len()
+                    cursor.rows.len()
                 } else {
-                    c.position.saturating_add(fetch_count).min(c.rows.len())
+                    start.saturating_add(fetch_count).min(cursor.rows.len())
                 };
-                (start, end, c.rows[start..end].to_vec())
-            }),
-            None => None,
-        };
-        drop(session_opt);
+                let rows = cursor.rows[start..end].to_vec();
+                cursor.position = end;
+                rows
+            })
+        });
 
-        let (_start, end, fetched_rows) = match cursor_data {
-            Some(d) => d,
+        let fetched_rows = match cursor_data {
+            Some(rows) => rows,
             None => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
                     ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
@@ -10714,13 +10714,6 @@ impl GatewayHandler {
                 )))]);
             }
         };
-
-        // Advance position
-        if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
-            if let Some(cursor) = session.cursors.get_mut(&cursor_name) {
-                cursor.position = end;
-            }
-        }
 
         let _n_fetched = fetched_rows.len();
 
