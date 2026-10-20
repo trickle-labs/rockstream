@@ -115,6 +115,44 @@ async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows(
     assert_eq!(rows, vec!["first".to_string(), "second".to_string()]);
     client.simple_query("CLOSE ok").await.unwrap();
 
+    // A large explicit count must clamp to the remaining rows, even after
+    // the cursor position is nonzero (usize arithmetic must not overflow).
+    client
+        .simple_query("DECLARE large_fetch CURSOR FOR SELECT * FROM small_view")
+        .await
+        .unwrap();
+    client.simple_query("FETCH 1 FROM large_fetch").await.unwrap();
+    let remaining: Vec<_> = client
+        .simple_query(&format!("FETCH {} FROM large_fetch", usize::MAX))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(remaining, vec!["second".to_string()]);
+    client.simple_query("CLOSE large_fetch").await.unwrap();
+
+    client
+        .simple_query("DECLARE large_move CURSOR FOR SELECT * FROM small_view")
+        .await
+        .unwrap();
+    client.simple_query("MOVE 1 FROM large_move").await.unwrap();
+    client
+        .simple_query(&format!("MOVE {} FROM large_move", usize::MAX))
+        .await
+        .unwrap();
+    let after_move = client
+        .simple_query("FETCH ALL FROM large_move")
+        .await
+        .unwrap();
+    assert!(!after_move
+        .iter()
+        .any(|message| matches!(message, SimpleQueryMessage::Row(_))));
+    client.simple_query("CLOSE large_move").await.unwrap();
+
     connection_task.abort();
     task.abort();
 }

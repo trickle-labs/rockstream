@@ -10697,7 +10697,7 @@ impl GatewayHandler {
                 let end = if fetch_all {
                     c.rows.len()
                 } else {
-                    (c.position + fetch_count).min(c.rows.len())
+                    c.position.saturating_add(fetch_count).min(c.rows.len())
                 };
                 (start, end, c.rows[start..end].to_vec())
             }),
@@ -10805,7 +10805,7 @@ impl GatewayHandler {
                 let end = if move_all {
                     cursor.rows.len()
                 } else {
-                    (cursor.position + move_count).min(cursor.rows.len())
+                    cursor.position.saturating_add(move_count).min(cursor.rows.len())
                 };
                 cursor.position = end;
                 end - start
