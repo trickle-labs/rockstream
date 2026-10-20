@@ -786,7 +786,10 @@ mod data_plane_tests {
             Duration::from_millis(100),
         );
         assert!(client.set_compaction_config(invalid).is_err());
-        assert_eq!(client.compaction_config().window_duration, Duration::from_millis(150));
+        assert_eq!(
+            client.compaction_config().window_duration,
+            Duration::from_millis(150)
+        );
 
         let retrieved_compactor = client
             .compactor(WorkloadId(1), ShardId(100))
