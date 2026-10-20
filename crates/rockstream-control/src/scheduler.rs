@@ -268,10 +268,9 @@ impl ShardScheduler {
                 })
                 .cloned()
                 .collect();
-            if let Some(winner) = PlacementAlgorithm::choose_with_preference(
-                &candidates,
-                preferred_az.as_deref(),
-            ) {
+            if let Some(winner) =
+                PlacementAlgorithm::choose_with_preference(&candidates, preferred_az.as_deref())
+            {
                 // acquire() should always succeed here because we just released
                 // the shard; no other worker holds it.
                 match self.manager.acquire_with_heat(
@@ -350,7 +349,10 @@ mod tests {
         // All three shards should be assigned (workers are healthy).
         assert_eq!(assignments.len(), 3);
         assert_eq!(
-            assignments.iter().map(|a| a.worker_id()).collect::<Vec<_>>(),
+            assignments
+                .iter()
+                .map(|a| a.worker_id())
+                .collect::<Vec<_>>(),
             vec![WorkerId(1), WorkerId(2), WorkerId(1)]
         );
     }
@@ -370,10 +372,7 @@ mod tests {
                 .iter()
                 .map(|assignment| (assignment.lease.shard_id, assignment.worker_id()))
                 .collect::<Vec<_>>(),
-            vec![
-                (ShardId(1), WorkerId(2)),
-                (ShardId(2), WorkerId(1)),
-            ]
+            vec![(ShardId(1), WorkerId(2)), (ShardId(2), WorkerId(1)),]
         );
         // Do not disturb a healthy owner's existing fencing token.
         assert_eq!(
@@ -469,12 +468,7 @@ mod tests {
         register(&sched, 1, 0.9);
         register(&sched, 2, 0.8);
         register(&sched, 3, 0.7);
-        let failed = [
-            ShardId(10),
-            ShardId(11),
-            ShardId(12),
-            ShardId(13),
-        ];
+        let failed = [ShardId(10), ShardId(11), ShardId(12), ShardId(13)];
         for shard in failed {
             sched.manager.acquire(shard, WorkerId(1)).unwrap();
         }
@@ -495,7 +489,9 @@ mod tests {
         assert_eq!((worker_two, worker_three), (2, 2));
         assert!(result.iter().all(|item| item.evicted == Some(WorkerId(1))));
         for item in &result {
-            assert!(sched.manager.is_valid_writer(item.lease.shard_id, item.lease.lease_token));
+            assert!(sched
+                .manager
+                .is_valid_writer(item.lease.shard_id, item.lease.lease_token));
         }
     }
 
