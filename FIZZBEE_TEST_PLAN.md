@@ -1415,7 +1415,8 @@ model checking or complete #134/#132 capacity qualification.
 
 ## v0.72 practical shard-placement balancing (issue #134)
 
-`ShardScheduler::assign_initial_shards` now counts existing live leases and
+`ShardScheduler::assign_initial_shards` and worker-loss reassignment now
+count existing live leases and
 each assignment completed in a batch, choosing among the *least-loaded
 compatible* healthy workers and retaining the existing capacity-headroom
 tie-break. Reusing an already healthy compatible shard lease remains a no-op.
