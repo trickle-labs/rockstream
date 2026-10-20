@@ -45,3 +45,25 @@ An operator can answer the seven primary operational questions without inspectin
    - Command: `rockstream doctor`
    - Evaluation: Runs 12 bounded diagnostic checks distinguishing PASS, WARN, and FAIL, outputting actionable remediation steps with stable RS-XXXX codes.
 
+
+## Workload policy application (v0.72)
+
+`SHOW WORKLOAD APPLICATION FOR <workload_name>` reports the catalog's
+`requested_revision` separately from the gateway's **actual live quota owner**:
+`requested_memory_limit_bytes`, `gateway_effective_memory_limit_bytes`, and
+`gateway_live_memory_bytes`. SQL NULL for the gateway values means no
+local accounting owner has been observed; a NULL requested cap means unlimited.
+For workloads that have a locally enforced unlimited cap, the effective-cap
+column is also NULL, but the live usage remains observable.
+
+`worker_effective_revision` is **NULL** and
+`worker_application_state` is `worker_ack_unavailable` for workloads
+with assigned views: the gateway cannot yet attest remote worker acknowledgement.
+For workloads without assigned views, the state is `no_assigned_views`.
+Do not read the accepted requested revision as proof of cluster-wide enforcement.
+The command returns SQLSTATE `42704` for an unknown workload.
+
+The existing `SHOW WORKLOAD REVISION FOR <name>` and `SHOW WORKLOAD STATUS`
+commands keep their legacy schemas. A future actual worker-acknowledgement
+protocol can populate the effective revision without making up acknowledgements.
+
