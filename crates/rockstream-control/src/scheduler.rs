@@ -250,9 +250,26 @@ impl ShardScheduler {
             })
             .cloned()
             .collect();
+        // Reassignment is a batch too: preserve the initial-placement
+        // balancing rule instead of repeatedly choosing one static winner.
+        let mut owned: HashMap<WorkerId, usize> = HashMap::new();
+        for lease in self.manager.leases() {
+            *owned.entry(lease.worker_id).or_default() += 1;
+        }
         for shard_id in freed {
+            let least_owned = compatible_workers
+                .iter()
+                .map(|worker| owned.get(&worker.worker_id).copied().unwrap_or(0))
+                .min();
+            let candidates: Vec<_> = compatible_workers
+                .iter()
+                .filter(|worker| {
+                    Some(owned.get(&worker.worker_id).copied().unwrap_or(0)) == least_owned
+                })
+                .cloned()
+                .collect();
             if let Some(winner) = PlacementAlgorithm::choose_with_preference(
-                &compatible_workers,
+                &candidates,
                 preferred_az.as_deref(),
             ) {
                 // acquire() should always succeed here because we just released
@@ -265,10 +282,13 @@ impl ShardScheduler {
                         .cloned()
                         .unwrap_or_else(LeaseHeatHint::default),
                 ) {
-                    Ok(lease) => assignments.push(ShardAssignment {
-                        lease,
-                        evicted: Some(dead_worker_id),
-                    }),
+                    Ok(lease) => {
+                        *owned.entry(winner.worker_id).or_default() += 1;
+                        assignments.push(ShardAssignment {
+                            lease,
+                            evicted: Some(dead_worker_id),
+                        });
+                    }
                     Err(LeaseError::AlreadyLeased { .. }) => {
                         if let Some(lease) = self.manager.get(shard_id) {
                             assignments.push(ShardAssignment {
