@@ -10805,7 +10805,10 @@ impl GatewayHandler {
                 let end = if move_all {
                     cursor.rows.len()
                 } else {
-                    cursor.position.saturating_add(move_count).min(cursor.rows.len())
+                    cursor
+                        .position
+                        .saturating_add(move_count)
+                        .min(cursor.rows.len())
                 };
                 cursor.position = end;
                 end - start

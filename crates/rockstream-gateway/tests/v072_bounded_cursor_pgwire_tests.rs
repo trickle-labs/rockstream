@@ -121,7 +121,10 @@ async fn eager_cursors_reject_unbounded_and_stacked_work_without_retaining_rows(
         .simple_query("DECLARE large_fetch CURSOR FOR SELECT * FROM small_view")
         .await
         .unwrap();
-    client.simple_query("FETCH 1 FROM large_fetch").await.unwrap();
+    client
+        .simple_query("FETCH 1 FROM large_fetch")
+        .await
+        .unwrap();
     let remaining: Vec<_> = client
         .simple_query(&format!("FETCH {} FROM large_fetch", usize::MAX))
         .await
