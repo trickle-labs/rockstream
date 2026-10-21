@@ -736,6 +736,10 @@ impl JoinOp {
             }
         }
 
+        // The borrowed key slices must no longer reference right_s before
+        // its staged rows are drained into the persistent arrangement.
+        drop(right_by_key);
+
         // Apply staged deltas to arrangements and track modified rows.
         let mut dirty_left = self.dirty_left.lock().unwrap();
         let mut dirty_right = self.dirty_right.lock().unwrap();
