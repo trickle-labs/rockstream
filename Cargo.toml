@@ -117,3 +117,7 @@ rockstream-sql = { path = "crates/rockstream-sql" }
 rockstream-storage = { path = "crates/rockstream-storage" }
 rockstream-test-support = { path = "crates/rockstream-test-support" }
 rockstream-types = { path = "crates/rockstream-types" }
+
+[patch.crates-io]
+# Security backport for pgwire 0.28.0 (issue #227). See vendored README.
+pgwire = { path = "vendor/pgwire-0.28.0" }
