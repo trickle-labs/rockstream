@@ -1,0 +1,166 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:146b420c6e1c889585a0538f63f723744cd18dba0185bfe59ea879f5d05cbf18",
+  "claims": [
+    {
+      "id": "claim_6d89d7f4ed04477f96b935b3e1a9cb75",
+      "statement": "RockStream incrementally maintains durable materialized views from changing data and serves committed results to PostgreSQL-compatible clients.",
+      "evidence": [
+        {
+          "resource": "repo://README.md#L3-L5",
+          "version": "repo-lines-v1:sha256:4044734aff75106632a99225d21f74a3d477c8b7d68815105976a4b2a5a932ea:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMzdmYmE4MzliNjVmNDk3ZWE2YTJjNWQ0NTM3NzQ4NjhiMGZiMzAyYmU2OGMxMjY4NmQxNTNlYTkxZjJkODZmMCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMGZhNzMxMDc5MGRlZTRiOGY4Zjk3YWQ1YTdiMjM3NjIyN2I3OWFiYWJlMmE5ZTQ5MmEyMWYyYzEzNjMzNDk5YSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjIsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiM2I2N2YwNDRlNDRmODYxODVhZDU3YmZkOTgwZGU5NDk5OGYwZjM1ZjdjNjU1MzY2MmYwYmRlZTAxMGIxMTIwYyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZmUzYWFkNTYyZjBkZTRlYTcyNzJmOTk4ZThiZjhmNmVhMTY0YjliOGNlNWZkNjVjZjBjMzQzMTNjYTQ2ZDU5NCJ9"
+        },
+        {
+          "resource": "repo://README.md#L46-L68",
+          "version": "repo-lines-v1:sha256:7cb9d8248ba70deb26bb5342279190442153f143ea5bcd9f25a02ea68f4e912f:eyJzZWxlY3RlZExpbmVDb3VudCI6MjMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE4YzBlN2U1MzkyNWQ1ZTdhZTE1ZjI2ZWJkOWYzYjdiZTJiYzJmMTBlYzBiYTM0NzVhODI0YjNhMjk3NGYzNjgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ2Yzg5NDFhZTRmMGEyNjI3MWRiODA2NDc5ODlhODZjNGQ3ZjI1ZWY3MDI1MjVlMjdkMWFmNWEyYWY5MTEyNTUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjcwODNiYjA5NTNjODYyOTJiMWQ0ZWZmMGNkMjJkNTczMjExNmExYjQ1M2ViNTQ0MWY3ZWZmYTU0NjRkYTY3NzQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_49858248f59c49d5b28ae4d5acef8f8e",
+      "statement": "The canonical documentation persona entry points are getting-started for evaluators, operator for operators, contributors for code contributors, and docs/README for maintainers; ADR 0001 makes persona entry points stable navigation.",
+      "evidence": [
+        {
+          "resource": "repo://README.md#L7-L17",
+          "version": "repo-lines-v1:sha256:ba2430fdfdf67382cc223204f171839fc1534d46b1ab1aab0a0fc1d1a1854b4d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc3YmY4ODdiY2ViZWRmZmQwMzJiZWE4NDM0N2E1NTYzYWU4ZDRkMTJmZWNhOTkwNDg5ZTJhZmY2MjYzZjgxZGEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImFlMWY4MjY1ZTNhNTRhZGZhNmRkZTJmMjljMzE3YzgyMWIxZjY5YjQ2OWFmNGNlOWRiM2Q4Y2JmZDM0MzU5MmMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjAxNGIxMzMzMTg2MDFjMWMzYTVkYmVlZjg5NmJmZGYwODNjYmZiMzMxNzY1MTU1OGRjYWFhOWZhYmIxM2JiMDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjliYjY0ODE4ODBiZDQ3NWZiZTA0YmEyOWMwYWE5YmY5MjA0M2RlNjQ3MjNiZTU2OTFmZTI0MjMyZjcyNTg3ZWYifQ"
+        },
+        {
+          "resource": "repo://docs/adr/0001-documentation-navigation.md",
+          "version": "repo-file-v1:sha256:d741c39d6bdb2e063192a1f773f57dafb182e756401ebd05d60efe0d53b8ecea"
+        }
+      ]
+    },
+    {
+      "id": "claim_7a40f23730f842ee8ab167791ae5f4df",
+      "statement": "The getting-started demo is ephemeral and simulated, while the local-project workflow creates a persistent scaffold and applies schema and seed data over pgwire.",
+      "evidence": [
+        {
+          "resource": "repo://docs/getting-started.md#L160-L209",
+          "version": "repo-lines-v1:sha256:44e49309d554589a434213eb7a9d430b4b97b399a889f669f9a421c4c58c64ba:eyJzZWxlY3RlZExpbmVDb3VudCI6NTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU4NDRmOWQ2Mjk4NmYxMDQwNmVmNWY4OWRiYjc2ZDhmZDA2MGJhNzRjOWI4NWI4YWNkODY3ZjQ3MjY3N2UzMWUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjYzNDMyOTFlODMwYTgxY2FlZDEzMWMwZDBmNDk2NmVmMjRiZmRlYTE3N2NkNGMyNGUyZjk1OGY0ZGFiNDYwMGMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijg4MDkxOGFjNjQzMDcwNDAzMDA0MzI3OGFiYjE2NzAwMWM2ODM0M2ZjNWEzYWRmN2Y4MmI2MTY5NTI5Yjg0YWYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ4NGI3YzQ5ZDIwNjQ0NWMzY2MzMDFlMTk3ZTA5YTA4OGRlOGI3YTQ4ODcxMmFlMDE3NDdiOTJhYTI2YjUxYjgifQ"
+        },
+        {
+          "resource": "repo://docs/getting-started.md#L5-L13",
+          "version": "repo-lines-v1:sha256:2e51aaaa1d6f6fe1782748038ce029638606709360a6480ea2fb75b8b67a5b67:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNTAxMWZjMTkxMjgyMjNjYmE4OWE0YTJhNzhiOWIxYjA4YWE3ZjE1YmVmOWY2MjA2YWMwZDQ5ZTg2Y2M5NWIwMCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNWFkMjhkNDM1ZTA3NjEzMGQxYTQ1MmFiMGVhZmY3ODkzOGYwMDBiZmU0MjUyMTRhZjU0MzEyY2ViNmU5N2E2MiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNzI0NzRmZjNiNDgyNmU4MTI2ZmVjNjcwYTE2ZmYyZjg0MDJkY2JlNmQ3YTJhMTIyMTNmZmY2YjI1MWY0MzhhYSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNDUyNTFiMDkwMTFlNTQxMTQ2Y2I5MmViM2Q1NTg2MTE5YzFhZjQ4MjE4MWM0ODczZDMxOTZiNWU2YTFlOWUwYyJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_317f9fb471ff4ea59429c2d408206dd6",
+      "statement": "The Cargo workspace uses edition 2021 and Rust 1.88, with toolchain 1.88 and rustfmt/clippy pinned in rust-toolchain.toml.",
+      "evidence": [
+        {
+          "resource": "repo://Cargo.toml#L28-L32",
+          "version": "repo-lines-v1:sha256:abd5399c3f873ed15c1a699d9e223a7c580ba6ec716aa53b5b77236d009dc4b8:eyJzZWxlY3RlZExpbmVDb3VudCI6NSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiZDg2OTQxMmEyZThkNWYzYmFiNDE4ODZjMTNhMDZjNmYwOTkzMzg3Y2RlNzExZDgzMjZlZGI4ZDU3NzRlYzk5ZiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMWY4NmQ3ZjRkM2Q4YzgxMjZhNGRmMjM5ZjZkMDA5OTg3MGMyOWNkYWE1NTk1Njg1Njc1M2MyNDBkY2I0YzhmYyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNjA4NjAzYzUwZjhiYTE4ODQ0ZmJkYjUxMDdjZjhiMzUyM2JkOTVhZjA2NDk2ZjAxOWUxMWExMzkxYzI4NDFlMCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiOWRlYzRhNzMwNGQ2ZDkxNThhMzZiZjMwYmUxYTExNmFlOWM1M2FjYWEwYTQyODE0MGJkZDIxMmM2Y2UxNTYyMSJ9"
+        },
+        {
+          "resource": "repo://rust-toolchain.toml",
+          "version": "repo-file-v1:sha256:74d98fe505e9e397bd46d6f232894aea501a75fb2b0bb0562774b9a5193796f4"
+        }
+      ]
+    },
+    {
+      "id": "claim_7a2ae48166484dff883542a720fb3411",
+      "statement": "rockstream-cli builds the single rockstream operator executable from src/main.rs; node roles are flags rather than separate executables.",
+      "evidence": [
+        {
+          "resource": "repo://README.md#L221-L233",
+          "version": "repo-lines-v1:sha256:a2cc5d52ccc7dfbd605be1cd8b024e08f4f44e3e821829d1a87e70706985b490:eyJzZWxlY3RlZExpbmVDb3VudCI6MTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImViYjY1ZjdjYTQwMDU4MjIwMWZjMDdlYzY5N2E1ZmQyZjBkMjdhNzU3ZTkwNzdhYWVjYzg5NmIwNThjYzI3MjAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ3YzA2YzU2MWQ1YzMyNzM0MzY4NTI2OGE0NmIzMzkxZjM5OThlZWU4OTBkMmJlNTFmMGQyMWNjNGE1M2FlNmQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjFiOGUwYzRmYTJiZGIxZGQyOTdmODUzZmRlOTIyNmUwNzg4MWZmZWJhOTRmNjBjN2ZiOTIxNjRiYjY3ZWMxODIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM4ZTEzZGUwYzdhYWU5NGRhYmIxMmQ5MjljYjNlNjE3OThlNjNlZWQwYzhkY2ZlYjJjN2VjZWRhOTk1NDEzMDYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/Cargo.toml#L1-L15",
+          "version": "repo-lines-v1:sha256:9003b0ed9a56b4226c41b9a1cb0d09681a4a971ab04c9f0e9d3454d51e433ee0:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhhM2NkNWE4MWIzZjlhNjIxYWE0OTNkOTBjNDVmNDJhYjU3MWQ0ZTQyYjhhZTVhZmYzNTFjYjBhMDJkMDZkODIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYyMTg3ZWRmNTAwOGQyOGRhMTQzZDgwMjIzMjliNDk1ZjdhMDQ0M2FmMDhhNWE3NzMxNjI0NjUzMzBjOGJiZDMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjhhOTU4OGVkNTg5N2FmNWYwZDkyOWM4NGY5MjE1ZmRmMWY4OTAxZmJiM2VmZDYwNzkwN2JlM2Y3ODk3YTU4MTMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_8aeacbd1e6584736aa25571833a19b9a",
+      "statement": "The CLI main entry parses commands; its Start branch constructs CLI configuration overrides, resolves configuration, builds StartOptions and invokes run_start.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/main.rs#L282-L415",
+          "version": "repo-lines-v1:sha256:cc9eb3b7eb997c56fcd462d352dbba599a138bfa93985ad10fe3bd7600f7eb99:eyJzZWxlY3RlZExpbmVDb3VudCI6MTM0LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiJmY2NiNmMxOTIzYWU0YTg5ZDU3NGViMGMzYTc2OTc1OGIwMzZiYTMyYzdlODFhMGYwMmMwMjUzYzNjMzUzYThmIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI1NTIyYzQyY2QxOWM2ZDAzZDgwOGM0NTI3MjA1NTI4MjViN2VhMWM1YjQ5MWIyMTg1MTFjYWM3NDE1Y2Y5ZDliIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI0YTlhOTMxZjlkMGUzZDkyYjg3Zjg3ZWE1YWU1MWZiZGM2MjI1ZDEzYTc5ZDM2YTdhYTVlNDRkMzNlNjEwMzJlIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiIzMzJmZjEzZWMxZjFmZmVlMjYxYzUyZDA0ZjZiNDU3NDQyZjVkYjZiM2ZmMzllOThmMDkxMzZiYmJmMjNhZWQ0In0"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/src/main.rs#L35-L49",
+          "version": "repo-lines-v1:sha256:e1ac8c750d559991e5d8972593a6228062364f2ea50b2b46305c1778c473825e:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhlYzkzNmQ2OGQ0YTNlMzIyMzBkNGZiYWI1ODVmZTI0MTA5ODAwNzQzM2Y0YTI5NjliNmEyNWE0YTlhMjdkMDQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImZjNjU5ZTdiMjRkYmUyOGQ4M2ZlYTI1YzYzNGUyMDVkYTExNDFkNTUwNGVlZTY3YmI5YzQ5OWM0OTQwMDlmZWIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjI2OTc0MTA5ZThjZWYwYjEzNzFlYjM2YWFhZGIzZjA2OGViYTAxOWU4NTVhNmVhZDljOTdhYTIxNmVjMDQ5NmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjIxNmM0ODUyZTdiYmJkNTIyYWQ2MjNjNmI2NDc0MWYwNWY4ZTRlMzRlMzkxNjA5NWJlNzkyMDEzYzk1Nzk3NjcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_10b77081587a42c0b2b2e16a616dd4de",
+      "statement": "Worker and frontier startup require a control URL, while gateway startup can run standalone without one.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L625-L642",
+          "version": "repo-lines-v1:sha256:f9dbcd7cd343dc2ade0672c5584bc887bc25d682df12a483b34476a03e1c3185:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI0MzA5ODY2YzU0ZDNjNGNhYjc4MTk2NzM3YTg2M2RmZmFlNWE3NzcxODVmMmQxZmI5ZmYwZWM5OTc4NGMzNTAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE1ZWI3YTNhOTczMjQxZTlhNDMxNDc5MmE1MDlmOGMyZDUyODVlYzEzMjVmZDYxNjEzOWQwMzViYTA3MTJjYTMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImVmMGNmYzlkMWZhYzU5MDhhNDYxODFlYjY4ZTgzYzMxYWQ3MzM5ZmJlZjQ4NzlhZjA2N2JkODQyODhlZjVhMWQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_f8fe36095ae74e56939e810d18e369bb",
+      "statement": "Repository command guidance requires RTK wrappers, and documentation_transcript_tests is a documented focused CLI test target.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md#L29-L44",
+          "version": "repo-lines-v1:sha256:a2821c190d484d6de52afe8bc0ecd9d3b563903b624e473f8e329e9ff76747e0:eyJzZWxlY3RlZExpbmVDb3VudCI6MTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijk0YjVmYTA0ZDUxNmE5YTU4M2IwM2NjZTM3NWVlNzAyZTk0NzZiYjY0MDQxYzRlN2Q1OWQ3ZTQzZTc4MmRlMTkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM4NTQ1MjRiZDI4ZTc1NmM1MWFhM2Y5MzczZWIwYWFlNTk3MDBiZTdhNGNhNjM0NDE5ZDBjMGJjYjViYzkxYzciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjYyNzJmMDAzYWYxMjExYmEwNWY5NDRlYzk4OTI2ZGE5OGFjMGRjMDY4Mjc2ZjM2NTcyNGM0ZmZiZmQwN2Q2ZjgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ0ZGVlN2I3NTdjNDY4MTM2ZjAxN2ZmYmUxOWEyMThhZTRlYWU2OGUxNTkyN2NlNmE0YzdhNzFiMzZjNzM2MDcifQ"
+        },
+        {
+          "resource": "repo://docs/test-commands.md#L3-L21",
+          "version": "repo-lines-v1:sha256:65629c3353a4b3b7d4a1494921aaec8260206ce1ba7bf7e7506178d1bbbf21f0:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAyMjZkYjk2N2VjZGI2YzRiZGRmYjlhNDMxNTFhNjY1ZGIxODg5MjU4NjEzOWUyZDJjZjJiZmY3ZDFmNTI2ZDgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ3YzA2YzU2MWQ1YzMyNzM0MzY4NTI2OGE0NmIzMzkxZjM5OThlZWU4OTBkMmJlNTFmMGQyMWNjNGE1M2FlNmQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjoyLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImVjNDY5ZjEzMGE3OTIzZmIxM2MyYjgwMmM1MjIyOTkxYzY5YmE2MTU0MjZiYjUyNjY5YzkxOTRiYTI0ZDQzMTMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImNmZjkzNjA0MjkyZWNhY2UzNGVjMzMwMDhiNzlkMGRkNmE5ZjkyYmM0MTdjM2ExY2QxMmUwNDIzYjIwZjBjMmEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_ff32415d053445279dc610c14208ddf1",
+      "statement": "The public SQL frontend is a documented subset rather than full PostgreSQL semantics, and Kafka view delivery is Experimental with bounded snapshot/change delivery and explicit limits.",
+      "evidence": [
+        {
+          "resource": "repo://README.md#L124-L152",
+          "version": "repo-lines-v1:sha256:1b5e6380b648fe2a7f2ef100e8727a2bf49e498d4f1a09317fe8b550f6f7d311:eyJzZWxlY3RlZExpbmVDb3VudCI6MjksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU5MTFiOTVmMzU2MWVlNzBlMWIyYmE4MTVhYjM4NDRmMWY2YjNmMDIxZDdiMWYyMTE3MTgwOGU3MDE1MGI5NDAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQyOGNkZTAyN2E4ZmQ1ZjFmNzRmYmQ1YTJkOTQxMDNkNDgxMjg1OTY0NzFmNWE2ODg5OTYyOTk3MzI1MDg1MDYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjNhZWYyMWI2ODA5NDY1OGU4NDNmMGE3YTI1OTAyZjkzYzc3NzliZDYyZjQwNDE0MmI2YjVhYWRkNDUzYjYwNmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ0NGE2Y2I2OTcxZjMxZGVjZGUyZTU3NWJiMTIyZDA0N2YyYWI0YjE1NmM0ZDc1NDE2ODQyMTJhNzEzNDNlODgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_8c032cf708094bc1a7f9a4daca7646d5",
+      "statement": "Operator diagnostics distinguish liveness from workload health and expose health, status, view progress and bounded doctor diagnostics.",
+      "evidence": [
+        {
+          "resource": "repo://docs/operator.md#L16-L46",
+          "version": "repo-lines-v1:sha256:48a74d4bc4cb2a7f6b9fb252c77f60a63ae0116853e7037a072baed609c5790f:eyJzZWxlY3RlZExpbmVDb3VudCI6MzEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJkMTEzNmRlYTdkYWRiMDU3ZTIwNGZmYjU2YzM2ZjcyMjYyMjQxOWVkZWUzNmFhNWZhNjBkODE2YzJkYTlmNDkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM5N2RlY2M4YmJhMmE1NTUxZGIzOTNiMGJlODZjNTg2ODlkYzE3ODE2M2RmY2M2N2NlMWFmNWE3OTNiYjA4MTUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImEwYTIyZjk1ZDJmNTc5NzQ1MTlhOTRhMjkwNGYzNDcwZGJjNTA2MmMxYWFkYTRmMmE3NGYwOTk3OTEzYjY3NjQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjA3MDRiYmIwOWQ3OGRmZjg0OGJmN2QwMTEwYzEyNzgyY2M3NTA1NzMxZjBmYTdlZjk4YWI5YWQ1Y2M0Mjg2OWYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_520c6f77ae384e3d8852dedb7677ac25",
+      "statement": "Fast/mock qualification modes are helper evidence with release_qualified false; successful release qualification is limited to the named worker-failure-kafka-minio-v1 scenario rather than general connector, control HA or PGWire recovery.",
+      "evidence": [
+        {
+          "resource": "repo://docs/test-commands.md#L51-L78",
+          "version": "repo-lines-v1:sha256:3f2aa63dababa9ede2bd74a876025a42703747e1467c93b6d288d143a65b9600:eyJzZWxlY3RlZExpbmVDb3VudCI6MjgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImFmYTg1Y2ZkOTJhNzZhY2U1MDJkODgyZWQyZjIwMmYzODQ0NjliNzhiZjIxMGU2Mzg3MDU4MTY2NWRmYmRhMDUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdmYWEwZGM4NTUwM2M5NDdkMWMwY2I5NjgxZmI3NzJmNjA0MTg3ZjI3YmEwNzYxNzQ4MjQ3NmZlNzU1ZTJiNzYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijg5NzA5M2QzOWRjMmJhZTY1YjJiMGE5MTYwMmEwOTczNDBjMzE2MDMzMjRmNDFmYzZkZTEyZTAzNGQ4ODUwOTEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ4ZmRhNDYyOGZlNTUyODUyODYxNTViM2FmOTMxZjEzZTRlZjgxZDllOWNmODA4MTE5Y2YyNzhjOWRkOGYyMDYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_f9b5263054964c9faf339b01a5d0a844",
+      "statement": "Canonical generated reference pages live under docs/reference, while older top-level reference URLs remain compatibility entry points; generated changes should be tied to their owning manifest or contributor source.",
+      "evidence": [
+        {
+          "resource": "repo://docs/README.md#L14-L25",
+          "version": "repo-lines-v1:sha256:d8575df77d12ed5fc45502cb00979330afe1e0413c160c9a701341acd79628ef:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRhMjliNWU0NTkzN2E5ZDk2ZmNiNjJmNDJjZGM2ZGViNDUwZTVkZjljYWZlMGYwZTFiNDA1NzA1YzkyMDFiNmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjllNzdmMGIzNDk5ZGU2ZDc3ODcyYzAyYWNhZDcyMWJkNjJlNDRmYTNlM2Y0YzYzZTcxNjJmYmYyZWMxNmQyMDkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImY5MTJkMGQzZDc4M2I5ZmNiN2FlYWY1N2E0N2Q0Yzc1YjhiYWUzODcyMzU4NmI3N2YxYjRlNDk0OTYzYTdjYTEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE1ZDZlZGQ2MTNiMzUyZGIzNTI1ZWE1NjBiZjFlNDY0MTkwNzdjNzE4Y2RlYTc2YzdkYTZmZTFhMTYyMGFkOTYifQ"
+        },
+        {
+          "resource": "repo://docs/adr/0002-reference-compatibility.md",
+          "version": "repo-file-v1:sha256:78fa027e24cc0a502ee2279df0625919d028d40828a9085497e9e77d52ab2350"
+        },
+        {
+          "resource": "repo://docs/contributors.md#L19-L29",
+          "version": "repo-lines-v1:sha256:e518a217462f7c79e40410dd815f75c2a4bfe5fa0cb2ea19344481915b9b36a7:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1MWRhMjg4Y2UxOTlkZDgyZDMyZDQ2NTM0MTQyZDY3YzFkZjRjZmFkZmNjNjA0MTRlOTlmODExZWIxOTc3MTQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI5MDQ5ZmRiYzgzZWY0NDRmZTIxOWU2MzZiMmI5NzFkZDdlNzFjMjcxMTc1OGMyYzViOWU1ZTVjNDU5NzFiYTciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjZiZTQ2OTBmZjdhMjY1ZDEwNDhmZjc2MzI1YjBkZTQ3OTEwOGQ5ODI2YWM4MTU2YTVkYzhmYzhiZjBkNmY2OWYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjoxLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwYjdkNTJhNDczOWU4ZTQyMGM1MTNmYjVjYmY3MTc0ODBlOTM5MWU5ZjZkMWFhYzYzNTg2YjE2MGY0MDIwM2UifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.7.2",
+    "at": "2026-10-21T16:22:36.376Z"
+  }
+}

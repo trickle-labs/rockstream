@@ -1,0 +1,368 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:b5aed90d549c215299440b7dca6eee8754ab7472d0ad6a66bb63989c95730de2",
+  "claims": [
+    {
+      "id": "claim_02a7e3de358b49f3b6fdf8b5b05bb519",
+      "statement": "The workspace has seventeen crates under crates/ plus fuzz, grouped into shared contracts, compilation, execution/storage, coordination, external boundaries, and validation/reference tooling rather than a strict dependency ladder; rockstream-cli builds rockstream and rockstream-docgen generates references.",
+      "evidence": [
+        {
+          "resource": "repo://ARCHITECTURE.md#L119-L164",
+          "version": "repo-lines-v1:sha256:ebbe8ac722a3182ea8af3fefb42b998e5eb6a0cafce93026aeed4bc45ba4f0b1:eyJzZWxlY3RlZExpbmVDb3VudCI6NDYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImMxZGNhMGE2N2IzZWNiNWJlMDllNjhmMjQ1NzA4MGVlOTIzNTlhMjhlODkxZGI4YTQ2YTU2NjFkNWEyMGEyOWMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijk5YjMzNDkwNDg2NGNjZjU2NzJlZTE3MWExZGIxNzE1ODgxMTc1YThjZDAwMjFhMjIxMWM1NzdlMGIyZWZjMzEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEifQ"
+        },
+        {
+          "resource": "repo://Cargo.toml#L1-L22",
+          "version": "repo-lines-v1:sha256:a32a161d7cc3e808857d255050b5a96abdceedc314fa1b22938d0d4818e36ad7:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQzNGUxMDJjODYxZjk5NGQyYWFjZTkxMTRkMzkyZGJjMTYyMTkwZTAwYmU4ZmUzNTdkNDcyMTUwY2E0Mzk2MTQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY5NDE2ZTA5Zjc4YmEzMTZjMDMyNTY4MjEzYjg1NWVlNzU2ZTQxNTY1ZDkxOGYwOTUxOWM4MWZkNjIwZjQwNjAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjhhYTk0ODZhMzJjOTg0YTFlYzc0N2I4ODZhNTY0YTA1Njg0ZWI0YmU4MmY0NDM3OGZkMjc5MmUzZWMyOGExMjIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_1c77978c6a9d4d39a7bce1ce6a54634d",
+      "statement": "Shared types define weighted Arrow data, epochs, identities, schemas and frontier contracts; selected production kernels are verified, not the entire database.",
+      "evidence": [
+        {
+          "resource": "repo://ARCHITECTURE.md#L151-L164",
+          "version": "repo-lines-v1:sha256:9116fbabfc1b96c3b035b3bbc4c17b2f76ae1a78b176e2e2fe7baae2075b229e:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg2MzI2ZjhmN2Q2MjEwZjE0YzIyZWI5ZmE2MmQwZWVlODg3NWNkZmU2ZmRkM2I3MTY3NzkzNWM5MDA4NjEyY2YiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijk5YjMzNDkwNDg2NGNjZjU2NzJlZTE3MWExZGIxNzE1ODgxMTc1YThjZDAwMjFhMjIxMWM1NzdlMGIyZWZjMzEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjdiN2JjNDNmY2I0OTA0NzVmMmVlYmFiNTZmZjk5Yzk2NzMxYzQ4NjY3YWFmM2NjNjJiYjEyYjJiN2EzMWEzMjkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEifQ"
+        },
+        {
+          "resource": "repo://ARCHITECTURE.md#L51-L65",
+          "version": "repo-lines-v1:sha256:667fb0c048c80a2056f0f9ea808b3d48960bb48833ed4f1a7361a235d1ec046a:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBlYzY1NjdhYThkZjQ3ODcwMzM3OTQxYWUyNzdjY2NkMGU0M2QwM2NjY2Q0ZjU1MmFiZmEyOGY0NzMzMGIwNWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZkZTUyNGRiZTJhNTBmNzgxNmVlMjVkYjdkZTYxMmZkNjFhZGY2YTYzMjJhZTdhYjk1MmNmYTQ3NzgyM2U1ZDkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImVkMjE0NTQ4MWMzMjA3NjlmZTU3M2FiZDM1Y2Q1YjY3OTcwMzNlMGI0MjE0YTZkYWVhZWM0NTgzOThlNjc0MTQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_f7a1b2c974b94f919f564c6de8af6dbf",
+      "statement": "The live gateway view compiler wraps SQL-lowered PlanNode in a ViewSink and invokes compile_plan_with_strategy; distributed workers deserialize logical plans, compile against shard storage, restore pipeline state, and only then report readiness.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2469-L2524",
+          "version": "repo-lines-v1:sha256:17aecc1bc0882875ef77f1ef99bdf72dc84745f7823522fae1ec42d3f88e1927:eyJzZWxlY3RlZExpbmVDb3VudCI6NTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc0NTVlNjRkYmM4ZjczNjdjMTAwNjg4MjE1ZjAyMmFkYzI2MWFlOWJlZWUyZjI2OTIxNWZlZmFiYmNjYzMzZmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1MjJjNDJjZDE5YzZkMDNkODA4YzQ1MjcyMDU1MjgyNWI3ZWExYzViNDkxYjIxODUxMWNhYzc0MTVjZjlkOWIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRiMDdjMGZlOTc3ODZmMWNlODg5N2RkY2Q0MzE2YWY0ODg0OGUwMWZiNGM0YzBlMGRmNGQ5NTkwZmExYjQyM2EiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/client.rs#L1404-L1509",
+          "version": "repo-lines-v1:sha256:b0fe7081cd4f4e262c5f0b895dfd9aa106c593dc0a2e2943bdcd3c0adf99dc0d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTA2LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiIwOGFiYWNhZDI0OWJkZDA5NWM3OTZiM2M3ZjBmMTdhZmM5NTM3ODI5YjRlNTg2MTllMTM4NjNlZTc5ZGQ4ZTQzIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJlZDE0ZjUwMjdhZjUxN2NkNzQ1ZDM5OTZlNjFmNzNiNDMwY2FmMTM2ZGM5ZGIxMzgyODQ3ZDc1OTM0MzQ4NzkyIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIwOTk5Njc1YjMzNGI2NGM4YzA0ZjQ2MzA0ZDAwN2RhY2IxMTFhMWI4MDIyN2Y5ZWRkM2Q4YTViOWFhMjg1ZmJkIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI3NzM5YWRmODA0YjUxMmE4NjlmZDkxMTk2MGYzYjJjMzE3NzVjMjlmNWFkMzRlODllMjQ3YzU2NWRhYzA5MDhhIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_3c6f2546a23a4bebb3ad6456f7c727e5",
+      "statement": "The all role starts embedded control, registers a worker, acquires the normal shard-0 lease, and shares its shard with the gateway instead of creating gateway-shard storage.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L383-L401",
+          "version": "repo-lines-v1:sha256:d7f1ca661aa0dfb58b8f44efcfdb583605c381bee2e4686ae5537bcd29898ac2:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjEwYzQyNmMzMzdlMzIyNDU3MjdjMzIzNjJjYjM0ODZiOTFhODE1YTkyNGIyNjIyZmNkYmQyMzM0OTE0N2E0YWUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQyMzliYmQ4NmUzZWZlYzdlZDMyYjFmZTg2ZjU1NjJhMWY0NzU3ODQ3ZGQ0NTZlZmFkMTk1NmYzYWQ4OTFlYzUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjViNGQ2ZjliMGJlYzU0OTE2NjNmYjAzNTY1Yjc2NTNkZjFkZjY5Y2E5YTc5ODYyYzFlMGJiMTlkMjAzNDE3ZjEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjljMTM3ZDIzMWYwYTVhZGRiZDE2OTlkMDQ5N2UxMjk5YTkxZGJiZGJhNGIyNmExMzQxYjFhYjcxM2U1YTcxZTYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L751-L808",
+          "version": "repo-lines-v1:sha256:b4c8a7828afad4e7e315ecedcf1cb6133b9ba888096b3909b50020744b8bece5:eyJzZWxlY3RlZExpbmVDb3VudCI6NTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYxYTdjY2VlNDZiZjU4NGU1ZjRlNDNkMTk1NmRkZDE0MWZjNGRjOTllMDhkYzNiMWM4YzViNGM0NjU0MjU5MzkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNmMTZkZjU5MDk5YzBiNGRiMDRiOWRkNGQxOWQzNjQzOTIwZTM5MzFiMzI1NDZjYjkzNTlhMjY2OGYzZGYwMDkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM3OTlhMTg4MGYyMDUzZDZiYjRlNTQwOTM3MGVmMjdkZjMwMDZkZDQ3Nzc5YWIyZGNiNzc4MGEzZDkwNzkzMWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc5NmVkNGE3MjRkYzk2ZTI2OTJhMDk0Y2M4MmI3ZWQxNGI2MWIwMzRhMDlhNGIwOWMyMDAyNjk4NzE0YzhlYjEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L950-L1029",
+          "version": "repo-lines-v1:sha256:9beddc02fc2a584c9d1c680ad1a71c8ebc8b573cdc0d5f92913bd6e798038e27:eyJzZWxlY3RlZExpbmVDb3VudCI6ODAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE1NzE4NmY1N2M1OTlhMjk1NDhlNzQ3ZjBmZGY0MmNjMjQwY2JmOGMwZmEyZmI0YTk5ZDdjNzE0NmE4ZTg4NDAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ0YjFmZGQzZDVkZTU3YjFjZWZmYzk0NDBkZDcwYjA3YjgxZTZjYzQyYTBmNTFlMDEyMWFhMmVhNDAwZjMzYWYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijc1MGQ1MzAwZTQ3NDlmYTM5YmZjNDA0YTM4YjRjNTkxMDVmNDE3ZDVjOTg5OGIyNzE1MTU5ZmNlNmJkMDBlOTYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZhZjM1ZTUyYjU4NTIyNDQ1NjE4OGMzNjQ5YWQyMmYwYjQ5ZDg3N2ZiNzMxYzMxMzlkMTM0M2E0ZDNhZTExNzEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_1272bcfd5d97493bab513af32da880b4",
+      "statement": "A separate gateway opens gateway-shard storage and optionally attaches a DataPlaneClient when configured with control; this does not eliminate gateway-local storage.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L343-L380",
+          "version": "repo-lines-v1:sha256:5fb3a1b5581c7ee4405e1b7a861eff46437530f3d7c00b56f8168bc89d1de55f:eyJzZWxlY3RlZExpbmVDb3VudCI6MzgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImFjNzgxMjdhNmNjMTMyZWEwMjU3NzQyOTA4MGJhMDBiOGIyYTY1M2NiZWM4ZDk5ZDljNmYxYzVmZmE5ZGE3N2QiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImFlMmM3N2RkMjcxODZhZTJiMzA1ZGQwYWUzMjJiNzQxMmUxMGM0N2E2MmFlZjQwMWMzYzBjZWRjNTFkZGQwZjgiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUwNTY3NzUzMzczYTYwZDM0OTg3ZmNjNzQwNDA2YTM2YmIwNDY1Y2Y2ZmFhOTJlYTNjMzQzMjIxODM1ZGM1OTEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImEzOTg0ZjI0MDExY2M5MTdhYjE4OTNhN2U1MjU5M2FhYWEyYzc0MGFlYzliMzQ4YTAyZGJkNDg0NTdhMjZhOTAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L538-L550",
+          "version": "repo-lines-v1:sha256:8ed91436760aaa348aad7a22245e8af98d7fe098fff7937bb2cc5307b492f654:eyJzZWxlY3RlZExpbmVDb3VudCI6MTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgxMjk0MTliMzI0YmQwOTdkYmEyNGJmMmYwMjM0NmU0ODgzMzJkYzUwNGU1ZTc2MjZiMjVlZjYxYjIyZGZjY2MiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjEzN2U3NGE3NDZmM2U0ZmE5OGQ3Y2I5OGRiMDdkMzBiZmY2NWNlZjY3NmYxN2FiMWVhNDkzYWM0ODQ5MDY4MTQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijk5MGRiYjgxYmUyOTBjYTkxNjBkOTQ4NDA3ZmRiZDM3MmQxY2UzMmQ5NjU4NjAyM2E2OGUzNjM0Yzc2MTM4NTcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_2bcc2f5d9c8c45b78489ce150d4db0b4",
+      "statement": "The control role attaches persistent shard, topology and migration stores and a frontier aggregator, and enables Raft only when peers are configured.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L808-L947",
+          "version": "repo-lines-v1:sha256:242619de5376d3f78f964cf0f1dd34b712aeb4c7d6822e2976b382962b1dc662:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQwLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiJjZjE2ZGY1OTA5OWMwYjRkYjA0YjlkZDRkMTlkMzY0MzkyMGUzOTMxYjMyNTQ2Y2I5MzU5YTI2NjhmM2RmMDA5IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiIxYzQzYzNhNzAwNTAwYmE2OWY4OWQ0YTUxMjE4ODhhYzVkMWI1YjhjNDgwYjM3NTIyMTljZWQyMThlZWVjMDFmIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI4YTk0ZDY4ZjgwNGQ4MGVhMGQwZTE4YjZjOWViMDcxMTc0MzkzMDM3Yjc0YjJjM2RkN2ExZDQ2ZDNiNjMzYzMzIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJiNDAyNzM0Y2Q1NDk2M2RiMTJlZDY0N2I1MzgzN2Q5ZDQ1ZTFmZmZjNTc4YTNhMTJjNTE3OTdlZjc3N2RlMzQxIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_40299cc17f8d4979a9cf4f662d3c65ca",
+      "statement": "Workers require a control address, reject deployments whose version, worker identity or lease token differs from current ownership, and recheck the lease fence before persistence.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L627-L644",
+          "version": "repo-lines-v1:sha256:de52715bf21c4328509fd3d567ba03ef1921b77a1204007b5793e1ceb0daa62d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImZjOTk1MDA0NTEyMjNkNDkwNDc1ZWVkYWViOGMzODhkOWE0ZjNhNTVjNmUwNjJjYTIzNGE2MzJiNDY5OTYzYzUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjEyNDA2YzllNDZkNDkyM2NmZmFjZWE0NDNiMmVmNzdkZDgyODhlNDVhYWQ5MmQ3ZTI1MWYyMTE3NDY3YTY1OGQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQ1NWZlNGIyOTAwN2RhZTU5NDM1ZjMyMGRhNmNlYjBlZmI3MTU0MGM2ODAzODU4MWRjNGQ5NTQ2NTRlNTE0YWIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImEyYTYxOWM0MmMyMjlmMDI3MTI2YzJmNzU5NDkwMTFjMzZlODJjN2FiYzNiMDA4OGMzNGFkMzExOTE0NjFkZTcifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/client.rs#L1404-L1418",
+          "version": "repo-lines-v1:sha256:a6402539ee4023b969020934c34f9ac8c18182edbc615b4128fa697f34baf780:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA4YWJhY2FkMjQ5YmRkMDk1Yzc5NmIzYzdmMGYxN2FmYzk1Mzc4MjliNGU1ODYxOWUxMzg2M2VlNzlkZDhlNDMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU3YTVmZmEzZTA5NWRmMDViNmIzMzMzODcxYWJhMWMxYjNlMjVhYjNkYmYxZDQ5MmYxNTRjMmNjMmIxMjJmNTciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjA5OTk2NzViMzM0YjY0YzhjMDRmNDYzMDRkMDA3ZGFjYjExMWExYjgwMjI3ZjllZGQzZDhhNWI5YWEyODVmYmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ1Y2UwZjFkN2JkYmRhMTY2MTQ1MjliMzNlNDc1NmFlYzhiYWVmMjc1MTBlZTlkYjQyNGUyZTYxMTkwN2ViNWMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/client.rs#L327-L335",
+          "version": "repo-lines-v1:sha256:979b8a51f1a687677b4c8e7224e8bda27a1043cd5d82d62b5bf5185e544b6521:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMjM0MjBmOWI1ZTMyMjdhMjA2NTIxODBjZWFlZjY4ZmVhYzRiNzNhN2FlMDczMDUxZWY2NDIzNzFhZjg1Zjg3MSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNDg5M2Y0MGUzNzgxZWI4OTZjODJkMDQ2YTA4MDY3YTExZTM1Y2RmMmYxZGZhZjI2ZmVhOTBiOGRiNjY3NjQxMyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiY2Q4ZTU4MTE4NTEyNGY0OWY1OGU3MzdmMjlmZWYwZDZhNzkxNmUxNDJjMzBiNjI0NGUwNjgwZWNlMjE0ZDIzNyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiOTgyMTIwNzUyZDVhNzVkOGIxOGQ5ODQzMjEzYzNjNDgxOGYwYzRhZDQ4ZTg4ZTI0ZTVmOTBiZjY3NDE5MDQyYSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_600bf66f0b384d2eafa81fd8e31db2af",
+      "statement": "The frontier role startup branch only creates an in-process aggregator and startup audit/metrics; the old KNOWN_ROLES comment claiming other roles run the embedded node is inconsistent with the current distinct startup branches.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L1032-L1045",
+          "version": "repo-lines-v1:sha256:cc3b6b028bd69217d6e883cd1c28c3ac25d8e6a2c4ccdd3fc9b70a22cdd6233e:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjJkNDNiZWJkYjJlZjhiYTkwZDg1ZWYyZjY5ODJjZGI4YjY0MzdiZTQ1YjUzN2JkNTE4NGIwOTI1ZWI4NWYwYTgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkzYjA1OTc4OTYyMWM0YjJhYTk2NTk3ZGJkNTQ0MWY1MjEwNmU0OWY1YmZiN2FiZjVlNzdjODlhNDQ0M2VjMDAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhhNzExNzdhZWEwYjBiNWQyZThkOGY2MmIzZDdjMWY2ZjIyYjAwNTkxNjAxNTZiNTFmOTVkNmViNmU3YjkzODUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImJjOWY4ZTQxNjIyNDg3YzRkNTI1YWI5NTYyMTU0NTVlNzJlZjkyNGI3OWY5ZWIwN2VhNGJjZTdmM2ZiMjkzMjgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L66-L69",
+          "version": "repo-lines-v1:sha256:e2af84640833799aceb1052fe8ba0c83ec0d9ae80b9fdbd72ed21d7aecbc9125:eyJzZWxlY3RlZExpbmVDb3VudCI6NCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNDY4ZDUyYTBkM2MyNTY0MzY5NWQxMGQxNmVkMGNkZmZjZWNiODFkY2VhY2M1OWYyNDlkMTNjMmRiYTI3MTI5NCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiODNjNmZlNjk1M2U5ZDljNDAwNDA1M2MzYmQyNGQyNjVlNWMxMTZjMDIxYmEzNWJmNTI0YTVlMzVhNjQzOTRlZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNWI4MGZmYzZhZGU2NjVhNmVlNjRmMjIyODFjZjgxNzgzNGU2N2MwNDVjOWNhMmVhMGNiOWRhYzc5YTBkOWIzMiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMjFkNGI3OWNkN2FhYjIxZmUwNzcyMDkzNDEyYTI5ZGNjZmFkYjBjZjI3ZTFkYjE3ZmZkYWMzOTU0YTgzN2ViZSJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L760-L815",
+          "version": "repo-lines-v1:sha256:2b194312d8eb429596363955207ac9bfd56a4e4e990680a6026300b0c047f472:eyJzZWxlY3RlZExpbmVDb3VudCI6NTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU2NTk4ZmQ4MDRmM2YyMDFhOTJkODI1MDAwNTAwMjVmZWJhYjBiOWJjMmUwYWM1MDZhZDU0M2Q2NWYzMzVjYTYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2NzUyYTc5ZDFhZDE4MDA2MDQ1NjcyMjY3MGIzYTcxYzdlNzkyODRmNGM2OTc0ZWYzYmVhZTBmMWQwOTM1NzMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjI0ZjI4YTQwM2Q3NTQwYmYwNDFiMzllOGI1M2FiZDM0ZDk0ZWNkZTJmYTJjY2FhY2IyZWZiYmRmNDY2NTNiZGMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5N2M4N2I0MDA1MmEyMDM0ZGViZmVhOTUxYzg5ZTMyZDQ3ZGZiYmE1OTQ4MjY5ZDJmMWNjNDViZDJhY2UzYzUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_7c247aa286a5466d8fc908ae60e5dcf9",
+      "statement": "Gateway application traffic uses PostgreSQL wire protocol; worker/control and current DataPlaneClient requests use newline-delimited JSON over TCP, whereas management is a separate version-checked tonic/gRPC service.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L477-L491",
+          "version": "repo-lines-v1:sha256:65bfff06479687a5d7b3142ea700a4891293bb26104160196c3c29cd758b3569:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA1OTQxOWIwZDZhYjdmZjBkYTgwMzFmOWM4NDMxZjYyZTM2NDE1ZWVlZTA5MGEzYzBiYTRjZGFlMWRjMDEwMTAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE4OWIyZGExMjI5YjQ2YjJjMjI4NWNjY2E0ZThmYWQxNjVjZDc4ZjczODQ1M2UxNzg0ZmFmMGI3YjE3M2Y5MDQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjkzMGU0MGQ2NDNkYzJiYTA3Y2JjNjc5YWZhZjMzYjcxNTkxNTU2OGY4ZjYzNDI0MGVhNmQxZDA2YmNlODQwYTYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjUxMWJlYzYxNjNmMTY4ZmZlYjc4NzZkZWQ4NDFlNzgzNWUxNTM0YzIzYjcyYzM2M2I3Zjg2ZDc1Y2Q4MWZhNDQifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/management.rs#L1-L30",
+          "version": "repo-lines-v1:sha256:51f1c9d4cd66a582d01c461db99984016716be3f7e0d0f9b1238886749437eee:eyJzZWxlY3RlZExpbmVDb3VudCI6MzAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE2NzA4ZmJmN2Y0ZTY0NDBmMmNmMzVmNDFmZDYzNTQ3MTk0M2VhYjhiNDNmOTcwMzY0NWQyZGNjNzkzMjQ4MTciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU0ZWFlMzllNTdiMzY1NTNlZGJhYTk4MmFmNTY4NTc3YmRhMmZiMzViYWIyZTUzYjQ2MjRlYWNkOGIyZjRjMjciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZlYjFlMzAzOWY5NjMwMjliOGU2ZDZiYWZkMzE5N2UxNDNkY2MzMzM3YThhODMyN2JhMzkwYTQ5Y2M2ZmVlODEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/management.rs#L140-L176",
+          "version": "repo-lines-v1:sha256:f144267a3cb4026a32efbc65ef3c053726029279b59b3a967f404d4bb1788bda:eyJzZWxlY3RlZExpbmVDb3VudCI6MzcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ4MWVmNmUzZjU1ODA0MTk3N2EyZDQ4MzYyYjBiNDJlMGRjM2JhZTVlYWFjOWUzZjM4MmYzYmJiY2I4MzU5ZDgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRkMDNmYjE0Y2I2MTcwZTYzODIzNWJhNDQwNTgxODJmZjc5NWM2N2Q4ZjY2MTFiMDI0ZmUwMmU2NmI5ODNkZmQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjMyMGM5NzM0OWNjZDQ1MDg4MDA4ZmNlYzVlOGVlNGQ5NjFiY2JiNGQ4ZTA3MzA4MzJiNDU2NjFmMjk0MTU3OTgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc4MTkzNDE3OGZjZTg1YjE3Nzc2MWQzOGMyMzNmMmE4NWQwNjZlYzcxNzIxMzI1ODU4ZTMwYWY2NWI1NzZjOTIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L1-L21",
+          "version": "repo-lines-v1:sha256:5940d27f77fc200a52bf414c3b2e9514c3dacc6e01409f2b71c544574f419a1c:eyJzZWxlY3RlZExpbmVDb3VudCI6MjEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM1NzM3OGEyNmI2NTUyYjk3NjM1NDVjZTc0NDQ2ZDc1YzYwNGM4M2M4ODM0N2M5NWI4NWE1YTk1ZTg5YzVjOTQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg1YmZjNWE3ZWQ3MGI5NTM3ZDAwNDM5MDk2YmYyZDlmYWM0OTk0OTYzM2MxN2I4N2U4MjRmYzlhODI2NGIwY2MiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ5YzM0ODBhNmJiMGJjZTFiNzFiNzVlMWJmMjhhMTVhYWE5MjBiYzg2MjhlZjQzYjRjNzM3MTIzODYxZWY0MGQifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/data_plane.rs#L24-L95",
+          "version": "repo-lines-v1:sha256:709f555ad2e0a77b2c7f2f2f15d8b13a2c54d6f8cf627e176d3ae589f9fb0a8e:eyJzZWxlY3RlZExpbmVDb3VudCI6NzIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM3YTY5ZGQ2OWEwODYxNWFjZjM4YmRlYWM1MjljYjVhOWFiYzk2MzIzYmEyODgyMmVkNTRlNzc3ZjYyYjExYWUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjoxLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_4d70be2951114d8fa7229faae59227ee",
+      "statement": "In commit_bound_source_ops the gateway serializes shard commits, allocates an epoch, processes a source delta through the compiled pipeline, and batches source mutations, output, operator state and frontier before calling the source runtime commit.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L4904-L5003",
+          "version": "repo-lines-v1:sha256:1f217a6b77dc563d58a37557ab6486d1851da97cf0ea24f7187df4cf5f4a36ef:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAwLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI4MTIyMzIzMmExYTFkNTQ0Y2UwODBkZWQ4OTI3NTk3OWMyY2YzYWU5YjY2YTQyMTU5ZjQyMTg4NGVmNTljOTFhIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJlNmIwNDQ5MTQ2OTcyMmU4MzYzYTk0ZTQwNDQ1MzhlMDEzYTJhMjE3ZTM2YjFlNTY4YmE2MGFjYjdiNGM4ZjJlIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI1YTBiZDcyYTNhNmU3OWU3NWUwNTY4YTlkYzI5MjllNjVlZGM5Nzc1M2FkYTAwYmRiNDI3MzIwYTEzZDAxNmU5IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJjNTM3YzMwM2U0ZmQ3YjY2MzUyMmIyMzIwYmNhNzVjZTY5MDFiYzNhZDNlZGEwY2EyZWE1NDNlNTNhNzk1MDNhIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_ccc63de326ca48ad939d26e305e92609",
+      "statement": "SourceRuntimeCoordinator validates source ownership and lifecycle/epoch consistency, adds source checkpoint, lifecycle and progress to the durable M3 commit, then acknowledges upstream; failed acknowledgement blocks with RS-4016 after local commit and requires checkpoint recovery and acknowledgement retry.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-connectors/src/source_runtime.rs#L312-L399",
+          "version": "repo-lines-v1:sha256:05863929d0fd588419c2703632c6c274b2d0f7ad12fb2283fa0e9128b008c1b4:eyJzZWxlY3RlZExpbmVDb3VudCI6ODgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE2NTgyOWUyNzVjODczNDQxMjlmNzg2ZDRjMzBhYTZjNTNmMDE2N2U1MGRjMTVlN2Q4MTM1OTZkOTlhMDE3MTUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwNzFjNmU5MjJkNjRlM2MyZDEyZDFiNDAwODRjMzFjYzRlNzgwN2ZiNDJlN2Y3MjI5Y2M4ODYwNWU3ZmM4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE2MmVlNTdlNDFhOGMyMGFlMDE2NGRmMjYxNDM5ZGNjNDk5ZDM1MjA4MzQxNTE1MTZkMDQ3ZThkZWFlOGE0NjYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjUxMTdhY2Q1MjJmMzU3YzkyYWExOTJiZjQ3Mzg1MDgxMGI0MWU3NGNmYWFjMDFlNjViZTg0NDFkYzhiM2Y3ZjUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_01e18e27b40746b39fd97adc4d8018a8",
+      "statement": "Local view reads reject unpublished backfills and prefer committed compiled output directly from ShardDb rather than waiting for a separately polling ShardReader.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7635-L7649",
+          "version": "repo-lines-v1:sha256:a1f62d6b0eb0007214454ecb71537459df9dbde209cc6d387e90bfe874dc916e:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAyNjYzZTAwOTFiNGQ2ZjczNGY1MGZkNmQ0MGIwODIyMjhkN2NkODM1OTE4ZDM3OGU1MTg5OGRlMmI4YjYzNTYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRjNGJjZTM2NDMyMmE5ODY5N2NiODU3YzE5MWYzMDRlOTU4MGY4ZDY5NTI0YzdlMDg5Y2Q5MDJlNGE5NjQ4ZTIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImY5ZjY1YTA0Y2I0MTE0NzczNjQzODM4NGZjMjY0ZDUzOGE4MWUyNGFjZjQ0ZWUzZDJhMzMyYWY3MTI5OGEwMjIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7688-L7696",
+          "version": "repo-lines-v1:sha256:d6e1ae996a58681b2cb2918c9394e540ae6adefa9715fff8f5a55c4206480dbf:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNjc4MzA2NGI5Y2Y0MDNmYmRhZjYwNzQ2NjlkMmJhMWUzNGE4ODdhNjkzMDJiMDg5ZTI0NzQwMjE1NjdmYzdkYSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiN2Y3NTE2YzRjNzk0MWZkODI0NGI3ZTdiZjRlOGJiYWZmYmY0MjkzYzM3MjFlMTA0MmUyMWI5OWE3OTAxZDU1OSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiYWZlNmU2ZDM1ODMzNTU0MTcxMDIxZjRlZGZhYjFhMWFkNzI2NjM2YzRhYzU0MjBiYzg4ZTlmNGM1MWY2YjZmNyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiODNiMGIyZDM0NjIwNTRmOTFjZTE1YzlhODljYzI3YWE1YzhlMTZmYjgwMmM2OGE2NmQ1NDYzNDVjZjAwZTlhMiJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7743-L7762",
+          "version": "repo-lines-v1:sha256:7ddb7aeaea8884ce71a063e8c6de807b573136b3b67544cb71fe99da053623eb:eyJzZWxlY3RlZExpbmVDb3VudCI6MjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM4N2ZjZWRjYWY4OTIxNjU2NDI2MzFjYjZkOGYwNzI1YWQ5MmE4ZWU2NDY3ZjhmODhlMjM1ODJhYTM5OTdhNzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjJhYzJiYzc1YjdhMWI4N2QwZjFlMjJjMGMyNDVmYmM5MzZiNmVkYzAyYzI2NjQ4OWMxMzliYWMxNjJhMjIwNzciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImEwMDQ2ODJlZDIzZDY2ODY2NTA0MGNiM2IyNDViMGRiMzEzOGUzZDdkYTQ2Yjk4YjQ2OGU4ZTY2NjhlMjE2ZjYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjU1MzI5YzkwNDUzNjdmNmUxZTFhNzlhODMwMjE5NmZhZmIwYTBhMzZkNTJkMThjY2E3ODc5Yzc0MmFmODNhODIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_1a66c0d06fdc476e8fe4e2d9609bfb82",
+      "statement": "Distributed workers commit output and pipeline state through PhysicalCommitGroup before sending ExecutionProgress; control validates lease/operator identity and acknowledges SourceDeltaCommitted after the expected reports arrive.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L3065-L3120",
+          "version": "repo-lines-v1:sha256:18fb9b4597b6736be235c43c2e0339d9817c57218d76733bec1cae5d0ba83259:eyJzZWxlY3RlZExpbmVDb3VudCI6NTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjllZDZkNjY3Y2Q3ZWZhZTA4NDZlYTI0NjUwZDRkZjc4YzVhYzUxMzE0NTcyMWMxMzE4ZGU3Yjg4YzJkYWZmMmEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjNjQ3OWNjMjMwNDQwZmQ0MWU4MjI0MjE4Njc5Njk4NTU5ZDI4OTNiZDY3YjQzODBhZmFiODExYjM4YTU1YWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjFlNTY3MDVmYjA5YzQ5ZjhlMDA5MjFhNjUzODkyYmM0MGJmMTFkYTc3MGE1MGZjOGViMGE2MjMyZTIwYjhhMmIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwNmU5YzhkMDQxZjZmNzg4Njc3MDk3NmI2MWE3NDZkMjZiYmQ4Yjk3MGQ5ZWE4NTEzNzE2OGIwNTgyNTJmMGMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/client.rs#L343-L389",
+          "version": "repo-lines-v1:sha256:0e1cfa9d4286ac1752b5ff6eecf704837e488512b37c9493ff749725e1c15e5c:eyJzZWxlY3RlZExpbmVDb3VudCI6NDcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU1ZTExODgwZjVhYWRkMDE5NjAxNjhjY2YzMzljZjQ0ZjJmZjBiYTIzMDJiYmY3MjllZDZjMjVhZjIzNjNhMWMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBmZGUxMWM0N2U3NDUyM2ZlMDVlYjY2ZjkzZWI3NzFmMzUzZjRjM2Q2Nzk5MGNhNTIwZDJiZjI4Y2NjOWU4YjIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjBjZGFjMjFmY2NkMzEwMWVlZTZhYmFlZTRmYmQ3ZDkwZGY0NDNmMGNlYTNlZjM1ZmQyNGU2NDUwNzc2NjJkMWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ1YjQxM2UwNzVkMmZmMDk2OWRiOGQzODUxN2FmMDkyMGNmMzM0MjQ5ZmFhYWQ1NTgyMDBkNjYxNGNjZDFiZWUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_829abcee65704f188a40020509527167",
+      "statement": "Query-time topology refresh opens every configured reader and rejects unavailable topology or unequal durable frontiers; CLI additional query-time shard directories are local-filesystem reader roots.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L453-L475",
+          "version": "repo-lines-v1:sha256:68ca93d797bbe576ecd90e7c1a26ea8046e34dca56ae2cd28a415b3dddf0da7f:eyJzZWxlY3RlZExpbmVDb3VudCI6MjMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI1ZmQzMjI1MDM5ZThkYjdjNDE5ZGQzYjE2NzRiNDZmN2RiNTE3MzYxNzkyMzlhYWMxYTFhZmFlNGE5Yjk5MGYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ5MjJmNTAyOThlYTBiNDcwZTI4MjE2NzBmOWE4NjgxMGE5ODA3NGMzZjBiN2I2Yjc3ODAwYzc0ZTM1ZDA3NzEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjM4NjNmZDQzOTVlZjdhYzkzYjliN2ZkODYwYTM4ODFhYWJkZDEzMmE1Y2UxNWViMGRhOWExNjJlNmQzMTkwMWIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNjNmIxODRhNzdlMTcyODA0ZGQ4YTM0NGZhNDQ2Yjc0ZjQyYzg2NWVkNWQ0ZDk1OGQxZTdjZDA2YmExMDk2MTgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L1989-L2035",
+          "version": "repo-lines-v1:sha256:43e9a052a70b26683217a379bbc5dc620e9be8bb702af882bdc3776f04531ac2:eyJzZWxlY3RlZExpbmVDb3VudCI6NDcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI1NjZmMjA0NDY5NzE1MzNjMjQ5NGFiOTZhNTk3N2M0ZGFjZDY5YjVmMGVmMmVjZTM5ZWIyZGZlYjYxZWM1MjMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg4YjhkNGVlY2FmNGQ2NzA3NWRlZDRiMzZhNjA1ZDhiZTU4OTBjNWVlZjQ3M2MzNGMxOWI1NWQxNmMyM2UyYmYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7545-L7579",
+          "version": "repo-lines-v1:sha256:2130771d7a153c1a988da662556313121a84f09e9e9262c0b32ceb21cd86b0b7:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdkOTMzMGVjYTZlOTRlN2NmODQ5YWY1YTJmZTQ5ODRmYzJhMDVkNmY2MWJmOTcxZWYxZjY0ZDM5ZjA2OWIyMDgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg4YjhkNGVlY2FmNGQ2NzA3NWRlZDRiMzZhNjA1ZDhiZTU4OTBjNWVlZjQ3M2MzNGMxOWI1NWQxNmMyM2UyYmYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQ2NmMxZDQ2ZmQxMmM4NjYyZmYyODgyMzk4OTlkMmE1Zjk3OWNjNjg3YTUyYTY4Yzc4NDAzZTFjMDUyNWZkYmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ5OWU2OGYwZDcwM2VkYWM5MmVhMDU1ZTQ3Yjk4NTljZDgzYmFlMzc3MDdjNDg1MDBmNDQ3MTM5NmVjNzZmMzUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_14edb4b8770747649686ca729b772bb8",
+      "statement": "The distributed materialized-view read branch calls read_workload and merges its snapshot, but the current control ReadWorkload handler supplies shard entries with empty deltas, so this call path alone does not establish serving persisted worker output.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L3122-L3147",
+          "version": "repo-lines-v1:sha256:34b6f8a014ffdc4a945afb3ae345c74b13e144edc332ee24695994368ac18646:eyJzZWxlY3RlZExpbmVDb3VudCI6MjYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM0Zjc4MjY1ODZiNGNiYzRiMmM3MGEyYmY4Y2YzODAzZWVmMTg5NDdlMDkxNDVmNDg2ZGQzYjI4YWNjZjZiMGMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjJmMDVkMDBlODJkMzNiNDEyNzFlN2U3M2IxZjM1MmViNWMzNWU3MjY2YWZiMzM1MDVkZWEwMGIzN2IwNGUyYjIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjIxNTk4ZTEzZDVkNWZjODIzNmFlNGIzNjhlMDAyOTkyZjliODI3YmRmMDllNjkyNTJlYmJmOTM5ZDAzYTI3ZmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImIwN2NlNDgzOWE3OTdiODk4MTRkMjQ4YTY2MTkwZTI3NGE4ODAzMTlmY2I4NGVmMDlhYmFkYmE0NWFjMDIwNzUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7693-L7708",
+          "version": "repo-lines-v1:sha256:637b3d229eaf3403e8b20ec2c68322e36550a8d63472b103d4857f8c231f903d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ2ZDFhYjc0YTU2YjhhYTc2NzkxYTUxM2VlNGEzMjNlZTBlYmJiOThhOTkyYTQ1YTEzMmM5MmI0MDUxOWU2OTEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNlNWMzZTAyMTQzYmU1N2QwMTZiMGM3YzE5ZmM4ODc4Y2UzYWY5NzkyNThjM2MyZmY4Yjg0ZDIyNzU3Y2ZjZmQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI5MGFkNTVkMDFkNDhlNzc3ZGM2MGY1YTEzNjY2ZjJjMmI1NjU5MmZmMzIwYjEwZGVlMDA3YzU4MDE4ZjRmMTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjcyMmQ1MGU3YjVjZGY5N2YwMzg4MzBhZDIzMGNmNWRmZjEwNzNkNGQ4YzcxMTJiZTgxMzRjZTg5NmZjYjg4MzkifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_04da1311b43e47059263507dc3c1bc7e",
+      "statement": "ShardDb commits frontiers with a flush before returning a report, and its durable checkpoints include durably flushed state.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-storage/src/shard_db.rs#L1310-L1348",
+          "version": "repo-lines-v1:sha256:b683a04a8c75b0bd13fe68df2577e603e50fd9c527bf7fce1fb6d9a01af7c8d5:eyJzZWxlY3RlZExpbmVDb3VudCI6MzksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU4OWQ0NGJkNGIyODQ4NDBlZTQ3OTMxYTRkZTFjY2UyZjk4YzI0NmEyM2U0OWJmYTY3MGEwOGFjMzkzZjE2MWUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ1NzU4NDJkM2RjOTAxZmVlOTBmM2UwNjU0ZTdjMTk3ODU3Y2FkNDI2NDE5Yzc1MTAxZGYzNTRhY2MwMGE1NDMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjY0MGI0NjI3MmE2YWM1YTk3NGZiZWIyYzAzNzA3YmVlZDA3OGE5OTUxMzk3OTUzYzBjYWMyZTBhMzBjYjQ5M2YiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImY5YWFjMTUyMzk5OGQ5NWM2ZDc1NzMyNDU0ZDQ0NDcyMjE5YjliYjJiNTdiMDVkYzExY2FjMzU3ZjliOWY1ZmIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_946a434079ca45f29b16e0d466d5c4b6",
+      "statement": "Shared control storage provides cross-process lease-state continuity while Raft term/vote persistence must remain replica-local under storage/raft; private control directories alone do not provide cross-process continuity.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L202-L220",
+          "version": "repo-lines-v1:sha256:7aba2737dc5c0a5a43fe3bd3c6a7795809527f9f7a174b2d1c015b9799ab3c13:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA0OTg0M2I0ZjFmYTk4YTJjODZmMGM0MTQyZDU4NjhmMmMzMGQyNDQwY2VjNGY3NTM0OTVkYWQyOGRmODIzYTQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIyNzBhMjUwNGQwNDZjZjNlZTgwYjk5MjA1NmIyNmZkMjI2MTBkNmIyZWNiYmY2MTc5YmIyOTYwODk2MjliODAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk3OTI5Yzc4MDUyYzQ3YWNmNGRjM2IzY2RiNDRmMDZhMmFmZTcyNTBlM2ZmMzczOTM4YWM2MTEyOTBjNjE0NzYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjlmMDlkMWY4YTE5ZTNhZWYyOTgyNDcxZDk5NzY1YjE3OGE4YzEyY2M1ZGIyNjJlNTg5OGVkNTBkZDMzMmQ0NjgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L817-L860",
+          "version": "repo-lines-v1:sha256:dba92765d6be707cfe736ebf1173775af7ccc5086a46c1bbbca25413029cd6a7:eyJzZWxlY3RlZExpbmVDb3VudCI6NDQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE0MTk4NzJkOTRlYWJiMWQxOGFmMDNkZWJhYTVlNWQ0NzFjMTNkMDgwODcxY2UyODFkZDVlOWQwNzliNWJhZmMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBhNTliMTA5OTM5NGUyZTBlMjBhYTcyZmM2OWY5ZTZhMWM2MGVmZDcxYjlmN2E3ODNjYTE1ZWNlZjVhOThkY2MiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI1MTQ0YjkzODc1NTc0NDBhNThmMDFkZGRkMThmN2ZmMzE2ZjA5OGQ3OGE4NTg5YjY1NmM1MzBlNTdiOGRmNDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImY3M2MzNmJhZWY3YWQ0YTNiZTZhZDMzMmI5NTcxMTg2MjQ2Yzk4MDA5NmU5OWE2NmUyM2RmZWNjOTlkYzNjNjgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L901-L927",
+          "version": "repo-lines-v1:sha256:6a6f2e8b391015d1c8533e73231f562617448c6381c1dd6e43ff37f2c4f63b84:eyJzZWxlY3RlZExpbmVDb3VudCI6MjcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc0ZTk0N2JjNWNkZjJiY2MzMGIzMzNiYmZmZmYyMDNjNGM3Yzg2MjA1MjcyYjVhYmYyOGViZTc4YmRmMjUxNDMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUxMDM0ODFjNTdkMGYwZGMwZjc2Y2QyY2M4YjM2MDRjNGU4Mjk2ZGE0MTIyYWRkMTllODE3NDVkYzdlMzMxYTYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjBiMDNjMWQ4OTgzODgzZGIxY2U0Mzc2MGYxZThiZDQwNmJlYzY2YjhiMjBjN2Q5NDA4NDE2NjgzZDUzYWFkZTEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjU0ZTc3M2Y4NjYxYzU3MjZiY2M0ZWYzMWNjM2Y1MDU1MWJkMWQ2YWI1NDg0M2U4YWMxOWE1MDg4ZjdiYTE4ZGMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_79cd86dab7c14f98a42798e74eec5ba7",
+      "statement": "PhysicalCommitGroup bounds retained epochs, bytes and waiters and acknowledges complete epochs after durable flush; legacy GroupCommit only coalesces write fragments and is not the same completion boundary.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/group_commit.rs#L1-L33",
+          "version": "repo-lines-v1:sha256:6571ef475f011a40b530bf208ffcd0e0ad71924a9b0092f3a640ffcdd5b76be2:eyJzZWxlY3RlZExpbmVDb3VudCI6MzMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAyMWMxY2E4NzlhYjg2N2RkMDYxZmJmYjM1YzJlZjUxMWFjNGEyMDVmY2NiNDYwYWY0YWEyMTgxOTgzN2Y4YmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE4ZmE2ZWFjMjBjODQwMmFiZTVmMjg2ZjM4YzcyNjhlMWMyODI3NjllNjVjNjNmYmM1MzRkOThmMDc5MTQxYjEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImVjNmJiY2FmNWMwOWY1NzUyODVlMWNlYTc5Yzg0ZjhhYzYyNTc1YTRkOTdlYjYzZWFmZjk2MTk0MGY1NTcyOGIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/src/group_commit.rs#L90-L111",
+          "version": "repo-lines-v1:sha256:f642a71d548cbc811a28f92bbfece90bc16a1f88fd06fc77846fe8220f93f2ee:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYxMGJmYTkxYjQxOGEyM2M3ZTNmYmI5ZjY2MGYxMTkyMjM2MzU0ZmU2YTk2MGM0NzNiNmJmMmY1MzEzMzIyNjYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjcyZDg4MmIwOTVlM2UyNzQxNGM1ZjA1ZDQ4NmNkZjQ4N2EzMmMxMjg5MmVhOTI4ZmZjOGFlY2JkYzRhMzU2ODMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjVkMjVhMTE2ZjcwMDMyZDJhZDgwMjY0NjQ5NGFhM2UwM2U2NzFiM2I5ZGMyMWNkMjIxYjdlMDZmM2M2N2RkM2EiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ0N2QyYjA2MTNiOTVjNzUyMmUzOGUxMTQ3M2FmMmNiMTRhYWQ1NGQ1Mzg3YTQ1MzYzNTdkNWM3NDE3NDU4OWQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_66fec7a9ca704330b7b9683da20279d7",
+      "statement": "The capability matrix is generated from capabilities.toml; Core is release-gated, Maintain supported and Experimental lacks continuity guarantees. Kafka and PostgreSQL CDC sources, exact integer/decimal aggregation and integer equi-joins are Core, while Kafka sink and floating aggregation/joins are Experimental.",
+      "evidence": [
+        {
+          "resource": "repo://capabilities.toml#L7-L33",
+          "version": "repo-lines-v1:sha256:92d7d6ab4d796550082005577be482f0545bad30ad5ecbc690bf242e5024f849:eyJzZWxlY3RlZExpbmVDb3VudCI6MjcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImIzOGJiN2QzNDYzZDY1Y2MwNWNmMzNiOTI3Yzc5ZWQzNzhiNTIzNGM0MmJjZjI3MmVkMGY1YTM2NmU3ZjkyZjUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNmMWY1NDM2ZWIzYTcxZTQ4NmU3YTBmNmFmMDcxNTVhNWNhMWEwM2U0Y2ZiOGU3ZWFlOWZkYzA2OGZlYjgxY2IiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjBiNGI2OGNhMmQ2NDU3NGVjNTdlOWIzOGQ5MmEzNTc2N2M5MzBiNDExOTIyNjJlNGFjZjg0ODZmOTY0NWMzYzAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM5OGVjOWI0NDU2YTkwNzZhMjQ1NDg1YzQ1N2Y0YjA5ODc2MGE1YmVlZjhmYmI1YzFhYmY2YTNkNGM5YmFlNmQifQ"
+        },
+        {
+          "resource": "repo://docs/capability-matrix.md#L1-L36",
+          "version": "repo-lines-v1:sha256:bf896c8d70c241c623863a109f32ebe0541532e727c23389677d09fb6e21fb62:eyJzZWxlY3RlZExpbmVDb3VudCI6MzYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjYwNTZiNDI1N2QyNjZkYTM5Yjc4ODY0ODlhNWY0YWJlOTNmZmYxMjAzMTQ5OTg4ZmY0NjUzOWYyNGZjZWE4OTAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjljM2U2MjViZDM4MTJjYTg4MWNhY2QzYzg5ZDg0MzBhYmNjYjNmMTc0NWYyZjJlMGRiZjBkNWQzMWQ5NGZkNDAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjJiODU1MjM0YjQyODI1ZmZiZWQyMmQ3MTdmYjQ1Y2I4NTg4NjNhZGY1MGE3MDc2MDkxNjI3ZGQ5ZjVjZTczNzkifQ"
+        },
+        {
+          "resource": "repo://docs/capability-matrix.md#L64-L79",
+          "version": "repo-lines-v1:sha256:aae8186f7c61ad3aaf184cbc94597d60deb17a967f75800d5ea85bb896a5e405:eyJzZWxlY3RlZExpbmVDb3VudCI6MTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ4NjE5OTA5MzFiYjU5MWUyNDQ4ZDI5Njk5YmU1YTZiOWI5YmU3MjlhZDViNjViM2JjMGFkZDk5MGI5MjgwODAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdlNGNlYzc4YzFlOTNiODMxNzBmYmM4NjcxNzRlNGJhNWEwNDE0Zjk2ZGY2MGVlNzM5ZmRjNmUwMTI4MTlhOWQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM5ZWI1ODc1NjViZGNmN2E3ODU1ZDE1ZTAzNmRjMjdkNWQwYmQ0ZTJhYTE0MzVkOTg0MjVjZjJmM2ZjNzQxMzQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5OGFjZGQ0NDg2OGRlYjdmYjQwNjhlMTkzODg4ZmE2NGQzOTA1MmJlMDcwNDZmNWYyNTRkZWVkMzMxYzQ1MjkifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_d617bf8cb97a4520976d41c6cddceb3d",
+      "statement": "ROCKSTREAM_PROJECT_FOCUS.md is a strategic proposal whose connector-reduction amendment overrides older broader connector descriptions; internal object storage for state, checkpoints, spill and recovery and the native PostgreSQL query protocol are explicitly retained, separately from PostgreSQL CDC.",
+      "evidence": [
+        {
+          "resource": "repo://ROCKSTREAM_PROJECT_FOCUS.md#L1-L55",
+          "version": "repo-lines-v1:sha256:6d1a4e280cf4f03413988e12f327566ad80d79188e6ac26c27051e383a619cb5:eyJzZWxlY3RlZExpbmVDb3VudCI6NTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc1MjJjZjRhMGIwZDFmZDRmZmViMmRhZDQzN2JjMTQ4MDgyNjAxNDU0NDQ4YmYxYTU3ZDMzNGE4ZmQ1ZDk3MDYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM0YzIzZGIxMzdkNWM3YmVjMjQ0YmQ1YjdlYjVhOGJjMDBhYWE5OGUzZjk5ZDg3NGM2MzRiNjk5ODY2ODljZDUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEifQ"
+        },
+        {
+          "resource": "repo://ROCKSTREAM_PROJECT_FOCUS.md#L90-L100",
+          "version": "repo-lines-v1:sha256:1ecab5a015401ef50b1ce996264788fd0c90e5dbb36436849e3ce11f2e283774:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxYmE0NzE5YzgwYjZmZTkxMWIwOTFhN2MwNTEyNGI2NGVlZWNlOTY0ZTA5YzA1OGVmOGY5ODA1ZGFjYTU0NmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdmNDdiNDBlOWFmNDUzNWJkMzhlMjA2MGMwYmQ2NGMxMzVlZTU3ZmY3NWQzZmFjMzM2NDZkNzYzMDEwOTdkY2UiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImFiNWRjZTY5MDAyOTcyZWQzNDY3Y2QxNDllZDAyNzdhZGViMmIxNjhkNjU1YzRjYjczODhhZjgwNWM0MmE4MTYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjVkOTE3NWI2MDI3MTBjMmNlZjAzOGU5NmJiMDEwMDY4NzdkZTI1MmE1ZjA2YzE5NTgyMzc1MDYxOGVkMjk4ZTQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_b8092c3d8d894ca1bc3928f4958591e2",
+      "statement": "Residual S3/HTTP parser wording and a bindable webhook listener do not imply supported connectors: removed connectors and webhook requests report RS-4017; an older rejection message denies Kafka row export even though the contract records implemented bounded sink delivery as Experimental.",
+      "evidence": [
+        {
+          "resource": "repo://capabilities.toml#L28-L33",
+          "version": "repo-lines-v1:sha256:60341ef966f38d3e1e504bc334e3a7f83726401fb88634e9eaaf1b74ebabe111:eyJzZWxlY3RlZExpbmVDb3VudCI6NiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYjM4YmI3ZDM0NjNkNjVjYzA1Y2YzM2I5MjdjNzllZDM3OGI1MjM0YzQyYmNmMjcyZWQwZjVhMzY2ZTdmOTJmNSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiY2YxZjU0MzZlYjNhNzFlNDg2ZTdhMGY2YWYwNzE1NWE1Y2ExYTAzZTRjZmI4ZTdlYWU5ZmRjMDY4ZmViODFjYiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiOThhOGI3ZDk4MDRlNThhMTkwMTJkYjdkNGRlN2Y5YmViODQ1OTliZjA0YjRkZTc2ZDg5ODU2NzA3YmZlYjE3OCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiYzk4ZWM5YjQ0NTZhOTA3NmEyNDU0ODVjNDU3ZjRiMDk4NzYwYTViZWVmOGZiYjVjMWFiZjZhM2Q0YzliYWU2ZCJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L13886-L13922",
+          "version": "repo-lines-v1:sha256:f0f2c5e4c31660e9a8cbd4ce9bc51a2f4e7b11b75e661754b10b08b52c1ea419:eyJzZWxlY3RlZExpbmVDb3VudCI6MzcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNkMGNiYWUzYzYxYjQwZjEyMDE0NTQ2MjU5OWMyZWRlZGYwMGQxZTY0ZDhmODJiZmZlM2FkZDRjYjc2MmM3NzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdkZWZmZGEwM2NhNzAyMmI1NjdhZGYwNDkwOWI2NjQ0Nzg5OTkzZjJlYjY1NDIzZjRlZjRlMjY5YzUxYmY0NTQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImEyNGNlZTQ4N2JlODBlNTEzOThiMDEyOTI5YjE3ODBjMDczODEyMmRlYTBiM2EzZmEyZGVkMTBiYWRmMzE5ZDciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjY4MzFjYmY5MjcwMzhiMzAwODYxMTZiYzAwYzc3ZmE5ZGIwOWFhMzhiMzJlYTkzM2M1NDZlMTY2Y2YyYzE3ODcifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L17190-L17216",
+          "version": "repo-lines-v1:sha256:307ee8b166f392ff42130ef22ce1e94718f4653b76ef1120f90c3f2a8d50e28b:eyJzZWxlY3RlZExpbmVDb3VudCI6MjcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjcyNzhkZDY3ZGVmZmQ3ZDc5NmY2Zjg0NjgxMzViMDEyZDMwNTk5Njc3MjgxMjk0ZmFhMjNjNzk4MTI4NzEyZTUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImMyZTU0ZTc0YTk5YzYxYTlhZTdkYjFmNjA1ODI1MTZjYzY1YTIwMzRhZDBjYzIzYzc0NzVlMmMyOWFkZjk4MTQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImU2ZjQwYzRmMzI0Yjc1MzM0YWY3MmVjMzY3NDAxNzM4MDcyZWNlZjRkODcxNmNlY2Y3MWMzOTkwZDgyYzlkMDIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L17708-L17708",
+          "version": "repo-lines-v1:sha256:d7009e983dbe79a8ee8d90155ba91b232512bf68892c6bae571eb2222f8df66f:eyJzZWxlY3RlZExpbmVDb3VudCI6MSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiZDcwMDllOTgzZGJlNzlhOGVlOGQ5MDE1NWJhOTFiMjMyNTEyYmY2ODg5MmM2YmFlNTcxZWIyMjIyZjhkZjY2ZiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZDcwMDllOTgzZGJlNzlhOGVlOGQ5MDE1NWJhOTFiMjMyNTEyYmY2ODg5MmM2YmFlNTcxZWIyMjIyZjhkZjY2ZiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMjNhMjBmNmNkMjg2ZGIxYjQ1ZWIwYTAxMmZmZmIyZTM3MjYyNjUyNjE0NTk4OGZlZTYxNGYzYzQ1NmVmM2U3MyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiN2QxYmQxODYyOTRkZjI3MWM3ODQyMTVmYzk3ZGIxYTlhMzU2NTFjNDdmODZiY2NmMDY4ZGYyZGI3YTdkOGJjNiJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L17944-L17955",
+          "version": "repo-lines-v1:sha256:21e5fc4f199056fe43ee8b074862fc240cb292723cab8d670d3654eab519fc2c:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE4ZDlmMjgwMTM4NDJiOTU1YmM5ODY4MWE3ZDMyNzAyYWNhNTI3OTdkMzliYjhmYWFmMTA5NzMxNjI2MGUxZTkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijc4ZDU0NmIxZTJmNjdmODI2NGVlZjA1ZmJjYmJlZTllNTk2ZDExOWViMDUxOWIzNjQ3MWQxZGFiMDBjZmI1YTQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImIwZmRlZjU1ZDc1ODFkMDNhNmZlNDMzOWRlNWZiMmFhNDU5ZjVmMGJlZGMxMTI2OWIyYjQ1NzkxZDkxOGIxYzYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_d2b81b7c60d74fc5904044cc06036eb4",
+      "statement": "The unified-data-plane test launches the binary and verifies a shard-0 manifest, absence of gateway-shard, and SIGTERM shutdown; distributed_dataplane_process_tests instead uses in-memory simulated lease changes and generation fencing, not a live control-process restart.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/tests/distributed_dataplane_process_tests.rs#L18-L112",
+          "version": "repo-lines-v1:sha256:ac98cc427384a1418e3e45f886ba61c0240c41e1176309c086e407b4dc46e214:eyJzZWxlY3RlZExpbmVDb3VudCI6OTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImEzMzAzODU4YzQxNTNmN2U1Y2E0MzdkNmRkMDYzMzUzMDY5MjhmYjljMGM2YTM4YTNmMWE1MGIzMjBjZTgzNTciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjlhNTY4OTRlMzYwMGUyZWEwNTM3M2FiZjJmYzJjMTUzNzdkM2FkODVjNDNjZGJiYzY0ZDk4ZGFhZWRlMzMzZTgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/tests/unified_data_plane_tests.rs#L12-L81",
+          "version": "repo-lines-v1:sha256:f6a8d6ae3bfe5aa6b1bda3997beb9f48466016c186183e887128abec4f7560e0:eyJzZWxlY3RlZExpbmVDb3VudCI6NzAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQyY2Q0ZGI0OGEzNTBlOGYwYjQ3OTQ0YzQ2ZTNmZmRiYmExMzJkMjI5MGE5MWQ3MDEyYjU2ZWI0NmM4YWI0ZjYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU5NjA2YTI3Y2E4N2EzY2Y3ZWVhZDY5NzljMGQ3Yzk3YjZiYmVjMTJhNTU1ZWNhYzFmMjBhMGI3MDBmNDJhNWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjMxY2M5ZGViY2FjZTcxMDFiOWFmNWM3MDhkMDJmNTM1Mzg3MGFlMTFlYjJlZjA4YzUwYjNlNmI5NjQ3YzA4MWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjoxLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_574818120fa2483f98b0e7123c8a8ddd",
+      "statement": "The capability ledger attaches named proofs to incremental, backfill, checkpoint recovery, bounded-state and failure behavior rather than treating an operator inventory as sufficient support evidence.",
+      "evidence": [
+        {
+          "resource": "repo://capabilities.toml#L101-L118",
+          "version": "repo-lines-v1:sha256:97a94443fc9e6165a3a4613dcbe741f6db22ce0e699d19a7334a4dae06913221:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2MmM1ZTI0OGU3ZmQxNjNhMjcwNTUxNDg4ZGQ0ZGY4OTIxZjZmMjVlM2FhMTY1ZTVhYmI1MzI3ZTI1NDJjYmEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY5NDE2ZTA5Zjc4YmEzMTZjMDMyNTY4MjEzYjg1NWVlNzU2ZTQxNTY1ZDkxOGYwOTUxOWM4MWZkNjIwZjQwNjAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjA2NDZhZGE0YjNiZDJjMTZhMzcwMzgyZDNiOTlhMjIzNTBjN2YxNjFjNjhhM2MxYTcyYWIyNGI3MTdmNmRkMDAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE4ZmE1ZjE4MTA2NDEyOWY4YTllMzcxNWU1MGJlYzhkMWU2YjAyYjNkYzRiNWNhM2VkNWYzNWRmYTU3OWUzMDAifQ"
+        },
+        {
+          "resource": "repo://docs/capability-matrix.md#L81-L107",
+          "version": "repo-lines-v1:sha256:5ede52ffbbcf500f10ebc68cb6200c9d203de0ca1a53f76bac4497237e723cf9:eyJzZWxlY3RlZExpbmVDb3VudCI6MjcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ3MzA1OGZkYTc1MTBiZjNjNzkyYjk3NDA4N2I3ODdjMGVmNDYzYWNhOTg5NjI2Yzc1MTAwMDcyZjZhODdiNWYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNiMDBiMTE5ZGRlNTU3MmVlNzQzNTNiNDY4OGFjNzBkYjNlYjI1OGQ1ZjE1ODRjZWE0ZDg0YjE0YmZiYjBiNzYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjZiZDJlMzAyYzI5OTU3NDk5NTk0NmYzN2Y3M2I2ZGYyZTc3ZTg1ODcwZmMzZDNjMzZhOTQzNTM2NzhmY2FiZGMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImMyMWU0MGMwMzM1MWE5Y2ZlMzM0OGMxOTE5Zjk5MjNlMTk0NGIxMjg5YTYwOTkzZTVhMTYwNmRkMzRmOGRjMTgifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.7.2",
+    "at": "2026-10-21T16:22:36.376Z"
+  }
+}

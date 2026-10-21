@@ -1,0 +1,248 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:b4276f81f58f5d9e051755d40d7e2b2c661358d48b866a2d3227275b84257ed1",
+  "claims": [
+    {
+      "id": "claim_5bfa7d1997d940a5a06310a512e0a26e",
+      "statement": "SqlFrontend registers Arrow schemas in empty DataFusion tables and sql_to_plan_node lowers an optimized logical plan via lower_with_views; column references are resolved against input schemas into positional indices.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-sql/src/frontend.rs#L138-L176",
+          "version": "repo-lines-v1:sha256:2f03c28250a51a8a733fb7e3f51b57aa390e7004389ddde8a11c327ab1f00482:eyJzZWxlY3RlZExpbmVDb3VudCI6MzksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAwMzdkODYyODc1OWMzODdhNjI5Y2VkOWQ3MTU4M2VhOWM2NjlkNzE4OWE0MDA3MTNlODExMTQ3Mzc4ZGEyZGEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI0ZjA1Yzk0NTIyNmRkODA5YjMzMDBmMmY1N2NiMjIwNTU0MTYxODJjNmMxYWE3NDkwMzFkYWZhMTBhMmZkODAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhlMGUyZTA0Yjc2NjU3YzY3MzdjMmM2NTA1NWQxZDMxNDgzMzJhYzI1NmU3NWVmYTdlNTlmODQ5ZmUyMDBlMmEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZlNDA0ZTZiMTE5YTI5N2E1OWIyNzY3YzNjMjMzMTNmYzdjYjM2NzhhNGFjNzBjZTk2MmVjYWYyYWViMGE4MzIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-sql/src/lower.rs",
+          "version": "repo-file-v1:sha256:99444e390d0e39f2c8fac51fb22538b460b44f4633c9eed525081efdf519f002"
+        }
+      ]
+    },
+    {
+      "id": "claim_55fb7266e4134ac0a91e5ef195fe7127",
+      "statement": "Gateway try_compile_view wraps the lowered plan in ViewSink with full-row PK and invokes direct executable compilation with the configured join strategy; DiffCtx is attempted only after ordinary compilation failure and does not replace the failed executable compilation.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2461-L2525",
+          "version": "repo-lines-v1:sha256:5b4f0b53003d9a1b67613b2c1ba82144565efecb03852729cca78b6f2d0e3c2c:eyJzZWxlY3RlZExpbmVDb3VudCI6NjUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM2MTkxMDQ3MGIzN2EyYTZmYjQ5ZjdjNDQ3NzExOTQ0NzAwYWY0ZDlkOThiN2VmMjQ1YWE4NzNmNzlmMjc0ODUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjEzZTljYTU3ZjdhNTYxZGRjNTc3ZDcyOGRlODY3NzNlMmVlZjE3MDE2NjExZWM0YTA3ZWYxOTQ1MDc2Nzk4NmYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjFlODBjNGUxYmEzOWZkNTc2MmJlOWVlODQyMjM2MmQ1NTA2YmU1MmQzNzhjNTE4OWZiYTNhMTM2OGUyNDc4MTIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_1d1fa3ad941c454db5383225f4f6dfe1",
+      "statement": "DiffCtx independently converts PlanNode into topologically ordered OpNodes with input edges, operator IDs and merge-safety metadata, rather than constructing CompiledView executable pipelines.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-diff/src/lib.rs",
+          "version": "repo-file-v1:sha256:a67834e383d916074a4c9cb3b326e6301407d1c75837329ba653c89bd70e3a91"
+        }
+      ]
+    },
+    {
+      "id": "claim_c68197f14c4144cb81bd969d93b21db5",
+      "statement": "The executable compiler requires a ViewSink root and returns a sink plus either a StatefulPipeline or a JoinPipeline with source names for routing; unsupported concrete shapes fail with UnsupportedPlanNode.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/compile.rs",
+          "version": "repo-file-v1:sha256:7e4723dc50bfd739bf932e2fd86f04eb35db797f0bc642de0151c7ccede22146"
+        }
+      ]
+    },
+    {
+      "id": "claim_d658e427b45b4aec8bbf3cd58a822112",
+      "statement": "SQL operator memory-budget validation is separate from executable compilation: validate_operator_support recursively evaluates estimated cardinality and supplied budgets and can reject oversized state before allocation.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-sql/src/compile.rs",
+          "version": "repo-file-v1:sha256:0e1c76afe62c1b406fee13835f6dcb3e200030696f1d57f1c174529f0b1fd6f1"
+        }
+      ]
+    },
+    {
+      "id": "claim_97ccd5c5605b4d4e850f76d2228f15ee",
+      "statement": "ArrowZSet pairs user-schema RecordBatch data with aligned signed i64 multiplicities, where positive inserts, negative retracts and zero is a no-op; try_new rejects length mismatch and new panics on mismatch.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/zset.rs#L1-L75",
+          "version": "repo-lines-v1:sha256:7b3c29737272b91ee7a507f3b510fcd05c255e0d5b9157d71885addf4d9ccaf1:eyJzZWxlY3RlZExpbmVDb3VudCI6NzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFjZTE1ZTBjYmQ3ZDg1NjZhZWQ2MDIwNTBlNDM1NmRkMzcwODVlMmRmZTNhMDE1ODVhOWFhMWU5M2M4MmI2N2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM4YmE4NWMwMzgxMWFlMjMwMTFhZWM1MzRiY2VhYjkzMjBkM2JjMWRmOGFhOGQyMGVmN2EzNWUxMWEyZWVmNDMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_0f40cf6b354141998dd62f237a19f4e5",
+      "statement": "Filter, project and map are linear delta transformations without persisted arrangement ownership; live execution distinguishes stateless stages from stateful stages with restore and persistence responsibilities.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-diff/src/lib.rs#L102-L145",
+          "version": "repo-lines-v1:sha256:73b07c2971e4457c7d792e3fcc18a3536af6ed26e4cb5b1fa06957836d9bd3df:eyJzZWxlY3RlZExpbmVDb3VudCI6NDQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVkOTRhYjM2NTEyNTdhOWU4N2IyZGI1ZmJiMjg4N2UzODM2N2FiNTlhODIxNzg1YmEzYjVkMTAyNzA3Y2MxZjQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1MjJjNDJjZDE5YzZkMDNkODA4YzQ1MjcyMDU1MjgyNWI3ZWExYzViNDkxYjIxODUxMWNhYzc0MTVjZjlkOWIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM0OTg5NzBmOTUxMDNhZjczODA5ZjdhMTQ4ZDk4NTYzYTg5ZjVmZWY0OWI4MjJhOWZhODM0Y2U4MGY2NTQ4NTYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjcxNGNlOGFlYmM0NTA5YjUzMzEzYzIwZmJhMGQ1ZjBkMWE5MmM4OTJlZDQ2YTI0ODYxNTJlZTYzNzBkZDFjNDkifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/src/live_exec.rs",
+          "version": "repo-file-v1:sha256:43c96177c2affe62ec848314509af6eaa9a1f57b956ab684fe1bb13377dfca17"
+        }
+      ]
+    },
+    {
+      "id": "claim_9b97ce45e01244c8bb6ed06ef4f07a1a",
+      "statement": "AggregateOp's delta-native path validates input, skips null key/value rows and zero weights, consolidates contributions by group, and emits changed aggregate deltas and state mutations instead of persisting independently for every input row.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/aggregate.rs#L811-L1207",
+          "version": "repo-lines-v1:sha256:a62067cc730273c44adf2b737a326c87347111e07196996e4804d4aee4e6e308:eyJzZWxlY3RlZExpbmVDb3VudCI6Mzk3LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI2MGZkZTA2ZWUxMmI3Mzc5Mjk5NjIyZDBiOTIxYjIyZGRjNzMzMDJkMDIxNWE1YTQ5OTI2YmIzZTJlNjRhNzU5IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI0ODkzZjQwZTM3ODFlYjg5NmM4MmQwNDZhMDgwNjdhMTFlMzVjZGYyZjFkZmFmMjZmZWE5MGI4ZGI2Njc2NDEzIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiJmNjEzNWJhYjAwNDNjNjU4MzgwZDBkYTQ2MTgwMWZhYjI1MjVhYWZmMzY2MWNiNjE1NzNkYWZkMjg2Yzc5YmQ0IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI5YmU1NzdiYzk2ZGQ2YjRjN2QxMDk3NjIwOWIyYzM3YTI0NjIwYWZiOWNhNTE5YjdmNDFkNzg4YWMwMDJmZmUyIn0"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/tests/delta_native_aggregate_tests.rs",
+          "version": "repo-file-v1:sha256:56aa301ad88532513bc85afef7fc6914eefc2c06505f38c26c7b3f3740dc2760"
+        }
+      ]
+    },
+    {
+      "id": "claim_2f2b13aad6dd41f7bffd82784cfaff6e",
+      "statement": "Aggregate state uses weighted sum and count contributions and retracts old visible results while inserting new visible results; deleting the final group member removes its result, and average finalization produces Float64.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/aggregate.rs",
+          "version": "repo-file-v1:sha256:a0b840386aa16dd0976b6f035fbaf2304971aa3ec838257ab3295526bdd117e3"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/tests/delta_native_aggregate_tests.rs",
+          "version": "repo-file-v1:sha256:56aa301ad88532513bc85afef7fc6914eefc2c06505f38c26c7b3f3740dc2760"
+        }
+      ]
+    },
+    {
+      "id": "claim_17e304305be24998bb4af4f721f56692",
+      "statement": "Direct aggregate compilation adapts the accumulator using distinct stages, retraction-safe MinMaxOp, surrogate key packers and multiple aggregate lanes joined with left outer joins; AVG carries sum/count through intermediate joins and finalizes afterward.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/compile.rs#L1023-L1231",
+          "version": "repo-lines-v1:sha256:55a3a62528d311763e6cbf2cdc14d23f169bc4cb28db5b06da9e58acf6ec55ed:eyJzZWxlY3RlZExpbmVDb3VudCI6MjA5LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiIwMTM1Yzc1ZDk4Mzg0MjBlNzc1MTNiMWFlY2ZhYzdiNTMyOWY3Y2VkN2M3MTIzMjNlZDdlZTMwNDFhZTc3YWQ4IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJmNzg1N2EwYjY2NzM2YWQ4YjNlYzc3ZWQzNjNiOThlYmM2ZWFmZjgzZjYxYWQ2NGJiODlhMTBhYjg1N2JkZjliIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiJlMDcyODg1MDM5ZmQ2OWFiZTZjMTMxYTgxNTI1YWNmNmNkZGJhMDMxZWY4ZjBlNDFhYmViMzIzMGM4NjFmZGQzIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI3MTA2ODMwNTQzNTUzZmJmNWE0YTEwM2VkZDk4Mjg2NDE4MDRiNTgyOWM0YzNiYjUzZmRiNGMyMjUxNzdhNmU3In0"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/src/compile.rs#L1236-L1727",
+          "version": "repo-lines-v1:sha256:d5af8486374c95254ab7cf03ba62740df8ae14afb3f8fb00da08a4afcabf7f85:eyJzZWxlY3RlZExpbmVDb3VudCI6NDkyLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiJmY2IyNjM3ODU3NzA0Y2IzZTIwOTE2Yjk4MDM3OTRkNjZkMTE0NTZlYzNhMWY4MWFkYTFmNjBjMDk5YzQ2ZDU0IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiIwMWJhNDcxOWM4MGI2ZmU5MTFiMDkxYTdjMDUxMjRiNjRlZWVjZTk2NGUwOWMwNThlZjhmOTgwNWRhY2E1NDZiIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI1MDBlMzYyNDE5MzU5YWJjNWMxMjJjMDM5NWU2MGFiM2Y4MGQ5OTUzNmE5OGEyMzljZjUwNzY3YTJkMzdmMzRkIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJhZGMwYzJjNjFhOTBhN2QxMTg2OTZmNGFkNjlkZWY0NWRjZTkxOGY1OGVmYzYzNmU5OTdhNzk3YzE2YjBkODJkIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_e8522f4505d041b3a591dceaace79bbe",
+      "statement": "Classic JoinOp maintains weighted left/right arrangements, stages both sides against prior state and commits with the cross-delta term; stable row identity hashes operator ID, join key and full row bytes and zero net weight removes entries.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/join.rs",
+          "version": "repo-file-v1:sha256:937290e0f87c4bbb6862f20c9f98e2b354425a3729160f8cee3ab069dda032f3"
+        }
+      ]
+    },
+    {
+      "id": "claim_2dbf69b46d5d406f94893d4f5c7612fc",
+      "statement": "JoinPipeline runs side preprocessing, a join epoch and postprocessing; compiler text packers can bridge SQL text columns to classic integer join internals, sharing mappings across matching key columns.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/compile.rs#L711-L828",
+          "version": "repo-lines-v1:sha256:36a4b7ac41f78c45ec2d81820702c57a50c72b3d0a909bd690f5758fd945f370:eyJzZWxlY3RlZExpbmVDb3VudCI6MTE4LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI3NjhiMWI4MDJhNGVkMzk1OWRiZDkwNWE5MzM2OGY3ZGIyNWNjNTUxNzg0N2IxNDg4NGRjYTMzODQwMmE3MDhhIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI5ZjY0ZDM0M2ZjNzE1ZDkxZDAxNDY4Nzk1YzlkZmQ4Zjc1Yzg4M2JkMjNjYmUwYmU5NzdjN2Y2MDE1MzQ5NGI5IiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiJjYzViZjRiNmY1YjQyMjk0MmY2NmY5NjRmNzIzODcyMjQxNGFkNTYwMjYwN2Y0MWIzZTljZWJiMzUxNjcwOTU2IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJjNGMzNjdiYWMyMjliZDYwMmIwMTVjNTRjN2FjYTBhN2JjYjJiMmEzMWRjY2Y1M2EzYWFlYWJjNTMwM2VhMzIyIn0"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/src/live_exec.rs#L1567-L1650",
+          "version": "repo-lines-v1:sha256:a9c06fc3e5356d459b99186b84a0cc96f4484fdcddd5fdca177f3374b5f83387:eyJzZWxlY3RlZExpbmVDb3VudCI6ODQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg5NzQ4ZTgxMDhhNTExMmNjYTM4YWY0NDc1MTVjYzc5YjljMmZkZmY1OGI4ZTgzYmI5N2MyMTdkNTcwNzM3NWQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdlMTlhZjNiNzY5ZmFkNGY3M2NlYTU4OGU1YTVlNTE4YzA4MDI1YTdiYTVkYWZkNDc2YWE4YzY0Y2Q5NmE2NzQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImE4ZDA4MDdhMWYzY2UzMTEzNTUwNmQ5MTY5ZWY5OGNmMDExOGYzNjhhMTBhMTg0MDRkYmY2M2I2Nzg0M2RkNjgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImU5NzMyZDc1ODM1ZDczNTJkYjI5NzVjMWIzNGNjMDc1MjRmYzhiYTIxYjkzMmY1MGQ1ODczZTEyNGY0ZDNhZmMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_ce52dc29e09d42cdb3b54660bc396332",
+      "statement": "Factorized strategy is limited to eligible inner-join aggregates with a single group column and non-distinct SUM, COUNT or AVG; multiple aggregates disable the candidate, auto consults governor estimates, and forced factorization rejects ineligible shapes.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/compile.rs#L214-L223",
+          "version": "repo-lines-v1:sha256:0d5f4bc8cb49a54f1eb2943b5d2090a15780cf5e35405f189ff221dd6106d4cd:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc4YTI1NGI3NmNlNDcwNGZmMjA4YTMzNzRjOGEwYThiNmUwYjI1NjQ2MzE5YzhjODkyZjk1MmI2ZjQ5M2U4MTciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImZkNTIzYzhkYzliZDM1ZTg5MjQwOTc5MGRkYjY2NDM4NmZkYmM0Nzg0NmE1MjNjOTQxYzY1NmFhOTgwOGUxYzkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM0NTNlZjYxMjlmNzlkNmQzNTg0NzU3NWY4N2RmODE4YzBiMjhmYWFiOTYxNDA4NWU1MjZhYTgwZWJiZjNiMjYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjRiNjQ5ZTcxMjExZTEyOTZjODdmMmExMTA5NTk0OTYyZWZiNzc5NTcxZDg2YTcxNDk0OThmYTlhMDY1Nzg1ZmUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/src/compile.rs#L893-L975",
+          "version": "repo-lines-v1:sha256:89e8af773d51692c2d5d6f74af38177274593f7b599e331d32cb8cb1cf121e37:eyJzZWxlY3RlZExpbmVDb3VudCI6ODMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjcyYTZhZDU2M2IzZThkZjQ5MDg2YTFlMzVlZjg3OWYzNjE1N2YyZjlmZDFkYWU2ZWI4MjQ0ZTM3ZDc0YzJmMTkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjNjQ3OWNjMjMwNDQwZmQ0MWU4MjI0MjE4Njc5Njk4NTU5ZDI4OTNiZDY3YjQzODBhZmFiODExYjM4YTU1YWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk0NjI2Zjc1MjFmNzk3YjMyMGQxNmY5ZDVjZWI1NTJmYzk5YjJmOGY4ODRmZGE4NThhMTlhYzhlMGZiYmI0ODIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc3NDg3MWRlYmE4OTk1YmM2NmUxMmE2ZGYwZWUxMmY2YzMwMjcyMzMwNjJlYWZjZDU2MTEzNjk5MmQ5ZTFhOWEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_896a5f13cb0643a1aeb2e33d0a4dc4ed",
+      "statement": "FactorizedJoinAggregateOp retains bounded factor payloads and emits aggregate deltas, with default limits of 100000 rows and 64 MiB; JoinPipeline records strategy and work counters including flattened intermediates and payload sizes.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/factorized.rs",
+          "version": "repo-file-v1:sha256:956fa92461c23e2b70c632edd8d46160a5f29c9ec339b61353ca7465cbdc5fc4"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/src/live_exec.rs#L1593-L1639",
+          "version": "repo-lines-v1:sha256:e607278052a73505b2357ab1edbfc39e4b207b6b5df419a6f32db9cfa9dc2be8:eyJzZWxlY3RlZExpbmVDb3VudCI6NDcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQyN2U0OTRmMTFhNjNiOTk0M2I5Y2U4NDQ1ZGNkZmE3ZDkwMzYyMGNhZmQzOTQwZDg4NWJkODU0NjJhMzU5NTAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFlNzVjNzBkOTQ2MzYyNWUxMDc5ZmQ4ZmM4ZWU2MmFkMmU5MmM0MmJlYWFiZmQ4NWI3OGQ4ZTBhNDk3OWI5NGEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQ2NzUwNzA2YTUzNzRmZmQ2ZTRhNDllZWIwNmNiMDYwZWE5ODhkOGMwNmJlNzA4YjFlNTY1NzcwMGM3NDYyM2MiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImJkYjdlYmZiZTYxYzUzZGI4OTQ0ODZmYzUwYmM3ZDgwMDIwZWEwOGVjYjcxNGE0YTJmYmE2ZTlmNzRhYzhkYTQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_9ee83ac25dda42188b10de4d2662e397",
+      "statement": "StatefulPipeline separates synchronous delta processing from async persist/restore and caller-owned batch appends; ack_persisted_state must occur only after the enclosing batch commits.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/live_exec.rs#L1137-L1180",
+          "version": "repo-lines-v1:sha256:237b681d65827e945c0c8a083a7de5026598853053ce42140f3c7a9c076d90fd:eyJzZWxlY3RlZExpbmVDb3VudCI6NDQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjMGQzNTA4ZGNjZWFhZGFiYmViZmExMWNiYjZmOWRlNzk4MGQxYzkwZGI3YzQ2YTgwMDRiODkzMGYxYTNlZTkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwNzFjNmU5MjJkNjRlM2MyZDEyZDFiNDAwODRjMzFjYzRlNzgwN2ZiNDJlN2Y3MjI5Y2M4ODYwNWU3ZmM4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImFhMjUxNTVlMWIwZmIyYjRhZWUzNzlmMzNjMzNmYTQ5NGRmM2RmMzEwNDYxNWMxYmRlMDA4ODMxOTFhOTlmMmIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImMyNjM0NmFjZTk3YzBkNzZlYzRjNjdhYTM4NmY1ODViM2FiNGRkMmU2NjAwZjdlNDNmMDAyMzM2MTE0NjEyMzQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_91b0029f87a4444aac7b8e6ad37b0b28",
+      "statement": "Recovery reuses durable sink identity and derives allocated internal stage IDs deterministically from view name and allocation sequence, so changing stateful compilation layout can change persisted addresses.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2530-L2588",
+          "version": "repo-lines-v1:sha256:27c5dd2f1aa9132ede038b3e75caf04bf23d403f761b1a7486ece6080d125ea8:eyJzZWxlY3RlZExpbmVDb3VudCI6NTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE5NzFiNmQ5MTE1NWViNzBiYTY0ZjA5OGQ5MTY1YTRmZWRlZGVlN2VjYWRkMDRiYjYxZTg2OWEwYmRmMzQzNjciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImVlMDUyNWY5MDVjMDIyOTAyNDQ0NWMyZGUzY2MyNjQwOWRhYWM0NDdiODY1OTEwNzQxZWQ0NWY5YTUzMWVhNWMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjcxNmU4ZGE0ZGNlYzdjM2FjMGU0OTI2MDZkOGJjZDUwMjY3MjYwMGUyYTk3NTMyZThlZTFlYjdkNTE0MGM2NTEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAxMzBkZDRiMDRjODdmYmZjYTYzODVlMjMxZDE3YjVhODM2NjcwODFlYjViZjM1MWViOGQxNmJmMWVjNzQ0YzEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/src/compile.rs#L153-L202",
+          "version": "repo-lines-v1:sha256:7256c3e958e45ce0923c2e9b4b0464c0db06c683d3b1f1ecf296149255ada1b4:eyJzZWxlY3RlZExpbmVDb3VudCI6NTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFkOWM3N2EyMTRlNWY0YzE5ODcxNmU4Y2YyYjU1MTU2N2FmMTNiNWI5YjIzYzRlMGMzZTYxNDFhMzczNDc4MjgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY0NzVlOTRhOTA0YWM0OWIzMTU0ZDQ2NzJhNjZlODYyOWI4NmRhYzc0ZTNlMjkzN2JlNjkyN2FlM2RhMTFjNTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjI1MWRhZjdjMTA5YWJmM2Y5ZWExZTU2N2UxMTg0OTJlMWJjYjBkM2NlNzc4MTJjMWE3ODdkZDQ0YTA1NGRkOTkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjdlN2NiMDc4NjZkZDkxZTUzZjBkMjdhZDk4MTEzZDg5Y2ExNjcyNTkxZjAwY2VlN2JjYTNiY2M5YmU5ZjcwY2QifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/src/live_exec.rs#L56-L104",
+          "version": "repo-lines-v1:sha256:64972a22b4261ef2c874e55fe6a4564d1c0fddd19b61414c4c089fee909580cb:eyJzZWxlY3RlZExpbmVDb3VudCI6NDksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE1ZDNjMmM1NWMwMzcyOTdjNzI3Mzg1ZjVhNWRkZTlmNzZmYmY3Yjg4NGFmYmRmOWVjNGYxYjc1YTBkYWE1YzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRlY2UxMWZmY2E4ZmJlZmViODgwZjI2MmI2MTJlZWM0Yjg5MTc5NGZkMWU4YTY2NjY2MDgxYjQyYWZhYmM2N2IiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjgzZTlkYWU1NDA4YzZhYWZjM2IzMGFjNzUwMGFjY2QzOTIxYTVhZmM4MjMyZWI3OWI2ZDY0MWNjOTBlODRmOTMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjUxMDg5NjZmMGExOTZmZjJmMWNmODJkZDVkNjk2NTM5YTdjNDgzY2NjYTBiNTEyYmM1ZDkwNDM0MGQ5NmY5YmQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_fb47281205d74be79b5227a0a319712d",
+      "statement": "WeightAdd/v1 and SumCount/v1 require checked i64 arithmetic including multiplication and inverses; overflow is non-retryable, signed provisional staging is valid, but materialized groups require positive count.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/aggregate.rs",
+          "version": "repo-file-v1:sha256:a0b840386aa16dd0976b6f035fbaf2304971aa3ec838257ab3295526bdd117e3"
+        },
+        {
+          "resource": "repo://docs/adr/0004-merge-law-arithmetic.md#L9-L18",
+          "version": "repo-lines-v1:sha256:422a11d1877a02387587ba4378991db04346836d82646bc0b9a707a9dcf452ce:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc3N2Y5ZDZiOWU4ODU1ZGE2YzhhZDE1YTkzOTc0M2EwMDAwZjU1NmFkZWNjNzg1NGZmOGY2MzYyYjRjZjQ5YzgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYyOGI5MTg4OWI3OTliODVmMzJmODkzNDhiYTE2MzQ4ZTEyNTAxYTU5YTJhZTAzMDk3NDdlNzU3M2VjYzZkZmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImNiMTU3YTZkMjc2N2ZmN2Y0MTMzZWUyNzY1MTM2N2M2ZmRmZjdhYjRmZDliYTNjYjQyNjJlMmFhNDQ5MGNjYTMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjUwYTU4YTY1MTdmMzViN2Q5NjIxMzhlODYzNGQ1Y2Y1ZWE5ZDdjNTYwMmU0ZTE4MjBhZGZlYzgwZjIwYzUwNjgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_91525b122b5f43ebbdb17cc2d4ed94a2",
+      "statement": "Regrouping or partial pushdown requires executable absolute-sum-budget admission rather than mathematical composability alone; absent admission skew splitting falls back to one spill shard, and exact-width decoding and tagged operand validation remain required.",
+      "evidence": [
+        {
+          "resource": "repo://docs/adr/0004-merge-law-arithmetic.md#L20-L35",
+          "version": "repo-lines-v1:sha256:02538eebedc9de0fc6e70be342b509140553f001af77bd237a3f58b962f11e5d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc4ZmY5NWU4ZWJjMWExOTIwYjAyYjdkMWZhZDNmYTVlMjE5NjJlYTZlNjgxMjE3MTI2NGNjYTJkNDkxMWQ5NmQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjEzMmU2NDNkYjA1YmVlMWUxOGY2ODJiZTAyNzQxYjBmN2RiNzcxMDU0NWM1MTQ5M2ZiYmYwZWJmMzRkM2VjYzUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhhYzE0MjEyYmUzZmQ0OWNiNGQxZmIxODc0YWMwMTAzODNiMjI0M2YxYjcyNWYxYTQ1ODYyZjQyNzY4NjMxNTIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImVmNzMyODlkZTFiYjVlM2E4NDM0Y2ZmMzYxNjczOGY4NWU3ZDQzMmM5MTM2Y2E4MDk0MGI0NTk4MGE4YWViOGUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_96722ffe27a74004b6e7d3eb8383ed6e",
+      "statement": "Focused factorized oracle tests cover incremental versus batch results, classic versus factorized fanout work, and updates/deletes/retractions, while the factorized_plan_rejection test verifies a windowed join remains classic.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/tests/factorized_join_aggregate_oracle_tests.rs",
+          "version": "repo-file-v1:sha256:aafe7c4125dfed810d0c6b7e318965c74798d7e76dfa30b52ed66ef62106c866"
+        },
+        {
+          "resource": "repo://crates/rockstream-ops/tests/factorized_plan_rejection_tests.rs",
+          "version": "repo-file-v1:sha256:d21bcdf0e3c03b5d6d09ee3f842b752860c72a8d79a990aff0010baf08ff3416"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.7.2",
+    "at": "2026-10-21T16:22:36.376Z"
+  }
+}

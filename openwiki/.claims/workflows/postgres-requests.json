@@ -1,0 +1,546 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:5ce4e8df38b7c8bde7c57ec7630a4ebb34983cc36f305342bc537c9a52f18015",
+  "claims": [
+    {
+      "id": "claim_d125ba045c9b46c4829a9978f912217e",
+      "statement": "GatewayHandler shares serving dependencies while routing session state, DML buffers, prepared statements, portals, and cached results by connection ID.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2074-L2095",
+          "version": "repo-lines-v1:sha256:319c19c6597977cfe2ad9142b44f63670a878cb1439691470f0089808e11fd3d:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU3MjQ5NGJkZDE2YTMwMDJmNjUwNWUyNTVhNTA2MGYwNDQ3OTRlODJiM2JjMTczNzkwNTQzNzkxYzNiOGJmMTYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImRlNmQwZWYzYTljODkzNjlmZjYzZTJlMWFkOGFjODk5YzlmNmQyMzE4MmIyNjM2MjE4Y2Y2MTNjZWIyNDdkZDIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjdhZThjNGNhYTZlMTk1MzM3MGI2YjIxMzU1MzRkMjQ3NDRiNzk3MmYxZTAwZGM0YjI5MTkzOTEwMzhiZGExNDQifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/session.rs#L121-L174",
+          "version": "repo-lines-v1:sha256:eb53b57d1d81eaad66620f00aacce7a692b6dc8048f9531793c749fa5e693214:eyJzZWxlY3RlZExpbmVDb3VudCI6NTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjMmI3NWMyYjVjNjNlYjhlY2NhYWIzNWMxYTA4MmZmYmE3MThhZDYzNWE1YTgyZGZhNGRlYWY2ZTVhNjRhMDciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjVmYjc5NTQ5ZjdiNTFhYzZjM2M0OTNjZDJkYzc2ZThhNGQyYjU3ODRhNmY4OGE2ZjZiOGJmOTcwODVkNzE1ZDkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImMyNGU0YzEyZTdiZjU2MDdkZjA5NWExNGJhY2E3MWQ3MzE5MTRjNTc0MzI5OWQxZmVkYjlmZDgwMTFkYTJiMTQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_0e47f93862074745ad3ec30211450c05",
+      "statement": "Simple queries resolve a stable connection ID, reject draining requests, handle empty input, and sequentially dispatch parseable multi-statement SQL through do_query_single.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L12658-L12748",
+          "version": "repo-lines-v1:sha256:a3f9c87f9f1520fb5226d67cd4b442fe79fd5e64fe3a99da89d9bff99cc3cfd9:eyJzZWxlY3RlZExpbmVDb3VudCI6OTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIxNTI4YzJhNWI1MDJhMmI2MzQwODJjYmY4OGViZTA3YmI5ZjFjMTVhODM3ZTMyNmE4NDkyMTNhZTFmZWVlZTYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjlkMTAzZGQzNzMwY2Q1YTdlMjBlOTA1Y2FiZWFkYjQ0MjM4OTBiYmY5ZjU5YzA1MzUyNWVmM2ZhYzJhNTQ2Y2YiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM0MzMwZDNjNTNhOTY5ZTRmNjM5M2U2N2UwNTA0MzhiYjIzNmI3NDc3ZmM0MzViN2YwZWUzODc4ZmJlMzNhMGEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5252-L5254",
+          "version": "repo-lines-v1:sha256:8ffaaadfd3e58fad92cf4c8596c47ed916c05a243de94ed8e895e7e963027cdc:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMmVlY2NhZDI0MzExNzkxZTczNDgwZDQ1ODQ1YTE0YzAxNjhjMGVlYjFiYWQyZDE0ZjBjODY4YTk0MDI1MmJmYiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiYzJlMWI5YjU1YzkwYzQyYmI3NTE2MzQ3MmY1N2FjMjZhYWE5ZTA5OWRlMzVhNDIwOTQwMTI3NDI5ODFhYTU3NSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiYmU5Y2M3ZTU5OWNkOTU0OGJjYjYwZDY4NGI1N2I1NDI3MTZjMDZjMTVmNTk2MjVmODhiNTk2ODA2OTUyZTUwOCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiYzBmOWNhOGQ3Yjc2NTdjZTgxMDg3ZGZjZDE2NjhiODdlMjI3NTlhODUxMDVlMzc0NTU2Mzg5ODU3ODY5NTg3MiJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_ace349355ee24e55b3b2c698daa9abd7",
+      "statement": "Extended Parse/Bind/Execute uses prepared statements and portals, while custom Execute collects complete query results before implementing max_rows delivery and PortalSuspended through cached offsets.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L12760-L12928",
+          "version": "repo-lines-v1:sha256:17080751856ee9ecc52d8c62a773695ebd0ae79b7adba2f15d20cd9e13c4a245:eyJzZWxlY3RlZExpbmVDb3VudCI6MTY5LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI0ZWRhOWU1MDBiMjJhNTZiODc0ZjcyY2U4MzFhZGJiNWU3ODNjYmY0ZDQyM2Y2NjIwYTQ2OTAyODc4ZWU5OTE1IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI0ODkzZjQwZTM3ODFlYjg5NmM4MmQwNDZhMDgwNjdhMTFlMzVjZGYyZjFkZmFmMjZmZWE5MGI4ZGI2Njc2NDEzIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI1YWY1YjA3MTI1Y2EwYjBmOTMzYzVjNDAwZmFmYjNjYzY1OWNlNjU1MzYxZjhlZDI5N2JjZjkzY2E2ODY4YTU1IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI2MWM2YjY0YWZmNjUyYzFmOWUwYjA4MmM5NjVjZGEwNjA1YjU0ZDU3ZTZjZGE3ZmZiYWMxOGU2N2E5MDNjOWU2In0"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L12970-L13158",
+          "version": "repo-lines-v1:sha256:3a65db27cb6b3cd97cadff67e9002223aef914aab602d0d389eeed64a9ca4d3d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTg5LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiJjMzVjZjExOTEyNWZmZGVlNWMwMGU4NTFmZGE4MjQ5ZmVlNDJhZDVhNThlYzBhNmRiMGExYTFmY2RmNzIxNTU4IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJiOTE1ZGVkY2I5ZjVhOGUyN2ExYjg4YjZhN2M5NTYwOTlmYzJiNTU5NmRlYzU0ZDkyNjU4M2U5MmRlNjZhZjVhIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIxNjJlZTU3ZTQxYThjMjBhZTAxNjRkZjI2MTQzOWRjYzQ5OWQzNTIwODM0MTUxNTE2ZDA0N2U4ZGVhZThhNDY2IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI0Mjg2YTc5N2U5ZGE2Njc1NDJjYTMwOWMxOTUxODYxZGFkOThhMjdmNjEwMGRkZjA4MDY2NDAyMzNmNmMyNWYzIn0"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/gateway_extended_query_tests.rs#L627-L684",
+          "version": "repo-lines-v1:sha256:19425c28828dc1084e84a20b2c32b762b7997a3a730b22dc6cb47eef536c133a:eyJzZWxlY3RlZExpbmVDb3VudCI6NTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUxOTQ4NGVlZGYzNjRmYjhjMTJmMWViOThmYmY2YTliNGY2NTBmNDI3ODc0YThkNzM1OTAxMGFhZGU0MzFiYzgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFkNWU2OWJkODJjNzRjZDRlMWNlYjZmMjBjN2MxODdmNDFlMmY3NWVkOTRiOWZjZTI2ZmMwZGZjNmFhOTZlOGMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjIzMDg3ZjI5YzVlOTliODZlZmM4Njg2ZjhiODcwMTA5MWJhODY5NzllYmU5M2Q1ZWZjNmEzNmVmODk2ZTFjMjkifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_af213b8aed11460fbf3ad433ffdf5071",
+      "statement": "Malformed supported binary Bind values return 22P03 and invalid parameter counts or format codes return 08P01 before execution, discard messages until Sync, and preserve the connection.",
+      "evidence": [
+        {
+          "resource": "repo://docs/pgwire-conformance.md#L67-L76",
+          "version": "repo-lines-v1:sha256:7ddd7ebaa2e9e43029d7fba28395081c66144dc9412659950ba1984561fb87d9:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjExYTlkNzA1N2I2NTg2NmM1ZjIzZmNhMWU3OTdkMzkyYTY3NjU1NjE4YmRhZDBkMWYwMmVjZWM5NGMxMDAxMTgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImFjZDA1ZDJiZjdmNGI1NWRlNDRjMDRjZTk0MzQyODU3YzNmYTg0OWJjNmFmYjhiNWM5ZjhkMjAxNTcyZGI4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImU4YmE5YjQ4ZmI1ODQ5NWYxOGIzMjNhNTc1OTE2NjJiZDEzMGMwY2E1MmU5MTZlNzRiOTAwMGY0OGViOTUxZTciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_6f8899e245ba4fb1831a3eba20f6a45f",
+      "statement": "Authentication-off startup assigns the System principal; session state owns the authenticated principal, namespace, transaction state, freshness settings, and cancellation identity.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L12146-L12162",
+          "version": "repo-lines-v1:sha256:e80d5accc08be7f88bd19f6c01e376c8f8706b2a59498128fd509cf5236bab6c:eyJzZWxlY3RlZExpbmVDb3VudCI6MTcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY4NjRlZWNmOTRhMDU5YTM5ZTMwMjY4NmI0NzZmNWNlZGFiMmMyOGU4MzAzYjgzMDEwM2MzNWU5NTM5YmYwN2EiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjNjQ3OWNjMjMwNDQwZmQ0MWU4MjI0MjE4Njc5Njk4NTU5ZDI4OTNiZDY3YjQzODBhZmFiODExYjM4YTU1YWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQ0MzQxM2MyOGI3YTBjNWZkYmNkNzY2NzU3NjE5NTc5MjEzZjdkYjBiNDk5YWQ1OGVkY2Y4OTlmNDhkNzFjOWQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc2OTIzMTE2ZDAyMzUzZjYzNGQyZDFlNjYxZDMyOGU5ZjJjZGZiMDA1NGRhNjQwYjYzODU4Y2UxZjVmMDFlMmMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/session.rs#L121-L174",
+          "version": "repo-lines-v1:sha256:eb53b57d1d81eaad66620f00aacce7a692b6dc8048f9531793c749fa5e693214:eyJzZWxlY3RlZExpbmVDb3VudCI6NTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjMmI3NWMyYjVjNjNlYjhlY2NhYWIzNWMxYTA4MmZmYmE3MThhZDYzNWE1YTgyZGZhNGRlYWY2ZTVhNjRhMDciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjVmYjc5NTQ5ZjdiNTFhYzZjM2M0OTNjZDJkYzc2ZThhNGQyYjU3ODRhNmY4OGE2ZjZiOGJmOTcwODVkNzE1ZDkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImMyNGU0YzEyZTdiZjU2MDdkZjA5NWExNGJhY2E3MWQ3MzE5MTRjNTc0MzI5OWQxZmVkYjlmZDgwMTFkYTJiMTQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_5a2141fa7fc14940974cd000d546bef6",
+      "statement": "Mutation dispatch checks policy-required ACL roles for non-System principals and audits denial; the shared read guard checks Viewer access and cross-namespace catalog-view access, and query-time execution checks all referenced relations.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2231-L2278",
+          "version": "repo-lines-v1:sha256:3cbc2e46dc7d1274f6027bfdd389d3f67175aee4ee4c478f65747af0f41d91cd:eyJzZWxlY3RlZExpbmVDb3VudCI6NDgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMwZDdiNzQ2YzM0MDQwOGYyM2EzYzI4OTJmMmNkMzc5MjBmMjQxOTk1YTdlYmYzZTNkYjQyZjYzMjU4N2Q2MDciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI0YzUyMmRlODllYjAzYjE2Mzc1MDgyYjYxOTZiODBjZDM4NjhjZDQ0Y2U1ZGFlZTFlMTBiM2E2NmJhMWRmMWMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI0M2E1N2EyMWVlYzc2YjBhNWU1NWYwY2M5MmY5YTIyNDBmNmM1ZmFiYmMxMjFhY2UxODUxYmQzMDg5NGZkNDYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ2ZTY3NjM3MDlkMDRkYmY4MmEwMzg5OTU2YWJlNjkxODEwYTEyYzhjMjAwMGZjYjVmNjg2NzQ4YTg4YzJlNzYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5742-L5747",
+          "version": "repo-lines-v1:sha256:0d8f1e7020410dca5f46853b5c614ad6db4ef77bc200d8298626f29ba8019ec3:eyJzZWxlY3RlZExpbmVDb3VudCI6NiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYzE5YmQ1Yjg2ZjQ1ZThlYTk2OGE0ZmM1N2Q2YTVmYzMxOTM4ZjAxZThiZDY1Mzg4OTlhYjY3MmZiYTFmZmIyNSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZTZiMDQ0OTE0Njk3MjJlODM2M2E5NGU0MDQ0NTM4ZTAxM2EyYTIxN2UzNmIxZTU2OGJhNjBhY2I3YjRjOGYyZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZDNlZjQ4NzllZWQ1MDAzY2YzMGMwZjdhMjgxZjgzZjJiMGE2MmNlYTE5MWE1ZTYxMDgyMzdhNjU1M2YxNzMzYiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiYjgwYWNkNDg3NTYwMWE5NTk0NDQ0M2Q0NjA1YjA1NjcxMjcyYzM0ZDk0MzMwNzBiYTEyZDM2OTA5YzMxMGNhMyJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7514-L7525",
+          "version": "repo-lines-v1:sha256:3a78249ac01d0a249a7c4c0ed09c366a8ca01c19d2ce257725224e4ecc07793f:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg0YmEwYWJkMzlhNjQ2YjNjYjQ5ZWU4YjUwOWI4M2IxMzQ2NGM4OTc1ZWNjMDJlMTA1ODZhMjNjMDYxYmE1MGQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijc3ODU5ODc3ZTlhNzA3ZDQ3N2Y5NmYwM2RhMzM1MGY1NjE4ODUyNzAzNDE5NjA3MDkwZDAyNzdlNmVkYTNkNWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijg3NjAzMWM5OWM5MTEwMmFlNTUxNzkwODA2NWQwYTFmMGFmNWViMDAxNmFhZDUxNmEzMTA0M2JjYmI2Mjk2YTgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7582-L7630",
+          "version": "repo-lines-v1:sha256:dc75c0d9e37680a109fe2318c8042b07ed5204b6fda1ce8fc222e8a553c3c147:eyJzZWxlY3RlZExpbmVDb3VudCI6NDksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRhNDU2NzJiZGU3MDM4MjAwZDM2ODYxNGJmMGZhMjA3ZjFjNGE5ODZiOTZkYmMxYTM4ZTE5YmVjODcwZDhhMjIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQyZWYxODBkYjZhZjk3MGY0M2E1NjNhZTk3ZWJkZGU4N2MxYjdhNzRmOWQ1NzIxNjQwZDc4YjE3ZmVmYWFjYzQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQxNDBiZDFjODI0ZjllZDM2Nzk1M2I4OWIzNjYzMWU1Yjc1NDAzZTI3YTI4MmUzODg2NGQwMTdkYmRjYWFhMmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjFiOTc5MzlmNWE0ZjFiMGYwNDJmOWFiZTAzMTUzZmVkNGEzZTUzMGIxNzFmY2U2MDk4MzBkYjIwYjJkNmY5MjEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_85d7f57dbd824d9496e2b02478e3185b",
+      "statement": "SUBSCRIBE authorizes before exposing retention metadata, scanning snapshots, or acquiring a stream slot, and COPY OUT checks read access before reading or emitting COPY frames.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5142-L5153",
+          "version": "repo-lines-v1:sha256:6a8d42a9d3756ab95c7c0ea767990d39bc77343ad6bb9f0b5e53ff9a25a709ce:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIxZmY3ZTQ0YmYwMjQyYzI1MDE0NmE3NmUwNDExOGRhZTljZDUyODUxMzM3M2E5MWVlNDQ0MDUxYmE4MWYwOTUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjJjZjMzNzM2NjJlMTVmNGQ1MmYxNmU4YjFlZTU0ZWM1MTZmNmE2NTFiYWM0MmJlMWE0YmIyZDI1YjBhNWE1MjMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjgxNTAwYWQ1ZTE0MzhlZjg2ZWIxYTU2NTdmMTcyOGI4NTk1NzA1ODAxZGY3ZTYwY2E5OTg2YmE1NzhhZWI0NWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjViOTk1NzgwNWUwOThjMjZhYTA2MGY4OTNmOWI3NjdkMWE3NWVkODY4MmY2MWM5MGZmNWMxZWMzOWMxZDY0MjcifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5530-L5569",
+          "version": "repo-lines-v1:sha256:3faf7ec523ef8f42398e6eab8d6bdc674317f58ea039456790f4030a41837c38:eyJzZWxlY3RlZExpbmVDb3VudCI6NDAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImFjYzg3YzUzZTcwZjUwODQ2MmI2ODY5MWFiZDg2NzA2M2Y4ZTBlYzJkY2JiYWQ5MWFjMTZmY2UwMWNlNzBhNTAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM1Y2RlZjgwODVhZTc0YWI2MzZkNjQ1OWY1YzZkNWZiZmIwZGIyNjRmMWIwZDc1YmFjNTE5YzliM2Y2NzE3YWMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjI0NWE3Y2VjYmYxZWEyYzdiNTIwNTlmMDNhZDkwNjU2YmQwMmU5M2QxODFkNTMwNmFiMDYxZDdmMTFlNDZlYmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE2MTI1ODAyZjA3MDI0ZGZmZDZhZjYwNTU3MDQ0OGYwZDM5YTAyYzlkMTE0Nzc4Y2FlYTU3NThlZDE3MGEyZjgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_40f8886da5cd4c9d809055e928d39b8f",
+      "statement": "INSERT stages stored row values and deterministic keys with primary-key checks; UPDATE stages old/new row images and keys; DELETE captures pre-images before appending mutations to the connection write buffer.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L11047-L11115",
+          "version": "repo-lines-v1:sha256:7d5b19f5b423b81c40c1e0919e58ba2e6c5c072726d674063d8457fedbf8133c:eyJzZWxlY3RlZExpbmVDb3VudCI6NjksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVhOGYyMGJkMTUyNDVkMzg3YWM1NDI1OGRlMzYwM2VlZDQxNzhmMDFjMGExNzM3ZjE4YjYxZGZmMjllNTRlMzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE3NjFiZjRiZTFiMWZjOTM5NDEyZDdiNjhhY2VkZmUyNjNjMWNiYzIyMjMxMjEyZGYzOTA5YzcyMjljZDE2ZWMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImRiODBkMWZjMGRlYmRjMDQ4MjVmZDFkYjhkNzlmOGY3ZTlhMWMzNTFlZjAyMmVjZDg0MDU2M2MxZDNjNzFiNjAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L11683-L11754",
+          "version": "repo-lines-v1:sha256:8a032075c24ee12c7a271097be994c1e3126261deffca7a12d79b3fd187478fd:eyJzZWxlY3RlZExpbmVDb3VudCI6NzIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU3YTVmZmEzZTA5NWRmMDViNmIzMzMzODcxYWJhMWMxYjNlMjVhYjNkYmYxZDQ5MmYxNTRjMmNjMmIxMjJmNTciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUwZjk1MzdiOTNkY2E2YmNkYjU3NjdmMDhkMWRlZmQ2NGM1MzkyMmUzMTRiOTEwM2IwZjJkMDdiNWFmMDU4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjkwZmIyYjY5MDFiZTRjYTdjZWZmYmQ0NjY1NzNiODEyMDdiOWQzNWY0NTU1NjQxMGY5NmFkZTZiMTYyNjI3ODkifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L11908-L11929",
+          "version": "repo-lines-v1:sha256:f6821197eeb4d2d329065634e611d605939ccd8f2c71f937a2c54099989e1a83:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImZkMjhiNGJmNTdiYTJjZjkzNzg2YzY0ZDdkODc1NzRkZGYwMGEyODZmNzkyMDBlNTQ0N2QyYjYzMzYyMWVlZDEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1MjJjNDJjZDE5YzZkMDNkODA4YzQ1MjcyMDU1MjgyNWI3ZWExYzViNDkxYjIxODUxMWNhYzc0MTVjZjlkOWIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjMwNWExYTk2MTdlODBmZTQ5Nzg5ZTg3YWRmNjI2ZTVlOGQzN2YzNDg0NjFhNGZlYTczZDM0MTcyYTRlNWE2ZWIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImRjZWRkNzM4OGM1NDBiODAzZTQwODZmYTM5NjcyYjg3ZTUxMWVhZWRmYTQzOTgxY2Q0MmZlZjRjOWQyOThkZTEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_afae96ef73454b1dac635372290207d4",
+      "statement": "INSERT, UPDATE, and DELETE autocommit through handle_commit outside an explicit transaction, while explicit blocks retain buffered operations until COMMIT or ROLLBACK.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L11117-L11135",
+          "version": "repo-lines-v1:sha256:eefda50fdb20da163c4bab7fa7f709912efd4175aba3be28545907808ea8de1c:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE0OGYzMmY5ZDBjMzQ2YTU3ZDc2N2U1NzIwMWY0YmNiZGYxNTYxMDdiYzRhZDg0NGNkMmI5NTRhMWNiN2NkZGUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU3NTZjMjE3MTNlOTRjMTIwNzUxYWUwNTQ4ODRmNjczN2VhZWIyMmM5NzA1MzZlYzhiNjZlZGEyMjQ2MjVkYjIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRhOWY4NmQyOGU3ODRmOWZkMzFmYjcyZDE1ZjYwY2JjZWFhZmRkNjY5Y2JkNWI2ZGE3ODg4YTAyMzMyMWViYjkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ3YzMyNWZlNmE0MGE0YTdhOWUwODc2ZTMzNTkyZGVkMDM3YTk5NTgzYzk5MWUxYzk5NzViZGQ2M2IyOTllMTMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L11756-L11769",
+          "version": "repo-lines-v1:sha256:5ff011f1d5d8294441c534a00770fa34756a23466e1d11ea47e0539e779e5bcd:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1NTIwZDI1NWVkOTYzYTRhN2RmN2U2ZGQzZGUwYTgwYWI3MjFmM2JlNDczMzYwMTUzNGQ3NGYzZmFmODgxYjkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRhOWY4NmQyOGU3ODRmOWZkMzFmYjcyZDE1ZjYwY2JjZWFhZmRkNjY5Y2JkNWI2ZGE3ODg4YTAyMzMyMWViYjkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImZlYzgwODliODY3NDUzMDMzOWMxZmVkODVmMGJmYzMzMjI1MWI0YzllNzlkOTJjZGIwNDRmNDk4YzU2YmJlNDgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L11932-L11945",
+          "version": "repo-lines-v1:sha256:5ff011f1d5d8294441c534a00770fa34756a23466e1d11ea47e0539e779e5bcd:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1NTIwZDI1NWVkOTYzYTRhN2RmN2U2ZGQzZGUwYTgwYWI3MjFmM2JlNDczMzYwMTUzNGQ3NGYzZmFmODgxYjkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRhOWY4NmQyOGU3ODRmOWZkMzFmYjcyZDE1ZjYwY2JjZWFhZmRkNjY5Y2JkNWI2ZGE3ODg4YTAyMzMyMWViYjkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImZlYzgwODliODY3NDUzMDMzOWMxZmVkODVmMGJmYzMzMjI1MWI0YzllNzlkOTJjZGIwNDRmNDk4YzU2YmJlNDgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_f2676d1bc8434068b7441e3481931d27",
+      "statement": "A multi-row UPDATE expression failure can occur before candidate mutations enter the buffer; the regression test verifies division-by-zero leaves both base table and materialized view unchanged, but per-operation buffer pushes do not provide an atomic whole-statement capacity reservation.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L11733-L11754",
+          "version": "repo-lines-v1:sha256:f90468cfe88988f0be9ee27d84a1198e755091436523940fbc51cb3ed2748d7d:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY1ZDhmNGQwYWE2NjdjNGI5ZTM2NDYyYzQyYzBmZDhkM2E1NDkwNTA0NmNmZDJjOWIwN2MzYjM1OTY3MmE5ZTIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE3NjFiZjRiZTFiMWZjOTM5NDEyZDdiNjhhY2VkZmUyNjNjMWNiYzIyMjMxMjEyZGYzOTA5YzcyMjljZDE2ZWMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjkwZmIyYjY5MDFiZTRjYTdjZWZmYmQ0NjY1NzNiODEyMDdiOWQzNWY0NTU1NjQxMGY5NmFkZTZiMTYyNjI3ODkifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/write_buffer.rs#L118-L139",
+          "version": "repo-lines-v1:sha256:237efc2408e4f94926f711143e9bfd39ab7ec713f459338b6ec84f255d97da8e:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNlZmY5ZDdiMmU5NzRjZmY5MGIzMjJkNDU1ZGQ4OTIwYTgzODMxMDRjMDkxYjJiMzhiMDNmOGJlYmY1MTdlNzIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjcyY2FmMTE0NGE5YWUyMmQ0MTFhZDI2NDA3YTU3OWU3YWNmYmM2YzFjY2Y5NDYyN2U5YzQ5MGFhMTBmZTk3ZjgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/dml_atomicity_and_view_tests.rs#L218-L261",
+          "version": "repo-lines-v1:sha256:6494639c261ff2f1dcc0c7984a1711f21ded3af5f9378c201463c49bab8dd6fa:eyJzZWxlY3RlZExpbmVDb3VudCI6NDQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg1MmZhNTZlNmQ0MmI0NTJlNWU3MDEyOWE2MmZmNTQxNGUzMDUxYTVlNjgxNDZiNDVlMmEwYjNmNzkwNGQ0MjYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdjZDRjYjM2Y2M0YTExMjY3MzEwMThmNGZlYTUyODE4MGQ2ODVhMWVjMTBmYjI4NGZkYjE1NTQyMjkzNjUyMjQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijc3NzJlOTI3NWNiNmEyNGZmYTg5NTJjY2E3N2U2YTRhNWEyYWRlNjNjZWQ0MzUxYzZiYzU4NjBhYWZlNTIyZDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc3NzJlOTI3NWNiNmEyNGZmYTg5NTJjY2E3N2U2YTRhNWEyYWRlNjNjZWQ0MzUxYzZiYzU4NjBhYWZlNTIyZDEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_87813f8aea6b48b0924342fb64741229",
+      "statement": "WriteBuffer accounts approximate operation bytes with a default 64 MiB bound and rejects overflowing pushes; savepoints are bounded to 128 and rollback-to truncates buffered operations to a recorded position.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/write_buffer.rs#L118-L205",
+          "version": "repo-lines-v1:sha256:4238fbf4a098b3f052e8f05393f1c49411d5786f445cd7e9a742e45b01ddb039:eyJzZWxlY3RlZExpbmVDb3VudCI6ODgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNlZmY5ZDdiMmU5NzRjZmY5MGIzMjJkNDU1ZGQ4OTIwYTgzODMxMDRjMDkxYjJiMzhiMDNmOGJlYmY1MTdlNzIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwNzFjNmU5MjJkNjRlM2MyZDEyZDFiNDAwODRjMzFjYzRlNzgwN2ZiNDJlN2Y3MjI5Y2M4ODYwNWU3ZmM4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQxZDM3YjU1ZjJjZGE4OWMxYmZhZDA4NjYwMjdkZWNiY2VlMDM4OGIwMzA1NDFiMjkxMzgxNWJlMjE1MzIwYjYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/write_buffer.rs#L47-L85",
+          "version": "repo-lines-v1:sha256:af30f60fb73c9f0ad17fdd2e6d365e20a570e3e8568ec3e557d64c023381f1a9:eyJzZWxlY3RlZExpbmVDb3VudCI6MzksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFiNDhhOGQ1ZDNiNThhNjM5OGFhMmJjZjlmZWZlNjEyZjYyYTZkNDIyZDY0MWIyMzg4OTlmMGQyZDlkYWQzMzIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQzNWMzOWRjOGZmMjA4MDFhMjkxZjk2Y2FhMjRiNzE1NTdiZjRhMWMzOTdmYzJmZjQ2YWZkOThkOWU5M2I4MDciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjY3NmE1NDRjYzAyM2VkNDA1ZTNiOThiOGEzNTQwOTBmYWQxNmU5ZTE4ZDVlZTlmN2JhNmMzZTcwMDUzMDA5ZDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImJmM2UzN2Y2NzljZDY2NzAyYjcxZjNmOThkN2IyYjYyZTAwMGEzM2FkYjQ4OTE1NDdjNjZhOTJkNDEyNGIxNzkifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/write_buffer.rs#L9-L13",
+          "version": "repo-lines-v1:sha256:7aa3b11fef65a4a6272d64d9afb22d83ecaf452ee7db67c070622942b48bd11c:eyJzZWxlY3RlZExpbmVDb3VudCI6NSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYzUwZmEyZTQwMDY3MWRiNTQxMDVhMmIwYzY1NmI1NjEyYjM3NzEwN2E3NTBhNDQ1Nzg4YWMzMWYwNDdlMzZhYyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNWExN2ZkMjQ5MDAwMWMyZjA5YzE5NzRlZWE5MzI3NjQ5MjQyODczOWU1ZjZhMjgxMzBhNjQ2NThmODUxZGRhNyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMjhjZDY3MTdmMDE1ZWRiN2Q2ZmMxZGI4Y2M4NTI5ZjIyMGJlNzY2Y2QxZmZhMWU3YmE2MWQwNDhjMWFjNzE4MiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiYzI0ZjNmZWM4NDE1MGU5ZmFiZmFiMTUwOTdjYjcyMjBlZmJlMjhlNGVjYjkwYzhkNDI5NjJlMTAwZjFhNjEzMSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_a89b094a13424443a96385012a1c7fe0",
+      "statement": "Read Committed is the supported session isolation; Serializable and Repeatable Read are rejected, and two-phase transaction commands are unsupported rather than providing a transaction-wide snapshot guarantee.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5783-L5817",
+          "version": "repo-lines-v1:sha256:6ecfc214019c445e7b0c18937e0b73c2014df302808814fbdbf2d7385e879a4c:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY5MDQzYTQ3OTE0OTkxM2VhMTUzZjFmODhjNTAzMGJmMzMwZGVjYWRlMDBiY2Y0Njg4NTZlNzk2OGQ2MmE4OTIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE3MDEyMmFkMDI4YTdhNWU3MDg4YzU2ODI1OWUyNTUwMjM1ZWFiZjYzOGY3NzEzMWY2M2M1NDIyYTg2YjRjYTQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjFlMjhjNGRjYTNkOGM2ZWFiMzE5YzM1MjcxZjMyMzZiNTI1NWJiNTUwMDk2MDg5YWNhOWFiYmFmZWU4NzI1MDQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImRhNGNkNmVmZmI0Y2FmYjM2ZjUwNGE3NzhmZDI3NDgzZThlNjA1MmVlZDMyZDQ4OThhNGQ4MDcyYThjZGMwZjkifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5906-L5911",
+          "version": "repo-lines-v1:sha256:31ff668d432b89d48ca76544da4195071668be73066357d9115e98bde252189e:eyJzZWxlY3RlZExpbmVDb3VudCI6NiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYTE2MTM3YTNjZGU1ZTQ1YWVkMGI4NGM0ZTM5Y2E1MTU0ZmI1NmZiNjUwZmZmZjY5ZThiOWMzZDkyNTAyYzhmNCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiODFmNzc5MjhhMDliNjg5NTYzYWQ4ZDczZWYwNDFlYmMzNTlkMjY1ZDlmNmMwYjY5YWZlZGY4ZjFlN2FkMzliMyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiM2VkMTM2NWJiZWU1OGRiNmRlYTc4MGQ3ZGNkZTkwNDM0MTVhMDE4MGMwMDlkMjExMzMzODEzNWUyZjc5Y2JkMSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNjFmYzMzZjhlMjkwN2VjYzE3ZTdjOWRmMWQ0MWI3MGQ3ODE2YTA4MmVmMjY0MmQ4NTVhYzRiODRhOWRjZTcxNSJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/session.rs#L115-L119",
+          "version": "repo-lines-v1:sha256:4be8c467def3bc227964e76e4a9ac69fe02cdec521f9bc25d3ee1fe8801517fb:eyJzZWxlY3RlZExpbmVDb3VudCI6NSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYTA0NjMwOWQwOTFlMzE5MzJkZGYxZWZiYmFhZGM5OWE5OTFhM2I0OGNjOGFhMDExOTQyYzFmMDc1Yzk2YzQ0ZSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZDM4OTVmN2Y2MjA2ZWZjMGVjYWIwZDI4ODA2YzU4NTBmNjk4YzRjZjJiOTMxMmQxM2M1NjJmOWU5NDQzNTU5ZCIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZmM5NDg1MGE0NjE2YmY1NDE0MGI4ODI0YWVhNWE3MGY5ZGQxNGQwNDdkYTU4MDc0YTNkYWVmYWMwZTA4ZDQ1MSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiYjJjMjYzNDEyNzU4OWNjMmViNWU0NWU0N2RlMjE0MDE2N2M3MzczMzdhYTM0ZTc0YTk5NmQ5ZmU1NGQ2MjA1NyJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/session.rs#L32-L40",
+          "version": "repo-lines-v1:sha256:f27bae849dff01c622437303fc982aab92f9ce3cc064a639e8df1801fedb6486:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMThkYTBiNjc0Njk4ZmI2ZmM3Y2Q0ZTdlMmNlODNkODdjZGMzNjRjNDQ1OTcyMmE0OTgwNGI0NzljOTdmODNjMCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNDEyY2EzNDVjY2Y3NWJmOWMwODA2YmNlNjk1YmU4ZGU4MDhiNzk5ODQyNTFhN2E1NGQyMDJjZjYxMDFkZDQ1MSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNjc2YTU0NGNjMDIzZWQ0MDVlM2I5OGI4YTM1NDA5MGZhZDE2ZTllMThkNWVlOWY3YmE2YzNlNzAwNTMwMDlkMSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiYTc0NzViMDAyZDIxM2FkZTE1NTY2MTg2M2NiYmE5MjJhZmUyMDcyNmUxNDYxYTdmYzYzMjNkOGI3Nzc4NzgzOCJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_811723be2f0b40cd82abfaa46041b55f",
+      "statement": "ROLLBACK clears buffered DML and pending transactional notifications without shard writes; successful explicit transaction completion clears cursors and local settings, and failed blocks allow rollback forms while rejecting other commands including SUBSCRIBE with 25P02.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10331-L10339",
+          "version": "repo-lines-v1:sha256:53478dac2ed540ec9f48e01044cea7e6461444203f122ab3a371ef5e0bbff141:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiZGQyOTgwMGVhZTAwMzJkNWJmYzk0ZDQ4NzRmMzE5MmEwYjk1ZGNkMjI5MzliOTcwZDMzZDlmYTA4Y2UzM2Y0MyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZTZiMDQ0OTE0Njk3MjJlODM2M2E5NGU0MDQ0NTM4ZTAxM2EyYTIxN2UzNmIxZTU2OGJhNjBhY2I3YjRjOGYyZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNzc4NTk4NzdlOWE3MDdkNDc3Zjk2ZjAzZGEzMzUwZjU2MTg4NTI3MDM0MTk2MDcwOTBkMDI3N2U2ZWRhM2Q1YSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNGVhMzY1Y2YyNjU1ZWE2NzQyYjllZGQ5YTgwN2E3ZDE4YjM5NzAwZDdhNzVlNzYyZmU1ZjgzNmZhODc3MjQ3NSJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5749-L5780",
+          "version": "repo-lines-v1:sha256:c7660caf23d032074d23c800c4c611cbc19fef5b056c156e6f9f6f6b94192fee:eyJzZWxlY3RlZExpbmVDb3VudCI6MzIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVlOTFjMmU1NDI1ZDQ4ZDViNjQ3ZjEyZjcyZmQ0ZjM0NDcwZDZmZDFlNGZiOGIxMmFhOWZjOGFmYWE0ZTk1YWMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI1MTk1ZTJkMmQ3ZTYzYmRhM2ZkN2MzNGFjMDliYzJhMTdkMzBkZGNlZDVkOWExMmNjY2M0OGMwMzczNjY3OTIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjlkOGM4YjFlMmEzMWE5Njc0MDUxNzM1NTVkNTUwMzk5NDNjZjdlN2RmYWI0ZGU0NTkyODhkYjZlYzEwNzdhODgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjRhNDBiYjIzYjY3YzdkOTg4ODlmMTRmZjk5M2FiNTc4MzRlZTRmNWY1ODI5NTg2NTMzNDUxN2FiZDAyMjJmYTIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5881-L5903",
+          "version": "repo-lines-v1:sha256:cd42d44b8c1e0b538b26f8276fd4d36f77423773c0357c52077ea68bd4b5afc5:eyJzZWxlY3RlZExpbmVDb3VudCI6MjMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU5MWE1ZDE2M2ZiMjVlZTFhZTdkYjVmMWQwNDE1OTYwZWVjOTIwNTZlM2M3NGIzOWQxYTQyMjM0ZWUwZTA2NmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg5OGFjZGM5YjZkMGI3YTFmODIyZjc0MjMyNWI3ZjUzY2YzODY3NzY0Mjg5Yjg0MmE3MGU1MTNkODFhMzE1MzAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjNlZDEzNjViYmVlNThkYjZkZWE3ODBkN2RjZGU5MDQzNDE1YTAxODBjMDA5ZDIxMTMzMzgxMzVlMmY3OWNiZDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImEyNTE2MTA1MTAzMGJmNGIxOWRlNWUzNjliZWQ3NTlhZDMyOGEwYTczZjc0YzRiYTJkZDk1MzY0N2I3NGQzNzYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L6891-L6914",
+          "version": "repo-lines-v1:sha256:59b3e0353bc91c5da98b4567bae959e3aa6aa367e0db0bf3a765f622e52a6fde:eyJzZWxlY3RlZExpbmVDb3VudCI6MjQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM0NzkyMjNhZGRiYWE4MTgxNDE0NGIyMGYwNzkxMjNmYTFkOGNmZjQ0OTllOTgxMTM3MTdiNjk1ZjBiYzU5NTciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjllNjA0MjM3MWFhZGVmNDcwMzQzYmQ0NmRiYzNjYmYyNTEzZDgwMzliNzBlM2U3MGY2NzVlOTIyOTRmMzNjZDYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImE4NjhkNDdmMWJmNGY0ZmUxZWQ0N2Y5ZmE1OTZhZDI1NDhjNjkyMzdlYTA2MWQ4OWZlNzUyNWRjMmIyYThlZTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjIyMWNjNzg3N2VlNzhkOWIyNDIxNDRmZjkyYmVlMDc3ZjFhMjZkYzk4ZGJmOTUyNTQyY2U0NDUxNTA0ZTYwNWMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/session.rs#L240-L246",
+          "version": "repo-lines-v1:sha256:dc5d7b545865bd94656bff6b2a78a38137b2b2ae0421d76e89cb830fd538eeb0:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNjE1ZmE2MWY3MDk2NzY5ZGFhYzRiY2VlYTQyMTY5ZDhlOGU4Y2I5YzU4OTA5NzEyN2JkYTIwYjIxNWVlODU3ZiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNDg5M2Y0MGUzNzgxZWI4OTZjODJkMDQ2YTA4MDY3YTExZTM1Y2RmMmYxZGZhZjI2ZmVhOTBiOGRiNjY3NjQxMyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiOWJiODMyNTk5ODBmY2Y4OTljMTQyNzVhMWMyMWYwNTc0MzczYWU0MzQ3NTk5NDQwNjc2NzA5ZTFmOWU2ZjY1MiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiYzk1NTg2MjVkNGM5NmJmZmFjZTYyMmViNmVhYzg5YjNlZjc0ZWQ2MTkwNTQwYmYxMGYxNmM3ZmQwOGMyN2VhYyJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_92fb0abdb99945738bb599517b8fdd18",
+      "statement": "Commit checks explicit idempotency keys for prior epochs and persists dedup metadata with table mutations; absent a supplied envelope it generates a new key per commit rather than a stable identity for independent client retries.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10056-L10101",
+          "version": "repo-lines-v1:sha256:c993dbb08956478ce5978a89e52f5e0e5a3f684a958e3de930c3887b87943c9c:eyJzZWxlY3RlZExpbmVDb3VudCI6NDYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYxYmE4NDkwMDE0NGJhNGU5MTgwMmFiNjkwZjM5Nzk0NzE3MWE4NzNhMzQ4NDk3ZTg0ZDRmYmM5YWU2ZTBiZDYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImZhZDliNTRiMjY3ZTdmYjM4OGJhZTg2ZjVkODg1YTA1ZjNiNzA0NDlmNDUyMDIyZWY0Y2I3Njk3ZDBjMjhlNjgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM2NzA1MzA1YzEwNTAwYzU4Y2FmMjg4MjIzNzczMjgwOWQ0NTM5YTQzYzcwNTlkNjc4MWZhZmJlYWJjZmUzNzgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10125-L10145",
+          "version": "repo-lines-v1:sha256:2da168e0760f275ab6640a1f1da231f853df3718ba99062b5660ced735d27611:eyJzZWxlY3RlZExpbmVDb3VudCI6MjEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM4ZmVmZGQzZDk0N2U2NDhkNjA3MmZlNGFiMWFhZjllNDU1YTRhNTc0MmQ3NGM4YzZjYzk4MWQ3NDI1ZTEyNGMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUzYjNjOWFlYTQwNjJkMDYyMjgxNzk0OWU0MjBiODdjMjA0YzMxZGE2MmJkZWUxZjEzNWU3MDMwNWQwYTE5MTAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImMwOTBlMTIwOTc0NWE2NjQ4Yjc4MWQ2OTZjMTEwNTgxNjlkODk5NDE1N2I3NTJmMTNlM2QyNGFlNzNjMDIzZDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjlmMDc0YzA5NmFjMGIyOGQyNDNiZWI0ZDQ3NmQyYTRhZTc4ZmMwYTVjYmNlNjdlZjY3NTZjMmI1ZTIxODY5ZTUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_3e10b3d566c544f78cb84a791db833a3",
+      "statement": "Local commit drains mutations, holds shard_commit_lock across normalization, epoch allocation, table/frontier write, dependent view refresh, flush, and subscription publication, then releases it before recording session freshness and returning completion.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10103-L10328",
+          "version": "repo-lines-v1:sha256:2cb8e61c85fc81d349a0d22cc735765f88ebfac2b02cc5c50fbe4afe8d9c6d33:eyJzZWxlY3RlZExpbmVDb3VudCI6MjI2LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI3NWIzN2M3YmQ1NjQ0OGM1MzgyYjAyNTYwODg5ZTg2MDBkNjMzMjI4ODI3ZTUzMWM5NDg3NTI2ZThmMDNhZjQ4IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiIzMDU1Y2JiNzM0N2VhZGUxYmM1YTQzZmY5YzkwMzljMWI1NjcwZjFmMDBlYmM0ZmFjNGU1NWMyMTQ4YjZkYWQ5IiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiJkYTlmODZkMjhlNzg0ZjlmZDMxZmI3MmQxNWY2MGNiY2VhYWZkZDY2OWNiZDViNmRhNzg4OGEwMjMzMjFlYmI5IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI2NTIyMmM0NjdmMmVmODRkYmQyN2Q2NzkyMmM5MmUzNmI4MTU3YTIxMmVmYzI0ODNmNGE3OThkMTlmMTA0ZGE2In0"
+        }
+      ]
+    },
+    {
+      "id": "claim_4aad06546ff44ae1aee5e30b8da5b7b3",
+      "statement": "ShardDb writes a table batch as one SlateDB batch and awaits durability, but updates its in-memory last_epoch from a frontier entry before the underlying write finishes.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-storage/src/shard_db.rs#L760-L807",
+          "version": "repo-lines-v1:sha256:eb684ccbe45411d6b6e7ad7c71e9ed408bf463cb6497072dc24e025978617238:eyJzZWxlY3RlZExpbmVDb3VudCI6NDgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZmZWJkODE2OTgxYzlhNGM0MTExYmI0M2VjZWE4NzkxZTlkZmZiZDg1OWYyMWI3ZGUwNDQzMzA4MTkxMDM2ODgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwNzFjNmU5MjJkNjRlM2MyZDEyZDFiNDAwODRjMzFjYzRlNzgwN2ZiNDJlN2Y3MjI5Y2M4ODYwNWU3ZmM4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE2MmVlNTdlNDFhOGMyMGFlMDE2NGRmMjYxNDM5ZGNjNDk5ZDM1MjA4MzQxNTE1MTZkMDQ3ZThkZWFlOGE0NjYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijg5OGRkYzk3N2E1ZmM1MzQ0N2ZmMjZmZjE2OWQwNTA3OGZkNTlkOTc1ZWRiOWVkMTM0MGIyMzM3NGRmZjdiMzYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_7759cc3854e144d7adb5f112c590f99b",
+      "statement": "Compiled-view refresh processes deltas, writes sink output, then persists pipeline state; local commit logs refresh failures as warnings while distributed source-delta submission failures propagate, so table writes and all dependent-view work are not one atomic batch.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10207-L10280",
+          "version": "repo-lines-v1:sha256:ff3e4ce787c42205242eb2d8c205e66b9145b73629a286cb3d948fa44f9a188e:eyJzZWxlY3RlZExpbmVDb3VudCI6NzQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQyMGM0NDMwOTY1YjAzYmQ2ZTMyOWVjYzU1NzhjNjEwNTYzZDBjYWI3Nzk0NTI5ZDVmNTE2OTVlYTcxM2M3MmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUzYjNjOWFlYTQwNjJkMDYyMjgxNzk0OWU0MjBiODdjMjA0YzMxZGE2MmJkZWUxZjEzNWU3MDMwNWQwYTE5MTAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjU2Yzc2NDI4MTQxYjg2NWJjMTc3MjkxMjk2YWQ4YzYyYjkwYjMzMTg5Nzc3ODkwNmY0NGQ4N2I1ZTg2MTM0YmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjViZGFkYWMwYzFlM2M5ZjMxZmFkODI5ZjFhYWExNDRhZjIxZTU3NTA2Zjc2ODdlYWNlMTNjZmI4YTdhODg2YjcifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2893-L2975",
+          "version": "repo-lines-v1:sha256:79a7723d6df6a99571bbff6b4a7b432c9ac2451d304763d016ffe532d3de9278:eyJzZWxlY3RlZExpbmVDb3VudCI6ODMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE0OTZlMzM5YmVlM2FmMmQzZjE3OTU3ODk1MGUwNGRlN2Y1MjdiN2QyOGQ4M2EzODVmNWNiNzkzNzUxZGYyNzYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwNzFjNmU5MjJkNjRlM2MyZDEyZDFiNDAwODRjMzFjYzRlNzgwN2ZiNDJlN2Y3MjI5Y2M4ODYwNWU3ZmM4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjdiOWE3N2M0M2I0ZTY1MTBhNTEyNzJkZGI5MjViNjkwOTY0ODVkMTlhY2Q0MTQzMmY2OWNjMGJkYTFmZTA1ZmEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImNkZjI3MzdiNjYxNWFjN2VmMzFjZTc5MjIzZDExM2ExMGMzZTQyOWFjMDZjZjg2NWEyNWI3Y2ViYTc2NGZhNmQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_bc0f78329e6144d3876ff52310c533e9",
+      "statement": "Subscription changes are published per table only after storage flush while holding the commit lock; UPDATE publishes a negative old row and positive new row at one epoch, and replay overflow after persistence requires resnapshot without rolling back the durable transaction.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10149-L10203",
+          "version": "repo-lines-v1:sha256:67a1bb5d8836890ea9bc68a607753f4b8e23c2a9626726f32ccd2440943cf46f:eyJzZWxlY3RlZExpbmVDb3VudCI6NTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjlkZTQ2M2FiYzA2ZmIwMWFiMWVjMjU5OGY5MjEyMzVhYzE2ZDU2YmRjNTFlNWRmMTBkOWM4NTc1YTRlNTIwZDIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjExZDI1YTk2NjgwMTllY2U0NjJiMTI3YTM1YjRkYWJiNzM3YjRmOTkxODRlNDM1ZGU5OTQyMGI4ZGU0NmNhYzAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjlmMDc0YzA5NmFjMGIyOGQyNDNiZWI0ZDQ3NmQyYTRhZTc4ZmMwYTVjYmNlNjdlZjY3NTZjMmI1ZTIxODY5ZTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjU2Yzc2NDI4MTQxYjg2NWJjMTc3MjkxMjk2YWQ4YzYyYjkwYjMzMTg5Nzc3ODkwNmY0NGQ4N2I1ZTg2MTM0YmMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10273-L10294",
+          "version": "repo-lines-v1:sha256:f0bea3c83960d453b5e8a8e90f1cef4993e3e2ef5719d6c88d6c9e4a59278bcc:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgxMTBkMzcyODYxYmVmZWY2NWFiNmJjNmZhNDM4OWNhOTc1Yzc3MDJmM2M3YTk0NGUxYmU2OTgzMjZhZDFlZmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZhNjliZTMyN2NiNmJiMmQwMzJkNjk4MjdkN2ZjZGNhNjIzNWRkMDUyOTQ3M2FhNWRmZWY5Y2E4OWE0YjllZDYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjdkZWQ1N2NkZjYyOGU3YmNmYjdkNzY2MzJhOGQ3MTQ4NzM0YzA0MWJjNjUwMjBkZDg5NmJlZjE4OGE3YTIyMTQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImMzNzhjZGM4ZmI2MTY4ZDYyMmFhZjVlODE1MWU2MzI0YjY5NTZmZDljODNiMjQyMDE4MzYxZTNjYzlhNmEwOWIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/v072_durable_subscription_publication_tests.rs#L45-L172",
+          "version": "repo-lines-v1:sha256:b39b30f95e546f99d9a8f2c9883e559894e508ce5786d8e1aa7ba22e122bfc69:eyJzZWxlY3RlZExpbmVDb3VudCI6MTI4LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI1MTk0ODRlZWRmMzY0ZmI4YzEyZjFlYjk4ZmJmNmE5YjRmNjUwZjQyNzg3NGE4ZDczNTkwMTBhYWRlNDMxYmM4IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJkNDM1YTQ2ZGFmYzJmMmQwZjM1MGEyMmFjYjA1MzI5ZjM3MGRmZjgxNDE4YmRkNjE0ZWNjZThiMDBiMzQ1ZDYyIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI0ZTBkNzVmZGRlOTQ2ZGZmMTBkOGE5N2UxOGY4MmI0OWI2ZmZmN2UzNmFmZmE2ZjVlNDdmMjBiMjBjZDM1NTZmIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJkOWIzYTBjMzM2NjZiMmVjYjUzM2IyM2Y0NDcwZTlkOTI1YzY3MjQzOGJhZDM3NDg3Y2YwZjhiODE1NGUxNmZiIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_d04547f6a3844ec7a50fb96c5fd1c9ab",
+      "statement": "Commit failures after the table write do not imply no state persisted; without a configured shard, handle_commit instead discards buffered writes and returns a best-effort completion.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10047-L10053",
+          "version": "repo-lines-v1:sha256:acc34b17ab5dfcaa6376404c0da8868039fe8d165e9d65e991dac12d5a223a56:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMTRmOWQ0NGNmNTJhMzg4OTVkNjAwYmYxZDhkYzJiMWM5ZTQ4ZmY2OTA4MjhlMDZiODIyNWY0Y2QzNGI5ZjkxYSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiODk4YWNkYzliNmQwYjdhMWY4MjJmNzQyMzI1YjdmNTNjZjM4Njc3NjQyODliODQyYTcwZTUxM2Q4MWEzMTUzMCIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiM2VkMTM2NWJiZWU1OGRiNmRlYTc4MGQ3ZGNkZTkwNDM0MTVhMDE4MGMwMDlkMjExMzMzODEzNWUyZjc5Y2JkMSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMmRhNjQ2MzhjZDc2MDkwOGU3YzhjN2Q0ZjM5N2JmMzBmZTIxZjc1ODkzMDJlMDczODdjZDFkNTdhOTRiNTM0MiJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10143-L10145",
+          "version": "repo-lines-v1:sha256:f66968312e26127644aded588259e77b7b8939a87d545609c0fc641f8e5be2a9:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNzE5OGRhY2FkOTQ0YzUxMGMwZjUzZmE2ZmUwMTgxY2FmNTJjZWQ5MWVhNWEyMjA1ZGJmZWQ0MWI0YmM1NjA3MSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNTNiM2M5YWVhNDA2MmQwNjIyODE3OTQ5ZTQyMGI4N2MyMDRjMzFkYTYyYmRlZTFmMTM1ZTcwMzA1ZDBhMTkxMCIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNWJlM2FlZTJlYjk1ZmYzNTNiMjM1OWJkMDkxOWRhYmI1NDMzNDc3NzJkOTgwZmQ5NDJlNjg4MmY5MzVlMmViYyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiOWYwNzRjMDk2YWMwYjI4ZDI0M2JlYjRkNDc2ZDJhNGFlNzhmYzBhNWNiY2U2N2VmNjc1NmMyYjVlMjE4NjllNSJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10238-L10280",
+          "version": "repo-lines-v1:sha256:3cc0eca1ed9f344075986312ddd465bc47dbe294611bd1bddfb61461d4c7128a:eyJzZWxlY3RlZExpbmVDb3VudCI6NDMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY5YzI5M2U0N2RmZmYyODFjODY0YjIxYjgyM2VmMDhhMTViZTRkNzQyMmYzMTRlNzNmNDVhZDIwOTM1MjlhYWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUzYjNjOWFlYTQwNjJkMDYyMjgxNzk0OWU0MjBiODdjMjA0YzMxZGE2MmJkZWUxZjEzNWU3MDMwNWQwYTE5MTAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQ0Y2VhOWMwMzdjNzQ5MWFmY2EwODY4MTMwZTQ0MzgwMzg3MDEyMTJjN2I0Zjc3ZGViN2E0MjE4YTZmN2Q3MWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjViZGFkYWMwYzFlM2M5ZjMxZmFkODI5ZjFhYWExNDRhZjIxZTU3NTA2Zjc2ODdlYWNlMTNjZmI4YTdhODg2YjcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_66ca5596a5f2449095c42de5256b4044",
+      "statement": "Local serving reads prefer ShardDb, resolve compiled sink output by catalog operator ID, and otherwise scan legacy prefixes; ordinary read_view_response does not acquire the local commit mutex.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7635-L7810",
+          "version": "repo-lines-v1:sha256:0e149a6744cfbf9c77d39067e88d36d6fb51f3d39cc13b9e15b8603e89855ebc:eyJzZWxlY3RlZExpbmVDb3VudCI6MTc2LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiIwMjY2M2UwMDkxYjRkNmY3MzRmNTBmZDZkNDBiMDgyMjI4ZDdjZDgzNTkxOGQzNzhlNTE4OThkZTJiOGI2MzU2IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJiZTQwMDNjZDhmN2Q1OWU3MjYwMWY4NmIyMWQzZTkxZDc4NGNmMDc4OTFkN2M2ZTM1Y2NjNDc3YzczODU5ZDdkIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI0YzRiY2UzNjQzMjJhOTg2OTdjYjg1N2MxOTFmMzA0ZTk1ODBmOGQ2OTUyNGM3ZTA4OWNkOTAyZTRhOTY0OGUyIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiIzMGNlZDczYTM1MjRjZGQwY2FhNTg5NWJjMjZjMThhY2IwZGVjMjZlODViZjYyNmMyYzBlNWZiYjhiNDUzZjc3In0"
+        }
+      ]
+    },
+    {
+      "id": "claim_6694a59ca52047e1bd63b6cb779ce136",
+      "statement": "Read-only serving uses the injected ViewReader; HotOnlyViewReader resolves compiled view directory entries and materializes weighted sink output, falls back to legacy prefixes, and carries a frontier label from reader opening; distributed-data-plane view reads instead merge workload snapshots.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7693-L7742",
+          "version": "repo-lines-v1:sha256:524b65432c4d66960e2f44e386b04d75075e06de8ba984340be0158ca6abab94:eyJzZWxlY3RlZExpbmVDb3VudCI6NTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ2ZDFhYjc0YTU2YjhhYTc2NzkxYTUxM2VlNGEzMjNlZTBlYmJiOThhOTkyYTQ1YTEzMmM5MmI0MDUxOWU2OTEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIwZjZhNjFlYzQyZDE3NTJkODY2ZWEyZjJmYmRmZWQwZWFjMjg0YzFjYWJmMDQ5ZDhlZGU4ODIzMTI0ZTYwMmQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI5MGFkNTVkMDFkNDhlNzc3ZGM2MGY1YTEzNjY2ZjJjMmI1NjU5MmZmMzIwYjEwZGVlMDA3YzU4MDE4ZjRmMTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjU2MzU3YmZiMDQ3MWU1ZTllMzczMDY3Nzc0YWU0MTVlMjE4YmE2ZWJlNWYyNzVkMzZmY2RkNjI0M2QxNjEyZGMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7802-L7810",
+          "version": "repo-lines-v1:sha256:a0098e589cb0501ad71b34a6b5c6e017e8cb005bc90642105b40954b0e93328f:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiODY5ODI1MTc5MjRmZThkM2UxNTY2NzExNWIxZjVhMjAxOGUwZDU1Y2U1YTAwMWIxZTJkNWUzMWI4YjI0MTIyYiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiYmU0MDAzY2Q4ZjdkNTllNzI2MDFmODZiMjFkM2U5MWQ3ODRjZjA3ODkxZDdjNmUzNWNjYzQ3N2M3Mzg1OWQ3ZCIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiYTAwNDY4MmVkMjNkNjY4NjY1MDQwY2IzYjI0NWIwZGIzMTM4ZTNkN2RhNDZiOThiNDY4ZThlNjY2OGUyMTZmNiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMzBjZWQ3M2EzNTI0Y2RkMGNhYTU4OTViYzI2YzE4YWNiMGRlYzI2ZTg1YmY2MjZjMmMwZTVmYmI4YjQ1M2Y3NyJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/view_reader.rs#L123-L191",
+          "version": "repo-lines-v1:sha256:7620e5f13d57b15f39f165199523f228fbfdb7629e19743cf036b1ce2c7e5b58:eyJzZWxlY3RlZExpbmVDb3VudCI6NjksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIwYjQ2MjFmNTg3NzM5NjdkNWE4OGViNDk4YjRlYjU5ZDEzZTViNzQ5YzVkNzkyNWM1ZTcyNWFiZjQ1ZjNhNTYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjJjODFjMzVmMTM5YzNjMzQwYWVlNTA1ZmI4NjAxZWNiYTQyYmFiOGEzOTU5ZmQ5NjdiN2ZjZmVkMDhjNTkxZGUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjYzYWI1ZmNjMWJiYzZjMDAyODY3NjM3YzY1OTI3ODBkNGY4Y2E3ZDQ2NTE5MDg1ZTA1OTVhZGIwY2M1NzdkNWIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjVjZjVlM2I0MzM0ZDkxNzRlYTllYTc2NWFlMWEyMDkwMzIwMzFjNTE5YmFkNTE5NjExNjJmNGYwMzA3MTJkNmUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_58a4b82c68bb456296ff76e7fb71d47f",
+      "statement": "SELECT dispatch has distinct index, catalog, serving-view, relation query-time DataFusion, and literal DataFusion branches; relation query-time execution registers streaming tables over selected shard readers and collects SQL result batches.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L16278-L16321",
+          "version": "repo-lines-v1:sha256:5c0d4ce52aa6e8c6e50b75d5b9bd7e36c7e37c3be972d231d5cf1c9f1569b3b9:eyJzZWxlY3RlZExpbmVDb3VudCI6NDQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJiZTk2ZDkzM2Y4NmUzNmFhMTgzNzg4NTVlOGI0NTllOGUwNzExN2YwNTA0YWNlNzI0M2Y2YWMwZjAyZTc3YTMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjJkY2E4NmU0NDY1MjliZTMyNTdkMmIwMmU2Y2U1ZGM4OGYzYjY3MmE1ZjM4NjRkYmQ4YzRjMDFjMTYwMjJkZjMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImY3NmYxNjY1MGVhZDZjNTdjMjMwMWZlMmZiNDljNzQ1NDhmY2M4OTIxMGY0M2M1NDMzZmU3MTFjZjAxODQ1ZTQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjFjZTQzZDkxNTc3ZGEwOTJiMmYxNzg0MmIyMTQ5ZjIzMjZmMTZjMjc0YjcwMzhmMTU5MzIwYTBmYzRkMmVkZGEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7026-L7200",
+          "version": "repo-lines-v1:sha256:53ed24a75c4de2f18d46be76337fd0508ce26779a7070d6aead888ccaaefd6c4:eyJzZWxlY3RlZExpbmVDb3VudCI6MTc1LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiIzZmYxYjdmYmQ3YTAwZWNiZDYwZDkzOTY5ODZhZThlMzNmZmU1M2QwMzc0NzRkYTRlMWZhNTg3YjE5ZWY1NGNjIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI3NjFiODMyYzFkOGZhMzczMTQ2OTY2ZTA5YWViMDI1Y2VmNzY3MDdlOTFjNjg2MmI2YzM5NjMyNWRjNGU4NDc3IiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIxNzYxYmY0YmUxYjFmYzkzOTQxMmQ3YjY4YWNlZGZlMjYzYzFjYmMyMjIzMTIxMmRmMzkwOWM3MjI5Y2QxNmVjIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJlNjEyY2EzNTAzMmVkZjEwNjNiYjRhM2U4NTM3NjI2MTI3NmQ5ZDIxMGFiNGIzOWY1NDIyZGNlOWFiZjgxYzRhIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_a869e4d01fda4343a018fcac9ce8171d",
+      "statement": "Query-time topology selection prefers a refresh provider, then configured topology, then a known local shard; provider refresh reopens all readers and rejects unequal persisted frontiers or unavailable topology instead of returning a local partial result.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L1989-L2035",
+          "version": "repo-lines-v1:sha256:43e9a052a70b26683217a379bbc5dc620e9be8bb702af882bdc3776f04531ac2:eyJzZWxlY3RlZExpbmVDb3VudCI6NDcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI1NjZmMjA0NDY5NzE1MzNjMjQ5NGFiOTZhNTk3N2M0ZGFjZDY5YjVmMGVmMmVjZTM5ZWIyZGZlYjYxZWM1MjMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg4YjhkNGVlY2FmNGQ2NzA3NWRlZDRiMzZhNjA1ZDhiZTU4OTBjNWVlZjQ3M2MzNGMxOWI1NWQxNmMyM2UyYmYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7545-L7579",
+          "version": "repo-lines-v1:sha256:2130771d7a153c1a988da662556313121a84f09e9e9262c0b32ceb21cd86b0b7:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdkOTMzMGVjYTZlOTRlN2NmODQ5YWY1YTJmZTQ5ODRmYzJhMDVkNmY2MWJmOTcxZWYxZjY0ZDM5ZjA2OWIyMDgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg4YjhkNGVlY2FmNGQ2NzA3NWRlZDRiMzZhNjA1ZDhiZTU4OTBjNWVlZjQ3M2MzNGMxOWI1NWQxNmMyM2UyYmYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQ2NmMxZDQ2ZmQxMmM4NjYyZmYyODgyMzk4OTlkMmE1Zjk3OWNjNjg3YTUyYTY4Yzc4NDAzZTFjMDUyNWZkYmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ5OWU2OGYwZDcwM2VkYWM5MmVhMDU1ZTQ3Yjk4NTljZDgzYmFlMzc3MDdjNDg1MDBmNDQ3MTM5NmVjNzZmMzUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_586705c82b2d4bca97d6368ace55b91b",
+      "statement": "MultiShardReader is a separate legacy-prefix scatter/union helper whose frontier is supplied by its caller; scatter_read does not itself reopen historical readers or pin storage by epoch and checks merged size after materializing shard results.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/multi_shard_reader.rs#L187-L227",
+          "version": "repo-lines-v1:sha256:f8d9bb2beb50a64f385f3cc17834e4e97745e075c8aa71fee16a6540fa0f266f:eyJzZWxlY3RlZExpbmVDb3VudCI6NDEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI4MDVkYzIwYTI0Y2E2M2U0MDYyMTc3N2M3OWIzMTE5MDEzMjVlMjg2YzZhNzE0MmFmOTlhYTAwOTNlOTU1OWYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjEwNzRkYWFiZTE3ZDliNWVjZDg1NjUyZGIzZmM2MDExZDZlMDc4MjBmNzYxMDU0MjFmOTNiOWIzMGFlODI1NzIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjYwNjNjNGQxYWY4Y2Q4OWJiMGJkZDc2NTdmZmNiZjY4MDZhNjEwZDc5ZDZjOGQ0YzMwN2MyNDFkZjM5MDA1MjIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImU5MDQ5NjNkODViZTg5ODBiNjY5YWYzNDM2MjliMmE0NzRiMzA1OGRmYWQxMzM1YzI1NTA2MDNmMGYwMWUwOTEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/multi_shard_reader.rs#L235-L287",
+          "version": "repo-lines-v1:sha256:67b85d4796efa7473b791624fa5add3402e99c9133c69657c40426e9aa39bbd5:eyJzZWxlY3RlZExpbmVDb3VudCI6NTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdjMWE5ZTY2NjU2ZmYxNmMxNTlmM2Y1MmNlMmYxOGRiNTFjMGEzY2U0NTk2ODA3ZTYyOWJjZjg3ODE2YWVhZmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE3NzY5ZTBmNmVhYTE0OThhNGIzMDM5MjRkODAyODg0YTQ0ZTE0MDAwMDYzMzI0M2VhMjlhYjA5YjY5MjI1M2UiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjUxZDJmMzhkMjRhYmNlOTNkOTAxYjkyMjYxMjUxOTljM2UzZWI5OGI3NjNjOTk5OWYxZGMwZWIxMTA2MjEzMjkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjA3MjlmMmViNjc1ZGI3YjA0MDhjMGQxM2Q1ZTlhYWZmOGIzNjY1N2U4MjRkYzY4ZjY2MDE3ZjMyMWIyNDNhZjQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_c72c3a865d254394b4361682430446f4",
+      "statement": "Relation reads prioritize explicit AFTER or one-shot wait_for tokens over automatic committed-write freshness; automatic waiting defaults to enabled with a 5000 ms timeout, polls local last_epoch every 10 ms, and logs then proceeds on timeout rather than failing the query.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10318-L10321",
+          "version": "repo-lines-v1:sha256:5687e6cd7bab01c1677efae5802366840bbd82ec28bf150a1d502ada54aa01c0:eyJzZWxlY3RlZExpbmVDb3VudCI6NCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYmQyOTExODc4NTM3MThjYWI0MDlmMWZmYzNkNWJkZmM2NDJiNjg3MWZiOGJlNWVjYjM5MTIxNTk3MzE2ODcyYSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZTZiMDQ0OTE0Njk3MjJlODM2M2E5NGU0MDQ0NTM4ZTAxM2EyYTIxN2UzNmIxZTU2OGJhNjBhY2I3YjRjOGYyZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMDI3MTM0ZTllOTI4Y2Y3OTM2M2QyZTQ5NzY1YjI2YmE1OWUzMTE5Njk1MjFkZjM3N2JlM2I5MDU3MzgzZmE3OCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZDVlNThhMWE1NzBjZWM3MDdiZTQ3MTA5MmFkYzQ4ZWE3ZjU4YmM2YjkxMjdhY2ExMTgwNGVmOWJjMzAzMmJhZiJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5262-L5283",
+          "version": "repo-lines-v1:sha256:b39713f60e8b9e48350630bed556d38f79276150cb98ae0d2c67a2c8afbd2785:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImRiY2U4ZDJiOTVlM2VmMDMxYWQzZjAzOGQzM2FiMDAwNWIyOThjNTA3MWNhOWViYWQwOGRiMDMyNGJlNWM1NGUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQ2YmMwODcwM2U2ZTY5MWYzODFjNjYxOTkyZjI2YjIzNTdhYThiYWY1YzkwODAxZjQ0OWYzMjYwMjI5NjM0YTciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjIwNWVlMmI5ODZkMzhhNTRjMTQ2Nzk4OTg2MjM2M2E2OGQ5MmYxODIwMjMzMTNkOWY4NzZhYzJhMTg3MWVmNzAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L6987-L7022",
+          "version": "repo-lines-v1:sha256:fcd7c396112483e3b2bfbe2d4fdd7b9c6e3e90fcd8d8d905d8a4011209f1f6af:eyJzZWxlY3RlZExpbmVDb3VudCI6MzYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjNiZDJiYzhhZDUxNzZhNzE4Nzk5NjM2MTc2MDhiM2MyMGFhZTMyNTg5MzgwYmRmMDgzYzQ2NThlNzMyNjM1ZDEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhkYjMzOWMxN2Q0Y2M1NGU3MGM0ZmNmZWNiNjExYmI5ZTdkMzYzZjI1YjE4ZTA5MjNhMWQzMDZjYzk1OTI0ZTUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImE4NjhkNDdmMWJmNGY0ZmUxZWQ0N2Y5ZmE1OTZhZDI1NDhjNjkyMzdlYTA2MWQ4OWZlNzUyNWRjMmIyYThlZTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE3NjFiZjRiZTFiMWZjOTM5NDEyZDdiNjhhY2VkZmUyNjNjMWNiYzIyMjMxMjEyZGYzOTA5YzcyMjljZDE2ZWMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/session.rs#L183-L195",
+          "version": "repo-lines-v1:sha256:2ab2d8b76fd944949ca06d55b322e3ec7ca71a78af55e2deaee09585e6ccfeff:eyJzZWxlY3RlZExpbmVDb3VudCI6MTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAwMzdkODYyODc1OWMzODdhNjI5Y2VkOWQ3MTU4M2VhOWM2NjlkNzE4OWE0MDA3MTNlODExMTQ3Mzc4ZGEyZGEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImEyMTI2NmQyZjMwYjdkMjhmOTRlNmMzZGJmOTQwZjI5ZTdhMDVhOTQyNzFmMjU2MjJmNzY3YjhjZDI4ZmE4ZjgiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQ1MDgxYzJlOGFhZDQzY2JlMmQwNzJkZWYwNGI3YWViY2NkYjY4Yjc1MGM2MDdjNTAxMjQzZWJlMmIxMjRlZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImJhMTk0MTUzNTgxMDdkMjQ1NjA3YTNhOTFjM2NlNWI3NDIyMDVjNWY5YjhmNjk3ZGVjMTBmMzg2YWNhNjY0NDMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_b8d8ff64c15040eca607cf90cbb55d55",
+      "statement": "Local snapshot SUBSCRIBE reserves a drop-owned slot, holds the commit mutex while capturing epoch and bounded snapshot, releases it before streaming, emits snapshot rows before later deltas with mz_timestamp and mz_diff, and polls idle tails every 100 ms; distributed snapshot fencing remains separate.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5564-L5733",
+          "version": "repo-lines-v1:sha256:11bea4b247cc89d4b29c100846c7ba63fc9277203262e4c4c3c85795d7df3be6:eyJzZWxlY3RlZExpbmVDb3VudCI6MTcwLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI2NDFhYzc0N2Q1ZTg1NDIxMzIwNjllMzgyNGQwN2NkZTViYjU4NzEzMzFkZDExY2NjMWM3ZDg2MWNkNWViNTA2IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiIyNTViZGIwYTZjNjFhYzEyMDg4NjA2NmEwOTc3OWM5NjBhOWZiYzMyYjZjYjY3MjU3NjM1MzRjNzJkYjhkM2EyIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIzZWQxMzY1YmJlZTU4ZGI2ZGVhNzgwZDdkY2RlOTA0MzQxNWEwMTgwYzAwOWQyMTEzMzM4MTM1ZTJmNzljYmQxIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJkODhkOThkZTk3MTg1MTlkZjVjYTkyZjk4Y2JiZjIyYzkxYzJiNmFmOGVlZjgwMDRiYjc1MWYwMTRiOTVkZWM2In0"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/v072_durable_subscription_publication_tests.rs#L175-L269",
+          "version": "repo-lines-v1:sha256:ab10e725470bbbd876f58d5507b1b4f906fccba547bdd3473ea563119d1090b3:eyJzZWxlY3RlZExpbmVDb3VudCI6OTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZmN2FiZjk0ODc4MjA3ZDRhY2I0OTcyOGNmZTJlM2Q5YjAyYTNlZDJkYmQ2NWE2YWUwNWY3NzBkYTIzMTVkMDUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY0M2Y5NTg0ZDE3NGM3M2Q4NDljNzRkYWE1MjAzYmVkZjc4NjgwMmI4MWQwNzBlZmE0NDA2NDUzYmQ2MzVhYTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjVjZmFlZTc1NzJjMGU3NmI2ZmQ2MjgwZTU3MWU0Y2M2ZmUyNmFiNjIxYzc5MmQ3NDMyYWFhMTM4NTczMTk5MmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjIyNTJjMjAwYjYwZDcwNjJlOTI1NWRjNTA1NGRmZTg1ZjVlOGNhNzRjMjhmZTU4MWVlNjcxZDI3ZTczMTczNWYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_02f3e11224ba477896f67520580abbc7",
+      "statement": "AS OF EPOCH replay is inclusive and validates retained history; the replay registry is bounded in-memory state, fails closed for unobserved or lost history, and is not durable replay across gateway restart.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/change_log.rs#L1-L11",
+          "version": "repo-lines-v1:sha256:f15234099aca6fc8c0fda86698c7bc41d45c2bc43413380c5eeb4a51f634e13d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU5N2NiYjcyN2ZiYWQ4MGVjODczYjg1ZTgxYjljODc2ZDFlMGM0NThkZjFmNWFlMTgxN2JmNWJkMjgwNWM3OGYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImExOGZiMmNhMjUwYzdjZDFlYjAwOWU4YmI0ZWY3YTJmZTRhMTgyNTQ0ZDc3ZDZlN2RlZjQ3YzZhNmVjNWE3MzEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjdiNTI3ZTk3MGYyODA1ZWE5ZTgzYTQ5MzBkYzNlNzhmOTRlZmNiOTFmOGRmZDhmYzExNTNkNmFlZmVhY2ZlYTkifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/subscribe_handler.rs#L168-L190",
+          "version": "repo-lines-v1:sha256:3829eb3b8cf23a28eb1652d329a7014cf14ffd2f24e1e34416f16e2d3706aead:eyJzZWxlY3RlZExpbmVDb3VudCI6MjMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdlNDRlNzRlODVlYmU1NjAyMzQ2YzYxNjlhZTQzOWI0ZjM3YjcwMmZlZTI0MGU3MTQ2YjY5ZDIxOTQ0ZThmM2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxYmE0NzE5YzgwYjZmZTkxMWIwOTFhN2MwNTEyNGI2NGVlZWNlOTY0ZTA5YzA1OGVmOGY5ODA1ZGFjYTU0NmIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImZmMTUwOWNiZDUyOGM4NzU5NzZkOTViZjAwNmI4NzY4Nzc4NmE4OTI0MzZkN2U3YWJlMzlkMDFhMjhhMGQ0NzgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjY3N2Q4MjlhZmYzMjc4MmM1MDk0YjYyYjBjNTMxYWI1MmU1MmIyMWQ3NTc4ZTllZjBkMzE3MjkyZDc2ODdlZDMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/subscribe_handler.rs#L446-L470",
+          "version": "repo-lines-v1:sha256:a751e33cc79fa7520ab2f520f0a5c84164823e175a22611c811b4b84c509c8e3:eyJzZWxlY3RlZExpbmVDb3VudCI6MjUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjEwYzY4NmQ3N2QyYWQzZDlmODg5M2MwMjQ5NDUwMGNiMjVkOGUwYTBiMDZkMGI5MGIyMWY4NjQzNGFmNzFjZGIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg4MzEyMzNkMjhkOTUzNWQ3YjM3NjFkMjFhM2U5YWU0M2Q4MTYwZmQ1MTAzNWExNTM3ZDAxODJlODY4OGY4OWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjY3N2JkM2Y2YjQ1Y2U0ZjVlZWM2ZTI4MjAyM2IzY2M1ODRjYjdmOTlmMzQyZWFjZjllYWVmZTQ3OWViNmJhZTYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_cb2f1f00909b4e04aa23b92c932faa5a",
+      "statement": "Subscription logs enforce whole monotone epochs and whole-epoch eviction; an oversized epoch clears replay and advances its floor, while active subscribers losing their next position fail as too slow instead of silently skipping changes.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/change_log.rs#L94-L160",
+          "version": "repo-lines-v1:sha256:651fd1ce3b98f10715f55957e18f3287a7f5c63453edc9520f3f60d69e28dfb8:eyJzZWxlY3RlZExpbmVDb3VudCI6NjcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ0MDcyOWNmMmFmMDhkZDdhMGY5MDg3YWM3YzJiYjRhMjI2YTlhOGM4NzczYzA2YWMyOWRjY2NmNTk4ODE1MmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwNzFjNmU5MjJkNjRlM2MyZDEyZDFiNDAwODRjMzFjYzRlNzgwN2ZiNDJlN2Y3MjI5Y2M4ODYwNWU3ZmM4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijg0ZmJiYzU1MTE5Y2E5ZDgwOTE0ZDgzMWQwNDAzZWZlZDU2MzBhYjUyOWEyNjE2MTUwMGQ4ZmVlZDQyMGMwM2UiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjllMDE4YjgxNTZmYzJjYTQ1YjRkMjJmMGNiZjdiODdkYjNlZjY4NzYwYWQzY2MyZDIyYjJjM2VkODE0Mzg5M2UifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/subscribe_handler.rs#L374-L443",
+          "version": "repo-lines-v1:sha256:9b4fdf714dce3543cd4b8cf66ec1db0372efb57044048bfabf734795a0f9e822:eyJzZWxlY3RlZExpbmVDb3VudCI6NzAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjljZDc2MjQyOTIwNTQ2OGEyNGU5NzY4YWI4YjU4ZTlkY2NjZWYxNzI4OTA4YWYzODkyN2Q1ZWFjYWU5OTk1MzAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQyNDcwYWM2MWNjZDQ1NzEzNGZmM2U4N2U4MWZjYmU5YTBlNjZjOTAwYjkwMTYyNGE1MzBiMGQxNjA4NDE1MWQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5YjIxZWRiOGI5ZjRkYTA3ZGQ1NjI2MTMwMWQxYzNlZjBkMDhiNjQzOGY2ZmYzNmEzZWVhN2M0M2NkYzA3NTYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_31f3d52fb1c04ea1978d9aec00bec380",
+      "statement": "Subscriptions have bounds of 16 active streams, 10000 snapshot rows, default 10000 retained entries, 16 MiB retained payload per relation, and 8 MiB per epoch, with drop-owned stream permits.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/change_log.rs#L19-L24",
+          "version": "repo-lines-v1:sha256:1494e9b53958b4be70b0a39055e3fa1f677a7679cff2888a09e58b4f84c4eb11:eyJzZWxlY3RlZExpbmVDb3VudCI6NiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiOWI0MGE0YWU2ZDQwYTliMzIzMWM4NjA3YTZmOTFiNjUzYmQ1OTA1MjMwZTUwMTI2NjZiMWYxNDA3NmM5NzNjYyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZjUzMWJjNDhiM2FhZTAzZmY1N2U1ODE1YjcwZDgyNmZmOWZiNTc5OWE1NWFjNWNkNDZkNzU2NjVmZWMxMTc1NiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiODk2NmM0MTRiZjRjY2JlYjM2YzdkYzg2Mjk5M2QyNDcxYjg4YTdiZGZmNzVmOWMzNTg1OTJiNzAyNjZiZWE3ZSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNjhjYzIzOWM4NDAxNDdkOGE2ZjdhMWNmYWY5ZmU1M2E2YTZhNjA2ZWQyNDYzNzcyNzQ2Y2E0NTJmM2QwNGQ4NSJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/subscribe_handler.rs#L29-L128",
+          "version": "repo-lines-v1:sha256:562ac695926ec9c76efddca517755ce5057dcf28424df2e511b55899a405ca77:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAwLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI4OGU3ZWEyZDA4MTA0NjJiZGE1MjY2YjZjMmU3OGY1NzQ5ZGRlODdkZGQ1MjI5MWRkMDkyZjg3YzU1NDVmMzdjIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI2ZTNhMDcyYzQzYWZiYWU5OGE2ODRlMjBlM2VmNTBlZmYzOWQ4MDM5MTFkZDc5YjQ0N2QwODM2YWM1YTgwYWJkIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIzYzQwYjg4NjRmODJiOWE5YTE5NjM0Yjk2Y2VmMjk3NjNjN2IwN2UxODZiMjA4MmUzOTI3MTdhYjI5NmQ5YjU5IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI0MjE3OTljOTY2NmU1ZjY2MjZiYzA1NjQ0N2Q0NDhiYjgyY2Q5YTBiZGUzZDNmZjZkODNhM2MxMDM2YWEwZDM2In0"
+        }
+      ]
+    },
+    {
+      "id": "claim_b11b7ab6ff734102b65145523cf5d7b9",
+      "statement": "Query-time scatter tracks cumulative row and byte budgets with in-flight metrics; COPY OUT guards output before frames and imposes a producer-read deadline without claiming complete producer admission.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L16324-L16381",
+          "version": "repo-lines-v1:sha256:eed81d53211269a1cdc108626abfe86c6447759ee4ba8bc4e0d0ba8ddde4f980:eyJzZWxlY3RlZExpbmVDb3VudCI6NTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkxMWMxNmI2NDRhYjYzZTI0NTNlOTNkMDZlNTFhMTI3ZmQ5ZjQ0ODgxZDVmZDlhNjAyMjlhYWYxY2M1Y2I4YWIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjNmYTI5Y2VkNzM1MmI5NDgxMWRiMzE1NTNhNjAyYTEwODdjZjNkMmFiYWMzMGU4NzJjM2ViZDhkZWJhZTRmOGIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5155-L5194",
+          "version": "repo-lines-v1:sha256:574bf7df3d75dfab66d01b7c38079c342747ae0de9cb161a2de8e7777e132d92:eyJzZWxlY3RlZExpbmVDb3VudCI6NDAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI3YWRmYzQwNDI0Mzc4YjQ0YWUzNzQyNTJkMzY5NmVlMWE2ODk0YmE1NGViMmNlNzIxMzYxOTJjNjM4YTZiNmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjNjQ3OWNjMjMwNDQwZmQ0MWU4MjI0MjE4Njc5Njk4NTU5ZDI4OTNiZDY3YjQzODBhZmFiODExYjM4YTU1YWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhiZWY4MzUzMWE5NDZjOTVlYWE5YWQ3NTMyZGE3OGVmOTljMmY4NzJiNzQ5ZDFkMTk5OTk5ZjdjMGUzZmNmZTIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImViMTgyMjExYmViOWIxZjNlNGQ3ZmZkN2Q3OTBlMzRjMGRkMmJjM2U1YmUzMjIxODQyZDkwMjQ0YjQ4NTQ3YzIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_dc1b5ad5fbc04e0bb0957fc8609fb97f",
+      "statement": "View capacity admission can pause lower-priority workloads or reject capacity requests, while backfill admission uses an independent reservation lane that does not pause running views; these are separate from ordinary SELECT scheduling.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/admission.rs#L1-L15",
+          "version": "repo-lines-v1:sha256:6d93ac842c08e113b37779436fa9901011be0ebe0534a77f3ed208aa6c9fb4aa:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI4MTM4MDQ0MWRmMzE5YTk3YzBhM2Y3YzhlYTFjZDVjZThlYzM5ZWE0Y2EzZDIyMWZkYzgxY2E3ODgyYTdjNTAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImRmMGY0NzEyNDQzNmNjNTc1OGZlYjA5ZWMxNDI2YzU2YTExNjYxODQyZDk0MmQ3NTY2N2JmYTEwYWJiZTQ5M2EiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZkNDQxYTQxYzU5MGQ4MmZmNzk0YmJlNTZhMDViMjc1MzhmMTE3ZmE2ZjcyZmYwNDdhYTMyMmQ5ODI1OTViMTUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/admission.rs#L121-L159",
+          "version": "repo-lines-v1:sha256:74f382548dae372f5ea9c1049531df4c3f744e4a6c78167a77aec544616df3c7:eyJzZWxlY3RlZExpbmVDb3VudCI6MzksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFhMGJlNjk0NmQ3OGJlYmRjNTZjZWYyNGJhZGRlZmIxYTY3NDZhOTljYWRlZWU0NzZiNjc4OTkyZGY4ZmY5NzgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNkNTljZDMzY2Q1ZTM0Mzk3NjVkNmVkOTgwYTVjNjg1NmYxMDBkN2UxOTE1ZjcwYTFkZTdmOGM0NDcwMmI2ZmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNhYTQ4ZjA5ZjljODViM2UxODZmMWNiNzZiZDEyYzg0NDIxZDg2OGRmNWMxMjJiOWIwODQwY2MxNzE2ZWYyYmQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_0ee816464a6e499d962f6263125e1f4a",
+      "statement": "CancelRequest matches backend PID and secret on a separate connection and signals a token; inspected serving-read and query-time DataFusion branches race that token and return 57014, but handle_commit has no equivalent cancellation race.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L10030-L10328",
+          "version": "repo-lines-v1:sha256:ddbd2579762cf1db45c47b17b63de85076c2c76e6eaf275963140c24418515df:eyJzZWxlY3RlZExpbmVDb3VudCI6Mjk5LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiJiMzkwYzdmYTg1Y2M0ZjYxM2JmMDI3ODgxYjMzMzlhMDI2NWNmNThiNWZlNTlmMTc5YzdhYjUzNzNhYmNiMmJiIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiIzMDU1Y2JiNzM0N2VhZGUxYmM1YTQzZmY5YzkwMzljMWI1NjcwZjFmMDBlYmM0ZmFjNGU1NWMyMTQ4YjZkYWQ5IiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI5OTliZGVmZWVhY2E2MzQwZTAyOTBkYzg2ZTg4OWM4OWQ1ZTE4OWFhNWJhNDRiNTg1YjNiNzA3MzRmNGE2MmQ4IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI2NTIyMmM0NjdmMmVmODRkYmQyN2Q2NzkyMmM5MmUzNmI4MTU3YTIxMmVmYzI0ODNmNGE3OThkMTlmMTA0ZGE2In0"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L13958-L13980",
+          "version": "repo-lines-v1:sha256:536b36567eb0299e5466c8026a4c22b5cb729a09bb1fcf15bb826c398dd96ab1:eyJzZWxlY3RlZExpbmVDb3VudCI6MjMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVjY2EyZWU4ZTE4ZWQzNGE4ZDk5NzE3ZWRlOWQ2YTViY2Q5ODVmZGYzYzAzMDg2ZjY1MzQ3MjgzMDcwMzAzOWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI1YWIwMzZkNDZjMzk2NjRmZTc2N2M3OTJlYmE4MmZmYWMyMDk2NTFlMzVlZDdlZmNiNTFhNTRjODdmZDVkZjciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQwYTg4OTI0ODFhZjQ5MTRmZTYwMTMwN2YyMWQ5MmFiOWViMWUwMDQ3YzZkZjlkM2MzMmY4Y2Y3N2JiOTNiOWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImZhZTgzZWQzYmQ4M2FjYmEyMTI4ZWZmOWE4ZDIxOWEwOTNkMTUyYmE2ZWZlMTdmNjIyZTYxMTUxYjMyNzgyNjQifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7112-L7168",
+          "version": "repo-lines-v1:sha256:49f6616ccbfd7b341701395fb539962b0e30f2f1d35f9e7eee41a3d63bcd75df:eyJzZWxlY3RlZExpbmVDb3VudCI6NTcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFmYzkwNjU3YzE0ZWUyNDA0MDhjMmY4NzdlNTQzMjEwMzNjMmYwYzg2MDJmZGE3NjA3NzU1NDA2NDY3MGVhMDciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ3NDZmM2QwMmJlYmI2NDE4NThmNDcwY2ZkMmFhM2Q3Njc0MzNhMThmYmFkZmNiYzM0MWM1YTYwYTc0ODczNTkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImZhZTgzZWQzYmQ4M2FjYmEyMTI4ZWZmOWE4ZDIxOWEwOTNkMTUyYmE2ZWZlMTdmNjIyZTYxMTUxYjMyNzgyNjQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjdkZWQ1N2NkZjYyOGU3YmNmYjdkNzY2MzJhOGQ3MTQ4NzM0YzA0MWJjNjUwMjBkZDg5NmJlZjE4OGE3YTIyMTQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_774ba718127d44d39d42c72ff59e8cd7",
+      "statement": "Connection teardown removes prepared statements, portal tracking and cached rows, sessions, write buffers, and COPY state, including socket termination paths.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L14085-L14096",
+          "version": "repo-lines-v1:sha256:b847e050ee476ee20bc81680a344e63d253af2d56fda65a37aab136b8448fe4d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImZkOGU3YTUwOGI5YzIzNjY4ZTEyODkxOGY5MmM1MDAwMjc2OGJhMzZiNDQ3YzQyZjQ3OWU2NDNkODkyNjQ0NTMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNkY2JhZjQ5MTQ0MTcxYzBjNTc0YTYyY2I1ODZhNTdhZGYxYTRhZGQxZjU2YzNiMTUyMTViNjA5NzZjZWQzMDIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjViYmE0MTdmMzUwYTFlZDRhMjJmNTU3MmMyMzE5ODAyYTNlOTlkZDI5MzkzNWM4OGIwN2E5YzBlNWY3YjQxMjIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImIwYjg1NmM0NTg2ODcyMDViNWVjZjk5ZmFhMTU4YTIzMzc1NTk5MGIxZDZiYjZhMWZlYjhmMmU2MDY3NGIwZmIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L14301-L14312",
+          "version": "repo-lines-v1:sha256:20d3fbeb92cfa04d6290a89cc3519ffc6bc123825e9cf8f7d6c6c36bfb1f7a40:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgwNzUxYTJkMzMwNDczZTk0ZjBhZTU3ODhmM2M5NGQzZDYxYzRmOTlhOGI1NmJlNTQ1MzhkODY3NGMzMjhhNWMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijg0NTVjZGQ0MjAwYjYwMjA4YjljNThiYmU0YmY2ZmI5ODI5ZTZlYTE0YjE1NzM0YjZiMTMyMjY1ODFkODM4YjQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjVhZWYzOWZiZDA3YTQ1ZDA0ZWE5MDJlZmIzYzU5ODAwNDMxYTYxYWMyMWJiOTIxN2VlODllYzQ2MWQ3NzUyZGQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_2b2bdf5c6c304b81a3280b73b842743b",
+      "statement": "Focused DML tests cover expression failure atomicity, primary-key update propagation, rollback, and atomic commit epochs, while durable-publication regressions cover exact rows, ordered concurrent publication, and local snapshot fencing but explicitly leave process-destruction durability to release qualification.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/dml_atomicity_and_view_tests.rs",
+          "version": "repo-file-v1:sha256:f30f60233d8f0e768044d1513f16d406742a99a0b7e686c599aedd7e40bdb597"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/v072_durable_subscription_publication_tests.rs",
+          "version": "repo-file-v1:sha256:93e0980c8befece3c8df8eb6c0f8014b315ba6a197137266b59a8c1418a19c06"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.7.2",
+    "at": "2026-10-21T16:22:36.376Z"
+  }
+}

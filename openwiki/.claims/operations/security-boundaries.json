@@ -1,0 +1,502 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:e9b7bbcc97448a723d9386fe601c7776777e4c157a48a6058b9b9695deb5b84a",
+  "claims": [
+    {
+      "id": "claim_3db37f17ee41457c84242718e8cdbaca",
+      "statement": "Gateway TLS is independent of internal TLS: with_tls builds an acceptor requiring client certificates when a CA is supplied, while mTLS startup uses a verified certificate CN and refuses missing CN rather than trusting a startup cn parameter.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L12217-L12238",
+          "version": "repo-lines-v1:sha256:7435082e37c34e964bbf30246909551e9bb4e42733c21c59bd4c52c10169eaeb:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhlZTI2MGZlYjVjMDY4YTFmYWM0YjYzNjYyNWM2YmNmZGQ3MTBiYzkyZGUwN2FiNjYzMzBkZmIxNTNiMGEzYTEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhkYjMzOWMxN2Q0Y2M1NGU3MGM0ZmNmZWNiNjExYmI5ZTdkMzYzZjI1YjE4ZTA5MjNhMWQzMDZjYzk1OTI0ZTUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUyN2QxYTUxOGQ4YjI2MDI2YWFmOTQ0MjQyOWZhOTQ4ZGQ1YmVkY2Y3MzljYjgwYThmMjFhYWFiNzI1MzY2MTIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjEwY2I4ZTc3MTFjOWIyM2RlNjgyOTc3ODMwMjc3MjU1MGRmMTc1MTdkYTE1NjI1ZWU0MjAwNjVkNzdiM2NmOGIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L13817-L13851",
+          "version": "repo-lines-v1:sha256:4b72c239580fac1332b75f4fcbeea50986ce54b2e9ff75ff0e14ab43b895dde5:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVmZjE5ZTg3MzE3NjEyZGUyMDNkZDU1MWZjODEwNjJkMThjMzQxMDkyODk0MWE4MzQ5OTE2ZWZlZDhmNmRmYzUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImZiNDgyZjNkODg3YjUyNDE0NTU0N2VlN2VlNmIyOGFkODhlYzFkOTFkZjFmNWJhMjBjM2M5YzVhNWFlMzUzZTAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImMyZmUzYjJhZThjMmY1NWJhNDRiYWEwNzZlYjUzZTE0NjYxOWY3ZTg1ZWIyMjc3MTE3NGNiMTY0M2YzNWFhMTAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/tls.rs#L86-L131",
+          "version": "repo-lines-v1:sha256:964248511510d897f256a6a3d13e964fd3885bd4b0143b4a3872665b63599d7d:eyJzZWxlY3RlZExpbmVDb3VudCI6NDYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYwOTNmYjBjY2NmYThjNTVlNDk2NzJmNDMzNzg2ZDg2ZDVjZTU0OTZiYWQwOTZiMDk3M2Y5MTI5MTU5YWUxYzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjNmNDJjZjhjYTc0MDc0N2IwZWE2ODM5YzMyNzFlMTcxMmVjNmI3ZDVlMDY3MjNjNDJhY2E5ZDRjODJlMDFmNGUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImU0MGUzODdiNTViOWU5Yzg1YTMxNWZkZTdlZDZlMzI5ODQzNjhlMmFmYTczZTRmNTY5MzJiNTRiY2ZjMDEwYmYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImFkY2YxY2Y0NzAwMjc4YzBmMjk3M2VlNTk4NmJiM2E1ZGVkMjQxOTllNzk2NzdjODU5MGRiMDkyZGViMTAzYjgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_c4c62befcb904cd9b0f49f343a5f4613",
+      "statement": "The control TCP protocol uses TLS and extracted NodeIdentity only when an acceptor is configured; otherwise it handles plaintext with no peer identity, and verified registration requires Worker role and a matching worker ID or address.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L2748-L2813",
+          "version": "repo-lines-v1:sha256:6a2b73c8d5b8c3c797b5da3a6b888483101d719d802d93cdf5d83394a3aa11e7:eyJzZWxlY3RlZExpbmVDb3VudCI6NjYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI3Nzk0Y2IxMWRjN2UxZGFhM2NlZGQzMWYxNWU2OGUwYmZiZDQzNDg5Njk2NWNmZWViZDM1MmE4Nzk0ZGEzZWYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc0MDlkZDRlM2FiZDAxZGRhM2M3MmQ2Mzg4ZjlmYTMwZWQwZTcyZjhhMTRiMjcyMzY3YWZiMTBhYzMxYjZlMDIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L2880-L2919",
+          "version": "repo-lines-v1:sha256:d29461af9f47a5c3a508b619142144909b165bcfa4cdfceb0991e0750820ab87:eyJzZWxlY3RlZExpbmVDb3VudCI6NDAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFkMDUwNTllYzQ0ZTY5NmYwZjUwMjVjYzdjYWNmOWU4YmU4Njk5ODlmMjk2NjA2ZTYwMjNjZmM3MTA0ZGE2OGQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI1Nzg1MjRlZGE4N2JlMzZiNmI2ZjM3M2Q1ODc3NjgyZTljYWI2NTdhYzBjMTcxMGFlOTgzMjQ3MTFlYzcxNzgiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQwZDQ4MjdlZmVkMTMwZTNhNjdjMzZlNzYwMGRhMjgwMGRmN2M0MGZlODgxM2M2MTViMmJkMWVlNDRjMGFkMmUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjU2ZGUxOGZjY2M4NDE3OTk5MzQ5NzU2MjMzY2FiZDY0OWJjZTdjNmI1YmYwNDM3N2EyYTI3MjE2MmQ2Mzk3OGQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_9f4c94794a594353a6d57be37c74cc6a",
+      "statement": "Shuffle service startup conditionally enables internal TLS and client CA authentication, but does not extract NodeIdentity or bind a worker request identity to its certificate in that service.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-runtime/src/exchange/service.rs",
+          "version": "repo-file-v1:sha256:ad74be5b3c1015e2daa718f72eaf5d3a3b9aff21fd9163cf9fa3bc087779ad54"
+        }
+      ]
+    },
+    {
+      "id": "claim_4ec40e0b3bdc4e30805848a30b245508",
+      "statement": "ManagementService starts a plaintext tonic server without TLS or an authentication interceptor; its administrative handlers do not resolve principals or check AclStore, and DrainWorker can schedule work after version, argument, admission, and operation-store checks.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/management.rs#L147-L169",
+          "version": "repo-lines-v1:sha256:d71419789636aec3f8c6c165ba5ba8f107a62b1ffafe10ebb96bb84b9299bf0f:eyJzZWxlY3RlZExpbmVDb3VudCI6MjMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJiMDg4NTMzY2VjYjU3OWE5MDFhNDk4NGY4ZGUxYzgzOGQ3MzVkMjg5ZjUxZWIzYzdiN2ZkOWIyN2Y4ZWIyMWQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU5YzEzNTkwNjY1NjMyM2QxYzVlYTQxNjU0ZWU2NmFmYjU4NWFjZGNmYWVhY2ExMjFkNWUzMGJmMTkzZWVkZDciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImZhNDM5MzQ5ODAyMzAzYzM5MTE1OTUyNWIzMzM2YTI4YjU4YjlhYzc4NjQ3ODAwYjExY2RiMmMxOGNkMjY0YjIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjFhMDNmMGFhMjNjMmEyNmZiMzZlZGVlMjZiN2U1YzUyZGZkZDFkM2UyNWQwODY1YjI5NGY0ZThhNWUzNmM5YjcifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/management.rs#L690-L729",
+          "version": "repo-lines-v1:sha256:c024272a77a8a0b227f11d09fde5a35a0273f42ffe700648ef7b34440622efe5:eyJzZWxlY3RlZExpbmVDb3VudCI6NDAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNlNzY0MWZhMDhkNDA2ZDM5ODY2YzdkYmQxZTkzNTc5MTAyNzE1ZmQ0OTYyZGE4ZWQxMTUyMDFiZDJkZjFkYjAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImUxNmQ4MTdhNjk4ZWY5ZTg5YmFiN2FlMDk5ZTBmOTRlNmIzYWVjZDc4MzQ1MThmYWI2NmRlYTAxYTFhMjhiNmQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhhZjEzYmFmZTU4MjJjZjIwYTE3MWY4YzRlOGFiNDg3MWVhZWViYjkzYmU2NWEwZmVjYjAzZDExY2MwOTIyMzMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZkYTlkMTZjNWJkNjhkYmUzMmMxYzkyZGMzZGFjYTI3NWMyYTI2YTg3NmVhYzk5Y2RkNTYxMDZlMTcwNDdjODAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_045abb240a8f435ca6c055a409111596",
+      "statement": "The CLI management client defaults unqualified addresses to HTTP and connects without configuring identity credentials; runtime DataPlaneClient strips HTTP/HTTPS prefixes and uses a raw TCP connection.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/transport.rs#L191-L210",
+          "version": "repo-lines-v1:sha256:1af0f98dc366b08a113e59573b00773f0e6c447072f78e37e997a03692bbb590:eyJzZWxlY3RlZExpbmVDb3VudCI6MjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIxODA3OTk3NjI0ZTNiNDM4MjYwZGU3NWYyNWI0NzhjOTQ4ZmM2ZDczNzFiYWRhNTliN2UyOTRjNDQ5YzJkMGMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFiMzk2ZDYxNDdiMTYyMDg0YWRiM2QyZjk0MjU1NjM0MDQ5YzY5MTk5NTkwOTBlYmEwZGFjMjYxOTg3MmZmM2UiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjkxYTE4YjY1Zjc3MDRiZTBlMmUzMDMzZTJhMDhlYWE4MDI3MmUzMzJmZDkxN2NlYWU3MGNmOTYzOTg3NTYzZmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUwYzZmMjJmZGUwYjMzNGEyYjVlYTlkN2Y0ZGM0NzZjOGQyNWE5YjFjYThjNTVkZTMyMzEzZTVjYTRhMWI3NmYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/data_plane.rs#L24-L43",
+          "version": "repo-lines-v1:sha256:74669840ae8fe79a59212f5c9d69bd9b0aa68a3ee0a0396ed34e3d4152b8ab71:eyJzZWxlY3RlZExpbmVDb3VudCI6MjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM3YTY5ZGQ2OWEwODYxNWFjZjM4YmRlYWM1MjljYjVhOWFiYzk2MzIzYmEyODgyMmVkNTRlNzc3ZjYyYjExYWUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAyYjYxZThiODdmM2Y1NjIyZWJlMjEyYTRlYWM5NGFjMGM5YmM4NjBkYzc4MDVhOGIxZTcxNGEzZGFlOTdmMzIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM3OTVhMTIwYmIyMmNhNDMxMTE1NWUzY2FlNGM2YTIxYWJhYTI1MTA2Nzg3ODkzMzAyZmU1YjE4NDQxODM1NTQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_4ecd5ef48b784c82886006e9973ee225",
+      "statement": "The Raft peer listener accepts raw TcpStreams and passes them directly to peer connection handling rather than the control worker TLS acceptor.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/raft.rs#L435-L475",
+          "version": "repo-lines-v1:sha256:81c289263d855dbf262f5d2edc000d456303788e19588d4ffc20422a2819ffbc:eyJzZWxlY3RlZExpbmVDb3VudCI6NDEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM1YmZiMDliZjY0ZDU3NDI5N2E4ODlhYTM2YjAxZDZkNTcxYzA3Y2ZiMjkyNmRkYzlhMTUwOWEwNDI3ZThlYmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYyODNkMGI4OTM4ZTZlZjkwNTIxNmJlNTk5MjI2ZDk5ZmQyZTJkMGQwZTkxMTdkZTRlMzU0OTNhODZkMTkwMmIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImNkNDA5MDJlN2YwODY3OWMxMWZhNjY1NDViMzc2NmRjYTUzM2VkMDNkNDkyZTUzN2RhMjExMTVhNmJiYTNkMWIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjMzNmJlNjJmYTkwZDk1YmI0ZDJkYzZmOGU0Y2QzNTc2NDNjMTBkMzU2OTkyZjVhYjJkYWEyNjYxMGE5MDdiYTEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_bfa6d863d1664ff0bbeea1f9eaae3162",
+      "statement": "NodeIdentity supports canonical role/node identity encodings and compatibility forms, including fallback of otherwise unrecognized bare CNs to the CLI role; parsing alone is not administrative authorization.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-types/src/identity.rs#L90-L179",
+          "version": "repo-lines-v1:sha256:2706af697a89055af01c63623f5b053e3e20cf8aaffed5b94a24bb69f75713f3:eyJzZWxlY3RlZExpbmVDb3VudCI6OTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMzZGRkNjFkNTVkNmE3YWRhYzg4NzMwZWYwZWI5ZGY2MmZkMWI1ODhhZDFiYTI1NTJkYzFlMTQzMDMyMmUxOTIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY5YjE5ODJlOGRkNzQ4MTE4MTQ2YjM5YTJkMDA2MmY0MDgxZTM0Nzc5Yjg2NzVjMjM0YzRmYjEyNGRjMzkzOTAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhjODM5ZmE4MjQ5YmYzZDNhZTFhODA3MzUyZDU4NTNjOTU0NzFhNzM4MDlkNDM2NDIyZTJiODE4MDhiMzBjZjciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImFiOWNjMjk4NzFjYzE3OGI0NDhiZTQ5YzQ1MGU4N2ZmOTM4NjVlMTNkNTA5NjAzZTE2ODYwYzI5MTI2NDk2OGUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_3263c925fe224ead8fd68da27e233c09",
+      "statement": "Control TLS requires certificate/key paths and a CA when client authentication is required; TlsCertificateReloader rebuilds and swaps acceptors with additional CA roots for overlap rather than replacing existing negotiated streams.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/tls.rs#L17-L62",
+          "version": "repo-lines-v1:sha256:937386760b0c7226f183415167a7fc42a069c6d5c77036221816a9832e22df79:eyJzZWxlY3RlZExpbmVDb3VudCI6NDYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ5NWEyZTVmMjg4MWVkYjE3NDU3YzhhNGY0NjcwNWE0NmE3OWJlMmEyNzc4YWQ0ZDhmZTQ1NmU4ZjdlMGU2ZmEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ1ODA0MzFlNDI2YjljNGI4MTM1YjY1MjU1N2I5MzQ2M2M4N2NmYjMxMWYwODVhODVmOTU1NWZiYTdlZjliNTgiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk1ZTEwOWNmYjI2NDZjOWMwMDdiZmIzMzMyOWQ3ZGRlYzkwMDdjYTgyZjVjZjk1MjllYWJlOWYyZWUxZGEyZjAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjA0ZTExZDBhYjFjMTM1NGZhYjM5OGRlNjZmZDI3MDlmNzdlZTliNjJlNmE2ODMxZjYwZWJjM2JjNWVjNDU4M2UifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/tls.rs#L68-L179",
+          "version": "repo-lines-v1:sha256:b3ab5eb1a9ee8bb92d4e61217bc977fe0189fc4a86c63cb40c07fdcb6c9cc191:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEyLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI4MDllMzY2MzA2MzNkMjUzM2M4YzUwN2M1OGI5NGY2ZDQ2ZmJlNjMxMDVkMTZkZWU3NTZkYzg2MzJiYjBlZmI2IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI0ODkzZjQwZTM3ODFlYjg5NmM4MmQwNDZhMDgwNjdhMTFlMzVjZGYyZjFkZmFmMjZmZWE5MGI4ZGI2Njc2NDEzIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiJhYjQxNzdlZDc5OWFiOTBhY2I2ZTJiMTQzODk0Y2Q3NjQ4Y2MwYzBmM2I5YzdmODM0ZTkxY2RmY2NhODU3NTEzIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI3ZDA5ZDYxNDJkNWY3ZThkZThmN2FjODY1OWFkMDcwNzJiNDVmYmMyMjJhNTJhYTIwODQ3MGE4MDcxMmRiYTFhIn0"
+        },
+        {
+          "resource": "repo://docs/security.md#L105-L129",
+          "version": "repo-lines-v1:sha256:de43c29735a8994e47b92fb9020213b6159fbe3809711e0f08d52e2e2cf2ff96:eyJzZWxlY3RlZExpbmVDb3VudCI6MjUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU4NDdkNmI4ZWI1OTY2ZjlkZTA2N2YxMmU1Y2I4MmI5N2YxYTAyNWFlM2Y1YmY3M2FlYWIzNjM1OWE5OWFlZTMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ3N2E3MDhhN2I1YzkzZmE3M2RhMDExOGIzZWNhMWEzZWYxMTAxODExYzFiNjUxNDdiZmY5NjU0OTFkYWI5OTIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_3ad00e294adc4b07871873dbcd4f186c",
+      "statement": "Gateway authentication modes map off to privileged System, JWT subjects to Jwt principals, verified certificate CNs to CertCn, and password-authenticated users to ScramUser; System bypasses gateway ACL checks.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/auth.rs#L18-L78",
+          "version": "repo-lines-v1:sha256:4ea59e30eb8ea0f6af8f1293f9a4bd26798e0081a58ad802f6b2fb2735330cb6:eyJzZWxlY3RlZExpbmVDb3VudCI6NjEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJmYjE4MWI3MTc3ZWE1ZmM5OWI4OThlNmFhYTYzODM5MDBhMDc1NTJjOGE2ZTFhMTIyNmQxNTYyMGM0MWU5MmEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjYyNmRmZjk5YTliNTgxN2QxOTZmZGYwMTA4M2VjNmMwOTNmMzFjNzcxOWQ2NzYxZmZiMWMwNzE1MDU1YzgwZDciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImY4Yzc3NzRlM2Q3ZTIzYWI5Njk2YTA1MGVhNjMzYmQ2NmEyYWM2ZjI2YjAyNjUyMmJlYzY3ZThlM2I3YmQwNWEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L12146-L12656",
+          "version": "repo-lines-v1:sha256:d1ec98eacbc2c06da9f5f1c261b86e832dc1e7d95760d78c93e9d67306877dd4:eyJzZWxlY3RlZExpbmVDb3VudCI6NTExLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI2ODY0ZWVjZjk0YTA1OWEzOWUzMDI2ODZiNDc2ZjVjZWRhYjJjMjhlODMwM2I4MzAxMDNjMzVlOTUzOWJmMDdhIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI2ZTRjMzVjNGUyZGEyMDE3M2I5ZGMwMTM4M2Y0NTZlM2ExMWRiYmQ4YmNiOWUyZjQ3NmNhMWY2OGE4ZTA2MDFiIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI0NDM0MTNjMjhiN2EwYzVmZGJjZDc2Njc1NzYxOTU3OTIxM2Y3ZGIwYjQ5OWFkNThlZGNmODk5ZjQ4ZDcxYzlkIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI3ODVlOTdhYzBlODE1NjM4MzQzNzMwY2MzNTg1ZDEwMGIxZGYxM2I1ZGM1Y2NhZDUxMDVkNDU0YWRlNGExZDRjIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_0b2f4c03a9df42a5babe02019f30b7f5",
+      "statement": "RoleCatalog is an in-memory password-authentication catalog storing salted SCRAM material and optional MD5 hashes, separate from ACL grants; password updates replace both representations.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/role_catalog.rs#L13-L81",
+          "version": "repo-lines-v1:sha256:db0fe8fbab91fa59a7541e6e7f03d9a67ab420432285d9e2ad1c63f9b633d72d:eyJzZWxlY3RlZExpbmVDb3VudCI6NjksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY1OGI5NGYwYTRhNjhkMDFlODMxYTU0ZGEyNGM1OTczM2NjMjJiMGJhYmQxMDQ3OGI1ZjNmZjY1YzQ3OTQ4N2MiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY4YTEzM2MxMjExOTAwOTg1MjlhMWM2ZGQxYTYwZDM2OGRkYTY5MGYwNWQ1ZDMzMTU5ZDgyOGRmMTI5M2Y3NDkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjUwNzgzNDA3YWZiNzc1OGY3MjliZTU3MDIwZmZmYzhhNzdkM2NhNDY2ODE2Yzc0N2U2YmNlY2M1N2EzYTM2NWYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_68d4c9cb52cf41728851e16b9dc9d0b7",
+      "statement": "JwtVerifier supports HS256 using supplied/cached keys, requires sub, checks exp only if present, and does not validate issuer or audience or fetch discovery keys in its verify path.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/auth.rs#L293-L388",
+          "version": "repo-lines-v1:sha256:f2d3324a038727cf907f02f10c478a1d734a9e96acec3c0498160db2e7bd46aa:eyJzZWxlY3RlZExpbmVDb3VudCI6OTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJkMjRhNDYxYjE4NTA2MWVhN2ZhYzA2MzAzNjlmMDk0ZjUyMzZiNmVmZjg0MWVlYTQ1NzM5MDE2ODUyNGUzOTIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjFkOWUwMTkxMjc3YzhkZWQwMmUwZmRmZDU5M2E3NDgxZDRhMzBmODQwMjU0NDZmZWY3NGJmMWQ3YmQyM2JiMWMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_10399c4904884b6d8f35ed4207ac3a12",
+      "statement": "CLI OIDC gateway startup supplies a built-in default signing key, and gateway startup has a verifier-absent fallback using the token as JWT identity, so the OIDC label alone is not production identity-provider integration.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L513-L528",
+          "version": "repo-lines-v1:sha256:70854c453d2fc3f23a1007d14f0a308391c0f63c33dee288c51865736952e701:eyJzZWxlY3RlZExpbmVDb3VudCI6MTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgwZjAxMTRhYjhmNDgxNzA3YTIzNjkzYjc2NjYzNzFlYmEyZWI3MDIxM2ZkOGRhNTM2NzMwYTVlODg3OWZkZWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijk0MzNkMGVhOWVjZjJmMzljOWE1MDQwNzM5NWVlNDExNzJmZTY4MmM5Yzg4NWEzNTA4Zjc1YmRlZTE1MWVmZmYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjVjZDlhMzAwNjJlNWQyMDgzNWU2YjUyZTMwNmQ2MjViMmQzMWEwZGEwZTczYzQwZTMyMjNhYjI1OGMxMDg0NTYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijk2YzkxOTYzZWZiNGQxOWNlMDM2YThiYzRhYzA1OTZiZGMzMTI1OWU2MTg3ZTM5YzcyY2Y3MzFkOGI2M2RjNjAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L12163-L12215",
+          "version": "repo-lines-v1:sha256:55017c0824decc61e447f336d6c60e0a3f97e6dc9e1eb940f118974cfefe7006:eyJzZWxlY3RlZExpbmVDb3VudCI6NTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4MDdlODM4ZDE0NjliNTBkNmNjYmE0ZGNhZDA3NjE5ZTBhZDdiMWUwZjM4OWJmYWNmNDk5OTc5YWYwMjQ4NWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhkYjMzOWMxN2Q0Y2M1NGU3MGM0ZmNmZWNiNjExYmI5ZTdkMzYzZjI1YjE4ZTA5MjNhMWQzMDZjYzk1OTI0ZTUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI4MzFlZDdiMmE0ZGE3OWMzYTY0ZGM0ZWVhZjMzNDk3NjAyMjU3YzcyOTdjNzNhNmJlNzUzMTA5MTU3MDk5MDUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImVlMDc3NjZiY2U5NWMxN2I3YTRkNzQ1NTRjZGJhZDYwMjM2Y2MxMzg2YzRkMzgzMTUyY2U5ZjIyNzMxYWUyYzMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_ab5694ff6df24b50b8f3ab118c3bcb5e",
+      "statement": "AuthMode parsing maps unknown strings to Off, whereas CLI run_start normalizes and validates an allowlist and returns RS-0002 for unknown authentication modes.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/lib.rs#L615-L622",
+          "version": "repo-lines-v1:sha256:45cf7eb1635e3503b2ff2f7b5530e68cda407cb7ffef6137a0a04a2fbc2fceb1:eyJzZWxlY3RlZExpbmVDb3VudCI6OCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNzMzNjU5OWI3Y2FiNjQyYmM4ZjYzMGY5M2FjZTEwMmMzZjZiYzA1NjQ2NzgxYzAwMGU5MTg3ZDdkNWMxOTU5YyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZThjMDFiMTFlYTliMTNmYzgyZGFjODBiOTNjNTAyMzg5ZmRjYTA2YTM0MmVmYzZhN2UyNGFlZTliMzUxZDEzMiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMTVlYjdhM2E5NzMyNDFlOWE0MzE0NzkyYTUwOWY4YzJkNTI4NWVjMTMyNWZkNjE2MTM5ZDAzNWJhMDcxMmNhMyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMzRiMGNiNTJlYjFhMzFlMTM1NzM0MWIxZDYyYjMyNDRmMzZjNDA4M2MxYWRkMDZiOTc3ZTZhNmQ5NjFlYTQwZiJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/auth.rs#L28-L39",
+          "version": "repo-lines-v1:sha256:acdcf26c48eabd501ded2337ef17bd5d4bd9b1aabc953f20c3543073dcde822b:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjNhNTZmZGM1MjczZTc4NTUyN2QyMWE5YWVkMzExNDE3MmI4OGM3YWM3YzliNzNhNTI3NTUxOGQ4OGVmNGQxY2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImFjYTQzOTJhNjVjOWE0M2U0MGI3OTgzZWI4NTYwZTk4MzA0Zjg4MTM4NGM2ZWRhMGFkN2UyYzdmYjU3ODI2NzgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijg0YzY1OGNlMTczNDMxZDc1MjcxMzY5YWVlMmI4MTlmZWJkNTNkOTE5NjYzNzMzYmZhNGI2NjMyYzg0ZGYwZTYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_85ceffd24a6b458aa1305ffdeb3385b6",
+      "statement": "Constructing a gateway in mTLS authentication mode does not itself install a TLS acceptor; TLS is installed through the separate with_tls builder.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L13817-L13851",
+          "version": "repo-lines-v1:sha256:4b72c239580fac1332b75f4fcbeea50986ce54b2e9ff75ff0e14ab43b895dde5:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVmZjE5ZTg3MzE3NjEyZGUyMDNkZDU1MWZjODEwNjJkMThjMzQxMDkyODk0MWE4MzQ5OTE2ZWZlZDhmNmRmYzUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImZiNDgyZjNkODg3YjUyNDE0NTU0N2VlN2VlNmIyOGFkODhlYzFkOTFkZjFmNWJhMjBjM2M5YzVhNWFlMzUzZTAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImMyZmUzYjJhZThjMmY1NWJhNDRiYWEwNzZlYjUzZTE0NjYxOWY3ZTg1ZWIyMjc3MTE3NGNiMTY0M2YzNWFhMTAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_2a021959133541b894cb407363e8ea0a",
+      "statement": "The current AclStore grant, revoke, and lookup operations act on an in-memory map, prefer object grants over namespace grants, compare minimum roles, and bypass checks for the identity string system.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/acl.rs#L125-L203",
+          "version": "repo-lines-v1:sha256:e600af12bb21a1f18103aa7c0ec049b898c4a6b589e5418c8efc34cdc420c6fa:eyJzZWxlY3RlZExpbmVDb3VudCI6NzksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc2NjhjYzNjZmNlNDA3MjYxZDQ0NjgxODI3OWVlMThhMzQ2ZjJkYTBjMTE2MWJhZjNmYjA5OTFiZDUzMGM5MWIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRlM2UxMWNmNzNiOWY5MjVjY2U2ZGExMjI4MDkxMTJkMjNjZDZkYzllODU2ZThhNmNlN2E3Y2QxZTg1NmVjNTgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQxOGM0Y2U4NjY4YTk2MjI3MTY2NTY1NzBlNDJhZmU5YjJmOTQ2YTNiYjQwMWEwOGU3M2ZhZjM4OWVjYmExZTQifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/acl.rs#L57-L65",
+          "version": "repo-lines-v1:sha256:14f0a145450704cc9a712f815e536303c5646a979bdc9131cb38179fcdb311ac:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNDg0MDY1MGFiMGRiM2Y1YmIyYzg4ZjFlYjg0ZmY5MDI2NzEyYjY0YmVkYjk1ZjU1ZTY4ZTc3NDIzZWVmOTBlMSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNDEyY2EzNDVjY2Y3NWJmOWMwODA2YmNlNjk1YmU4ZGU4MDhiNzk5ODQyNTFhN2E1NGQyMDJjZjYxMDFkZDQ1MSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiM2I4OWVlNDQ3NDZjZDQ0MTQxMzBjM2FmZDRhYWNjMTAxMzZmZTJjMDcwYjY4NDA2NGM3OTQxYWYzNThmYzJkZCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiYzMyZGMyNTY3YzdhOGZjZjg0ZmFmYjhhMWQyNDQ4MjdmYjQ1ZGRiMGZiYThmODIzYjhiMjMzNmQ1NTY5M2JlZSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_f3b769b79f34406eb655a54c373bf95b",
+      "statement": "Gateway mutation authorization treats missing sessions as System and connectionless dispatch as trusted; read access likewise uses a System default without a connection, so these paths must not substitute for authenticated sessions.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2231-L2245",
+          "version": "repo-lines-v1:sha256:a600a37da1763368b3d18024dc4b9e2c385a21c3d97a75d7f42f7beead2489b0:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMwZDdiNzQ2YzM0MDQwOGYyM2EzYzI4OTJmMmNkMzc5MjBmMjQxOTk1YTdlYmYzZTNkYjQyZjYzMjU4N2Q2MDciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI0M2E1N2EyMWVlYzc2YjBhNWU1NWYwY2M5MmY5YTIyNDBmNmM1ZmFiYmMxMjFhY2UxODUxYmQzMDg5NGZkNDYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImFiMzk4YTkzZmYyOTAzNzIzMTc4NmQ1OTMyN2Y0YjdmZDFlZDc3NDVkNzMyNDA3NzE0Yjg4ZWZiZTI5MTgxYTQifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7582-L7605",
+          "version": "repo-lines-v1:sha256:e1ed82f2d610ebea7db967097ff52fb09832aad6fe7826b12510e584493e8971:eyJzZWxlY3RlZExpbmVDb3VudCI6MjQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRhNDU2NzJiZGU3MDM4MjAwZDM2ODYxNGJmMGZhMjA3ZjFjNGE5ODZiOTZkYmMxYTM4ZTE5YmVjODcwZDhhMjIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1MjJjNDJjZDE5YzZkMDNkODA4YzQ1MjcyMDU1MjgyNWI3ZWExYzViNDkxYjIxODUxMWNhYzc0MTVjZjlkOWIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQxNDBiZDFjODI0ZjllZDM2Nzk1M2I4OWIzNjYzMWU1Yjc1NDAzZTI3YTI4MmUzODg2NGQwMTdkYmRjYWFhMmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc1OTE4YzA4YTVlYjAyMzdkMmMwZmFjZjdmY2RlMjI2ZjgxOTZmMTQ4YjA3MGJmZWQxN2QwNmUwYTg4YWZiZWIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/session.rs",
+          "version": "repo-file-v1:sha256:b7928fcff8d7124535d67855283469def7be65f4718888f9cb110d92b96e6fca"
+        }
+      ]
+    },
+    {
+      "id": "claim_e65adff8062c451bb83bf25e25eb54d8",
+      "statement": "Gateway relation access requires Viewer in the session namespace and additionally requires session-namespace Admin for non-System cross-namespace catalog-view reads; denials return SQLSTATE 42501 with RS-2401 or RS-2402.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L7582-L7630",
+          "version": "repo-lines-v1:sha256:dc75c0d9e37680a109fe2318c8042b07ed5204b6fda1ce8fc222e8a553c3c147:eyJzZWxlY3RlZExpbmVDb3VudCI6NDksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRhNDU2NzJiZGU3MDM4MjAwZDM2ODYxNGJmMGZhMjA3ZjFjNGE5ODZiOTZkYmMxYTM4ZTE5YmVjODcwZDhhMjIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQyZWYxODBkYjZhZjk3MGY0M2E1NjNhZTk3ZWJkZGU4N2MxYjdhNzRmOWQ1NzIxNjQwZDc4YjE3ZmVmYWFjYzQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQxNDBiZDFjODI0ZjllZDM2Nzk1M2I4OWIzNjYzMWU1Yjc1NDAzZTI3YTI4MmUzODg2NGQwMTdkYmRjYWFhMmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjFiOTc5MzlmNWE0ZjFiMGYwNDJmOWFiZTAzMTUzZmVkNGEzZTUzMGIxNzFmY2U2MDk4MzBkYjIwYjJkNmY5MjEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_19356226bb0241eabb7ed591c04a53bb",
+      "statement": "Gateway mutations consult shared pgwire_mutation_policy before execution, using session identity, namespace, and resource; insufficient roles produce 42501/RS-2401 and attempt an audit event, with PipelineOwner for ordinary creation and Admin for secret DDL and administrative changes.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2231-L2282",
+          "version": "repo-lines-v1:sha256:47739ba35b2eee3d531a1b0a5442d10c9424a254acbf6ac280aa5b60ad770cce:eyJzZWxlY3RlZExpbmVDb3VudCI6NTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMwZDdiNzQ2YzM0MDQwOGYyM2EzYzI4OTJmMmNkMzc5MjBmMjQxOTk1YTdlYmYzZTNkYjQyZjYzMjU4N2Q2MDciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI1NWJkYjBhNmM2MWFjMTIwODg2MDY2YTA5Nzc5Yzk2MGE5ZmJjMzJiNmNiNjcyNTc2MzUzNGM3MmRiOGQzYTIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI0M2E1N2EyMWVlYzc2YjBhNWU1NWYwY2M5MmY5YTIyNDBmNmM1ZmFiYmMxMjFhY2UxODUxYmQzMDg5NGZkNDYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImNhODg0N2JmOGQwZDFhNjE0ZTRhZDdkNzcyZTc4OTgxMWVjODNhNDg2YWUyZjk0ZWMwYmQwOWIzMzcxNDNkM2EifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/gateway_mutation_authorization_tests.rs",
+          "version": "repo-file-v1:sha256:f432506eed644c9578ee67d5840d8b8541f88f7b75702baf05744256b3da9b82"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/mutation_policy.rs",
+          "version": "repo-file-v1:sha256:ca3da4253f0d7291519bcd892399c4c0846fa507e6cab5c5890cd7ffe15c9154"
+        }
+      ]
+    },
+    {
+      "id": "claim_57d5647c05504df083328026b14bbcbe",
+      "statement": "SUBSCRIBE reuses the SELECT ACL/namespace gate before retention lookup, snapshot reads, or stream admission; focused tests prove denied snapshot/replay and cross-namespace requests do not call readers or consume stream slots, while a Viewer grant allows admission.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L5515-L5568",
+          "version": "repo-lines-v1:sha256:baff50d0ad3b4dcae9e0b9876edb36360087a50785a0a94ac166269d33fecc70:eyJzZWxlY3RlZExpbmVDb3VudCI6NTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg1Mjc1ZWFmOGU4NmE1ODJiYTg5MmEwZmI0MWI5NzRmZDIxNDcwNDNmYTFkZDQxZWRjZTUwNWNlN2FhNzNiZjUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM0MWI0NmEwODkzYzE1NjU2YjUzNTYxMWRjYjNjNTEwZjBmODFkNjcxOGIwYjEyYzQxMjA5M2I3NTRiMzAxNjciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQzZWY0ODc5ZWVkNTAwM2NmMzBjMGY3YTI4MWY4M2YyYjBhNjJjZWExOTFhNWU2MTA4MjM3YTY1NTNmMTczM2IiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjhlNWU0MTRmMWIwZDg4N2IyNTNjOWU2NmEzNDVlOTdkNWFhNmNhZDllMGExOWM4ZWJlZDczOTI2N2FkNGMzZWYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/v072_subscription_authorization_tests.rs#L76-L135",
+          "version": "repo-lines-v1:sha256:00836feccbcc2ed156b5762c56034d23b1251da4f3046cfc5f620e454bcd2ff2:eyJzZWxlY3RlZExpbmVDb3VudCI6NjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUxOTQ4NGVlZGYzNjRmYjhjMTJmMWViOThmYmY2YTliNGY2NTBmNDI3ODc0YThkNzM1OTAxMGFhZGU0MzFiYzgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY0N2FiYmQzNDM1Y2QyOTBjNDc2M2FkNmE2NmU2MjU1ODVkN2M1ZmEzMjYxM2Y5NGIyNzVhZGIyYTc0MjY2NDkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImE1OTM3Njc5MWU2OTQ3NmY3YTA3MTg5NmRjMjViOTEzN2VmODQyM2UzZTk2MzQwY2NmYWMzMzIzZDQyY2E1MWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc3NzJlOTI3NWNiNmEyNGZmYTg5NTJjY2E3N2U2YTRhNWEyYWRlNjNjZWQ0MzUxYzZiYzU4NjBhYWZlNTIyZDEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_67251dc7291c4298b0d1d4d4e5aff1b5",
+      "statement": "CLI mutation authorization uses local ClientIdentity roles and shared CLI_MUTATION_POLICY, but ClientIdentity is caller-constructed metadata defaulting to Admin rather than proof of verified bearer or certificate credentials; local denials are not server-side management authorization.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/transport.rs#L1073-L1106",
+          "version": "repo-lines-v1:sha256:31421c4fd7d2442bbdd6caaea0912604bb2cfc9597a4a7a86c9674a0f5f4f1c0:eyJzZWxlY3RlZExpbmVDb3VudCI6MzQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQwYTQ5NDU0OGVhOTEwNDAwYWE1NmZjMjI3MWJiYzNiYzliMzM5MGY0ZjgzMTBlYzFkZWQ3Y2FhZjk4YzBlODMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFlNzVjNzBkOTQ2MzYyNWUxMDc5ZmQ4ZmM4ZWU2MmFkMmU5MmM0MmJlYWFiZmQ4NWI3OGQ4ZTBhNDk3OWI5NGEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRhNTIwN2MzZTk1YTdmYTg3YmNkZDhiNzdiMWJjNjNlZDA4Njk4NDI0MDg4YTFiZTMxM2E0Y2FkMWVkMjE2ODAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImNmN2NkZGFiNjRkODQ0NjM3YjE1M2I2MjliZDhiNTgwYTJiNTYxMDk1NWFmYTJjODIzY2IyN2MxMTg4MjBjY2QifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-cli/src/transport.rs#L60-L145",
+          "version": "repo-lines-v1:sha256:48512162ba7aaa409848429b678f9b538c4a4529230ba06f0d20e62648719ac3:eyJzZWxlY3RlZExpbmVDb3VudCI6ODYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM0N2YzMTU2YWRlN2I2NWMxNGE3MWU5M2U0NGYxOWVmMDZjMzZkMzlhYjQzZjVjOWU0ZDk0ZmI3OGNlYWFmY2YiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/management.rs#L690-L729",
+          "version": "repo-lines-v1:sha256:c024272a77a8a0b227f11d09fde5a35a0273f42ffe700648ef7b34440622efe5:eyJzZWxlY3RlZExpbmVDb3VudCI6NDAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNlNzY0MWZhMDhkNDA2ZDM5ODY2YzdkYmQxZTkzNTc5MTAyNzE1ZmQ0OTYyZGE4ZWQxMTUyMDFiZDJkZjFkYjAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImUxNmQ4MTdhNjk4ZWY5ZTg5YmFiN2FlMDk5ZTBmOTRlNmIzYWVjZDc4MzQ1MThmYWI2NmRlYTAxYTFhMjhiNmQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhhZjEzYmFmZTU4MjJjZjIwYTE3MWY4YzRlOGFiNDg3MWVhZWViYjkzYmU2NWEwZmVjYjAzZDExY2MwOTIyMzMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZkYTlkMTZjNWJkNjhkYmUzMmMxYzkyZGMzZGFjYTI3NWMyYTI2YTg3NmVhYzk5Y2RkNTYxMDZlMTcwNDdjODAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/mutation_policy.rs#L10-L86",
+          "version": "repo-lines-v1:sha256:67ddcaaac46c3ae28e75c5cb6e92ceaf2d6b886ee438a9a2bbcddd1907938800:eyJzZWxlY3RlZExpbmVDb3VudCI6NzcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc3MzQ2ODk2ZjM2NmQ5NjRmZWI0ZDVjNmQ1YjliM2I1OWU3YTljYzNhNWFhYmJhNWI1YWMzODU4Y2NiOTI0MTUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImIwMmQyYzBkNmRjNWU3NGQ5MmZhMTRiOTFkYmVhMjY0MDkwYmViMzVmZGI5MTg4ZDliMzQxMTgxZGNlOWY0Y2UiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhmNmU2ODY2N2QyMjlkMGI4MzU1ZjY0NDlhOWY0MTdiZjg3N2QxMjBhNDNhODcwYzNkMjBiMGQxNjRhMDEyMjUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImZhMDcyMTJiOWQ1MzJiN2UxYjAwN2QyMzc5YzdjOTQ5NGY1YWIzZjRjMzQxNzNmN2IyNDZjNWZiNWZiNjNjYjgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_35bae26c31f34272bc425e5da1cc25a5",
+      "statement": "SecretStore owns encrypted catalog entries and the active KEK provider; envelope encryption uses local DEKs, AES-256-GCM payload encryption, and provider-wrapped DEKs, while SHOW SECRETS returns metadata rather than plaintext.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/kek.rs#L407-L480",
+          "version": "repo-lines-v1:sha256:9b35fecfca35bc24752af5a2a7da01ab7dbae868a48c601f9514d54f14aa194b:eyJzZWxlY3RlZExpbmVDb3VudCI6NzQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjNjMDNjMzEzZmZjYzEzMTA5Zjk5YmYwYzYzYjhiNDBjNmM5MzRkZDU5MGFjN2RmNTc5YjJmNjk3NjMwMTAwYTEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjFhODI1ZjJhODYxNGU5ODVkZDI0YmU4YTFiNjg0ZmI3MGE5M2YzMTYwZmM3YWRmOTc0YTU0MWJmYTFhMDY2ZWMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/secret_store.rs",
+          "version": "repo-file-v1:sha256:1b29fe4a279e37b74bc14e78c2669079326243dc7461954ff7ad471d77dc4aae"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L9236-L9269",
+          "version": "repo-lines-v1:sha256:57e0981fbf3d0209554a6251788ec4786276d75ce391f84ba180208d214de646:eyJzZWxlY3RlZExpbmVDb3VudCI6MzQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg0NjQwOWY4YjZlZGExNTk0OWNhZGY2ZGY2YzA5MmRkZGQ4OTQ1NmYyZTlhZmRhNzk3NzlhODYyOTFjYzAyN2MiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxYmE0NzE5YzgwYjZmZTkxMWIwOTFhN2MwNTEyNGI2NGVlZWNlOTY0ZTA5YzA1OGVmOGY5ODA1ZGFjYTU0NmIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjJmYWYzYmVjMDkzOWMyYmMyZTU4NDFmZTE4YjczZWE2ZjlmZGMyMmNhYzJmNTk4MDNjOWMyMjRjNWE5ZDZlOGMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjJkZGU0NDczNWMxNGQ5NGNkYjYzYjE4OThhNmYxZjM1YWMyYjQ1MmFkNjM4YjgzMzk1ODNkYmRiMTQ4NmUyNzAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_e419e315a7074cea86eb2d4dde3d0ba8",
+      "statement": "Default gateway/control secret stores use EnvKekProvider::from_env_or_default, deriving a key from RS_SECRET_KEK or a deterministic fallback when absent; KMS selection requires explicit provider/store injection rather than merely an ARN.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/kek.rs#L109-L132",
+          "version": "repo-lines-v1:sha256:5922313557e7158c9ae04f8da0899b501da47481fd07a170d38fa2661d9c9510:eyJzZWxlY3RlZExpbmVDb3VudCI6MjQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhlNDE3MWExMDU5ZDIxMjY4ZTM0NTIzZTNkMzFjZjZlNmUyMDgyYTkwNTdmMWNjZGNkZmYzNzg4NWRkZTRlMjAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImIyYzUwMjkwMWI1YTE4YjgzYjY1MTFkYTNiNTk0MzIxYTE0YjMyMDFlYTk1YzMyODkzNTRhZTYwY2YxODE5NjYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM0MzMwZDNjNTNhOTY5ZTRmNjM5M2U2N2UwNTA0MzhiYjIzNmI3NDc3ZmM0MzViN2YwZWUzODc4ZmJlMzNhMGEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L330-L345",
+          "version": "repo-lines-v1:sha256:a617a4a3f8be03cf0c65ef7bc4aecfb8f19c7fb009b3a84fbd83d2f51d66ffc6:eyJzZWxlY3RlZExpbmVDb3VudCI6MTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM5YWYwZmFkYmJkZjA0N2Y4NzYxNmNjYzk4ZDhlOWFmYjNmNzk4NzNkYjk5OGM5NmM2YzRlNTFkZjcxOTlmZjAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhlOWJlZGFjMTFiMDYxZDk3Nzc0NGY3ODVhOGU3OTM5ZWM2OGI1YWJjZjU0MzU3ODQ2MTUyMDcxMjg2ODVkNDIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjNhZjViNWVlYTQxYzIxY2Q0MzczNWUxYjQ1YTJmYTljMThiOWI3Y2RiOWRkZmFlNDlkZmEyZGZjZDY0NjM3MTYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjkxZjcwYTNjY2JiZWQ3NjY0Yjk5ZWFmMzE2MTk5OWY4NzdmOTBmOWVhMzMzMzFlNzU1ZGRhMmUxMTdhNGM0NzEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2306-L2368",
+          "version": "repo-lines-v1:sha256:eee49ba5251cf0e711fc4d22d4f922732270d0d09b32c13d83ef84a4ba42ff7a:eyJzZWxlY3RlZExpbmVDb3VudCI6NjMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImEzZTdjYmNjMmQwM2EwMjhmMDQ1ZDZiYmVlNzlhMjk0NjZhMGE2Y2I2ZWJkZTNhYzY0OGFjMDBlMmViODUxYmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIwNjA2MmM2ZjBmNzgwNzA1YjIyZmJkN2ZjOWYwZWRmNGJkMjhlYjc4NWMxOGY5ZTE4ZTkxMDQ3MjRhODYwNTYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImJhOWQ5MzFhNmU5MmQzZDM5NmJhYmIxZmFiN2YyZGYwNWRmODJjNDE1YTBiYWNjNzA3NWY3NmM4OTM3MjNjMDkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM0ZjlhMTgyZWRlY2FjNjkwOTc1N2NhMzU4YTZkM2M4ZWQzMDI1YmEwYTZlZWY0MTFhMTI5ZmJkOWNhYjg1NWYifQ"
+        },
+        {
+          "resource": "repo://docs/security.md#L3-L15",
+          "version": "repo-lines-v1:sha256:bdc9033dbbd2b166aa28e6c4ba7da272204f4c9816c86d44ea5ca3cb05dc4b3e:eyJzZWxlY3RlZExpbmVDb3VudCI6MTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVkYTZiZTExMzgwNjE1YmU4NTExZjEzMDY0ODQ2ZTY5ZDg0ZjgxYWQ2OTg5NjRhODE0YmYwYTA3YTMwZjFmOTIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImUzNDA0NjkyMWIxMTk5ZjBhMjM3MThhNzNjZGQzMDRmZWZkODhlNDIyOGIxMmM3MDEzMGFkMzUzZDc0NDM1M2QiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjoyLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImY4MDU4NDRiNGI2NDliNTIwYTRjN2U2MmQ0ZDE3YjkwZWQyZjcwZmJlMGE0Y2I0OWYzZjQyYjBlNTIyNDc0MjgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ0OWNmNWUwOGRkNTVkOTUzNjBlNTIxMGNlZWU0MWY3NDMyM2NiMWYxZjZjY2NlMTUyYTk5OTM4OWFhODQzMzcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_a6025eb5eb184c778c55507cb77f0426",
+      "statement": "AwsKmsKekProvider uses signed KMS Encrypt/Decrypt to wrap locally generated DEKs with no local-encryption fallback; local protocol fixtures do not qualify AWS IAM enforcement and the real AWS permission test is explicitly ignored.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/kek.rs",
+          "version": "repo-file-v1:sha256:7737da9ce76b10dddc46ffbd24405c3873cb562b9991dad472f4c86b1d74c56d"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/tests/aws_kms_tests.rs",
+          "version": "repo-file-v1:sha256:6ebc6f9aeca31a97ae60bcf3da68914c96f2b9429ef8bb74fa4d89cc35bdda9d"
+        },
+        {
+          "resource": "repo://docs/security.md#L9-L43",
+          "version": "repo-lines-v1:sha256:b6d5499563a48ea2a6596175a89e5ae2e8f3722cd93483da939bb3c68e1e88f4:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM0ZTk3NTA1OTEzNzhiN2M4MmZhODgwZWUyNjM0OTBlNGI1ZGQzMzNkNWY3NjJlOTk5ZGUwZmRkMDE3ZTY1YjMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA1YTBmZDlhNzU2YmRiNmYyZDBiMWJiYWY1YmRkMWUxY2ZkMDYyOWQyMzg3NzY3Y2E5MjI5ODU5MmY1NTc3YmYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImIyY2IwOTVlZjI2MWNiYzkwYWYzZGI1NzJjNTE4M2JlYTg3MDA1MWVmODMxNWEyNzMzMGQ2OGM3ZDM5Y2IzMDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNmODFlNzk3YzZmYzMwOGNhNzE2M2U0ZTZiYzA2NDdhODY4ZWQwYWM1M2VjYWY0Nzk1NDdmMzVjNDRmNzQxOGEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_edde46efa90b40fb867f947a0f3d6872",
+      "statement": "Gateway secret DDL currently targets namespace ID 0 and uses pgwire as the store audit actor rather than the authenticated principal actor.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L9143-L9269",
+          "version": "repo-lines-v1:sha256:a37d436352149c683c4228d0492e0b35422729dd0133d195a91390e8a7053c68:eyJzZWxlY3RlZExpbmVDb3VudCI6MTI3LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI2NWUzMWExMDIwOGZjZTE5ZWIxZjdiN2QzZjg1NTI2MzA1MjU1N2I1MzU4YjI2NzgwMDg5NDFjZjg5MTYyYTA3IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiIwMWJhNDcxOWM4MGI2ZmU5MTFiMDkxYTdjMDUxMjRiNjRlZWVjZTk2NGUwOWMwNThlZjhmOTgwNWRhY2E1NDZiIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIyZmFmM2JlYzA5MzljMmJjMmU1ODQxZmUxOGI3M2VhNmY5ZmRjMjJjYWMyZjU5ODAzYzljMjI0YzVhOWQ2ZThjIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiIyZGRlNDQ3MzVjMTRkOTRjZGI2M2IxODk4YTZmMWYzNWFjMmI0NTJhZDYzOGI4MzM5NTgzZGJkYjE0ODZlMjcwIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_17c0a15fa3ab4a2dbf954d96ce6800f8",
+      "statement": "Live control secret-token issuance requires a verified Worker certificate and issues a 300-second namespace-0 token bound to its node ID without a per-secret assignment or ACL check in that branch.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L3548-L3578",
+          "version": "repo-lines-v1:sha256:17263a045895693e27cc1d9c78e920e86f8549298f1a1a63e8b5cb99e807a312:eyJzZWxlY3RlZExpbmVDb3VudCI6MzEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ2Njg4ZWUwNWVjOTgxYjg2ZDE0MzEzYmExNzM0MmNhODNkYmRhMzIyOWY5MjJjZGRlNDRjNzgwNGM2OTEyNzUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjNjQ3OWNjMjMwNDQwZmQ0MWU4MjI0MjE4Njc5Njk4NTU5ZDI4OTNiZDY3YjQzODBhZmFiODExYjM4YTU1YWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjliMmNiYTcyN2Y4NjNhM2NkMDQ2NDdiNDZhNThjYzMyOTZmM2VmNzM4ODYyNzk1NGQ3NjFhN2VjZWZjYWNkMGIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNmOTkzZjMzN2JlNmUyZDgzNjFjYjgwZmYwMTQxOWFjMWQxYmM2NjBjYmYyZTVmNTY1YTFiNzA3YmM4YmUyMjAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_f8c63d06567a47be93c382d35998c90a",
+      "statement": "WorkerSecretManager verifies token identity, expiry, nonce and AES-GCM authentication before retaining plaintext in a bounded memory-only cache, removes expired entries on reads, and uses a token key derived from the public worker identity string rather than a private key.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/secret_store.rs#L795-L825",
+          "version": "repo-lines-v1:sha256:f30e803d9fa432c8ca9e2f5a5b0c6a681180a27a1b7fab6edf28dbe7060318c5:eyJzZWxlY3RlZExpbmVDb3VudCI6MzEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU5ODM1YTQwNTU4YTI2ZjZhYTkzYjE5OWMzMDI5NmU1NjM3ZTE0MTE3NTEzMzIxNjJhZGE0YjNmNjJkMmVlODQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM1Y2RlZjgwODVhZTc0YWI2MzZkNjQ1OWY1YzZkNWZiZmIwZGIyNjRmMWIwZDc1YmFjNTE5YzliM2Y2NzE3YWMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjUyOWNlZmM3ZDA2MjZjNzY5M2E1MDA5YWVjN2JiM2E2MTgwOGY0NjVmMDdmMjcxNDRmZmFhNjU5OTMxN2NkOTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjM1ZDc1ZDI4NWMwMDllZmEzZTRlMWZmZDljYWY0M2E3NWY5NWMzMzQzNTE3NTQ4ZjllNGZjM2E1NTYwYTY0MjYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/secrets.rs#L11-L119",
+          "version": "repo-lines-v1:sha256:500c48814685a94e304301b9b4bb8bc133631e813ef93b27325963c2777faae0:eyJzZWxlY3RlZExpbmVDb3VudCI6MTA5LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI2NzA5ZWViZmM3MTU5MWQ4Njk5MjJiZDZjZjg5ZmQyMmYyYmU0MGM1MzA3M2MyNjYwOTM3ZGQxZDk4NDVjZjk5IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI0Y2ZhYTg3MjM2OWVkNmE2MzQ1MDIzZjQxNTYyYjU3Y2I4ZTU0ZDI0NmU2ZGNjMjZhNzc5ZTEwODYxYzY3NGIxIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIwZTBlOTE5ZGJlMzQ0MWY3YzVjZDIwYTJlZGU0YWJhYzYzM2IyZTFjMDcyZTEwYWM0NWE1ZTJkNDRlZGJlNTI5IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJkNDdkMmIwNjEzYjk1Yzc1MjJlMzhlMTE0NzNhZjJjYjE0YWFkNTRkNTM4N2E0NTM2MzU3ZDVjNzQxNzQ1ODlkIn0"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/secret.rs#L108-L124",
+          "version": "repo-lines-v1:sha256:58f39f704ffc3eee322729a7e750fba6ff4a25ee6c0fd8173a544d408207f814:eyJzZWxlY3RlZExpbmVDb3VudCI6MTcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjNiYmI1ZDIyNjMxOTZiYTMxNmNlNTgwOTZjMTcwM2NjN2U2ZDE3OWRkODUyNjExOTNmY2E3Yzg3ZGFhNTQzYWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI4YmFhNzViYmRjOWI4YmQxNThjNzkwYzU1MDk4OTUwMzdjODY4NDVlZWQ3NTIyZWQ2NjJhMGJjZGVjMzZjMzgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImE1YzhjM2QxMjA5NDRhZWY5NWZiNTJhYTUwYTgyODMzZTg2NWZhOTJjOGQ1MWMyYzM4OGQ5MzQ1NTdmZjFkYzUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_a8ca35e5f9e84110980a079643aae638",
+      "statement": "ALTER SECRET increments its version and emits a rotation notification; the runtime responds to SecretRotated by requesting a fresh token and resolves issued tokens into its in-memory secret manager.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/secret_store.rs#L530-L575",
+          "version": "repo-lines-v1:sha256:7afd018bb184c9abefd5c9777d1f1a366b1ff9225c81c77bd8f68780277a1acc:eyJzZWxlY3RlZExpbmVDb3VudCI6NDYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE0ZmVjNmRjZDc0ZDQyNWRmNzExYTI1MGNlMzg1NzE4MmE3NGJlNGNlMzcxM2E5OTUyMzliZmY0NjA4N2QyMzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImViZmNiMmY2MTVhMTY0OTYwNjRmMDlhNWFjYjkxZmI5ZTkyMWExZGQyYmU3YzExNDYzNzA2NTRiOGRmMzQ3YmYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRkYzBjZjhjMDU4NzdlN2FkZDRkMTZhMGI4MjliZDA3MGJhYzVjYmRkNzVkOGY3ZDczYjA4MGM4OTAyNzZiN2IiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjliODM5ZjI5N2MwNjhiMTBhNzQwOTA0YjRjZmUxN2IxZjRjMjkxMTU2N2E0OWQxMGE4ZDkwZmYwN2RmMGM4NjgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/client.rs#L1876-L1897",
+          "version": "repo-lines-v1:sha256:c9841abafa98a74c5a1bc6e4516137022b2841d880ff87ccaa59c31d106688df:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI1M2FmOGIxZWExZGJlYzI2YzU2NjczZWI4YWJmNWJlYzgxYTRhZGRhNzYwNDA4MmZiNmJjZDIyYmM3YTI3ZmYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhkYjMzOWMxN2Q0Y2M1NGU3MGM0ZmNmZWNiNjExYmI5ZTdkMzYzZjI1YjE4ZTA5MjNhMWQzMDZjYzk1OTI0ZTUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUyN2QxYTUxOGQ4YjI2MDI2YWFmOTQ0MjQyOWZhOTQ4ZGQ1YmVkY2Y3MzljYjgwYThmMjFhYWFiNzI1MzY2MTIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImI4ZGMwYmI1OWU0ZDUzY2YyYjM3ZWY4M2YwY2E1ZWNiNDg0NjU1YTE0NTljOTk0YmYwNTQ3MjU4MjdmNTVkNzgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_8a1132385e0b4963ad2a902c86b2b97c",
+      "statement": "KEK rotation locks out competing store operations, stages all rewrapped envelopes before atomic publication, leaves stored envelopes unchanged on staging failure, and uses a cancellation-resistant spawned commit that waits for durability before dropping the old provider.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/secret_store.rs#L705-L791",
+          "version": "repo-lines-v1:sha256:87174bdfb3b3ed0d5c0345c1667cc8efa9e8140f79df4ad08c372571505f7f7b:eyJzZWxlY3RlZExpbmVDb3VudCI6ODcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjEyMTBhZDczNDEzNjJlY2RlNWNhNmE1OTJjMDI5ZGRmOWU3ODRlNjE4MDZhNTNmN2UwNGMxNTk4ZjZhZTY4OTQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQyMGZlYTAwNTM0ODZkM2RjNjI0YWIyY2E5MDA0YTRmMGNkMzM1MmNmM2IzZDIyNjFmYTYxYzRjZmM3NDdlY2EiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRmMzFiZWI5NGFkN2VkYWIwZDU4MWRjOTJjZGYxMGJjYmYyODFjYWY4NWIxMzgxMGY0OGYzNDA0ZmI4YWExNmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjUyOWNlZmM3ZDA2MjZjNzY5M2E1MDA5YWVjN2JiM2E2MTgwOGY0NjVmMDdmMjcxNDRmZmFhNjU5OTMxN2NkOTUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/tests/secrets_rotation_failure_tests.rs",
+          "version": "repo-file-v1:sha256:271952fe022c588d0da45cfc32b4a1f2846c5b222e0107d04691f43d79c3fb26"
+        }
+      ]
+    },
+    {
+      "id": "claim_9805195b0df44551828b67b0818d09b5",
+      "statement": "Interrupted KEK rotation recovery requires retaining both keys, reopening with RetainedKekProvider and retrying rotation; the retained provider writes with its first provider and tries both on reads, and a shared store per catalog is required because independent instances are not coordinated by its lock.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/kek.rs#L73-L102",
+          "version": "repo-lines-v1:sha256:746d0d74964f4296e2b3b9b85b8ad00b7fd9dfcb9ab7f9a1877dd17152842211:eyJzZWxlY3RlZExpbmVDb3VudCI6MzAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjEzNDQxNDhhZWJmM2E4NWZmZTI4Y2MyODE4OWQ0MGFkYTU0Yjg4M2EzYTMzYjM4MWUwMDcwYmNkNGRmM2UzNjkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImZiNDNjOTFhODQ5NWViNWIzOTRmYTBjNDllMjI0YjBiN2NjMTcwOTc1NWQ0NzE5MmYyNjcxNmZiYTBhMWY4ODkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQxZTYyMmU4NGZmOWM3YjFlYWJjYzFhZjhkM2I0YmVkNjU1MGYyODI0MWUxNTc0ZmE2YTlhYTk2MWZkZWJlODAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/tests/secrets_rotation_failure_tests.rs#L554-L651",
+          "version": "repo-lines-v1:sha256:c34f7d9b8e8e09f54a5c45f34eb82c5e409ba07c5faa741c920624323d5ec05f:eyJzZWxlY3RlZExpbmVDb3VudCI6OTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjNjYWExMGZmZTgzYjNkZDYyZWEzMWE0MWQ2NWIzNTQ4MTg1MTI4OTg3MmU3N2FhNjMzMWJjNjkyMTNjYTJjODUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijc3NzJlOTI3NWNiNmEyNGZmYTg5NTJjY2E3N2U2YTRhNWEyYWRlNjNjZWQ0MzUxYzZiYzU4NjBhYWZlNTIyZDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        },
+        {
+          "resource": "repo://docs/security.md#L45-L62",
+          "version": "repo-lines-v1:sha256:70d21f81646c32d59c918739ab241328bf0772879e1908b9da069e3f3630fb05:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxMDFhZTc2MDQyMDBhNTAxYjVlMjJmMDIwNjU3ZjdlNzc5NmNiOTMyNWNjMjI3NDg3YWVmZmQ5NGJhODk5NGMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIyODRjY2JhZTMxMmZlMDk5MmFlMDMyYjc4OGI5OTIzNDljZTIzZmE1ODE2NjMyMGRkOTRjNmRlOWYxMzVmMTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjkzOWM4MDkyOWQwYzBiMjIxNmVkYjZiMGMwMjM5ZDg5NjhmNDgyOTJjYjc2ZTc5NWU4YWFlZmE1ZGIyNjI4ZDEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImY4N2NkMTA3Y2NjZjY0MzU2N2FlZDBlYjlmNTAwZWVlOTBjOGIwNDIyYTA1OWNhMjhlMWMyYjU2YzE1ZDM2NTEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_f5f17ae92a204202846704690ee1f8db",
+      "statement": "FileAuditLog appends JSONL under a process-local lock, opens the file during append, propagates I/O errors and does not fsync; gateway denial, secret store, control TLS, and CLI audit callers discard failures, so audit is not fail-closed or transactional with mutations.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-cli/src/transport.rs#L47-L57",
+          "version": "repo-lines-v1:sha256:8f311cda0abf06aa471a7751e24cb66251cb31c601aa1afeb429e4fe3d569476:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImUxYzNjNzExOThkMTM3ZGJiODhmODBlZmZlOTcxNzU4ODE4ZTUyZjA1MzE4YTgwZDUzNDkxNjg3NDhlNDAyOTAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQxZTJiOWE2YjZlNTQwOWZkYTQzZjcwMzk5OGEwZjI0MDNiNzAzZjA3NzQzM2JjZjVhNmQzZDc1YTczNGNmNjQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjhlZDA0YWUwZWRmMTY4NDk0MDVmYzFjNDkwZmI5MmE3YzIyNjU4YTQ4NmExZWZkM2YxZGVmYTc5MzU5MGNjZDAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/audit.rs#L22-L50",
+          "version": "repo-lines-v1:sha256:d200721ba2ff86a1e4f618ec85a397dd86ea1c7acd9478770463461499075165:eyJzZWxlY3RlZExpbmVDb3VudCI6MjksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZkYzY4ZWNmY2JkOThiZTQ4NDcxYWM0Nzc4MDU2NjU0YjhlNjU4MjliZTUwNjYyNmVhNDExOTgyOTY5NzU2MzUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImNmNzY4NjRlNWY5NjgxMTg0NGIwYTcyOTFhMDJjMjUwOWZkN2MxOWRjN2Y2NzhiZTljYTljNjk4MzhiMTViMjQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjcxYjM5NDVhYzc3MTViZTUxMzYyNDE2M2MwMWRlZThkNzRjNjQyMDhjMTk1YzRjZWRlYjNmZTdmMTAxNWIzMzMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/secret_store.rs#L251-L258",
+          "version": "repo-lines-v1:sha256:1b20f2a61a6b49418474d181c227dafa8c81d32c7faf944297a85dbf22e3f64e:eyJzZWxlY3RlZExpbmVDb3VudCI6OCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMzZhYTkxYTAzOTljMWZhYmRlZTk5YWU4Njg0ZDRlODMzZThhOThkZGZhODQ4N2M4NzkxNjU2ZjMxMDkwMWM3NSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZTZiMDQ0OTE0Njk3MjJlODM2M2E5NGU0MDQ0NTM4ZTAxM2EyYTIxN2UzNmIxZTU2OGJhNjBhY2I3YjRjOGYyZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNDZiYzA4NzAzZTZlNjkxZjM4MWM2NjE5OTJmMjZiMjM1N2FhOGJhZjVjOTA4MDFmNDQ5ZjMyNjAyMjk2MzRhNyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMjFkOTBjNGZjNWNmOWFmZjM5NTQ3NGJkMDViMTZkY2NhZDU0OTRhNTFkODE1ZTA5YzgxZjdkZGQxYjA0YmY5NyJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/secret_store.rs#L749-L760",
+          "version": "repo-lines-v1:sha256:58f876f2588e5d77626717dd5d30644c2da60c16ccaa2f7e9205a74ba3134d34:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdjZjU5OGE4ZmEyMDE3OTg3ODc0ZmE4MjAwOTE1OGNhYmY2MDRhMTc0MTEzNjRkMTQyNjExYTY1NzA5ZWMyMzYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhkYjMzOWMxN2Q0Y2M1NGU3MGM0ZmNmZWNiNjExYmI5ZTdkMzYzZjI1YjE4ZTA5MjNhMWQzMDZjYzk1OTI0ZTUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjlkM2Q4ZTQwY2QwZDI2YzNkOTFiYzBmOGFkNGRiOWVlODJjMTU1MjBkYjFlYmY5MTk1MjcxMGY2Yjc3YTYxNjkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjgwN2YyMzY1MTBkZTFmNDBkZDBlMDM3ZmI0MTdkZjViOTY5YjNlNzRiMDkxNmE5ZTYyZGE1YzY4ZmRlNmZlY2UifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L2755-L2807",
+          "version": "repo-lines-v1:sha256:21098a7ad6131c26eeeb7f728cbd7548b2a21c5468bcd1ee83b8f6b7997f3994:eyJzZWxlY3RlZExpbmVDb3VudCI6NTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgxNzQwZjg2ZDRlYjFmMjgxYThiMGZhOWJkMzlmMGNhYjRmYWYyMTEwZTczZWIxM2NkOTYzZjFhNjQ4NWM3N2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjNjQ3OWNjMjMwNDQwZmQ0MWU4MjI0MjE4Njc5Njk4NTU5ZDI4OTNiZDY3YjQzODBhZmFiODExYjM4YTU1YWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImFiMGEyZjRjYjg1Nzc0OGFhMTY1MDM4MWQzYmFlZGI3YjM3MDIxMDdlNTlkOTkyNDVjZDMzMjhkZjg5MmUwZWMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjlkMmZkZTMxMzFmOGNhMzA2M2QyNDFkOGRmOGEyY2QwZmViZTUwZWQ3N2RkZDlhZDAyOGE2NWQ3YWZmNGI4MGEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/src/server.rs#L2261-L2270",
+          "version": "repo-lines-v1:sha256:bcc809c36d1c5044221e09cd156095219b0fbaea8b5e1a5bde15919899d2e3c7:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBmNzIwODU0MTYxMmE0ODg4YjBkN2Y4NzYyNmMzYTQ2ZjAyNWMxNzVmMWI4NzNjNjJlMTkwM2EyODQ1YzMyZjMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkzYjA1OTc4OTYyMWM0YjJhYTk2NTk3ZGJkNTQ0MWY1MjEwNmU0OWY1YmZiN2FiZjVlNzdjODlhNDQ0M2VjMDAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE0OWNiMDE0MWI2MDQyNTBkNmZiOWIyMjE3Yzk4ZmVkYzRlNTk2NzY3OGM2MDNiZmJkZWViMzdhZWQ0YjZhMDkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImFkZDJiZDQ3NmM5NWYzYzg0MTA0ODZmMTEyNzA1OWUzYTI0NDIxZmFlNjY3OGI5MWU5MGVmMzMxNmQ5YzQ4MzAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_8ab441ee34604fa88213704aa4b32e57",
+      "statement": "Secret audit/listing tests verify plaintext literals are absent from audit and metadata, with rotation tests also inspecting encrypted catalog artifacts; diagnostic redaction masks recognized assignments, bearer values, URL credentials and key-like input, but FileAuditLog itself does not sanitize arbitrary event fields.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/audit.rs#L35-L49",
+          "version": "repo-lines-v1:sha256:922bb327b7bd01ce19a9df777ee0bcb0dbe77fc08659b7fafa23be9e72af0807:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImRlZWM2ZjM0MzI0ZDBmZGJjOGQ4ZTAwNWQwNDBhZTM2NDU2NmI1ZWY1NDkzZTEwMzE4N2Q5Yzg3M2EzNDE4MzAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwNzFjNmU5MjJkNjRlM2MyZDEyZDFiNDAwODRjMzFjYzRlNzgwN2ZiNDJlN2Y3MjI5Y2M4ODYwNWU3ZmM4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImViOWEwOGJjMjlmNmViZWJlOWE1ZjAxOTAzZDk4NDVkYmNiNTg0MmE0NTVmMDdkNWY0MDAyZGFjMzJhNWM2MDUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjkxNTdkYWNmYzVmM2I3OTYxYWY5NmMxNTIyOTM5ZmM0ZWU0YzU1NDFiMzY1OTUwNDFkYTE3YzEyYzMzNjI0YTcifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/management.rs#L376-L406",
+          "version": "repo-lines-v1:sha256:c3642e03f2e20f7a1eb4a1ced03c9ae1bf913190965c243a0cead76c60af1b0d:eyJzZWxlY3RlZExpbmVDb3VudCI6MzEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY1YzQ4NTJmYjY3YjliYjZlODA5OTIzZGVhYzE1ZjkwNmRhODQzOTBmZWQ1NzAyNTY5ZDMzMzU3MjM3MzUxZmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImVmZTE4ZWQ5MzhiZDg5MzBiZmEwNDllYmFiZjYyNzcxZTNjMmM0MzZjYzY1YTRlNzY4MDFhNDA5NTRkNWNiMzkifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/tests/secrets_redaction_tests.rs",
+          "version": "repo-file-v1:sha256:4f0e5ad3e18ccf1844da7c4a0b7ea94d37cae04be2e6c91e337d6624a81f7203"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/tests/secrets_rotation_failure_tests.rs#L155-L168",
+          "version": "repo-lines-v1:sha256:b760610fb2acf04ce2e3e1536286b18b6034d6bcd82ac0bc91a4d3c046de501e:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImMwYmU5YTU3Y2RlNmFjZDAxMTNmMzU1MWNhZjg4Zjk1ZTgyMWI1YWY2YjM1ZTkzMjhiMjhhM2U5YmNiYzY5MTEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY2NWQwOGJmZmRkMWFkNDc1NzljY2I2ZWZkODI2YzkxOTUyNGZmYTA3YmU5NmRiNzFjYWRjYTQ0YTExNjFjNzIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM2MzUzZGVjMzc1ZmRkZTE2MTZmZjQ4NjJlNjkwYzc4NjFkODNmMmI5NTdlOTFjZmJhZDNhNjQ1ZmViOWFhZmEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjIwOGU3NDI3MzYyNzg1MTcxMDY0ZTJkMTBjN2VhNzA0YmUwYmVjMTRhNWFmZjI2NzEyN2U0OTlmMjY1NzkxYzUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/diagnostic.rs#L222-L233",
+          "version": "repo-lines-v1:sha256:5c650a86858fe2a3bbf48290bc5559b2f1c7c931fefd921f654582b0bccbdd06:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU2YzE5Y2EzNWU2NTk4YjM1MWI4Y2JhNzc2MTQyOGNlOWUxOGRmMzU4MjBkMDNjNTZhMmEwYThmZDYwMzk4NWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc4ZGQyMTJlZWEyM2UzNThkZGUwYjk2ZGM3NTY3NTkxYWY2N2EyOWNiNTJiOGY0MzQzMDk1N2Y3ZDdkZmIwZTEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_bd57ed2429794a91a4151a7c4eebe9de",
+      "statement": "Repository security documents differ in scope: the readiness report records a closed internal assessment while the threat model says a commissioned independent report is not yet available; their broad boundary statements do not establish identical protection on all current listeners.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/management.rs#L147-L165",
+          "version": "repo-lines-v1:sha256:446a40a188ebbca8fefb0eda95b08aa537d32126ba910091ab8f0205b6a4cea8:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJiMDg4NTMzY2VjYjU3OWE5MDFhNDk4NGY4ZGUxYzgzOGQ3MzVkMjg5ZjUxZWIzYzdiN2ZkOWIyN2Y4ZWIyMWQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc3MmY2NDk2YTNlMjI0Yjc0ZDRkN2JjNTNjNDg1NGRlY2M5ZjM3OGFhYTk1YjVkMmFjNzU5YWEyZTUyMDRjMjciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImZhNDM5MzQ5ODAyMzAzYzM5MTE1OTUyNWIzMzM2YTI4YjU4YjlhYzc4NjQ3ODAwYjExY2RiMmMxOGNkMjY0YjIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc1NDZhY2VjMTlkMjk2YzgwYjZjNTM1NzliNjhmMTBiZTljMDM0YjFiYjczOWYyYWI0NjBiZTZmMmNhY2JjNzEifQ"
+        },
+        {
+          "resource": "repo://docs/security-report.md#L1-L19",
+          "version": "repo-lines-v1:sha256:86eeebf265e0b6f4222b4754eb361af059dc6dc963f0f7e0ded0b6a9d9db4240:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhlYjUxZDM0MjlhOTIyYzIzODRjMDk1MDU1MWMzNjI0NzVmMWRmMzU1YTkyMGU4Y2JmYTIyZTdlN2U2N2U2MDIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjViNzk5ZjdjZDYzYmQxODA4YTQ2NzRmMmJkODAzN2ZmNGJjZGU0NGU5OWQwMmExODg2ZmEyZTMyYmYwNzY5ZmYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEifQ"
+        },
+        {
+          "resource": "repo://docs/threat-model.md#L19-L21",
+          "version": "repo-lines-v1:sha256:875dfa4b6c6e2af06e24029b19e995c30cd113d36964f60c8e3ec9c2bc62b3c3:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiOWU0M2YxZGNhMGE0YTg0OWI1MGVmZmUyYmRhNzg3YTNhYjZhNTgyZGIxNWYzZWVhZThlM2ZkYTdmMDk4NWE3YyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNDk3MWQ5ZjY5NjNjN2Y4MDY3MTg5OTUxMGNjZDM4MmU4NjNkNzRhYWFlMmMwYjgyMmYzZGEwZTdiZjYxYjAzMyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMWZhNmEwY2M3ODZiMWY4ODM4OTU4MjJhNmJkZTgyZTQyYmRmMWMxZjUxZWQ1ZGU5NzFkNTJlN2RhNDZjMWVkZCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjAsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSJ9"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.7.2",
+    "at": "2026-10-21T16:22:36.376Z"
+  }
+}

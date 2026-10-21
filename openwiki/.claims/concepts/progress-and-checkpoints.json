@@ -1,0 +1,478 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:2c11d4863840068c6de97fcf61c71da024ee0e68daca2420cbac63ecad7026b3",
+  "claims": [
+    {
+      "id": "claim_53c72b3df54b46aeb8b206e3a1b7a324",
+      "statement": "Logical epochs, event-time milliseconds, processing-time milliseconds, source offsets, and checkpoint round IDs are distinct progress domains; Epoch is a u64 logical number rather than a timestamp.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-connectors/src/source_runtime.rs#L93-L123",
+          "version": "repo-lines-v1:sha256:220c0f57796aea55ca8ec08c4f5af7332a4df1cc83b2302e28f02bf3ff9a63b9:eyJzZWxlY3RlZExpbmVDb3VudCI6MzEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU0M2YwYWQzODI5ZTBjMzZjODA2ZWQxMWQ0NzI4MDM2YWM4ZTRlZDkzNDA1NjNkZTUzOTkwMTIwZDQwZjlkNzYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY5YjE5ODJlOGRkNzQ4MTE4MTQ2YjM5YTJkMDA2MmY0MDgxZTM0Nzc5Yjg2NzVjMjM0YzRmYjEyNGRjMzkzOTAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjZiMjBlNzhiOGRlMmI1ZDBlYzRlNDgwN2I0ZTNhODFmYzIyYjczMTQ4Mzg2ZWVmNzM1ZjZjYzFlMTIyYjRkZWMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjdmOTQ1NTMyYjIzMGJjNjE5Njc0NmNjZWRkMDNlN2RlZmZhNjNiMmFiMDc0YTI5MmQ5NDdiMDA4ZjllYTJhNTgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/checkpoint.rs#L31-L48",
+          "version": "repo-lines-v1:sha256:f100aa7a2990d73fc399a8c02b32faa1037d9633b519257ab940448d8dc24f9e:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQzZjE0ZjVkZDZkZWU2ODNhZTk2MTEyYTU3ZGIxZTc4NjEzMGNlYjVkNjYxN2ZhNmM5N2ZlNzlhYTc4NzliZTIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjU2YzI0N2I1ZmUyMTRjYWZlNDRkN2JiNzVkOTQwYmQxODg2MjQxZDdmOTVmZDFlM2MyNmE2OWNiNWJkYzAxZjciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQwZTU5NTExMWY4YWRhMzUxYTFhMmM3OTNkZTg5NThkZWZjZTk5NWU1YjE1ZDQ3MDA0OGY5ZTkwMjkxYTVmNzYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/lib.rs#L105-L118",
+          "version": "repo-lines-v1:sha256:cc25b63054798ddcc21b051f03a6c06506f60ff1ceee674806f48fdbba4117c1:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgxYjBlNWJjNDQ1MWI1NjYwM2ZjNTAyOWEwZDM2MWQ4MzBkMTVkZGI2MmEzZDgzYmZmMTdhNGVlMTMzYThiOWYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijg4NzU4MjExYTExYWUzZTdlY2Y1YmVjNmFlMjRhNjJiMGIxM2NkNmFmNTYzYmIzNDEwNjhiYzRjMTI4ZDA3OTYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjdiYzk4ZDZiMGRjNDkyYzUwMTZkZjEwODA1YTNhNTRlYjljMTg0YTVhNjEzN2U3ZjRiZWNmYTBjMjIwNTUwZDAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_1c8e3e7fc32445c69026c2a173fda422",
+      "statement": "Source epoch allocation follows the recovered source registry and rejects exhaustion, while ShardDb provides a separate checked atomic allocator for direct-write epochs; allocation is not itself persistence.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-connectors/src/source_runtime.rs#L116-L143",
+          "version": "repo-lines-v1:sha256:81006d374e8b402f0db0d9dc401496094bdc1306860c04d160807552edfa22fb:eyJzZWxlY3RlZExpbmVDb3VudCI6MjgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjcyZGI4NTkzMDYzYjAzMDEyN2VjNTMxYjdlMDM2MjM0MGUxY2YwMDhmZjg1MTFlNTAwYjgwOTk5OWMyZGQ2ODIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwZjNlZDQwNWNlNTRmNmU1MDI1MTZhNjM5MThkMTE5ODkwZDI1Mzg1ZGU4OGIyMTllOWI4ZmUwMjY5NGMwZTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjZiMjBlNzhiOGRlMmI1ZDBlYzRlNDgwN2I0ZTNhODFmYzIyYjczMTQ4Mzg2ZWVmNzM1ZjZjYzFlMTIyYjRkZWMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE3MjJkY2FjNjc2NDZmODQ1NzE4MjVlNDU2OWQ3YThjMzBhZTQ2ODdjMjcxYWVjOTJmZjJhYmRlNTQ4ZTQ4OGEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-storage/src/shard_db.rs#L649-L671",
+          "version": "repo-lines-v1:sha256:01ec5c0e56b929fb367d4aa6ef5b6be5a16b932b0bf73bc583d3cb1b5ae89f28:eyJzZWxlY3RlZExpbmVDb3VudCI6MjMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE4YWViODgwMzVjOTdmNjgwYjk0N2JjNTY4MjgzNGMyMzQ5NzFmZmVlODAzNzkyZGJiZTAwYzBhNDc1ZDIzZjkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjJjNmFkMTdlNzhiNWM1YjQzNDNmOTExNjNmZWVjNTIzZDc2YmMzNTUzZTgyNWYxOTk3YzIxMGViYzc4Y2MxOGIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijg0M2QyN2IyNTU5YmJlMGQ2YjRmZDc2ODg2NWY4N2VmODI4MTllYmIzNjZkODJkNTkyMDE4MDcyZjhhMWZiZTgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImY2YzNiNmUyYzZmNDY0MjU4NTA4NDEwNDc4NWI3ZWZiOWNiYzU3ZDM2OGI2OTJhMjM4ZDlhOWIwMjYzNWRlYzkifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_c5d297a8a8a24ec99f90a5a2cfd068ac",
+      "statement": "SourceRuntimeCoordinator recovers the highest committed checkpoint, ignoring prepared records, before permitting owner activation; replacing an owner fences prior owner leases.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-connectors/src/source_runtime.rs#L126-L143",
+          "version": "repo-lines-v1:sha256:5666bb823a14da5e334270b338d95b8767560be570468d2e2a45f4c8c3e0ff34:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJlZTQ4ZjFhZjYxMjdlYzVhMWMxYWM0ZWY5MDMyZjBiOTI3N2I1ZTQ0ZWI2ZGMxMWIzY2FlMjE2NDg4YmZlMTYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwZjNlZDQwNWNlNTRmNmU1MDI1MTZhNjM5MThkMTE5ODkwZDI1Mzg1ZGU4OGIyMTllOWI4ZmUwMjY5NGMwZTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImViOWEwOGJjMjlmNmViZWJlOWE1ZjAxOTAzZDk4NDVkYmNiNTg0MmE0NTVmMDdkNWY0MDAyZGFjMzJhNWM2MDUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE3MjJkY2FjNjc2NDZmODQ1NzE4MjVlNDU2OWQ3YThjMzBhZTQ2ODdjMjcxYWVjOTJmZjJhYmRlNTQ4ZTQ4OGEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-connectors/src/source_runtime.rs#L174-L202",
+          "version": "repo-lines-v1:sha256:f8249485de04873469388f5a00828d90bcc37e594772d955d63606cbd58acfa9:eyJzZWxlY3RlZExpbmVDb3VudCI6MjksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU4NGMwYzU0ZjMxYzk1YWU0MWQ2NzQ2YTg3ZDdhZmU4NDkzNTE0ZDdjOGQ4MjE4YTczZjJkNWUzNzdhZGU5YzUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImFjZGZmZGUyZjc2ZmI5NTBhMzg1MjE3NmQ1ZWFjYjA3NDNhNDEwNmEzNjdiOTZjNzNiM2ZjNmMzYjRhZTc3NzMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjJlMTI4MmRiYmJkYTY2MTliMmYwZGU0OTE0M2MzNGMwZDRiZDUxNTAyNDI0MjI0ZDA0ZWM5MTg1MDAzYTIyYmUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_a0c7ff6a05be471c9e913719d9defb57",
+      "statement": "SourceRuntimeCoordinator commits input, committed checkpoint, and progress state in an M3 batch before upstream commit_offset; acknowledgement failure leaves durable local progress and blocks with a recovery diagnostic, and the named in-flight epoch limit is 64.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-connectors/src/source_runtime.rs#L18-L19",
+          "version": "repo-lines-v1:sha256:dd34344772091d9ac2737fdc6a45196262baef22bed967a1f47f80b6f391d760:eyJzZWxlY3RlZExpbmVDb3VudCI6MiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNDY1ZTM0YmNhMjY5YjRmNjJkYTJhZjRlYmRmMWE3NWY3MzI0MzY1YWJmYzJkOTY3NjYxZGQ3MjRhNjEzNmE3NiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZGE0N2JhM2UwNDZhYjAyMTBkNzM4ODkyMzViZjEzNzYzMmExNzc0Yjk1NzIwNWUyMmJiNGYyYmJkMDIzM2UxYiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMDBlMjY0YWMzZmEzMDQwNzU2NTQ5NDFmZjM1NDg1ZDUxNzU1NDc5ODA5NWExNTQxODY2ZDQ4ZjIwMzg2NTg0NSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNzlhZGIxZWEwZDdhMWRhMThjYTBmZmE5ZmNhNzVhY2NlMGEwNjgzMGQzYjdlOTIzYWM5NzYwOTQyMDJlNDY1MiJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-connectors/src/source_runtime.rs#L239-L309",
+          "version": "repo-lines-v1:sha256:e134dd1823f6814075955dc0d3a3177b5a65560314eb14cfb16c205edd5e20f1:eyJzZWxlY3RlZExpbmVDb3VudCI6NzEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI0MGU2YmE4YjIxNmYzMmFkZWVjZTVmYTY2ZTM1Yzk2ZTcyZmVmYjM3MDhmM2EzZTQ1M2E1MDJmZTMyYTI4OTQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwNzFjNmU5MjJkNjRlM2MyZDEyZDFiNDAwODRjMzFjYzRlNzgwN2ZiNDJlN2Y3MjI5Y2M4ODYwNWU3ZmM4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRlNDNiYzRkYjA1NTQ3NzI5ZTdlMzYyYmZhYWIwYjk5NzM5NjhiOWNkZmZhYTc2YjI4YzRlNGM5YTQ0YjQ0MmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ1NjczZTBhYTg0ZGQ3NGE1MTg1YTIxMGYyNzFiZmUzMjM2MzhkMWZjNjc0Y2I1ZGM1ODI0ZWU1MzQ0Mzg0NDIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_d8ebadceaf0348de966652543574926a",
+      "statement": "ShardDb::commit_epoch writes and flushes the supplied epoch unchanged before returning a scalar frontier report, with non-decreasing ordering required of callers; it does not convert a committed epoch into an exclusive next epoch.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-storage/src/shard_db.rs#L1310-L1337",
+          "version": "repo-lines-v1:sha256:0ade840fc77a49ae7c8aaa4864991f101fc94b648454f4e72eb31f220a376308:eyJzZWxlY3RlZExpbmVDb3VudCI6MjgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU4OWQ0NGJkNGIyODQ4NDBlZTQ3OTMxYTRkZTFjY2UyZjk4YzI0NmEyM2U0OWJmYTY3MGEwOGFjMzkzZjE2MWUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjY0MGI0NjI3MmE2YWM1YTk3NGZiZWIyYzAzNzA3YmVlZDA3OGE5OTUxMzk3OTUzYzBjYWMyZTBhMzBjYjQ5M2YiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ0YThkMmFiNjk4NGM2YjA2Y2RjZmRjMTBlZGY0YWVmMTQyMDcxMGE5NDdlNzMwOTUyMzNlZTQwZTMxZWY3YzIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_eee4fae4d2664c8c94462d0e1719ef73",
+      "statement": "ADR 0005 and MembershipFrontierReport define frontier F as durability of epochs strictly less than F; ClusterFrontier::has_committed_through(x) tests F >= x but documents completeness strictly before x rather than inclusive completeness of x.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-types/src/frontier.rs#L240-L251",
+          "version": "repo-lines-v1:sha256:ff149b081b065c671fccaff6fa8c0296f1745a5e86971a09cd7ad21fffe93229:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxYjgxZjlhZTg5MDM1ZDA4ZmY4NzBkYjc5YTZiMGI2MDU4YTYzZWJlNDE0MDM4NzBmZDEzNDY2ZDljYTNlMjEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg5Y2U5NDhkMTM2NmY3MmRkYWU4ZTVlMWU2NmYyZjY0ZmIxMGQ2NTI0OWJkM2JiYWU3NTllMGNiNDI0YTA0MWMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUyYmE1MjM4YjdiN2Y1NWVkN2FhYzY2ZWM4MWNjOWIwMzg4ZjE4ZmY3OTYyY2U2NTM0NmY5NGY1MzU3MWZhYWMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZhZDgyMmRmMzk1MjcxMGQ4MTFiNzVmODIxNTEzNTc0ZmZiYmE4NzA5MDI2ZjU4ZTBhMzZjNjI4NmFlZDZjOTgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/frontier.rs#L442-L460",
+          "version": "repo-lines-v1:sha256:08140a2a2d5b1c3405287e208ab540a70ae5b2576b0181f967b7dd3ef50d6612:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJkNjEwNWMyNGNiYjcyY2I1OGVjNzRlOTdhOTU5MGJhMWZjM2E3Mjk2YWUyZjNhNTNkMmJkNDRiNmEwYjcxN2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjdmMGJhMmIyOTY5YTY2MGUzMmVmOTViM2ZjNjcwNDQ4NjRmZjhkODQ2MThlYTc5MGFjYmJkNmM1Y2JkZTI3N2MiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjExNTU4ODM3NDM2YTczM2M1MjRlMzU5ZWFkYzVhMzE5ZTY4MjJjMzhkZGRhMmViMmUzNTU2ZmQ5NDQxZGQ4MzcifQ"
+        },
+        {
+          "resource": "repo://docs/adr/0005-frontier-membership.md#L14-L32",
+          "version": "repo-lines-v1:sha256:8d0451a40617099d1742e07f0eb79509cb86a62149a117cace6d878de3ee9496:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgwMTY2OWI4OWMxY2M3MjFkZGM1ZGZkMjljYzkxNDMxNmMwMmNkNTU1MDUxYzlmMGI2NTkwNTBjMGU0MjQxM2MiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQyNmViMWM2ZWIyZmViY2U3NmMzNWNhYjYyOTYwNzc0ODkzMTEyYzRkYmI2NTlkMWVjZTc0ZjFkOGFmMzI3MmEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImNiMTU3YTZkMjc2N2ZmN2Y0MTMzZWUyNzY1MTM2N2M2ZmRmZjdhYjRmZDliYTNjYjQyNjJlMmFhNDQ5MGNjYTMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImVmNzMyODlkZTFiYjVlM2E4NDM0Y2ZmMzYxNjczOGY4NWU3ZDQzMmM5MTM2Y2E4MDk0MGI0NTk4MGE4YWViOGUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_3e701217882b49beb2557b4c320787af",
+      "statement": "The worker execution path durably commits frame.epoch through PhysicalCommitGroup, which writes the largest committed epoch itself to the shard frontier key, and then sends ExecutionProgress for that same epoch.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/group_commit/physical.rs#L464-L505",
+          "version": "repo-lines-v1:sha256:9e6115f7b15164badad5f73025f195609b5ce5bf17fa1bc0237b19f253ebae2b:eyJzZWxlY3RlZExpbmVDb3VudCI6NDIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA5MjQ3YTBkYzUxYjkxYTIwZDYwY2ZjMDE5M2Q1YzU0ZWY4MjVmMjdmOGY3NzVhMTVkOWRiMjVkZmYwOWUwM2EiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA3ZjQ4M2FhNmE3ZjYxYjk1NmNkODYxM2E0NjNjNDNlYTU3ZWYyMzY3ZjJmMWQzYTFmMzg0YjhmM2ZjNTNkNWYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjY4ZjUzZDI3YjlhNzhhMjJmMmZmMmM3YmIzZGIyMWIyMDBhMDNlZWExYjVlZjhiMDlhMjNmNzE3Yzk4MTYxYzUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijk5MDc4NGMyZDA2NjBiNWJjM2JiMWEyZDUyNTBmYzA2YzIwNDNkMDAwZjE2YTU5MTc1ZGMxMTk0ODI4ZDYzMzEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/client.rs#L343-L389",
+          "version": "repo-lines-v1:sha256:0e1cfa9d4286ac1752b5ff6eecf704837e488512b37c9493ff749725e1c15e5c:eyJzZWxlY3RlZExpbmVDb3VudCI6NDcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU1ZTExODgwZjVhYWRkMDE5NjAxNjhjY2YzMzljZjQ0ZjJmZjBiYTIzMDJiYmY3MjllZDZjMjVhZjIzNjNhMWMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBmZGUxMWM0N2U3NDUyM2ZlMDVlYjY2ZjkzZWI3NzFmMzUzZjRjM2Q2Nzk5MGNhNTIwZDJiZjI4Y2NjOWU4YjIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjBjZGFjMjFmY2NkMzEwMWVlZTZhYmFlZTRmYmQ3ZDkwZGY0NDNmMGNlYTNlZjM1ZmQyNGU2NDUwNzc2NjJkMWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ1YjQxM2UwNzVkMmZmMDk2OWRiOGQzODUxN2FmMDkyMGNmMzM0MjQ5ZmFhYWQ1NTgyMDBkNjYxNGNjZDFiZWUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_d85baf031e5449a892281099dbfe0892",
+      "statement": "The service forwards aggregated frontier values unchanged in ClusterFrontierAdvanced, and workers pass the value unchanged to exchange GC, which deletes epochs inclusively through that value; this boundary differs from ADR 0005's exclusive completeness contract and requires explicit reconciliation before using membership frontiers for reclamation.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L3651-L3666",
+          "version": "repo-lines-v1:sha256:08146991d0a13cb5a075195f2e8ad806677e6965b572c2696a19443b4fb2e995:eyJzZWxlY3RlZExpbmVDb3VudCI6MTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJiOGVhZDc3M2RiY2Y0MzlkMDA2ZDAzZTg1MzhmZGZlOWI4OGY5ZjA3NzNhZjUzZjkyZjkyNTRkZWZhNTNkNDgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImMwYWZjMTA3YjA1MWE5MDRkODdjODExMjliYzBkZDE1NmI3YTQyMWNhZmFmYzk1NDM0YWE0Yzc5YWM1MmE1ZWUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImIzOTIyZDJhN2ZhNDUwNzQ4OTk1MWQxZGU4N2UwNTUyYzYzYzEwOGIyZTQ5YWY4YjI0YzZjNmZlMmE4MjdiYjgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNlZjVlNGNjMTZmYmI2MGU1YjcxY2E4ZWFhNDA1Nzg3MGY5Njg3NTUxOWVjZjMwNGQyZjY0NDA0ZDQ5OTQ3MjYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/client.rs#L1857-L1866",
+          "version": "repo-lines-v1:sha256:d091d440c6788fa73c7efc156502fcb1531c1d2800bb711f4ec730c5cf246418:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ4MWNhYTIyMjI0ZWJmOWZhMjU0YzI2ZmE0NTRjZjAzMTk5ZDMwYmI0ZWIwY2E3ZWZmM2UwNTYxOGU2NTIxNjQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU3NTFmODE2MzhhNDNjNTczZWEwMDBiNzUwYmU0NmZlZjg1MzhlMjc1NTIyYWM4MTdhY2VjOWJhZTg3YWExZDQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUyN2QxYTUxOGQ4YjI2MDI2YWFmOTQ0MjQyOWZhOTQ4ZGQ1YmVkY2Y3MzljYjgwYThmMjFhYWFiNzI1MzY2MTIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImRlMGRmYWVmMzBkOGQ1NjM5YmE2MzZiMTQzZGViOWUxYzliMzFiNTlmZWJlYTMzMmY3YmYxZWQ5MWE2Y2I4ZGEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-runtime/src/exchange/persistence.rs#L328-L369",
+          "version": "repo-lines-v1:sha256:02714b20ec96f84846baae953d766027ab9b71cc0c60d431358c219293be3bee:eyJzZWxlY3RlZExpbmVDb3VudCI6NDIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZhMTIwZWI1NGMzZjJkYTkyODgyMzUyZmE3ZTY4MWZlNGE4OWRjMjhiMzM2MTFiNDAwN2M3ZjZmZWJhMjdlM2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjEwMDY4OTg2YmIxZDk4M2Y1NDFlYmY4YzYyZDBmYTlkNjJlYWRjN2Q0YzZiMTZmYmM0MmViYmFjNjFlNjBlZjciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImE4ZjkxNGY2MjVhNzdmMzYyNTlmNmEwZWQ0MWJmZTJlMTUxYjBmMjY2YjQzMDA3MDczODRjMWExMDQzZDJhYTkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ5YjNlZDU4MWY5ODVlNTk5Zjk1ZTNlMmU2YTEzZDA1MTVjNzQzMzg1MmEzYjQ2NTFjODI1YTExNGIxOWJmZjEifQ"
+        },
+        {
+          "resource": "repo://docs/adr/0005-frontier-membership.md#L27-L28",
+          "version": "repo-lines-v1:sha256:a6cc2c5f7f5774e08ac1d3809dbca88995e9f62ac409f5354125a8a481142097:eyJzZWxlY3RlZExpbmVDb3VudCI6MiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNDM5ZjMxZmVhOTU3Y2IyZWExOWExNDM0MzVhMmM0M2RhMGY2ODQ4ODRjMDNiNDM0ODA3OWVmM2Q4OWY0MTZmNSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiOTYzZThiMjdkMWUxODgxZmY2ZmNkMWZlYmQ2MTNkMDRkOGRkNTkwNmI0ZWY2YzQzMzMzMjY0ZTgyMjVlNjk5NCIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiY2Q0MTE3MGM4ZTljMDhkOWNkNzQ4ZmE3N2ZiN2Y1YjRiMmI3ZmEzMGVhZGZkYTliNTQ1NjdjMDAyMzAwZWNhZiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNzM4ODU0YjY1NTczZGEyNzQ2NzFiMjM5NTZmYWVjMjQxOTdmYmExZmM5NDI2NTRjMjZhOWEwMWY0ZjgxODJiMSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_e693829b5b4743daad83e05e92bc97ba",
+      "statement": "Configured frontier aggregation takes the minimum over authoritative active membership, initializes member progress as unknown, requires a value for every active member to compute a meet, and treats an empty active membership as no completeness.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L168-L200",
+          "version": "repo-lines-v1:sha256:018a8680ab8e7a92abe4d9b4a44cd5b1f7f62abd3372764f68aad5493916edb8:eyJzZWxlY3RlZExpbmVDb3VudCI6MzMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgzNWE5Y2UyZmU1M2YyN2M0M2Y0OGRmY2U2NTU4OGExOTUzMjFiMzE4NjY5ZDlhZTBmY2Q0M2E3NmQ5MzYwMTkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjJkY2UzNjJlYWQ0ODA4NmMxMmZjZGYzNDU1OGYzZTBkMGVmMmU1NmE3Mjk0NWJlODk2NWViNzdiZmQ3YjA1MWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ1YWExNDRmZDBlMzI2ODlhZmZjMGZhYzNiYTIwMGY5OTk0NGRkZjE0MWE1ZTNhMGFjMjdiYjRlMWVhN2MzYzcifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L227-L268",
+          "version": "repo-lines-v1:sha256:be0f942c8636a985f80e2b62928dab2f2760a7f0c3351b8ad1c40510bf500f81:eyJzZWxlY3RlZExpbmVDb3VudCI6NDIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjcxMzBmYjg0MjI0ZTAyN2JmODE0Y2U1MmMyMjQ4YmNhNzhlOWQ1OTJlNjFiM2E4Yzk4YzgxMGJkYmEzZDhiZWIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ1MGUwZmNhOGMzNTZiMDZhNjVmN2UxMzlkZGVhNTliYTJiYTEzMWY4MDIwZTNkMjU4ZjkyNzEyYzUwOWMxYzQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_460c224596ae4fba856c236f9220a40b",
+      "statement": "Membership report admission validates version, scope, generation, active shard, and incarnation and advances member progress monotonically; the service, not the aggregator admission method, checks the reporting connection's current shard lease and envelope lease token.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L390-L445",
+          "version": "repo-lines-v1:sha256:6f99e64783b93df14a5081d7577b2199914cca9926fe50e63def19c68b2ac74b:eyJzZWxlY3RlZExpbmVDb3VudCI6NTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ3MjAyM2E4NzQ3NTNhMmU3Zjk1MTRjNzZlODkyYTc4OTU4NDA2N2FjNDAzN2Y2NDJjZjgwZmI0ZWQyNzYzNmMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUwNzFjNmU5MjJkNjRlM2MyZDEyZDFiNDAwODRjMzFjYzRlNzgwN2ZiNDJlN2Y3MjI5Y2M4ODYwNWU3ZmM4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImJlZGYzZThiMTExZTkzOGE2Y2NhNzQ1NWIzNjNhNDg0YzFiNTc3OTQ0ZTVhMWFkYjUxZDI4YjNkNTg0OTdmODIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNkNzdhM2QzMmM2MjU2MmY0YTQ2ODgwYmEzYzI5ODkwNzYyMzQ5NWM2YjdhODEwOGZlMDI0ZGRiMDUwOGQzNTIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L3675-L3683",
+          "version": "repo-lines-v1:sha256:96b9e89ae51e8b08ae9dd691a8deeae564d295c71ed39a451846a60161c735d7:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNmI1YTZhMzY3ZjkzNzg5YzY3MjJlZGI2OTZiMmM2MzgxYTFlNjBhODgwMzgwZjlhODJhY2NlMWRiOTUwNGY0MiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiYmIzYTIxOWFlNDEyZTYyMDcyODExNGRkOGVlODI4ZDViZmRlMGY4NWIyMmNhNzc1MzE0OTVkNzI4MjI5NWNhNiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNzFlZDY5ODRiODBlN2IwOTQ0ZGMwOWMzZmM4M2Q5ZGQxZTRjZWI2ZTcxZTY5YjY1ZWEwNTk4OTM3ZTRmYjVjMiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNDQzMzQ3NjZmNGMwZjUwM2Q1OWI5NGJiNWUzYTU0MTg4MzMyMDVkZjc0MzdmNjRkMTFjMWJmMWIwNzVjZmNkZiJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_ca27fe3abbe248e084836f35b45d0fa7",
+      "statement": "Activating or replacing a member requires a supplied bootstrap epoch at least as high as current publication; activation, retirement, and guarded replacement advance generation with overflow rejection, and retirement of the last member clears publication.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L183-L200",
+          "version": "repo-lines-v1:sha256:859daad172412ed6c7260d8bbcc638a80b1c50c6418f1139b4a56f8caa05db00:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YmQ3ZjU4ZTA4YjMxNjgzMjdmZGIzOGIzYjMyZjdiNDIwMDIyNWQ2NTBmZDE4ODgzNmE2NTcwNGQ2ZTRiYzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImViOWEwOGJjMjlmNmViZWJlOWE1ZjAxOTAzZDk4NDVkYmNiNTg0MmE0NTVmMDdkNWY0MDAyZGFjMzJhNWM2MDUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ1YWExNDRmZDBlMzI2ODlhZmZjMGZhYzNiYTIwMGY5OTk0NGRkZjE0MWE1ZTNhMGFjMjdiYjRlMWVhN2MzYzcifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L276-L387",
+          "version": "repo-lines-v1:sha256:ff03614a94fe4e9b9f385daa97607e5de47d913f95767d1e5790847978970caa:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEyLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI0MjQ1NGZjYTJjY2Q1ZDYzZGExZjQ3NjkxOTUwMGY4M2RlMTQ5ZWIzNjAyOGMyMDhkNjIyZTNmOGQ0N2VjMGQ2IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI3YjJlNzEzMWE3MGUyNmI0MjVmYzU0NGY2YjFmODkxZjBiZTViZDdlNzcwNzE3OTgzZThlMGM2NmMyMDhkN2Q0IiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI1MjA3YTlmODM3YTg1NjdmM2ZiYmNlZjk1MThhYmMxMTY4MzA0ZTk4NTViMjhhZjZmMTY5NmRiNjc1M2E2MWI1IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJmODJhZGMyZjBkY2ZlYmY1MDZiZmI0ZDEwZmNhMTVmNjY1YmZlMjJlNDhiY2I5M2RhMWI3MWNjMGI3NzU3M2YwIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_1bb1b10f5f604061a45479db43d8a32c",
+      "statement": "Bootstrap durability and membership configuration authority remain external responsibilities: the membership API checks bootstrap epoch bounds rather than proving underlying snapshot durability.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L277-L315",
+          "version": "repo-lines-v1:sha256:5220f45d57a6cf9395cdbb58ae6e039c0801e72d2b4d34586474c80c4b49bee2:eyJzZWxlY3RlZExpbmVDb3VudCI6MzksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjljOWEwZGMyZWFmZDI1NTRlZGZhMzFhMzU4OGIxOTg2YmY1MzFiZDYwOTU5MGEzZWM1YWE3NzhiNTdkMjQ1NmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdiMmU3MTMxYTcwZTI2YjQyNWZjNTQ0ZjZiMWY4OTFmMGJlNWJkN2U3NzA3MTc5ODNlOGUwYzY2YzIwOGQ3ZDQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImU3NmI1OTRjYzcwZmNjMDQ0Mjk4ZmYyMjE2YjFlMjY0NDUwNDI2ZjE3NDNhNjVmMDU3YjM3NjRhZmQ5MDE2MDUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImEwOWMyNmUzYTQ0NGVhZDEzZjVmNzI2ZWE4MTliY2YyODk1NGY3ZjU5NTMwZGEzZGQ3ZDFhZWU2MTM3NTU4YTYifQ"
+        },
+        {
+          "resource": "repo://docs/adr/0005-frontier-membership.md#L34-L40",
+          "version": "repo-lines-v1:sha256:60b5c0cb4ee69dd2171e35e7ec8c3c4b921dfe91ebe9adba67526f8c1e0bc878:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiODYxMDViNDE3ZjE5NTg5NGJmNTE5YmRlZDdmY2M0NzgyOGJkZDZkN2IyNzMxNDI5NzJkNjRkMDAzMjg2NDRiNiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZjkwZGQ0MjY5ZTE2MDM4MjNhZGM4YmNlYTY0ZjFmYjBmNjA1Y2FjMmMwOWU0Yzc3MGM2YjgwNDBlNTU0YzZkYyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZjYwODQ2Y2FlOGQ4YjQ2NWJkMmUxZmM1OTY3NDdmMmRhZjM5OWQ1OWYwZmEyNDkyZTllYWNjNmE2N2U1ZWRhMiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjAsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_7092ab7697744b808470e0e6ef721909",
+      "statement": "The scalar compatibility aggregator learns membership from reports and only advances publication, which cannot safely establish completeness after admitting a lower-progress member; configured aggregators reject legacy scalar reports.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L660-L700",
+          "version": "repo-lines-v1:sha256:75337fe2805b2b6e596503b27412932fa6e70266d202693c55592f60e3bda12f:eyJzZWxlY3RlZExpbmVDb3VudCI6NDEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBhMTk4YTY1OTc2ZjJkN2IwYmE1OThmNGMxOWQ3NTVhYWQ1MTc1MTA5MTAwYmQ0Y2VhMDlhMzcyZDFkZjdiZjQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI2NDRiNTNlM2IyZTE0YmU5YmU3ZDUyYTViODNkMjc0YmVjZGZkNmM5YTA1YmE1NTZhYzFlNmRhMTUxM2U4ZWYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM0ZDI3Y2I3N2I0ZWQyZjNhMWQ3NDM4NmI0ZTFiOThiZjE1OWYwZGVmOTUxOGY1NzdjZjI0MzZkMjcxYmNiMmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzY2JjYjFhYmY0ZTMzZTBjYjgwMjE3ZDEzOGVlYjcyNzZlMGU5YmMzNTYzYmNmYjE4NGRlNzYzNTExNTMyOTAifQ"
+        },
+        {
+          "resource": "repo://docs/adr/0005-frontier-membership.md#L5-L23",
+          "version": "repo-lines-v1:sha256:62e1320f12e89d089ae22f810f54041051a007d8189e85c4e6063ba2b90bb96e:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRlMzYzNGRiYjgwMWE3M2I3MGU4OWVkNzc1NDZjNzdiMTA5M2JiODhjOWU0NzkxOGU5NjY1OTRkYTQ5OTRhZjkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkyMDExZmEwMDU1OTRmNzIyMjZlM2IzZGIzMzM3YWRiMzA4OGViOWJhMjM1ZmZlZGM5MGE4NzBlOWRlMWZhM2QiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjM1M2QzNGUyNTc4MzI3ZWZjZjFmOWU2ZDFjZGE0OWY5NDQxYzFiNTM3YzM0Y2U4OGIzYTNkZjE1NGYyMjMwZDAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImNkNDExNzBjOGU5YzA4ZDljZDc0OGZhNzdmYjdmNWI0YjJiN2ZhMzBlYWRmZGE5YjU0NTY3YzAwMjMwMGVjYWYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_f7f1c861b50741538c816cc1814464b9",
+      "statement": "Durable frontier publisher election is optional wiring separate from local aggregation; the lease store serializes token checks, persists a strictly larger token and holder, and flushes before granting a lease, while stale acquisition is a normal race loss.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L214-L268",
+          "version": "repo-lines-v1:sha256:a0a59868b9a07c15d0eb0f1f98bf7c4845f09c83ede2717eed52884385f4927e:eyJzZWxlY3RlZExpbmVDb3VudCI6NTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJmNzljZjhlZDc2YjljYzZiYjJlMTBiZGQzMTM4NDM4MGYyN2YzMDI5ZjQ2MjJhZWNlYjJjMmJhZDMyYjc2MTIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhiYTBlZWUzMmRiM2I4N2JlYTFiOWYwZTBkNzQ2MGUwNWE5YjM1ZmJiYmJhZDM5YjZmNDE2NmI3OThmOTBjYjgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ1MGUwZmNhOGMzNTZiMDZhNjVmN2UxMzlkZGVhNTliYTJiYTEzMWY4MDIwZTNkMjU4ZjkyNzEyYzUwOWMxYzQifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L485-L565",
+          "version": "repo-lines-v1:sha256:e6c597c0aab75af84cdc8d777d85fc0bac0cb20fde709dc228cfdb81940bb8d8:eyJzZWxlY3RlZExpbmVDb3VudCI6ODEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVkMTNhNjBlMzExMjI2OTU0YTU3NTY1MmZiYWZlNWEwYTQ0NmM5YzhjZjNkMzlkMDk3Mzg4NjI4YWNjYmZiMzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjdhMmQyM2FlNWJhODQ1YzQwZTMzNDZlNjlhMjBjMTVkMDA1NmY1ZTU5YmFmODMxMDc4ZjgwZGI0MGE1NjVhOGQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQyOWM3MDFmMmI4NjI0MjA1MDhjOWYzMmZmNDNjN2Y1YmQyYWY0NTllNjYzOTIzOWFmMTE4N2I4YjlhNDlmMTcifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L851-L901",
+          "version": "repo-lines-v1:sha256:2978a91db2d1632dee72789ebdaef4302c1251ec773474ea71c34c708f706561:eyJzZWxlY3RlZExpbmVDb3VudCI6NTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZjNDcxNTc2OGUwNjBhYzhkMGY4NTY4NzljZjNhYzZkYzU5NzY1MTBiNzNkYTFlMGI4ZTQxODFjM2Y2NDIwMTQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA2NWUwNjMwNTg0YThmM2M0NmNlZjJhODNkYTFjM2FjNTAxNTk0ODJjZTgyMjE1N2Y3OWU1ZWY4ZWUwZmFkZWMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjJjMTQxZDA4ZTBiODI3ZWFmMDE3N2QxZWNiYWIwODA1N2E4N2FhMzAzZmEwZDAzYzE5NWUyNTExMDU4MTlhNjMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjhjYTZlYzliMGE2NjhmODVmZDBlNjU4NjgxZjZlM2MzNWQyN2Q4MTZkYmQxZTE4ZmMyNzU2YjEwNWJkZmQ3MjgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_f6b4bee07c2d4022a64045ed115fa6c1",
+      "statement": "Durable membership publications are scoped by scope and generation so publisher recovery does not import a different configuration's publication.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L1009-L1032",
+          "version": "repo-lines-v1:sha256:7d7f94150372e805a7a891c33d46a966f450e6f23cec03adfed4c5120432ccc6:eyJzZWxlY3RlZExpbmVDb3VudCI6MjQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBkYTlhOWIwZjlhOTJjZTRlYzA1YzcxYmY1OThmMmU2M2E1ODAyNzkyZDczYmU3MmEwMmRjOGRlNjhmNjdiZGMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBiY2Y1NTFmNzU1MmMyMDdmNzFiZjRmZWU1Mzg0NDNmYWY5YjY5ZjJmMmQ3MTM3NWU2ZjBkYWI1NTQzZjU3ZGIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjFkYzJhMGVhYzk2ZWNjYzljMGFmZGMzN2MxNDUwMWE3M2U1OTY5NDU5MzA4ZTkyZTljZjVlMDE0MjUyMDFlYWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L929-L938",
+          "version": "repo-lines-v1:sha256:65606860fc0604a2cce9d14ad3b311b66a42fc0f5e9590aadaa775b5a95bbaff:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImUyOWVlYzkwMTZlZWNlYTNjMDQwOTljYjU4MTUwOTBjZWQ0OWIzYWQxOGI2NDhhOGMzZDQ1ZDI4ZDg0YzQxYzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAzODI5MDkwYmM5YzBjOTg3YjVhYzczMjg0MzQ1MGFhMmNhYTZkZjliZDVlMzYyMzIyODE1YWY3M2YxOTMyYWQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhkMGVkZDY5ZTM4MzljMjVlOGQ5MmI1NDliZmFlNTkyZjc2NDc3ZjBmN2ZjYTdlMWUyZTc2NGY4ZWI0MDBjNzMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjIxZGM3NzM3YmRjZTdlNzkyYTViYjdmMDVjZDNhYTYzOTE2YzBkMzk1ZjcxNzc1YTE0MzY1MjIyMGNlMjgwMTAifQ"
+        },
+        {
+          "resource": "repo://docs/adr/0005-frontier-membership.md#L29-L30",
+          "version": "repo-lines-v1:sha256:2b5b200b66a9deb5a61a6a67b737a3e36920b8b52ad8f785f42fdf6fd1483d58:eyJzZWxlY3RlZExpbmVDb3VudCI6MiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNzNjMjYzYzMxMzhmMjQzNjFjMjNmYTI4MWVjZTNjMjlmMjJkYjIzOWRiNzZmNmQ0NzI3M2I2ZGQ0Y2E0Yjk5OCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMDkyYjNjYzcxZDEyODMzN2Y5NTY1MDRlZjBhNGExZTU1M2UwZGIyMzdlZTU2OTMxMDZjZTU0ZWY4YjdkYWYwYSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNGE3YTRjMGM0MTA1ZTE4YzI1NDFlN2FlOGM0ZDFlZTcwM2FiM2FhNWEyNzI5M2YxN2RjOTBhZWUwNjdjODJjNiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZjYwODQ2Y2FlOGQ4YjQ2NWJkMmUxZmM1OTY3NDdmMmRhZjM5OWQ1OWYwZmEyNDkyZTllYWNjNmE2N2U1ZWRhMiJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_c38178d992874202afc1fc0347847b82",
+      "statement": "try_publish requires publisher status and a meet, demotes on preflight token mismatch, and then uses a store assertion for current publisher fencing; the store rejects retreating writes and flushes publication before synchronized handoff reads, with RS-8002 and RS-8003 hard invariant assertions.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L1088-L1120",
+          "version": "repo-lines-v1:sha256:8a4eae218f5a987f9d7ddd730ced8e298534dfd3891eb277d28c884e0987a0e3:eyJzZWxlY3RlZExpbmVDb3VudCI6MzMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE0MzRiY2E2OGNmYmM0ZWFhOTgwMjQ1MTVlNmQ4ZGVkOTkxZWVkYjEyZjU1OGUxYWFmYWViY2RmZmMxNTExYzMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZlZjNmOTM3MzQ5YzlmZTAzMGFlYTdiYzhhY2IzMTMxMDYwZWFkN2I4NjEzMWEzNzIyN2U2YWIyYjZlMWM5NWUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjY0M2RkN2I5MWFmMDBjN2MwOWQ2ZGRiZTYzZDQ1MGNjNGY5NGU1OTU1YTJjZTU5YWIyNmJkMzcxYzVkNGJlMmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjBlYzZhNzUwY2IzOGU3MDA4M2EyYjUwM2FjNjI0MzVjNjU1N2RiN2RkNTI2NDEyNDUzZjBjZjljM2QzNWE1YzMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L584-L643",
+          "version": "repo-lines-v1:sha256:28b0a60242b847c92c4e3afc5d4bf570d71cd955ddd748a97eb45eae2752f121:eyJzZWxlY3RlZExpbmVDb3VudCI6NjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImIyYjg3ODkxOWFiMzE0ZmYwMGQ3NGM3ZGZlMzEwYmZhOThhY2E0ODk0NTllMTQ0ZWExNDkwZDMyOGRlNjk4NTQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjJlYjkwMjQwM2UyODY0NDY4YmI4ZGQ2YTU5MDk3ZjAxNzlkN2YxYjYzZjRlMjJkNGFiYjhjMDI5Nzg1MmJkNDUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRlN2U5YzQ4ZTBhYjAxYTYzODA4OWY3NzQxMWRiNGUyYmEzMjk5ODQzNDQ3ZDJjZDhmNWQzZTRhZTE1MzViNzEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjhjOTllZjY3ZTFjOGZmNDkzNjlmNDg1NWYzZWJiMmFmNjQ4Nzc2Y2JmODFlZWE3NzJlYzgyZTJhMjg2MWM5YjgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L904-L1005",
+          "version": "repo-lines-v1:sha256:fb98cd79d8249f80a86067644d56c3ab21e68d5107a86089ed3c22af498f52a9:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAyLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI4ZmRkNWYwMzA0NDI4ZDcyYTBiMDg4YmViNTQyNjgwODdiYmI3YmI4Mjk2ZmQwNzY4OTNlZjY5YjkxOTU3NDE5IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJjMjVlMGE1YzQ4NTUyOWNkYjgzMjc3M2QxMGE0NzUzZmRiYzA4N2MyNTA5MWU1ZDhkYWJmMmJlZDE1YWVjNGFiIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI1NTMxODZmNGJjN2E1NTZjMWM4MWQyOTUyZjRkMTkyYmU2MzRmYjRkNzk4NmQ4ZTJkYTFkYzNmNzFjZTEzYzg2IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiIxZGMyYTBlYWM5NmVjY2M5YzBhZmRjMzdjMTQ1MDFhNzNlNTk2OTQ1OTMwOGU5MmU5Y2Y1ZTAxNDI1MjAxZWFhIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_e0ad32d4c31e4549a59f6ee19c41d3de",
+      "statement": "The scalar control-service frontier handler ingests locally, gates replies on Raft leadership, and reads cluster_frontier rather than invoking the optional durable try_publish path.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L3599-L3673",
+          "version": "repo-lines-v1:sha256:21405e8c97c74565529671e8974f9119fa556b9aeeca5a0c189a771fc3c3bfa9:eyJzZWxlY3RlZExpbmVDb3VudCI6NzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE4YjY4NjU0Y2I2NGRiZDU5YWEyZWQ2YWY2ZGQ1ZTVmYzdjMDVkNGVhMDVlOTliNmMyZWM4ZWM5N2Q3NjgxZmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBjNjQ3OWNjMjMwNDQwZmQ0MWU4MjI0MjE4Njc5Njk4NTU5ZDI4OTNiZDY3YjQzODBhZmFiODExYjM4YTU1YWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImQ2ZGMxZjdiZDdkNzQwMDAxNTMyNGM4NGU0ODAxNjE5NTBlNTk3NjA5YmI4MTllODdhYzZkZGJjNTQ5N2JhNzUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNiZTY4ZGYzYTY3NDMxODdjZmI3ZDI3YWY2OGY4Yzg4YmViZmE2NmQ5NTI3NWRhNDM5YzIxZGE1NWQ0MDlmYjIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_63a2b78a5bfe4e01b48fc71447463be0",
+      "statement": "CheckpointCoordinator allocates checkpoint rounds from one with overflow rejection, reserves one separate alignment credit per registered shard, and delegates barrier injection to the caller; the barrier contract requires draining in-flight input and local operator completion before snapshotting.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L194-L215",
+          "version": "repo-lines-v1:sha256:4c729c0f93444492da3c40baed3d43584d50537af99b633ac8c9022a399fccae:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBhN2UxNTY3ODEwOTkzZWQwMzIwYWVkZjc4NjQwNzVlYzYwODcwNjNhMGY1ZTRhNjAzMDlkY2I4MmZkNTcwNWQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ2NDk3ODYxMDdkZGRhZmE3MzlkZGE0Yzc5NTFkNDc2ZjMwMmZiNjBiNzIzN2EzNTIyZDYyZjEwNTVkNWE0YjciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImJjNDRkYjE2N2YwMTc4MGNhMGJjZjczYTk5MmU3MmNmN2RiMWJkNjc0NWQ4ZDYzYmI5NDlkODIxOGNkNGFmODgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L229-L310",
+          "version": "repo-lines-v1:sha256:9f4d1867d81e4d17f033343b4c456d0a1a5574e853812d6efe0ec0b2cd03df12:eyJzZWxlY3RlZExpbmVDb3VudCI6ODIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU2OTg5ODdjMjQ3MjMyNTI1YWI0YWViYjg0NTAwODA3ZTdmY2U2ODhmYzYwMTZhNmZjOTc3NjBjYTgzZWMzMmMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxYmE0NzE5YzgwYjZmZTkxMWIwOTFhN2MwNTEyNGI2NGVlZWNlOTY0ZTA5YzA1OGVmOGY5ODA1ZGFjYTU0NmIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImMwMmRhYzFiNGIzMzhlNzZlYzNmMjdmMDU4ZGEwNjhmNTNhOTJhZjVkODJkOWNiNmIwNDg3YzNjMzRiZWY0OWYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjU2MzM1NjYxY2IxYWExZDU5MDkwMmU2MDBhY2FhMTA3MTk2Yjc0ZjE5NjVkYzg3YzM5ZDg4NzM2NTI3MTEyMDUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/checkpoint.rs#L138-L157",
+          "version": "repo-lines-v1:sha256:706c80cf91f105fd32ac2f4df3b951d7e280127a8de72b55b68c296c523cbaa9:eyJzZWxlY3RlZExpbmVDb3VudCI6MjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVjNGVlODUyMmMzMzI4ZTBmODVjYmI4ZTBkZWQxZTNhM2Q3YTk1NjY0YjhlZDZiMzZjMzhiZjE4ZTkxNDg2ZTIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImRkMDhkY2Y2YzY5YTY5Y2Y4ZGFmYmQ5YzMzZDYwNjZlYjI4YTA5NjIwMzM3YTk0ZTBjNmM0MTNmOTMyN2U4NzYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_42621274fd2e42cca18e83ed30caff16",
+      "statement": "ShardDb::create_checkpoint uses SlateDB Durable checkpoint scope and returns both a manifest ID and snapshot UUID, enabling exact snapshot references rather than dependence on mutable latest state.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-storage/src/shard_db.rs#L1339-L1356",
+          "version": "repo-lines-v1:sha256:dbd347e3c8ef55e8d797c67389cfe69e492538d5687ef8a0ea238439421749bc:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNhMmVlYmI4MjE3N2UzN2M2MjYzZDcyNDU1YzU0Y2IzMTFmZmE4NWJjYTRlNjI3MWZjYWYxNzBhNGZmZWI4NjgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY5YjE5ODJlOGRkNzQ4MTE4MTQ2YjM5YTJkMDA2MmY0MDgxZTM0Nzc5Yjg2NzVjMjM0YzRmYjEyNGRjMzkzOTAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjBkM2VmNDg5M2U4YWM1NzBkYTRiMzFlYjM2YzYxODY5ZWM5OTQ3ODFhODRhOWQ4MTlmZTI0YTU2YTg1M2JkZDMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjI4MGEyOTljZGRlOGIxNTI4NTIyNDZlNTJiYWI3MzAzYWE5MWNiZDQwZjZlYjQ5Y2I0MmU0YmIzMjFjNDk5NWMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/checkpoint.rs#L64-L80",
+          "version": "repo-lines-v1:sha256:d50bcfca73a5326a6736c37602badb586b0b1d6407bff631bc9ed95120a0bc1e:eyJzZWxlY3RlZExpbmVDb3VudCI6MTcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU2ZTU5YTNmOWIwZTIwODFiNTQ5ZDI0OWExOGVmYjgzNGE3NTdmNzhhZGU1YTZiZjk0M2ViYzVjZDRlZDBiNTYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE5YTdhYmI0ZDI2NmZhODUwMDY3OWY2MDgwMjE5YjI4MTI0NTYzNDIwZTVkZDI0MzRhZTM1ZmQzYTdhYTZmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjY3NjQ5OTY2MjY0MGYzNmUyYmY3NDgwZmU5NGM4ZjM4Y2E3MmY1YzhiMGNhN2M0MjM5NjM3YmM0YWJiNTc1ZDkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjI2NjFkZTFhNTNmODU1NmNjZTFhYTRkZTg1NzEyMTllZWM0OGNhOGVkOWZiZWZjN2UwMzJiN2ZmYjYzZjM0NjgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_54a30f678539449e948bb0043f6119b0",
+      "statement": "CheckpointCoordinator validates confirmation round and shard, invokes the manifest commit callback after all pending shards confirm, and records completion only after callback success; it clears the round before calling the callback, so failure does not leave an in-place retryable pending round.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L468-L542",
+          "version": "repo-lines-v1:sha256:096da74dc227cf3ea1098004fba6317590c253209816c4aa0b8c911f87739d02:eyJzZWxlY3RlZExpbmVDb3VudCI6NzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjliM2NhMTFmOWUzMWU0ZGU2ZTM3M2RhOTQzNGFmZTYzMTcyYmY5MmEyZTFjZjE4YzMzODNmY2M3MWZiYTRjMWIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImEzOWY5ZDRmY2VhNmZiNjU0ZTBiMzkyNzExNTA4ZjA1YjVhZjNiMTUxYjYyYmQ0ZjNlYmZhN2U5MDQ2YWM5MzIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjM1N2QwYjIyMDk2OTY0YzI5ZDU2YTc2NzcwODQyMjcxOWQxZjQ5NjVlNmQ3NmQ0MjA3MGQ3M2VjNDA1MjE2ZTIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImYyNWQwNmI3MTk1MjFjZTc1NDkxYjRiZDJmMTIxZTM0MTVkYWFiMGE4MjY4MDJmODdmYmM4YjExMzZhODdiYzYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_e05d839cd0ce45ee8ef475aad4400e49",
+      "statement": "Changelog checkpoint collection requires matching round IDs, stages per-shard contributions before confirmation, snapshots contributions with the final confirmation, and asserts one contribution for every manifest shard.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L341-L390",
+          "version": "repo-lines-v1:sha256:11bc422f62a4fac8ce00a3e9924111353da01bb38d0c875d6b0bd0067b2651ec:eyJzZWxlY3RlZExpbmVDb3VudCI6NTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjE0NDkxOGRkYzg1NDhmZDk2MTNmMGNjMzZlMzRjNDM1MTBjYmI4OWI2YWM4ODI2ZjkxZTJkMmUyMzVjMTRlM2UiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMwNjM4NDU1OTU3NTVkYTk4NGE5ZGZmZmRkODk1ZjBiYjA3ZTVmOGY5NzAzNGMyMTk5ZmJhOTVhMDdkZmI0Y2MiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM0OWNjN2Y4MmRkOWVjYjk0NWI1MmVmNTg2MTMzOTU3MDAwOWE3OTA2ZWRlYzkxNjM3YzA4Y2FlN2RlOGQ1YmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImViOWEwOGJjMjlmNmViZWJlOWE1ZjAxOTAzZDk4NDVkYmNiNTg0MmE0NTVmMDdkNWY0MDAyZGFjMzJhNWM2MDUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L497-L518",
+          "version": "repo-lines-v1:sha256:c0ba4b777377dadaaca7b6933bd9b4d1b3ba404f179da9823040e3483d04eb5c:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFkZDhjNjU5OGJiMmYzMTA0NTJjNWNmM2U5YTExODQ2N2FmNGFlMDZmNDA2MmJiZTczYzM5NDllZTQxOGRiNDciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdmYWM2YWY0MGFjZGJkMjE3Y2VjNzA5NjBjOWI2OTllM2RkZGE1ZjlkNTQ0Y2Y5YTVhYWJkNzE4OTgxZGMwY2UiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijc5ZWZkNDg3Y2FjOWY5ZTdiM2ZlZThlNmQ3YWIyYmVkMzUwNTExZWI0YjdjOGQ1MGY0ZWJhNTMzMThjM2I1NmYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjI3MjUzOGM5MmI3ODA2ZDhjNDA3YThlMGI3MzEzZWYwZTVlYmI2ZDFlODc2ODVkOWZhNmI5ZmI2OTQxYWFlMGQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_af52f7695d674114a944c8b1b5aba63f",
+      "statement": "CheckpointManifestStore persists shard changelog contributions separately and writes manifests using create-only object-store semantics, accepting identical repeats but rejecting conflicting content; exact loading preserves storage/corruption errors while the convenience load suppresses them.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint_store.rs#L122-L218",
+          "version": "repo-lines-v1:sha256:88e29546a1888128d531101c8da51b548ebc7c1bf854456ece1d6d375c052472:eyJzZWxlY3RlZExpbmVDb3VudCI6OTcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjJiMWI4YzVlMzJjMmU4NDI2NjJmMjUwYjhiZDljM2RkZjM4YTNmOTUyNDBiZTdjYzI4Nzk0OTYwMTEwOTNkMDIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjNjNDdmMjBjOTMxOGVmOWQyMDllOTEwNzRiMzBhYTE3MTM4MDU2ZDFlZGMwNmI2MzNlZTgxZDk1ZTY3MjUwNDIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjY0MGI0NjI3MmE2YWM1YTk3NGZiZWIyYzAzNzA3YmVlZDA3OGE5OTUxMzk3OTUzYzBjYWMyZTBhMzBjYjQ5M2YiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjliODFmZTlhZDA0NGJlNTdjNWQ4YWIwZTNjYmM4NmJjMjMxZjllOWU3NDJiYWI3N2QzMzY5YTVhMGUyZWZjZGQifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint_store.rs#L30-L55",
+          "version": "repo-lines-v1:sha256:70b423718bf38b0f6f94fee860d08f07482d9b94ea1bf0bd1c115034de4ee055:eyJzZWxlY3RlZExpbmVDb3VudCI6MjYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRhYTAyMjNjZTQ1NDE2MTRlN2MzOTdiYjVmYWViMDUyNmIwYmQ5M2RmMGMyM2JmZjRiOTNhYTVhODQ0YmE3NDQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAyMjFjNGUzYjZiNTIwODEyYzNhMDZlYWRkZjE5MzcyOTUyM2VhODc1YzY2YTY0ZTVlODk3NTIyNzFkYWNhNGIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjgzMTY0NzM1ZDFiNmExM2E5MWE5MWRiMjg1NTVkMjkxMTkyZjQ1MjU3NzUwNDhkOWI3M2UzNDFiODhhNDM0YWUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_8f59e9183aa64daa9e47d3cac8f02f6d",
+      "statement": "The live worker CreateShardCheckpoint handler requires matching worker identity and active shard lease and rejects active workloads, so that entrypoint is an idle-shard backup mechanism rather than evidence of flowing-workload barrier alignment.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-runtime/src/client.rs#L1749-L1799",
+          "version": "repo-lines-v1:sha256:26d7da9bb718e10d4f5ea728e27d19253e25e9ccb6bc3d560bb06004ad69157b:eyJzZWxlY3RlZExpbmVDb3VudCI6NTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIyZDc0NGM3YzAyNjZiMDk1MzhiMGFmNzJhYzU4OGRlMjRhMWI5ZDcwNjA1ODJmOTYwZTFmYTIwNjY1MzdhNjAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBkMGIzMGI5NWQwMDRiZWQ0MWNiNDliYWIwY2EwNGFiMWJmZWZiMThlMmJlMGZlNDdhN2IxNTQyMDEwMjYwZjAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM5NGEwMDExNzg5YjdlMDk0YTNmNmE5NTUxMzQ4NTMxZWY5MjUyMzIxZGIwYmJhNjIxODg4ZTA4NWQ4OGMyNDAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZiYTJlMmJjZmY2ZDlhZTZjMDEzMjA5YTFmOWEwZGZlMGU2YjgzNDM2MDM0NzhmZjIxMmFhMzA0MzJjMTE4NTMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_161a4a8ee0cc4bab89dc60f5a473085b",
+      "statement": "Checkpoint alignment defaults to 64 credits and 60 seconds, rolls back partial acquisition, and returns AlignmentTimeout on a second begin even before expiry; expired-round cleanup occurs when begin_checkpoint checks it, not through a background watchdog in this coordinator.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L244-L280",
+          "version": "repo-lines-v1:sha256:a2b076f963c16f0947557c36718ad7df0491ba24315d5b1536239bde7589c838:eyJzZWxlY3RlZExpbmVDb3VudCI6MzcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjliM2NhMTFmOWUzMWU0ZGU2ZTM3M2RhOTQzNGFmZTYzMTcyYmY5MmEyZTFjZjE4YzMzODNmY2M3MWZiYTRjMWIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFlNTMyMDVmNjhiNTc2Y2I5NzUxZDRlZDliZTU3MGM0MWFjZmVhZTFlOWZlOTgyOGRkNGE5ZGU2ZTFmYzdhYWUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRiYjBiOWNhYTM3YjIwZTYwMTU2MjAyYjdlMzVhNmQ1ZGQ2ZDhjMmVmZTUwYTBjNzA2MjI1YmY3MmZlYmY1YTEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNmYzA0NjcyOWJmN2I1YWQyMmY3NDUwNjI2YWQxNGI1YzcyZGRjZGNkOTA1YTU3ZWRiZDJiMjMxNzZkMjJiMDIifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L45-L53",
+          "version": "repo-lines-v1:sha256:4619bee3a25605062e2d6163d7d21943f489e45a5327d712f3da748980ab7942:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiOGJlMTRlZTQwOGFiODA4Y2Q4ZmNmZGQ3N2MyZmU0MTQyZjA0ZmZmOTc5ZjVkYmI5NjY2NDExOWRlMjE4MDU1NiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMzMxMGJkNDUzMTliY2QwYjJhMzM0ZmU1MDBkNWQ3ZTBiYzJlMWZlZWVlMThmOTQzMzU4MDM0Zjk4Y2MwZDEwZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZTEyZTJjZTcwYWYyYWZhZmFhOTc1YWM1ZTg4OTkxOTEwOWExMDVkYWVhYmQyN2ExY2NjZmMzNmM1ZTg2N2NkYSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiY2UzMzIwZDQwYTc3MDNmYTczMWNkNWFiYThkNzMyYmY3YTViMWQ0NDY4ODRiYmZhNTY3YjFiOTAxNTkzN2NiMCJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_ed56fe25d93744a298f42375deb2fb47",
+      "statement": "Checkpoint retention keeps IDs at or above latest minus horizon, so the default horizon of three retains the latest plus up to three older contiguous rounds; in-memory pruning and explicit object-store manifest/contribution GC are separate operations with strict-below-cutoff deletion.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L52-L53",
+          "version": "repo-lines-v1:sha256:6d5f931449e7034f80eac98ff31a8e21b09fb5b488967b7ca4ccafd15810cf23:eyJzZWxlY3RlZExpbmVDb3VudCI6MiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNDgwMjJlOGM5NjdjZGQ4NTViMDZkNzc0ZTA3YzRjZTQ2OWE5OGM2NjNmNDUzYzgyNDlkZGE1YWUzYWJlYmIxZSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMzMxMGJkNDUzMTliY2QwYjJhMzM0ZmU1MDBkNWQ3ZTBiYzJlMWZlZWVlMThmOTQzMzU4MDM0Zjk4Y2MwZDEwZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMmY5NzJiYzBhNjIwNzE0YTE1NDZmNTRlNTFiNDFkZWNmNzU1ZWMwNTliODljZDBlODA1YTQ3OTAyMzdjNWM4ZiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiY2UzMzIwZDQwYTc3MDNmYTczMWNkNWFiYThkNzMyYmY3YTViMWQ0NDY4ODRiYmZhNTY3YjFiOTAxNTkzN2NiMCJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L531-L558",
+          "version": "repo-lines-v1:sha256:2e7b8a57dad89b3cb95afefa2bc0b7917e118ed91301548d72adaa11e279e015:eyJzZWxlY3RlZExpbmVDb3VudCI6MjgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjliM2NhMTFmOWUzMWU0ZGU2ZTM3M2RhOTQzNGFmZTYzMTcyYmY5MmEyZTFjZjE4YzMzODNmY2M3MWZiYTRjMWIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU2YjA0NDkxNDY5NzIyZTgzNjNhOTRlNDA0NDUzOGUwMTNhMmEyMTdlMzZiMWU1NjhiYTYwYWNiN2I0YzhmMmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQxZGEzZTNjNTUyY2IyYTYwODhhMjk1NTI0YjY0YzUzYzU0NWExMzc4M2VhOGU1N2VmZjgyMzNkMDMyN2YwNjgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImI0ZDMzY2Y5MzY0YjkxY2NkMmNkYjlkODVhMWMxNmFhMmZiZWI1Njg3NjJmYjhkMDZlZWEzOTE0MmVlZTQ5ZTgifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint_store.rs#L221-L239",
+          "version": "repo-lines-v1:sha256:dba83dd5d258eb5e9ad9c3b6942dde7677fb9c281366b56ce80f42691207b5b9:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM3Y2U3MDJiYzJkMmQyNzQxYWIxMjgxMzExMzQ1OTg5YmY3OTA1ZDY5NzViYTcwMjIyMDc1YWE1ODBjNzVjMjkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1MjJjNDJjZDE5YzZkMDNkODA4YzQ1MjcyMDU1MjgyNWI3ZWExYzViNDkxYjIxODUxMWNhYzc0MTVjZjlkOWIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImIyMzhhNTIzMThkYzQwNzMyMmNjZTYzYzkwZTY3ZDE4YTgzZWJmOWRkNDM2MjA3N2ZjZTIwZjJlZTE2NjNkODAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ2Y2ZjNmEwZDg4NTQ0NDk3MzFhMDJhZTk3MzIwY2ZmMzlhMTAzY2NlMDBiMTc5YzdhNTBiNzU0MDg1ZjEzNzYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint_store.rs#L85-L119",
+          "version": "repo-lines-v1:sha256:145685c9cd5a8a8f3fe7ed293e2b2b24d98c7a539b7440c219a75b9644ce50e2:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxNDY3NGY4MDE3NDNhMDc4YjI3OGYzOWRlMWQwY2ZiYTNmODM5YmIyMGQ2OTdiYTEzYTY1NDRhZDRjYWNhNDkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZmMzNhNzA4NDk5Mzc0YTA1OTg3YmFiZWZkZmVlYmJhZjg5MjAxYjA2NTllMWFhOTUwZmE5MzIxZGRhZDJlOTYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRjMWFlYjdjMGYwOTRmOGE5N2U0MDgwMTdkOWJlYjI5NGI2OWFlODZiMjFlMmM3ODU4ZmIzOTBjM2MzZDlhNzMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImI3NWM3NGFkYzVhMjM1Y2NiYjJhZDU3Y2NkOGIyZTRhMWQ4NzIxMjkyYjNkMzIxNWY1ZDgwMjY3YTEwNWU1ZGUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_a398583712dd40f78b2c7dd7b0fb0a7e",
+      "statement": "The scalar frontier registry is capped at 100,000 shards with RS-8001 on overflow, and checkpoint alignment exposes credit fill and per-shard alignment diagnostics with dedicated exhaustion/timeout/ID-overflow errors.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L219-L226",
+          "version": "repo-lines-v1:sha256:bace7bca9ca12364c321b1dbef203d5d5c400658f746a883af58e42d7c03ff6c:eyJzZWxlY3RlZExpbmVDb3VudCI6OCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNjcwMDFmZThjMWU3Mjc1NmQ3OGE5NDM4M2JjZGQ4NDIwYWNmYjU4N2RhMjU1MjZjMTYzMDY5Yjk0YmYzYzFjOCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMzJkZWI4Y2UwYjY2YTBjOTNhZTUyNTZhYjZiNzQ3ODAzY2MxYWUyMWFmY2FlMjBkYzgzY2I3OWM0NzgyZjYxNSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiOTk5YmRlZmVlYWNhNjM0MGUwMjkwZGM4NmU4ODljODlkNWUxODlhYTViYTQ0YjU4NWIzYjcwNzM0ZjRhNjJkOCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZWY2NjIzMmExMWM1NzQ1ZjA3Y2M5MjM5YWVmMDE2YmVmNDY1ZTA0YTgwMmFjMDVkMTU0NGRlYzQwYTE3NjM2OSJ9"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L57-L97",
+          "version": "repo-lines-v1:sha256:457cc75b25770a9b61b014467f0ead41666713eae8d078264537b2bcc645b0bf:eyJzZWxlY3RlZExpbmVDb3VudCI6NDEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYxNjRjZjU0NDhhYzAzZDJjMzViMTY3ZTg1NjkzYzIxZjYxM2JlY2YxODMyNjVmNDBkMzVkMDA5OGE5MTAzMmQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA1MjBkMDE3MmRjNWViYzcxMTY5NmE3MTY5MTAwNWNkYjBlYzA1MDlhYzk4M2QxOTRlYTQ3ZGNjY2E3YmViMDIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImNlMzMyMGQ0MGE3NzAzZmE3MzFjZDVhYmE4ZDczMmJmN2E1YjFkNDQ2ODg0YmJmYTU2N2IxYjkwMTU5MzdjYjAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjA1ZTA5NGMxNTU4NzEzYTBhOTAxZTczYWRhZjI5YjA3ZjgwNjFhYjJkMDJiOGI2NWNmYjBmOGMwZDYxMDdlMWUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L573-L616",
+          "version": "repo-lines-v1:sha256:24ab3ddd73e20d047e82fb3d13df33148b77ebf82d560f69e00536866b70da17:eyJzZWxlY3RlZExpbmVDb3VudCI6NDQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZkZDVkNzU0MDMzYzllNGY4ODI4MTNiNzNhMWVjOTdkNzEyMTExZmQ2ODk5ODYzOTljM2Q2ZTgwYzY4OTkyYWQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdkOTllN2M0OTcxM2MzMzc2Njc3MTI5MWRiY2NjMzc2NGM0OTk1N2U5N2U0NjgyN2U3ODIxMzliM2FiZjk5NDIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjNkYmM3ZDZmNDc5ODhhZTU3OWU2N2ZjMDk2OWJkOGM4MDUyZDRlMzVmYTI4OGZmMjBmY2IxMDhhYTA5MTI1NWYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjJmMzNiZjNmYzMzY2MxNDQzZDljNDg1NzllNWE5MWY0ZjhlNGE4Y2FiNzZhMzhjNGUyYTEwNjY2ZWI4MTc4MTkifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L53-L65",
+          "version": "repo-lines-v1:sha256:900ed1e3d5fe29d264c8d5fef1e7508baaf141f005a083895e0c432454c15dbf:eyJzZWxlY3RlZExpbmVDb3VudCI6MTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdiNzgyZDkxNGY5Njc5ZDg0ZjY4YTdjMzM4YmQ2NjZmNGQyNGQ4NjYxZDg5MGY0M2ZhNzk5MmEzNDJmOTVlNWYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImVlOTM5NTMwNDFhNTkwMDc3MGNkNzc3Mjk4NThmZmRmYTVhYTY1YmZlM2NjZjMzMDMwZmFhOTBjZWU0NmEyN2MiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImNjZTNhN2FiYzRkODllYWJiMGY1MDRlNmM2MTM1YzFjMzI5ZDBhYzQwNWY3MGE5YzMzNDI5MDRhMjBmYTBmNzIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ4MGQ4YzhlYTM4MThiMzQyNTZmNmQ2ZTU5MGZjOTM1NWM4NWZjNmQ3ZTZlNDIzNjc0NzA5NWY4MTM1NGUzNzAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L667-L672",
+          "version": "repo-lines-v1:sha256:65083b2e439bc86cdfee7f2040b3921f12d5e67bbe0beb00dc386104e6e885de:eyJzZWxlY3RlZExpbmVDb3VudCI6NiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNTY4NWRlNjI3NmQzMGQ3Yzk5YTlmOGM3OGQ2ZjRjYTI3ZDk0NjFjNDQ5YjE2MTEyZmZiZWUwY2Q1OGM0ZmZmZiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZTZiMDQ0OTE0Njk3MjJlODM2M2E5NGU0MDQ0NTM4ZTAxM2EyYTIxN2UzNmIxZTU2OGJhNjBhY2I3YjRjOGYyZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiOGE3M2YxODY2MjBlMTIxYzdmY2NmM2YwNmYyNWE3YzRjMzUxYjY4OTdiMzdiODkxNjlkZGNlZjQ4OTYzZjYyNiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNmVhYjdkOTllYWRlYWM2NGY4NzRhOWNjMmUyZGRhOTVkMjU2Nzc3MmJhZjY0YzFmMjFhYjQ0YzU4NTUyNjc1ZiJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_88b9cdcb0664492fac0e0cc93ad44a28",
+      "statement": "FreshnessToken meet intersects source keys and join unions them; SourceProgress compares source epochs before combining equal-epoch optional watermarks, and watermark_ms takes the minimum only over present values.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-types/src/frontier.rs#L33-L149",
+          "version": "repo-lines-v1:sha256:90408ce07482ba243f733599e6fda69333864bc03fe13b1cef12dd33e9205d22:eyJzZWxlY3RlZExpbmVDb3VudCI6MTE3LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiJmZjc5NmNiZjg2NWYwMmY4ODJhYzUzNjY4NWI4NjE0YjljOTk4M2Q2MDJiNzYyYTRjMTI0Y2E3MTM2MWJjZDNlIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI0ODkzZjQwZTM3ODFlYjg5NmM4MmQwNDZhMDgwNjdhMTFlMzVjZGYyZjFkZmFmMjZmZWE5MGI4ZGI2Njc2NDEzIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI4N2Q0ZjQ3ZmQwMjY1NTY1YzZlMmM4Nzg0MDUxZjZiOTc5Zjk5OGFiMTQ3YTkwYmRiNzQyMDA5MzcyMGE3MzQxIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJhNTIxNjA0YjM1ZmM0MGFmMDBjYmE0ZWVhMmZkNWUyYzNhZjE4NjNiMzkxMTg1ZDdiZjRiYjA5ZTcyZDBjOGIzIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_e7ed8e2d96664e25b541b634b82406a0",
+      "statement": "FreshnessToken XORs its diagnostic hash in both meet and join, making the full token non-idempotent and unsuitable as an idempotent lattice field or membership/checkpoint authority.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-types/src/frontier.rs#L120-L149",
+          "version": "repo-lines-v1:sha256:3c3fa78426438656eb7d8c5a521e7a6ad6e25078654b568df194aa5a03dfe3c0:eyJzZWxlY3RlZExpbmVDb3VudCI6MzAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgwMGJkM2YzNTRjZTMxMzJjMWU5ZGNmYWQzMTdhZjEzMjdjODY1Y2RhMjE4ZWZiYWIwNjk2NDZjMTg0ZWRkOWQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImE1MjE2MDRiMzVmYzQwYWYwMGNiYTRlZWEyZmQ1ZTJjM2FmMTg2M2IzOTExODVkN2JmNGJiMDllNzJkMGM4YjMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/frontier.rs#L199-L209",
+          "version": "repo-lines-v1:sha256:6b7ee186d339159d87b717670c0bc458c11392ff6f53dccb248a9c5f2a01305b:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkyYjVlZGY1OTQ5Y2ZlYTY3ODIyY2Y2OTExMzIzNjNkNjhkNmYxZTE2OWY1ZTBkNGY3YzE0ZTVmYTFlNmQ0ZTUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImIwYzI3YjlkMTA3ZDk1ZDg4MmJhNGYxZjcwNmUyOGI2YTYyNWYyMGJlYTRlNGQ5MmQ2YmUxMjVhOWNiYTQzNTciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImYyZDgyOGEwMzdhYzFjODE1MzViMWQ1NTAwODMyMzIzYmZiYjg2NmEzYTNmODdlN2E2OGMxM2EyYmFlNTZmZmYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/frontier.rs#L24-L30",
+          "version": "repo-lines-v1:sha256:5809c1266f47297cc09b269262429e0aa580810a35032a1048a42f72b328e011:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNjc1NjI3MzljZWY0ZmI2ZTNkYmNjMzFiOWVlZWVhYWRiYWU0MWY1YWZmZGM2OGFjNzY1NGY1OGYwOGFkMjA1NCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNzc2ZjQ1MzkzNjFlNzdhNmMyNGQ5NTJiNDQyZjdiM2EwMzgwMjFhNmNlZjY1NjgyNTIwMmJmNGU1YzdlZTA1ZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMWYwZjExZjI5ZTVmNmZkM2QyYWY0MTRmN2Y5NGE3MzUxMWZlZTY5YTlmOGJkNzQ0Nzg5OTJlYjVhYmQ0MDYyNSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTUzMTE4YWE0ODIxNWRjMThlYzkwYzVkMzViZjkwMTYyMTgwNWEzYjAxMjM2ODUzNTM5ODg3NzY0NDgyOTNmZSJ9"
+        },
+        {
+          "resource": "repo://docs/adr/0005-frontier-membership.md#L31-L32",
+          "version": "repo-lines-v1:sha256:62db0d5a2e1bf6f4d2ef541780c116b8d1e404b807df88bb6f884cb257e7c367:eyJzZWxlY3RlZExpbmVDb3VudCI6MiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNmM1NGU1NGUzOWQyMzVmNmUxZTFmOWNhMTE4ZWU1Mzg0N2M0ZmYzZWMwZWE4YTVmZGM4N2Q5ODlkMDg4OWU4OCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZDI2ZWIxYzZlYjJmZWJjZTc2YzM1Y2FiNjI5NjA3NzQ4OTMxMTJjNGRiYjY1OWQxZWNlNzRmMWQ4YWYzMjcyYSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiYThmZTY1ZjJhNmVkNmM1MDMyNjQ5ZDJlMDFlNWY0ZTY5NTk2OWQ3MWU3YzY0MzMyYmZmYWIwMDJhNGVkYzI3ZCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZWY3MzI4OWRlMWJiNWUzYTg0MzRjZmYzNjE2NzM4Zjg1ZTdkNDMyYzkxMzZjYTgwOTQwYjQ1OTgwYThhZWI4ZSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_5e106d4b7d094b05999f9e424b47683e",
+      "statement": "The M1 and M2 formal models use bounded shard/epoch state and atomic actions with fairness annotations; their crash, replay, physical-group, publication, and membership reasoning is model-level evidence rather than live network or object-store integration coverage.",
+      "evidence": [
+        {
+          "resource": "repo://formal/m1_epoch_commit.fizz",
+          "version": "repo-file-v1:sha256:a8a956f59ff6c2888d44820937e4284be05623505d0dc313f92f7228daab28ee"
+        },
+        {
+          "resource": "repo://formal/m2_frontier_agg.fizz",
+          "version": "repo-file-v1:sha256:3291f891e82fb6dc8cd5e2540da3917a459df7e7a404202b365d231ed3a11b2e"
+        }
+      ]
+    },
+    {
+      "id": "claim_cb3eb59e7af6475cb83210eaf8dc130a",
+      "statement": "Frontier tests cover membership bootstrap guards, stale generation/incarnation, empty membership, legacy rejection and generation-scoped persistence; lease durability tests cover reopened LocalFileSystem and Docker-gated MinIO storage, while service tests exercise V2 lease admission and coordinator tests exercise collection and bounds.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-control/src/checkpoint.rs#L690-L1199",
+          "version": "repo-lines-v1:sha256:459e71b87a105f44fdbb85bb8507dd078621be0b094f8255f180f000328d2f84:eyJzZWxlY3RlZExpbmVDb3VudCI6NTEwLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI0ODkzZjQwZTM3ODFlYjg5NmM4MmQwNDZhMDgwNjdhMTFlMzVjZGYyZjFkZmFmMjZmZWE5MGI4ZGI2Njc2NDEzIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI0MTJjYTM0NWNjZjc1YmY5YzA4MDZiY2U2OTViZThkZTgwOGI3OTk4NDI1MWE3YTU0ZDIwMmNmNjEwMWRkNDUxIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiJkNTU1M2UzZGU2NDI4NTE1MjE2MTk2ZjJmY2U1ZjI3YTJjMzZmN2M4ZjhjNzEyMTYxZTI5Mzg3MmMyMmIwY2I5IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MCwiZm9sbG93aW5nQ29udGV4dEhhc2giOiJlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1In0"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/frontier.rs#L1492-L1629",
+          "version": "repo-lines-v1:sha256:12839c9d239561a66578a513c9af54f0a9b5b22afd88b3d1e3c7dff908216f14:eyJzZWxlY3RlZExpbmVDb3VudCI6MTM4LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiJjOWNiZDFiZTA3MzU2ZjRiMmZmNmMxNTg2ZWZkZjQ5MDZjYjRiMDliZDJhZWZkMTQwYzQwZWUyOTA1YmM4NmU4IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI0MTJjYTM0NWNjZjc1YmY5YzA4MDZiY2U2OTViZThkZTgwOGI3OTk4NDI1MWE3YTU0ZDIwMmNmNjEwMWRkNDUxIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI1MDZmZjUxNzE5OWFlY2Q5NTcyYTBjM2QxNDA1ZTZlYzc5ODUxOGE2NzAxNzBjOGMyNzNjOTEzNDIwNWZkOGU2IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MCwiZm9sbG93aW5nQ29udGV4dEhhc2giOiJlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1In0"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/src/service.rs#L4655-L4755",
+          "version": "repo-lines-v1:sha256:74632817f645bdaf49e68f5d874f0adae459d122f453af114dcad2644c4bc72d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAxLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiIwZTI2ZTNiMDM4YTE0ZDBmNmQ1OGFlNTQwMzJjZGQ2MGI5NThhZDc5Y2U5NWZjYWFhZTNkYTIyMmU5ZDgzMjNkIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI0ODkzZjQwZTM3ODFlYjg5NmM4MmQwNDZhMDgwNjdhMTFlMzVjZGYyZjFkZmFmMjZmZWE5MGI4ZGI2Njc2NDEzIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI2M2M4MDhhZmUwOGNlMDJlMmEyN2E0NjhjNzZmYzNjZjc0MTZmMGM5M2FhOGFiMDlkYzU2Y2RmZDlkZDNjOTJkIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI3OGU2MzVlZDhlZGY4MGI1NzA1NzA4ZmNkZDcwN2U5ZWFmNTRiMmZjZGY0MjYzNTg2OTZmYjBhMjU4MjI1NjAxIn0"
+        },
+        {
+          "resource": "repo://crates/rockstream-control/tests/frontier_lease_tests.rs",
+          "version": "repo-file-v1:sha256:9aabcf5dd34e621e9ba897f88f492906ab7d142937f5c5118f4f630e768429fd"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.7.2",
+    "at": "2026-10-21T16:22:36.376Z"
+  }
+}

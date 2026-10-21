@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "pages": {
+    "/openwiki/architecture/cluster-and-exchange.md": {
+      "pageVersion": "sha256:28ed4c894ec67831dec67e470f355d86b9bdf7741a42acd7b85dfe4a2c87ba4f",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/architecture/incremental-sql-engine.md": {
+      "pageVersion": "sha256:b4276f81f58f5d9e051755d40d7e2b2c661358d48b866a2d3227275b84257ed1",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/architecture/system-overview.md": {
+      "pageVersion": "sha256:b5aed90d549c215299440b7dca6eee8754ab7472d0ad6a66bb63989c95730de2",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/concepts/progress-and-checkpoints.md": {
+      "pageVersion": "sha256:2c11d4863840068c6de97fcf61c71da024ee0e68daca2420cbac63ecad7026b3",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/concepts/storage-and-replay.md": {
+      "pageVersion": "sha256:e1f32aabfed89db770c05a8aba8dec65917115f68329643e7a2e1bed98a63a3f",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/integrations/kafka-view-delivery.md": {
+      "pageVersion": "sha256:eb11dc99c19c5757d35776f7c1aa62ed5e5bdd027d5934e5b8dd996b561b3ddc",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/integrations/source-ingestion.md": {
+      "pageVersion": "sha256:09989c57a5f35aa2759f33dd53735c4c96c932039cb0a32edb5be3f2f7445cb3",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/operations/deployment-and-configuration.md": {
+      "pageVersion": "sha256:b7b32ee63684c1eb7161b7bce15e24cc5c40c8ef21f4a1866aee6c585818794b",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/operations/diagnostics-and-recovery.md": {
+      "pageVersion": "sha256:d5e9c2c9424d25a8d770d5836bd05d0f71db870cb149e4b756b70d84c0a198df",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/operations/security-boundaries.md": {
+      "pageVersion": "sha256:e9b7bbcc97448a723d9386fe601c7776777e4c157a48a6058b9b9695deb5b84a",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/quickstart.md": {
+      "pageVersion": "sha256:146b420c6e1c889585a0538f63f723744cd18dba0185bfe59ea879f5d05cbf18",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/testing/correctness-and-qualification.md": {
+      "pageVersion": "sha256:d980cbbc082a19e0fc246f4de358c64b43cd35ef858af51a5f941b7b800076cc",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/workflows/postgres-requests.md": {
+      "pageVersion": "sha256:5ce4e8df38b7c8bde7c57ec7630a4ebb34983cc36f305342bc537c9a52f18015",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    },
+    "/openwiki/workflows/views-and-schema.md": {
+      "pageVersion": "sha256:23b6d1be91168c1b7ea845cf223d3f5898967c294ce9c169e367b23e8080b28b",
+      "completedBy": "openwiki/0.7.2",
+      "completedRunId": "b568316b-aea7-45db-b9e2-c1714f5d3e07",
+      "gitHead": "cd778ab8f697fc44b210e0e132f659abd2883e7c",
+      "sourceFingerprint": "sha256:1090183a5046ae369558c2d69ed2b8284917f5114414144806fc9142ac1eeb15"
+    }
+  }
+}

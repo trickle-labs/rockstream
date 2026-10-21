@@ -1,0 +1,354 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:d980cbbc082a19e0fc246f4de358c64b43cd35ef858af51a5f941b7b800076cc",
+  "claims": [
+    {
+      "id": "claim_a53208acfa4b4dc18a30344aa57d815a",
+      "statement": "Core gateway semantics tests use a local socket, local-filesystem ShardDb, CatalogStubs and NoopViewReader; the aggregate matrix asserts rows across insert/update/delete, while several behavior-named tests delegate to the same aggregate_cell scenario rather than distinct recovery scenarios.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs#L1074-L1102",
+          "version": "repo-lines-v1:sha256:32542a0e776fae90b7982bd8bedbb07bd33812fc770f4e444803446fd46f7c8d:eyJzZWxlY3RlZExpbmVDb3VudCI6MjksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUxOTQ4NGVlZGYzNjRmYjhjMTJmMWViOThmYmY2YTliNGY2NTBmNDI3ODc0YThkNzM1OTAxMGFhZGU0MzFiYzgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjJlYjBmMWRjZDc3ZjgyM2I4MmQyYTcyMzUxNmUwZDRlYWIzZjg2OTM4ODUxODdkNjg5NTgzZWFhZjc4NmQxZjkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImYzNWRiMGY5NGYxNGJhNjJlYTQ4Zjk0MjYzMzUxZjA4ZTY5N2U5NGNlZDc1MTY4YTRmMjU4ZWFkYzYyODE1NjEifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs#L22-L65",
+          "version": "repo-lines-v1:sha256:582775ff63e28ec0ea384fbd1f5d17ed14f70316aeaafec55724ebd0b20063bd:eyJzZWxlY3RlZExpbmVDb3VudCI6NDQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ5NDNlMWM0ZGQ5MjQ3NDUwZTY0NTU1MjZmYTBmNDVmYmU5MWI5MTM4MWIyMmJiYWMyODkyZTY4MmQzNWVkMzUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdhOGFjODUwZWQ3OWJlYjg3NjZlY2UwY2RiZGUxYjVmZmI5NjQzYjFmMmJmNTE5YjIyYTg4ZmMxOGE5YTFkOGMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjNjNTA3MWQxYjc1ZTg0ZmZhOGNhZmU2ZDI5NDgzMTc0Mjg0MDE5ODQxMTQ3ZTE3ZGYzYjVmOWQ4MWRmZDUwNDAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImNhYzY1M2E3MmMwN2MxOTc5NmJkOGM2MjFlZGNhMzRkMzU5MjA1MDNhNWI1MmJmMGU4OGVlMGRlMTg5ZGE2M2IifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs#L796-L900",
+          "version": "repo-lines-v1:sha256:3a1690bb62a269afb4166d94002a9db53395449a0fcc82161b30abc83966db6a:eyJzZWxlY3RlZExpbmVDb3VudCI6MTA1LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI1MjI5ZDI0MTFlZTUyMTk4MmQ1MTkwZDI0MjVmMDRkYzhhOWRmZWE0MjcyMGMyYWQ1MTE4ZDJmMzRmM2JmZGIzIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJjN2MxNDJmZmEzNDdkNTRhMDk5YjYxYjJkNmE1YmI3NDA0NWJmNjg4MWViY2EyN2IwMTdlZThlYjcxNWQ5ZGEyIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIxMmNjOGUwZTQwYTI4ZDViNmJhZWI1ODhjYTM3YjExNTIwZTMxNjM0YWZkZWQ5MzQ5Y2E3YTlhNDRjN2VkMjI0IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiIzNjk1YmYzNWUwMTE2NjhkNWE3OGUwMzZhMzc4YjY1MjUwZWIyZTIyYTA4MjU5ZTBhYjBiOWYwNTExZGNmZTA0In0"
+        }
+      ]
+    },
+    {
+      "id": "claim_d601fd8e8e4e44fe846a4dce131678b6",
+      "statement": "The no-op oracle validates accumulation and DataFusion identity-query plumbing over positive-net-weight rows, including representing duplicate positive weights as one row; it is not production operator equivalence proof.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-oracle/src/harness.rs#L1-L55",
+          "version": "repo-lines-v1:sha256:b9814f141bcb7b87b9e19b68581ae68a9913333837d728103a184bab6444bff2:eyJzZWxlY3RlZExpbmVDb3VudCI6NTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImZjM2M1ODA2ZTIyZmVlMTRjZTlmMDBkMmVmZjkxMDgxMzU3ZTc4ZWVmMjA1ZTk0MDhmNGVkMDBjZmViYmZmNTEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjdiYzk4ZDZiMGRjNDkyYzUwMTZkZjEwODA1YTNhNTRlYjljMTg0YTVhNjEzN2U3ZjRiZWNmYTBjMjIwNTUwZDAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-oracle/src/harness.rs#L170-L191",
+          "version": "repo-lines-v1:sha256:361fefb4673910f8a6b1ff690573e232ef26f85e40b0b7f118c2d75ac6c20ae3:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjcwODRiZWFmYzJhOTc3N2VhMDJjZTMwNmMxMzdhZjI5OTYzZmQzZjVhZjE0NTFjMTQ0M2Y2OTVkNjI0ZDZmNmEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjI3ODJmNmRhMmI3YmI3YjY3Y2EwNGI5ZDZjY2JlOTJjYTExZDA2ZDViMzA2MTg2ZWI3ODE0YmQ1MWFlNWJmNjIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRiZmQzMjU5ZjlmYTg0NjgwOGY5ZTRhODFiMGY2NDY0OGRjYWNlYjdkNDNjMDc2NzJjZWM1ODhkZWViZmEwOWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijk3OGE4MzJmOTM1YzIwNjQwZDUxNGViNDA3OTVmNmUyOTg1NDA2YmJhODU0NTNjNGEzNTdhYjcxMjk4YTYzY2QifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_3c874454b53d4e509b88f65e62837025",
+      "statement": "The aggregate oracle executes AggregateOp over epochs and compares accumulated output to a weighted-input batch reference, with DataFusion validation of the reference; the batch reference shares avg_from_sum_count with the law layer.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-oracle/src/aggregate_oracle.rs#L1-L38",
+          "version": "repo-lines-v1:sha256:4480c12d4864c74a0b09b20edc193c96c6539b2c4786323cdac129356a6135d7:eyJzZWxlY3RlZExpbmVDb3VudCI6MzgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImEyODRhMmVlZTE1MTVhZTIwOWJkNWFmMmFjOWIyNThjMTQyMmQwMTM0OGIwNTExMDRmMDZkMjVmNWNjYjdmMmYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImUzNjlkMjgwZDE1MWNkYjkwMzA4MWE3MGNmOGRmYTgxZjAxOTRkYzA5NGZmNGM5ODZmMjQ2ZjA2MjRhZDBhYzMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijg4NzU3YjU3YTA0YTMzNDdhMDE4MWRkOWU4OTU5MjQyNzY4NzA5OTU5OTI3MTRhOTkwMmM2YzhiYTFjZjdlNzYifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-oracle/src/aggregate_oracle.rs#L67-L177",
+          "version": "repo-lines-v1:sha256:92b684b5a7cbc29484e4f58fc22bb84919c1d3311ba32dd231f076cb0b97a537:eyJzZWxlY3RlZExpbmVDb3VudCI6MTExLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiJiYmNkYmUyZTcxYWYwNTg0NzE1ZWMxMDNmYTgwZTE1NDc3ZWJlMDI3NWU3MzA1ZTQ3YzJkMjUwNjlkYTZhMzhiIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI0ZWNlMTFmZmNhOGZiZWZlYjg4MGYyNjJiNjEyZWVjNGI4OTE3OTRmZDFlOGE2NjY2NjA4MWI0MmFmYWJjNjdiIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI5MWI5MjJjZTQwMTExMGIwMzQ2ODMzNzI3Yzk2YTc5NWJiNGI5MjFlZGMyZDA4YjM2NGE4NTJiOTZmOThkODY3IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI5MDM5NWM0MmY0MTQzMzhjYWJlN2U2MzM5Y2JhMmE0YzkxM2Y4MDkzZDdkZWY3MzUyYzBiOGQwMGI1OTM2ZmNjIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_4ae952eec24c4d289fe276878d6b18f5",
+      "statement": "The join capability pairs LFS and MinIO durability tests, whose bodies flush and reopen gateway/shard state within one OS process while reusing an in-memory catalog, rather than killing the process or recovering the catalog from scratch.",
+      "evidence": [
+        {
+          "resource": "repo://capabilities.toml#L185-L194",
+          "version": "repo-lines-v1:sha256:fad24a9c61aea89eed9c17d1a68f51fbf690136a2acb3a5784ff1787fc9c8855:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU4NzE5NTA2YTRhYzEwZjVmZmIwYmRkMTBhNmE5ZjBjZTc2YTM5MTJkZDRkOWJlYzY3YmRkYmU4OGYyZWU4YzUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU1YmY1ZTAzYjM4MmY3NmY3MWI3MmRlZTg4NWJiYjQ3NDIyNmUyZTJjNGVlMzRmMGI5YTZmOGViYzM0ZTdjYmEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjEwOTRjOTc2OGQyNmM4MWM3ZDYwNWYwYmIyNTU3ZTQ3YzM3ZTY2YmFlNTQ4MjEyZTA2OWI2NDlkNTk0YzY2YWMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImYyOGZhNmM1ZDA0MGZhZjgyNGM1OWU2NWQxMjg1NDI2NzhkMzZmNGRkZDRkNzU3YTE3ZjA1NDk2NjBiNWU5NTkifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/core_operator_durability_minio_tests.rs#L60-L110",
+          "version": "repo-lines-v1:sha256:ae3e9d63d20905eb6f34df274a55bf83d12b1d08aa95f0811eb5cbb36864ac2e:eyJzZWxlY3RlZExpbmVDb3VudCI6NTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUxOTQ4NGVlZGYzNjRmYjhjMTJmMWViOThmYmY2YTliNGY2NTBmNDI3ODc0YThkNzM1OTAxMGFhZGU0MzFiYzgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRlMGQ3NWZkZGU5NDZkZmYxMGQ4YTk3ZTE4ZjgyYjQ5YjZmZmY3ZTM2YWZmYTZmNWU0N2YyMGIyMGNkMzU1NmYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjJhNmMzZjEwZGEzNTBmMjRmYmVkMDJmMGM3NTgzY2M2MzlhYjliNmZmMTBiZDU1ZWJlNWE5MDdlMTllYjQ1ZWUifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/live_exec_join_durability_lfs_tests.rs#L87-L147",
+          "version": "repo-lines-v1:sha256:005308450f613ad0d4bed26a171aaf30627a69332ed5f1be7567e175e87fecb9:eyJzZWxlY3RlZExpbmVDb3VudCI6NjEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUxOTQ4NGVlZGYzNjRmYjhjMTJmMWViOThmYmY2YTliNGY2NTBmNDI3ODc0YThkNzM1OTAxMGFhZGU0MzFiYzgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRjMGRmNDZjYTMwNWIxYTM3MzE5MDNjNjllNjBhZGU2YWFhZGFkZTQzODIxZjQ1Mjg4YzE4OTU2MTYxODNiNTIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_57a010d3114f4238887044d1a41ed225",
+      "statement": "The MinIO join durability case can print SKIP and return on unavailable Docker locally; CI accounting rejects skip-marked success and requires Docker for Docker-owned suites.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-gateway/tests/core_operator_durability_minio_tests.rs#L60-L69",
+          "version": "repo-lines-v1:sha256:696bcc106604947bb3e3a026fc0d243dd4ff8c3a448f875cde62e79ec2ccced9:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjUxOTQ4NGVlZGYzNjRmYjhjMTJmMWViOThmYmY2YTliNGY2NTBmNDI3ODc0YThkNzM1OTAxMGFhZGU0MzFiYzgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImFkOWUxMjU0NjQyNTU3NmQzZGVhZThjOWI5ZGJmMTI4ZDVkNmRkYWY1ZDdmZTg1NzkzNDkyN2RlZmZhM2I5ZGQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRlMGQ3NWZkZGU5NDZkZmYxMGQ4YTk3ZTE4ZjgyYjQ5YjZmZmY3ZTM2YWZmYTZmNWU0N2YyMGIyMGNkMzU1NmYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYzE1MjRkYTkwOTIyNmFjNmM2Y2IwYTQ3NzUxNDhjNDhjNmE3MDNmZmU2NmZiM2VhY2YxYjI5M2I0YzgxYTEifQ"
+        },
+        {
+          "resource": "repo://docs/ci-test-accounting.md#L111-L113",
+          "version": "repo-lines-v1:sha256:6496c2c6c2bf1f124b17e93900069bbb737cd69c3f6f3b85c752032ca0db6073:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYzFlY2RmMDliMTcyNzJmZGRkMWQxMWE4MWYzNWMxNTgxZjAyMWZkOTYwNzVjYjRiNDljNmFhOTNkZmM1NmJjZSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiYjAxNWMzNmIxMTM2MzgwY2IyYjE4NzI3YzE5ZDZhY2JmMzMyYWQ4ZmNmZmI1NGM0YTI2NTU5YWQ4M2UzNWUyNSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNDAxNDg0Mjg3MWVlZGE2MDRiNjY2MWE0ZWY2MWY2YTNhODA5ZTcwY2I3MThlOWJlNjAxMTczZmI5MGJkYWJlNiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjAsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSJ9"
+        },
+        {
+          "resource": "repo://docs/ci-test-accounting.md#L13-L15",
+          "version": "repo-lines-v1:sha256:4c9fb0ee4af126316004df31aa98d2843ec7a85da9d1fddce454b2e76ce877e6:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiZWI3OGZiZDFiNWZlZjI0MTNiYmIwNDhiMzUxOGE1MDZkODY0MDQ0ZTgzNTA3NWM1NGY3ZWMyMjdhNmY5M2JiYyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZTVlZmIwNTllYjNjMzI2MjA1ZmMxOTg2NmRjZmU0YzQ3MzZkNGJkOTZjNjAzYzRjMjUxMmM5NzQ5MGI2MDk1ZiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZmUzMDQwY2RiY2I0MWQ0NjFjODExMjJhZTZiNWUwNWVhYzMwN2IzYTczZWE4MTc5YTg0Y2Q3MjQ2NWMzNGM3MSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTlhODZiY2VkZmFmYzZmZTgyZWE0OGIzMjQ3NmM3Yjk2YzczZDgwZjJkYWU3MjljYmQzNzdkMmI0NTFjZDhmNCJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_c7122d22709d4bb18ffd036282aa5f4d",
+      "statement": "Simulation Runtime abstracts clock, sleep, task spawning, simulated network and object-store handles and exposes a reproducible seed; the failure matrix explicitly distinguishes deterministic coverage from missing live-backend evidence for many failure categories.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-sim/src/runtime.rs#L17-L45",
+          "version": "repo-lines-v1:sha256:077e49843ae7231a7ec6d26cc939b4ddc986d0cd7f17a701ab176ebfe92207be:eyJzZWxlY3RlZExpbmVDb3VudCI6MjksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc0YjA3OWFiMzY5YmY3Y2FmM2VjYzc1OWE5ZWViMjdkZjJjNzZiM2UxYmU2NWE1MThlZTVlMDUwOTgzYzkyZjEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjdiNDU5ZWI2Y2VlZWFiM2E4NTQ1ODU5NDExMDEyYTJhYjgwYjZlNjIzNjJlZWY1MTQwMDg3NWI3ZDFiMjU0YzciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZjYzQ3NmI3YmZlNzY3ZTY1YzlhMjljMDc4MWI1MDQzYTUzNjI3MGVjMDAxMzk4ODQxNGE1MzIzNTc3YTNmZTQifQ"
+        },
+        {
+          "resource": "repo://docs/failure-matrix.md#L19-L29",
+          "version": "repo-lines-v1:sha256:f2ea7d58c4a1a79f128651de6834eb49dab2648514db36dce11f2df6448d90ad:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjhkODYyMDRkMWZmMjU4MmVjYzUxNWM4MDZmMjJlOWNiOTgxMmFlMzkzYzY3YWJjNTBkYzgzN2MzNWI3M2QwZGEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY0Yzc3MWMxNzFkNjAzNWNhNjcyMWI4ZWEzMjQyZmRjM2IyN2ZkY2NjZDllMGZhNGQxYWZkZDg0Mjc3YTc2MGEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjI5ZTIyNWVhZDgxMGE3YzJkMGMxZjIyODYyYTAxOWI1NWEzMWUxMWU5ZDQyNGYyMjczOTRkMTMxMGQyMmQwYTMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_33fd648f741848ad87050f5a1453ec29",
+      "statement": "Qualification recovery helper tests supply timing and recovery observations and simulate topology/authority changes; they prove observer bookkeeping and rejection behavior rather than measured process crashes or application durability.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-sim/tests/qualification_recovery_tests.rs#L1-L140",
+          "version": "repo-lines-v1:sha256:4648bb8e649098942a9402649e155d0b188548497307a4f3ef1bfc4820684215:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQwLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI5MjYxODc5YWYxZTJhY2E1OTNiZWFjODFmZDZhMmQ2M2M0NDQ5ZDEwZjI4NjNmNjQxNmE0MzczZmM1OTZmYzNkIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJhN2E1N2Q0OGY4YTZkMTdhODM2M2YyM2MxMWFjYmU1M2M3NDExOThjYWRkYTlhOTgyYzE1MTRlZWUxZjE2ZTVhIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MCwicHJlY2VkaW5nQ29udGV4dEhhc2giOiJlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiIwYjhjMmI1ZGM2OTI4NTA4YmYzNGMwZWUwZjJjNWVjMjUxMTVmOWUyMDBjZDBmMGZmMGM4MjBmNjIxMjkxNTgxIn0"
+        },
+        {
+          "resource": "repo://docs/test-commands.md#L51-L57",
+          "version": "repo-lines-v1:sha256:3400567bdd36bf66c388191a8ab8a57928ed26e9a337c79784092b28f172ab22:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYWZhODVjZmQ5MmE3NmFjZTUwMmQ4ODJlZDJmMjAyZjM4NDQ2OWI3OGJmMjEwZTYzODcwNTgxNjY1ZGZiZGEwNSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNGExZWVhNjQ1Mzg1Y2RiYTQxY2FjMDRiNDY3MWYyODk1NWFmMGI5Mzg3YzljZGUzNDA3MGFlMjY2MjdlZjhhZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiODk3MDkzZDM5ZGMyYmFlNjViMmIwYTkxNjAyYTA5NzM0MGMzMTYwMzMyNGY0MWZjNmRlMTJlMDM0ZDg4NTA5MSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMGIxNDJmOTVhOGFhYTY5NGI3M2YwYmMxMDhhZmVlMDViOTc4MWU5MWExZjVjZWI5YmJiMjBmYzdmNmRkZmVhYyJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_491f84a6a67f47c7b803d22e42fa8c95",
+      "statement": "ProcessIsolationAuditor validates declared worker count and unique supplied PIDs and WorkerIds, without launching processes, probing liveness, or enforcing optional cgroups; the external harness separately computes aggregate/distinct multiset expectations without engine internals.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-test-support/src/external_harness.rs#L34-L155",
+          "version": "repo-lines-v1:sha256:cd2d71466e8cbad22965663108b09c5f0d313559b43c967197e7a5ff709cf149:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIyLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiIxZDcwNDY3NjdiY2U5NWJkNzMzNDUzMDFmNTVhNjliMmQ2YzhiZjRiODg4OWE0ODEyMWRjZGUwM2JiZjE2YzQyIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJlNmIwNDQ5MTQ2OTcyMmU4MzYzYTk0ZTQwNDQ1MzhlMDEzYTJhMjE3ZTM2YjFlNTY4YmE2MGFjYjdiNGM4ZjJlIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiJlNmRhNGM0Yzc5OTczMmNjYzExYTI1NWI0Njg1NzJkNzNhODAyZDcyNWU1NWExNTY4OGE1YzUxZTUxMmYwY2JjIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiIzMDk1OWZlMzhlODNkNzA3NTE0ZWVkZTJlNmE4ODlkNWE1ODJmNmVlMzMwZDY2YzExNmFlN2Q1YTNiYWVmZTA1In0"
+        }
+      ]
+    },
+    {
+      "id": "claim_b8856b9aeb124a7c91347f5df8d9a701",
+      "statement": "The release qualification shell entrypoint delegates to Python, which validates suite selection before prerequisites and binds the candidate to HEAD, tracked diff hash, untracked file hashes, compiler version, lockfile hash and selected execution settings; live recovery rechecks candidate identity after execution.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/release-qualification.py#L204-L218",
+          "version": "repo-lines-v1:sha256:73986d86f96028a06c9e94cf9cca387ef9ad9270fe41af7e29fc7fc6b1e9abf2:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRlZGZjNzNmMzUwZGZkNDU0ZDJhM2UzNjMwYWU0MDNhNDE0YTZlMDZlNWQ1NWYwOGI5NGNiNWIwNjlmN2E2ZTQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjdhMDdiNjdjZmI3YjEzMWE1ZmNjYzgwNTY3Mzc3YTY5MzJmNzM5MTM3MjgwZDgyODU2ZDgxZGQ3OGMxYzdlZTgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc0YzNiN2I4MDgwMzQ0YWYwNmRmNjA0NWVkM2I0YTdlMTI2MjE5MGY4N2Y3MDNiMzcwMDI4NTMxNmZjZmIxMjUifQ"
+        },
+        {
+          "resource": "repo://scripts/release-qualification.py#L226-L285",
+          "version": "repo-lines-v1:sha256:a64a8f6e8610965da5082e60578aa920b5d21e310b98953744c4d19319d1b66a:eyJzZWxlY3RlZExpbmVDb3VudCI6NjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImMyZTMxMjU3ZGMwYWUxZDU5MzAzN2MyODBjOWFkNTA4MTliOGE2YzhjZjcyOGJlMDcxNmQwMGEzZWVjYzA0YmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImVkNDE3OWM5YWFiZjJmYjg3YjViODkwZmI4ODhmOWRiMzMxMWQ2YTdiYTcxNGUxZjgwZTliODI0MmEzMTQxN2IiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQ1ZDgzNGEyM2I4NGQwMTU0NDdlM2NkMmRiZWE3NjNiMjY1ZmVjMTU5ZjVmMGY3OWZlNmY3NjRjNzY3YThmNTciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijg2NmYyNzU5ZTI1MjEzN2FiNWE5NDQ3Mzg4YmVhMjE0MWEyNWJhNTAxZDU3NjU2NmI1YmM1ZWI5NjEyYjE4NjUifQ"
+        },
+        {
+          "resource": "repo://scripts/run-release-qualification.sh#L1-L4",
+          "version": "repo-lines-v1:sha256:b93a069d60bad0b38c85246342382e1768b631e0b5dde7576e3da82d6da2622c:eyJzZWxlY3RlZExpbmVDb3VudCI6NCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMWQ5NWZjMDRhODBjOTUyZjQ5Y2U0MTg4NjI3YzUzYjBmYmU4YzQ0MDQxYjk1MmQ1OTJhY2QxZGU5OTg2MTQ2NiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZTNiMjFjZTFkNDcxZmNiYzE0ODZmNmJhNTc0ZGQ1MzU3NmE4ODZiNzFjYzFjNjQ2MWFjNTFmNTViOTM0ZDYyYSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjAsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjAsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_ce9e5f0b10ae4d74b1ac4d346380da38",
+      "statement": "Qualification reports validate complete libtest transcripts, reject duplicate/malformed/ignored/failed or missing mandatory results, record commands and exits and omissions, and use a fresh live recovery artifact directory; unavailable Docker prevents release execution rather than falling back to helpers.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/release-qualification.py#L221-L294",
+          "version": "repo-lines-v1:sha256:b62472011aa72d1f51dde3276b12617ec077dcfb7969631c7a0b3ca641f247b4:eyJzZWxlY3RlZExpbmVDb3VudCI6NzQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ2MzQ3YWRlODdhNDY5YWUwZjAwMWEwMDU5ODEwNGViZWYyZGQxZjg0ZTljZTZjYTZkNDhlZjM2ZjI1OTViODUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVlYmY4NTBiZDU1ZGYyZmM5NGM5NjQ5YmQyYWVhMjI5OWE3MzRjMjQyOTIxMDM5ZmU0ZmI0YmJiYmMwNTNkNzQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRmYmQwMDkzMTRiYzI3MDg0MTY3MzRhMDJhZTVmZjM5YTFlNDhhMDUwYmU5MWY0M2IyZmFhOTIwMDJjNjJiZmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNkNDEzNDBjYzIzOWExNTljZTliNjAyMmU5ZjYzMjI4MzJlMmVhZDc2Y2FlOWU0NzU0ZDIxMGViOGZiNmQ1ZTgifQ"
+        },
+        {
+          "resource": "repo://scripts/release-qualification.py#L80-L161",
+          "version": "repo-lines-v1:sha256:7fa3a2ced3c11a43d9aac9ee3b2b67646f081b6c67a50dc57da956f27d1654d0:eyJzZWxlY3RlZExpbmVDb3VudCI6ODIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ2MjA3MTE2MDVmMjkzYTI4NDZjMzJiNTdhMzJhODI0NGQ0MTEyMzJkZjJhOTNlNTQzMzk2ZGE4NjEwYWZjZjEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjhhYTUxOTQ3MjZiMzcwYWUzZTNiYWEyNTFhNzg5ZThmMGVjOTgwM2JhZTZkNmM0NjBkYTRhZGMyNzQ1YjBiMGUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjVmMDE5YTExM2YxZTUyZDliMzYxODg1YjNmOTVkNjI0YTFlNWNkMzhkNzIwODlkMjdlZDQ4NDUzOThhY2VkNGQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_4d609b871e72460aa25d0dca82c92b6a",
+      "statement": "Fast/quick flags or nonempty ROCKSTREAM_QUALIFY_FAST or ROCKSTREAM_QUALIFY_MOCK_ENV select helper-only evidence with release_qualified false; prerequisites-only execution cannot qualify a release, and non-fast all/e2e retain missing live::e2e evidence.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/release-qualification.py#L109-L161",
+          "version": "repo-lines-v1:sha256:c9a4fd0bea03468857af4080d7a5edd91c7a3d383e98603744d419de0afb0d71:eyJzZWxlY3RlZExpbmVDb3VudCI6NTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY2NjQ4MWJlOTUzMDI0YzFjZTY1ZTRmMGVkMDgzZmM0N2U0MzY5NDYzY2MzNTY3Y2RjY2Q4OTc0ZGYyYWVkM2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijg0MDRjNTYyOWQwMjkwMzU5ZTg2MDNiZjY0MTVlYWQ5MTU1ODhhOWRlNmNjOWFlZGNmNmJjNTE3Y2UzODJjNmQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjVmMDE5YTExM2YxZTUyZDliMzYxODg1YjNmOTVkNjI0YTFlNWNkMzhkNzIwODlkMjdlZDQ4NDUzOThhY2VkNGQifQ"
+        },
+        {
+          "resource": "repo://scripts/release-qualification.py#L226-L246",
+          "version": "repo-lines-v1:sha256:b45748c15691d5b465d6a25752989ee9ac932a736bef35d684c8e129e092ae42:eyJzZWxlY3RlZExpbmVDb3VudCI6MjEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImMyZTMxMjU3ZGMwYWUxZDU5MzAzN2MyODBjOWFkNTA4MTliOGE2YzhjZjcyOGJlMDcxNmQwMGEzZWVjYzA0YmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjczYjdiY2JhNTBkZmQ0Yjk0MTgyOTkyNTEyOGNiZWFiY2IyYWUzZjBlMGVkOTMxOTExZjRhZTMxYjYzMTYzZDciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQ1ZDgzNGEyM2I4NGQwMTU0NDdlM2NkMmRiZWE3NjNiMjY1ZmVjMTU5ZjVmMGY3OWZlNmY3NjRjNzY3YThmNTciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImI0NmM3M2FmNTM0YzRlZDYzNDJlNDhlN2QwNDViZTgzN2IwYjFiZDFlMThhY2IzNDhlZmZlODM0NDBiYjBkOTQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_ce6bcd9f2a2743108ccf75b41ef05f2d",
+      "statement": "worker-failure-kafka-minio-v1 is a versioned fixed scenario whose history, fault boundary, expected output and deadlines require a new scenario version when changed; evidence consumers bind its ID, manifest hash and source revision.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-sim/src/qualification/worker_failure.rs#L173-L183",
+          "version": "repo-lines-v1:sha256:83c74706c6a2e2e17f1d493ad21adc3771070106d0f381ab475e402232e37800:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImRkM2EzOThkODJiNjAwYmUyMGY0ZTlkZDVmZWFhOTI0MTJhYmU1NDk0ZDA3ZTVkZThiMDE3MmVhNmQ5ODg0NGQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk2NzMzMjU3MmIyYjZjYmMxNWNhZmQzOWMwNmRhYzQyM2RmNDM3Y2M0YzY4NDAyMjRhZDRiNzliYTdlMTEyZTkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjJhY2FjZDkwYjU1MWU2Y2UxZGNhNzQ5ODFjY2Y3OGYxZjBjMDdlM2EyN2ZlZmU4NWIzM2I3NmIwN2IxZWU5ODcifQ"
+        },
+        {
+          "resource": "repo://docs/testing/worker-failure-recovery.md#L12-L18",
+          "version": "repo-lines-v1:sha256:6927fadd1ceba315b3e0818d7595d5ba97d90d6680a61a3232fc66c8bbf00791:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMGMyYmYyMzdhYzhlNDQ4NTQ4NGEwYjEwZWUzMDllMzg1N2NlZDYxOTYzOThmNmI2YzJmMTg0YWJkNDE3NDIwNSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNzhkOTk3ODAyMDMwZTBhNzhiNmU4OGM2Zjk3NTBmODU0MGQ2MjUzZTI2YjllZTNlZDUyOTExYzI1ZTdjOThjYSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiODIwNDAyOTNlYWQ5ZDRhZTU3ZTVlMjgzZjBmYjVjMzkzZTJiNTQyNDgyM2JkZGIzMjY3MzhlYjU4ZDdhNTRiMiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMGMzNjY4ZWJhMDIxMTg3YjIyNzUzOTg0ZDQxZWEzZTg5MzYzMTA4ZjU2YTYwNzE1NjNlYTZhMTM3Mzk5MWYwOCJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_d8fba1be1b2c463aac265667e63a8f5b",
+      "statement": "The live worker-failure scenario provisions Kafka and MinIO, starts production control and two worker fixture subprocesses using production source/view/checkpoint/sink APIs, kills the first at a durable pending transaction, and observes replacement ownership and recovery; it does not exercise standalone CLI gateway-to-worker transport.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs#L221-L340",
+          "version": "repo-lines-v1:sha256:3cf07fcc3e1435bc30ce27822775386a4f4bdd91d2f8b14a514211785567bbbe:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIwLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiIwM2JlNGExOTM2NWVmODA2NTg3NWJkYmExY2M4YTMxZGQ3NGFjMGQ0ZjZkMjkwODY5NWRlNGU0MjRkYTA1MjExIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiIwYWU2MTk2MTcwMzAzZWI0ODg2NTY1YzNiM2I2MTA3OGYxZWEzMGJmMzU0NmRiOWU1YzA3MmM0ZWZkMDM4YjM0IiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIzZWQ3N2UwYzYxZjk5NjYzNTU1Yzg0OTdjYzNjMDhjZTMzMjlkMGY0MWEyODRmNmFhODAyYzZhMzgyZmYwMjc3IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI3Nzg4N2QzYjk2OTFkOGY1NWVlNTViN2I2ZDE1YzI2ZmRmNmNlNjFhZWE3NWY0NzA4ODgwZGQyNjA5NTE3ZmNkIn0"
+        },
+        {
+          "resource": "repo://docs/testing/worker-failure-recovery.md#L20-L29",
+          "version": "repo-lines-v1:sha256:cb3f4d035a267e0d4916bdb773b662258a854ddaf2e0f719befcf83d6f426560:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMzYTE1YTliYzg5NjNmNjc4MzIzMGRiMWRlZWJlMzY4NmFiYzZmNmMyYTI0ODVhMzIzYjU2N2E3ZjMxODFhZWIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU3ZjMyMjMzYjdjYzNhNjA3YTVmZGY3NGQwZDM5MzczZTE4OTc2MWIxMTQwZjZjOTdkMTgzMGQzZTI0MjA5ZjYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk2ZWVlZWJjZDYzYWEzZWZiZGE5OTFiNDZkMzhhZmM0ZDhiMTFkZTQ2ODBmYzlmNWRhZDkyOGU4YjZkZWRhYzEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijk3ODc1ZjJiMWVhZGI1MWUzYjlmMDE1YjUwZGRlOGI3ZjUyMjMzNGQyZjVhMmJiZjdmMzJmMDMyODFiMDRjZTAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_bfa94bc89d344e5fb44637c9903b09dc",
+      "statement": "The worker-failure parent independently reads the recovered view with ShardReader/HotOnlyViewReader and consumes read_committed Kafka; validation compares full view and sink output, offsets, ownership, cursor/application state and frontier-5 query output, with fault-relative 5/30/60-second deadlines rather than storage-brownout exhaustion proof.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-sim/src/qualification/worker_failure.rs#L184-L257",
+          "version": "repo-lines-v1:sha256:37d2fe701b05aee0578d59c884ccf6c077f0781aad7f87864f39cb191da47029:eyJzZWxlY3RlZExpbmVDb3VudCI6NzQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImFkYjIwMTBhZjM4NGVlYmIzZmIzNmZhN2Q5MjMzM2Q3MWVlMWNmOGQ5N2QxZjk2ZjM0OTY4ZDM2ZTg2N2UxMzIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ4OTc3MWZlMWI2NjI4ODc1YWEyM2U3ZGJlNGFhNzE0NjFkMDBjZGZiNjZkZGYxMWI5ZDgyMGFjNTg5N2ZkZjYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImFkNDRmZGY3NTEzZTgxZjkxMTc1YWZkYWYwYzMzZTYwN2UwZmI0MjhjYzBmYjFkODQ1Yzg2ZmM0MzhiZjY5OTQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImE1MjE2MDRiMzVmYzQwYWYwMGNiYTRlZWEyZmQ1ZTJjM2FmMTg2M2IzOTExODVkN2JmNGJiMDllNzJkMGM4YjMifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs#L342-L405",
+          "version": "repo-lines-v1:sha256:f696aafb164d36a82c2c7b1c692019a5723c411d654183e52d1cc55704bf7821:eyJzZWxlY3RlZExpbmVDb3VudCI6NjQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjcyZDE3ZDgyYzg4MmVjNTlhZmRjMmIxYWM4NjYzNjkyZTI3YTY2YmFjNmNhMTYyNmRkYTkyZjUyMjgwMzExMmEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM1NWI0MzA3Y2FlOTRiMGU2NzI5N2E4NzRhZDU5ODNkNWM0NTgwNjI3ZDliMzM2NzEwNTM2NTkzYjI3YmQ4YjUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI2MDg4MmE1OWNlYjQ2ZDU5NjkyZGE4MTAxM2MxMmU1NmYwMDk1YzM2OTEyMDllOThlOWU2MTA5OTFiNzMzZDQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM1MDgxNzM3MWZjZDA5YTM4ZDhiYWY5ODU3ZWFjZWI5NzFmZDRjZDUyZjU1NmQ2YzE2MDBhNGJmYzRiN2U1MzEifQ"
+        },
+        {
+          "resource": "repo://docs/testing/worker-failure-recovery.md#L31-L46",
+          "version": "repo-lines-v1:sha256:9945387303a88d7ef0b77597bdf563a7906b7bcf90c20ea86e35a59eca40f8fc:eyJzZWxlY3RlZExpbmVDb3VudCI6MTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjY2Yjc1NmIyNjEzYjMyMjhiMTUwNjc2Y2E2NGIyNjA2Zjg3Y2NiOTQ2MTBhYTU3YTZjYjczM2FlYTQ1NDNmYTEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZlOGMxMjdjYmJiNDhlOTI2MmVmYTBiYzU1NTYzMWUxYTU1ODMxNjU4ZDBjNTkwMWRkOTQ0MTNlZTE3YzFjNjMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImJlODg3N2JhODczOWQ4OGE3NjQ3ZWE2ZmVmZmUxZWRiMWQxYmQxMzA5OTllNjA3NjA3N2JiODRiZDZkNjU5OWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQzMTU4N2MzNDkzM2U1M2IzN2NhNzU2ZjQxNjVlNmQxMDI2MDY0NTk0ZmJkYmIxNWFiNGUyNTJiMTA1YmZiODgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_95069fc4556c46e4b7abb666c476abe3",
+      "statement": "Integrated release qualification checks six complete corrupted records for missing detection, constant durations, stale frontier, changed value, duplicate sink output and unchanged process ownership, comparing their exact expected failure reasons rather than relying on test names.",
+      "evidence": [
+        {
+          "resource": "repo://docs/testing/worker-failure-recovery.md#L59-L67",
+          "version": "repo-lines-v1:sha256:a2af413c74be85d43030ec96755a9305145c06cc2f58906ce5274f12095a0ae2:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNTIyNDcxZDdmNDU2ZTkxNDc1MjM4Mzc2Njc5ODJmMDVmNjkyYjMxMzdlN2U1MzQyNDFlMDNkMmFlYjlkMzMyZiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiOGY4ZjJjNzllZDc2YTcyMmQ4ZTQ2NjM5MGJmODYxMmU0ZjIxZjc5YWYxZGRhMDFkMTRiYzQ3MDRhMDRmMDBkNSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNGQ1MDdmMGY3ZGYzMzgzZTdmYzk3ZDM4NjBlZjkxZjc5NjA0NjE1OGFjN2M0NjY4OTY2NTZkN2Y1MTMxZDkyMiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjAsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSJ9"
+        },
+        {
+          "resource": "repo://scripts/release-qualification.py#L164-L201",
+          "version": "repo-lines-v1:sha256:497ca8213037b2b70da99256dc1137e13d0792d8f69dc2ee38c4e9efc40d0d4d:eyJzZWxlY3RlZExpbmVDb3VudCI6MzgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg5ZmRmMTU1YjY1NjFlN2E4ZjI2M2RlZjIwODlhNGI0Njk2ZDQyMzEwYjdlOWZhNDc5YTFkZDk1NTNjZDRiYjkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImRhMDE3NGQ4NDM1ZmMwNTFjYzFiYmIzZTk5ZGM3MzQwNzE4NmQ2MDg5NTg2YmY2MmNjOTczZDQ2NWRlZjI3YmYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRmYmQwMDkzMTRiYzI3MDg0MTY3MzRhMDJhZTVmZjM5YTFlNDhhMDUwYmU5MWY0M2IyZmFhOTIwMDJjNjJiZmMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ5MGYzYjAzMzc1OTUzOTZhZTc2MGM1YzA5YmEyYTE1ZmUxOTcyMGJiOTk4M2ExZmZlMWUyYTgzMTAxZTQ2NzQifQ"
+        },
+        {
+          "resource": "repo://scripts/release-qualification.py#L60-L64",
+          "version": "repo-lines-v1:sha256:94cd9e0a6e1386e2d1d761f176723bebac982fe19c14f9e020ba767dd5a81a2a:eyJzZWxlY3RlZExpbmVDb3VudCI6NSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNmEzNDc4OWE5MWFjZTk5Yzg3YjNhNWI4YmY3NWY1YTExZmQxNzJmOWMwZjU2MTQ5NGFjOTczY2ExYjhjZWIxMCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNDEyY2EzNDVjY2Y3NWJmOWMwODA2YmNlNjk1YmU4ZGU4MDhiNzk5ODQyNTFhN2E1NGQyMDJjZjYxMDFkZDQ1MSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiYzU5MGFmYTgxNjdmZGY4NjA3ZTMxMTJhYmQ3OTJiZjIxNmE1MzcwMzYzZDNjYzcyNmVmNDhjZDkwYjJhYTgzZSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiY2M1NjlkZDc2ODg1Njk4ZWQxMDJmOWI5YjJlZjc4Njc5NjMyYzhmNDlkOGY0NDY1NGUyOTJkMzZhMWRhZTlhNyJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_79e02da6a4034fcaa554438882271e7c",
+      "statement": "Successful release_qualified recovery evidence is scoped only to worker-failure-kafka-minio-v1 and explicitly excludes general Kafka recovery, PostgreSQL CDC, distributed-control HA, PGWire transport and recovery p99; the real-cluster chaos workflow runs this integrated scenario and uploads its evidence.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/real-cluster-chaos.yml#L1-L8",
+          "version": "repo-lines-v1:sha256:c7576c0f1fdb231713a768eade6a9bb05d2eddfccc228a32a3db4cf0608145ae:eyJzZWxlY3RlZExpbmVDb3VudCI6OCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNmRjYjA1MGJmZTQzMjRiZmQ0ODJlMmJmM2U4N2RhMTY2ZTQwZDJjNTdmYzdlNTI0ZjdiN2I1YzQ1ZDRhNDE4NiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMWNmYTZkOTg0MGVlZDU0MmE2ZjRkMjY0YWJiYWRmNGY0ZGQ2YTliM2E4MjMzODQ3Y2E5NGFmZDY1MGFkOTU2NCIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjAsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNjliMmQ4ZDhjODM4MWQ4ZGRmMGUxYTEzMDBiMGE1MDg5Yzg3YWQ4NWUwOWZkYWNkYTM5MDViOGUwNTYxZGU2OSJ9"
+        },
+        {
+          "resource": "repo://.github/workflows/real-cluster-chaos.yml#L53-L70",
+          "version": "repo-lines-v1:sha256:af5ff25ee743cb4baeebbed86e48bf9af1823abf625a451d4fd3a87e8ccf7725:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU5YzNmYWQyZDFmZWYwYWMxNmJhNTFkYjE3MGY5NDNmMTliZTNkODk5YmUzZDExNDU1NjQzNWU2MjMyNTRjYjMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYwYmQzZmMxZDU2NDg1NmRjMGFiMWU3YmM2MTAxMDQ0NDEzZjJhZTNmZDhjZjBhZmEyMjhiZTBlMTkwYjAyOTIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjgxOWU5MDA3NThmNDllMWQzYTMwZDgzYThiNjEzYzQ5Yjg2MjVmMzBiMzUxMzJhMGJiYjNhYjllNmYwN2MwMGUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        },
+        {
+          "resource": "repo://docs/testing/worker-failure-recovery.md#L43-L46",
+          "version": "repo-lines-v1:sha256:ebbff5e0d8d5b99950dfd67528d603281fdced18074132bd4e2d740ddda39a91:eyJzZWxlY3RlZExpbmVDb3VudCI6NCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiOWM4MWU4N2YwMTUzYTA3YzQ0Mjg0ZTlmYWE2MDA5OTNiNjU3NzBlY2U2MmU4OTM5OWQzMTZjZDkwNDZjNzZhZiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNmU4YzEyN2NiYmI0OGU5MjYyZWZhMGJjNTU1NjMxZTFhNTU4MzE2NThkMGM1OTAxZGQ5NDQxM2VlMTdjMWM2MyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiYjQ2ODBkMzk3YmExNjI2ZDBjMzI5YzI0MTk1NDlkYTFkNjgwNmFiYjI3YjM0OTAyZWM0ZGFiYmQ1YjdhZmIzOCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNDMxNTg3YzM0OTMzZTUzYjM3Y2E3NTZmNDE2NWU2ZDEwMjYwNjQ1OTRmYmRiYjE1YWI0ZTI1MmIxMDViZmI4OCJ9"
+        },
+        {
+          "resource": "repo://scripts/release-qualification.py#L141-L160",
+          "version": "repo-lines-v1:sha256:87f22ee5650eaf62eccd461a3ae4b45be15d3794594e1d8024227a9418254c59:eyJzZWxlY3RlZExpbmVDb3VudCI6MjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijc2NzdmZTFmMWNkMWJhMmNmY2M3MGE2NjFlZWIxYWI4YTljMmY0ZTJkMTJhOWVmMjRkNTE5ODY2NDJjMDE3OWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImVhYTFhMmE1ZDAxMDc4OGYxZjlhMDVmNTJjZTA0NWQ4MGI3N2JmNzg4ZjcwZmE3NDhkZWJjODk3ZDdiYzY1ZmUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjU4YjZiNzMwZDgzYjU5NGE2OGMwN2I1Yjc3YmNjNmFmZDVlMjhiZGU2MGZjYzA1NDI4ZWFhMjM1OTczOWRmN2MiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjRmYmQwMDkzMTRiYzI3MDg0MTY3MzRhMDJhZTVmZjM5YTFlNDhhMDUwYmU5MWY0M2IyZmFhOTIwMDJjNjJiZmMifQ"
+        },
+        {
+          "resource": "repo://scripts/release-qualification.py#L65-L65",
+          "version": "repo-lines-v1:sha256:f7801709e46e2d7160a67edf1974a731a4af70668354c454144d6517a9784042:eyJzZWxlY3RlZExpbmVDb3VudCI6MSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiZjc4MDE3MDllNDZlMmQ3MTYwYTY3ZWRmMTk3NGE3MzFhNGFmNzA2NjgzNTRjNDU0MTQ0ZDY1MTdhOTc4NDA0MiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZjc4MDE3MDllNDZlMmQ3MTYwYTY3ZWRmMTk3NGE3MzFhNGFmNzA2NjgzNTRjNDU0MTQ0ZDY1MTdhOTc4NDA0MiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiYTRiZGM4YjAzOGVmYjIxMjc1MWY4NWUwOGYzNjlhODA2YzE3MmQ1NmY3M2EwMTY2YjBmZWY2ZDhmMGYzNmIyOSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZGMyNGJlZjQwN2NhNjk2ODZhNTllYTJlZjRmYmExMTgxNTUwOWI0OGNkMzU5N2M2YjkyYjkxYzFlY2RhOGU2NSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_22d2a0517fe44f27a9ba19301535ad8f",
+      "statement": "General EvidenceManifest validation checks identity fields, digest syntax, failed/mandatory-skipped results and regenerated summaries from supplied raw samples, rejecting a single positive sample equal to a target; disk digest checking is separate, and deserialization alone performs neither validation.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-types/src/evidence_manifest.rs#L228-L365",
+          "version": "repo-lines-v1:sha256:496bf74a789995d1c059b21f3a8093b1e2d093c07189fe6f798f95df0aa0fc05:eyJzZWxlY3RlZExpbmVDb3VudCI6MTM4LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI3MzY4MGI0NmQ0ZGY3YjEwZjQzMTBiYmI5NWZhMmYwNzE5Njg4YTM4MTgyZTBjMzA1NmVhNWM4YThmZDJkYjI1IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJlNmIwNDQ5MTQ2OTcyMmU4MzYzYTk0ZTQwNDQ1MzhlMDEzYTJhMjE3ZTM2YjFlNTY4YmE2MGFjYjdiNGM4ZjJlIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI4MTc5MjIyY2U2YmM1OWIyMjhhYThmNDU4OWJjMGJkMWU0OWIxMTk5ODQ5MDMyZjJhOWVkNTgwYTA5Nzk1NjFiIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJhNzI0MDgzNGQxZGNlYmY3ZjkxN2MzYTEyYzM0NWY2NDhkOWEyZWYwODViNTY3YzViY2ZhZWRiMGY4YWYzNDg2In0"
+        },
+        {
+          "resource": "repo://crates/rockstream-types/src/evidence_manifest.rs#L370-L407",
+          "version": "repo-lines-v1:sha256:47ab63c454e08eb0422a436a1ce29e0c7e3928d3d02df4faac019707c77fc90b:eyJzZWxlY3RlZExpbmVDb3VudCI6MzgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdmNzRiMjAyNjQyMDU1NDJhNTc2YjUxZWJiNzkwNjc5NzUwOWE3NzczZWFmZTY3MGExYzYxNDU2ZmJkMTdmYmYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE2MmVlNTdlNDFhOGMyMGFlMDE2NGRmMjYxNDM5ZGNjNDk5ZDM1MjA4MzQxNTE1MTZkMDQ3ZThkZWFlOGE0NjYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_6034f50fd0864c3eae3412e177f31a8e",
+      "statement": "The checked-in general evidence manifest identifies a specific candidate and environment, while integrity validation over supplied data does not establish production-observation provenance or qualification of another checkout.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-types/src/evidence_manifest.rs#L228-L365",
+          "version": "repo-lines-v1:sha256:496bf74a789995d1c059b21f3a8093b1e2d093c07189fe6f798f95df0aa0fc05:eyJzZWxlY3RlZExpbmVDb3VudCI6MTM4LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI3MzY4MGI0NmQ0ZGY3YjEwZjQzMTBiYmI5NWZhMmYwNzE5Njg4YTM4MTgyZTBjMzA1NmVhNWM4YThmZDJkYjI1IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJlNmIwNDQ5MTQ2OTcyMmU4MzYzYTk0ZTQwNDQ1MzhlMDEzYTJhMjE3ZTM2YjFlNTY4YmE2MGFjYjdiNGM4ZjJlIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI4MTc5MjIyY2U2YmM1OWIyMjhhYThmNDU4OWJjMGJkMWU0OWIxMTk5ODQ5MDMyZjJhOWVkNTgwYTA5Nzk1NjFiIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJhNzI0MDgzNGQxZGNlYmY3ZjkxN2MzYTEyYzM0NWY2NDhkOWEyZWYwODViNTY3YzViY2ZhZWRiMGY4YWYzNDg2In0"
+        },
+        {
+          "resource": "repo://docs/evidence-manifest.json#L1-L20",
+          "version": "repo-lines-v1:sha256:b92bcd2ef5815592431ccb65d26ee84aeaea574cc4170172c39c72c1afb50e5d:eyJzZWxlY3RlZExpbmVDb3VudCI6MjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE2ZmIwOGZkYTFhY2I5NTdiNjExNmJkMzc4MTFhMWZlNDFhMDE2MTFjMDYzMWVkYmY3ODZkNjg4OWEyN2E1NWMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRkNWNkMmZiNGYzZGY4ODQ1MTUyNTViMzk1MjNmMmY4YjU0NzJiZWVhOWY1NjZmZmNhMjA0ZGI4MDI1NjEwNDEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQxNGIzZWQwYmFmOTVlNmZjZTFkZGI4MjgxZDJlNzNjYjI5YmUzYTAyNGNiMGM1MmM0MWEwZDNmMDZhZTYxN2UifQ"
+        },
+        {
+          "resource": "repo://docs/test-commands.md#L43-L78",
+          "version": "repo-lines-v1:sha256:145e411d914210d2159bf068aec4d7de7ec1120a70890c82de26612ecd32ff53:eyJzZWxlY3RlZExpbmVDb3VudCI6MzYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAyNGM0ZDBmNWJjOWE1Mzk3ODJiZGE0NjEzNzE2MmNjMjJiMGE2MThlMjEzYTkzZmUwYmQyM2VmMTNjNjRiMmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdmYWEwZGM4NTUwM2M5NDdkMWMwY2I5NjgxZmI3NzJmNjA0MTg3ZjI3YmEwNzYxNzQ4MjQ3NmZlNzU1ZTJiNzYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjcxYmU0YjkxN2E2ZWYzNDlmMDdiNjgxMjEyNTdjMjFlMDI0NjQ3MjhiMjA2MjA5YTYzZThjNmVmNGVmZWNlODUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ4ZmRhNDYyOGZlNTUyODUyODYxNTViM2FmOTMxZjEzZTRlZjgxZDllOWNmODA4MTE5Y2YyNzhjOWRkOGYyMDYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_6c473a78b1744b4b8ab84b9aa41c68f3",
+      "statement": "CI case accounting proves selection and terminal outcomes rather than assertion faithfulness, treats known ignored cases as limitations not passes, requires explicit ownership for simulation targets, and does not imply independently scheduled soak/fuzz/release evidence from green PR checks.",
+      "evidence": [
+        {
+          "resource": "repo://docs/ci-test-accounting.md#L109-L113",
+          "version": "repo-lines-v1:sha256:afcd9f8ea6181e5938e23dfec129f21673cc97897c59515c7c550d63adeadc81:eyJzZWxlY3RlZExpbmVDb3VudCI6NSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiM2VjOTViZGVkNDUwOTU0NmQ2OGMyOTg0NGJmZDVjNzRiYzZlOTYwNTlkN2Y3MjhkNWFhNDAyY2M2ZGU4MjM4YyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiYjAxNWMzNmIxMTM2MzgwY2IyYjE4NzI3YzE5ZDZhY2JmMzMyYWQ4ZmNmZmI1NGM0YTI2NTU5YWQ4M2UzNWUyNSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZDE4ZWE3OTk0NmNlYzFmMDcwMDlkNzQxOGE2Y2VkYWIwYzUyYTM5ZjAxMTdkZDI5YjYzZGEwMzBjMTI3ZGM5MSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjAsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSJ9"
+        },
+        {
+          "resource": "repo://docs/ci-test-accounting.md#L3-L15",
+          "version": "repo-lines-v1:sha256:8fe256b140d3da87842312d9d9b75d7a2aa28ae32ea1f2f0f13a8a924decfd67:eyJzZWxlY3RlZExpbmVDb3VudCI6MTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY4ZDdlZTFlNmZjMWNkZjFhYjQwZDZkOWQ0ODJlZTU1YjhhZjgwYjk5NTQxYjMyNTg1ZjljOTBmZWRiNjJhMTkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU1ZWZiMDU5ZWIzYzMyNjIwNWZjMTk4NjZkY2ZlNGM0NzM2ZDRiZDk2YzYwM2M0YzI1MTJjOTc0OTBiNjA5NWYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjoyLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjZkMWUxZGZkMWU3N2Q0OWNhZjJiOWEyOGIwZmZiZWVlNWNlZTM2NzVlNWJmMWMyN2VkNjQ3NjA4ZDA2NTcyNWMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImU5YTg2YmNlZGZhZmM2ZmU4MmVhNDhiMzI0NzZjN2I5NmM3M2Q4MGYyZGFlNzI5Y2JkMzc3ZDJiNDUxY2Q4ZjQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_335a2363934144bba42571267fc3eaa9",
+      "statement": "The SQL fuzz target calls DDL parsing and plan conversion on UTF-8 input and discards ordinary returned errors, providing robustness exploration rather than exact SQL-result equivalence.",
+      "evidence": [
+        {
+          "resource": "repo://fuzz/fuzz_targets/fuzz_sql_parser.rs#L1-L18",
+          "version": "repo-lines-v1:sha256:38fc53e2cc523d6b930e5ca2f40f60294e8c19d9e4669dc7cfc6fbdcf18a2393:eyJzZWxlY3RlZExpbmVDb3VudCI6MTgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImZhZmMyMDE2NjJiM2Q3OGUxNTQ3YWRlMWUxMjJkNGNkY2IyZTA0NDFmNmNmZmUzOTAzMjU2NThlNTk5ZWQ0M2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY2ZjViNDBiMTU4NDU3ZDE3ODY0ZjIxNzkwNzg2ZGQ1YTJlY2RiNjRiNjZhNjUxZjc4OGQ0ZTI1Y2QzMzAzZDIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_856edf55ee864b2fbd0a8cca56e97934",
+      "statement": "The Makefile combines Rust verification, proof-contract checks and FizzBee protocol verification under verify; active protocol models cover epoch commit, frontier aggregation, sink 2PC, self-fencing, migration and control HA.",
+      "evidence": [
+        {
+          "resource": "repo://Makefile#L27-L51",
+          "version": "repo-lines-v1:sha256:856b2ffd282de11f6537322cbf18606c82f4062e04ea69b6938388c6303766c3:eyJzZWxlY3RlZExpbmVDb3VudCI6MjUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU0MmI4NjAwZTZmMTdkMTE5ZWU3YWM0MDViYWY4MDMwOGNkY2Q2MDczZjg5M2ZhMjQ2NmI5MWE1Njc5NzhkOTgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjcwM2E4ODYzYWE4NDNlNjcyNDJhMWYwOGVhMWEyY2ZiODA3YTNjY2U3MjMzZWYyOTRlN2VhYmY5YjA5NjZhY2UiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQ3NGQ4ZjhmYjA3YjEwZTY4ZjVlY2NlMTZhYTkxODFmNDhjY2QwNTgxZDY1MmY0NzJiODUzZDEwYjY4ZjE2YjMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzZGEzNmIwNWNiMjIyMzY5NjcxNjg5NWYwN2FjZTgwNjE3YTNhMzRiM2JmM2U5ZDEzZGUxZGJlM2Y0MDYxOGUifQ"
+        },
+        {
+          "resource": "repo://formal/README.md#L7-L19",
+          "version": "repo-lines-v1:sha256:1efec6162b595f959df4427ed193d3617adc15f5d3249743444506cf07991ea5:eyJzZWxlY3RlZExpbmVDb3VudCI6MTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImVmYWI3MTM1ZjFlOTI4MDk0NWI1NDljMjJhY2FkOWQ5YTE3NjJmZWQ0MjFjNTU3NWJiNTVmNWYyNGE5NWIyMzUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQwZWNlZmZiOGU5YTNhNWMwZDk1YjhkN2M4NDU4YTlmNTRjNDliOThkMTUxMjlmMzQ5M2NjMjJmYzlmMjIxZTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM3M2IyNTJhNDk1OTY0ZmJmZjJmNGE3NmFlY2I1NDg5MGRiNzQzOTA1M2ZkYjlhOTBjNDYyNGVmNWNlMzJiMmEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjVkMDRhNzk5YzliNDg0NDc4NGE1ZDU1ZmZiODVjNjE2MGE0NTlmMmZmNDJmOTgxYzZjZDBlMmQ2MWZiNjhiYmMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_ba6a1a9ef7814f09beabf0129622974d",
+      "statement": "Production AggregateOp calls the verified aggregate transition kernel, while the verified crate also has ordinary boundary tests; Verus qualification uses pinned tooling and records revision/digests/commands/logs/exits/timing, leaving missing prerequisites blocked rather than passing.",
+      "evidence": [
+        {
+          "resource": "repo://crates/rockstream-ops/src/aggregate.rs#L290-L315",
+          "version": "repo-lines-v1:sha256:f37b5cbd3ca10ef3fb6aaf956606b3b3079d1919a518b54a93faf18e8eabe238:eyJzZWxlY3RlZExpbmVDb3VudCI6MjYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImM1Y2RlZjgwODVhZTc0YWI2MzZkNjQ1OWY1YzZkNWZiZmIwZGIyNjRmMWIwZDc1YmFjNTE5YzliM2Y2NzE3YWMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxYmE0NzE5YzgwYjZmZTkxMWIwOTFhN2MwNTEyNGI2NGVlZWNlOTY0ZTA5YzA1OGVmOGY5ODA1ZGFjYTU0NmIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE2NDM1MzM3OTYzNzRiZmQwZjE0OTIzNDhlZDk0MmJjYTUzNTBlZjE4YjY3MjQ0NzNmODJiZTVlMWMwYTgxNzUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImNlMzE5ZDBiNDNjMjMyZWFmYWY1ODc2NDg1OGMyNzQwOTg4NjQ4YmIxYWNkZGUxNGJjYmQ4ODliNjUwZjEwMzAifQ"
+        },
+        {
+          "resource": "repo://crates/rockstream-verified/src/lib.rs#L61-L75",
+          "version": "repo-lines-v1:sha256:1307bde30cd23569eee89367cd9adeff5414882c150d81291961a25166ebf3a2:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkyYjVlZGY1OTQ5Y2ZlYTY3ODIyY2Y2OTExMzIzNjNkNjhkNmYxZTE2OWY1ZTBkNGY3YzE0ZTVmYTFlNmQ0ZTUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImYyZGU1MTMxZWM2ZGJlZGQzNWE3NmRlOTdlODBhYTIyYzBlMjkzYjg4ZGIyOTAyNzQ4NGRkNThjNjViZDU4NWEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjRiZWE2NjgyM2M5OTFhMmMxZWJkOTY0NjMzYTc2ZjExYTJhYjUwZWQ5ZDFhOTRhMWE5YjAwNjMyMWJmZDVmMjcifQ"
+        },
+        {
+          "resource": "repo://formal/verus/README.md#L3-L44",
+          "version": "repo-lines-v1:sha256:250a0b75cc32728e92ac54dfcfb6c0fa464d0ba414464b293d1fbcdbf0735e4e:eyJzZWxlY3RlZExpbmVDb3VudCI6NDIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI2NGI2MmUzNGYzOTRmZDY1MmZhYzRjZjliNzAxM2RiZjI4ZGFlZTlmNTA5ZGY1MmEwZGE4MGNiOGNhNTQ3MmMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI4ZjQ2N2EwMjdhMjI1YzJhZjEwZTgxNjk5ODExODkwMjE0NTc4Y2IwODgxN2U4YmZmYmRiZmNkMzNlZmNlMzkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjoyLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjA5YTI4N2ZmYjFmZDUyYmYwZDU0M2YwOWE4MjEwNjNlN2VlZGUzYzZhYTlkZGI1ZjVhY2NlYTk3YTkwZmI0NTkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.7.2",
+    "at": "2026-10-21T16:22:36.376Z"
+  }
+}
