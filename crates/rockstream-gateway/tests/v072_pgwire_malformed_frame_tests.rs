@@ -128,9 +128,8 @@ async fn malformed_frames_fail_closed_and_next_client_still_works() {
 #[test]
 fn raw_decoder_rejects_original_and_minimized_fuzz_inputs_without_panics() {
     let bad_copy = &b"d\x00\x00\x00\x00"[..];
-    let result = std::panic::catch_unwind(|| {
-        PgWireFrontendMessage::decode(&mut BytesMut::from(bad_copy))
-    });
+    let result =
+        std::panic::catch_unwind(|| PgWireFrontendMessage::decode(&mut BytesMut::from(bad_copy)));
     assert!(result.is_ok(), "malformed CopyData must not panic");
     assert!(result.unwrap().is_err(), "malformed CopyData must fail");
 
@@ -141,9 +140,8 @@ fn raw_decoder_rejects_original_and_minimized_fuzz_inputs_without_panics() {
         "00000027000300007573657200726f636b73747265616500646174616261007227000300007573",
     )
     .unwrap();
-    let result = std::panic::catch_unwind(|| {
-        Startup::decode(&mut BytesMut::from(original.as_slice()))
-    });
+    let result =
+        std::panic::catch_unwind(|| Startup::decode(&mut BytesMut::from(original.as_slice())));
     assert!(result.is_ok(), "malformed Startup must not panic");
     assert!(result.unwrap().is_err(), "malformed Startup must fail");
 
