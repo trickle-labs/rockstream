@@ -64,8 +64,11 @@ impl OperatorTask {
                     error!(
                         operator = self.op.name(),
                         error = %e,
-                        "RS-0001: failed to push input frontier"
+                        "RS-0001: failed to push input frontier; stopping the pipeline"
                     );
+                    // Progress metadata is part of the ordered epoch contract.
+                    // Never emit the batch (or later epochs) after a rejected frontier.
+                    break;
                 }
             }
 
@@ -201,6 +204,63 @@ mod tests {
             sink.recv().await.is_none(),
             "the result after a failed epoch must not be emitted"
         );
+    }
+
+    struct RejectFrontier;
+
+    impl Operator for RejectFrontier {
+        fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, crate::error::OpError> {
+            Ok(delta)
+        }
+
+        fn name(&self) -> &str {
+            "RejectFrontier"
+        }
+
+        fn push_input_frontier(
+            &self,
+            _frontier: rockstream_types::frontier::FreshnessToken,
+        ) -> Result<(), crate::error::OpError> {
+            Err(crate::error::OpError::unsupported_plan_node(
+                "injected frontier rejection",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_frontier_stops_pipeline_without_publishing_later_batches() {
+        use rockstream_types::frontier::FreshnessToken;
+
+        let (input, receiver) = mpsc::channel(16);
+        let (output, mut sink) = mpsc::channel(16);
+        let task = tokio::spawn(
+            OperatorTask {
+                op: Arc::new(RejectFrontier),
+                input_rx: receiver,
+                output_tx: output,
+                grpc_call_count: Arc::new(AtomicU64::new(0)),
+                shuffle_write_count: Arc::new(AtomicU64::new(0)),
+            }
+            .run(),
+        );
+        input
+            .send(
+                ArrowZSet::from_ab_rows(&[(1, 10)], 1)
+                    .with_frontier(FreshnessToken::new(Default::default(), 42)),
+            )
+            .await
+            .unwrap();
+        input
+            .send(ArrowZSet::from_ab_rows(&[(2, 20)], 1))
+            .await
+            .unwrap();
+        drop(input);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(sink.recv().await.is_none());
     }
 
     #[tokio::test]
