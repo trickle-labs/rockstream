@@ -118,6 +118,13 @@ mod frame_regressions {
     fn missing_query_terminator_is_rejected() {
         let mut bytes = BytesMut::from(&b"Q\x00\x00\x00\x06xy"[..]);
         assert!(PgWireFrontendMessage::decode(&mut bytes).is_err());
+        let mut no_body = BytesMut::from(&b"Q\x00\x00\x00\x04"[..]);
+        assert!(PgWireFrontendMessage::decode(&mut no_body).is_err());
+        let mut empty_sql = BytesMut::from(&b"Q\x00\x00\x00\x05\x00"[..]);
+        assert!(matches!(
+            PgWireFrontendMessage::decode(&mut empty_sql),
+            Ok(Some(PgWireFrontendMessage::Query(_)))
+        ));
     }
 
     #[test]
