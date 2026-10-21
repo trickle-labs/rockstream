@@ -6,7 +6,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::BytesMut;
 use object_store::memory::InMemory;
+use pgwire::messages::{startup::Startup, Message, PgWireFrontendMessage};
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
     view_reader::{ViewReadStrategy, ViewReader},
@@ -121,4 +123,33 @@ async fn malformed_frames_fail_closed_and_next_client_still_works() {
     assert_eq!(rows, vec!["1".to_string()]);
     connection_task.abort();
     task.abort();
+}
+
+#[test]
+fn raw_decoder_rejects_original_and_minimized_fuzz_inputs_without_panics() {
+    let bad_copy = &b"d\x00\x00\x00\x00"[..];
+    let result = std::panic::catch_unwind(|| {
+        PgWireFrontendMessage::decode(&mut BytesMut::from(bad_copy))
+    });
+    assert!(result.is_ok(), "malformed CopyData must not panic");
+    assert!(result.unwrap().is_err(), "malformed CopyData must fail");
+
+    // The original 39-byte seed revealed an independent unterminated C-string
+    // panic in the startup decoder, before libFuzzer minimized the CopyData
+    // framing underflow down to five bytes.
+    let original = hex::decode(
+        "00000027000300007573657200726f636b73747265616500646174616261007227000300007573",
+    )
+    .unwrap();
+    let result = std::panic::catch_unwind(|| {
+        Startup::decode(&mut BytesMut::from(original.as_slice()))
+    });
+    assert!(result.is_ok(), "malformed Startup must not panic");
+    assert!(result.unwrap().is_err(), "malformed Startup must fail");
+
+    let mut valid_empty_query = BytesMut::from(&b"Q\x00\x00\x00\x05\x00"[..]);
+    assert!(matches!(
+        PgWireFrontendMessage::decode(&mut valid_empty_query),
+        Ok(Some(PgWireFrontendMessage::Query(_)))
+    ));
 }
