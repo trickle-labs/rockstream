@@ -7747,18 +7747,14 @@ impl GatewayHandler {
                         .await
                         .map_err(|e| PgWireError::ApiError(Box::new(e)))?
                 } else {
-                    let prefix = format!("view_output/{view_name}/");
-                    let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
-                        PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-                    })?;
-                    kvs.into_iter().map(|(_, v)| v.to_vec()).collect()
+                    self.scan_relation_rows_bounded(view_name, shard_db)
+                        .await
+                        .map_err(|error| PgWireError::ApiError(Box::new(error)))?
                 }
             } else {
-                let prefix = format!("view_output/{view_name}/");
-                let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
-                    PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-                })?;
-                kvs.into_iter().map(|(_, v)| v.to_vec()).collect()
+                self.scan_relation_rows_bounded(view_name, shard_db)
+                    .await
+                    .map_err(|error| PgWireError::ApiError(Box::new(error)))?
             };
             // Apply ORDER BY if specified
             if !order_by.is_empty() {
