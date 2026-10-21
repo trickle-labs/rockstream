@@ -196,10 +196,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            sink.recv().await.unwrap().positive_ab_rows(),
-            vec![(1, 10)]
-        );
+        assert_eq!(sink.recv().await.unwrap().positive_ab_rows(), vec![(1, 10)]);
         assert!(
             sink.recv().await.is_none(),
             "the result after a failed epoch must not be emitted"
