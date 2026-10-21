@@ -1138,6 +1138,24 @@ mod tests {
     }
 
     #[test]
+    fn correction_preserves_exact_weighted_many_to_many_join_rows() {
+        let op = JoinOp::new(OperatorId(734), vec![0], vec![0]);
+        let left = make_lr_batch(&[(1, 10, 2), (1, 20, -1), (2, 30, 1)]);
+        let right = make_lr_batch(&[(1, 100, 3), (1, 200, -2), (2, 300, 4)]);
+        let output = op.process_epoch(left, right).unwrap();
+        assert_eq!(
+            extract_join_output_3col(&output),
+            vec![
+                (1, 10, 100, 6),
+                (1, 10, 200, -4),
+                (1, 20, 100, -3),
+                (1, 20, 200, 2),
+                (2, 30, 300, 4),
+            ]
+        );
+    }
+
+    #[test]
     fn join_no_match_produces_empty() {
         let op = JoinOp::new(OperatorId(2), vec![0], vec![0]);
         let left = make_lr_batch(&[(1, 10, 1)]);
