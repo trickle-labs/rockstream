@@ -2,7 +2,7 @@
 
 Upstream source: https://github.com/sunng87/pgwire/tree/v0.28.0
 Original license: dual MIT and Apache-2.0 (retained unchanged here).
-Only `src/messages/codec.rs` and `src/error.rs` change production behavior.
+Only `src/messages/codec.rs`, `src/messages/simplequery.rs` and `src/error.rs` change production behavior.
 
 The historical 0.28 decoder accepts malformed length fields below the four-byte
 header and passes them to `CopyData::decode_body`, which can panic on unsigned
@@ -21,5 +21,8 @@ version is compatible with RockStream. Replace the patch with a qualified
 upstream release as soon as one is tested. Keep decoder fuzzing enabled;
 never mask errors in the fuzz target or disable the required checks.
 
-Focused regression: `cargo test -p pgwire frame_regressions`, with full
-repository checks and a real socket malformed-frame smoke required before merge.
+Focused regressions: `cargo test --manifest-path vendor/pgwire-0.28.0/Cargo.toml frame_regressions` and
+`cargo test -p rockstream-gateway --test v072_pgwire_malformed_frame_tests`,
+with full repository checks and a real socket malformed-frame smoke required
+before merge. The vendored package is intentionally excluded from workspace
+membership, but remains the patched Cargo dependency.
