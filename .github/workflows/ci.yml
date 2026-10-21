@@ -4,8 +4,16 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths-ignore:
+      - "**/AGENTS.md"
+      - "**/openwiki/**"
+      - "**/.openwikiignore"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/AGENTS.md"
+      - "**/openwiki/**"
+      - "**/.openwikiignore"
   workflow_dispatch:
   schedule:
     - cron: "45 3 * * *"

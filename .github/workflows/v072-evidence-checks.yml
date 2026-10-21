@@ -7,12 +7,18 @@ on:
       - tools/r1-local-harness/**
       - benchmarks/r1-local/profile-v072.toml
       - .github/workflows/v072-evidence-checks.yml
+      - '!**/AGENTS.md'
+      - '!**/openwiki/**'
+      - '!**/.openwikiignore'
   push:
     branches: [main]
     paths:
       - tools/r1-local-harness/**
       - benchmarks/r1-local/profile-v072.toml
       - .github/workflows/v072-evidence-checks.yml
+      - '!**/AGENTS.md'
+      - '!**/openwiki/**'
+      - '!**/.openwikiignore'
 
 permissions:
   contents: read

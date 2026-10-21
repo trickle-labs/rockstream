@@ -31,6 +31,9 @@ on:
       - "scripts/release-qualification*"
       - "scripts/run-release-qualification.sh"
       - ".github/workflows/real-cluster-chaos.yml"
+      - "!**/AGENTS.md"
+      - "!**/openwiki/**"
+      - "!**/.openwikiignore"
 
 concurrency:
   group: real-cluster-chaos-${{ github.event.pull_request.number || github.ref }}

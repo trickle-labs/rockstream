@@ -6,6 +6,9 @@ on:
       - 'crates/rockstream-ops/**'
       - 'crates/rockstream-storage/**'
       - '.github/workflows/v072-commit-checks.yml'
+      - '!**/AGENTS.md'
+      - '!**/openwiki/**'
+      - '!**/.openwikiignore'
 
 permissions:
   contents: read

@@ -1,0 +1,27 @@
+# Local credentials and agent state
+.env
+.env.*
+!.env.example
+!.env.*.example
+**/*.pem
+**/*.key
+.aws/
+.codex/
+.claude/
+.p2p/
+.scratch/
+
+# Build output, caches, and raw generated artifacts; keep source and tests.
+**/target/
+**/node_modules/
+**/__pycache__/
+.cache/
+.DS_Store
+*.log
+lcov.info
+output.txt
+/1
+fuzz/corpus/
+fuzz/artifacts/
+formal/out/
+evidence/r1-local/artifacts/

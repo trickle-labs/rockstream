@@ -69,6 +69,17 @@ case-accounting runner, preserving the per-case transcript and debug setting.
 
 ### Explicit prose-only CI scope (partial CI-cost optimization)
 
+Changes limited to `AGENTS.md`, an `openwiki/` directory, or `.openwikiignore`
+at any depth do not trigger branch-push or pull-request CI workflows. Mixed
+changes still run the workflows matching their other paths. Scheduled, manual,
+and release-tag runs retain their existing triggers; GitHub does not apply
+path filters to tag pushes.
+
+Main currently requires checks from `CI`. GitHub leaves required checks pending
+when path filters skip the workflow, so metadata-only PRs will be blocked from
+merging under the current ruleset. These filters do not change repository
+rules or produce qualification evidence.
+
 `ci-policy` now shares the conservative path allowlist in `scripts/ci-scope.py`.
 Only a pull request whose **every** changed file is allowlisted prose can use
 lightweight CI: `AGENTS.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`,

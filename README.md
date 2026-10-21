@@ -267,6 +267,23 @@ cargo test --workspace
 verification checks. See [test commands](docs/test-commands.md) for focused and
 release-qualification commands.
 
+### OpenWiki
+
+Use [OpenWiki](https://github.com/langchain-ai/openwiki#model-providers) with the
+`openai-chatgpt` provider to use your ChatGPT subscription's Codex allowance.
+OpenWiki 0.7.0 is the configured baseline; install it with
+`rtk proxy npm install -g openwiki@0.7.0`. From the repository root:
+
+```bash
+OPENWIKI_PROVIDER=openai-chatgpt rtk proxy openwiki code --init
+```
+
+Sign in with your ChatGPT account in the browser wizard and select a model.
+For later runs, use `--update` to preserve and refresh the existing wiki.
+The [wiki brief](openwiki/INSTRUCTIONS.md) sets RockStream's documentation scope;
+`.openwikiignore` excludes credentials, caches, build output, and raw artifacts.
+The Codex integration can also use these files through its existing session.
+
 ## Contributing
 
 Read the [contributor guide](docs/contributors.md) for repository conventions,
