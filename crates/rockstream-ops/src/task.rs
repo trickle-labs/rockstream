@@ -168,16 +168,6 @@ mod tests {
     async fn operator_error_closes_pipeline_before_later_epochs_can_escape() {
         let (input, receiver) = mpsc::channel(16);
         let (output, mut sink) = mpsc::channel(16);
-        let task = tokio::spawn(
-            OperatorTask {
-                op: Arc::new(RejectNegative),
-                input_rx: receiver,
-                output_tx: output,
-                grpc_call_count: Arc::new(AtomicU64::new(0)),
-                shuffle_write_count: Arc::new(AtomicU64::new(0)),
-            }
-            .run(),
-        );
         input
             .send(ArrowZSet::from_ab_rows(&[(1, 10)], 1))
             .await
@@ -191,6 +181,17 @@ mod tests {
             .await
             .unwrap();
         drop(input);
+        let task = tokio::spawn(
+            OperatorTask {
+                op: Arc::new(RejectNegative),
+                input_rx: receiver,
+                output_tx: output,
+                grpc_call_count: Arc::new(AtomicU64::new(0)),
+                shuffle_write_count: Arc::new(AtomicU64::new(0)),
+            }
+            .run(),
+        );
+
 
         tokio::time::timeout(std::time::Duration::from_secs(10), task)
             .await
@@ -230,16 +231,6 @@ mod tests {
 
         let (input, receiver) = mpsc::channel(16);
         let (output, mut sink) = mpsc::channel(16);
-        let task = tokio::spawn(
-            OperatorTask {
-                op: Arc::new(RejectFrontier),
-                input_rx: receiver,
-                output_tx: output,
-                grpc_call_count: Arc::new(AtomicU64::new(0)),
-                shuffle_write_count: Arc::new(AtomicU64::new(0)),
-            }
-            .run(),
-        );
         input
             .send(
                 ArrowZSet::from_ab_rows(&[(1, 10)], 1)
@@ -252,6 +243,17 @@ mod tests {
             .await
             .unwrap();
         drop(input);
+        let task = tokio::spawn(
+            OperatorTask {
+                op: Arc::new(RejectFrontier),
+                input_rx: receiver,
+                output_tx: output,
+                grpc_call_count: Arc::new(AtomicU64::new(0)),
+                shuffle_write_count: Arc::new(AtomicU64::new(0)),
+            }
+            .run(),
+        );
+
 
         tokio::time::timeout(std::time::Duration::from_secs(10), task)
             .await
