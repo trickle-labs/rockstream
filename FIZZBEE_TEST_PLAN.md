@@ -1427,3 +1427,17 @@ reassignment remain owned by the existing shard lease/raft models. Existing
 multiple workers, pre-existing leases and fencing stability. Placement counts
 are advisory; they are not a global memory reservation, throughput guarantee
 or proof of starvation freedom under sustained workload contention.
+
+## v0.72 bounded local SELECT scans (issue #135)
+
+The local gateway's ordinary `SELECT FROM` storage read now uses the
+existing bounded `ShardDb::scan_prefix_bounded` producer instead of eagerly
+materializing an unlimited `scan_prefix` result. Storage returns the same
+logical keys for formats v1/v2/v3; the v3 dispatch condition is restored to
+match the existing unbounded and paginated reads. Over-budget scans carry an
+explicit truncation marker; the gateway rejects such results before encoding
+any rows. Injected storage failures continue to propagate instead of being
+interpreted as empty scans. This is a **read-only resource admission** change:
+it does not change shard lease ownership, fencing, commit ordering, durable
+acknowledgements, or the M1–M7 coordination protocol. Unit regressions cover
+complete/truncated/row-over-budget responses and v3 logical-key/failure behavior.
