@@ -2,7 +2,7 @@ use bytes::BytesMut;
 
 use super::codec;
 use super::Message;
-use crate::error::PgWireResult;
+use crate::error::{PgWireError, PgWireResult};
 
 /// A sql query sent from frontend to backend.
 #[non_exhaustive]
@@ -30,6 +30,11 @@ impl Message for Query {
     }
 
     fn decode_body(buf: &mut BytesMut, _: usize) -> PgWireResult<Self> {
+        // Empty SQL is valid when encoded as one NUL byte; an absent
+        // terminator is not a valid Query frame, even for zero-length SQL.
+        if buf.last().copied() != Some(0) {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let query = codec::get_cstring(buf).unwrap_or_else(|| "".to_owned());
 
         Ok(Query::new(query))
