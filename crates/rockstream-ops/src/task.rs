@@ -85,8 +85,13 @@ impl OperatorTask {
                     error!(
                         operator = self.op.name(),
                         error = %e,
-                        "RS-0001: operator processing error"
+                        "RS-0001: operator processing error; stopping the pipeline"
                     );
+                    // A failed epoch must not vanish while subsequent epochs
+                    // continue to flow as if the data were complete. Closing
+                    // the downstream sender makes the failure observable as
+                    // a closed stream; the upstream receiver is also dropped.
+                    break;
                 }
             }
         }
@@ -136,6 +141,66 @@ mod tests {
         assert_eq!(out.num_rows(), 1);
         assert_eq!(out.positive_ab_rows(), vec![(2, 7)]);
         assert!(out_rx.recv().await.is_none());
+    }
+
+    struct RejectNegative;
+
+    impl Operator for RejectNegative {
+        fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, crate::error::OpError> {
+            if delta.positive_ab_rows().iter().any(|(id, _)| *id < 0) {
+                Err(crate::error::OpError::unsupported_plan_node(
+                    "injected operator failure",
+                ))
+            } else {
+                Ok(delta)
+            }
+        }
+
+        fn name(&self) -> &str {
+            "RejectNegative"
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_error_closes_pipeline_before_later_epochs_can_escape() {
+        let (input, receiver) = mpsc::channel(16);
+        let (output, mut sink) = mpsc::channel(16);
+        let task = tokio::spawn(
+            OperatorTask {
+                op: Arc::new(RejectNegative),
+                input_rx: receiver,
+                output_tx: output,
+                grpc_call_count: Arc::new(AtomicU64::new(0)),
+                shuffle_write_count: Arc::new(AtomicU64::new(0)),
+            }
+            .run(),
+        );
+        input
+            .send(ArrowZSet::from_ab_rows(&[(1, 10)], 1))
+            .await
+            .unwrap();
+        input
+            .send(ArrowZSet::from_ab_rows(&[(-1, 20)], 1))
+            .await
+            .unwrap();
+        input
+            .send(ArrowZSet::from_ab_rows(&[(2, 30)], 1))
+            .await
+            .unwrap();
+        drop(input);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sink.recv().await.unwrap().positive_ab_rows(),
+            vec![(1, 10)]
+        );
+        assert!(
+            sink.recv().await.is_none(),
+            "the result after a failed epoch must not be emitted"
+        );
     }
 
     #[tokio::test]
