@@ -1074,6 +1074,9 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
     tls_config: InternalTlsConfig,
     compaction_config: EpochCompactionConfig,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    compaction_config
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let initial_headroom = system_memory_headroom()?;
     let clean_url = control_url
         .trim_start_matches("https://")
