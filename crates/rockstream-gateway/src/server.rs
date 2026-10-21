@@ -7228,8 +7228,8 @@ impl GatewayHandler {
                 });
             }
         };
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_millis(FALLBACK_QUERY_MAX_WALL_MS);
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(FALLBACK_QUERY_MAX_WALL_MS);
         // Build a DataFusion session and register catalog objects as empty MemTables
         // so the planner can resolve any referenced names.
         let ctx = SessionContext::new();
@@ -15236,7 +15236,9 @@ fn account_fallback_query_batch(
     previous_bytes: usize,
     batch: &RecordBatch,
 ) -> Result<(usize, usize), GatewayError> {
-    let rows = previous_rows.checked_add(batch.num_rows()).unwrap_or(usize::MAX);
+    let rows = previous_rows
+        .checked_add(batch.num_rows())
+        .unwrap_or(usize::MAX);
     let bytes = previous_bytes
         .checked_add(batch.get_array_memory_size())
         .unwrap_or(usize::MAX);
@@ -20511,8 +20513,7 @@ mod v072_datafusion_fallback_limits {
             datafusion::arrow::datatypes::DataType::Int64,
             false,
         )]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
-            .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
     }
 
     #[test]
@@ -20529,10 +20530,12 @@ mod v072_datafusion_fallback_limits {
                 .unwrap(),
             (3, FALLBACK_QUERY_MAX_ARRAY_BYTES)
         );
-        assert!(
-            account_fallback_query_batch(0, FALLBACK_QUERY_MAX_ARRAY_BYTES - bytes + 1, &batch)
-                .is_err()
-        );
+        assert!(account_fallback_query_batch(
+            0,
+            FALLBACK_QUERY_MAX_ARRAY_BYTES - bytes + 1,
+            &batch
+        )
+        .is_err());
         assert!(account_fallback_query_batch(usize::MAX, 0, &batch).is_err());
         assert!(account_fallback_query_batch(0, usize::MAX, &batch).is_err());
     }
