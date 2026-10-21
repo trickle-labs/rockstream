@@ -20513,7 +20513,8 @@ mod v072_datafusion_fallback_limits {
             datafusion::arrow::datatypes::DataType::Int64,
             false,
         )]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+            .unwrap_or_else(|error| panic!("valid tiny batch: {error}"))
     }
 
     #[test]
@@ -20521,13 +20522,14 @@ mod v072_datafusion_fallback_limits {
         let batch = small_batch();
         let bytes = batch.get_array_memory_size();
         assert_eq!(
-            account_fallback_query_batch(FALLBACK_QUERY_MAX_ROWS - 3, 0, &batch).unwrap(),
+            account_fallback_query_batch(FALLBACK_QUERY_MAX_ROWS - 3, 0, &batch)
+                .unwrap_or_else(|error| panic!("exact row boundary: {error}")),
             (FALLBACK_QUERY_MAX_ROWS, bytes)
         );
         assert!(account_fallback_query_batch(FALLBACK_QUERY_MAX_ROWS - 2, 0, &batch).is_err());
         assert_eq!(
             account_fallback_query_batch(0, FALLBACK_QUERY_MAX_ARRAY_BYTES - bytes, &batch)
-                .unwrap(),
+                .unwrap_or_else(|error| panic!("exact byte boundary: {error}")),
             (3, FALLBACK_QUERY_MAX_ARRAY_BYTES)
         );
         assert!(account_fallback_query_batch(
