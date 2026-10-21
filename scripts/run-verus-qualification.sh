@@ -12,7 +12,8 @@ if [ -n "$QUALIFY_TARGET" ]; then
   TARGET_ARGS=(--target "$QUALIFY_TARGET")
 fi
 OVERALL=0
-trap 'rm -rf "$TARGET_ROOT"' EXIT
+DEBUG_STAGE_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TARGET_ROOT" "$DEBUG_STAGE_ROOT"' EXIT
 mkdir -p "$OUTPUT_ROOT"
 
 QUALIFICATION_TOML="$ROOT/formal/verus/qualification.toml"
@@ -69,16 +70,30 @@ run_step cargo-check env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
   cargo check --workspace --locked "${TARGET_ARGS[@]}"
 run_step cargo-all-features env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
   cargo check --workspace --all-features --locked "${TARGET_ARGS[@]}"
+
+# CI runners have a bounded disk quota. Preserve the exact debug executable
+# before clearing its large incremental/rlib build tree. The release profile
+# compiles independently and needs the freed space; neither binary is forged.
+TARGET_SUFFIX=""
+if [ -n "$QUALIFY_TARGET" ]; then
+  TARGET_SUFFIX="$QUALIFY_TARGET/"
+fi
+DEBUG_BINARY="$TARGET_ROOT/${TARGET_SUFFIX}debug/rockstream"
+if [ -f "$DEBUG_BINARY" ]; then
+  cp "$DEBUG_BINARY" "$DEBUG_STAGE_ROOT/rockstream" || OVERALL=1
+else
+  echo "verus qualification: RS-0906: debug runtime artifact was not produced" >&2
+  OVERALL=1
+fi
+if [ "$OVERALL" -eq 0 ]; then
+  rm -rf "$TARGET_ROOT/${TARGET_SUFFIX}debug"
+fi
+
 run_step cargo-release env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
   cargo build --workspace --locked --release "${TARGET_ARGS[@]}"
 
 RUNTIME_ARTIFACT="$OUTPUT_ROOT/rockstream-release"
 DEBUG_ARTIFACT="$OUTPUT_ROOT/rockstream-debug"
-TARGET_SUFFIX=""
-if [ -n "$QUALIFY_TARGET" ]; then
-  TARGET_SUFFIX="$QUALIFY_TARGET/"
-fi
-
 # Ensure any pre-existing final destination files are removed so stale files
 # from earlier runs cannot count as evidence.
 rm -f "$RUNTIME_ARTIFACT" "$DEBUG_ARTIFACT"
@@ -114,7 +129,7 @@ stage_runtime_artifact() {
 }
 
 stage_runtime_artifact "release" "$TARGET_ROOT/${TARGET_SUFFIX}release/rockstream" "$RUNTIME_ARTIFACT"
-stage_runtime_artifact "debug" "$TARGET_ROOT/${TARGET_SUFFIX}debug/rockstream" "$DEBUG_ARTIFACT"
+stage_runtime_artifact "debug" "$DEBUG_STAGE_ROOT/rockstream" "$DEBUG_ARTIFACT"
 
 if [ "$OVERALL" -eq 0 ]; then
   STATUS=passed
