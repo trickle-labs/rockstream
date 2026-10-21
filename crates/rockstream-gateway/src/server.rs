@@ -1176,6 +1176,15 @@ pub static QUERY_TIME_SCATTER_PEAK_BYTES_IN_FLIGHT: AtomicUsize = AtomicUsize::n
 pub static QUERY_TIME_SCATTER_PEAK_BATCHES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static QUERY_TIME_SCATTER_BATCH_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(QUERY_TIME_SCATTER_MAX_CONCURRENT_SHARD_BATCHES);
+/// Safety limits for the standalone DataFusion SELECT fallback (not the
+/// distributed/query-time scatter path). Bounded execution prevents an ad hoc
+/// SELECT without a relation from collecting an unlimited result in memory.
+const FALLBACK_QUERY_MAX_ROWS: usize = 10_000;
+const FALLBACK_QUERY_MAX_ARRAY_BYTES: usize = 8 * 1024 * 1024;
+const FALLBACK_QUERY_MAX_WALL_MS: u64 = 5_000;
+const FALLBACK_QUERY_MAX_CONCURRENT: usize = 16;
+static FALLBACK_QUERY_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(FALLBACK_QUERY_MAX_CONCURRENT);
 static NEXT_DISTRIBUTED_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn query_time_scatter_fill_levels() -> QueryTimeScatterFillLevels {
@@ -7205,6 +7214,18 @@ impl GatewayHandler {
     ///
     /// Return execution failures through the same error path as relation queries.
     async fn try_datafusion_select(&self, q: &str) -> Vec<Response<'static>> {
+        // Reserve execution capacity prospectively. Dropping this function
+        // on timeout, cancellation or disconnect drops the permit and stream.
+        let _permit = match FALLBACK_QUERY_PERMITS.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: "ad hoc SELECT concurrency budget exceeded".to_string(),
+                });
+            }
+        };
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(FALLBACK_QUERY_MAX_WALL_MS);
         // Build a DataFusion session and register catalog objects as empty MemTables
         // so the planner can resolve any referenced names.
         let ctx = SessionContext::new();
@@ -7244,24 +7265,66 @@ impl GatewayHandler {
             }
         }
 
-        let df = match ctx.sql(q).await {
-            Ok(df) => df,
-            Err(error) => {
+        let df = match tokio::time::timeout_at(deadline, ctx.sql(q)).await {
+            Ok(Ok(df)) => df,
+            Ok(Err(error)) => {
                 return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
                     detail: format!("plan: {error}"),
-                })
+                });
+            }
+            Err(_) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: "ad hoc SELECT planning timed out".to_string(),
+                });
             }
         };
 
         let output_schema = Arc::new(df.schema().as_arrow().clone());
-        let mut batches = match df.collect().await {
-            Ok(b) => b,
-            Err(error) => {
+        // collect() can retain every output batch before checking any limit.
+        // Pull batches incrementally, rejecting excess rows/array bytes before
+        // adding another batch to the retained response.
+        let mut stream = match tokio::time::timeout_at(deadline, df.execute_stream()).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
                 return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
-                    detail: format!("collect: {error}"),
-                })
+                    detail: format!("execute: {error}"),
+                });
+            }
+            Err(_) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: "ad hoc SELECT execution timed out".to_string(),
+                });
             }
         };
+        let mut batches = Vec::new();
+        let mut retained_rows = 0usize;
+        let mut retained_bytes = 0usize;
+        loop {
+            let next = match tokio::time::timeout_at(deadline, stream.try_next()).await {
+                Ok(Ok(next)) => next,
+                Ok(Err(error)) => {
+                    return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("stream: {error}"),
+                    });
+                }
+                Err(_) => {
+                    return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                        detail: "ad hoc SELECT stream timed out".to_string(),
+                    });
+                }
+            };
+            let Some(batch) = next else {
+                break;
+            };
+            match account_fallback_query_batch(retained_rows, retained_bytes, &batch) {
+                Ok((rows, bytes)) => {
+                    retained_rows = rows;
+                    retained_bytes = bytes;
+                }
+                Err(error) => return query_time_error_response(error),
+            }
+            batches.push(batch);
+        }
         if batches.is_empty() {
             batches.push(RecordBatch::new_empty(output_schema));
         }
@@ -15158,6 +15221,30 @@ fn backfill_not_published_response(view_name: &str) -> Vec<Response<'static>> {
     ))))]
 }
 
+/// Refuse a complete output batch before retaining it, using the Arrow
+/// array footprint as a conservative producer-side memory measure.
+fn account_fallback_query_batch(
+    previous_rows: usize,
+    previous_bytes: usize,
+    batch: &RecordBatch,
+) -> Result<(usize, usize), GatewayError> {
+    let rows = previous_rows
+        .checked_add(batch.num_rows())
+        .unwrap_or(usize::MAX);
+    let bytes = previous_bytes
+        .checked_add(batch.get_array_memory_size())
+        .unwrap_or(usize::MAX);
+    if rows > FALLBACK_QUERY_MAX_ROWS || bytes > FALLBACK_QUERY_MAX_ARRAY_BYTES {
+        return Err(GatewayError::QueryTimeExecutionFailed {
+            detail: format!(
+                "ad hoc SELECT result budget exceeded: {rows} rows/{bytes} bytes (max {} rows/{} bytes)",
+                FALLBACK_QUERY_MAX_ROWS, FALLBACK_QUERY_MAX_ARRAY_BYTES
+            ),
+        });
+    }
+    Ok((rows, bytes))
+}
+
 fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response<'static>> {
     use chrono::TimeZone;
     use datafusion::arrow::array::{
@@ -20441,5 +20528,46 @@ mod v072_storage_select_scan_tests {
         );
         assert!(checked_complete_storage_scan("orders", rows.clone(), true, 2).is_err());
         assert!(checked_complete_storage_scan("orders", rows, false, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod v072_datafusion_fallback_limits {
+    use super::*;
+    use arrow::array::Int64Array;
+
+    fn small_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            datafusion::arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+            .unwrap_or_else(|error| panic!("valid tiny batch: {error}"))
+    }
+
+    #[test]
+    fn row_and_byte_budgets_count_complete_batches_without_truncation() {
+        let batch = small_batch();
+        let bytes = batch.get_array_memory_size();
+        assert_eq!(
+            account_fallback_query_batch(FALLBACK_QUERY_MAX_ROWS - 3, 0, &batch)
+                .unwrap_or_else(|error| panic!("exact row boundary: {error}")),
+            (FALLBACK_QUERY_MAX_ROWS, bytes)
+        );
+        assert!(account_fallback_query_batch(FALLBACK_QUERY_MAX_ROWS - 2, 0, &batch).is_err());
+        assert_eq!(
+            account_fallback_query_batch(0, FALLBACK_QUERY_MAX_ARRAY_BYTES - bytes, &batch)
+                .unwrap_or_else(|error| panic!("exact byte boundary: {error}")),
+            (3, FALLBACK_QUERY_MAX_ARRAY_BYTES)
+        );
+        assert!(account_fallback_query_batch(
+            0,
+            FALLBACK_QUERY_MAX_ARRAY_BYTES - bytes + 1,
+            &batch
+        )
+        .is_err());
+        assert!(account_fallback_query_batch(usize::MAX, 0, &batch).is_err());
+        assert!(account_fallback_query_batch(0, usize::MAX, &batch).is_err());
     }
 }
