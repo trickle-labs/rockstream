@@ -20499,3 +20499,41 @@ mod v072_subscription_producer_bounds_tests {
         assert_eq!(handler.subscribe_registry.active_streams(), 0);
     }
 }
+
+#[cfg(test)]
+mod v072_datafusion_fallback_limits {
+    use super::*;
+    use arrow::array::Int64Array;
+
+    fn small_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            datafusion::arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+            .unwrap()
+    }
+
+    #[test]
+    fn row_and_byte_budgets_count_complete_batches_without_truncation() {
+        let batch = small_batch();
+        let bytes = batch.get_array_memory_size();
+        assert_eq!(
+            account_fallback_query_batch(FALLBACK_QUERY_MAX_ROWS - 3, 0, &batch).unwrap(),
+            (FALLBACK_QUERY_MAX_ROWS, bytes)
+        );
+        assert!(account_fallback_query_batch(FALLBACK_QUERY_MAX_ROWS - 2, 0, &batch).is_err());
+        assert_eq!(
+            account_fallback_query_batch(0, FALLBACK_QUERY_MAX_ARRAY_BYTES - bytes, &batch)
+                .unwrap(),
+            (3, FALLBACK_QUERY_MAX_ARRAY_BYTES)
+        );
+        assert!(
+            account_fallback_query_batch(0, FALLBACK_QUERY_MAX_ARRAY_BYTES - bytes + 1, &batch)
+                .is_err()
+        );
+        assert!(account_fallback_query_batch(usize::MAX, 0, &batch).is_err());
+        assert!(account_fallback_query_batch(0, usize::MAX, &batch).is_err());
+    }
+}
