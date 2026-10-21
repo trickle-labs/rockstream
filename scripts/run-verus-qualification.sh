@@ -63,7 +63,7 @@ run_step verifier env RUSTUP_TOOLCHAIN="${VERUS_RUST_TOOLCHAIN:-1.98.1}" \
 run_step verifier-incremental env CARGO_INCREMENTAL=1 \
   RUSTUP_TOOLCHAIN="${VERUS_RUST_TOOLCHAIN:-1.98.1}" \
   cargo verus verify -p rockstream-verified --locked "${TARGET_ARGS[@]}"
-run_step cargo-debug env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
+run_step cargo-debug env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" CARGO_PROFILE_DEV_DEBUG=0 \
   cargo build --workspace --locked "${TARGET_ARGS[@]}"
 run_step cargo-check env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
   cargo check --workspace --locked "${TARGET_ARGS[@]}"
