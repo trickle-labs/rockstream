@@ -707,21 +707,24 @@ impl JoinOp {
         let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
         let mut out_weights: Vec<i64> = Vec::new();
 
-        // Build a map from join_key → staged right delta rows for O(1) lookup.
-        let mut right_by_key: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = HashMap::new();
-        for (join_key, _row_id, row_bytes, w) in &right_s.rows {
+        // Decode each staged row *once*, not once per matching pair. A
+        // many-to-many epoch can produce millions of output pairs from a
+        // comparatively small delta; allocating temporary Vecs for every
+        // pair dominated the join performance benchmark and memory churn.
+        // Borrow the staged join keys until correction output is complete.
+        let mut right_by_key: HashMap<&[u8], Vec<(Vec<i64>, i64)>> = HashMap::new();
+        for (join_key, _row_id, row_bytes, weight) in &right_s.rows {
             right_by_key
-                .entry(join_key.clone())
+                .entry(join_key.as_slice())
                 .or_default()
-                .push((row_bytes.clone(), *w));
+                .push((Self::deserialize_row(row_bytes, self.right_n_cols), *weight));
         }
 
-        // ΔL ⋈ ΔR correction term.
+        // ΔL ⋈ ΔR correction: preserve every pair and its bilinear weight.
         for (join_key, _row_id, left_bytes, l_w) in &left_s.rows {
-            if let Some(right_rows) = right_by_key.get(join_key) {
-                for (right_bytes, r_w) in right_rows {
-                    let left_vals = Self::deserialize_row(left_bytes, self.left_n_cols);
-                    let right_vals = Self::deserialize_row(right_bytes, self.right_n_cols);
+            if let Some(right_rows) = right_by_key.get(join_key.as_slice()) {
+                let left_vals = Self::deserialize_row(left_bytes, self.left_n_cols);
+                for (right_vals, r_w) in right_rows {
                     for (i, v) in left_vals.iter().enumerate() {
                         left_cols[i].push(*v);
                     }
