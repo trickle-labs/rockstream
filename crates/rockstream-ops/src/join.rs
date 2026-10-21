@@ -578,16 +578,16 @@ impl JoinOp {
     ///
     /// Output has `left_n_cols + right_n_cols` Int64 columns.
     fn make_output_batch(
-        left_row_vals: &[Vec<i64>],  // left_n_cols vecs
-        right_row_vals: &[Vec<i64>], // right_n_cols vecs
+        left_row_vals: Vec<Vec<i64>>,  // left_n_cols vecs
+        right_row_vals: Vec<Vec<i64>>, // right_n_cols vecs
         schema: &SchemaRef,
     ) -> Result<RecordBatch, OpError> {
         let mut cols: Vec<ArrayRef> = Vec::new();
         for col in left_row_vals {
-            cols.push(Arc::new(Int64Array::from(col.clone())) as ArrayRef);
+            cols.push(Arc::new(Int64Array::from(col)) as ArrayRef);
         }
         for col in right_row_vals {
-            cols.push(Arc::new(Int64Array::from(col.clone())) as ArrayRef);
+            cols.push(Arc::new(Int64Array::from(col)) as ArrayRef);
         }
         RecordBatch::try_new(Arc::clone(schema), cols).map_err(OpError::arrow)
     }
@@ -631,7 +631,7 @@ impl JoinOp {
             staged.push(join_key, row_id, row_bytes, w);
         }
 
-        let batch = Self::make_output_batch(&left_cols, &right_cols, &schema)?;
+        let batch = Self::make_output_batch(left_cols, right_cols, &schema)?;
         debug!(
             op = "JoinOp",
             op_id = self.op_id.0,
@@ -681,7 +681,7 @@ impl JoinOp {
             staged.push(join_key, row_id, row_bytes, w);
         }
 
-        let batch = Self::make_output_batch(&left_cols, &right_cols, &schema)?;
+        let batch = Self::make_output_batch(left_cols, right_cols, &schema)?;
         debug!(
             op = "JoinOp",
             op_id = self.op_id.0,
@@ -754,7 +754,7 @@ impl JoinOp {
         left_s.staged_bytes = 0;
         right_s.staged_bytes = 0;
 
-        let batch = Self::make_output_batch(&left_cols, &right_cols, &schema)?;
+        let batch = Self::make_output_batch(left_cols, right_cols, &schema)?;
         Ok(ArrowZSet::new(batch, out_weights))
     }
 
