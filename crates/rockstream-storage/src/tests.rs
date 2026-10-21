@@ -64,6 +64,35 @@ async fn overwrite_value() {
     db.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn bounded_scan_preserves_format_v3_logical_keys_and_overflow_signal() {
+    use rockstream_types::compatibility::SupportedStorageFormatRange;
+
+    let store = Arc::new(InMemory::new());
+    let db = ShardDb::builder("test/v072-bounded-format-v3", store)
+        .with_supported_format_range(SupportedStorageFormatRange::v3_only())
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(db.format_version(), 3);
+    db.put(b"view_output/orders/001", b"first").await.unwrap();
+    db.put(b"view_output/orders/002", b"second").await.unwrap();
+    db.flush().await.unwrap();
+
+    let prefix = b"view_output/orders/";
+    let complete = db.scan_prefix(prefix).await.unwrap();
+    assert_eq!(complete.len(), 2);
+    assert_eq!(complete[0].0.as_ref(), b"view_output/orders/001");
+    assert_eq!(complete[1].0.as_ref(), b"view_output/orders/002");
+
+    let (bounded, truncated) = db.scan_prefix_bounded(prefix, 1024).await.unwrap();
+    assert!(!truncated);
+    assert_eq!(bounded, complete);
+    let (_, truncated) = db.scan_prefix_bounded(prefix, 1).await.unwrap();
+    assert!(truncated, "over-budget v3 scan must not report a complete result");
+    db.close().await.unwrap();
+}
+
 // === WriteBatch Tests ===
 
 #[tokio::test]
