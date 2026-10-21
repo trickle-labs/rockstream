@@ -978,7 +978,11 @@ shuffle frames, while surviving non-zero weights collapse into a single emitted 
 This in-memory compaction is outside the core M1–M7 FizzBee coordination state machines
 (operating entirely within single-epoch micro-batch buffers), verified by
 `crates/rockstream-runtime/tests/in_flight_zset_epoch_compaction_tests.rs` with exact
-output assertions covering net-zero omission and window boundary drains.
+output assertions covering net-zero omission and window boundary drains. Worker-wide
+configuration updates validate positive, ordered duration bounds and reject a window
+outside them before replacing the accepted config; the `client.rs` regression asserts
+an invalid update preserves the prior value. This setter is local configuration and
+adds no M1–M7 coordination transition.
 
 The v0.69 PostgreSQL CDC golden connector establishes the complete snapshot and
 WAL fence coordination protocol, quad-LSN progress persistence, transaction
