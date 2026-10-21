@@ -974,7 +974,9 @@ impl ShardDb {
         prefix: &[u8],
         max_bytes: usize,
     ) -> Result<(Vec<(Bytes, Bytes)>, bool), StorageError> {
-        if self.format_version == 2 && prefix.first().copied() != Some(0x06) {
+        if (self.format_version == 2 || self.format_version == 3)
+            && prefix.first().copied() != Some(0x06)
+        {
             return self
                 .scan_physical_prefix_bounded(prefix, true, max_bytes)
                 .await;
