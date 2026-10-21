@@ -774,7 +774,17 @@ mod data_plane_tests {
         assert_eq!(compactor.config().window_duration, custom_window);
 
         let new_config = EpochCompactionConfig::new(Duration::from_millis(150)).unwrap();
-        client.set_compaction_config(new_config.clone());
+        client.set_compaction_config(new_config.clone()).unwrap();
+        assert_eq!(
+            client.compaction_config().window_duration,
+            Duration::from_millis(150)
+        );
+
+        // Invalid updates must not mutate the accepted worker configuration.
+        let invalid = new_config
+            .clone()
+            .with_bounds(Duration::from_millis(500), Duration::from_millis(100));
+        assert!(client.set_compaction_config(invalid).is_err());
         assert_eq!(
             client.compaction_config().window_duration,
             Duration::from_millis(150)
@@ -815,8 +825,13 @@ impl WorkerClientHandle {
     }
 
     /// Set the worker-wide epoch compaction config.
-    pub fn set_compaction_config(&self, config: EpochCompactionConfig) {
+    pub fn set_compaction_config(
+        &self,
+        config: EpochCompactionConfig,
+    ) -> Result<(), crate::epoch_compaction::EpochCompactionError> {
+        config.validate()?;
         *self.compaction_config.write() = config;
+        Ok(())
     }
 
     /// Get active deployment for a workload and shard.
@@ -1059,6 +1074,9 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
     tls_config: InternalTlsConfig,
     compaction_config: EpochCompactionConfig,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    compaction_config
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let initial_headroom = system_memory_headroom()?;
     let clean_url = control_url
         .trim_start_matches("https://")

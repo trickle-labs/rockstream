@@ -142,6 +142,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saturated_pipeline_does_not_starve_separate_workload() {
+        // Deliberately leave the busy workload's output undrained so its
+        // bounded operator channels exhaust their credits.
+        let (busy_source, busy_sink) = make_pipeline().build();
+        let busy_producer = tokio::spawn(async move {
+            for i in 0..128 {
+                if busy_source
+                    .send(ArrowZSet::from_ab_rows(&[(i, 6)], 1))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            true
+        });
+
+        // The other workload uses its own credits/tasks and must make
+        // progress even though the busy sink cannot accept another batch.
+        let (quiet_source, mut quiet_sink) = make_pipeline().build();
+        quiet_source
+            .send(ArrowZSet::from_ab_rows(&[(777, 6)], 1))
+            .await
+            .unwrap();
+        drop(quiet_source);
+        let quiet_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), quiet_sink.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(quiet_result.positive_ab_rows(), vec![(777, 12)]);
+        assert!(
+            !busy_producer.is_finished(),
+            "the busy workload should remain bounded by its undrained sink"
+        );
+
+        // Disconnect the saturated sink: upstream tasks unwind instead of
+        // holding an infinite queued backlog or leaking a producer.
+        drop(busy_sink);
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(10), busy_producer)
+                .await
+                .unwrap()
+                .unwrap(),
+            "a disconnected sink must stop its blocked producer"
+        );
+    }
+
+    #[tokio::test]
     async fn scheduler_end_to_end() {
         let sched = make_pipeline();
         let (source_tx, mut sink_rx) = sched.build();
