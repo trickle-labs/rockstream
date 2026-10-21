@@ -77,17 +77,21 @@ async fn local_select_surfaces_scan_failures_and_recovers_without_partial_rows()
 
     shard.set_fail_scans(true);
     let denied = client.simple_query(sql).await;
-    assert!(denied.is_err(), "a failed scan must not return partial/empty success");
+    assert!(
+        denied.is_err(),
+        "a failed scan must not return partial/empty success"
+    );
 
     shard.set_fail_scans(false);
     let recovered = client.simple_query(sql).await.unwrap();
-    assert_eq!(
-        recovered
-            .iter()
-            .filter(|message| matches!(message, SimpleQueryMessage::Row(_)))
-            .count(),
-        2
-    );
+    let recovered_values: Vec<_> = recovered
+        .iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recovered_values, vec!["1".to_string(), "2".to_string()]);
 
     connection_task.abort();
     task.abort();
