@@ -90,6 +90,10 @@ async fn bounded_scan_preserves_format_v3_logical_keys_and_overflow_signal() {
     assert_eq!(bounded, complete);
     let (_, truncated) = db.scan_prefix_bounded(prefix, 1).await.unwrap();
     assert!(truncated, "over-budget v3 scan must not report a complete result");
+    db.set_fail_scans(true);
+    let blocked = db.scan_prefix_bounded(prefix, 1024).await;
+    assert!(blocked.is_err(), "injected storage faults must reach bounded readers");
+    db.set_fail_scans(false);
     db.close().await.unwrap();
 }
 
