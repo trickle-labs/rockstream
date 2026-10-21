@@ -181,6 +181,7 @@ mod tests {
             .await
             .unwrap();
         drop(input);
+
         let task = tokio::spawn(
             OperatorTask {
                 op: Arc::new(RejectNegative),
@@ -191,7 +192,6 @@ mod tests {
             }
             .run(),
         );
-
 
         tokio::time::timeout(std::time::Duration::from_secs(10), task)
             .await
@@ -243,6 +243,7 @@ mod tests {
             .await
             .unwrap();
         drop(input);
+
         let task = tokio::spawn(
             OperatorTask {
                 op: Arc::new(RejectFrontier),
@@ -253,7 +254,6 @@ mod tests {
             }
             .run(),
         );
-
 
         tokio::time::timeout(std::time::Duration::from_secs(10), task)
             .await
