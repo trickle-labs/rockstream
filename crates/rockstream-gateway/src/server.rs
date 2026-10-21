@@ -2786,16 +2786,12 @@ impl GatewayHandler {
         let (rows, truncated) = shard_db
             .scan_prefix_bounded(prefix.as_bytes(), MAX_COMPILED_VIEW_SOURCE_SCAN_BYTES)
             .await?;
-        if truncated || rows.len() > MAX_COMPILED_VIEW_SOURCE_ROWS {
-            return Err(GatewayError::QueryTimeResultSetTooLarge {
-                relation: relation_name.to_string(),
-                row_limit: MAX_COMPILED_VIEW_SOURCE_ROWS,
-            });
-        }
-        Ok(rows
-            .into_iter()
-            .map(|(_, value)| value.to_vec())
-            .collect::<Vec<_>>())
+        checked_complete_storage_scan(
+            relation_name,
+            rows,
+            truncated,
+            MAX_COMPILED_VIEW_SOURCE_ROWS,
+        )
     }
 
     /// Scan `relation_name`'s full current contents and wrap them as a
@@ -16591,6 +16587,23 @@ fn extract_after_fence_token(q: &str) -> Option<FreshnessToken> {
 }
 
 /// Extract the view name from a simple `SELECT … FROM <name> [LIMIT n]` query.
+/// Reject over-budget producer scans before exposing rows to a PGWire
+/// response. A scan marked as truncated is never a valid partial result.
+fn checked_complete_storage_scan(
+    relation: &str,
+    rows: Vec<(Bytes, Bytes)>,
+    truncated: bool,
+    max_rows: usize,
+) -> Result<Vec<Vec<u8>>, GatewayError> {
+    if truncated || rows.len() > max_rows {
+        return Err(GatewayError::QueryTimeResultSetTooLarge {
+            relation: relation.to_string(),
+            row_limit: max_rows,
+        });
+    }
+    Ok(rows.into_iter().map(|(_, value)| value.to_vec()).collect())
+}
+
 fn extract_view_name_from_select(q: &str) -> Option<String> {
     let ql = q.to_lowercase();
     let from_pos = ql.find(" from ")?;
@@ -20408,5 +20421,25 @@ mod v072_subscription_producer_bounds_tests {
         assert!(matches!(denied.as_slice(), [Response::Error(_)]));
         assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
         assert_eq!(handler.subscribe_registry.active_streams(), 0);
+    }
+}
+
+#[cfg(test)]
+mod v072_storage_select_scan_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_truncated_or_oversized_storage_results_without_partial_rows() {
+        let rows = vec![
+            (Bytes::from_static(b"a"), Bytes::from_static(b"one")),
+            (Bytes::from_static(b"b"), Bytes::from_static(b"two")),
+        ];
+        assert_eq!(
+            checked_complete_storage_scan("orders", rows.clone(), false, 2)
+                .unwrap_or_else(|error| panic!("complete results must succeed: {error}")),
+            vec![b"one".to_vec(), b"two".to_vec()]
+        );
+        assert!(checked_complete_storage_scan("orders", rows.clone(), true, 2).is_err());
+        assert!(checked_complete_storage_scan("orders", rows, false, 1).is_err());
     }
 }
