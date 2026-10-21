@@ -578,16 +578,16 @@ impl JoinOp {
     ///
     /// Output has `left_n_cols + right_n_cols` Int64 columns.
     fn make_output_batch(
-        left_row_vals: &[Vec<i64>],  // left_n_cols vecs
-        right_row_vals: &[Vec<i64>], // right_n_cols vecs
+        left_row_vals: Vec<Vec<i64>>,  // left_n_cols vecs
+        right_row_vals: Vec<Vec<i64>>, // right_n_cols vecs
         schema: &SchemaRef,
     ) -> Result<RecordBatch, OpError> {
         let mut cols: Vec<ArrayRef> = Vec::new();
         for col in left_row_vals {
-            cols.push(Arc::new(Int64Array::from(col.clone())) as ArrayRef);
+            cols.push(Arc::new(Int64Array::from(col)) as ArrayRef);
         }
         for col in right_row_vals {
-            cols.push(Arc::new(Int64Array::from(col.clone())) as ArrayRef);
+            cols.push(Arc::new(Int64Array::from(col)) as ArrayRef);
         }
         RecordBatch::try_new(Arc::clone(schema), cols).map_err(OpError::arrow)
     }
@@ -631,7 +631,7 @@ impl JoinOp {
             staged.push(join_key, row_id, row_bytes, w);
         }
 
-        let batch = Self::make_output_batch(&left_cols, &right_cols, &schema)?;
+        let batch = Self::make_output_batch(left_cols, right_cols, &schema)?;
         debug!(
             op = "JoinOp",
             op_id = self.op_id.0,
@@ -681,7 +681,7 @@ impl JoinOp {
             staged.push(join_key, row_id, row_bytes, w);
         }
 
-        let batch = Self::make_output_batch(&left_cols, &right_cols, &schema)?;
+        let batch = Self::make_output_batch(left_cols, right_cols, &schema)?;
         debug!(
             op = "JoinOp",
             op_id = self.op_id.0,
@@ -707,21 +707,24 @@ impl JoinOp {
         let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
         let mut out_weights: Vec<i64> = Vec::new();
 
-        // Build a map from join_key → staged right delta rows for O(1) lookup.
-        let mut right_by_key: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = HashMap::new();
-        for (join_key, _row_id, row_bytes, w) in &right_s.rows {
+        // Decode each staged row *once*, not once per matching pair. A
+        // many-to-many epoch can produce millions of output pairs from a
+        // comparatively small delta; allocating temporary Vecs for every
+        // pair dominated the join performance benchmark and memory churn.
+        // Borrow the staged join keys until correction output is complete.
+        let mut right_by_key: HashMap<&[u8], Vec<(Vec<i64>, i64)>> = HashMap::new();
+        for (join_key, _row_id, row_bytes, weight) in &right_s.rows {
             right_by_key
-                .entry(join_key.clone())
+                .entry(join_key.as_slice())
                 .or_default()
-                .push((row_bytes.clone(), *w));
+                .push((Self::deserialize_row(row_bytes, self.right_n_cols), *weight));
         }
 
-        // ΔL ⋈ ΔR correction term.
+        // ΔL ⋈ ΔR correction: preserve every pair and its bilinear weight.
         for (join_key, _row_id, left_bytes, l_w) in &left_s.rows {
-            if let Some(right_rows) = right_by_key.get(join_key) {
-                for (right_bytes, r_w) in right_rows {
-                    let left_vals = Self::deserialize_row(left_bytes, self.left_n_cols);
-                    let right_vals = Self::deserialize_row(right_bytes, self.right_n_cols);
+            if let Some(right_rows) = right_by_key.get(join_key.as_slice()) {
+                let left_vals = Self::deserialize_row(left_bytes, self.left_n_cols);
+                for (right_vals, r_w) in right_rows {
                     for (i, v) in left_vals.iter().enumerate() {
                         left_cols[i].push(*v);
                     }
@@ -732,6 +735,10 @@ impl JoinOp {
                 }
             }
         }
+
+        // The borrowed key slices must no longer reference right_s before
+        // its staged rows are drained into the persistent arrangement.
+        drop(right_by_key);
 
         // Apply staged deltas to arrangements and track modified rows.
         let mut dirty_left = self.dirty_left.lock().unwrap();
@@ -747,7 +754,7 @@ impl JoinOp {
         left_s.staged_bytes = 0;
         right_s.staged_bytes = 0;
 
-        let batch = Self::make_output_batch(&left_cols, &right_cols, &schema)?;
+        let batch = Self::make_output_batch(left_cols, right_cols, &schema)?;
         Ok(ArrowZSet::new(batch, out_weights))
     }
 
@@ -1132,6 +1139,24 @@ mod tests {
         let rows = extract_join_output_3col(&out);
         // Should produce (l_k=10, l_v=100, r_v=200, weight=1)
         assert!(rows.contains(&(10, 100, 200, 1)), "rows: {rows:?}");
+    }
+
+    #[test]
+    fn correction_preserves_exact_weighted_many_to_many_join_rows() {
+        let op = JoinOp::new(OperatorId(734), vec![0], vec![0]);
+        let left = make_lr_batch(&[(1, 10, 2), (1, 20, -1), (2, 30, 1)]);
+        let right = make_lr_batch(&[(1, 100, 3), (1, 200, -2), (2, 300, 4)]);
+        let output = op.process_epoch(left, right).unwrap();
+        assert_eq!(
+            extract_join_output_3col(&output),
+            vec![
+                (1, 10, 100, 6),
+                (1, 10, 200, -4),
+                (1, 20, 100, -3),
+                (1, 20, 200, 2),
+                (2, 30, 300, 4),
+            ]
+        );
     }
 
     #[test]
