@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# Keep the upstream security backport out of workspace-wide formatting, but
+# still resolve it as the pinned patched dependency below.
+exclude = ["vendor/pgwire-0.28.0"]
 members = [
     "crates/rockstream-cli",
     "crates/rockstream-connectors",
