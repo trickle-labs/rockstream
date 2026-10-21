@@ -167,13 +167,11 @@ mod tests {
             .await
             .unwrap();
         drop(quiet_source);
-        let quiet_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            quiet_sink.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let quiet_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), quiet_sink.recv())
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(quiet_result.positive_ab_rows(), vec![(777, 12)]);
         assert!(
             !busy_producer.is_finished(),
