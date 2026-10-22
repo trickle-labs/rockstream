@@ -675,3 +675,17 @@ evidence = [
     "cargo test --locked -p rockstream-runtime --lib recovery",
     "cargo test --locked -p rockstream-storage --test catalog_storage_tests",
 ]
+
+[[claims]]
+id = "VS7-02"
+status = "adapter-qualified"
+domain = "Physical commit transfers each epoch between pending, in-flight, uncertain, and committed ownership; retained counts decrease only after durable completion, frontiers are monotone, and ACKs require durable success."
+assumptions = ["The driver owns exactly the entries removed from pending or uncertain maps; ShardDb reports write/flush outcomes under its backend durability contract; the kernel does not prove physical I/O or process scheduling."]
+implementation = ["crates/rockstream-verified/src/physical_commit.rs::begin_owner", "crates/rockstream-verified/src/physical_commit.rs::finish_transition", "crates/rockstream-ops/src/group_commit/physical.rs::finish"]
+theorems = ["crates/rockstream-verified/src/physical_commit.rs::begin_owner", "crates/rockstream-verified/src/physical_commit.rs::finish_transition"]
+production_callers = ["crates/rockstream-ops/src/group_commit/physical.rs::drive", "crates/rockstream-ops/src/group_commit/physical.rs::finish"]
+regression_tests = ["crates/rockstream-ops/src/group_commit/physical.rs::unknown_flush_keeps_later_epoch_queued_until_reconciliation", "crates/rockstream-ops/src/group_commit/physical.rs::cancelled_request_at_each_storage_gate_keeps_both_epochs", "crates/rockstream-ops/src/group_commit/physical.rs::dropped_driver_flight_retains_exact_uncertain_ownership", "crates/rockstream-ops/src/group_commit/physical.rs::lfs_subprocess_cuts_have_only_legal_atomic_recoveries"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-ops --lib boundary_tests",
+]

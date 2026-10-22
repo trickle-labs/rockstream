@@ -56,3 +56,9 @@ do not establish refinement of SlateDB or ObjectStore implementations.
 | `crates/rockstream-verified/src/persistence.rs::{commit_outcome,coupled_commit_is_durable}` | State, outputs, source markers, and frontier are authoritative only after one successful write and flush; write-success/flush-failure remains unknown. | `SourceCheckpointStore` and group commit keep acknowledgements/frontiers closed until the durable boundary succeeds. |
 | `crates/rockstream-verified/src/persistence.rs::{replay_decision,recovery_scan_status,recovery_is_ready}` | Prepared/invalid records do not advance replay; duplicates are no-ops; bounded scans distinguish completion, quota, cancellation, corruption, and continuation; readiness requires complete restored state. | Storage scans continue with progress, reject incomplete metadata, and recover the highest valid committed record. |
 | `crates/rockstream-verified/src/persistence.rs::compaction_is_eligible` | Reclamation requires both reader and replay horizons and excludes retained snapshots/in-flight deltas. | Arrangement/catalog adapters supply the real horizons and storage-specific snapshot/lease evidence. |
+
+VS7-02 covers the physical commit owner's local transition after a storage result.
+
+| Production code | Verus contract | Caller obligation |
+|---|---|---|
+| `crates/rockstream-verified/src/physical_commit.rs::{begin_owner,finish_transition}` | Pending or uncertain work enters one flight; only durable completion releases retained epoch/byte/operation charges, advances a monotone frontier, and permits ACK. Failed and unknown outcomes retain charges without ACK. | `PhysicalCommitGroup` owns the drained entries, passes the actual storage outcome, and applies the executable kernel before replying. LFS subprocess tests qualify selected crash cuts; backend durability and Tokio scheduling remain outside the proof. |

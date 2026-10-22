@@ -18,7 +18,7 @@ EVIDENCE_FIELDS = (
     "qualification_evidence",
     "verifier_output",
 )
-CLAIM_ID = re.compile(r"^VS[0-5]-[0-9]{2}$")
+CLAIM_ID = re.compile(r"^VS[0-9]+-[0-9]{2}$")
 
 
 def load(path: Path) -> dict:
