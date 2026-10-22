@@ -25,6 +25,7 @@ class GateSelfTests(unittest.TestCase):
         manifest = tomllib.loads((ROOT / "crates/rockstream-gateway/Cargo.toml").read_text())
         self.assertEqual(manifest["features"], {"testcontainers": []})
         self.assertEqual(POLICY["jobs"]["pr-gateway"]["features"], ["testcontainers"])
+        self.assertEqual(POLICY["jobs"]["pr-gateway"]["services"], ["docker"])
         self.assertEqual(POLICY["jobs"]["pr-gateway"]["conformance_targets"], [
             "rockstream-gateway/test:" + name for name in (
                 "auth_scram_tests", "gateway_dml_tests", "gateway_extended_query_tests",
@@ -161,7 +162,8 @@ class GateSelfTests(unittest.TestCase):
                         "conformance_targets": [wire_key], "services": [],
                         "test_threads": {wire_key: 4}}
                 policy = {"jobs": {"fixture": spec}, "known_limitations": {}}
-                events = [] if event is None else [{"type": "test", "name": "must_run", "event": event}]
+                events = [] if event is None else [{"type": "test", "name": "must_run", "event": event,
+                                                   "exec_time": 1.25}]
                 calls = []
 
                 def run(argv, cwd, env):
@@ -171,7 +173,7 @@ class GateSelfTests(unittest.TestCase):
                     if argv[1:] == ["--list"]:
                         return CompletedProcess(argv, 0, "must_run: test\n", "")
                     threads = 1 if argv[0] == "conformance_doc_tests" else 4
-                    self.assertEqual(argv[1:], ["-Z", "unstable-options", "--format", "json", f"--test-threads={threads}"])
+                    self.assertEqual(argv[1:], ["-Z", "unstable-options", "--format", "json", "--report-time", f"--test-threads={threads}"])
                     if argv[0] == "conformance_doc_tests":
                         self.assertEqual(report.read_text(), "".join(json.dumps(e) + "\n" for e in events))
                         output = [{"type": "test", "name": "must_run", "event": "ok"}]
@@ -188,15 +190,16 @@ class GateSelfTests(unittest.TestCase):
                 self.assertEqual(build.call_args.args[2], ["testcontainers"])
                 self.assertEqual(calls, [
                     ["wire_tests", "--list"],
-                    ["wire_tests", "-Z", "unstable-options", "--format", "json", "--test-threads=4"],
+                    ["wire_tests", "-Z", "unstable-options", "--format", "json", "--report-time", "--test-threads=4"],
                     ["conformance_doc_tests", "--list"],
-                    ["conformance_doc_tests", "-Z", "unstable-options", "--format", "json", "--test-threads=1"],
+                    ["conformance_doc_tests", "-Z", "unstable-options", "--format", "json", "--report-time", "--test-threads=1"],
                 ])
                 result = json.loads(out.read_text())
                 self.assertEqual(result["status"], expected_status)
                 self.assertEqual(code, int(expected_status == "failed"))
                 self.assertEqual(result["targets"][0]["tests"], [{
                     "id": "rockstream-gateway::test/wire_tests::must_run",
+                    **({"execution_seconds": 1.25} if event is not None else {}),
                     "outcome": {"ok": "passed", "failed": "failed", None: "not_run", "ignored": "unexpected_skip"}[event],
                     "reason": {"ok": None, "failed": "test failed", None: "libtest emitted no terminal execution event",
                                "ignored": "mandatory test is #[ignore]"}[event],

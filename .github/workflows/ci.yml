@@ -314,7 +314,8 @@ jobs:
 
   gateway:
     name: Check tests (gateway)
-    needs: docker-build
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -328,9 +329,9 @@ jobs:
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-      - uses: ./.github/actions/load-candidate-image
-        with:
-          image-id: ${{ needs.docker-build.outputs.image-id }}
+      # GatewayServer runs in process; its external services use their own images.
+      - name: Require Docker
+        run: docker info
       - name: Record gateway cases and PGWire conformance events once
         run: python3 scripts/ci-test-inventory.py run --job pr-gateway
       - name: Upload exact gateway test execution evidence

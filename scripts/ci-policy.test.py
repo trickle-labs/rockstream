@@ -67,11 +67,21 @@ class PolicyTests(unittest.TestCase):
             for step in steps[1:-1]:
                 self.assertRegex(step, r"if: (always\(\) && )?needs.ci-policy.outputs.expensive == 'true'")
             self.assertIn("if: needs.ci-policy.outputs.expensive == 'false'", steps[-1])
-        for job in ("check-tests", "postgres-differential", "formal-verify", "docker-build"):
+        for job in ("check-tests", "gateway", "postgres-differential", "formal-verify", "docker-build"):
             self.assertIn("needs: ci-policy", blocks[job])
             self.assertIn("if: needs.ci-policy.outputs.scope == 'full'", blocks[job])
-        for job in ("gateway", "control-plane-ha"):
-            self.assertIn("needs: docker-build", blocks[job])
+        self.assertIn("needs: docker-build", blocks["control-plane-ha"])
+
+    def test_only_production_image_consumers_wait_for_the_image(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        blocks = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", workflow, re.M | re.S))
+        consumers = [name for name, block in blocks.items()
+                     if "uses: ./.github/actions/load-candidate-image" in block]
+        self.assertEqual(consumers, ["control-plane-ha"])
+        self.assertEqual(re.findall(r"^    needs: (.+)$", blocks["gateway"], re.M), ["ci-policy"])
+        self.assertIn("run: docker info", blocks["gateway"])
+        self.assertIn("run: python3 scripts/ci-test-inventory.py run --job pr-gateway", blocks["gateway"])
+        self.assertIn("image-id: ${{ needs.docker-build.outputs.image-id }}", blocks["control-plane-ha"])
 
     def test_lane_policy(self):
         cases = [
