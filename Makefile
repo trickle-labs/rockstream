@@ -247,7 +247,10 @@ release:
 	@test "$$(git rev-parse origin/main)" = "$(QUALIFIED_SHA)" || (echo "ERROR: origin/main differs from verified candidate; git fetch and requalify" && exit 1)
 	@version=$$(awk '/^\[workspace.package\]/{in_pkg=1;next} in_pkg && /^\[/{exit} in_pkg && /^version = "/{gsub(/"/,"",$$3);print $$3;exit}' Cargo.toml); \
 	  test "$$version" = "$(VERSION)" || (echo "ERROR: workspace version $$version differs from release $(VERSION)" && exit 1)
-	@test -z "$$(git tag --list 'v$(VERSION)')" || (echo "ERROR: release tag already exists; do not retag" && exit 1)
+	@grep -E "^\\| \\*\\*v$(echo $(VERSION) | sed 's/\\.0$//')\\*\\* \\|.*✅ Done" ROADMAP.md >/dev/null || (echo "ERROR: roadmap is not marked Done; candidate is not fully qualified" && exit 1)
+	@test -f "sign-offs/v$(echo $(VERSION) | sed 's/\\.0$//').md" || (echo "ERROR: completed release sign-off missing" && exit 1)
+	@bash scripts/check-exit-criteria.sh >/dev/null || (echo "ERROR: exit criteria sign-off incomplete" && exit 1)
+	@test -z "$(git tag --list 'v$(VERSION)')" || (echo "ERROR: release tag already exists; do not retag" && exit 1)
 	@git tag -s "v$(VERSION)" -m "Release v$(VERSION)"
 	@git verify-tag "v$(VERSION)" || (echo "ERROR: signature verification failed; do not push" && exit 1)
 	@git push origin "v$(VERSION)"
