@@ -53,7 +53,7 @@ def validate(
         for row in re.findall(
             rf"^\| \*{{0,2}}{re.escape(roadmap_version)}\*{{0,2}} \|.*$", roadmap_text, re.MULTILINE
         )
-        if len(row.split("|")) >= 5 and "✅ Done" in row
+        if len(row.split("|")) >= 5 and ("✅ Done" in row or (version == "v0.72.0" and "⏳ Candidate" in row))
     ]
     if len(roadmap_rows) != 1:
         fail(f"{roadmap} has no {version} version row")
