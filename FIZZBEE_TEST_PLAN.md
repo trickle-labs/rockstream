@@ -1445,3 +1445,7 @@ interpreted as empty scans. This is a **read-only resource admission** change:
 it does not change shard lease ownership, fencing, commit ordering, durable
 acknowledgements, or the M1–M7 coordination protocol. Unit regressions cover
 complete/truncated/row-over-budget responses and v3 logical-key/failure behavior.
+
+## v0.72 CLI checkpoint export integrity (#221)
+
+The CLI backup operation selects one committed control checkpoint and must enumerate its required immutable shard manifest, WAL and SST objects before exporting. A merely visible-prefix inventory is insufficient: missing referenced shard storage must fail with a checkpoint-integrity error and must not create a terminal success marker. The management and CLI export paths now share the existing checkpoint-aware inventory; this does not alter M3 cluster checkpoint durability, lease fencing or the committed checkpoint itself. Concrete coverage: `cli_prefix_export_rejects_missing_committed_shard_objects_before_success` deletes a real checkpointed shard before CLI export and requires failure without a commit marker; `lfs_export_restore_fresh_cluster_is_bit_identical` preserves the positive committed state recovery contract. Error-code catalog aliasing for RS-5035 is tracked separately as D1 in #221.
