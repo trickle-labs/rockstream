@@ -72,6 +72,11 @@ mod tests {
         assert_eq!(aggregate::transition(10, 1, -9, -1), None);
         assert_eq!(aggregate::transition(i64::MAX, 1, 1, 1), None);
         assert_eq!(aggregate::transition(1, 0, 0, 1), None);
+        assert_eq!(aggregate::transition(0, 0, 0, 1), Some((0, 1)));
+        assert_eq!(aggregate::transition(0, 0, 0, -1), None);
+        assert_eq!(aggregate::transition(0, i64::MAX, 0, 1), None);
+        assert_eq!(aggregate::transition(i64::MIN, 1, i128::MIN, 0), None);
+        assert_eq!(aggregate::transition(i64::MAX, 1, i128::MAX, -1), None);
     }
 
     #[test]
@@ -95,6 +100,18 @@ mod tests {
         assert_eq!(
             frontier::admit_frontier_report(1, true, true, true, u64::MAX, u64::MAX),
             Some(u64::MAX)
+        );
+        assert_eq!(
+            frontier::admit_frontier_report(1, false, true, true, 0, 1),
+            None
+        );
+        assert_eq!(
+            frontier::admit_frontier_report(1, true, true, false, 0, 1),
+            None
+        );
+        assert_eq!(
+            frontier::admit_frontier_report(1, true, true, true, 0, 0),
+            Some(0)
         );
         assert!(frontier::activation_preserves_publication(Some(5), 5));
         assert!(!frontier::activation_preserves_publication(Some(5), 4));
@@ -128,6 +145,16 @@ mod tests {
         assert!(persistence::epoch_is_admissible(4, 5, true, true, false));
         assert!(!persistence::epoch_is_admissible(4, 6, true, true, false));
         assert!(!persistence::epoch_is_admissible(4, 5, false, true, true));
+        assert!(persistence::epoch_is_admissible(4, 6, false, true, false));
+        assert!(!persistence::epoch_is_admissible(4, 5, true, false, false));
+        assert!(!persistence::epoch_is_admissible(4, 4, false, true, false));
+        assert!(!persistence::epoch_is_admissible(
+            u64::MAX,
+            u64::MAX,
+            true,
+            true,
+            false
+        ));
         assert_eq!(
             persistence::replay_decision(persistence::COMMIT_COMMITTED, true, true, false),
             persistence::REPLAY_APPLY
@@ -162,6 +189,26 @@ mod tests {
         );
         assert_eq!(
             persistence::recovery_scan_status(0, 3, 2, 2, true, false),
+            persistence::SCAN_CANCELLED
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(0, 3, 3, 3, false, false),
+            persistence::SCAN_COMPLETE
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(u64::MAX - 1, u64::MAX, 2, 2, false, false),
+            persistence::SCAN_COMPLETE
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(0, 3, 1, 0, false, false),
+            persistence::SCAN_QUOTA
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(4, 3, 0, 0, false, false),
+            persistence::SCAN_CORRUPT
+        );
+        assert_eq!(
+            persistence::recovery_scan_status(4, 3, 0, 0, true, true),
             persistence::SCAN_CANCELLED
         );
         assert!(persistence::compaction_is_eligible(10, 8, 9, false, false));

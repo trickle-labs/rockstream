@@ -31,7 +31,7 @@ VS3 covers the Z-set adapter and aggregate transition boundary.
 | Production code | Verus contract | Caller obligation |
 |---|---|---|
 | `crates/rockstream-ops/src/zset.rs::{try_new,validate,select_rows}` | Row and weight lengths align; ordered selection preserves requested order/repetition, rejects invalid indices, and carries the frontier. | Arrow row equality and decoding remain adapter responsibilities; zero filtering does not imply duplicate consolidation. |
-| `crates/rockstream-verified/src/aggregate.rs::transition` | A valid absent or positive-count state plus a consolidated delta yields an exact present/deleted state or a checked rejection; zero-count nonzero-sum states are invalid. | `AggregateOp` validates/casts Arrow input and supplies valid-retraction semantics. |
+| `crates/rockstream-verified/src/aggregate.rs::transition` | Every valid representable absent or positive-count transition yields the exact present/deleted state; invalid envelopes, counts, sums, and arithmetic reject. | `AggregateOp` validates/casts Arrow input and supplies valid-retraction semantics. |
 | `crates/rockstream-ops/src/aggregate.rs::{StagedEpochAggregator::ingest_delta,AggregateOp::process_delta_with_result}` | Candidate arithmetic, output, and touched-key mutations are ready before authoritative state installation. | Durable write atomicity, restart, and storage outcomes remain VS5 obligations. |
 
 VS4 covers membership-aware frontier admission and the local publication
@@ -41,8 +41,8 @@ generation and incarnation admission.
 
 | Production code | Verus contract | Caller obligation |
 |---|---|---|
-| `crates/rockstream-verified/src/frontier.rs::admit_frontier_report` | A report is admitted only for the supported envelope version, active member, matching generation, and matching incarnation; accepted epochs are monotone. | `rockstream-control::frontier::FrontierAggregator` validates scope and authority before calling the kernel. |
-| `crates/rockstream-verified/src/frontier.rs::fixed_membership_transition` | A fixed-membership report transition never lowers the admitted epoch. | The control adapter computes the meet only across the configured active set and treats missing reports as no completeness. |
+| `crates/rockstream-verified/src/frontier.rs::admit_frontier_report` | A report is admitted exactly for the supported envelope version, active member, matching generation, and matching incarnation; the result is the exact maximum epoch. | `rockstream-control::frontier::FrontierAggregator` validates scope and authority before calling the kernel. |
+| `crates/rockstream-verified/src/frontier.rs::fixed_membership_transition` | A fixed-membership report transition returns the exact maximum epoch. | The control adapter computes the meet only across the configured active set and treats missing reports as no completeness. |
 | `crates/rockstream-verified/src/frontier.rs::activation_preserves_publication` | A new member's durable bootstrap is at least the currently published frontier, or no publication exists. | Membership activation/replacement supplies the durable catch-up evidence and rejects generation overflow. |
 | `crates/rockstream-verified/src/frontier.rs::completes_before` | Frontier `F` completes epochs strictly less than `F`. | Reporters, readers, and cleanup consumers use the exclusive comparison. |
 
@@ -52,7 +52,7 @@ do not establish refinement of SlateDB or ObjectStore implementations.
 
 | Production code | Verus contract | Caller obligation |
 |---|---|---|
-| `crates/rockstream-verified/src/persistence.rs::{epoch_is_admissible,next_epoch}` | Valid authority admits only a newer epoch; consecutive and gapped source/shard sequences reject duplicates and exhaustion. | Source epoch registries validate identity and persist the entry before advancing in-memory state. |
-| `crates/rockstream-verified/src/persistence.rs::{commit_outcome,coupled_commit_is_durable}` | State, outputs, source markers, and frontier are authoritative only after one successful write and flush; write-success/flush-failure remains unknown. | `SourceCheckpointStore` and group commit keep acknowledgements/frontiers closed until the durable boundary succeeds. |
-| `crates/rockstream-verified/src/persistence.rs::{replay_decision,recovery_scan_status,recovery_is_ready}` | Prepared/invalid records do not advance replay; duplicates are no-ops; bounded scans distinguish completion, quota, cancellation, corruption, and continuation; readiness requires complete restored state. | Storage scans continue with progress, reject incomplete metadata, and recover the highest valid committed record. |
+| `crates/rockstream-verified/src/persistence.rs::{epoch_is_admissible,next_epoch}` | Valid authority admits exactly newer epochs, consecutive when required; duplicates, gaps, and exhaustion reject. | Source epoch registries validate identity and persist the entry before advancing in-memory state. |
+| `crates/rockstream-verified/src/persistence.rs::{commit_outcome,coupled_commit_is_durable}` | The outcome is exactly failed, committed, or unknown from write/flush results; state, outputs, source markers, and frontier are authoritative only after one successful write and flush. | `SourceCheckpointStore` and group commit keep acknowledgements/frontiers closed until the durable boundary succeeds. |
+| `crates/rockstream-verified/src/persistence.rs::{replay_decision,recovery_scan_status,recovery_is_ready}` | Replay and bounded scan return exact outcomes, with cancellation before corruption before quota before completion/continuation; readiness requires complete restored state. | Storage scans continue with progress, reject incomplete metadata, and recover the highest valid committed record. |
 | `crates/rockstream-verified/src/persistence.rs::compaction_is_eligible` | Reclamation requires both reader and replay horizons and excludes retained snapshots/in-flight deltas. | Arrangement/catalog adapters supply the real horizons and storage-specific snapshot/lease evidence. |
