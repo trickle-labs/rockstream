@@ -343,6 +343,15 @@ impl Message for Execute {
     }
 
     fn decode_body(buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
+        // Execute requires a NUL-terminated portal name followed by a
+        // four-byte max_rows field. Check both before calling Buf::get_i32;
+        // fuzz builds can abort on a panic before catch_unwind can recover.
+        let Some(name_end) = buf.iter().position(|byte| *byte == 0) else {
+            return Err(crate::error::PgWireError::InvalidMessageBody);
+        };
+        if buf.len().saturating_sub(name_end + 1) < 4 {
+            return Err(crate::error::PgWireError::InvalidMessageBody);
+        }
         let name = codec::get_cstring(buf);
         let max_rows = buf.get_i32();
 
