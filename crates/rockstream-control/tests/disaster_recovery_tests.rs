@@ -398,13 +398,19 @@ async fn cli_prefix_export_rejects_missing_committed_shard_objects_before_succes
     while let Some(entry) = objects.next().await {
         deleted.push(entry.unwrap().location);
     }
-    assert!(!deleted.is_empty(), "the fixture must contain actual shard data");
+    assert!(
+        !deleted.is_empty(),
+        "the fixture must contain actual shard data"
+    );
     drop(objects);
     for path in deleted {
         source.delete(&path).await.unwrap();
     }
     let manifests = CheckpointManifestStore::new(source.clone());
-    assert_eq!(manifests.load_latest_manifest().await.unwrap(), Some(checkpoint));
+    assert_eq!(
+        manifests.load_latest_manifest().await.unwrap(),
+        Some(checkpoint)
+    );
 
     // Same service method used by StorageClient::export_checkpoint, not the
     // separate checkpoint-aware management export_prefix path.
@@ -429,7 +435,9 @@ async fn cli_prefix_export_rejects_missing_committed_shard_objects_before_succes
 
     assert!(matches!(
         destination
-            .head(&Path::from("checkpoint-exports/missing-shard-preinventory/commit"))
+            .head(&Path::from(
+                "checkpoint-exports/missing-shard-preinventory/commit"
+            ))
             .await,
         Err(object_store::Error::NotFound { .. })
     ));
