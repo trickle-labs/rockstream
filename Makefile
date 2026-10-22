@@ -34,6 +34,7 @@ verify-proof-contracts:
 	python3 scripts/check-verus-manifest.py
 	python3 scripts/check-verus-qualification.py
 	bash scripts/test-verus-gates.sh
+	python3 scripts/test-verus-production-mutations.py
 	bash scripts/check-verus-qualification.test.sh
 
 # Run the clean, digest-bound VS6 qualification matrix (requires pinned Verus).
