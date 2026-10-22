@@ -56,3 +56,9 @@ do not establish refinement of SlateDB or ObjectStore implementations.
 | `crates/rockstream-verified/src/persistence.rs::{commit_outcome,coupled_commit_is_durable}` | State, outputs, source markers, and frontier are authoritative only after one successful write and flush; write-success/flush-failure remains unknown. | `SourceCheckpointStore` and group commit keep acknowledgements/frontiers closed until the durable boundary succeeds. |
 | `crates/rockstream-verified/src/persistence.rs::{replay_decision,recovery_scan_status,recovery_is_ready}` | Prepared/invalid records do not advance replay; duplicates are no-ops; bounded scans distinguish completion, quota, cancellation, corruption, and continuation; readiness requires complete restored state. | Storage scans continue with progress, reject incomplete metadata, and recover the highest valid committed record. |
 | `crates/rockstream-verified/src/persistence.rs::compaction_is_eligible` | Reclamation requires both reader and replay horizons and excludes retained snapshots/in-flight deltas. | Arrangement/catalog adapters supply the real horizons and storage-specific snapshot/lease evidence. |
+
+VS7 covers exchange reservation ownership and local release accounting.
+
+| Production code | Verus contract | Caller obligation |
+|---|---|---|
+| `crates/rockstream-verified/src/ownership.rs::{same_owner,release_accounting}` | A release changes local counters only for its owning channel instance; global bytes and request charges fall once, with exact residual charges when the inputs are valid. | `FlowController` keeps the channel lock over admission, handoff, release, and teardown; each live `FlowPermit` retains its unique `Arc` owner token and releases once. Delivered channel keys are retired after teardown because wire ACKs carry no generation. Tokio scheduling and transport delivery remain outside this local proof. |

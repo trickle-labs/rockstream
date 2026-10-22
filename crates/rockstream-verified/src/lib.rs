@@ -6,6 +6,7 @@ pub mod codecs;
 pub mod frontier;
 pub mod keys;
 pub mod laws;
+pub mod ownership;
 pub mod persistence;
 pub mod routing;
 pub mod zset;
@@ -13,7 +14,7 @@ pub mod zset;
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{aggregate, codecs, frontier, keys, persistence, routing, zset};
+    use super::{aggregate, codecs, frontier, keys, ownership, persistence, routing, zset};
 
     #[test]
     fn fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths() {
@@ -171,6 +172,20 @@ mod tests {
         assert!(!persistence::compaction_is_eligible(10, 8, 9, true, false));
         assert!(persistence::recovery_is_ready(true, true, true, true));
         assert!(!persistence::recovery_is_ready(true, true, false, true));
+    }
+
+    #[test]
+    fn exchange_owner_release_preserves_other_channel_charges() {
+        assert!(ownership::same_owner(11, 11));
+        assert!(!ownership::same_owner(11, 12));
+        assert_eq!(
+            ownership::release_accounting(true, 2, 2, 5, 8, 3, 1, 2),
+            (1, 1, 3, 6, 2)
+        );
+        assert_eq!(
+            ownership::release_accounting(false, 2, 2, 5, 8, 3, 1, 2),
+            (2, 2, 5, 6, 2)
+        );
     }
 }
 
