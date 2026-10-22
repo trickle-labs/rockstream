@@ -3,18 +3,24 @@
 ## Result and limits
 
 Remove the production-image dependency from gateway, which never consumes that
-image. Keep every target, feature, service, case, assertion, tier, waiver, required
-check name, and aggregate dependency. HA still runs the identity-checked production
-image; Docker build/smoke, HA, durability, recovery, transaction, protocol, security,
-formal and performance gates remain mandatory. No regression detection moves to
-nightly or release. No retries or selective source execution are added.
+image, then balance test owners and parallelize independent builds/benchmarks.
+Every existing case and assertion is retained. The four million-row proportionality
+cases move to the existing nightly/tag lane; four new 10,000-row PR cases execute
+the same shared assertions for all operator families. HA still runs the
+identity-checked production image. Durability, recovery, transaction, protocol,
+security, formal and performance checks stay mandatory. Existing required-check
+names, features and waivers are preserved; the aggregate gains the independently
+scheduled CLI-only build. No retries or selective source execution are added.
 
-For eight successful PR runs, a queue-free replay using each run's measured job
+For the initial dependency-only commit, a queue-free replay of eight successful PR runs using measured job
 durations estimates median critical-path time **95.92 → 69.70 minutes (27.3%)**.
 This is an estimate, not a hosted before/after benchmark. The observed baseline
 median including queues is **130.67 minutes**; it must not be compared directly
 with the queue-free estimate. The 50% target is not established: gateway and the
-parallel Verus jobs still set a roughly one-hour floor in this sample.
+parallel Verus jobs still set a roughly one-hour floor in that initial replay.
+The subsequent changes below attack those independent costs. Their hosted end-to-end
+effect remains unmeasured; the original 27.3% estimate is not a measurement of the
+expanded change.
 
 ## Baseline method and sample
 
@@ -113,7 +119,7 @@ the ops, storage and runtime bench profiles, plus 1m37s compiling the dev compar
 Long gaps between attempts are not runner consumption. These data do not prove
 host noise caused the failures. No retries or benchmark thresholds are changed.
 
-## Ranked bottlenecks and test-pyramid findings
+## Ranked bottlenecks and findings at the initial inspection
 
 Costs below use the low-queue run's accounting unless stated otherwise. Classification
 is by executed boundaries, not file names. No arbitrary unit/integration/E2E ratio
@@ -188,7 +194,7 @@ Additional findings and rejected changes:
   Selection still recognizes only allowlisted prose; shared config, unknown paths
   and source changes run full CI, so no transitive dependency selector is needed.
 
-## Before/after interpretation and validation
+## Initial dependency-only replay and validation
 
 For each successful run, let P=image-independent longest parallel job, D=Docker,
 G=gateway, H=HA, S=selection and C=Check, using active job durations. The queue-free
@@ -220,9 +226,132 @@ cancelled, missing and unexpected skipped dependencies. No branch protection or
 required-check name changes. Workflow YAML/dependency validation, the documentation
 gate, production CLI fixture-isolation gate, and `git diff --check` also pass.
 
-Full Rust, Docker and hosted suites have not been run locally. Docker socket access
-is unavailable in the sandbox. No production code or test workload is changed.
-After publication, compare candidate job/step timings and exact accounting case
-IDs/outcomes against a base run on matching runners/cache conditions; publish an
-observed reduction only after those runs complete. No nightly-only regression
-detection is introduced by this change.
+Those checks describe the first commit. The follow-up below changes test scheduling
+and introduces the explicitly described scale split. Full Rust, Docker and hosted
+suites have not been run locally. After publication, compare candidate job/step
+timings and exact accounting case IDs/outcomes against a base run on matching
+runners/cache conditions; publish an observed reduction only after those runs complete.
+
+## Follow-up toward a 30-minute target
+
+The initial hosted run [39826874980](https://github.com/trickle-labs/rockstream/actions/runs/39826874980)
+was still queued when follow-up work began. Queue latency remains outside these
+execution changes; a 30-minute execution path alone does not guarantee 30 minutes
+from a PR update.
+
+### Changes and coverage
+
+* Split the former crate owner into connectors/control/runtime, ops, and storage/SQL;
+  move oracle to its own PR owner. Split gateway into conformance producers plus
+  the documentation consumer, and the remaining targets. Unknown new targets still
+  inherit the package's PR owner. All explicit simulation assignment rules remain.
+  Every target runs serially within its job; separate runners isolate global
+  counters, environment variables, files, ports and Docker services. Conformance
+  report ordering is unchanged. No harness transfer or cross-feature binary reuse.
+* Move only `view_refresh_proportionality_tests` to `nightly-seeds`, which already
+  runs daily, on dispatch and on release tags. Preserve all four original case IDs,
+  one million rows, chunk sizes and assertions. Add a PR target calling the same
+  functions at 10,000 rows in ten commits. This still exercises every family through
+  real gateway sockets, commits, local storage and compiled views. Full rescans
+  exceed the same delta-work threshold of 100 at either scale. Scale-dependent
+  failures beyond 10,000 rows may now be detected by the next daily run instead of
+  the PR. Real MinIO durability, COPY buffering, recovery and transaction cases stay
+  on PRs. No new ignore or waiver is added.
+* Run ops/storage/runtime/control benchmark packages on independent runners. Keep
+  their exact baselines, tags, comparator and existing retry limit. A shell pipeline
+  failure is fatal. The original named performance gate validates the matrix result
+  and classification, rejecting missing, failed, cancelled or unexpectedly skipped
+  results. Prose skips are explicit exclusions, not benchmark passes.
+* Move the ordinary CLI-only release builds to independent Linux/macOS jobs and add
+  their matrix to `Check`. Do not delete those builds: a local Cargo 1.88 feature-tree
+  comparison found workspace-only `url/serde` and `either/default` features, so a
+  successful workspace build is not equivalent evidence. Keep the clean Verus
+  matrix commands, verifier checks, production-wrapper test and source-bound evidence.
+  Smoke-test both debug/release workspace artifacts produced by qualification.
+* Split clean qualification into debug/verification and release phases on separate
+  runners for both platforms. The original serial runner remains the default. Both
+  phases retain fresh build directories, commands and budgets; partial phase records
+  cannot become full qualification without successful matrix results and validation
+  of source revision, target, source digests, all six step IDs/statuses/budgets, and
+  both binary hashes. The original named Verus jobs assemble and smoke-test the
+  complete result. Missing, corrupted or mixed-revision inputs fail closed.
+
+### Timing and cost implications
+
+These are the original run 39726733128 execution times reallocated by the new
+ownership, excluding compilation, setup and queues. They are useful for balancing,
+not predictions of total job time:
+
+| New owner | Existing execution minutes |
+| --- | ---: |
+| Workspace excluding oracle | 2.18 |
+| Oracle | 23.24 |
+| Connectors/control/runtime | 9.67 |
+| Ops | 13.31 |
+| Storage/SQL | 8.69 |
+| Gateway conformance | 20.79 |
+| Gateway components excluding million-row scale | 13.07, plus the new small suite |
+
+The macOS Verus artifact's `steps.tsv` separates cold verification (80 seconds),
+incremental verification (5), debug build (364), default check (219), all-feature
+check (33), and release build (1,536). That is **11.68 minutes debug/verification +
+25.60 release**. The original job also spent 21.48 minutes building the CLI-only
+consumer. Overlapping all three paths removes their serial sum; the measured
+longest constituent is 25.60 minutes, before setup, artifact transfer, assembly,
+wrapper tests and smoke tests. Cold release may lose build-script reuse from the
+debug phase, so 25.60 is a reference cost, not a promised phase duration.
+
+This supports pursuing an approximately **30–40-minute execution path**, conditional
+on acceptable shard compilation and phase overhead. It does not establish a
+30-minute hosted result. Four-package benchmark execution/builds can overlap, but
+their separate runners may recompile shared dependencies. Shard compilation costs
+cannot be inferred by splitting the old package times: earlier packages warmed
+dependencies for later ones.
+
+Thus neither 30-minute time-to-green nor a runner-minute saving is claimed. The
+first baseline remains 130.67 minutes median including queues and 440.61 occupied
+runner-minutes. More parallel jobs may increase cost and queue pressure. Nightly
+adds the retained million-row execution and its compilation; PRs save that execution
+but still run all-family proportionality coverage at the smaller scale. A new hosted
+run is needed to quantify the final critical path, build duplication and total cost.
+
+### Follow-up validation
+
+The policy, inventory, scope, benchmark and qualification-assembly tests cover exact shard ownership,
+unchanged conformance ordering/ownership, nightly schedule and report invocation,
+both scale configurations, all four benchmark command sequences and baseline paths,
+comparator retry exhaustion, immediate build failure, and fail-closed matrix
+aggregation. Qualification tests exercise the actual runner with command shims,
+compare every phase command against the serial qualification contract, and reject
+missing phases/steps/binaries, failed statuses, mixed revisions/targets/digests,
+duplicate steps, exceeded budgets and altered binary content. Live Cargo metadata accounts for 605 targets (one new PR target),
+including the same 69 simulation integration targets. All 39 Python self-tests and
+the broader `make verify-proof-contracts` checks pass, including atomic staging and
+actual phase-runner command checks. Workflow YAML/matrix validation, documentation,
+shell syntax, Rust formatting and diff whitespace checks pass.
+
+### Local scale comparison (measured, not hosted time-to-green)
+
+One sequential pair on the same macOS ARM64 host, Rust/Cargo 1.99.1, debug test
+profile, `testcontainers` feature, one test thread, and shared compiled dependencies:
+
+| Workload | Cases and outcomes | Harness wall time |
+| --- | --- | ---: |
+| Retained million-row suite | Exact four original case IDs passed | 305.45 s |
+| New 10,000-row PR suite | Exact four new case IDs passed | 20.39 s |
+
+This is **93.3% less execution time for this suite**, achieved by moving scale
+coverage rather than claiming faster production behavior. Both binaries were built
+together before timing; the warmed no-run build took 0.66 seconds. The same libtest
+JSON parser/accounting function verified every case and rejected missing/ignored
+outcomes. The shared functions retain every original assertion. Compilation of the
+new feature-specific binaries beforehand took 2m56s and is excluded from these
+execution numbers. This single pair does not support p95 estimates or predictions
+for Ubuntu CI or the whole workflow. CI uses Rust 1.88; the local execution here
+used the installed Homebrew Rust 1.99.1. Rust 1.88 formatting and the earlier libtest
+timing compatibility check also pass.
+
+The first local attempt failed only because sandbox loopback binds are prohibited;
+the host-authorized rerun and this complete comparison passed. Full workspace,
+Docker and real Verus compilation were not rerun locally. The hosted workflow is
+still needed to measure the final critical path and increased parallel runner cost.

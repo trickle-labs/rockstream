@@ -6,7 +6,7 @@
     "rockstream-diff": "pr-workspace",
     "rockstream-docgen": "pr-workspace",
     "rockstream-management-proto": "pr-workspace",
-    "rockstream-oracle": "pr-workspace",
+    "rockstream-oracle": "pr-oracle",
     "rockstream-plan": "pr-workspace",
     "rockstream-test-support": "pr-workspace",
     "rockstream-types": "pr-workspace",
@@ -14,15 +14,25 @@
     "rockstream-fuzz": "pr-workspace",
     "rockstream-connectors": "pr-crates",
     "rockstream-control": "pr-crates",
-    "rockstream-ops": "pr-crates",
+    "rockstream-ops": "pr-ops",
     "rockstream-runtime": "pr-crates",
-    "rockstream-storage": "pr-crates",
-    "rockstream-sql": "pr-crates",
-    "rockstream-gateway": "pr-gateway"
+    "rockstream-storage": "pr-storage-sql",
+    "rockstream-sql": "pr-storage-sql",
+    "rockstream-gateway": "pr-gateway-components"
   },
   "sim_lib_job": "pr-sim-unit",
   "target_jobs": {
-    "rockstream-gateway/test:pg18_differential_conformance_tests": "pr-postgres-differential"
+    "rockstream-gateway/test:pg18_differential_conformance_tests": "pr-postgres-differential",
+    "rockstream-gateway/test:auth_scram_tests": "pr-gateway",
+    "rockstream-gateway/test:gateway_dml_tests": "pr-gateway",
+    "rockstream-gateway/test:gateway_extended_query_tests": "pr-gateway",
+    "rockstream-gateway/test:gateway_integration_tests": "pr-gateway",
+    "rockstream-gateway/test:gateway_proof_tests": "pr-gateway",
+    "rockstream-gateway/test:golden_wire_tests": "pr-gateway",
+    "rockstream-gateway/test:listen_notify_tests": "pr-gateway",
+    "rockstream-gateway/test:transaction_savepoint_tests": "pr-gateway",
+    "rockstream-gateway/test:conformance_doc_tests": "pr-gateway",
+    "rockstream-gateway/test:view_refresh_proportionality_tests": "nightly-seeds"
   },
   "sim_groups": {
     "pr-sim": [
@@ -127,9 +137,6 @@
         ],
         "rockstream-runtime": [
           "simulation"
-        ],
-        "rockstream-sql": [
-          "testcontainers"
         ]
       },
       "services": []
@@ -156,7 +163,9 @@
     "pr-postgres-differential": {
       "tier": "pull_request",
       "features": [],
-      "services": ["docker"],
+      "services": [
+        "docker"
+      ],
       "include_ignored_targets": [
         "rockstream-gateway/test:pg18_differential_conformance_tests"
       ]
@@ -189,7 +198,10 @@
       "features": [
         "simulation"
       ],
-      "services": []
+      "services": [],
+      "package_features": {
+        "rockstream-gateway": []
+      }
     },
     "nightly-docker": {
       "tier": "nightly",
@@ -232,6 +244,41 @@
           "resource_leak_soak_real_binary_minio_churn_is_flat"
         ]
       }
+    },
+    "pr-oracle": {
+      "tier": "pull_request",
+      "features": [],
+      "services": [
+        "docker"
+      ]
+    },
+    "pr-ops": {
+      "tier": "pull_request",
+      "features": [],
+      "services": [
+        "docker"
+      ]
+    },
+    "pr-storage-sql": {
+      "tier": "pull_request",
+      "features": [],
+      "package_features": {
+        "rockstream-sql": [
+          "testcontainers"
+        ]
+      },
+      "services": [
+        "docker"
+      ]
+    },
+    "pr-gateway-components": {
+      "tier": "pull_request",
+      "features": [
+        "testcontainers"
+      ],
+      "services": [
+        "docker"
+      ]
     }
   },
   "target_requirements": {

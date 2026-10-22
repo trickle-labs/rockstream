@@ -55,11 +55,11 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(dependencies, [
             "ci-policy", "check-quality", "check-tests", "gateway",
             "postgres-differential", "control-plane-ha", "formal-verify",
-            "verus-verify", "nexmark-regression-gate", "benchmark", "docker-build",
+            "verus-verify", "verus-consumer", "nexmark-regression-gate", "benchmark", "docker-build",
         ])
         self.assertIn("run: python3 scripts/ci-scope.py check", check)
         self.assertIn("CI_NEEDS: ${{ toJSON(needs) }}", check)
-        for job in ("verus-verify", "nexmark-regression-gate", "benchmark"):
+        for job in ("nexmark-regression-gate",):
             block = blocks[job]
             self.assertIn("    needs: ci-policy\n", block)
             steps = re.split(r"^      - ", block.split("    steps:\n")[1], flags=re.M)[1:]
@@ -67,10 +67,44 @@ class PolicyTests(unittest.TestCase):
             for step in steps[1:-1]:
                 self.assertRegex(step, r"if: (always\(\) && )?needs.ci-policy.outputs.expensive == 'true'")
             self.assertIn("if: needs.ci-policy.outputs.expensive == 'false'", steps[-1])
-        for job in ("check-tests", "gateway", "postgres-differential", "formal-verify", "docker-build"):
+        for job in ("check-tests", "gateway", "postgres-differential", "formal-verify", "docker-build", "benchmark-suites", "verus-consumer", "verus-qualify"):
             self.assertIn("needs: ci-policy", blocks[job])
             self.assertIn("if: needs.ci-policy.outputs.scope == 'full'", blocks[job])
         self.assertIn("needs: docker-build", blocks["control-plane-ha"])
+
+    def test_balanced_shards_benchmarks_and_clean_consumer_keep_their_gates(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        blocks = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", workflow, re.M | re.S))
+        self.assertEqual(re.findall(r"^          - ([\w-]+)$", blocks["check-tests"], re.M), [
+            "workspace", "crates", "sim-unit", "sim-integration", "oracle", "ops",
+            "storage-sql", "gateway-components",
+        ])
+        self.assertIn("run: python3 scripts/ci-test-inventory.py run --job pr-${{ matrix.shard }}", blocks["check-tests"])
+        self.assertIn("suite: [ops, storage, runtime, control]", blocks["benchmark-suites"])
+        self.assertIn("fail-fast: false", blocks["benchmark-suites"])
+        self.assertIn('run: bash scripts/run-benchmark-gate.sh "${{ matrix.suite }}"', blocks["benchmark-suites"])
+        self.assertIn("name: Performance-regression gate (ops/storage/runtime/control)", blocks["benchmark"])
+        self.assertIn("needs: [ci-policy, benchmark-suites]\n    if: always()", blocks["benchmark"])
+        self.assertIn("run: python3 scripts/ci-scope.py check-benchmarks", blocks["benchmark"])
+        self.assertIn("CI_NEEDS: ${{ toJSON(needs) }}", blocks["benchmark"])
+        self.assertIn("run: make qualify-verus", blocks["verus-qualify"])
+        self.assertIn("phase: [debug, release]", blocks["verus-qualify"])
+        self.assertIn("os: [ubuntu-latest, macos-14]", blocks["verus-qualify"])
+        self.assertIn("VERUS_QUALIFICATION_PHASE: ${{ matrix.phase }}", blocks["verus-qualify"])
+        self.assertIn("needs: [ci-policy, verus-qualify]\n    if: always()", blocks["verus-verify"])
+        self.assertIn("run: python3 scripts/ci-scope.py check-verus", blocks["verus-verify"])
+        self.assertIn("--status passed --merge target/verus-phases", blocks["verus-verify"])
+        self.assertIn("name: verus-phase-${{ matrix.target }}-debug", blocks["verus-verify"])
+        self.assertIn("name: verus-phase-${{ matrix.target }}-release", blocks["verus-verify"])
+        self.assertIn("VERUS_QUALIFICATION_OUTPUT: evidence/verus/${{ matrix.target }}", blocks["verus-verify"])
+        self.assertIn('"$VERUS_QUALIFICATION_OUTPUT/rockstream-debug" --help', blocks["verus-verify"])
+        self.assertIn('"$VERUS_QUALIFICATION_OUTPUT/rockstream-release" --help', blocks["verus-verify"])
+        self.assertIn("os: [ubuntu-latest, macos-14]", blocks["verus-consumer"])
+        self.assertIn("run: cargo build --locked --release -p rockstream-cli", blocks["verus-consumer"])
+        self.assertNotIn("cargo build --locked --release -p rockstream-cli", blocks["verus-verify"])
+        runner = (ROOT / "scripts/run-verus-qualification.sh").read_text()
+        self.assertIn('cargo build --workspace --locked "${TARGET_ARGS[@]}"', runner)
+        self.assertIn('cargo build --workspace --locked --release "${TARGET_ARGS[@]}"', runner)
 
     def test_only_production_image_consumers_wait_for_the_image(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

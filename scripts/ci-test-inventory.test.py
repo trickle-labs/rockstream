@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import tempfile
 import tomllib
 import unittest
@@ -37,6 +38,39 @@ class GateSelfTests(unittest.TestCase):
     def setUp(self):
         self.target = {"package": "rockstream-sim", "kind": "test", "name": "chaos_tests"}
         self.key = gate.target_id(**self.target)
+
+    def test_balanced_ownership_and_nightly_scale_preserve_pr_families(self):
+        packages, targets = gate.inventory(gate.cargo_metadata())
+        owner = gate.assignments(targets, packages, POLICY)
+        self.assertEqual([gate.target_id(**t) for t in gate.selected_targets(
+            "pr-gateway", targets, owner, POLICY)], sorted(
+                POLICY["jobs"]["pr-gateway"]["conformance_targets"] +
+                ["rockstream-gateway/test:conformance_doc_tests"]))
+        for package, job in {
+            "rockstream-oracle": "pr-oracle", "rockstream-ops": "pr-ops",
+            "rockstream-storage": "pr-storage-sql", "rockstream-sql": "pr-storage-sql",
+        }.items():
+            self.assertEqual({k: v for k, v in owner.items() if k.startswith(package + "/")},
+                             {k: job for k in targets if k.startswith(package + "/")})
+        nightly = "rockstream-gateway/test:view_refresh_proportionality_tests"
+        ordinary = "rockstream-gateway/test:view_refresh_proportionality_pr_tests"
+        self.assertEqual({k: owner[k] for k in (nightly, ordinary)}, {
+            nightly: "nightly-seeds", ordinary: "pr-gateway-components",
+        })
+        self.assertEqual(POLICY["jobs"]["nightly-seeds"]["package_features"], {"rockstream-gateway": []})
+        self.assertEqual(POLICY["jobs"]["pr-gateway-components"], {
+            "tier": "pull_request", "features": ["testcontainers"], "services": ["docker"],
+        })
+        for name, rows, chunk in ((nightly, "1_000_000", "50_000"), (ordinary, "10_000", "1_000")):
+            source = (ROOT / "crates/rockstream-gateway/tests" / (name.split(":")[1] + ".rs")).read_text()
+            self.assertIn('#[path = "support/view_refresh_proportionality.rs"]', source)
+            self.assertEqual(re.findall(r"proportionality::(\w+)\(([^,]+), ([^)]+)\).await;", source),
+                             [(family, rows, chunk) for family in (
+                                 "stateless_project", "aggregate", "join", "session_window")])
+        workflow = (ROOT / ".github/workflows/test-accounting-expensive.yml").read_text()
+        self.assertIn('cron: "15 2 * * *"', workflow)
+        self.assertIn("run: python3 scripts/ci-test-inventory.py run --job nightly-seeds", workflow)
+        self.assertIn("name: nightly-seeds-test-evidence", workflow)
 
     def assertFails(self, fn, message):
         with self.assertRaisesRegex(ValueError, message):
