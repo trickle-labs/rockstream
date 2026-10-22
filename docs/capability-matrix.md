@@ -4,7 +4,7 @@
 
 Contract version: `v0.72.0`
 
-Roadmap row fingerprint: `sha256:1e2d15dfc1bd40cd10653cad57f59ba390531a3228cc4f2340188d5127799ba7`
+Roadmap row fingerprint: `sha256:9cca84f19d0f21b134e1d7014699b2b90a86ece8cacfaae19677e541c4708a5d`
 
 > RockStream ingests changing data, continuously maintains a documented SQL subset as durable materialized views, and serves globally committed results to PostgreSQL-compatible clients while surviving ordinary distributed-system failures without losing or silently corrupting committed state.
 
