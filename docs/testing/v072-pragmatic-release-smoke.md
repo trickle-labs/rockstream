@@ -33,5 +33,6 @@ A separate report should include one overload/cancel/restart reproduction **on t
 
 - Confirm signed tag policy and required CI on the version-bumped candidate commit.
 - Confirm decoder fuzz is green on the exact candidate (not an earlier PR head), and check any newer scheduled fuzz findings.
+- Resolve the potential CLI checkpoint export false-success in [#221](https://github.com/trickle-labs/rockstream/issues/221) before publishing. Its targeted real-shard negative regression on [PR #231](https://github.com/trickle-labs/rockstream/pull/231) is pending; if it confirms a bug, require a fail-closed repair, no success marker, and a successful intact export/restore on the final candidate. An untested backup is not acceptance evidence.
 - Close security issue #227 only when the known crashes and final integrated decoder checks are satisfied; close parent #132 only when this smoke and its limitations are recorded.
 - Publish signed immutable `v0.72.0` tag via an authorized maintainer and release notes only after all gates pass. No retagging or branch-protection bypasses.

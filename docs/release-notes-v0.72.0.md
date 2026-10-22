@@ -18,6 +18,7 @@
 - Subscription replay is retained only within its bounded history; clients must resnapshot when replay is unavailable.
 - The v0.72 quota, memory and scheduling tests are practical regressions, **not** measured guarantees of p99 latency, 8-worker scaling, beyond-RAM recovery, or cloud cost. No universal production qualification or all-configuration memory/RSS guarantee is asserted.
 - Existing v0.71 storage/checkpoint deployments should be backed up and exercised through recovery before upgrades. The release does not introduce a new migration guarantee.
+- **Pending release-safety triage:** [#221](https://github.com/trickle-labs/rockstream/issues/221) questions whether CLI checkpoint export can incorrectly report a successful backup when a committed checkpoint references missing shard objects. Do not rely on a reported export success alone: validate recovery on an isolated target. Resolve the suspicion (and conflicting integrity-error code) before treating CLI exports as release-safe.
 - This is not the complete typed console API or a claim that every PostgreSQL message is supported. Malformed-frame coverage is bounded by the included regressions and decoder fuzzing.
 
 ## Verification and reproducibility
