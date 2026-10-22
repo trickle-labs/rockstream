@@ -128,6 +128,28 @@ mod frame_regressions {
     }
 
     #[test]
+    fn malformed_execute_without_portal_name_and_row_count_fails_closed() {
+        // The scheduled 2026-10-22 fuzz run minimized a second panic to this
+        // five-byte Execute message with an empty body.
+        for payload in [
+            &b"E\x00\x00\x00\x04"[..],
+            &b"E\x00\x00\x00\x05\x00"[..],
+            &b"E\x00\x00\x00\x08\x00\x00\x00\x00"[..],
+        ] {
+            let mut frame = BytesMut::from(payload);
+            assert!(
+                PgWireFrontendMessage::decode(&mut frame).is_err(),
+                "short Execute must be rejected"
+            );
+        }
+        let mut valid = BytesMut::from(&b"E\x00\x00\x00\x09\x00\x00\x00\x00\x00"[..]);
+        assert!(matches!(
+            PgWireFrontendMessage::decode(&mut valid),
+            Ok(Some(PgWireFrontendMessage::Execute(_)))
+        ));
+    }
+
+    #[test]
     fn complete_copy_data_remains_accepted() {
         let mut bytes = BytesMut::from(&b"d\x00\x00\x00\x06hi"[..]);
         assert!(matches!(
