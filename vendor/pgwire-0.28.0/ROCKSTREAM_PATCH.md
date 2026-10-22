@@ -2,7 +2,7 @@
 
 Upstream source: https://github.com/sunng87/pgwire/tree/v0.28.0
 Original license: dual MIT and Apache-2.0 (retained unchanged here).
-Only `src/messages/codec.rs`, `src/messages/simplequery.rs` and `src/error.rs` change production behavior.
+Only `src/messages/codec.rs`, `src/messages/simplequery.rs`, `src/messages/extendedquery.rs` and `src/error.rs` change production behavior.
 
 The historical 0.28 decoder accepts malformed length fields below the four-byte
 header and passes them to `CopyData::decode_body`, which can panic on unsigned
@@ -26,3 +26,7 @@ Focused regressions: `cargo test --manifest-path vendor/pgwire-0.28.0/Cargo.toml
 with full repository checks and a real socket malformed-frame smoke required
 before merge. The vendored package is intentionally excluded from workspace
 membership, but remains the patched Cargo dependency.
+
+## 2026-10-22 follow-up
+
+Scheduled main fuzz [39720408746](https://github.com/trickle-labs/rockstream/actions/runs/39720408746) minimized a distinct `Execute` panic to `45 00 00 00 04` (a frame with no body); this is not the earlier `CopyData` length-zero bug. `Execute::decode_body` now checks for the required portal-name NUL and four-byte row count before calling `get_i32`, avoiding abort-on-panic in fuzzer builds. Added short-message and valid-boundary regression; full CI and scheduled fuzz verification remain required.
