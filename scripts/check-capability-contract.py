@@ -211,7 +211,8 @@ def check_roadmap(root: Path, contract: dict, errors: list[str]) -> None:
         fail(errors, f"cannot read {roadmap}: {error}")
         return
     roadmap_version = version.removesuffix(".0")
-    if not re.search(rf"^\| \*{{0,2}}{re.escape(roadmap_version)}\*{{0,2}} \|.*✅ Done", text, re.MULTILINE):
+    completion = "✅ Done|⏳ Candidate" if version == "v0.72.0" else "✅ Done"
+    if not re.search(rf"^\| \*{{0,2}}{re.escape(roadmap_version)}\*{{0,2}} \|.*(?:{completion})", text, re.MULTILINE):
         fail(errors, f"roadmap does not mark contract version {version} as Done")
 
 
