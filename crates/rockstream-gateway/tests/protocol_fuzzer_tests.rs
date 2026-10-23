@@ -99,12 +99,12 @@ async fn run_connection(addr: SocketAddr, sequence: &[String]) -> Result<(), Str
                 if columns.len() == 1 && columns[0].name() == "probe"
                     && row.len() == 1 && row.get(0) == Some("1")
         ) {
-            return Err(format!("unexpected probe response: {response:?}"));
+            return Err(format!("RS-0001 unexpected probe response: {response:?}"));
         }
         for sql in sequence {
             if let Err(error) = client.simple_query(sql).await {
                 if error.as_db_error().is_none() {
-                    return Err(format!("transport failure for {sql:?}: {error}"));
+                    return Err(format!("RS-0004 transport failure for {sql:?}: {error}"));
                 }
             }
         }
