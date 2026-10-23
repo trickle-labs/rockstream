@@ -60,6 +60,10 @@ mkdir -p "$policy_root/formal/verus" "$policy_root/crates"
 cp "$ROOT/formal/verus/manifest.toml" "$policy_root/formal/verus/manifest.toml"
 cp "$ROOT/formal/verus/assumptions.toml" "$policy_root/formal/verus/assumptions.toml"
 cp -R "$ROOT/crates/." "$policy_root/crates/"
+# Include the production adapter paths referenced by the VS7-03 claim.
+mkdir -p "$policy_root/vendor/pgwire-0.28.0/src/messages"
+cp "$ROOT/vendor/pgwire-0.28.0/src/messages/codec.rs" "$ROOT/vendor/pgwire-0.28.0/src/messages/mod.rs" \
+  "$policy_root/vendor/pgwire-0.28.0/src/messages/"
 for fixture in unchecked_assumption verus_only_substitution; do
 	cp "$ROOT/formal/verus/negative/$fixture.rs" \
 		"$policy_root/crates/rockstream-verified/src/$fixture.rs"
@@ -79,6 +83,10 @@ mkdir -p "$unmarked_root/formal/verus" "$unmarked_root/crates"
 cp "$ROOT/formal/verus/manifest.toml" "$unmarked_root/formal/verus/manifest.toml"
 cp "$ROOT/formal/verus/assumptions.toml" "$unmarked_root/formal/verus/assumptions.toml"
 cp -R "$ROOT/crates/." "$unmarked_root/crates/"
+# Include the production adapter paths referenced by the VS7-03 claim.
+mkdir -p "$unmarked_root/vendor/pgwire-0.28.0/src/messages"
+cp "$ROOT/vendor/pgwire-0.28.0/src/messages/codec.rs" "$ROOT/vendor/pgwire-0.28.0/src/messages/mod.rs" \
+  "$unmarked_root/vendor/pgwire-0.28.0/src/messages/"
 printf '\npub fn unregistered_runtime_only() -> u64 { 0 }\n' \
   >>"$unmarked_root/crates/rockstream-verified/src/routing.rs"
 unmarked_log="$TMP_ROOT/unmarked.log"
@@ -96,6 +104,10 @@ mkdir -p "$conditional_root/formal/verus" "$conditional_root/crates"
 cp "$ROOT/formal/verus/manifest.toml" "$conditional_root/formal/verus/manifest.toml"
 cp "$ROOT/formal/verus/assumptions.toml" "$conditional_root/formal/verus/assumptions.toml"
 cp -R "$ROOT/crates/." "$conditional_root/crates/"
+# Include the production adapter paths referenced by the VS7-03 claim.
+mkdir -p "$conditional_root/vendor/pgwire-0.28.0/src/messages"
+cp "$ROOT/vendor/pgwire-0.28.0/src/messages/codec.rs" "$ROOT/vendor/pgwire-0.28.0/src/messages/mod.rs" \
+  "$conditional_root/vendor/pgwire-0.28.0/src/messages/"
 printf '\n#[cfg(not(verus_only))]\npub fn runtime_only_branch() -> u64 { 0 }\n' \
   >>"$conditional_root/crates/rockstream-verified/src/routing.rs"
 conditional_log="$TMP_ROOT/conditional.log"
@@ -113,6 +125,10 @@ mkdir -p "$fixture_root/formal/verus" "$fixture_root/crates"
 cp "$ROOT/formal/verus/manifest.toml" "$fixture_root/formal/verus/manifest.toml"
 cp "$ROOT/formal/verus/assumptions.toml" "$fixture_root/formal/verus/assumptions.toml"
 cp -R "$ROOT/crates/." "$fixture_root/crates/"
+# Include the production adapter paths referenced by the VS7-03 claim.
+mkdir -p "$fixture_root/vendor/pgwire-0.28.0/src/messages"
+cp "$ROOT/vendor/pgwire-0.28.0/src/messages/codec.rs" "$ROOT/vendor/pgwire-0.28.0/src/messages/mod.rs" \
+  "$fixture_root/vendor/pgwire-0.28.0/src/messages/"
 sed -i.bak 's/id = "VS0-02"/id = "UNKNOWN"/' "$fixture_root/formal/verus/manifest.toml"
 manifest_log="$TMP_ROOT/manifest.log"
 if python3 "$ROOT/scripts/check-verus-manifest.py" --root "$fixture_root" >"$manifest_log" 2>&1; then
