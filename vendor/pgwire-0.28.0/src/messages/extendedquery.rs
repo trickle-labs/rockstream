@@ -353,6 +353,10 @@ impl Message for Describe {
     }
 
     fn decode_body(buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
+        // Describe requires a target kind and a terminated name.
+        if buf.len() < 2 || !buf[1..].contains(&0) {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let target_type = buf.get_u8();
         let name = codec::get_cstring(buf);
 
