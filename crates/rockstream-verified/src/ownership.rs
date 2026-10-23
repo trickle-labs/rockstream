@@ -9,6 +9,7 @@ verus! {
     }
 
     // verus-claim: VS7-01
+    #[allow(clippy::too_many_arguments)]
     pub fn release_accounting(
         owner_matches: bool,
         rows: u32,
