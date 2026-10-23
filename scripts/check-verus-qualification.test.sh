@@ -185,6 +185,9 @@ printf '    ;;\n' >> "$SHIM_BIN/cp"
 printf 'esac\n' >> "$SHIM_BIN/cp"
 chmod +x "$SHIM_BIN/cp"
 
+# Exercise legacy all-phase artifact failure cases independent of CI's split phase.
+export VERUS_QUALIFICATION_PHASE=all
+
 # Case A — stale destination
 CASE_A_OUT="$TMP_ROOT/case-a-out"
 mkdir -p "$CASE_A_OUT"
