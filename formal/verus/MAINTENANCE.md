@@ -12,6 +12,11 @@ library upgrade requires a reviewed update to `toolchain.lock.toml`, a clean
 non-incremental proof run, and refreshed claim evidence. Assumption changes
 require the same review and an updated `assumptions.toml` entry.
 
+The negative fixtures are verifier smoke and trust-policy checks. The
+`production_mutations` inventory runs each executable-source change in an
+isolated copy, requires a verifier error at that source target, and retains
+baseline and mutant logs. A compile or setup failure does not count.
+
 Use the frozen R1 profile and thresholds for runtime, allocation, RSS, commit,
 and freshness comparisons. A missing backend, unavailable tool, skipped test,
 or absent raw log is `blocked`; it is never a pass. Do not weaken a contract,
