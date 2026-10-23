@@ -570,21 +570,39 @@ fn test_benchmark_ci_job_exists_and_covers_four_subsystems() {
     let root = repo_root();
     let workflow: serde_yaml::Value = serde_yaml::from_str(
         &std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap(),
-    ).expect("CI workflow must be valid YAML");
+    )
+    .expect("CI workflow must be valid YAML");
     let jobs = &workflow["jobs"];
     let suites = &jobs["benchmark-suites"];
     let gate = &jobs["benchmark"];
     assert_eq!(suites["timeout-minutes"].as_u64(), Some(90));
-    let matrix = suites["strategy"]["matrix"]["suite"].as_sequence()
+    let matrix = suites["strategy"]["matrix"]["suite"]
+        .as_sequence()
         .expect("benchmark suites must be an explicit matrix");
     let actual: BTreeSet<_> = matrix.iter().map(|value| value.as_str().unwrap()).collect();
-    assert_eq!(actual, BTreeSet::from(["ops", "storage", "runtime", "control"]));
-    let commands: Vec<_> = suites["steps"].as_sequence().unwrap().iter()
-        .filter_map(|step| step["run"].as_str()).collect();
-    assert!(commands.iter().any(|run| run.contains("scripts/run-benchmark-gate.sh")));
-    let gate_needs = gate["needs"].as_sequence().expect("benchmark gate must depend on suites");
-    assert!(gate_needs.iter().any(|need| need.as_str() == Some("benchmark-suites")));
-    assert!(gate["steps"].as_sequence().unwrap().iter()
+    assert_eq!(
+        actual,
+        BTreeSet::from(["ops", "storage", "runtime", "control"])
+    );
+    let commands: Vec<_> = suites["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .collect();
+    assert!(commands
+        .iter()
+        .any(|run| run.contains("scripts/run-benchmark-gate.sh")));
+    let gate_needs = gate["needs"]
+        .as_sequence()
+        .expect("benchmark gate must depend on suites");
+    assert!(gate_needs
+        .iter()
+        .any(|need| need.as_str() == Some("benchmark-suites")));
+    assert!(gate["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
         .filter_map(|step| step["run"].as_str())
         .any(|run| run.contains("scripts/ci-scope.py check-benchmarks")));
     let runner = std::fs::read_to_string(root.join("scripts/run-benchmark-gate.sh")).unwrap();
