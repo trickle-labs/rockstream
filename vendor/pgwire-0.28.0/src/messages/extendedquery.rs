@@ -39,21 +39,25 @@ impl Message for Parse {
     }
 
     fn decode_body(buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
-        if !buf.contains(&0) {
+        // Check the complete Parse body before consuming any bytes.
+        let Some(name_end) = buf.iter().position(|byte| *byte == 0) else {
+            return Err(PgWireError::InvalidMessageBody);
+        };
+        let remaining = &buf[name_end + 1..];
+        let Some(query_end) = remaining.iter().position(|byte| *byte == 0) else {
+            return Err(PgWireError::InvalidMessageBody);
+        };
+        let fields = &remaining[query_end + 1..];
+        if fields.len() < 2 {
+            return Err(PgWireError::InvalidMessageBody);
+        }
+        let count = u16::from_be_bytes([fields[0], fields[1]]) as usize;
+        if fields.len() - 2 != count * 4 {
             return Err(PgWireError::InvalidMessageBody);
         }
         let name = codec::get_cstring(buf);
-        if !buf.contains(&0) {
-            return Err(PgWireError::InvalidMessageBody);
-        }
         let query = codec::get_cstring(buf).unwrap_or_else(|| "".to_owned());
-        if buf.remaining() < 2 {
-            return Err(PgWireError::InvalidMessageBody);
-        }
         let type_oid_count = buf.get_u16();
-        if buf.remaining() < type_oid_count as usize * 4 {
-            return Err(PgWireError::InvalidMessageBody);
-        }
 
         let mut type_oids = Vec::with_capacity(type_oid_count as usize);
         for _ in 0..type_oid_count {
