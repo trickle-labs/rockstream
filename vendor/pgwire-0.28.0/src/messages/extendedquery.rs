@@ -135,6 +135,10 @@ impl Message for Close {
         if buf.len() < 2 || !buf[1..].contains(&0) {
             return Err(PgWireError::InvalidMessageBody);
         }
+        // Check both required fields before calling Buf getters.
+        if buf.len() < 2 || !buf[1..].contains(&0) {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let target_type = buf.get_u8();
         let name = codec::get_cstring(buf);
 
