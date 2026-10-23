@@ -131,6 +131,10 @@ impl Message for Close {
     }
 
     fn decode_body(buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
+        // Close has the same target/name framing as Describe.
+        if buf.len() < 2 || !buf[1..].contains(&0) {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let target_type = buf.get_u8();
         let name = codec::get_cstring(buf);
 
