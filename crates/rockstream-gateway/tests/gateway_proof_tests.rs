@@ -4923,7 +4923,11 @@ async fn proof_index_scan_point_lookup_via_wire() {
             .await
             .expect("timed SELECT failed");
         let elapsed = start.elapsed();
-        assert_eq!(data_rows_from(&sample).len(), 2, "timed lookup returned wrong row count");
+        assert_eq!(
+            data_rows_from(&sample).len(),
+            2,
+            "timed lookup returned wrong row count"
+        );
         best = best.min(elapsed);
     }
     assert!(
