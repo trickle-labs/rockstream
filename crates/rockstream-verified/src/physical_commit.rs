@@ -32,6 +32,7 @@ verus! {
     }
 
     // verus-claim: VS7-02
+    #[allow(clippy::too_many_arguments)]
     pub fn finish_transition(
         source: u8,
         outcome: u8,
