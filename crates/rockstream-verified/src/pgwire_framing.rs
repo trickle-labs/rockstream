@@ -12,9 +12,7 @@ verus! {
             result.is_some() ==> offset <= bytes.len() && bytes.len() - offset >= 4,
             offset > bytes.len() || bytes.len() - offset < 4 ==> result.is_none(),
     {
-        let Some(end) = offset.checked_add(4) else {
-            return None;
-        };
+        let end = offset.checked_add(4)?;
         if end > bytes.len() {
             return None;
         }
