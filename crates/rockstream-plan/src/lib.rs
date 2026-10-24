@@ -374,6 +374,7 @@ pub enum OuterJoinKind {
     Full,
     Semi,
     Anti,
+    NullAwareAnti,
 }
 
 /// Join semantics metadata for specialized join handling (v0.8 — IVM-4).

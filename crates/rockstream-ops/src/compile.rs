@@ -662,9 +662,10 @@ fn transfer_predicate(shape: &mut JoinShape, predicate: &Expr) -> bool {
             right.is_some() && right_is_raw,
         ),
         JoinKind::Outer(op) => match op.kind() {
-            OuterJoinKind::Left | OuterJoinKind::Semi | OuterJoinKind::Anti => {
-                (left.is_some() && left_is_raw, false)
-            }
+            OuterJoinKind::Left
+            | OuterJoinKind::Semi
+            | OuterJoinKind::Anti
+            | OuterJoinKind::NullAwareAnti => (left.is_some() && left_is_raw, false),
             OuterJoinKind::Right => (false, right.is_some() && right_is_raw),
             OuterJoinKind::Full => (false, false),
         },

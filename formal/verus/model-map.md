@@ -63,8 +63,11 @@ VS7-03 covers the shared PgWire frame reader in the vendored production codec.
 |---|---|---|
 | `crates/rockstream-verified/src/pgwire_framing.rs::{read_length,frame_span}` | A successful length read stays within received bytes; a complete frame has checked start/end offsets within the buffer; incomplete frames report zero consumption. | `pgwire::messages::codec::decode_packet` advances only for `COMPLETE`, isolates the body, and leaves trailing frames intact. Message-specific field validity and socket delivery are adapter responsibilities. |
 
-VS7 covers exchange reservation ownership and local release accounting.
+VS7-01 covers exchange reservation ownership and local release accounting.
+
+VS7-02 covers the physical commit owner's local transition after a storage result.
 
 | Production code | Verus contract | Caller obligation |
 |---|---|---|
 | `crates/rockstream-verified/src/ownership.rs::{same_owner,release_accounting}` | A release changes local counters only for its owning channel instance; global bytes and request charges fall once, with exact residual charges when the inputs are valid. | `FlowController` keeps the channel lock over admission, handoff, release, and teardown; each live `FlowPermit` retains its unique `Arc` owner token and releases once. Delivered channel keys are retired after teardown because wire ACKs carry no generation. Tokio scheduling and transport delivery remain outside this local proof. |
+| `crates/rockstream-verified/src/physical_commit.rs::{begin_owner,finish_transition}` | Pending or uncertain work enters one flight; only durable completion releases retained epoch/byte/operation charges, advances a monotone frontier, and permits ACK. Failed and unknown outcomes retain charges without ACK. | `PhysicalCommitGroup` owns the drained entries, passes the actual storage outcome, and applies the executable kernel before replying. LFS subprocess tests qualify selected crash cuts; backend durability and Tokio scheduling remain outside the proof. |

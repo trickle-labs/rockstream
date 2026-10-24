@@ -9,6 +9,7 @@ pub mod laws;
 pub mod ownership;
 pub mod persistence;
 pub mod pgwire_framing;
+pub mod physical_commit;
 pub mod routing;
 pub mod zset;
 
@@ -16,7 +17,8 @@ pub mod zset;
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        aggregate, codecs, frontier, keys, ownership, persistence, pgwire_framing, routing, zset,
+        aggregate, codecs, frontier, keys, ownership, persistence, pgwire_framing,
+        physical_commit, routing, zset,
     };
 
     #[test]
@@ -250,6 +252,79 @@ mod tests {
         assert_eq!(
             pgwire_framing::frame_span(7, 1, Some(-1)),
             (pgwire_framing::INVALID, 0, 0)
+        );
+    }
+
+    #[test]
+    fn physical_commit_kernel_conserves_retained_work_and_ack_boundary() {
+        assert_eq!(
+            physical_commit::begin_owner(true, false, false),
+            Some(physical_commit::FLIGHT_PENDING)
+        );
+        assert_eq!(
+            physical_commit::begin_owner(true, true, false),
+            Some(physical_commit::FLIGHT_UNCERTAIN)
+        );
+        assert_eq!(physical_commit::begin_owner(true, false, true), None);
+        assert_eq!(
+            physical_commit::finish_transition(
+                physical_commit::FLIGHT_PENDING,
+                physical_commit::DURABLE,
+                2,
+                1,
+                9,
+                4,
+                2,
+                1,
+                Some(1),
+                2
+            ),
+            Some((physical_commit::COMMITTED, 1, 5, 1, Some(2), true))
+        );
+        assert_eq!(
+            physical_commit::finish_transition(
+                physical_commit::FLIGHT_PENDING,
+                physical_commit::WRITE_FAILED,
+                2,
+                1,
+                9,
+                4,
+                2,
+                1,
+                Some(1),
+                2
+            ),
+            Some((physical_commit::PENDING, 2, 9, 2, Some(1), false))
+        );
+        assert_eq!(
+            physical_commit::finish_transition(
+                physical_commit::FLIGHT_UNCERTAIN,
+                physical_commit::OUTCOME_UNKNOWN,
+                2,
+                1,
+                9,
+                4,
+                2,
+                1,
+                Some(1),
+                2
+            ),
+            Some((physical_commit::UNCERTAIN, 2, 9, 2, Some(1), false))
+        );
+        assert_eq!(
+            physical_commit::finish_transition(
+                physical_commit::FLIGHT_PENDING,
+                physical_commit::DURABLE,
+                2,
+                1,
+                9,
+                4,
+                2,
+                1,
+                Some(3),
+                2
+            ),
+            None
         );
     }
 

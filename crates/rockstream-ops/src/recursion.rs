@@ -486,7 +486,7 @@ fn eval_plan(plan: &PlanNode, bindings: &HashMap<String, Relation>) -> Result<Re
                     OuterJoinKind::Semi if matched => {
                         *out.entry(left_row.clone()).or_insert(0) += *left_weight;
                     }
-                    OuterJoinKind::Anti if !matched => {
+                    OuterJoinKind::Anti | OuterJoinKind::NullAwareAnti if !matched => {
                         *out.entry(left_row.clone()).or_insert(0) += *left_weight;
                     }
                     _ => {}

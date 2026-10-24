@@ -11956,7 +11956,7 @@ impl GatewayHandler {
                 )]);
             }
             return Ok(vec![promote_response(Response::Execution(
-                Tag::new("DELETE 0").with_rows(0),
+                Tag::new("DELETE").with_rows(0),
             ))]);
         }
 
@@ -12011,7 +12011,7 @@ impl GatewayHandler {
 
         let count = captured_rows.len();
         Ok(vec![promote_response(Response::Execution(
-            Tag::new(&format!("DELETE {count}")).with_rows(count),
+            Tag::new("DELETE").with_rows(count),
         ))])
     }
 

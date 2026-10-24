@@ -61,7 +61,10 @@ fn output_schema(kind: OuterJoinKind, left: &Schema, right: &Schema) -> SchemaRe
             )
         })
         .collect::<Vec<_>>();
-    if !matches!(kind, OuterJoinKind::Semi | OuterJoinKind::Anti) {
+    if !matches!(
+        kind,
+        OuterJoinKind::Semi | OuterJoinKind::Anti | OuterJoinKind::NullAwareAnti
+    ) {
         fields.extend(right.fields().iter().enumerate().map(|(i, field)| {
             Field::new(
                 format!("r_{i}"),
@@ -95,6 +98,7 @@ struct ArrRow {
 struct StagedDelta {
     rows: Vec<(Vec<u8>, u128, Vec<u8>, i64)>,
     staged_bytes: u64,
+    null_weight: i64,
 }
 
 type OuterJoinRows = (Vec<Vec<Option<i64>>>, Vec<Vec<Option<i64>>>, Vec<i64>);
@@ -115,6 +119,10 @@ struct OuterJoinState {
     right_arr: HashMap<Vec<u8>, HashMap<u128, ArrRow>>,
     /// Per-key total net right-side weight (for Left/Full/Semi/Anti tracking).
     right_key_weight: HashMap<Vec<u8>, i64>,
+    /// Total net weight of right rows with a NULL in any join key.
+    right_null_weight: i64,
+    /// Total net weight on the right, needed for NULL NOT IN an empty relation.
+    right_total_weight: i64,
     /// Per-key total net left-side weight (for Right/Full tracking).
     left_key_weight: HashMap<Vec<u8>, i64>,
     state_bytes: u64,
@@ -241,6 +249,7 @@ pub struct OuterJoinOp {
     dirty_right: Mutex<HashSet<(Vec<u8>, u128)>>,
     dirty_rw: Mutex<HashSet<Vec<u8>>>,
     dirty_lw: Mutex<HashSet<Vec<u8>>>,
+    dirty_null_weight: Mutex<bool>,
 }
 
 impl OuterJoinOp {
@@ -277,6 +286,7 @@ impl OuterJoinOp {
             dirty_right: Mutex::new(HashSet::new()),
             dirty_rw: Mutex::new(HashSet::new()),
             dirty_lw: Mutex::new(HashSet::new()),
+            dirty_null_weight: Mutex::new(false),
         }
     }
 
@@ -389,6 +399,7 @@ impl OuterJoinOp {
             OuterJoinKind::Full => self.process_epoch_full(left, right),
             OuterJoinKind::Semi => self.process_epoch_semi(left, right),
             OuterJoinKind::Anti => self.process_epoch_anti(left, right),
+            OuterJoinKind::NullAwareAnti => self.process_epoch_null_aware_anti(left, right),
         }
     }
 
@@ -427,6 +438,9 @@ impl OuterJoinOp {
                 capsule_key
             };
             staged.push(join_key, row_id, row_bytes, w);
+            if is_null {
+                staged.null_weight += w;
+            }
         }
         Ok(())
     }
@@ -1043,6 +1057,128 @@ impl OuterJoinOp {
         concat_zsets(outputs, out_schema)
     }
 
+    fn process_epoch_null_aware_anti(
+        &self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
+
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
+        let delta_rw: HashMap<Vec<u8>, i64> = {
+            let staged = self.right_staged.lock().unwrap();
+            let mut map = HashMap::new();
+            for (join_key, _, _, weight) in &staged.rows {
+                *map.entry(join_key.clone()).or_insert(0) += weight;
+            }
+            map
+        };
+        let null_delta = self.right_staged.lock().unwrap().null_weight;
+        let total_delta: i64 = delta_rw.values().sum();
+        let mut output_rows = vec![Vec::new(); self.left_n_cols];
+        let mut output_weights = Vec::new();
+
+        {
+            let state = self.state.lock().unwrap();
+            let old_null = state.right_null_weight > 0;
+            let new_null = state.right_null_weight + null_delta > 0;
+            let old_empty = state.right_total_weight == 0;
+            let new_empty = state.right_total_weight + total_delta == 0;
+
+            if old_null != new_null || old_empty != new_empty {
+                for (key, rows) in &state.left_arr {
+                    let old_matches = state.right_key_weight.get(key).copied().unwrap_or(0);
+                    let new_matches = old_matches + delta_rw.get(key).copied().unwrap_or(0);
+                    for row in rows.values() {
+                        let values = Self::deserialize_row(&row.row_bytes, self.left_n_cols)?;
+                        let has_null_key = self
+                            .left_key_cols
+                            .iter()
+                            .any(|column| values[*column].is_none());
+                        let was_visible = if has_null_key {
+                            old_empty
+                        } else {
+                            !old_null && old_matches == 0
+                        };
+                        let now_visible = if has_null_key {
+                            new_empty
+                        } else {
+                            !new_null && new_matches == 0
+                        };
+                        if was_visible != now_visible {
+                            for (column, value) in values.iter().enumerate() {
+                                output_rows[column].push(*value);
+                            }
+                            output_weights.push(
+                                row.weight * (i64::from(now_visible) - i64::from(was_visible)),
+                            );
+                        }
+                    }
+                }
+            } else if !old_null {
+                for (key, delta) in &delta_rw {
+                    let old_matches = state.right_key_weight.get(key).copied().unwrap_or(0);
+                    let new_matches = old_matches + delta;
+                    if (old_matches == 0) != (new_matches == 0) {
+                        let sign = if old_matches == 0 { -1 } else { 1 };
+                        for (row_bytes, weight) in state.probe_left(key) {
+                            let values = Self::deserialize_row(row_bytes, self.left_n_cols)?;
+                            let has_null_key = self
+                                .left_key_cols
+                                .iter()
+                                .any(|column| values[*column].is_none());
+                            if has_null_key {
+                                continue;
+                            }
+                            for (column, value) in values.iter().enumerate() {
+                                output_rows[column].push(*value);
+                            }
+                            output_weights.push(sign * weight);
+                        }
+                    }
+                }
+            }
+
+            if !new_null {
+                let staged_left = self.left_staged.lock().unwrap();
+                for (key, _, row_bytes, weight) in &staged_left.rows {
+                    let values = Self::deserialize_row(row_bytes, self.left_n_cols)?;
+                    let has_null_key = self
+                        .left_key_cols
+                        .iter()
+                        .any(|column| values[*column].is_none());
+                    if has_null_key && !new_empty {
+                        continue;
+                    }
+                    let matches = state.right_key_weight.get(key).copied().unwrap_or(0)
+                        + delta_rw.get(key).copied().unwrap_or(0);
+                    if has_null_key || (!new_null && matches == 0) {
+                        for (column, value) in values.iter().enumerate() {
+                            output_rows[column].push(*value);
+                        }
+                        output_weights.push(*weight);
+                    }
+                }
+            }
+        }
+
+        let outputs = if output_weights.is_empty() {
+            Vec::new()
+        } else {
+            vec![ArrowZSet::new(
+                Self::make_semi_batch(&output_rows, &out_schema)?,
+                output_weights,
+            )]
+        };
+        self.commit_staged(&delta_rw, None);
+        concat_zsets(outputs, out_schema)
+    }
+
     // ─── Inner join helper ────────────────────────────────────────────────────
 
     /// Compute the inner join contribution: ΔL⋈R₀ + L₀⋈ΔR + ΔL⋈ΔR.
@@ -1140,7 +1276,24 @@ impl OuterJoinOp {
         }
 
         left_s.staged_bytes = 0;
+        let null_delta = right_s.null_weight;
+        right_s.null_weight = 0;
         right_s.staged_bytes = 0;
+
+        if self.kind == OuterJoinKind::NullAwareAnti {
+            let total_delta: i64 = delta_rw.values().sum();
+            let old_bytes = u64::from(state.right_total_weight > 0) * 16;
+            state.right_total_weight += total_delta;
+            state.right_null_weight += null_delta;
+            let new_bytes = u64::from(state.right_total_weight > 0) * 16;
+            state.state_bytes = state
+                .state_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(new_bytes);
+            if total_delta != 0 || null_delta != 0 {
+                *self.dirty_null_weight.lock().unwrap() = true;
+            }
+        }
 
         // Update right_key_weight.
         for (key, delta) in delta_rw {
@@ -1223,6 +1376,7 @@ impl OuterJoinOp {
             let mut dirty_right = self.dirty_right.lock().unwrap();
             let mut dirty_rw = self.dirty_rw.lock().unwrap();
             let mut dirty_lw = self.dirty_lw.lock().unwrap();
+            let mut dirty_null_weight = self.dirty_null_weight.lock().unwrap();
 
             // Left arrangement (same key format as JoinOp).
             for (join_key, row_id) in dirty_left.drain() {
@@ -1285,6 +1439,18 @@ impl OuterJoinOp {
                     } else {
                         batch.delete(&storage_key);
                     }
+                } else {
+                    batch.delete(&storage_key);
+                }
+            }
+
+            if std::mem::take(&mut *dirty_null_weight) {
+                let mut storage_key = vec![0x01, 0x4F, 0x4E];
+                storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
+                if state.right_total_weight > 0 {
+                    let mut value = state.right_total_weight.to_be_bytes().to_vec();
+                    value.extend_from_slice(&state.right_null_weight.to_be_bytes());
+                    batch.put(&storage_key, &value);
                 } else {
                     batch.delete(&storage_key);
                 }
@@ -1381,6 +1547,20 @@ impl OuterJoinOp {
             }
         }
 
+        if kind == OuterJoinKind::NullAwareAnti {
+            let mut null_weight_key = vec![0x01, 0x4F, 0x4E];
+            null_weight_key.extend_from_slice(&op_id.0.to_be_bytes());
+            if let Some(value) = db.get(&null_weight_key).await.map_err(OpError::storage)? {
+                if value.len() >= 16 {
+                    st.right_total_weight =
+                        i64::from_be_bytes(value[..8].try_into().unwrap_or([0; 8]));
+                    st.right_null_weight =
+                        i64::from_be_bytes(value[8..16].try_into().unwrap_or([0; 8]));
+                    st.state_bytes += u64::from(st.right_total_weight > 0) * 16;
+                }
+            }
+        }
+
         Ok(OuterJoinOp {
             op_id,
             kind,
@@ -1395,6 +1575,7 @@ impl OuterJoinOp {
             dirty_right: Mutex::new(HashSet::new()),
             dirty_rw: Mutex::new(HashSet::new()),
             dirty_lw: Mutex::new(HashSet::new()),
+            dirty_null_weight: Mutex::new(false),
         })
     }
 
