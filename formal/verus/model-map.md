@@ -57,6 +57,12 @@ do not establish refinement of SlateDB or ObjectStore implementations.
 | `crates/rockstream-verified/src/persistence.rs::{replay_decision,recovery_scan_status,recovery_is_ready}` | Replay and bounded scan return exact outcomes, with cancellation before corruption before quota before completion/continuation; readiness requires complete restored state. | Storage scans continue with progress, reject incomplete metadata, and recover the highest valid committed record. |
 | `crates/rockstream-verified/src/persistence.rs::compaction_is_eligible` | Reclamation requires both reader and replay horizons and excludes retained snapshots/in-flight deltas. | Arrangement/catalog adapters supply the real horizons and storage-specific snapshot/lease evidence. |
 
+VS7-03 covers the shared PgWire frame reader in the vendored production codec.
+
+| Production code | Verus contract | Caller obligation |
+|---|---|---|
+| `crates/rockstream-verified/src/pgwire_framing.rs::{read_length,frame_span}` | A successful length read stays within received bytes; a complete frame has checked start/end offsets within the buffer; incomplete frames report zero consumption. | `pgwire::messages::codec::decode_packet` advances only for `COMPLETE`, isolates the body, and leaves trailing frames intact. Message-specific field validity and socket delivery are adapter responsibilities. |
+
 VS7 covers exchange reservation ownership and local release accounting.
 
 | Production code | Verus contract | Caller obligation |

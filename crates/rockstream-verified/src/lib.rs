@@ -8,13 +8,16 @@ pub mod keys;
 pub mod laws;
 pub mod ownership;
 pub mod persistence;
+pub mod pgwire_framing;
 pub mod routing;
 pub mod zset;
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{aggregate, codecs, frontier, keys, ownership, persistence, routing, zset};
+    use super::{
+        aggregate, codecs, frontier, keys, ownership, persistence, pgwire_framing, routing, zset,
+    };
 
     #[test]
     fn fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths() {
@@ -219,6 +222,35 @@ mod tests {
         assert!(!persistence::compaction_is_eligible(10, 8, 9, true, false));
         assert!(persistence::recovery_is_ready(true, true, true, true));
         assert!(!persistence::recovery_is_ready(true, true, false, true));
+    }
+
+    #[test]
+    fn pgwire_framing_kernel_keeps_incomplete_input_and_bounds_complete_frames() {
+        assert_eq!(
+            pgwire_framing::read_length(&[b'Q', 0, 0, 0, 6, b'x', 0], 1),
+            Some(6)
+        );
+        assert_eq!(pgwire_framing::read_length(&[b'Q', 0, 0, 0], 1), None);
+        assert_eq!(
+            pgwire_framing::frame_span(7, 1, Some(6)),
+            (pgwire_framing::COMPLETE, 5, 7)
+        );
+        assert_eq!(
+            pgwire_framing::frame_span(6, 1, Some(6)),
+            (pgwire_framing::INCOMPLETE, 0, 0)
+        );
+        assert_eq!(
+            pgwire_framing::frame_span(4, 1, None),
+            (pgwire_framing::INCOMPLETE, 0, 0)
+        );
+        assert_eq!(
+            pgwire_framing::frame_span(7, 1, Some(3)),
+            (pgwire_framing::INVALID, 0, 0)
+        );
+        assert_eq!(
+            pgwire_framing::frame_span(7, 1, Some(-1)),
+            (pgwire_framing::INVALID, 0, 0)
+        );
     }
 
     #[test]

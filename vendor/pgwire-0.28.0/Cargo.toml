@@ -16,6 +16,7 @@ readme = "README.md"
 rust-version = "1.75"
 
 [dependencies]
+rockstream-verified = { path = "../../crates/rockstream-verified" }
 derive-new = "0.7"
 bytes = "1.1.0"
 thiserror = "2"

@@ -1,0 +1,57 @@
+name: PgWire PR Fuzz
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "vendor/pgwire-0.28.0/**"
+      - "crates/rockstream-gateway/**"
+      - "crates/rockstream-verified/src/pgwire_framing.rs"
+      - "fuzz/Cargo.toml"
+      - "fuzz/fuzz_targets/fuzz_pgwire_decoder.rs"
+      - "fuzz/corpus/fuzz_pgwire_decoder/**"
+      - "scripts/run-fuzz.py"
+      - ".github/workflows/fuzz-pgwire-pr.yml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: nightly-2026-02-01
+
+jobs:
+  pgwire-decoder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_INCREMENTAL: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-01
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target/fuzz
+          cache-all-crates: true
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.1 --locked
+      - name: Build the instrumented PgWire decoder
+        run: cargo fuzz build fuzz_pgwire_decoder --dev --target-dir target/fuzz
+      - name: Run bounded raw and structured decoder mutations
+        run: python3 scripts/run-fuzz.py --target fuzz_pgwire_decoder --seconds 20 --bin-dir target/fuzz/x86_64-unknown-linux-gnu/debug
+      - name: Retain corpus, minimized failures, and replay metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-pgwire-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/fuzz-results/
+            fuzz/corpus/fuzz_pgwire_decoder/
+          retention-days: 90
+          if-no-files-found: error

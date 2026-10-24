@@ -1,6 +1,7 @@
 use std::str;
 
 use bytes::{Buf, BufMut, BytesMut};
+use rockstream_verified::pgwire_framing;
 
 use crate::error::{PgWireError, PgWireResult};
 
@@ -50,19 +51,12 @@ pub(crate) fn put_option_cstring(buf: &mut BytesMut, input: &Option<String>) {
 }
 
 /// Try to read message length from buf, without actually move the cursor
-pub(crate) fn get_length(buf: &BytesMut, offset: usize) -> Option<usize> {
-    if buf.remaining() >= 4 + offset {
-        Some((&buf[offset..4 + offset]).get_i32() as usize)
-    } else {
-        None
-    }
+pub(crate) fn get_length(buf: &BytesMut, offset: usize) -> Option<i32> {
+    pgwire_framing::read_length(buf.as_ref(), offset)
 }
 
 /// Check if message_length matches and move the cursor to right position then
 /// call the `decode_fn` for the body
-/// Maximum encoded packet length including the 4-byte length field.
-const MAX_PACKET_BYTES: usize = 64 * 1024 * 1024;
-
 /// Parse a complete, bounded message body. Invalid lengths and fields must
 /// fail closed without consuming another frame from the stream.
 pub(crate) fn decode_packet<T, F>(
@@ -73,27 +67,26 @@ pub(crate) fn decode_packet<T, F>(
 where
     F: Fn(&mut BytesMut, usize) -> PgWireResult<T>,
 {
-    if let Some(msg_len) = get_length(buf, offset) {
-        if !(4..=MAX_PACKET_BYTES).contains(&msg_len) {
-            return Err(PgWireError::InvalidMessageLength(msg_len));
+    let raw_length = get_length(buf, offset);
+    let (status, body_start, end) = pgwire_framing::frame_span(buf.remaining(), offset, raw_length);
+    if status == pgwire_framing::INVALID {
+        return Err(PgWireError::InvalidMessageLength(
+            raw_length.unwrap() as usize
+        ));
+    }
+    if status == pgwire_framing::COMPLETE {
+        buf.advance(body_start);
+        let mut body = buf.split_to(end - body_start);
+        // Defensive isolation for the legacy 0.28 message decoders.
+        // Framing checks are necessary even when panic=abort is enabled.
+        let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_fn(&mut body, end - offset)
+        }))
+        .map_err(|_| PgWireError::InvalidMessageBody)??;
+        if body.has_remaining() {
+            return Err(PgWireError::InvalidMessageBody);
         }
-        let total = msg_len
-            .checked_add(offset)
-            .ok_or(PgWireError::InvalidMessageLength(msg_len))?;
-        if buf.remaining() >= total {
-            buf.advance(offset + 4);
-            let mut body = buf.split_to(msg_len - 4);
-            // Defensive isolation for the legacy 0.28 message decoders.
-            // Framing checks are necessary even when panic=abort is enabled.
-            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                decode_fn(&mut body, msg_len)
-            }))
-            .map_err(|_| PgWireError::InvalidMessageBody)??;
-            if body.has_remaining() {
-                return Err(PgWireError::InvalidMessageBody);
-            }
-            return Ok(Some(decoded));
-        }
+        return Ok(Some(decoded));
     }
     Ok(None)
 }
@@ -128,30 +121,6 @@ mod frame_regressions {
     }
 
     #[test]
-    fn malformed_parse_requires_both_cstrings_and_exact_oid_payload() {
-        // The longer scheduled fuzz minimized another abort-on-panic to
-        // 50 00 00 00 04: Parse with a zero-byte body.
-        for input in [
-            &b"P\x00\x00\x00\x04"[..],
-            &b"P\x00\x00\x00\x05\x00"[..],
-            &b"P\x00\x00\x00\x06\x00\x00"[..],
-            &b"P\x00\x00\x00\x08\x00\x00\x00\x01"[..],
-            &b"P\x00\x00\x00\x0a\x00\x00\x00\x01\x00\x00"[..],
-        ] {
-            let mut input = BytesMut::from(input);
-            assert!(
-                PgWireFrontendMessage::decode(&mut input).is_err(),
-                "incomplete Parse frame must fail without panicking"
-            );
-        }
-        let mut valid = BytesMut::from(&b"P\x00\x00\x00\x08\x00\x00\x00\x00"[..]);
-        assert!(matches!(
-            PgWireFrontendMessage::decode(&mut valid),
-            Ok(Some(PgWireFrontendMessage::Parse(_)))
-        ));
-    }
-
-    #[test]
     fn malformed_execute_without_portal_name_and_row_count_fails_closed() {
         // The scheduled 2026-10-22 fuzz run minimized a second panic to this
         // five-byte Execute message with an empty body.
@@ -180,6 +149,192 @@ mod frame_regressions {
             PgWireFrontendMessage::decode(&mut bytes),
             Ok(Some(PgWireFrontendMessage::CopyData(_)))
         ));
+    }
+    #[test]
+    fn malformed_parse_requires_both_cstrings_and_exact_oid_payload() {
+        // The longer scheduled fuzz minimized another abort-on-panic to
+        // 50 00 00 00 04: Parse with a zero-byte body.
+        for input in [
+            &b"P\x00\x00\x00\x04"[..],
+            &b"P\x00\x00\x00\x05\x00"[..],
+            &b"P\x00\x00\x00\x06\x00\x00"[..],
+            &b"P\x00\x00\x00\x08\x00\x00\x00\x01"[..],
+            &b"P\x00\x00\x00\x0a\x00\x00\x00\x01\x00\x00"[..],
+        ] {
+            let mut input = BytesMut::from(input);
+            assert!(
+                PgWireFrontendMessage::decode(&mut input).is_err(),
+                "incomplete Parse frame must fail without panicking"
+            );
+        }
+        let mut valid = BytesMut::from(&b"P\x00\x00\x00\x08\x00\x00\x00\x00"[..]);
+        assert!(matches!(
+            PgWireFrontendMessage::decode(&mut valid),
+            Ok(Some(PgWireFrontendMessage::Parse(_)))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod framing_properties {
+    use super::*;
+    use crate::messages::{
+        extendedquery::{Bind, Execute, Parse},
+        simplequery::Query,
+        startup::Startup,
+        Message, PgWireFrontendMessage,
+    };
+    use bytes::Bytes;
+
+    fn decode_startup(buf: &mut BytesMut) -> PgWireResult<Option<String>> {
+        Startup::decode(buf).map(|message| message.map(|message| format!("{message:?}")))
+    }
+
+    fn decode_frontend(buf: &mut BytesMut) -> PgWireResult<Option<String>> {
+        PgWireFrontendMessage::decode(buf)
+            .map(|message| message.map(|message| format!("{message:?}")))
+    }
+
+    fn canonical_frames() -> Vec<(
+        &'static str,
+        BytesMut,
+        String,
+        fn(&mut BytesMut) -> PgWireResult<Option<String>>,
+    )> {
+        let mut startup = Startup::new();
+        startup.parameters.insert("user".into(), "alice".into());
+        startup.parameters.insert("database".into(), "db".into());
+        let mut bytes = BytesMut::new();
+        startup.encode(&mut bytes).unwrap();
+        let mut cases = vec![(
+            "Startup",
+            bytes,
+            format!("{startup:?}"),
+            decode_startup as fn(&mut BytesMut) -> PgWireResult<Option<String>>,
+        )];
+        for (name, message) in [
+            (
+                "Query",
+                PgWireFrontendMessage::Query(Query::new("SELECT 1".into())),
+            ),
+            (
+                "Parse",
+                PgWireFrontendMessage::Parse(Parse::new(
+                    Some("stmt".into()),
+                    "SELECT $1".into(),
+                    vec![23],
+                )),
+            ),
+            (
+                "Bind",
+                PgWireFrontendMessage::Bind(Bind::new(
+                    Some("portal".into()),
+                    Some("stmt".into()),
+                    vec![0],
+                    vec![Some(Bytes::from_static(b"7")), None],
+                    vec![0],
+                )),
+            ),
+            (
+                "Execute",
+                PgWireFrontendMessage::Execute(Execute::new(Some("portal".into()), 10)),
+            ),
+        ] {
+            let mut bytes = BytesMut::new();
+            message.encode(&mut bytes).unwrap();
+            cases.push((name, bytes, format!("{message:?}"), decode_frontend));
+        }
+        cases
+    }
+
+    #[test]
+    fn every_valid_frame_split_preserves_bytes_then_consumes_only_its_frame() {
+        let mut following = BytesMut::new();
+        let next = PgWireFrontendMessage::Query(Query::new("SELECT 2".into()));
+        next.encode(&mut following).unwrap();
+        for (name, frame, expected, decode) in canonical_frames() {
+            for split in 0..frame.len() {
+                let mut input = BytesMut::from(&frame[..split]);
+                let before = input.clone();
+                assert_eq!(decode(&mut input).unwrap(), None, "{name} split {split}");
+                assert_eq!(
+                    input, before,
+                    "{name} split {split} consumed incomplete input"
+                );
+                input.extend_from_slice(&frame[split..]);
+                input.extend_from_slice(&following);
+                assert_eq!(
+                    decode(&mut input).unwrap(),
+                    Some(expected.clone()),
+                    "{name} split {split}"
+                );
+                assert_eq!(
+                    input, following,
+                    "{name} split {split} consumed the next frame"
+                );
+                assert_eq!(
+                    decode_frontend(&mut input).unwrap(),
+                    Some(format!("{next:?}")),
+                    "{name} split {split}"
+                );
+                assert!(input.is_empty(), "{name} split {split} left bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_lengths_fail_without_consumption_and_complete_bad_bodies_leave_next_frame() {
+        let mut following = BytesMut::new();
+        PgWireFrontendMessage::Query(Query::new("SELECT 2".into()))
+            .encode(&mut following)
+            .unwrap();
+        for (name, frame, _, decode) in canonical_frames() {
+            let offset = usize::from(name != "Startup");
+            for length in [0i32, 3, -1, pgwire_framing::MAX_PACKET_BYTES as i32 + 1] {
+                let mut input = frame.clone();
+                input[offset..offset + 4].copy_from_slice(&length.to_be_bytes());
+                let before = input.clone();
+                assert_eq!(
+                    decode(&mut input).unwrap_err().to_string(),
+                    format!(
+                        "Invalid PostgreSQL protocol message length: {}",
+                        length as usize
+                    ),
+                    "{name} length {length}"
+                );
+                assert_eq!(input, before, "{name} invalid length consumed bytes");
+            }
+        }
+
+        let mut cases = canonical_frames();
+        for (name, mut frame, _, decode) in cases.drain(..) {
+            match name {
+                "Startup" | "Query" => *frame.last_mut().unwrap() = b'x',
+                "Parse" => {
+                    let count = frame.len() - 6;
+                    frame[count..count + 2].copy_from_slice(&2u16.to_be_bytes());
+                }
+                "Bind" => {
+                    let count = frame.len() - 4;
+                    frame[count..count + 2].copy_from_slice(&2u16.to_be_bytes());
+                }
+                "Execute" => {
+                    let name_end = 5 + frame[5..].iter().position(|byte| *byte == 0).unwrap();
+                    frame[name_end] = b'x';
+                }
+                _ => unreachable!(),
+            }
+            frame.extend_from_slice(&following);
+            assert_eq!(
+                decode(&mut frame).unwrap_err().to_string(),
+                "Invalid or truncated PostgreSQL protocol message body",
+                "{name}"
+            );
+            assert_eq!(
+                frame, following,
+                "{name} malformed body consumed the next frame"
+            );
+        }
     }
 }
 

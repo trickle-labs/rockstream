@@ -118,6 +118,10 @@ class FuzzRunnerTests(unittest.TestCase):
                     "fuzz_control_worker_decoder", "fuzz_raft_rpc_decoder",
                     "fuzz_kafka_payload_decoder", "fuzz_oidc_jwt_decoder"]
         self.assertEqual(runner.registered_targets(self.root), expected)
+        self.assertEqual(runner.selected_targets(expected, None), expected)
+        self.assertEqual(runner.selected_targets(expected, "fuzz_pgwire_decoder"), ["fuzz_pgwire_decoder"])
+        with self.assertRaisesRegex(ValueError, "^unregistered fuzz target: missing$"):
+            runner.selected_targets(expected, "missing")
         manifest = self.root / "fuzz/Cargo.toml"
         original = manifest.read_text()
         manifest.write_text(original.replace('name = "fuzz_sql_parser"', 'name = "missing_sql_parser"'))
