@@ -76,6 +76,7 @@ struct TestGates {
     before_write: Option<Arc<TestGate>>,
     after_write: Option<Arc<TestGate>>,
     after_flush: Option<Arc<TestGate>>,
+    fail_after_flush: bool,
 }
 
 #[cfg(test)]
@@ -585,6 +586,18 @@ async fn persist(flight: &Flight) -> Outcome {
                 #[cfg(test)]
                 if let Some(gate) = gate {
                     gate.pause().await;
+                }
+                #[cfg(test)]
+                if flight
+                    .owner
+                    .test_gates
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|gates| gates.fail_after_flush)
+                {
+                    return Outcome::FlushUnknown(
+                        "test injected completion error after durable flush".to_owned(),
+                    );
                 }
                 return Outcome::Durable;
             }
@@ -1244,6 +1257,10 @@ mod boundary_tests {
                 "before_write" => gates.before_write = Some(gate.clone()),
                 "after_write" => gates.after_write = Some(gate.clone()),
                 "after_flush" => gates.after_flush = Some(gate.clone()),
+                "after_flush_error" => {
+                    gates.after_flush = Some(gate.clone());
+                    gates.fail_after_flush = true;
+                }
                 _ => panic!("unexpected crash mode: {mode}"),
             }
             group.inner.test_gates.lock().replace(gates);
@@ -1256,6 +1273,8 @@ mod boundary_tests {
         batch.delete(b"b");
         batch.put(b"c", b"insert");
         batch.merge(b"sum", &MergeOperatorRegistry::encode_sum(7));
+        let batch_bytes = batch.byte_size();
+        let batch_operations = batch.len();
         group.add_epoch(2, batch).unwrap();
         let flushing = {
             let group = group.clone();
@@ -1273,6 +1292,53 @@ mod boundary_tests {
             assert!(flushing.await.unwrap().is_err());
             assert_eq!(group.fill().pending_epochs, 1);
             publish_transcript(&transcript, b"pre-operation-error");
+        } else if mode == "after_flush_error" {
+            tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+                .await
+                .unwrap();
+            let mut later = WriteBatch::new();
+            later.put(b"later", b"must-not-commit");
+            let later_bytes = later.byte_size();
+            let later_operations = later.len();
+            group.add_epoch(3, later).unwrap();
+            assert!(!flushing.is_finished());
+            assert_eq!(group.last_committed(), 1);
+            assert_eq!(
+                group.fill(),
+                PhysicalCommitFill {
+                    pending_epochs: 1,
+                    retained_epochs: 2,
+                    retained_bytes: batch_bytes + later_bytes,
+                    retained_operations: batch_operations + later_operations,
+                    active_waiters: 1,
+                    in_flight: true,
+                    retry_required: false,
+                    outcome_unknown: false,
+                    max_bytes: MAX_GROUP_COMMIT_PENDING_BYTES,
+                    max_epochs: PHYSICAL_COMMIT_GROUP_MAX_EPOCHS,
+                    max_waiters: MAX_GROUP_COMMIT_WAITERS,
+                }
+            );
+            gate.proceed.notify_one();
+            assert!(flushing.await.unwrap().is_err());
+            let fill = group.fill();
+            assert_eq!(
+                fill,
+                PhysicalCommitFill {
+                    pending_epochs: 1,
+                    retained_epochs: 2,
+                    retained_bytes: batch_bytes + later_bytes,
+                    retained_operations: batch_operations + later_operations,
+                    active_waiters: 0,
+                    in_flight: false,
+                    retry_required: true,
+                    outcome_unknown: true,
+                    max_bytes: MAX_GROUP_COMMIT_PENDING_BYTES,
+                    max_epochs: PHYSICAL_COMMIT_GROUP_MAX_EPOCHS,
+                    max_waiters: MAX_GROUP_COMMIT_WAITERS,
+                }
+            );
+            publish_transcript(&transcript, b"post-flush-error");
         } else {
             tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
                 .await
@@ -1296,6 +1362,7 @@ mod boundary_tests {
             "before_write",
             "after_write",
             "after_flush",
+            "after_flush_error",
             "graceful",
             "pre_operation_error",
         ] {
@@ -1336,7 +1403,7 @@ mod boundary_tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let observed = std::fs::read(&transcript).unwrap();
-            if mode == "graceful" || mode == "pre_operation_error" {
+            if mode == "graceful" || mode == "pre_operation_error" || mode == "after_flush_error" {
                 assert!(child.wait().unwrap().success(), "{mode}: child failed");
             } else {
                 assert_eq!(observed, b"before-ack", "{mode}: ack preceded the cut");
@@ -1400,6 +1467,10 @@ mod boundary_tests {
                 }
                 "graceful" => {
                     assert_eq!(observed, b"ack:2");
+                    assert_eq!(actual, committed);
+                }
+                "after_flush_error" => {
+                    assert_eq!(observed, b"post-flush-error");
                     assert_eq!(actual, committed);
                 }
                 "after_write" => {
