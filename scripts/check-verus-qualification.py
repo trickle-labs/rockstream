@@ -34,7 +34,7 @@ def add(errors: list[str], message: str) -> None:
 
 
 def check_files(root: Path, data: dict, errors: list[str]) -> None:
-    for key in ("plan", "manifest", "sign_off", "maintenance", "runner", "recorder"):
+    for key in ("plan", "manifest", "sign_off", "maintenance", "runner", "mutation_runner", "recorder"):
         relative = data.get(key)
         if not isinstance(relative, str) or not relative:
             add(errors, f"qualification.{key} must name a file")
@@ -166,7 +166,7 @@ def check_budgets(root: Path, data: dict, errors: list[str]) -> None:
         add(errors, "VS6 runtime tolerances must be frozen")
 
 
-def check_mutations(root: Path, data: dict, errors: list[str]) -> None:
+def check_mutations(root: Path, data: dict, errors: list[str], claims: dict[str, str]) -> None:
     mutations = data.get("mutations")
     if not isinstance(mutations, list):
         add(errors, "mutations must be an array")
@@ -202,6 +202,41 @@ def check_mutations(root: Path, data: dict, errors: list[str]) -> None:
     }
     for kind in sorted(required_kinds - actual_kinds):
         add(errors, f"required mutation kind is missing: {kind}")
+
+    production = data.get("production_mutations")
+    if not isinstance(production, list) or len(production) != 6:
+        add(errors, "exactly six production mutations are required")
+        return
+    production_ids: set[str] = set()
+    production_kinds: set[str] = set()
+    for mutation in production:
+        mutation_id = mutation.get("id") if isinstance(mutation, dict) else None
+        if not isinstance(mutation_id, str) or not mutation_id:
+            add(errors, "every production mutation needs an id")
+            continue
+        if mutation_id in production_ids:
+            add(errors, f"duplicate production mutation: {mutation_id}")
+        production_ids.add(mutation_id)
+        if mutation.get("required") is not True or mutation.get("expected") != "verifier-error":
+            add(errors, f"{mutation_id} must require a verifier error")
+        if mutation.get("claim") not in claims:
+            add(errors, f"{mutation_id} references unknown claim")
+        production_kinds.add(mutation.get("kind"))
+        target = mutation.get("target")
+        before, after = mutation.get("before"), mutation.get("after")
+        if not isinstance(target, str) or "::" not in target:
+            add(errors, f"{mutation_id} has no production target")
+            continue
+        path, symbol = target.split("::", 1)
+        source = root / path
+        if not source.is_file() or not isinstance(before, str) or not isinstance(after, str):
+            add(errors, f"{mutation_id} has no exact source mutation")
+        elif before == after or source.read_text().count(before) != 1 or f"fn {symbol}(" not in source.read_text():
+            add(errors, f"{mutation_id} source mutation does not uniquely match {target}")
+    if production_ids != {f"PM{i:02d}" for i in range(1, 7)}:
+        add(errors, "production mutation IDs are incomplete")
+    if not {"unsafe-acceptance", "incorrect-result", "erroneous-rejection"}.issubset(production_kinds):
+        add(errors, "production mutations omit an outcome class")
 
 
 def check_maintenance(root: Path, data: dict, errors: list[str]) -> None:
@@ -249,7 +284,7 @@ def main() -> int:
     check_claim_evidence(root, data, errors, claims)
     check_builds(data, errors)
     check_budgets(root, data, errors)
-    check_mutations(root, data, errors)
+    check_mutations(root, data, errors, claims)
     if not errors:
         check_maintenance(root, data, errors)
     if errors:
@@ -258,7 +293,8 @@ def main() -> int:
         return 1
     print(
         f"verus qualification: {len(claims)} claims classified; "
-        f"{len(data['builds'])} builds and {len(data['mutations'])} mutation controls registered."
+        f"{len(data['builds'])} builds, {len(data['mutations'])} smoke/policy controls, "
+        f"and {len(data['production_mutations'])} production mutations registered."
     )
     return 0
 

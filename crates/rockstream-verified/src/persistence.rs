@@ -19,8 +19,8 @@ verus! {
     // verus-claim: VS5-02
     pub fn next_epoch(current_epoch: u64) -> (result: Option<u64>)
         ensures
-            result.is_some() ==> result.unwrap() > current_epoch,
-            current_epoch == u64::MAX ==> result.is_none(),
+            result.is_some() <==> current_epoch < u64::MAX,
+            result.is_some() ==> result.unwrap() as int == current_epoch as int + 1,
     {
         current_epoch.checked_add(1)
     }
@@ -28,9 +28,13 @@ verus! {
     // verus-claim: VS5-01
     pub fn commit_outcome(write_succeeded: bool, flush_succeeded: bool) -> (result: u8)
         ensures
-            result == COMMIT_COMMITTED ==> write_succeeded && flush_succeeded,
-            result == COMMIT_UNKNOWN ==> write_succeeded && !flush_succeeded,
-            result == COMMIT_FAILED ==> !write_succeeded,
+            result == (if !write_succeeded {
+                COMMIT_FAILED
+            } else if flush_succeeded {
+                COMMIT_COMMITTED
+            } else {
+                COMMIT_UNKNOWN
+            }),
     {
         if !write_succeeded {
             COMMIT_FAILED
@@ -50,9 +54,9 @@ verus! {
         duplicate: bool,
     ) -> (result: bool)
         ensures
-            result ==> authority_valid && !duplicate && candidate_epoch > current_epoch,
-            (!authority_valid || duplicate || candidate_epoch <= current_epoch)
-                ==> !result,
+            result == (authority_valid && !duplicate && candidate_epoch > current_epoch
+                && (!require_consecutive
+                    || candidate_epoch as int == current_epoch as int + 1)),
     {
         if !authority_valid || duplicate || candidate_epoch <= current_epoch {
             false
@@ -95,11 +99,15 @@ verus! {
         duplicate: bool,
     ) -> (result: u8)
         ensures
-            result == REPLAY_APPLY ==> state == COMMIT_COMMITTED
-                && identity_matches && scope_matches && !duplicate,
-            result == REPLAY_NOOP ==> state == COMMIT_COMMITTED
-                && identity_matches && scope_matches && duplicate,
-            result == REPLAY_UNKNOWN ==> state == COMMIT_UNKNOWN,
+            result == (if state == COMMIT_UNKNOWN {
+                REPLAY_UNKNOWN
+            } else if state != COMMIT_COMMITTED || !identity_matches || !scope_matches {
+                REPLAY_REJECT
+            } else if duplicate {
+                REPLAY_NOOP
+            } else {
+                REPLAY_APPLY
+            }),
     {
         if state == COMMIT_UNKNOWN {
             REPLAY_UNKNOWN
@@ -122,14 +130,21 @@ verus! {
         corrupt: bool,
     ) -> (result: u8)
         ensures
-            cancelled ==> result == SCAN_CANCELLED,
-            !cancelled && corrupt ==> result == SCAN_CORRUPT,
-            !cancelled
-                && !corrupt
-                && cursor <= total_rows
-                && (requested_page_size == 0 || max_page_size == 0)
-                ==> result == SCAN_QUOTA,
-            !cancelled && !corrupt && cursor > total_rows ==> result == SCAN_CORRUPT,
+            result == (if cancelled {
+                SCAN_CANCELLED
+            } else if corrupt || cursor > total_rows {
+                SCAN_CORRUPT
+            } else if requested_page_size == 0 || max_page_size == 0 {
+                SCAN_QUOTA
+            } else if cursor as int + (if requested_page_size < max_page_size {
+                requested_page_size as int
+            } else {
+                max_page_size as int
+            }) >= total_rows as int {
+                SCAN_COMPLETE
+            } else {
+                SCAN_MORE
+            }),
     {
         if cancelled {
             SCAN_CANCELLED
