@@ -30,3 +30,7 @@ membership, but remains the patched Cargo dependency.
 ## 2026-10-22 follow-up
 
 Scheduled main fuzz [39720408746](https://github.com/trickle-labs/rockstream/actions/runs/39720408746) minimized a distinct `Execute` panic to `45 00 00 00 04` (a frame with no body); this is not the earlier `CopyData` length-zero bug. `Execute::decode_body` now checks for the required portal-name NUL and four-byte row count before calling `get_i32`, avoiding abort-on-panic in fuzzer builds. Added short-message and valid-boundary regression; full CI and scheduled fuzz verification remain required.
+
+## 2026-10-23 follow-up
+
+Long-duration scheduled main decoder fuzz run [39898746096](https://github.com/trickle-labs/rockstream/actions/runs/39898746096) reproduced a third truncated-message panic, minimized to hex `50 00 00 00 04` (`Parse` with no body). This affects the existing pinned decoder where `Parse::decode_body` unconditionally reads OID count and OID values. The narrow correction checks both NUL-terminated strings, the two-byte OID count, and the exact array byte length before any unchecked `Buf` getter; it includes minimized-input and valid-message regressions. The prior CopyData and Execute corrections remain in force. Verify with the same strict fuzz engine and full required CI on this exact head; a PR-only green result is not sufficient evidence that every malformed frontend message is safe.

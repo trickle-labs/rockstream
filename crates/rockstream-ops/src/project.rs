@@ -79,7 +79,12 @@ impl ProjectOp {
             })
             .collect();
         let schema = Arc::new(Schema::new(fields));
-        let new_data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
+        let new_data = RecordBatch::try_new_with_options(
+            schema,
+            cols,
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(input.num_rows())),
+        )
+        .map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(new_data, input.weights))
     }
 }
@@ -158,5 +163,15 @@ mod tests {
         let out = op.apply(input).unwrap();
         assert!(out.is_empty());
         assert_eq!(out.schema().field(0).name(), "a");
+    }
+
+    #[test]
+    fn zero_column_projection_keeps_rows_for_count_star() {
+        let mut input = ArrowZSet::from_ab_rows(&[(1, 3), (2, 6)], 1);
+        input.weights = vec![1, -1];
+        let out = ProjectOp::new(vec![]).apply(input).unwrap();
+        assert_eq!(out.data.num_columns(), 0);
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(out.weights, vec![1, -1]);
     }
 }
