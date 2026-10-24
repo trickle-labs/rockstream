@@ -222,11 +222,7 @@ mod copy_data_regressions {
 
     #[test]
     fn copy_data_rejects_bad_lengths_before_splitting() {
-        for (len, contents) in [
-            (0usize, &b"abc"[..]),
-            (3, &b"abc"[..]),
-            (5, &b""[..]),
-        ] {
+        for (len, contents) in [(0usize, &b"abc"[..]), (3, &b"abc"[..]), (5, &b""[..])] {
             let mut body = BytesMut::from(contents);
             let before = body.clone();
             assert!(matches!(
