@@ -472,6 +472,68 @@ mod tests {
             let events = both(&mut gateway, &mut reference, sql, None).await;
             assert_rows(&events, vec![row(&[Some(count)])], "SELECT 1", b'I', false);
         }
+
+        for sql in [
+            "CREATE TABLE t_notin_left (id BIGINT)",
+            "CREATE TABLE t_notin_right (id BIGINT)",
+            "INSERT INTO t_notin_left VALUES (1), (2), (NULL)",
+            "INSERT INTO t_notin_right VALUES (1)",
+        ] {
+            both(&mut gateway, &mut reference, sql, None).await;
+        }
+        let not_in = "SELECT id FROM t_notin_left WHERE id NOT IN (SELECT id FROM t_notin_right) ORDER BY id";
+        let not_exists = "SELECT id FROM t_notin_left WHERE NOT EXISTS (SELECT 1 FROM t_notin_right WHERE t_notin_right.id = t_notin_left.id) ORDER BY id";
+        let events = both(&mut gateway, &mut reference, not_in, None).await;
+        assert_rows(&events, vec![row(&[Some("2")])], "SELECT 1", b'I', false);
+        let events = both(&mut gateway, &mut reference, not_exists, None).await;
+        assert_rows(
+            &events,
+            vec![row(&[Some("2")]), row(&[None])],
+            "SELECT 2",
+            b'I',
+            false,
+        );
+        both(
+            &mut gateway,
+            &mut reference,
+            "INSERT INTO t_notin_right VALUES (NULL)",
+            None,
+        )
+        .await;
+        let events = both(&mut gateway, &mut reference, not_in, None).await;
+        assert_rows(&events, vec![], "SELECT 0", b'I', false);
+        let events = both(&mut gateway, &mut reference, not_exists, None).await;
+        assert_rows(
+            &events,
+            vec![row(&[Some("2")]), row(&[None])],
+            "SELECT 2",
+            b'I',
+            false,
+        );
+        both(
+            &mut gateway,
+            &mut reference,
+            "DELETE FROM t_notin_right WHERE id IS NULL",
+            None,
+        )
+        .await;
+        let events = both(&mut gateway, &mut reference, not_in, None).await;
+        assert_rows(&events, vec![row(&[Some("2")])], "SELECT 1", b'I', false);
+        both(
+            &mut gateway,
+            &mut reference,
+            "DELETE FROM t_notin_right",
+            None,
+        )
+        .await;
+        let events = both(&mut gateway, &mut reference, not_in, None).await;
+        assert_rows(
+            &events,
+            vec![row(&[Some("1")]), row(&[Some("2")]), row(&[None])],
+            "SELECT 3",
+            b'I',
+            false,
+        );
         handle.abort();
     }
 

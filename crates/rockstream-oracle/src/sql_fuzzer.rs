@@ -1602,7 +1602,7 @@ mod tests {
             "SELECT category, COUNT(val) FROM t1 GROUP BY category",
             "SELECT category, COUNT(*) FROM t1 GROUP BY category",
             "SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id",
-            "SELECT id FROM t1 WHERE id NOT IN (SELECT id FROM t2 WHERE id > -100)",
+            "SELECT id FROM t1 WHERE id NOT IN (SELECT id FROM t2)",
             "SELECT id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)",
         ] {
             let report = run_case_with_deltas(
@@ -1625,6 +1625,38 @@ mod tests {
                 "sql={sql}"
             );
             assert_eq!(report.operation_history, history);
+        }
+
+        let null_right = [None, Some(0), Some(4)];
+        let not_in_initial = pair(&[negative], &[right_match], 1);
+        let insert_null = pair(&[], &[null_right], 1);
+        let remove_null = pair(&[], &[null_right], -1);
+        for sql in [
+            "SELECT id FROM t1 WHERE id NOT IN (SELECT id FROM t2)",
+            "SELECT id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)",
+        ] {
+            let report = run_case_with_deltas(
+                sql,
+                seed + 1,
+                not_in_initial.clone(),
+                vec![
+                    ("insert_right_null", insert_null.clone()),
+                    ("remove_right_null", remove_null.clone()),
+                ],
+                vec![
+                    "snapshot: left -1, right 1".into(),
+                    "insert right NULL".into(),
+                    "remove right NULL".into(),
+                ],
+            )
+            .await;
+            assert_eq!(
+                report.outcome,
+                OracleCaseOutcome::Compared {
+                    epochs: vec!["snapshot", "insert_right_null", "remove_right_null"],
+                },
+                "sql={sql}"
+            );
         }
 
         let empty = pair(&[], &[], 1);
