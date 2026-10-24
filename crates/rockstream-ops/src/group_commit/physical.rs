@@ -650,6 +650,10 @@ fn finish(mut flight: Flight, outcome: Outcome) {
             *epochs.last().expect("physical flight has an epoch"),
         )
         .expect("M1-S8: physical commit transition must conserve retained work and frontier");
+    assert!(
+        frontier >= state.last_committed,
+        "M1-S8: physical commit frontier cannot move backward"
+    );
     state.retained_epochs = retained_epochs;
     state.retained_bytes = retained_bytes;
     state.retained_operations = retained_operations;
