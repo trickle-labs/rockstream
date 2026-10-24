@@ -954,9 +954,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
-version = "1.11.1"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 dependencies = [
  "serde",
 ]
@@ -4472,7 +4472,7 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -5114,7 +5114,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-cli"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5154,7 +5154,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-connectors"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5186,7 +5186,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-control"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5234,7 +5234,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-diff"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "rockstream-plan",
  "rockstream-types",
@@ -5244,7 +5244,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-docgen"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "chrono",
  "clap",
@@ -5266,7 +5266,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-fuzz"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -5282,7 +5282,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-gateway"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5341,7 +5341,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-management-proto"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "prost 0.13.5",
  "protoc-bin-vendored",
@@ -5352,7 +5352,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-ops"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5392,7 +5392,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-oracle"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5430,7 +5430,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-plan"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "rockstream-types",
  "rockstream-verified",
@@ -5440,7 +5440,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-runtime"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -5492,7 +5492,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sim"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5531,7 +5531,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sql"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5566,7 +5566,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-storage"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5600,7 +5600,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-test-support"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "arrow",
  "datafusion",
@@ -5620,7 +5620,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-types"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "antichain",
  "arrow",
@@ -5644,7 +5644,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-verified"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "vstd",
 ]
@@ -6631,9 +6631,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",

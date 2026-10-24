@@ -377,3 +377,68 @@ fn export_restore_uses_no_slatedb_range_deletion() {
     assert!(!production.contains("delete_range"));
     assert!(!production.contains("range_delete"));
 }
+
+#[tokio::test]
+async fn cli_prefix_export_rejects_missing_committed_shard_objects_before_success() {
+    use futures::StreamExt;
+    use object_store::memory::InMemory;
+    use rockstream_control::CheckpointExportError;
+
+    // Use a real checkpointed shard, unlike the older zero-shard CLI fixture.
+    let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let destination: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let checkpoint = seed_checkpoint(source.clone(), 37).await;
+    assert_eq!(checkpoint.shards.len(), 1);
+
+    // Keep the durable cluster control manifest, but lose its shard storage
+    // before the CLI's export_latest_prefix inventory begins.
+    let shard_prefix = Path::from("shards/0");
+    let mut objects = source.list(Some(&shard_prefix));
+    let mut deleted = Vec::new();
+    while let Some(entry) = objects.next().await {
+        deleted.push(entry.unwrap().location);
+    }
+    assert!(
+        !deleted.is_empty(),
+        "the fixture must contain actual shard data"
+    );
+    drop(objects);
+    for path in deleted {
+        source.delete(&path).await.unwrap();
+    }
+    let manifests = CheckpointManifestStore::new(source.clone());
+    assert_eq!(
+        manifests.load_latest_manifest().await.unwrap(),
+        Some(checkpoint)
+    );
+
+    // Same service method used by StorageClient::export_checkpoint, not the
+    // separate checkpoint-aware management export_prefix path.
+    let failure = CheckpointExportService::new()
+        .export_latest_prefix(
+            source,
+            destination.clone(),
+            &manifests,
+            "missing-shard-preinventory",
+            &Path::from(""),
+        )
+        .await;
+    match failure {
+        Err(CheckpointExportError::Integrity(message)) => {
+            assert!(
+                message.contains("shard") || message.contains("SlateDB"),
+                "unexpected checkpoint-integrity diagnostic: {message}"
+            );
+        }
+        other => panic!("missing committed shard storage must not export SUCCESS: {other:?}"),
+    }
+
+    assert!(matches!(
+        destination
+            .head(&Path::from(
+                "checkpoint-exports/missing-shard-preinventory/commit"
+            ))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}

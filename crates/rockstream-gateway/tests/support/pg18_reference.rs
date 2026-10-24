@@ -141,10 +141,20 @@ mod tests {
         if actual == reference {
             return true;
         }
+        if ["nonnull_count", "total_count"].contains(&reference.name.as_str()) {
+            return reference.table_id == 0
+                && reference.column_id == 0
+                && reference.type_id == 20
+                && reference.type_size == 8
+                && reference.type_modifier == -1
+                && reference.format_code == 0
+                && *actual == FieldDescription::new(reference.name.clone(), 0, 0, 20, 0, 0, 0);
+        }
         // Bound the gateway's missing origin/size/typmod metadata to these corpus columns.
         let (column, size, modifier) = match (reference.name.as_str(), reference.type_id) {
             ("id", 23) => (1, 4, -1),
             ("id", 20) => (1, 8, -1),
+            ("val", 20) => (2, 8, -1),
             ("amount", 1700) => (2, -1, (18 << 16) + 4 + 4),
             ("category", 25) => (2, -1, -1),
             _ => return false,
@@ -410,6 +420,58 @@ mod tests {
             b'I',
             false,
         );
+        let events = both(
+            &mut gateway,
+            &mut reference,
+            "CREATE TABLE t_edge (id BIGINT, val BIGINT)",
+            None,
+        )
+        .await;
+        assert_eq!(
+            events,
+            vec![Event::Command("CREATE TABLE".into()), Event::Ready(b'I')]
+        );
+        let select_edge = "SELECT id, val FROM t_edge ORDER BY id";
+        let events = both(&mut gateway, &mut reference, select_edge, None).await;
+        assert_rows(&events, vec![], "SELECT 0", b'I', false);
+        for sql in [
+            "SELECT COUNT(val) AS nonnull_count FROM t_edge",
+            "SELECT COUNT(*) AS total_count FROM t_edge",
+        ] {
+            let events = both(&mut gateway, &mut reference, sql, None).await;
+            assert_rows(&events, vec![row(&[Some("0")])], "SELECT 1", b'I', false);
+        }
+        let events = both(
+            &mut gateway,
+            &mut reference,
+            "INSERT INTO t_edge VALUES (-1, -2), (0, 0), (1, NULL), (1, NULL)",
+            None,
+        )
+        .await;
+        assert_eq!(
+            events,
+            vec![Event::Command("INSERT 0 4".into()), Event::Ready(b'I')]
+        );
+        let events = both(&mut gateway, &mut reference, select_edge, None).await;
+        assert_rows(
+            &events,
+            vec![
+                row(&[Some("-1"), Some("-2")]),
+                row(&[Some("0"), Some("0")]),
+                row(&[Some("1"), None]),
+                row(&[Some("1"), None]),
+            ],
+            "SELECT 4",
+            b'I',
+            false,
+        );
+        for (sql, count) in [
+            ("SELECT COUNT(val) AS nonnull_count FROM t_edge", "2"),
+            ("SELECT COUNT(*) AS total_count FROM t_edge", "4"),
+        ] {
+            let events = both(&mut gateway, &mut reference, sql, None).await;
+            assert_rows(&events, vec![row(&[Some(count)])], "SELECT 1", b'I', false);
+        }
         handle.abort();
     }
 
@@ -447,6 +509,15 @@ mod tests {
                 "unexpected allowance for metadata field {field}"
             );
         }
+        let count_reference = FieldDescription::new("nonnull_count".into(), 0, 0, 20, 8, -1, 0);
+        let count_gateway = FieldDescription::new("nonnull_count".into(), 0, 0, 20, 0, 0, 0);
+        assert!(field_matches(&count_gateway, &count_reference));
+        let mut wrong_type = FieldDescription::new("nonnull_count".into(), 0, 0, 20, 0, 0, 0);
+        wrong_type.type_id = 23;
+        assert!(!field_matches(&wrong_type, &count_reference));
+        let mut wrong_reference = FieldDescription::new("nonnull_count".into(), 0, 0, 20, 8, -1, 0);
+        wrong_reference.format_code = 1;
+        assert!(!field_matches(&count_gateway, &wrong_reference));
     }
 
     #[test]

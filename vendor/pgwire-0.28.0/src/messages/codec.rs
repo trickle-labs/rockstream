@@ -150,6 +150,29 @@ mod frame_regressions {
             Ok(Some(PgWireFrontendMessage::CopyData(_)))
         ));
     }
+    #[test]
+    fn malformed_parse_requires_both_cstrings_and_exact_oid_payload() {
+        // The longer scheduled fuzz minimized another abort-on-panic to
+        // 50 00 00 00 04: Parse with a zero-byte body.
+        for input in [
+            &b"P\x00\x00\x00\x04"[..],
+            &b"P\x00\x00\x00\x05\x00"[..],
+            &b"P\x00\x00\x00\x06\x00\x00"[..],
+            &b"P\x00\x00\x00\x08\x00\x00\x00\x01"[..],
+            &b"P\x00\x00\x00\x0a\x00\x00\x00\x01\x00\x00"[..],
+        ] {
+            let mut input = BytesMut::from(input);
+            assert!(
+                PgWireFrontendMessage::decode(&mut input).is_err(),
+                "incomplete Parse frame must fail without panicking"
+            );
+        }
+        let mut valid = BytesMut::from(&b"P\x00\x00\x00\x08\x00\x00\x00\x00"[..]);
+        assert!(matches!(
+            PgWireFrontendMessage::decode(&mut valid),
+            Ok(Some(PgWireFrontendMessage::Parse(_)))
+        ));
+    }
 }
 
 #[cfg(test)]
