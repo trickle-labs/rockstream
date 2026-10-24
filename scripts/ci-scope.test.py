@@ -36,6 +36,30 @@ def needs_for(lane):
 
 
 class ScopeTests(unittest.TestCase):
+    def test_matrices_reject_every_unexpected_result(self):
+        for command, job, label in (
+            ("check-benchmarks", "benchmark-suites", "Benchmark suites"),
+            ("check-verus", "verus-qualify", "Verus phases"),
+        ):
+            for lane, expected in (("full", "success"), ("prose", "skipped")):
+                classification = needs_for(lane)["ci-policy"]
+                for result in ("success", "skipped", "failure", "cancelled", "", None):
+                    needs = {"ci-policy": classification, job: {"result": result}}
+                    with self.subTest(lane=lane, result=result):
+                        if result == expected:
+                            self.assertEqual(self.run_main(command, {"CI_NEEDS": json.dumps(needs)}),
+                                             (0, f"{label} passed ({lane} CI); excluded jobs are not execution evidence.\n", ""))
+                        else:
+                            self.assertEqual(self.run_main(command, {"CI_NEEDS": json.dumps(needs)}),
+                                             (1, "", f"::error::{job}: unexpected result {result!r} for {lane} CI\n"))
+                valid = {"ci-policy": classification, job: {"result": expected}}
+                for needs in ({"ci-policy": classification}, {**valid, "extra": {"result": "success"}}):
+                    self.assertEqual(self.run_main(command, {"CI_NEEDS": json.dumps(needs)}),
+                                     (1, "", "::error::CI dependency set differs from the required jobs\n"))
+                valid["ci-policy"] = {"result": "cancelled", "outputs": classification["outputs"]}
+                self.assertEqual(self.run_main(command, {"CI_NEEDS": json.dumps(valid)}),
+                                 (1, "", "::error::CI classification did not succeed with a valid scope\n"))
+
     def run_main(self, command, env):
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", [str(SCRIPT), command]):

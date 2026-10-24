@@ -59,7 +59,7 @@ cp "$ROOT/crates/rockstream-storage/src/keys.rs" "$TMP_ROOT/crates/rockstream-st
 
 bash "$CHECKER" "$ROOT" >/dev/null || fail "real qualification contract did not pass"
 
-expected="verus qualification: 31 claims classified; 6 builds and 7 mutation controls registered."
+expected="verus qualification: 32 claims classified; 6 builds and 7 mutation controls registered."
 actual="$(bash "$CHECKER" "$ROOT")"
 [[ "$actual" == "$expected" ]] || fail "positive checker output changed: $actual"
 
@@ -185,6 +185,9 @@ printf '    ;;\n' >> "$SHIM_BIN/cp"
 printf 'esac\n' >> "$SHIM_BIN/cp"
 chmod +x "$SHIM_BIN/cp"
 
+# Exercise legacy all-phase artifact failure cases independent of CI's split phase.
+export VERUS_QUALIFICATION_PHASE=all
+
 # Case A — stale destination
 CASE_A_OUT="$TMP_ROOT/case-a-out"
 mkdir -p "$CASE_A_OUT"
@@ -305,4 +308,51 @@ sys.exit(0)
 ' "$CASE_C_OUT/qualification.json" "$CASE_C_OUT" || fail "Case C: recorded digests do not match staged files"
 
 echo "OK: VS6 qualification runner enforces atomic fail-closed artifact staging."
+
+# Each phase must contain exactly its own commands and binary, never a full claim.
+for phase in debug release; do
+  phase_out="$TMP_ROOT/phases/$phase"
+  mkdir -p "$phase_out"
+  PATH="$SHIM_BIN:$PATH" MOCK_CP_MODE=normal VERUS_QUALIFICATION_PHASE="$phase" \
+    VERUS_QUALIFICATION_OUTPUT="$phase_out" VERUS_QUALIFICATION_TARGET=x86_64-unknown-linux-gnu \
+    bash "$ROOT/scripts/run-verus-qualification.sh" >"$phase_out/run.log" 2>&1 || \
+    fail "qualification phase $phase failed: $(<"$phase_out/run.log")"
+  [[ ! -f "$phase_out/qualification.json" ]] || fail "partial phase emitted full qualification"
+done
+PATH="$SHIM_BIN:$PATH" python3 "$ROOT/scripts/record-verus-qualification.py" \
+  --root "$ROOT" --run-id parallel-test --status passed --merge "$TMP_ROOT/phases" \
+  --target x86_64-unknown-linux-gnu --output "$TMP_ROOT/complete/qualification.json" >/dev/null
+python3 -c '
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+records = {phase: json.loads((root / "phases" / phase / "phase.json").read_text()) for phase in ("debug", "release")}
+commands = [
+    "env RUSTUP_TOOLCHAIN=1.98.1 cargo verus verify -p rockstream-verified --locked --target x86_64-unknown-linux-gnu",
+    "env CARGO_INCREMENTAL=1 RUSTUP_TOOLCHAIN=1.98.1 cargo verus verify -p rockstream-verified --locked --target x86_64-unknown-linux-gnu",
+    "env RUSTUP_TOOLCHAIN=1.88 CARGO_PROFILE_DEV_DEBUG=0 cargo build --workspace --locked --target x86_64-unknown-linux-gnu",
+    "env RUSTUP_TOOLCHAIN=1.88 cargo check --workspace --locked --target x86_64-unknown-linux-gnu",
+    "env RUSTUP_TOOLCHAIN=1.88 cargo check --workspace --all-features --locked --target x86_64-unknown-linux-gnu",
+    "env RUSTUP_TOOLCHAIN=1.88 cargo build --workspace --locked --release --target x86_64-unknown-linux-gnu",
+]
+for phase, expected in (("debug", commands[:5]), ("release", commands[5:])):
+    assert records[phase]["phase"] == phase
+    assert [step.split("\t", 3)[3] for step in records[phase]["steps"]] == expected
+    assert list(records[phase]["runtime_artifacts"]) == ["rockstream-" + phase]
+complete = json.loads((root / "complete/qualification.json").read_text())
+assert complete["phase"] == "all" and complete["status"] == "passed"
+assert complete["tool_versions"] == records["debug"]["tool_versions"]
+assert complete["phase_tool_versions"] == {phase: record["tool_versions"] for phase, record in records.items()}
+assert complete["steps"] == records["debug"]["steps"] + records["release"]["steps"]
+assert complete["runtime_artifacts"] == {**records["debug"]["runtime_artifacts"], **records["release"]["runtime_artifacts"]}
+' "$TMP_ROOT" || fail "parallel phase evidence differs from the full qualification commands"
+python3 -c 'import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); d=json.loads(p.read_text()); d["status"]="failed"; p.write_text(json.dumps(d))' \
+  "$TMP_ROOT/phases/release/phase.json"
+expect_failure "$TMP_ROOT/merge-failed.log" python3 "$ROOT/scripts/record-verus-qualification.py" \
+  --root "$ROOT" --run-id parallel-test --status passed --merge "$TMP_ROOT/phases" \
+  --target x86_64-unknown-linux-gnu --output "$TMP_ROOT/complete/qualification.json"
+[[ "$(<"$TMP_ROOT/merge-failed.log")" == "RS-0906: incomplete qualification: release: qualification identity or status mismatch" ]] || \
+  fail "phase rejection output changed: $(<"$TMP_ROOT/merge-failed.log")"
+[[ ! -f "$TMP_ROOT/complete/qualification.json" ]] || fail "failed merge retained stale passing qualification"
+python3 -B "$ROOT/scripts/record-verus-qualification.test.py"
+echo "OK: VS6 parallel phases assemble only complete source-bound evidence."
 

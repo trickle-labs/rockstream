@@ -11,10 +11,11 @@ verus! {
         reported_epoch: u64,
     ) -> (result: Option<u64>)
         ensures
-            result.is_some() ==> active && generation_matches && incarnation_matches,
-            result.is_some() ==> result.unwrap() >= current_epoch,
-            !active || !generation_matches || !incarnation_matches || version != 1
-                ==> result.is_none(),
+            result == if version == 1 && active && generation_matches && incarnation_matches {
+                Some(if reported_epoch > current_epoch { reported_epoch } else { current_epoch })
+            } else {
+                None
+            },
     {
         if version != 1 || !active || !generation_matches || !incarnation_matches {
             None
@@ -56,7 +57,7 @@ verus! {
 
     // verus-claim: VS4-02
     pub fn fixed_membership_transition(current_epoch: u64, reported_epoch: u64) -> (result: u64)
-        ensures result >= current_epoch,
+        ensures result == (if reported_epoch > current_epoch { reported_epoch } else { current_epoch }),
     {
         if reported_epoch > current_epoch {
             reported_epoch

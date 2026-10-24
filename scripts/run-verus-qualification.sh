@@ -12,10 +12,14 @@ TARGET_ARGS=()
 if [ -n "$QUALIFY_TARGET" ]; then
   TARGET_ARGS=(--target "$QUALIFY_TARGET")
 fi
+PHASE="${VERUS_QUALIFICATION_PHASE:-all}"
+case "$PHASE" in all|debug|release) ;; *) echo "invalid qualification phase: $PHASE" >&2; exit 1 ;; esac
 OVERALL=0
 DEBUG_STAGE_ROOT="$(mktemp -d)"
 trap 'rm -rf "$DEBUG_STAGE_ROOT"' EXIT
 mkdir -p "$OUTPUT_ROOT"
+rm -f "$OUTPUT_ROOT/qualification.json" "$OUTPUT_ROOT/phase.json"
+: > "$STEPS"
 
 QUALIFICATION_TOML="$ROOT/formal/verus/qualification.toml"
 COLD_VERIFICATION_BUDGET="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["budgets"]["cold_verification_seconds"])' "$QUALIFICATION_TOML")"
@@ -60,38 +64,43 @@ if ! command -v cargo-verus >/dev/null 2>&1 || ! command -v verus >/dev/null 2>&
   exit 127
 fi
 
-run_step verifier env RUSTUP_TOOLCHAIN="${VERUS_RUST_TOOLCHAIN:-1.98.1}" \
-  cargo verus verify -p rockstream-verified --locked "${TARGET_ARGS[@]}"
-run_step verifier-incremental env CARGO_INCREMENTAL=1 \
-  RUSTUP_TOOLCHAIN="${VERUS_RUST_TOOLCHAIN:-1.98.1}" \
-  cargo verus verify -p rockstream-verified --locked "${TARGET_ARGS[@]}"
-run_step cargo-debug env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" CARGO_PROFILE_DEV_DEBUG=0 \
-  cargo build --workspace --locked "${TARGET_ARGS[@]}"
-run_step cargo-check env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
-  cargo check --workspace --locked "${TARGET_ARGS[@]}"
-run_step cargo-all-features env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
-  cargo check --workspace --all-features --locked "${TARGET_ARGS[@]}"
-
-# CI runners have a bounded disk quota. Preserve the exact debug executable
-# before clearing its large incremental/rlib build tree. The release profile
-# compiles independently and needs the freed space; neither binary is forged.
 TARGET_SUFFIX=""
 if [ -n "$QUALIFY_TARGET" ]; then
   TARGET_SUFFIX="$QUALIFY_TARGET/"
 fi
-DEBUG_BINARY="$TARGET_ROOT/${TARGET_SUFFIX}debug/rockstream"
-if [ -f "$DEBUG_BINARY" ]; then
-  cp "$DEBUG_BINARY" "$DEBUG_STAGE_ROOT/rockstream" || OVERALL=1
-else
-  echo "verus qualification: RS-0906: debug runtime artifact was not produced" >&2
-  OVERALL=1
-fi
-if [ "$OVERALL" -eq 0 ]; then
-  rm -rf "$TARGET_ROOT/${TARGET_SUFFIX}debug"
+if [ "$PHASE" != release ]; then
+  run_step verifier env RUSTUP_TOOLCHAIN="${VERUS_RUST_TOOLCHAIN:-1.98.1}" \
+    cargo verus verify -p rockstream-verified --locked "${TARGET_ARGS[@]}"
+  run_step verifier-incremental env CARGO_INCREMENTAL=1 \
+    RUSTUP_TOOLCHAIN="${VERUS_RUST_TOOLCHAIN:-1.98.1}" \
+    cargo verus verify -p rockstream-verified --locked "${TARGET_ARGS[@]}"
+  run_step cargo-debug env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" CARGO_PROFILE_DEV_DEBUG=0 \
+    cargo build --workspace --locked "${TARGET_ARGS[@]}"
+  run_step cargo-check env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
+    cargo check --workspace --locked "${TARGET_ARGS[@]}"
+  run_step cargo-all-features env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
+    cargo check --workspace --all-features --locked "${TARGET_ARGS[@]}"
+
+  # CI runners have a bounded disk quota. Preserve the exact debug executable
+  # before clearing its large incremental/rlib build tree. The release profile
+  # compiles independently and needs the freed space; neither binary is forged.
+  DEBUG_BINARY="$TARGET_ROOT/${TARGET_SUFFIX}debug/rockstream"
+  if [ -f "$DEBUG_BINARY" ]; then
+    cp "$DEBUG_BINARY" "$DEBUG_STAGE_ROOT/rockstream" || OVERALL=1
+  else
+    echo "verus qualification: RS-0906: debug runtime artifact was not produced" >&2
+    OVERALL=1
+  fi
+  if [ "$OVERALL" -eq 0 ]; then
+    rm -rf "$TARGET_ROOT/${TARGET_SUFFIX}debug"
+  fi
+
 fi
 
-run_step cargo-release env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
-  cargo build --workspace --locked --release "${TARGET_ARGS[@]}"
+if [ "$PHASE" != debug ]; then
+  run_step cargo-release env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
+    cargo build --workspace --locked --release "${TARGET_ARGS[@]}"
+fi
 
 RUNTIME_ARTIFACT="$OUTPUT_ROOT/rockstream-release"
 DEBUG_ARTIFACT="$OUTPUT_ROOT/rockstream-debug"
@@ -129,18 +138,24 @@ stage_runtime_artifact() {
   return 0
 }
 
-stage_runtime_artifact "release" "$TARGET_ROOT/${TARGET_SUFFIX}release/rockstream" "$RUNTIME_ARTIFACT"
-stage_runtime_artifact "debug" "$DEBUG_STAGE_ROOT/rockstream" "$DEBUG_ARTIFACT"
+if [ "$PHASE" != debug ]; then
+  stage_runtime_artifact "release" "$TARGET_ROOT/${TARGET_SUFFIX}release/rockstream" "$RUNTIME_ARTIFACT"
+fi
+if [ "$PHASE" != release ]; then
+  stage_runtime_artifact "debug" "$DEBUG_STAGE_ROOT/rockstream" "$DEBUG_ARTIFACT"
+fi
 
 if [ "$OVERALL" -eq 0 ]; then
   STATUS=passed
 else
   STATUS=failed
 fi
+RECORD="$OUTPUT_ROOT/phase.json"
+if [ "$PHASE" = all ]; then RECORD="$OUTPUT_ROOT/qualification.json"; fi
 python3 "$ROOT/scripts/record-verus-qualification.py" \
   --root "$ROOT" --run-id "$RUN_ID" --status "$STATUS" \
-  --steps "$STEPS" --target "$QUALIFY_TARGET" \
+  --steps "$STEPS" --target "$QUALIFY_TARGET" --phase "$PHASE" \
   ${RUNTIME_ARGS[@]+"${RUNTIME_ARGS[@]}"} \
-  --output "$OUTPUT_ROOT/qualification.json" || OVERALL=1
+  --output "$RECORD" || OVERALL=1
 exit "$OVERALL"
 

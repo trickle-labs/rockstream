@@ -2,7 +2,8 @@ use crate::exchange::proto::ShuffleAck;
 use parking_lot::Mutex;
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::error_code::{RS_3006, RS_3024};
-use std::collections::HashMap;
+use rockstream_verified::ownership;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +17,8 @@ pub const DEFAULT_MAX_PENDING_REQUESTS: usize = 256;
 type CreditKey = (u64, u32, u32);
 
 struct ChannelCreditState {
+    owner: Arc<()>,
+    had_delivery: bool,
     available_rows: u32,
     max_rows: u32,
     rows_in_flight: u32,
@@ -27,6 +30,8 @@ struct ChannelCreditState {
 impl ChannelCreditState {
     fn new(max_rows: u32) -> Self {
         Self {
+            owner: Arc::new(()),
+            had_delivery: false,
             available_rows: max_rows,
             max_rows,
             rows_in_flight: 0,
@@ -34,6 +39,29 @@ impl ChannelCreditState {
             bytes_in_flight: 0,
             awaiting_ack: Vec::new(),
         }
+    }
+}
+
+/// One lock protects both live reservations and retired channel keys.
+/// A separate retired-key mutex added measurable overhead to the common
+/// credit-acquire/ACK path while providing no extra synchronization guarantee.
+#[derive(Default)]
+struct ChannelRegistry {
+    live: HashMap<CreditKey, ChannelCreditState>,
+    retired: HashSet<CreditKey>,
+}
+
+impl std::ops::Deref for ChannelRegistry {
+    type Target = HashMap<CreditKey, ChannelCreditState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.live
+    }
+}
+
+impl std::ops::DerefMut for ChannelRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.live
     }
 }
 
@@ -87,6 +115,7 @@ impl Drop for CreditWaiterSlot {
 pub struct FlowPermit {
     controller: FlowController,
     key: CreditKey,
+    owner: Arc<()>,
     batch_bytes: usize,
     row_count: u32,
     acquired_at: Instant,
@@ -108,7 +137,13 @@ impl FlowPermit {
     /// Transfer ownership to acknowledgement accounting before publishing the frame.
     pub(crate) fn handoff(mut self, epoch: u64, seq: u64) {
         let mut channels = self.controller.channels.lock();
-        if let Some(state) = channels.get_mut(&self.key) {
+        if let Some(state) = channels.get_mut(&self.key).filter(|state| {
+            ownership::same_owner(
+                Arc::as_ptr(&state.owner) as usize,
+                Arc::as_ptr(&self.owner) as usize,
+            )
+        }) {
+            state.had_delivery = true;
             state
                 .awaiting_ack
                 .push(((epoch, seq), (self.batch_bytes, self.row_count)));
@@ -127,8 +162,12 @@ impl FlowPermit {
     pub fn release(mut self) {
         if self.active {
             self.active = false;
-            self.controller
-                .release_batch_permit(self.key, self.batch_bytes, self.row_count);
+            self.controller.release_batch_permit(
+                self.key,
+                &self.owner,
+                self.batch_bytes,
+                self.row_count,
+            );
         }
     }
 }
@@ -137,8 +176,12 @@ impl Drop for FlowPermit {
     fn drop(&mut self) {
         if self.active {
             self.active = false;
-            self.controller
-                .release_batch_permit(self.key, self.batch_bytes, self.row_count);
+            self.controller.release_batch_permit(
+                self.key,
+                &self.owner,
+                self.batch_bytes,
+                self.row_count,
+            );
         }
     }
 }
@@ -157,7 +200,8 @@ pub struct FlowController {
     max_inflight_bytes: usize,
     max_batch_bytes: usize,
     max_pending_requests: usize,
-    channels: Arc<Mutex<HashMap<CreditKey, ChannelCreditState>>>,
+    // Delivered IDs remain retired until a wire-level generation can distinguish them.
+    channels: Arc<Mutex<ChannelRegistry>>,
     notifiers: Arc<Mutex<HashMap<CreditKey, ChannelNotifier>>>,
     aggregate_bytes: Arc<AtomicU64>,
     pending_requests: Arc<AtomicU64>,
@@ -188,7 +232,7 @@ impl FlowController {
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             max_pending_requests: DEFAULT_MAX_PENDING_REQUESTS,
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            channels: Arc::new(Mutex::new(ChannelRegistry::default())),
             notifiers: Arc::new(Mutex::new(HashMap::new())),
             aggregate_bytes: Arc::new(AtomicU64::new(0)),
             pending_requests: Arc::new(AtomicU64::new(0)),
@@ -220,7 +264,19 @@ impl FlowController {
     }
 
     pub fn set_row_budget(&self, row_budget: u32) {
-        self.row_budget.store(row_budget.max(1), Ordering::Relaxed);
+        let row_budget = row_budget.max(1);
+        let mut channels = self.channels.lock();
+        self.row_budget.store(row_budget, Ordering::Relaxed);
+        for state in channels.values_mut() {
+            state.max_rows = row_budget;
+            state.available_rows = row_budget.saturating_sub(state.rows_in_flight);
+        }
+        Self::update_credit_metrics(&channels);
+        drop(channels);
+        self.global_notify.notify_waiters();
+        for notifier in self.notifiers.lock().values() {
+            notifier.notify.notify_waiters();
+        }
     }
 
     pub fn row_budget(&self) -> u32 {
@@ -393,6 +449,11 @@ impl FlowController {
 
         let key = (exchange_id, src_shard, target_shard);
         let mut channels = self.channels.lock();
+        if channels.retired.contains(&key) {
+            return Err(format!(
+                "[{RS_3006}] exchange channel was retired; use a new exchange ID"
+            ));
+        }
 
         let cur_pending = self.pending_requests.load(Ordering::Relaxed) as usize;
         if cur_pending >= self.max_pending_requests {
@@ -433,6 +494,7 @@ impl FlowController {
         state.rows_in_flight = state.rows_in_flight.saturating_add(row_count);
         state.batches_in_flight += 1;
         state.bytes_in_flight += batch_bytes;
+        let owner = state.owner.clone();
 
         let new_bytes = self
             .aggregate_bytes
@@ -445,6 +507,7 @@ impl FlowController {
         Ok(FlowPermit {
             controller: self.clone(),
             key,
+            owner,
             batch_bytes,
             row_count,
             acquired_at: Instant::now(),
@@ -500,26 +563,47 @@ impl FlowController {
     }
 
     /// Internal release called by `FlowPermit` on drop/release.
-    fn release_batch_permit(&self, key: CreditKey, batch_bytes: usize, row_count: u32) {
+    fn release_batch_permit(
+        &self,
+        key: CreditKey,
+        owner: &Arc<()>,
+        batch_bytes: usize,
+        row_count: u32,
+    ) {
         {
             let mut channels = self.channels.lock();
-            if let Some(state) = channels.get_mut(&key) {
-                let released_rows = row_count.min(state.rows_in_flight);
-                state.rows_in_flight -= released_rows;
-                state.available_rows =
-                    (state.available_rows.saturating_add(row_count)).min(state.max_rows);
-                state.batches_in_flight = state.batches_in_flight.saturating_sub(1);
-                state.bytes_in_flight = state.bytes_in_flight.saturating_sub(batch_bytes);
+            let (matches, rows, batches, bytes) =
+                channels.get(&key).map_or((false, 0, 0, 0), |state| {
+                    (
+                        ownership::same_owner(
+                            Arc::as_ptr(&state.owner) as usize,
+                            Arc::as_ptr(owner) as usize,
+                        ),
+                        state.rows_in_flight,
+                        state.batches_in_flight,
+                        state.bytes_in_flight,
+                    )
+                });
+            let (next_rows, next_batches, next_channel_bytes, new_bytes, new_pending) =
+                ownership::release_accounting(
+                    matches,
+                    rows,
+                    batches,
+                    bytes,
+                    self.aggregate_bytes.load(Ordering::Relaxed),
+                    self.pending_requests.load(Ordering::Relaxed),
+                    row_count,
+                    batch_bytes,
+                );
+            if matches {
+                let state = channels.get_mut(&key).expect("matching channel exists");
+                state.rows_in_flight = next_rows;
+                state.batches_in_flight = next_batches;
+                state.bytes_in_flight = next_channel_bytes;
+                state.available_rows = state.max_rows.saturating_sub(state.rows_in_flight);
             }
-
-            let new_bytes = self
-                .aggregate_bytes
-                .fetch_sub(batch_bytes as u64, Ordering::Relaxed)
-                .saturating_sub(batch_bytes as u64);
-            let new_pending = self
-                .pending_requests
-                .fetch_sub(1, Ordering::Relaxed)
-                .saturating_sub(1);
+            self.aggregate_bytes.store(new_bytes, Ordering::Relaxed);
+            self.pending_requests.store(new_pending, Ordering::Relaxed);
 
             Self::update_batch_metrics(&channels, new_bytes, new_pending);
         }
@@ -539,9 +623,13 @@ impl FlowController {
     pub fn teardown_exchange(&self, exchange_id: u64) {
         {
             let mut channels = self.channels.lock();
+            let mut retired = Vec::new();
             channels.retain(|key, state| {
                 if key.0 != exchange_id {
                     return true;
+                }
+                if state.had_delivery {
+                    retired.push(*key);
                 }
                 let bytes = state
                     .awaiting_ack
@@ -553,6 +641,7 @@ impl FlowController {
                     .fetch_sub(state.awaiting_ack.len() as u64, Ordering::Relaxed);
                 false
             });
+            channels.retired.extend(retired);
             let cur_bytes = self.aggregate_bytes.load(Ordering::Relaxed);
             let cur_pending = self.pending_requests.load(Ordering::Relaxed);
             Self::update_batch_metrics(&channels, cur_bytes, cur_pending);
@@ -593,28 +682,28 @@ impl FlowController {
         let key = (ack.exchange_id, ack.src_shard, ack.target_shard);
         let reservation = {
             let mut channels = self.channels.lock();
+            if channels.retired.contains(&key) {
+                return;
+            }
             let state = self.channel_state(&mut channels, key);
             if let Some(index) = state
                 .awaiting_ack
                 .iter()
                 .position(|(identity, _)| *identity == (ack.epoch, ack.seq))
             {
-                Some(state.awaiting_ack.remove(index).1)
+                Some((state.owner.clone(), state.awaiting_ack.remove(index).1))
             } else {
                 // Keep legacy credit release atomic with admission; stale ACKs cannot free a new batch.
                 if state.batches_in_flight == 0 {
                     state.rows_in_flight -= ack.credit_grant.min(state.rows_in_flight);
-                    state.available_rows = state
-                        .available_rows
-                        .saturating_add(ack.credit_grant)
-                        .min(state.max_rows);
+                    state.available_rows = state.max_rows.saturating_sub(state.rows_in_flight);
                 }
                 Self::update_credit_metrics(&channels);
                 None
             }
         };
-        if let Some((batch_bytes, row_count)) = reservation {
-            self.release_batch_permit(key, batch_bytes, row_count);
+        if let Some((owner, (batch_bytes, row_count))) = reservation {
+            self.release_batch_permit(key, &owner, batch_bytes, row_count);
         } else {
             self.notify_waiters(key);
         }
@@ -630,11 +719,13 @@ impl FlowController {
         let key = (exchange_id, src_shard, target_shard);
         {
             let mut channels = self.channels.lock();
+            if channels.retired.contains(&key) {
+                return;
+            }
             let state = self.channel_state(&mut channels, key);
             let released = row_count.min(state.rows_in_flight);
             state.rows_in_flight -= released;
-            state.available_rows =
-                (state.available_rows.saturating_add(row_count)).min(state.max_rows);
+            state.available_rows = state.max_rows.saturating_sub(state.rows_in_flight);
             Self::update_credit_metrics(&channels);
         }
 
@@ -664,33 +755,56 @@ impl FlowController {
     pub fn set_credits(&self, exchange_id: u64, src_shard: u32, target_shard: u32, amount: u32) {
         let key = (exchange_id, src_shard, target_shard);
         let mut channels = self.channels.lock();
-        channels.insert(
-            key,
-            ChannelCreditState {
-                available_rows: amount,
-                max_rows: amount.max(1),
-                rows_in_flight: 0,
-                batches_in_flight: 0,
-                bytes_in_flight: 0,
-                awaiting_ack: Vec::new(),
-            },
-        );
+        if channels.retired.contains(&key) {
+            return;
+        }
+        if let Some(state) = channels.get_mut(&key) {
+            // Replacing a live channel would detach its permit and ACK charges.
+            if state.rows_in_flight != 0
+                || state.batches_in_flight != 0
+                || !state.awaiting_ack.is_empty()
+            {
+                return;
+            }
+            state.available_rows = amount;
+            state.max_rows = amount.max(1);
+        } else {
+            channels.insert(
+                key,
+                ChannelCreditState {
+                    owner: Arc::new(()),
+                    had_delivery: false,
+                    available_rows: amount,
+                    max_rows: amount.max(1),
+                    rows_in_flight: 0,
+                    batches_in_flight: 0,
+                    bytes_in_flight: 0,
+                    awaiting_ack: Vec::new(),
+                },
+            );
+        }
         Self::update_credit_metrics(&channels);
     }
 
     /// Admit row credits under the channel lock without touching notifier
     /// state. The common uncontended path needs no waiter allocation or
     /// notifier-map lock; rejected attempts never consume partial credits.
-    fn try_acquire_rows(&self, key: CreditKey, row_count: u32) -> bool {
+    fn try_acquire_rows(&self, key: CreditKey, row_count: u32) -> Result<bool, String> {
         let mut channels = self.channels.lock();
+        if channels.retired.contains(&key) {
+            return Err(format!(
+                "[{RS_3006}] exchange channel was retired; use a new exchange ID"
+            ));
+        }
         let state = self.channel_state(&mut channels, key);
         if state.available_rows < row_count {
-            return false;
+            return Ok(false);
         }
         state.available_rows -= row_count;
         state.rows_in_flight = state.rows_in_flight.saturating_add(row_count);
+        state.had_delivery = true;
         Self::update_credit_metrics(&channels);
-        true
+        Ok(true)
     }
 
     /// Acquire row credit for the specified channel, suspending the caller if none are available.
@@ -710,7 +824,7 @@ impl FlowController {
         }
 
         let key = (exchange_id, src_shard, target_shard);
-        if self.try_acquire_rows(key, row_count) {
+        if self.try_acquire_rows(key, row_count)? {
             return Ok(());
         }
         // Reservation and keyed notifier have the same drop-owned lifetime.
@@ -724,7 +838,7 @@ impl FlowController {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.try_acquire_rows(key, row_count) {
+            if self.try_acquire_rows(key, row_count)? {
                 return Ok(());
             }
             #[cfg(test)]
@@ -820,5 +934,157 @@ mod v072_credit_fastpath_tests {
         assert_eq!(controller.channels.lock().len(), 0);
         assert_eq!(controller.get_credits(7, 1, 2), 1);
         assert_eq!(controller.rows_in_flight(7, 1, 2), 0);
+    }
+
+    #[test]
+    fn old_permit_cannot_release_recreated_channel() {
+        let controller = FlowController::with_row_budget(1)
+            .with_max_inflight_batches(1)
+            .with_max_inflight_bytes(8);
+        let snapshot = || {
+            let channels = controller.channels.lock();
+            (
+                channels.get(&(7, 1, 2)).map(|state| {
+                    (
+                        state.available_rows,
+                        state.rows_in_flight,
+                        state.batches_in_flight,
+                        state.bytes_in_flight,
+                        state.awaiting_ack.clone(),
+                    )
+                }),
+                controller.bytes_in_flight(),
+                controller.pending_requests(),
+            )
+        };
+        let mut transcript = vec![("initial", snapshot())];
+        let old = controller.try_acquire_batch_permit(7, 1, 2, 2, 1).unwrap();
+        transcript.push(("old acquired", snapshot()));
+        controller.teardown_exchange(7);
+        transcript.push(("torn down", snapshot()));
+        let new = controller.try_acquire_batch_permit(7, 1, 2, 3, 1).unwrap();
+        transcript.push(("new acquired", snapshot()));
+        controller.set_credits(7, 1, 2, 5);
+        transcript.push(("live reset refused", snapshot()));
+        drop(old);
+        transcript.push(("old dropped", snapshot()));
+        assert!(controller.try_acquire_batch_permit(7, 1, 2, 1, 1).is_err());
+        transcript.push(("new bound enforced", snapshot()));
+        drop(new);
+        transcript.push(("new dropped", snapshot()));
+        assert_eq!(
+            transcript,
+            vec![
+                ("initial", (None, 0, 0)),
+                ("old acquired", (Some((0, 1, 1, 2, vec![])), 2, 1)),
+                ("torn down", (None, 2, 1)),
+                ("new acquired", (Some((0, 1, 1, 3, vec![])), 5, 2)),
+                ("live reset refused", (Some((0, 1, 1, 3, vec![])), 5, 2)),
+                ("old dropped", (Some((0, 1, 1, 3, vec![])), 3, 1)),
+                ("new bound enforced", (Some((0, 1, 1, 3, vec![])), 3, 1)),
+                ("new dropped", (Some((1, 0, 0, 0, vec![])), 0, 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn lowering_live_row_budget_preserves_charges() {
+        let controller = FlowController::with_row_budget(3);
+        let first = controller.try_acquire_batch_permit(7, 1, 2, 2, 1).unwrap();
+        let second = controller.try_acquire_batch_permit(7, 1, 2, 3, 1).unwrap();
+        let snapshot = || {
+            (
+                controller.get_credits(7, 1, 2),
+                controller.rows_in_flight(7, 1, 2),
+                controller.batches_in_flight(7, 1, 2),
+                controller.bytes_in_flight(),
+                controller.pending_requests(),
+            )
+        };
+        let mut transcript = vec![("two live", snapshot())];
+        controller.set_row_budget(1);
+        transcript.push(("lowered", snapshot()));
+        assert!(controller.try_acquire_batch_permit(7, 1, 2, 1, 1).is_err());
+        drop(first);
+        transcript.push(("one live", snapshot()));
+        assert!(controller.try_acquire_batch_permit(7, 1, 2, 1, 1).is_err());
+        drop(second);
+        transcript.push(("released", snapshot()));
+        let third = controller.try_acquire_batch_permit(7, 1, 2, 1, 1).unwrap();
+        transcript.push(("new live", snapshot()));
+        drop(third);
+        transcript.push(("idle", snapshot()));
+        assert_eq!(
+            transcript,
+            vec![
+                ("two live", (1, 2, 2, 5, 2)),
+                ("lowered", (0, 2, 2, 5, 2)),
+                ("one live", (0, 1, 1, 3, 1)),
+                ("released", (1, 0, 0, 0, 0)),
+                ("new live", (0, 1, 1, 1, 1)),
+                ("idle", (1, 0, 0, 0, 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn delivered_cancelled_and_torn_down_reservations_keep_exact_charges() {
+        let controller = FlowController::with_row_budget(2);
+        let snapshot = || {
+            (
+                controller.get_credits(7, 1, 2),
+                controller.rows_in_flight(7, 1, 2),
+                controller.batches_in_flight(7, 1, 2),
+                controller.bytes_in_flight(),
+                controller.pending_requests(),
+            )
+        };
+        let ack = |seq| ShuffleAck {
+            exchange_id: 7,
+            src_shard: 1,
+            target_shard: 2,
+            epoch: 1,
+            seq,
+            credit_grant: 1,
+        };
+        let delivered = controller.try_acquire_batch_permit(7, 1, 2, 2, 1).unwrap();
+        let cancelled = controller.try_acquire_batch_permit(7, 1, 2, 3, 1).unwrap();
+        let mut transcript = vec![("acquired", snapshot())];
+        delivered.handoff(1, 1);
+        transcript.push(("handed off", snapshot()));
+        drop(cancelled);
+        transcript.push(("cancelled", snapshot()));
+        controller.handle_ack(&ack(1));
+        transcript.push(("acknowledged", snapshot()));
+        let later = controller.try_acquire_batch_permit(7, 1, 2, 4, 1).unwrap();
+        later.handoff(1, 2);
+        transcript.push(("later delivered", snapshot()));
+        controller.handle_ack(&ack(1));
+        transcript.push(("duplicate ack", snapshot()));
+        controller.teardown_exchange(7);
+        transcript.push(("torn down", snapshot()));
+        controller.handle_ack(&ack(2));
+        transcript.push(("late ack", snapshot()));
+        assert_eq!(
+            controller
+                .try_acquire_batch_permit(7, 1, 2, 1, 1)
+                .unwrap_err(),
+            format!("[{RS_3006}] exchange channel was retired; use a new exchange ID")
+        );
+        controller.set_credits(7, 1, 2, 2);
+        assert!(!controller.channels.lock().contains_key(&(7, 1, 2)));
+        assert_eq!(
+            transcript,
+            vec![
+                ("acquired", (0, 2, 2, 5, 2)),
+                ("handed off", (0, 2, 2, 5, 2)),
+                ("cancelled", (1, 1, 1, 2, 1)),
+                ("acknowledged", (2, 0, 0, 0, 0)),
+                ("later delivered", (1, 1, 1, 4, 1)),
+                ("duplicate ack", (1, 1, 1, 4, 1)),
+                ("torn down", (2, 0, 0, 0, 0)),
+                ("late ack", (2, 0, 0, 0, 0)),
+            ]
+        );
     }
 }

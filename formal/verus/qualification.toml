@@ -448,3 +448,12 @@ test_evidence = "recorded: gated storage, cancellation, and LFS subprocess crash
 review_evidence = "recorded: sign-offs/verus/VS7-physical-commit.md"
 qualification_evidence = "blocked: physical backend durability and scheduler behavior remain external"
 verifier_output = "recorded: pinned Verus, 78 verified, 0 errors"
+
+[[claim_evidence]]
+id = "VS7-01"
+theorem_evidence = "recorded: manifest.theorems; pinned Verus verified the production-used ownership kernels"
+model_evidence = "not-applicable: local accounting transition, not a transport scheduler model"
+test_evidence = "recorded: exact runtime ownership transcripts and verified-kernel unit test"
+review_evidence = "recorded: sign-offs/verus/VS7.md"
+qualification_evidence = "blocked: transport delivery and long-running retired-key churn are outside the local proof"
+verifier_output = "recorded: pinned Verus, 70 verified, 0 errors"

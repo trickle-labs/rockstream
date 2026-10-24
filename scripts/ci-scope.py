@@ -20,6 +20,7 @@ PROSE_DIRS = (
 HEAVY_JOBS = (
     "check-tests", "gateway", "postgres-differential",
     "control-plane-ha", "formal-verify", "docker-build",
+    "verus-consumer",
 )
 
 
@@ -49,7 +50,7 @@ def scope_for_event(event_name: str, event: dict) -> str:
     return scope_for_paths(os.fsdecode(diff).split("\0")[:-1])
 
 
-def check_results(needs: dict) -> str:
+def check_results(needs: dict, *, group: str | None = None) -> str:
     classification = needs.get("ci-policy", {})
     outputs = classification.get("outputs", {})
     scope = outputs.get("scope")
@@ -58,21 +59,26 @@ def check_results(needs: dict) -> str:
             or expected_expensive is None
             or outputs.get("expensive") != expected_expensive):
         raise ValueError("CI classification did not succeed with a valid scope")
-    expected = {"ci-policy", "check-quality", "verus-verify",
-                "nexmark-regression-gate", "benchmark", *HEAVY_JOBS}
+    matrix_job = {"benchmarks": "benchmark-suites", "verus": "verus-qualify"}.get(group)
+    expected = ({"ci-policy", matrix_job} if matrix_job else
+                {"ci-policy", "check-quality", "verus-verify",
+                 "nexmark-regression-gate", "benchmark", *HEAVY_JOBS})
     if set(needs) != expected:
         raise ValueError("CI dependency set differs from the required jobs")
     for job in sorted(expected - {"ci-policy"}):
         allowed = {"success", "skipped"} if scope == "prose" and job in HEAVY_JOBS else {"success"}
+        if matrix_job and scope == "prose":
+            allowed = {"skipped"}
         result = needs[job].get("result")
         if result not in allowed:
             raise ValueError(f"{job}: unexpected result {result!r} for {scope} CI")
-    return f"Check passed ({scope} CI); excluded jobs are not execution evidence."
+    label = {"benchmarks": "Benchmark suites", "verus": "Verus phases"}.get(group, "Check")
+    return f"{label} passed ({scope} CI); excluded jobs are not execution evidence."
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("scope", "check"))
+    parser.add_argument("command", choices=("scope", "check", "check-benchmarks", "check-verus"))
     args = parser.parse_args()
     if args.command == "scope":
         scope = "full"
@@ -87,7 +93,8 @@ def main() -> int:
         print(f"scope={scope}")
         return 0
     try:
-        print(check_results(json.loads(os.environ["CI_NEEDS"])))
+        group = {"check-benchmarks": "benchmarks", "check-verus": "verus"}.get(args.command)
+        print(check_results(json.loads(os.environ["CI_NEEDS"]), group=group))
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
