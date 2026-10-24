@@ -320,7 +320,12 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
                     } else {
                         on_result?
                     };
-                    lower_outer_join(OuterJoinKind::Anti, join, left_keys, right_keys)
+                    let kind = if join.null_aware {
+                        OuterJoinKind::NullAwareAnti
+                    } else {
+                        OuterJoinKind::Anti
+                    };
+                    lower_outer_join(kind, join, left_keys, right_keys)
                 }
 
                 JoinType::RightSemi

@@ -39,7 +39,10 @@ fn empty() -> ArrowZSet {
 }
 
 fn expected_schema(kind: OuterJoinKind) -> SchemaRef {
-    let names = if matches!(kind, OuterJoinKind::Semi | OuterJoinKind::Anti) {
+    let names = if matches!(
+        kind,
+        OuterJoinKind::Semi | OuterJoinKind::Anti | OuterJoinKind::NullAwareAnti
+    ) {
         vec!["l_0", "l_1"]
     } else {
         vec!["l_0", "l_1", "r_0", "r_1"]
@@ -133,7 +136,9 @@ async fn compiled_outer_join_schema_preserves_each_input_column_nullability() {
                 OuterJoinKind::Left => vec![false, left_nullable, true, true],
                 OuterJoinKind::Right => vec![true, true, false, right_nullable],
                 OuterJoinKind::Full => vec![true; 4],
-                OuterJoinKind::Semi | OuterJoinKind::Anti => vec![false, left_nullable],
+                OuterJoinKind::Semi | OuterJoinKind::Anti | OuterJoinKind::NullAwareAnti => {
+                    vec![false, left_nullable]
+                }
             };
             let expected_schema = Arc::new(Schema::new(
                 expected_schema(kind)
@@ -164,7 +169,7 @@ async fn compiled_outer_join_schema_preserves_each_input_column_nullability() {
             };
             let expected = match kind {
                 OuterJoinKind::Semi => vec![(vec![Some(1), left_value], 1)],
-                OuterJoinKind::Anti => vec![],
+                OuterJoinKind::Anti | OuterJoinKind::NullAwareAnti => vec![],
                 _ => vec![(vec![Some(1), left_value, Some(1), right_value], 1)],
             };
             assert_relation_schema(
@@ -226,6 +231,7 @@ async fn compiled_null_keys_never_match_and_retract_exactly() {
                 OuterJoinKind::Full => vec![left, right],
                 OuterJoinKind::Semi => vec![],
                 OuterJoinKind::Anti => vec![(vec![None, Some(7)], 1)],
+                OuterJoinKind::NullAwareAnti => vec![],
             };
             assert_relation(
                 join.pipeline
@@ -268,6 +274,7 @@ async fn compiled_null_keys_never_match_and_retract_exactly() {
                     vec![(vec![None, Some(7), None, None], -1)]
                 }
                 OuterJoinKind::Anti => vec![(vec![None, Some(7)], -1)],
+                OuterJoinKind::NullAwareAnti => vec![],
                 _ => vec![],
             };
             assert_relation(
@@ -307,7 +314,7 @@ async fn compiled_null_payload_is_distinct_from_zero_after_reopen() {
             kind,
             match kind {
                 OuterJoinKind::Semi => vec![(vec![Some(1), None], 1)],
-                OuterJoinKind::Anti => vec![],
+                OuterJoinKind::Anti | OuterJoinKind::NullAwareAnti => vec![],
                 _ => vec![(vec![Some(1), None, Some(1), Some(0)], 1)],
             },
         );
@@ -336,6 +343,7 @@ async fn compiled_null_payload_is_distinct_from_zero_after_reopen() {
                 OuterJoinKind::Right => vec![(vec![Some(1), None, Some(1), Some(0)], -1)],
                 OuterJoinKind::Semi => vec![(vec![Some(1), None], -1)],
                 OuterJoinKind::Anti => vec![(vec![Some(1), None], 1)],
+                OuterJoinKind::NullAwareAnti => vec![(vec![Some(1), None], 1)],
             },
         );
         assert_relation(
@@ -347,11 +355,89 @@ async fn compiled_null_payload_is_distinct_from_zero_after_reopen() {
                 OuterJoinKind::Left | OuterJoinKind::Full => {
                     vec![(vec![Some(1), None, None, None], -1)]
                 }
-                OuterJoinKind::Anti => vec![(vec![Some(1), None], -1)],
+                OuterJoinKind::Anti | OuterJoinKind::NullAwareAnti => {
+                    vec![(vec![Some(1), None], -1)]
+                }
                 _ => vec![],
             },
         );
         drop(join);
         Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn compiled_null_aware_anti_tracks_null_and_empty_right_across_reopen() {
+    let kind = OuterJoinKind::NullAwareAnti;
+    let dir = TempDir::new().unwrap();
+    let db = open_db(&dir).await;
+    let join = compile(
+        kind,
+        db.clone(),
+        empty().data.schema(),
+        empty().data.schema(),
+    );
+
+    assert_relation(
+        join.pipeline
+            .process(input(Some(2), Some(20), 1), input(Some(1), Some(10), 1))
+            .unwrap(),
+        kind,
+        vec![(vec![Some(2), Some(20)], 1)],
+    );
+    assert_relation(
+        join.pipeline
+            .process(empty(), input(None, Some(99), 1))
+            .unwrap(),
+        kind,
+        vec![(vec![Some(2), Some(20)], -1)],
+    );
+    join.pipeline.persist(&db).await.unwrap();
+    db.flush().await.unwrap();
+    drop(join);
+    Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+
+    let db = open_db(&dir).await;
+    let join = compile(
+        kind,
+        db.clone(),
+        empty().data.schema(),
+        empty().data.schema(),
+    );
+    join.pipeline.restore(&db).await.unwrap();
+    assert_relation(
+        join.pipeline
+            .process(empty(), input(None, Some(99), -1))
+            .unwrap(),
+        kind,
+        vec![(vec![Some(2), Some(20)], 1)],
+    );
+    assert_relation(
+        join.pipeline
+            .process(input(None, Some(30), 1), empty())
+            .unwrap(),
+        kind,
+        vec![],
+    );
+    assert_relation(
+        join.pipeline
+            .process(empty(), input(Some(1), Some(10), -1))
+            .unwrap(),
+        kind,
+        vec![(vec![None, Some(30)], 1)],
+    );
+    assert_relation(
+        join.pipeline
+            .process(empty(), input(Some(2), Some(20), 1))
+            .unwrap(),
+        kind,
+        vec![(vec![Some(2), Some(20)], -1), (vec![None, Some(30)], -1)],
+    );
+    assert_relation(
+        join.pipeline
+            .process(empty(), input(Some(2), Some(20), -1))
+            .unwrap(),
+        kind,
+        vec![(vec![Some(2), Some(20)], 1), (vec![None, Some(30)], 1)],
+    );
 }
