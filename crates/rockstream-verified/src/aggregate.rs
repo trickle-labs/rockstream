@@ -9,6 +9,14 @@ verus! {
         delta_count: i64,
     ) -> (result: Option<(i64, i64)>)
         ensures
+            result.is_some() <==> old_count >= 0
+                && (old_count != 0 || old_sum == 0)
+                && 0 <= old_count as int + delta_count as int <= i64::MAX as int
+                && (if old_count as int + delta_count as int == 0 {
+                    old_sum as int + delta_sum as int == 0
+                } else {
+                    i64::MIN as int <= old_sum as int + delta_sum as int <= i64::MAX as int
+                }),
             result.is_some() ==> {
                 let state = result.unwrap();
                 state.1 >= 0
