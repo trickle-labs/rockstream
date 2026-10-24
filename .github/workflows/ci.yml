@@ -75,7 +75,7 @@ jobs:
 
   check-quality:
     needs: ci-policy
-    name: Check
+    name: Check quality
     runs-on: ubuntu-latest
     permissions:
       contents: read
