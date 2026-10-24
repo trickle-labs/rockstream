@@ -39,6 +39,26 @@ impl Message for Parse {
     }
 
     fn decode_body(buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
+        // A Parse body contains two NUL-terminated strings followed by an
+        // unsigned 16-bit OID count and exactly that many four-byte OIDs.
+        // Preflight before using Buf getters: fuzz builds may abort on panic.
+        let Some(name_end) = buf.iter().position(|byte| *byte == 0) else {
+            return Err(crate::error::PgWireError::InvalidMessageBody);
+        };
+        let remaining = &buf[name_end + 1..];
+        let Some(query_end) = remaining.iter().position(|byte| *byte == 0) else {
+            return Err(crate::error::PgWireError::InvalidMessageBody);
+        };
+        let fields_start = name_end + 1 + query_end + 1;
+        let fields = &buf[fields_start..];
+        if fields.len() < 2 {
+            return Err(crate::error::PgWireError::InvalidMessageBody);
+        }
+        let type_oid_count = u16::from_be_bytes([fields[0], fields[1]]) as usize;
+        if fields.len() - 2 != type_oid_count * 4 {
+            return Err(crate::error::PgWireError::InvalidMessageBody);
+        }
+
         let name = codec::get_cstring(buf);
         let query = codec::get_cstring(buf).unwrap_or_else(|| "".to_owned());
         let type_oid_count = buf.get_u16();

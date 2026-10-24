@@ -188,7 +188,11 @@ impl CheckpointExportService {
                 "dr.export.after_m3_selection",
             ));
         }
-        let objects = Self::list_export_objects(&source, prefix).await?;
+        // The CLI must inventory the immutable shard objects named by the
+        // selected committed checkpoint, not only objects still visible under
+        // the source prefix. Missing referenced storage must fail before a
+        // generation record or terminal success marker can be written.
+        let objects = Self::list_checkpoint_objects(&source, &checkpoint, prefix).await?;
         self.export_objects(source, destination, checkpoint, generation, objects)
             .await
     }

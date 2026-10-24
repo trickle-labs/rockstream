@@ -234,18 +234,27 @@ e2e-nextest:
 qualify:
 	@bash scripts/run-release-qualification.sh
 
-# Bump the workspace version, commit, tag, and push.
-# Usage: make release VERSION=0.5.0
+# Sign and push an already-qualified, immutable release candidate on main.
+# Usage: make release VERSION=0.72.0 QUALIFIED_SHA=<exact-green-main-sha>
+# Requires git signing configured (GPG or SSH) and signature verification.
+# Deliberately does not bump, commit, or push any unqualified source.
 release:
-	@test -n "$(VERSION)" || (echo "ERROR: VERSION is required. Usage: make release VERSION=0.5.0" && exit 1)
-	@echo "=== Releasing v$(VERSION) ==="
-	@sed -i '' 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
-	@cargo check --workspace -q
-	@git add Cargo.toml Cargo.lock
-	@git commit -m "Release v$(VERSION)"
-	@git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
-	@git push && git push --tags
-	@echo "=== Released v$(VERSION) ==="
+	@test -n "$(VERSION)" && test -n "$(QUALIFIED_SHA)" || (echo "ERROR: VERSION and QUALIFIED_SHA are required" && exit 1)
+	@printf '%s\n' "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$' || (echo "ERROR: VERSION must be semver x.y.z" && exit 1)
+	@test "$$(git symbolic-ref --quiet --short HEAD)" = "main" || (echo "ERROR: release must be cut from main" && exit 1)
+	@test -z "$$(git status --porcelain)" || (echo "ERROR: release worktree must be clean" && exit 1)
+	@test "$$(git rev-parse HEAD)" = "$(QUALIFIED_SHA)" || (echo "ERROR: HEAD differs from verified candidate" && exit 1)
+	@test "$$(git rev-parse origin/main)" = "$(QUALIFIED_SHA)" || (echo "ERROR: origin/main differs from verified candidate; git fetch and requalify" && exit 1)
+	@version=$$(awk '/^\[workspace.package\]/{in_pkg=1;next} in_pkg && /^\[/{exit} in_pkg && /^version = "/{gsub(/"/,"",$$3);print $$3;exit}' Cargo.toml); \
+	  test "$$version" = "$(VERSION)" || (echo "ERROR: workspace version $$version differs from release $(VERSION)" && exit 1)
+	@grep -E "^\\| \\*\\*v$(echo $(VERSION) | sed 's/\\.0$//')\\*\\* \\|.*✅ Done" ROADMAP.md >/dev/null || (echo "ERROR: roadmap is not marked Done; candidate is not fully qualified" && exit 1)
+	@test -f "sign-offs/v$(echo $(VERSION) | sed 's/\\.0$//').md" || (echo "ERROR: completed release sign-off missing" && exit 1)
+	@bash scripts/check-exit-criteria.sh >/dev/null || (echo "ERROR: exit criteria sign-off incomplete" && exit 1)
+	@test -z "$(git tag --list 'v$(VERSION)')" || (echo "ERROR: release tag already exists; do not retag" && exit 1)
+	@git tag -s "v$(VERSION)" -m "Release v$(VERSION)"
+	@git verify-tag "v$(VERSION)" || (echo "ERROR: signature verification failed; do not push" && exit 1)
+	@git push origin "v$(VERSION)"
+	@echo "Published signed tag v$(VERSION) at $(QUALIFIED_SHA)"
 
 # Clean build artifacts
 clean:
