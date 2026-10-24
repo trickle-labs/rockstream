@@ -103,8 +103,8 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("run: cargo build --locked --release -p rockstream-cli", blocks["verus-consumer"])
         self.assertNotIn("cargo build --locked --release -p rockstream-cli", blocks["verus-verify"])
         runner = (ROOT / "scripts/run-verus-qualification.sh").read_text()
-        self.assertIn('cargo build --workspace --locked "${TARGET_ARGS[@]}"', runner)
-        self.assertIn('cargo build --workspace --locked --release "${TARGET_ARGS[@]}"', runner)
+        self.assertIn('cargo build --workspace --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}', runner)
+        self.assertIn('cargo build --workspace --locked --release ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}', runner)
 
     def test_only_production_image_consumers_wait_for_the_image(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
