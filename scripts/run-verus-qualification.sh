@@ -4,7 +4,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "$ROOT" rev-parse --short HEAD)"
 OUTPUT_ROOT="${VERUS_QUALIFICATION_OUTPUT:-$ROOT/evidence/verus/$RUN_ID}"
-TARGET_ROOT="$(mktemp -d)"
+# Reuse the job's rust-cache target tree; only the large debug profile is cleared below.
+TARGET_ROOT="$ROOT/target"
 STEPS="$OUTPUT_ROOT/steps.tsv"
 QUALIFY_TARGET="${VERUS_QUALIFICATION_TARGET:-}"
 TARGET_ARGS=()
@@ -13,7 +14,7 @@ if [ -n "$QUALIFY_TARGET" ]; then
 fi
 OVERALL=0
 DEBUG_STAGE_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TARGET_ROOT" "$DEBUG_STAGE_ROOT"' EXIT
+trap 'rm -rf "$DEBUG_STAGE_ROOT"' EXIT
 mkdir -p "$OUTPUT_ROOT"
 
 QUALIFICATION_TOML="$ROOT/formal/verus/qualification.toml"

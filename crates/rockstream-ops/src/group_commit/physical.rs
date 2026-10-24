@@ -938,11 +938,9 @@ mod boundary_tests {
             tokio::time::timeout(Duration::from_secs(2), gate.reached.notified())
                 .await
                 .unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(5), &mut flushing)
-                    .await
-                    .is_err()
-            );
+            assert!(tokio::time::timeout(Duration::ZERO, &mut flushing)
+                .await
+                .is_err());
             flushing.abort();
             assert!(flushing.await.unwrap_err().is_cancelled());
             group.add_epoch(2, second).unwrap();
@@ -1233,10 +1231,16 @@ mod boundary_tests {
             } else {
                 assert_eq!(observed, b"before-ack", "{mode}: ack preceded the cut");
                 child.kill().unwrap();
-                assert!(
-                    !child.wait().unwrap().success(),
-                    "{mode}: child was not killed"
+                let status = child.wait().unwrap();
+                #[cfg(unix)]
+                assert_eq!(
+                    std::os::unix::process::ExitStatusExt::signal(&status),
+                    Some(9),
+                    "{mode}: child did not die from SIGKILL"
                 );
+                #[cfg(not(unix))]
+                assert!(!status.success(), "{mode}: child was not killed");
+                assert_eq!(std::fs::read(&transcript).unwrap(), b"before-ack");
             }
 
             let db = Arc::new(
@@ -1288,7 +1292,13 @@ mod boundary_tests {
                     assert_eq!(observed, b"ack:2");
                     assert_eq!(actual, committed);
                 }
-                "after_write" | "after_flush" => {
+                "after_write" => {
+                    assert!(
+                        actual == baseline || actual == committed,
+                        "{mode}: recovery was not one legal atomic history: {actual:?}"
+                    );
+                }
+                "after_flush" => {
                     assert_eq!(actual, committed, "{mode}: awaited durable write was lost");
                 }
                 _ => unreachable!(),
