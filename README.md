@@ -179,8 +179,10 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 
 ## Project status
 
-The current workspace version is **v0.61.0**. Engineering work toward the v1
-release qualification is active; RockStream does not yet claim a `v1.0.0`
+The current workspace source version is **v0.72.0**. A source-version bump
+is not itself a published release: a release requires passing checks on the
+exact candidate and an immutable, signed `v0.72.0` tag. Engineering work toward
+a qualified v1 release continues; RockStream does not yet claim a `v1.0.0`
 release. The checked-in [capability matrix](docs/capability-matrix.md),
 [evidence manifest](docs/evidence-manifest.json), and [version sign-offs](sign-offs/)
 record what has shipped and how each milestone was verified.

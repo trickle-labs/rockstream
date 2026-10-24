@@ -1,22 +1,23 @@
 //! Slice 7 — Protocol Fuzzer (v0.39)
 //!
-//! Generates random but structurally valid pgwire message byte sequences and
-//! feeds them to a live `GatewayServer`, asserting:
+//! Generates SQL request sequences through a live `GatewayServer`, asserting:
 //! - No panics
-//! - No hangs (each sequence times out in ≤ 5 s)
-//! - No malformed (non-pgwire) responses
+//! - No hangs (each sequence must finish within 5 s)
+//! - Exact successful probes before and after each generated sequence
 //!
-//! Runs 200 random sequences by default (scaled to be fast in CI).
-//! Set `PROPTEST_CASES=5000` to scale up.
+//! Runs 200 random sequences and persists shrunk failures beside this test.
 
 use std::sync::Arc;
+use std::{net::SocketAddr, time::Duration};
 
 use proptest::prelude::*;
+use proptest::test_runner::{Config, FileFailurePersistence, TestCaseError, TestRunner};
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
+use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 // ── NoopViewReader ─────────────────────────────────────────────────────────────
 
@@ -68,88 +69,132 @@ fn random_sequence() -> BoxedStrategy<Vec<String>> {
     prop::collection::vec(random_sql(), 1..=10).boxed()
 }
 
-// ── Shared server ─────────────────────────────────────────────────────────────
-
-/// Returns a port with a running gateway. We use a single Tokio runtime
-/// shared across all proptest cases (via `once_cell`).
-fn get_server_port() -> u16 {
-    use std::sync::OnceLock;
-    static PORT: OnceLock<u16> = OnceLock::new();
-    *PORT.get_or_init(|| {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = GatewayServer::with_catalog(
-                addr,
-                Arc::new(CatalogStubs::new()),
-                Arc::new(FuzzNoopReader),
-            );
-            let (local_addr, _handle) = server.serve_background().await.unwrap();
-            // Intentionally leak `_handle` — it lives for the entire test process.
-            Box::leak(Box::new(_handle));
-            local_addr.port()
-        })
-    })
+async fn start_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(FuzzNoopReader),
+    )
+    .serve_background()
+    .await
+    .unwrap()
 }
 
-// ── Fuzzer property test ──────────────────────────────────────────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 200,
-        // The test body already enforces a 5s Tokio timeout per generated
-        // sequence. Keeping proptest's fork/timeout watchdog enabled causes
-        // false failures from child-process startup overhead before the first
-        // case runs, so leave the outer watchdog off.
-        timeout: 0,
-        ..ProptestConfig::default()
-    })]
-
-    /// Slice 7 green gate: no panics, no hangs under 200 random SQL sequences.
-    #[test]
-    fn protocol_fuzzer_no_panics_no_hangs(sequence in random_sequence()) {
-        let port = get_server_port();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let outcome = rt.block_on(async {
-            let timeout = tokio::time::Duration::from_secs(5);
-            tokio::time::timeout(timeout, async {
-                // Each proptest case gets a fresh connection
-                let conn_result = tokio_postgres::connect(
-                    &format!("host=127.0.0.1 port={port} user=test dbname=test"),
-                    tokio_postgres::NoTls,
-                )
-                .await;
-
-                let (client, conn) = match conn_result {
-                    Ok(x) => x,
-                    // Connection refused is not a panic — just skip
-                    Err(_) => return Ok::<(), String>(()),
-                };
-
-                tokio::spawn(async move { conn.await.ok(); });
-
-                for sql in &sequence {
-                    // Each statement is allowed to error (unsupported, invalid, etc.)
-                    // What we test is that it does NOT panic or hang.
-                    let _ = client.simple_query(sql.as_str()).await;
-                }
-                Ok(())
-            })
+async fn run_connection(addr: SocketAddr, sequence: &[String]) -> Result<(), String> {
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=test dbname=test", addr.port()),
+        NoTls,
+    )
+    .await
+    .map_err(|e| format!("connect: {e}"))?;
+    let task = tokio::spawn(connection);
+    let result = async {
+        let response = client
+            .simple_query("SELECT 1 AS probe")
             .await
-        });
-
-        // Timeout is NOT a test failure for proptest — just log it.
-        // A panic would propagate and fail the test.
-        match outcome {
-            Ok(_) | Err(_) => {} // timeout or success both OK; panics propagate
+            .map_err(|e| format!("probe query: {e}"))?;
+        if !matches!(
+            response.as_slice(),
+            [SimpleQueryMessage::RowDescription(columns), SimpleQueryMessage::Row(row), SimpleQueryMessage::CommandComplete(1)]
+                if columns.len() == 1 && columns[0].name() == "probe"
+                    && row.len() == 1 && row.get(0) == Some("1")
+        ) {
+            return Err(format!("RS-0001 unexpected probe response: {response:?}"));
         }
+        for sql in sequence {
+            if let Err(error) = client.simple_query(sql).await {
+                if error.as_db_error().is_none() {
+                    return Err(format!("RS-0004 transport failure for {sql:?}: {error}"));
+                }
+            }
+        }
+        Ok(())
     }
+    .await;
+    drop(client);
+    let connection_result = task
+        .await
+        .map_err(|e| format!("client task panicked: {e}"))?
+        .map_err(|e| format!("client connection failed: {e}"));
+    result?;
+    connection_result
+}
+
+async fn exercise_sequence(addr: SocketAddr, sequence: &[String]) -> Result<(), String> {
+    run_connection(addr, sequence).await?;
+    run_connection(addr, &[]).await
+}
+
+#[test]
+fn protocol_fuzzer_no_panics_no_hangs() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (addr, server_task) = rt.block_on(start_server());
+    let mut runner = TestRunner::new(Config {
+        cases: 200,
+        timeout: 0,
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        source_file: Some(file!()),
+        test_name: Some(concat!(
+            module_path!(),
+            "::protocol_fuzzer_no_panics_no_hangs"
+        )),
+        ..Config::default()
+    });
+    runner
+        .run(&random_sequence(), |sequence| {
+            let outcome = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), exercise_sequence(addr, &sequence))
+                    .await
+            });
+            if server_task.is_finished() {
+                return Err(TestCaseError::fail("gateway listener task stopped"));
+            }
+            outcome
+                .map_err(|_| TestCaseError::fail(format!("request timed out: {sequence:?}")))?
+                .map_err(|e| TestCaseError::fail(format!("{sequence:?}: {e}")))
+        })
+        .unwrap();
+    server_task.abort();
+    rt.block_on(server_task).unwrap_err();
+}
+
+#[test]
+fn protocol_harness_rejects_unavailable_and_nonresponding_endpoints() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable = unused.local_addr().unwrap();
+        drop(unused);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), exercise_sequence(unavailable, &[])).await,
+            Ok(Err(_))
+        ));
+
+        let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_addr = stalled.local_addr().unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(100),
+            exercise_sequence(stalled_addr, &[])
+        )
+        .await
+        .is_err());
+        drop(stalled);
+
+        let (addr, server_task) = start_server().await;
+        let normal =
+            tokio::time::timeout(Duration::from_secs(5), exercise_sequence(addr, &[])).await;
+        assert!(matches!(normal, Ok(Ok(()))), "normal operation: {normal:?}");
+        server_task.abort();
+        server_task.await.unwrap_err();
+    });
 }

@@ -227,9 +227,11 @@ pub fn apply_delta_physically(current: &ArrowZSet, delta: &ArrowZSet) -> ArrowZS
             }
         } else if w < 0 {
             for _ in 0..(-w) {
-                if let Some(pos) = active_rows.iter().position(|r| r == &row_val) {
-                    active_rows.remove(pos);
-                }
+                let pos = active_rows
+                    .iter()
+                    .position(|r| r == &row_val)
+                    .unwrap_or_else(|| panic!("invalid retraction of absent row {row_val:?}"));
+                active_rows.remove(pos);
             }
         }
     }
@@ -501,6 +503,10 @@ impl ExecNode {
                         )))
                         .collect();
                     let schema = Arc::new(Schema::new(fields));
+                    if epoch_id == 1 && group_by.is_empty() && matches!(func, AggregateFunc::Count)
+                    {
+                        return make_zset(schema, vec![vec![0]], 1);
+                    }
                     return ArrowZSet::empty(schema);
                 }
 
@@ -569,11 +575,10 @@ impl ExecNode {
 
                 let vals = match func {
                     AggregateFunc::Count => {
-                        let col_vals =
-                            rockstream_ops::expr::eval_i64(agg_input, &in_val.data).unwrap();
-                        col_vals
-                            .into_iter()
-                            .map(|v| if v == 0 { 0 } else { 1 })
+                        let col =
+                            rockstream_ops::expr::eval_to_array(agg_input, &in_val.data).unwrap();
+                        (0..in_val.num_rows())
+                            .map(|row| i64::from(!col.is_null(row)))
                             .collect()
                     }
                     _ => rockstream_ops::expr::eval_i64(agg_input, &in_val.data).unwrap(),
@@ -590,9 +595,11 @@ impl ExecNode {
                 let kv_batch = RecordBatch::try_new(schema, cols).unwrap();
                 let kv_zset = ArrowZSet::new(kv_batch, in_val.weights);
 
+                let global_count = group_by.is_empty() && matches!(func, AggregateFunc::Count);
+                let was_empty = global_count && op.live_groups() == 0;
                 let raw_out = op.process_delta(kv_zset).unwrap();
 
-                if raw_out.is_empty() {
+                let output = if raw_out.is_empty() {
                     let logical_schema = if group_by.is_empty() {
                         Arc::new(Schema::new(vec![Field::new(
                             "agg",
@@ -710,6 +717,22 @@ impl ExecNode {
                         let data = RecordBatch::try_new(logical_schema, arrow_cols).unwrap();
                         ArrowZSet::new(data, raw_out.weights)
                     }
+                };
+                if global_count {
+                    let schema = output.schema();
+                    let zero = |weight| make_zset(schema.clone(), vec![vec![0]], weight);
+                    let output = if was_empty && epoch_id > 1 {
+                        concat_zsets(&output, &zero(-1))
+                    } else {
+                        output
+                    };
+                    if op.live_groups() == 0 {
+                        concat_zsets(&output, &zero(1))
+                    } else {
+                        output
+                    }
+                } else {
+                    output
                 }
             }
             ExecNode::Union { left, right } => {
@@ -1505,6 +1528,201 @@ mod tests {
             OracleCaseOutcome::Compared {
                 epochs: vec!["snapshot", "decimal_insert", "decimal_retract"],
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn nullable_duplicate_and_empty_histories_match_each_epoch() {
+        fn rows(schema: SchemaRef, values: &[[Option<i64>; 3]], weight: i64) -> ArrowZSet {
+            let scalars: Vec<_> = values
+                .iter()
+                .map(|row| row.iter().copied().map(ScalarValue::Int64).collect())
+                .collect();
+            let mut zset = rebuild_zset(schema, &scalars);
+            zset.weights.fill(weight);
+            zset
+        }
+
+        let left = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Int64, true),
+            Field::new("category", DataType::Int64, false),
+        ]));
+        let right = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("val", DataType::Int64, true),
+            Field::new("group_id", DataType::Int64, false),
+        ]));
+        let pair = |t1: &[[Option<i64>; 3]], t2: &[[Option<i64>; 3]], weight| {
+            HashMap::from([
+                ("t1".to_string(), rows(left.clone(), t1, weight)),
+                ("t2".to_string(), rows(right.clone(), t2, weight)),
+            ])
+        };
+        let seed = 239;
+        let mut rng = FuzzRng::new(seed);
+        let duplicate = [Some(1), None, Some(1)];
+        let negative = [Some(-1), Some(-2), Some(2)];
+        let left_new = [Some(2), Some(rng.next_range(1, 9)), Some(3)];
+        let right_match = [Some(1), Some(rng.next_range(1, 9)), Some(1)];
+        let right_new = [Some(2), Some(rng.next_range(1, 9)), Some(3)];
+        let initial = pair(
+            &[duplicate, duplicate, [Some(0), Some(0), Some(1)], negative],
+            &[right_match, [None, Some(0), Some(1)]],
+            1,
+        );
+        let first = HashMap::from([
+            (
+                "t1".to_string(),
+                concat_zsets(
+                    &rows(left.clone(), &[duplicate], -1),
+                    &rows(left.clone(), &[left_new], 1),
+                ),
+            ),
+            (
+                "t2".to_string(),
+                concat_zsets(
+                    &rows(right.clone(), &[right_match], -1),
+                    &rows(right.clone(), &[right_new], 1),
+                ),
+            ),
+        ]);
+        let second = pair(&[duplicate, negative], &[right_new], -1);
+        let third = pair(&[duplicate, negative], &[right_match, right_new], 1);
+        let history = vec![
+            format!("snapshot(seed={seed}): duplicate 1, zero, negative, NULL, join match"),
+            "retract one duplicate and last join match; insert matching 2".to_string(),
+            "retract last duplicate and group 2 member; retract prior-epoch match 2".to_string(),
+            "reinsert duplicate, group member, and join matches".to_string(),
+        ];
+        for sql in [
+            "SELECT id, val FROM t1",
+            "SELECT COUNT(val) FROM t1",
+            "SELECT COUNT(*) FROM t1",
+            "SELECT category, COUNT(val) FROM t1 GROUP BY category",
+            "SELECT category, COUNT(*) FROM t1 GROUP BY category",
+            "SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id",
+            "SELECT id FROM t1 WHERE id NOT IN (SELECT id FROM t2 WHERE id > -100)",
+            "SELECT id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)",
+        ] {
+            let report = run_case_with_deltas(
+                sql,
+                seed,
+                initial.clone(),
+                vec![
+                    ("mixed", first.clone()),
+                    ("extinction", second.clone()),
+                    ("reinsert", third.clone()),
+                ],
+                history.clone(),
+            )
+            .await;
+            assert_eq!(
+                report.outcome,
+                OracleCaseOutcome::Compared {
+                    epochs: vec!["snapshot", "mixed", "extinction", "reinsert"],
+                },
+                "sql={sql}"
+            );
+            assert_eq!(report.operation_history, history);
+        }
+
+        let empty = pair(&[], &[], 1);
+        let inserted = pair(&[duplicate], &[right_match], 1);
+        let retracted = pair(&[duplicate], &[right_match], -1);
+        for sql in [
+            "SELECT COUNT(val) FROM t1",
+            "SELECT COUNT(*) FROM t1",
+            "SELECT category, COUNT(val) FROM t1 GROUP BY category",
+            "SELECT category, COUNT(*) FROM t1 GROUP BY category",
+            "SELECT t1.id, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.id",
+        ] {
+            let report = run_case_with_deltas(
+                sql,
+                240,
+                empty.clone(),
+                vec![
+                    ("insert", inserted.clone()),
+                    ("empty_again", retracted.clone()),
+                    ("reinsert", inserted.clone()),
+                ],
+                vec![
+                    "empty snapshot".into(),
+                    "insert match".into(),
+                    "remove last member".into(),
+                    "reinsert match".into(),
+                ],
+            )
+            .await;
+            assert_eq!(
+                report.outcome,
+                OracleCaseOutcome::Compared {
+                    epochs: vec!["snapshot", "insert", "empty_again", "reinsert"],
+                },
+                "sql={sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn equivalent_batch_splits_and_reorders_preserve_the_complete_bag() {
+        // One frontier: the initial duplicate makes both intermediate retraction orders valid.
+        let schema = t1_schema();
+        let initial = make_zset(schema.clone(), vec![vec![1, 1], vec![3, 3], vec![1, 1]], 1);
+        let retract = make_zset(schema.clone(), vec![vec![1], vec![3], vec![1]], -1);
+        let insert = make_zset(schema, vec![vec![2], vec![0], vec![1]], 1);
+        let coalesced = apply_delta_physically(&initial, &concat_zsets(&retract, &insert));
+        let split = apply_delta_physically(&apply_delta_physically(&initial, &retract), &insert);
+        let reordered =
+            apply_delta_physically(&apply_delta_physically(&initial, &insert), &retract);
+        let result = |zset: &ArrowZSet| {
+            let mut bag = empty_result(zset.data.schema().as_ref());
+            add_batch_rows(&mut bag, &zset.data, &zset.weights);
+            bag
+        };
+        let expected = typed_result(
+            vec![
+                OracleField {
+                    data_type: DataType::Int64,
+                    nullable: false
+                };
+                3
+            ],
+            vec![
+                (
+                    vec![
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(3)),
+                        ScalarValue::Int64(Some(1)),
+                    ],
+                    1,
+                ),
+                (
+                    vec![
+                        ScalarValue::Int64(Some(2)),
+                        ScalarValue::Int64(Some(0)),
+                        ScalarValue::Int64(Some(1)),
+                    ],
+                    1,
+                ),
+            ],
+        );
+        for actual in [&coalesced, &split, &reordered] {
+            assert_eq!(result(actual), expected);
+        }
+    }
+
+    #[test]
+    fn absent_retraction_is_reported() {
+        let current = ArrowZSet::empty(t1_schema());
+        let delta = make_zset(t1_schema(), vec![vec![1], vec![2], vec![3]], -1);
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply_delta_physically(&current, &delta)
+        }))
+        .unwrap_err();
+        assert_eq!(
+            failure.downcast_ref::<String>().unwrap(),
+            "invalid retraction of absent row [Int64(1), Int64(2), Int64(3)]"
         );
     }
 }
