@@ -222,10 +222,6 @@ jobs:
       - name: Install pinned Verus
         if: needs.ci-policy.outputs.expensive == 'true'
         run: echo "$(bash scripts/install-verus.sh)" >> "$GITHUB_PATH"
-      - uses: actions/setup-python@v5
-        if: needs.ci-policy.outputs.expensive == 'true'
-        with:
-          python-version: "3.11"
       - name: Verify Rust kernels
         if: needs.ci-policy.outputs.expensive == 'true'
         run: make verify-rust
