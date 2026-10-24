@@ -690,3 +690,17 @@ evidence = [
     "cargo test --locked -p pgwire --lib framing_properties",
     "cargo test --locked -p rockstream-gateway --test v072_pgwire_malformed_frame_tests",
 ]
+
+[[claims]]
+id = "VS7-01"
+status = "adapter-qualified"
+domain = "A reservation releases local channel counters only for its owning channel instance, while aggregate bytes and requests fall once on cancellation or ACK."
+assumptions = ["Each channel instance owns a unique live Arc token; the controller lock serializes accounting transitions; a permit is released or handed off once; channel keys with any delivered reservation are retired at teardown because wire ACKs carry no generation."]
+implementation = ["crates/rockstream-verified/src/ownership.rs::same_owner", "crates/rockstream-verified/src/ownership.rs::release_accounting", "crates/rockstream-runtime/src/exchange/flow_control.rs::release_batch_permit"]
+theorems = ["crates/rockstream-verified/src/ownership.rs::same_owner", "crates/rockstream-verified/src/ownership.rs::release_accounting"]
+production_callers = ["crates/rockstream-runtime/src/exchange/flow_control.rs::handoff", "crates/rockstream-runtime/src/exchange/flow_control.rs::release_batch_permit"]
+regression_tests = ["crates/rockstream-runtime/src/exchange/flow_control.rs::old_permit_cannot_release_recreated_channel", "crates/rockstream-runtime/src/exchange/flow_control.rs::delivered_cancelled_and_torn_down_reservations_keep_exact_charges", "crates/rockstream-runtime/src/exchange/flow_control.rs::lowering_live_row_budget_preserves_charges"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-runtime --lib exchange::flow_control",
+]

@@ -792,6 +792,24 @@ futures or per-channel notifier identity. This documents the formal boundary
 required by DC.2; the v0.72 resource inventory, physical memory bounds,
 producer-side pressure and release-process evidence remain incomplete.
 
+Issue #236 strengthens exchange reservation identity after channel teardown.
+An acknowledgment carries only the channel key and epoch/sequence, not a unique
+channel generation. Consequently, a key that has delivered a frame is retired
+for the lifetime of its controller: a delayed acknowledgment must not release
+credits held by a replacement channel with the same key. Fresh keys that have
+never delivered remain reusable. Reservation handoff and release compare the
+owning channel token before changing per-channel row, batch, or byte accounting;
+aggregate outstanding credits remain attached to the original reservation
+until its own completion or teardown. A late or duplicate ACK cannot transfer
+ownership to another channel. The production
+`v072_exchange_credit_waiters` and flow-controller lifecycle tests assert
+this accounting through cancellation, teardown, and stale ACKs. The associated
+Verus ownership kernel proves only the local owner/release arithmetic.
+The abstract FizzBee M1–M7 models do not contain channel generations, Tokio
+permits, or per-channel byte budgets, so they do not prove ACK identity or wire
+liveness. This is an implementation-level refinement under the DC.2
+coordination-model coupling rule, not a new abstract transition.
+
 Issue #117 closes an implementation-level liveness gap in exchange flow control.
 `FlowController::acquire_batch_permit`, used by `WorkerStreamMultiplexer::send_frame`,
 and the separately reachable row-only `acquire_credit` register their Tokio

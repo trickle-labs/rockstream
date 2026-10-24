@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import tempfile
 import tomllib
 import unittest
@@ -25,6 +26,7 @@ class GateSelfTests(unittest.TestCase):
         manifest = tomllib.loads((ROOT / "crates/rockstream-gateway/Cargo.toml").read_text())
         self.assertEqual(manifest["features"], {"testcontainers": []})
         self.assertEqual(POLICY["jobs"]["pr-gateway"]["features"], ["testcontainers"])
+        self.assertEqual(POLICY["jobs"]["pr-gateway"]["services"], ["docker"])
         self.assertEqual(POLICY["jobs"]["pr-gateway"]["conformance_targets"], [
             "rockstream-gateway/test:" + name for name in (
                 "auth_scram_tests", "gateway_dml_tests", "gateway_extended_query_tests",
@@ -36,6 +38,39 @@ class GateSelfTests(unittest.TestCase):
     def setUp(self):
         self.target = {"package": "rockstream-sim", "kind": "test", "name": "chaos_tests"}
         self.key = gate.target_id(**self.target)
+
+    def test_balanced_ownership_and_nightly_scale_preserve_pr_families(self):
+        packages, targets = gate.inventory(gate.cargo_metadata())
+        owner = gate.assignments(targets, packages, POLICY)
+        self.assertEqual([gate.target_id(**t) for t in gate.selected_targets(
+            "pr-gateway", targets, owner, POLICY)], sorted(
+                POLICY["jobs"]["pr-gateway"]["conformance_targets"] +
+                ["rockstream-gateway/test:conformance_doc_tests"]))
+        for package, job in {
+            "rockstream-oracle": "pr-oracle", "rockstream-ops": "pr-ops",
+            "rockstream-storage": "pr-storage-sql", "rockstream-sql": "pr-storage-sql",
+        }.items():
+            self.assertEqual({k: v for k, v in owner.items() if k.startswith(package + "/")},
+                             {k: job for k in targets if k.startswith(package + "/")})
+        nightly = "rockstream-gateway/test:view_refresh_proportionality_tests"
+        ordinary = "rockstream-gateway/test:view_refresh_proportionality_pr_tests"
+        self.assertEqual({k: owner[k] for k in (nightly, ordinary)}, {
+            nightly: "nightly-seeds", ordinary: "pr-gateway-components",
+        })
+        self.assertEqual(POLICY["jobs"]["nightly-seeds"]["package_features"], {"rockstream-gateway": []})
+        self.assertEqual(POLICY["jobs"]["pr-gateway-components"], {
+            "tier": "pull_request", "features": ["testcontainers"], "services": ["docker"],
+        })
+        for name, rows, chunk in ((nightly, "1_000_000", "50_000"), (ordinary, "10_000", "1_000")):
+            source = (ROOT / "crates/rockstream-gateway/tests" / (name.split(":")[1] + ".rs")).read_text()
+            self.assertIn('#[path = "support/view_refresh_proportionality.rs"]', source)
+            self.assertEqual(re.findall(r"proportionality::(\w+)\(([^,]+), ([^)]+)\).await;", source),
+                             [(family, rows, chunk) for family in (
+                                 "stateless_project", "aggregate", "join", "session_window")])
+        workflow = (ROOT / ".github/workflows/test-accounting-expensive.yml").read_text()
+        self.assertIn('cron: "15 2 * * *"', workflow)
+        self.assertIn("run: python3 scripts/ci-test-inventory.py run --job nightly-seeds", workflow)
+        self.assertIn("name: nightly-seeds-test-evidence", workflow)
 
     def assertFails(self, fn, message):
         with self.assertRaisesRegex(ValueError, message):
@@ -161,7 +196,8 @@ class GateSelfTests(unittest.TestCase):
                         "conformance_targets": [wire_key], "services": [],
                         "test_threads": {wire_key: 4}}
                 policy = {"jobs": {"fixture": spec}, "known_limitations": {}}
-                events = [] if event is None else [{"type": "test", "name": "must_run", "event": event}]
+                events = [] if event is None else [{"type": "test", "name": "must_run", "event": event,
+                                                   "exec_time": 1.25}]
                 calls = []
 
                 def run(argv, cwd, env):
@@ -171,7 +207,7 @@ class GateSelfTests(unittest.TestCase):
                     if argv[1:] == ["--list"]:
                         return CompletedProcess(argv, 0, "must_run: test\n", "")
                     threads = 1 if argv[0] == "conformance_doc_tests" else 4
-                    self.assertEqual(argv[1:], ["-Z", "unstable-options", "--format", "json", f"--test-threads={threads}"])
+                    self.assertEqual(argv[1:], ["-Z", "unstable-options", "--format", "json", "--report-time", f"--test-threads={threads}"])
                     if argv[0] == "conformance_doc_tests":
                         self.assertEqual(report.read_text(), "".join(json.dumps(e) + "\n" for e in events))
                         output = [{"type": "test", "name": "must_run", "event": "ok"}]
@@ -188,15 +224,16 @@ class GateSelfTests(unittest.TestCase):
                 self.assertEqual(build.call_args.args[2], ["testcontainers"])
                 self.assertEqual(calls, [
                     ["wire_tests", "--list"],
-                    ["wire_tests", "-Z", "unstable-options", "--format", "json", "--test-threads=4"],
+                    ["wire_tests", "-Z", "unstable-options", "--format", "json", "--report-time", "--test-threads=4"],
                     ["conformance_doc_tests", "--list"],
-                    ["conformance_doc_tests", "-Z", "unstable-options", "--format", "json", "--test-threads=1"],
+                    ["conformance_doc_tests", "-Z", "unstable-options", "--format", "json", "--report-time", "--test-threads=1"],
                 ])
                 result = json.loads(out.read_text())
                 self.assertEqual(result["status"], expected_status)
                 self.assertEqual(code, int(expected_status == "failed"))
                 self.assertEqual(result["targets"][0]["tests"], [{
                     "id": "rockstream-gateway::test/wire_tests::must_run",
+                    **({"execution_seconds": 1.25} if event is not None else {}),
                     "outcome": {"ok": "passed", "failed": "failed", None: "not_run", "ignored": "unexpected_skip"}[event],
                     "reason": {"ok": None, "failed": "test failed", None: "libtest emitted no terminal execution event",
                                "ignored": "mandatory test is #[ignore]"}[event],

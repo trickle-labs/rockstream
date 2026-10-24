@@ -448,3 +448,12 @@ test_evidence = "recorded: canonical split, malformed body, corpus, and socket r
 review_evidence = "recorded: sign-offs/verus/VS7-pgwire-framing.md"
 qualification_evidence = "blocked: transport delivery and all message-specific body semantics remain external"
 verifier_output = "recorded: pinned Verus, 74 verified, 0 errors"
+
+[[claim_evidence]]
+id = "VS7-01"
+theorem_evidence = "recorded: manifest.theorems; pinned Verus verified the production-used ownership kernels"
+model_evidence = "not-applicable: local accounting transition, not a transport scheduler model"
+test_evidence = "recorded: exact runtime ownership transcripts and verified-kernel unit test"
+review_evidence = "recorded: sign-offs/verus/VS7.md"
+qualification_evidence = "blocked: transport delivery and long-running retired-key churn are outside the local proof"
+verifier_output = "recorded: pinned Verus, 70 verified, 0 errors"

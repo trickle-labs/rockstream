@@ -186,6 +186,8 @@ def observed_results(
         cid = case_id(pkg, kind, name, test_name)
         event = terminal.get(test_name)
         item = {"id": cid, "outcome": "not_run", "reason": None}
+        if event is not None and "exec_time" in event:
+            item["execution_seconds"] = event["exec_time"]
         if test_name not in selected:
             item.update(outcome="not_selected", reason="Supplemental invocation: other cases owned by the primary target job")
         elif event is None:
@@ -376,7 +378,7 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
                             raise RuntimeError(f"--list failed: {listing.stderr[-1000:]}")
                         listed = parse_list(listing.stdout)
                         cases = spec.get("cases", {}).get(t["name"])
-                        args = [executable, "-Z", "unstable-options", "--format", "json", f"--test-threads={threads}"]
+                        args = [executable, "-Z", "unstable-options", "--format", "json", "--report-time", f"--test-threads={threads}"]
                         args += libtest_flags(key, spec)
                         if cases is not None:
                             # Supplemental jobs select explicit expensive cases, one execution per ID.

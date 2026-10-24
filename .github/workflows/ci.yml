@@ -164,6 +164,8 @@ jobs:
         run: bash scripts/check-operator-state-bytes.test.sh
       - name: CI test-accounting self-tests
         run: python3 scripts/ci-test-inventory.test.py
+      - name: Benchmark scheduling self-tests
+        run: python3 -B scripts/run-benchmark-gate.test.py
       - name: CI lane and image self-tests
         run: python3 scripts/ci-policy.test.py
       - name: CI prose-only scope and required-check self-tests
@@ -178,21 +180,26 @@ jobs:
       - name: qualification execution gate self-tests
         run: bash scripts/check-qualification-mutations.test.sh
 
-  verus-verify:
-    name: Verus verify and qualify (VS6)
+  verus-qualify:
+    name: VS6 clean phase (${{ matrix.os }}, ${{ matrix.phase }})
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-14]
+        phase: [debug, release]
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
     needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
       VERUS_QUALIFICATION_TARGET: ${{ matrix.target }}
+      VERUS_QUALIFICATION_OUTPUT: evidence/verus/${{ matrix.target }}/${{ matrix.phase }}
+      VERUS_QUALIFICATION_PHASE: ${{ matrix.phase }}
     steps:
       - name: Validate qualification selection
         env:
@@ -223,10 +230,10 @@ jobs:
         if: needs.ci-policy.outputs.expensive == 'true'
         run: echo "$(bash scripts/install-verus.sh)" >> "$GITHUB_PATH"
       - name: Verify Rust kernels
-        if: needs.ci-policy.outputs.expensive == 'true'
+        if: matrix.phase == 'debug'
         run: make verify-rust
       - name: Verify proof contracts
-        if: needs.ci-policy.outputs.expensive == 'true'
+        if: matrix.phase == 'debug'
         run: make verify-proof-contracts
       - name: Run clean VS6 qualification matrix
         if: needs.ci-policy.outputs.expensive == 'true'
@@ -235,19 +242,97 @@ jobs:
         if: always() && needs.ci-policy.outputs.expensive == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: verus-qualification-${{ matrix.target }}
-          path: evidence/verus/
+          name: verus-phase-${{ matrix.target }}-${{ matrix.phase }}
+          overwrite: true
+          path: evidence/verus/${{ matrix.target }}/${{ matrix.phase }}
           if-no-files-found: error
           retention-days: 14
+
+  verus-verify:
+    name: Verus verify and qualify (VS6)
+    timeout-minutes: 90
+    needs: [ci-policy, verus-qualify]
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      VERUS_QUALIFICATION_OUTPUT: evidence/verus/${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate all qualification phases or the explicit prose exclusion
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-scope.py check-verus
+      - uses: dtolnay/rust-toolchain@master
+        if: needs.ci-policy.outputs.scope == 'full'
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+        if: needs.ci-policy.outputs.scope == 'full'
+      - uses: actions/download-artifact@v4
+        if: needs.ci-policy.outputs.scope == 'full'
+        with:
+          name: verus-phase-${{ matrix.target }}-debug
+          path: target/verus-phases/debug
+      - uses: actions/download-artifact@v4
+        if: needs.ci-policy.outputs.scope == 'full'
+        with:
+          name: verus-phase-${{ matrix.target }}-release
+          path: target/verus-phases/release
+      - name: Assemble complete source-bound qualification
+        if: needs.ci-policy.outputs.scope == 'full'
+        env:
+          QUALIFY_TARGET: ${{ matrix.target }}
+        run: |
+          python3 scripts/record-verus-qualification.py --root . --run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --status passed --merge target/verus-phases --target "$QUALIFY_TARGET" \
+            --output "$VERUS_QUALIFICATION_OUTPUT/qualification.json"
       - name: Exercise production wrapper
-        if: needs.ci-policy.outputs.expensive == 'true'
+        if: needs.ci-policy.outputs.scope == 'full'
         run: cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests
+      - name: Smoke-test the clean workspace Cargo consumers
+        if: needs.ci-policy.outputs.scope == 'full'
+        run: |
+          "$VERUS_QUALIFICATION_OUTPUT/rockstream-debug" --help
+          "$VERUS_QUALIFICATION_OUTPUT/rockstream-release" --help
+      - name: Upload complete VS6 qualification evidence
+        if: always() && needs.ci-policy.outputs.scope == 'full'
+        uses: actions/upload-artifact@v4
+        with:
+          name: verus-qualification-${{ matrix.target }}
+          overwrite: true
+          path: evidence/verus/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+
+  verus-consumer:
+    name: Ordinary CLI consumer (${{ matrix.os }})
+    timeout-minutes: 90
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: verus-ordinary-consumer
+      # CLI-only feature resolution differs from the clean workspace qualification.
       - name: Build ordinary Cargo consumer
-        if: needs.ci-policy.outputs.expensive == 'true'
         run: cargo build --locked --release -p rockstream-cli
-      - name: Record intentional documentation-only exclusion
-        if: needs.ci-policy.outputs.expensive == 'false'
-        run: echo "Full qualification excluded by the recorded documentation-only PR policy."
 
   check-tests:
     needs: ci-policy
@@ -262,6 +347,10 @@ jobs:
           - crates
           - sim-unit
           - sim-integration
+          - oracle
+          - ops
+          - storage-sql
+          - gateway-components
     permissions:
       actions: write
       contents: read
@@ -280,7 +369,7 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: Require Docker
-        if: matrix.shard == 'crates'
+        if: contains(fromJSON('["crates", "oracle", "ops", "storage-sql", "gateway-components"]'), matrix.shard)
         run: docker info
       - name: Record workspace test case execution
         if: matrix.shard == 'workspace'
@@ -294,6 +383,9 @@ jobs:
       - name: Record all ordinary simulation integration cases
         if: matrix.shard == 'sim-integration'
         run: python3 scripts/ci-test-inventory.py run --job pr-sim
+      - name: Record balanced package shard execution
+        if: contains(fromJSON('["oracle", "ops", "storage-sql", "gateway-components"]'), matrix.shard)
+        run: python3 scripts/ci-test-inventory.py run --job pr-${{ matrix.shard }}
       - name: Qualification helper checks (not release evidence)
         if: matrix.shard == 'sim-integration'
         run: bash scripts/run-release-qualification.sh --fast --output target/qualification-helpers.json
@@ -314,7 +406,8 @@ jobs:
 
   gateway:
     name: Check tests (gateway)
-    needs: docker-build
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -328,9 +421,9 @@ jobs:
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-      - uses: ./.github/actions/load-candidate-image
-        with:
-          image-id: ${{ needs.docker-build.outputs.image-id }}
+      # GatewayServer runs in process; its external services use their own images.
+      - name: Require Docker
+        run: docker info
       - name: Record gateway cases and PGWire conformance events once
         run: python3 scripts/ci-test-inventory.py run --job pr-gateway
       - name: Upload exact gateway test execution evidence
@@ -386,6 +479,7 @@ jobs:
       - control-plane-ha
       - formal-verify
       - verus-verify
+      - verus-consumer
       - nexmark-regression-gate
       - benchmark
       - docker-build
@@ -536,103 +630,46 @@ jobs:
         if: needs.ci-policy.outputs.expensive == 'false'
         run: echo "Full qualification excluded by the recorded documentation-only PR policy."
 
-  benchmark:
-    name: Performance-regression gate (ops/storage/runtime/control)
+  benchmark-suites:
+    name: Benchmark (${{ matrix.suite }})
     needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
     runs-on: ubuntu-latest
-    # Locally measured sum of the four `cargo bench --noplot` wall-clock
-    # times is ~4 minutes on a warm cache; sized generously above that plus
-    # checkout/build overhead so a slow CI runner doesn't flake. Recorded in
-    # `.claude/v0.45.4-evidence.md`.
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [ops, storage, runtime, control]
     steps:
-      - name: Validate qualification selection
-        env:
-          EXPENSIVE: ${{ needs.ci-policy.outputs.expensive }}
-        run: test "$EXPENSIVE" = true || test "$EXPENSIVE" = false
       - uses: actions/checkout@v4
-        if: needs.ci-policy.outputs.expensive == 'true'
       - uses: dtolnay/rust-toolchain@master
-        if: needs.ci-policy.outputs.expensive == 'true'
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
-        if: needs.ci-policy.outputs.expensive == 'true'
-      - name: run rockstream-ops bench
-        if: needs.ci-policy.outputs.expensive == 'true'
-        run: cargo bench -p rockstream-ops --bench perf_regression -- --noplot | tee ops-bench.out
-      - name: compare rockstream-ops against v0.45.4 baseline
-        if: needs.ci-policy.outputs.expensive == 'true'
-        run: |
-          if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-ops/benches/baseline/v0.45.4-ops.json --output ops-bench.out --tag ops; then
-            exit 0
-          fi
-          for attempt in 1 2; do
-            echo "ops benchmark gate failed; retry $attempt/2 to reject host-noise false positives"
-            output="ops-bench-retry-${attempt}.out"
-            cargo bench -p rockstream-ops --bench perf_regression -- --noplot | tee "$output"
-            if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-ops/benches/baseline/v0.45.4-ops.json --output "$output" --tag ops; then
-              exit 0
-            fi
-          done
-          exit 1
-      - name: run rockstream-storage bench
-        if: needs.ci-policy.outputs.expensive == 'true'
-        run: cargo bench -p rockstream-storage --bench storage_bench -- --noplot | tee storage-bench.out
-      - name: compare rockstream-storage against v0.45.4 baseline
-        if: needs.ci-policy.outputs.expensive == 'true'
-        run: |
-          if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-storage/benches/baseline/v0.45.4-storage.json --output storage-bench.out --tag storage; then
-            exit 0
-          fi
-          for attempt in 1 2; do
-            echo "storage benchmark gate failed; retry $attempt/2 to reject host-noise false positives"
-            output="storage-bench-retry-${attempt}.out"
-            cargo bench -p rockstream-storage --bench storage_bench -- --noplot | tee "$output"
-            if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-storage/benches/baseline/v0.45.4-storage.json --output "$output" --tag storage; then
-              exit 0
-            fi
-          done
-          exit 1
-      - name: run rockstream-runtime bench
-        if: needs.ci-policy.outputs.expensive == 'true'
-        run: cargo bench -p rockstream-runtime --bench exchange_bench -- --noplot | tee runtime-bench.out
-      - name: compare rockstream-runtime against v0.51 baseline
-        if: needs.ci-policy.outputs.expensive == 'true'
-        run: |
-          if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.51-runtime.json --output runtime-bench.out --tag runtime; then
-            exit 0
-          fi
-          for attempt in 1 2; do
-            echo "runtime benchmark gate failed; retrying (${attempt}/2) to reject host-noise false positives"
-            retry_output="runtime-bench-retry-${attempt}.out"
-            cargo bench -p rockstream-runtime --bench exchange_bench -- --noplot | tee "$retry_output"
-            if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.51-runtime.json --output "$retry_output" --tag runtime; then
-              exit 0
-            fi
-          done
-          exit 1
-      - name: run rockstream-control bench
-        if: needs.ci-policy.outputs.expensive == 'true'
-        run: cargo bench -p rockstream-control --bench frontier_bench -- --noplot | tee control-bench.out
-      - name: compare rockstream-control against v0.45.4 baseline
-        if: needs.ci-policy.outputs.expensive == 'true'
-        run: |
-          if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-control/benches/baseline/v0.45.4-control.json --output control-bench.out --tag control; then
-            exit 0
-          fi
-          for attempt in 1 2; do
-            echo "control benchmark gate failed; retry $attempt/2 to reject host-noise false positives"
-            output="control-bench-retry-${attempt}.out"
-            cargo bench -p rockstream-control --bench frontier_bench -- --noplot | tee "$output"
-            if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-control/benches/baseline/v0.45.4-control.json --output "$output" --tag control; then
-              exit 0
-            fi
-          done
-          exit 1
-      - name: Record intentional documentation-only exclusion
-        if: needs.ci-policy.outputs.expensive == 'false'
-        run: echo "Full qualification excluded by the recorded documentation-only PR policy."
+        with:
+          shared-key: benchmark-${{ matrix.suite }}
+      - name: Run package benchmark and existing regression gate
+        run: bash scripts/run-benchmark-gate.sh "${{ matrix.suite }}"
+      - name: Upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.suite }}
+          overwrite: true
+          path: "*-bench-*.out"
+          if-no-files-found: error
+
+  benchmark:
+    name: Performance-regression gate (ops/storage/runtime/control)
+    needs: [ci-policy, benchmark-suites]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate all benchmark suites or the explicit prose exclusion
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-scope.py check-benchmarks
 
   release-version-check:
     name: Version / tag alignment

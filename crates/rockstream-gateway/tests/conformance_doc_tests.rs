@@ -567,66 +567,47 @@ fn test_dependabot_config_is_valid() {
 /// the comparator logic works in isolation.
 #[test]
 fn test_benchmark_ci_job_exists_and_covers_four_subsystems() {
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
-    let ci_path = repo_root.join(".github/workflows/ci.yml");
-
-    let content = std::fs::read_to_string(&ci_path).expect("failed to read ci.yml");
-
-    // Isolate the `benchmark:` job's body: from its header (a line starting
-    // with exactly two spaces then `benchmark:`) up to the next line that
-    // starts a new top-level job (two-space indent followed by a bare key,
-    // not further-indented step content).
-    let lines: Vec<&str> = content.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| *l == "  benchmark:")
-        .expect("ci.yml must contain a top-level `benchmark:` job");
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| {
-            !l.is_empty() && l.starts_with("  ") && !l.starts_with("   ") && l.ends_with(':')
-        })
-        .map(|i| start + 1 + i)
-        .unwrap_or(lines.len());
-    let job_body = lines[start..end].join("\n");
-    let job_body = job_body.as_str();
-
-    assert!(
-        job_body.contains("timeout-minutes:"),
-        "benchmark job must declare a `timeout-minutes` bound"
+    let root = repo_root();
+    let workflow: serde_yaml::Value = serde_yaml::from_str(
+        &std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap(),
+    )
+    .expect("CI workflow must be valid YAML");
+    let jobs = &workflow["jobs"];
+    let suites = &jobs["benchmark-suites"];
+    let gate = &jobs["benchmark"];
+    assert_eq!(suites["timeout-minutes"].as_u64(), Some(90));
+    let matrix = suites["strategy"]["matrix"]["suite"]
+        .as_sequence()
+        .expect("benchmark suites must be an explicit matrix");
+    let actual: BTreeSet<_> = matrix.iter().map(|value| value.as_str().unwrap()).collect();
+    assert_eq!(
+        actual,
+        BTreeSet::from(["ops", "storage", "runtime", "control"])
     );
-    let timeout_line = job_body
-        .lines()
-        .find(|l| l.trim_start().starts_with("timeout-minutes:"))
-        .expect("timeout-minutes line must exist");
-    let timeout_value = timeout_line
-        .split(':')
-        .nth(1)
-        .map(|s| s.trim())
-        .unwrap_or("");
-    assert!(
-        timeout_value.parse::<u32>().is_ok(),
-        "benchmark job's timeout-minutes must be numeric, got {:?}",
-        timeout_value
-    );
-
+    let commands: Vec<_> = suites["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .collect();
+    assert!(commands
+        .iter()
+        .any(|run| run.contains("scripts/run-benchmark-gate.sh")));
+    let gate_needs = gate["needs"]
+        .as_sequence()
+        .expect("benchmark gate must depend on suites");
+    assert!(gate_needs
+        .iter()
+        .any(|need| need.as_str() == Some("benchmark-suites")));
+    assert!(gate["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .any(|run| run.contains("scripts/ci-scope.py check-benchmarks")));
+    let runner = std::fs::read_to_string(root.join("scripts/run-benchmark-gate.sh")).unwrap();
     for tag in ["ops", "storage", "runtime", "control"] {
-        assert!(
-            job_body.contains(&format!("--tag {tag}")),
-            "benchmark job must invoke bench_regression_gate with `--tag {tag}`"
-        );
-        let baseline_path = if tag == "ops" {
-            "crates/rockstream-ops/benches/baseline/v0.45.4-ops.json".to_string()
-        } else if tag == "runtime" {
-            "crates/rockstream-runtime/benches/baseline/v0.51-runtime.json".to_string()
-        } else {
-            format!("crates/rockstream-{tag}/benches/baseline/v0.45.4-{tag}.json")
-        };
-        assert!(
-            job_body.contains(&baseline_path),
-            "benchmark job must reference baseline path `{baseline_path}`"
-        );
+        assert!(runner.contains(tag), "benchmark runner must support {tag}");
     }
 }
 
