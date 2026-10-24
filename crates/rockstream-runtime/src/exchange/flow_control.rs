@@ -42,6 +42,29 @@ impl ChannelCreditState {
     }
 }
 
+/// One lock protects both live reservations and retired channel keys.
+/// A separate retired-key mutex added measurable overhead to the common
+/// credit-acquire/ACK path while providing no extra synchronization guarantee.
+#[derive(Default)]
+struct ChannelRegistry {
+    live: HashMap<CreditKey, ChannelCreditState>,
+    retired: HashSet<CreditKey>,
+}
+
+impl std::ops::Deref for ChannelRegistry {
+    type Target = HashMap<CreditKey, ChannelCreditState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.live
+    }
+}
+
+impl std::ops::DerefMut for ChannelRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.live
+    }
+}
+
 /// A per-channel notifier exists only while an actual legacy row-credit
 /// waiter owns it. This bounds the notifier registry across many ephemeral
 /// channels instead of retaining a key forever after cancellation.
@@ -177,9 +200,8 @@ pub struct FlowController {
     max_inflight_bytes: usize,
     max_batch_bytes: usize,
     max_pending_requests: usize,
-    channels: Arc<Mutex<HashMap<CreditKey, ChannelCreditState>>>,
-    // shortcut: delivered keys stay retired for this controller's lifetime; add a wire generation before supporting high-churn ID reuse.
-    retired: Arc<Mutex<HashSet<CreditKey>>>,
+    // Delivered IDs remain retired until a wire-level generation can distinguish them.
+    channels: Arc<Mutex<ChannelRegistry>>,
     notifiers: Arc<Mutex<HashMap<CreditKey, ChannelNotifier>>>,
     aggregate_bytes: Arc<AtomicU64>,
     pending_requests: Arc<AtomicU64>,
@@ -210,8 +232,7 @@ impl FlowController {
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             max_pending_requests: DEFAULT_MAX_PENDING_REQUESTS,
-            channels: Arc::new(Mutex::new(HashMap::new())),
-            retired: Arc::new(Mutex::new(HashSet::new())),
+            channels: Arc::new(Mutex::new(ChannelRegistry::default())),
             notifiers: Arc::new(Mutex::new(HashMap::new())),
             aggregate_bytes: Arc::new(AtomicU64::new(0)),
             pending_requests: Arc::new(AtomicU64::new(0)),
@@ -427,13 +448,12 @@ impl FlowController {
         }
 
         let key = (exchange_id, src_shard, target_shard);
-        let retired = self.retired.lock();
-        if retired.contains(&key) {
+        let mut channels = self.channels.lock();
+        if channels.retired.contains(&key) {
             return Err(format!(
                 "[{RS_3006}] exchange channel was retired; use a new exchange ID"
             ));
         }
-        let mut channels = self.channels.lock();
 
         let cur_pending = self.pending_requests.load(Ordering::Relaxed) as usize;
         if cur_pending >= self.max_pending_requests {
@@ -602,14 +622,14 @@ impl FlowController {
     /// Purge all channel credit state and notifier entries for the given exchange.
     pub fn teardown_exchange(&self, exchange_id: u64) {
         {
-            let mut retired = self.retired.lock();
             let mut channels = self.channels.lock();
+            let mut retired = Vec::new();
             channels.retain(|key, state| {
                 if key.0 != exchange_id {
                     return true;
                 }
                 if state.had_delivery {
-                    retired.insert(*key);
+                    retired.push(*key);
                 }
                 let bytes = state
                     .awaiting_ack
@@ -621,6 +641,7 @@ impl FlowController {
                     .fetch_sub(state.awaiting_ack.len() as u64, Ordering::Relaxed);
                 false
             });
+            channels.retired.extend(retired);
             let cur_bytes = self.aggregate_bytes.load(Ordering::Relaxed);
             let cur_pending = self.pending_requests.load(Ordering::Relaxed);
             Self::update_batch_metrics(&channels, cur_bytes, cur_pending);
@@ -660,11 +681,10 @@ impl FlowController {
     pub fn handle_ack(&self, ack: &ShuffleAck) {
         let key = (ack.exchange_id, ack.src_shard, ack.target_shard);
         let reservation = {
-            let retired = self.retired.lock();
-            if retired.contains(&key) {
+            let mut channels = self.channels.lock();
+            if channels.retired.contains(&key) {
                 return;
             }
-            let mut channels = self.channels.lock();
             let state = self.channel_state(&mut channels, key);
             if let Some(index) = state
                 .awaiting_ack
@@ -698,11 +718,10 @@ impl FlowController {
     ) {
         let key = (exchange_id, src_shard, target_shard);
         {
-            let retired = self.retired.lock();
-            if retired.contains(&key) {
+            let mut channels = self.channels.lock();
+            if channels.retired.contains(&key) {
                 return;
             }
-            let mut channels = self.channels.lock();
             let state = self.channel_state(&mut channels, key);
             let released = row_count.min(state.rows_in_flight);
             state.rows_in_flight -= released;
@@ -735,11 +754,10 @@ impl FlowController {
     /// Set initial/explicit row credits for a pathway.
     pub fn set_credits(&self, exchange_id: u64, src_shard: u32, target_shard: u32, amount: u32) {
         let key = (exchange_id, src_shard, target_shard);
-        let retired = self.retired.lock();
-        if retired.contains(&key) {
+        let mut channels = self.channels.lock();
+        if channels.retired.contains(&key) {
             return;
         }
-        let mut channels = self.channels.lock();
         if let Some(state) = channels.get_mut(&key) {
             // Replacing a live channel would detach its permit and ACK charges.
             if state.rows_in_flight != 0
@@ -772,13 +790,12 @@ impl FlowController {
     /// state. The common uncontended path needs no waiter allocation or
     /// notifier-map lock; rejected attempts never consume partial credits.
     fn try_acquire_rows(&self, key: CreditKey, row_count: u32) -> Result<bool, String> {
-        let retired = self.retired.lock();
-        if retired.contains(&key) {
+        let mut channels = self.channels.lock();
+        if channels.retired.contains(&key) {
             return Err(format!(
                 "[{RS_3006}] exchange channel was retired; use a new exchange ID"
             ));
         }
-        let mut channels = self.channels.lock();
         let state = self.channel_state(&mut channels, key);
         if state.available_rows < row_count {
             return Ok(false);
