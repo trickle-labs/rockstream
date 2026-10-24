@@ -297,15 +297,15 @@ async fn test_multi_page_catalog_scan_continues_to_completion() {
     // Single page scan hits MAX_SCAN_PAGE_SIZE (1024)
     let page1 = CatalogLogManager::scan_page(&all_txns, 0, 1024).await;
     assert_eq!(page1.transactions, all_txns[..1024].to_vec());
-    assert_eq!(page1.has_more, true);
+    assert!(page1.has_more);
     assert_eq!(page1.next_cursor, Some(1024));
     let page2 = CatalogLogManager::scan_page(&all_txns, 1024, 1024).await;
     assert_eq!(page2.transactions, all_txns[1024..2048].to_vec());
-    assert_eq!(page2.has_more, true);
+    assert!(page2.has_more);
     assert_eq!(page2.next_cursor, Some(2048));
     let page3 = CatalogLogManager::scan_page(&all_txns, 2048, 1024).await;
     assert_eq!(page3.transactions, all_txns[2048..].to_vec());
-    assert_eq!(page3.has_more, false);
+    assert!(!page3.has_more);
     assert_eq!(page3.next_cursor, None);
 
     // Multi-page continuing scan traverses the entire catalog without truncation
