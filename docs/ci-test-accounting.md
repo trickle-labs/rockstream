@@ -18,29 +18,67 @@ A known `#[ignore]` case may only be recorded as a **limitation** if individuall
 
 | Job key | Trigger | Scope |
 | --- | --- | --- |
-| `pr-workspace` | CI PR/push | Default testable Cargo targets in lightweight workspace packages |
-| `pr-crates` | CI PR/push | Connectors, control, ops, runtime, storage and SQL, with per-package features |
-| `pr-gateway` | CI PR/push | Gateway and TestContainers feature, requires Docker |
+| `pr-workspace` | CI PR/push | Default testable Cargo targets in lightweight workspace packages, excluding oracle |
+| `pr-crates` | CI PR/push | Connectors, control and runtime, with per-package features |
+| `pr-oracle` | CI PR/push | All oracle tests, including broad properties and retraction seeds |
+| `pr-ops` | CI PR/push | Operator tests, including storage/cache boundaries |
+| `pr-storage-sql` | CI PR/push | Storage and SQL, with SQL TestContainers enabled |
+| `pr-gateway` | CI PR/push | Eight conformance-producing targets and their documentation consumer; requires Docker |
+| `pr-gateway-components` | CI PR/push | Remaining gateway targets with TestContainers; all-family 10,000-row proportionality checks |
 | `pr-postgres-differential` | CI PR/push | Default-feature PostgreSQL differential target, including the ignored reference corpus, requires Docker |
 | `pr-sim-unit` | CI PR/push | Simulation library |
 | `pr-sim` | CI PR/push | Explicitly assigned ordinary simulation integration targets |
 | `pr-ha` | CI PR/push | Separate HA suite; Docker hard prerequisite |
-| `nightly-seeds` | daily schedule, dispatch | 100,000-seed chaos, SQL fuzz seed harness, longer simulation soaks |
+| `nightly-seeds` | daily schedule, dispatch, tags | 100,000-seed chaos, SQL fuzz seed harness, longer simulation soaks, and all-family million-row gateway proportionality checks |
 | `nightly-docker` | daily schedule, dispatch | Docker simulation/MinIO/recovery and resource tests |
 | `release-docker` | tag or explicit dispatch | Real rolling-upgrade cases; requires two configured distinct image references |
 | `daily-resource` | separate daily resource-soak workflow | Four-hour MinIO resource-lifecycle gate, independently reported (the existing dedicated workflow owns it) |
 
 The PR jobs are called in `ci.yml`, also on its nightly schedule and explicit dispatch. Seeded, Docker and release suites are called in `test-accounting-expensive.yml`; the existing specialized resource, real-cluster chaos, and fuzz workflows remain independent reports. Release image variables `ROCKSTREAM_ROLLING_N_IMAGE` and `ROCKSTREAM_ROLLING_N_PLUS_1_IMAGE` must reference distinct, available images. If absent, the release job fails and the release claim remains blocked. The specialized real-cluster chaos job retains its per-cell SLO gate; no retry or non-blocking bypass is added.
 
-**Mandatory PR safety checks, collectively:** `Check` (quality + five test shards + default-feature PostgreSQL differential accounting + lane selection), `Control-plane HA smoke`, `Formal verify (M1–M4, M6–M7)`, both `Verus verify and qualify (VS6)` platform checks, `Nexmark regression gate`, `Performance-regression gate (ops/storage/runtime/control)`, and `Docker image (release binary)`. The `Check` aggregator depends on these jobs and fails if any dependency is failed, skipped, cancelled, or missing. **Do not use an older green `Check` run as evidence that independently scheduled checks have passed.** Check the individual job conclusions and recorded lane selection for the PR commit. Existing main ruleset check names remain unchanged; workflow, composite-action and CI policy changes require maintainer ownership review.
+**Mandatory PR safety checks, collectively:** `Check` (quality + nine test shards + default-feature PostgreSQL differential accounting + ordinary CLI consumers on both platforms + lane selection), `Control-plane HA smoke`, `Formal verify (M1–M4, M6–M7)`, both `Verus verify and qualify (VS6)` platform checks, `Nexmark regression gate`, `Performance-regression gate (ops/storage/runtime/control)`, and `Docker image (release binary)`. The performance gate aggregates four independently scheduled package suites. The `Check` aggregator depends on these jobs and fails if any mandatory dependency is failed, skipped, cancelled, or missing. **Do not use an older green `Check` run as evidence that independently scheduled checks have passed.** Check the individual job conclusions and recorded lane selection for the PR commit. Existing main ruleset check names remain unchanged; workflow, composite-action and CI policy changes require maintainer ownership review.
 
 ## Consolidated PR execution (#199)
 
 The gateway feature matrix is intentional: `pr-gateway` runs all owned targets once with `testcontainers` (the package's only declared feature, equivalent to the previous `--all-features` conformance pass). `pr-postgres-differential` exclusively owns `pg18_differential_conformance_tests` with default features, including `--include-ignored`. Thus default-feature reference coverage remains, while that target no longer also runs in the TestContainers pass. The eight `conformance_targets` emit raw libtest events to `target/pgwire-test-results.json` from their accounted invocation. `conformance_doc_tests` runs last and consumes the freshly cleared and regenerated report. Both raw conformance events and exact accounting JSON are uploaded even on failure; missing artifacts fail visibly. No case assertion or ignored-case waiver is weakened.
 
-`Docker image (release binary)` builds and smoke-tests one production image per CI run, tagged and labelled with the candidate `GITHUB_SHA`. It uploads an immutable run-local artifact and exposes its Docker image ID. Gateway and HA consumers download that artifact, require Docker, verify both image ID and revision label, then create the test harness's required `rockstream-tc-test:latest` alias. Each consumer records the verified revision and ID in `candidate-image.tsv`. Missing images, unavailable artifacts, or identity mismatches fail before tests. Other shards start independently of the image build. Separate release rolling-upgrade evidence still requires its two distinct configured image references.
+`Docker image (release binary)` builds and smoke-tests one production image per CI run, tagged and labelled with the candidate `GITHUB_SHA`. It uploads an immutable run-local artifact and exposes its Docker image ID. The HA consumer downloads that artifact, requires Docker, verifies both image ID and revision label, then creates the test harness's required `rockstream-tc-test:latest` alias. It records the verified revision and ID in `candidate-image.tsv`. Missing images, unavailable artifacts, or identity mismatches fail before HA tests. Gateway starts independently after lane selection: its servers run in process and its MinIO, PostgreSQL, Kafka and driver containers use their own images. Docker remains mandatory for gateway. Adding a production-image consumer there requires restoring the image prerequisite and identity verification. Separate release rolling-upgrade evidence still requires its two distinct configured image references.
 
-Only `canonical_type_tests` and `arrangement_spec_isolation_tests` use four libtest threads. These targets operate on local in-memory values with no services, environment mutation, shared ports or files; their exact terminal case identities, outcomes and captured output matched one serial execution and five four-thread repetitions locally. All other targets, including gateway, HA, global-state tests and Docker tests, remain serial. New parallel targets require explicit ownership and a bounded thread count in the existing matrix. Reports record thread counts, target execution seconds and package build seconds (the latter is repeated per target, so count it only once per package).
+Only `canonical_type_tests` and `arrangement_spec_isolation_tests` use four libtest threads. These targets operate on local in-memory values with no services, environment mutation, shared ports or files; their exact terminal case identities, outcomes and captured output matched one serial execution and five four-thread repetitions locally. All other targets, including gateway, HA, global-state tests and Docker tests, remain serial within a job. Balanced package/target owners run on separate runners, so process globals, files, Docker daemons and port spaces are isolated. Conformance producers and their documentation consumer retain one owner and serial report ordering. New parallel targets require explicit ownership and a bounded thread count in the existing matrix. Reports record thread counts, target execution seconds and package build seconds (the latter is repeated per target, so count it only once per package).
+
+The four `view_refresh_proportionality_tests` cases retain their exact IDs and
+million-row workload under `nightly-seeds`. Four new PR cases call the same shared
+functions with 10,000 rows and ten commits. All project, aggregate, join and session
+families retain the same delta-work assertions; a full-table rescan exceeds the
+unchanged threshold at either scale. Only failures specific to the million-row
+scale are deferred to the daily/tag lane. That lane compiles this gateway target
+with default features and records it through the existing inventory runner.
+
+Each benchmark package keeps its existing baseline, comparison command and maximum
+of two comparator retries, but gets its own runner. Build failures fail immediately
+and cannot be hidden by `tee`. The named performance check requires every matrix
+cell to succeed for full CI; only an explicitly classified prose lane permits the
+whole matrix to be skipped. The separate CLI-only release builds remain mandatory
+on Linux and macOS alongside clean Verus qualification: workspace and CLI-only
+feature resolution are not identical. Clean workspace binaries are also smoke-tested.
+
+Clean Verus qualification runs debug/verification and release phases on separate
+runners for each platform. Each phase uses a fresh target directory and the same
+commands and time budgets as the serial runner (`VERUS_QUALIFICATION_PHASE=all`,
+still the local default). A phase emits `phase.json`, never `qualification.json`.
+The existing named Verus checks require all four phase jobs, then validate and merge
+the matching platform artifacts. Revision, target, input digests, exact step IDs,
+success statuses, budgets and runtime binary hashes must match before a full
+qualification record is written. Downloaded binaries regain executable mode only
+after digest verification. Missing or mismatched evidence fails the required check.
+
+Libtest runs with `--report-time`; terminal events that supply `exec_time` also
+record per-case `execution_seconds` in the same accounting report. Missing or
+ignored cases do not acquire fabricated timings. Timing does not change outcome
+classification, report ordering, or mandatory execution requirements. Case time
+includes its fixture setup and teardown; it is not a separate service-start metric.
+See the [October critical-path investigation](ci-critical-path-2026-10.md) for
+measured baseline costs, coverage analysis, and explicitly estimated savings.
 
 ## Qualification lanes
 

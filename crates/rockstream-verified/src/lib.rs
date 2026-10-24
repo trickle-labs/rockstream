@@ -6,14 +6,18 @@ pub mod codecs;
 pub mod frontier;
 pub mod keys;
 pub mod laws;
+pub mod ownership;
 pub mod persistence;
+pub mod physical_commit;
 pub mod routing;
 pub mod zset;
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{aggregate, codecs, frontier, keys, persistence, routing, zset};
+    use super::{
+        aggregate, codecs, frontier, keys, ownership, persistence, physical_commit, routing, zset,
+    };
 
     #[test]
     fn fixed_width_codecs_keep_exact_bytes_and_reject_wrong_widths() {
@@ -218,6 +222,93 @@ mod tests {
         assert!(!persistence::compaction_is_eligible(10, 8, 9, true, false));
         assert!(persistence::recovery_is_ready(true, true, true, true));
         assert!(!persistence::recovery_is_ready(true, true, false, true));
+    }
+
+    #[test]
+    fn physical_commit_kernel_conserves_retained_work_and_ack_boundary() {
+        assert_eq!(
+            physical_commit::begin_owner(true, false, false),
+            Some(physical_commit::FLIGHT_PENDING)
+        );
+        assert_eq!(
+            physical_commit::begin_owner(true, true, false),
+            Some(physical_commit::FLIGHT_UNCERTAIN)
+        );
+        assert_eq!(physical_commit::begin_owner(true, false, true), None);
+        assert_eq!(
+            physical_commit::finish_transition(
+                physical_commit::FLIGHT_PENDING,
+                physical_commit::DURABLE,
+                2,
+                1,
+                9,
+                4,
+                2,
+                1,
+                Some(1),
+                2
+            ),
+            Some((physical_commit::COMMITTED, 1, 5, 1, Some(2), true))
+        );
+        assert_eq!(
+            physical_commit::finish_transition(
+                physical_commit::FLIGHT_PENDING,
+                physical_commit::WRITE_FAILED,
+                2,
+                1,
+                9,
+                4,
+                2,
+                1,
+                Some(1),
+                2
+            ),
+            Some((physical_commit::PENDING, 2, 9, 2, Some(1), false))
+        );
+        assert_eq!(
+            physical_commit::finish_transition(
+                physical_commit::FLIGHT_UNCERTAIN,
+                physical_commit::OUTCOME_UNKNOWN,
+                2,
+                1,
+                9,
+                4,
+                2,
+                1,
+                Some(1),
+                2
+            ),
+            Some((physical_commit::UNCERTAIN, 2, 9, 2, Some(1), false))
+        );
+        assert_eq!(
+            physical_commit::finish_transition(
+                physical_commit::FLIGHT_PENDING,
+                physical_commit::DURABLE,
+                2,
+                1,
+                9,
+                4,
+                2,
+                1,
+                Some(3),
+                2
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn exchange_owner_release_preserves_other_channel_charges() {
+        assert!(ownership::same_owner(11, 11));
+        assert!(!ownership::same_owner(11, 12));
+        assert_eq!(
+            ownership::release_accounting(true, 2, 2, 5, 8, 3, 1, 2),
+            (1, 1, 3, 6, 2)
+        );
+        assert_eq!(
+            ownership::release_accounting(false, 2, 2, 5, 8, 3, 1, 2),
+            (2, 2, 5, 6, 2)
+        );
     }
 }
 
