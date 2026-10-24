@@ -70,16 +70,16 @@ if [ -n "$QUALIFY_TARGET" ]; then
 fi
 if [ "$PHASE" != release ]; then
   run_step verifier env RUSTUP_TOOLCHAIN="${VERUS_RUST_TOOLCHAIN:-1.98.1}" \
-    cargo verus verify -p rockstream-verified --locked "${TARGET_ARGS[@]}"
+    cargo verus verify -p rockstream-verified --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}
   run_step verifier-incremental env CARGO_INCREMENTAL=1 \
     RUSTUP_TOOLCHAIN="${VERUS_RUST_TOOLCHAIN:-1.98.1}" \
-    cargo verus verify -p rockstream-verified --locked "${TARGET_ARGS[@]}"
+    cargo verus verify -p rockstream-verified --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}
   run_step cargo-debug env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" CARGO_PROFILE_DEV_DEBUG=0 \
-    cargo build --workspace --locked "${TARGET_ARGS[@]}"
+    cargo build --workspace --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}
   run_step cargo-check env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
-    cargo check --workspace --locked "${TARGET_ARGS[@]}"
+    cargo check --workspace --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}
   run_step cargo-all-features env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
-    cargo check --workspace --all-features --locked "${TARGET_ARGS[@]}"
+    cargo check --workspace --all-features --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}
 
   # CI runners have a bounded disk quota. Preserve the exact debug executable
   # before clearing its large incremental/rlib build tree. The release profile
@@ -99,7 +99,7 @@ fi
 
 if [ "$PHASE" != debug ]; then
   run_step cargo-release env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.88}" \
-    cargo build --workspace --locked --release "${TARGET_ARGS[@]}"
+    cargo build --workspace --locked --release ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}
 fi
 
 RUNTIME_ARTIFACT="$OUTPUT_ROOT/rockstream-release"

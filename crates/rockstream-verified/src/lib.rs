@@ -17,8 +17,8 @@ pub mod zset;
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        aggregate, codecs, frontier, keys, ownership, persistence, pgwire_framing,
-        physical_commit, routing, zset,
+        aggregate, codecs, frontier, keys, ownership, persistence, pgwire_framing, physical_commit,
+        routing, zset,
     };
 
     #[test]

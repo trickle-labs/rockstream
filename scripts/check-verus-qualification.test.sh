@@ -59,7 +59,7 @@ cp "$ROOT/crates/rockstream-storage/src/keys.rs" "$TMP_ROOT/crates/rockstream-st
 
 bash "$CHECKER" "$ROOT" >/dev/null || fail "real qualification contract did not pass"
 
-expected="verus qualification: 32 claims classified; 6 builds and 7 mutation controls registered."
+expected="verus qualification: 33 claims classified; 6 builds and 7 mutation controls registered."
 actual="$(bash "$CHECKER" "$ROOT")"
 [[ "$actual" == "$expected" ]] || fail "positive checker output changed: $actual"
 
