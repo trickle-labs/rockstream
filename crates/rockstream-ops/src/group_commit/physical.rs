@@ -792,7 +792,7 @@ mod boundary_tests {
         let dir = tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
         let db = Arc::new(
-            ShardDb::builder("unknown-flush-gated", store)
+            ShardDb::builder("unknown-flush-gated", store.clone())
                 .build()
                 .await
                 .unwrap(),
@@ -896,140 +896,250 @@ mod boundary_tests {
             db.get(b"second_k").await.unwrap(),
             Some(bytes::Bytes::from_static(b"second_v"))
         );
+
+        let gate = TestGate::new();
+        group.inner.test_gates.lock().replace(TestGates {
+            before_write: Some(gate.clone()),
+            ..TestGates::default()
+        });
+        let mut third = WriteBatch::new();
+        third.put(b"third_k", b"third_v");
+        let mut fourth = WriteBatch::new();
+        fourth.put(b"fourth_k", b"fourth_v");
+        let third_bytes = third.byte_size();
+        let fourth_bytes = fourth.byte_size();
+        group.add_epoch(3, third).unwrap();
+        let failed_write = {
+            let group = group.clone();
+            tokio::spawn(async move { group.flush().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), gate.reached.notified())
+            .await
+            .unwrap();
+        group.add_epoch(4, fourth).unwrap();
+        db.set_fail_writes(true);
+        group.inner.test_gates.lock().take();
+        gate.proceed.notify_one();
+        assert!(failed_write.await.unwrap().is_err());
+        assert_eq!(group.last_committed(), 2);
+        assert_eq!(
+            group.fill(),
+            PhysicalCommitFill {
+                pending_epochs: 2,
+                retained_epochs: 2,
+                retained_bytes: third_bytes + fourth_bytes,
+                retained_operations: 2,
+                active_waiters: 0,
+                in_flight: false,
+                retry_required: true,
+                outcome_unknown: false,
+                max_bytes: 10 * 1024 * 1024,
+                max_epochs: 64,
+                max_waiters: MAX_GROUP_COMMIT_WAITERS,
+            }
+        );
+        assert_eq!(db.get(b"third_k").await.unwrap(), None);
+        assert_eq!(db.get(b"fourth_k").await.unwrap(), None);
+
+        db.set_fail_writes(false);
+        assert_eq!(group.flush().await.unwrap(), vec![3, 4]);
+        assert_eq!(group.last_committed(), 4);
+        assert_eq!(
+            db.get(b"third_k").await.unwrap(),
+            Some(bytes::Bytes::from_static(b"third_v"))
+        );
+        assert_eq!(
+            db.get(b"fourth_k").await.unwrap(),
+            Some(bytes::Bytes::from_static(b"fourth_v"))
+        );
+        assert_eq!(
+            group.fill(),
+            PhysicalCommitFill {
+                pending_epochs: 0,
+                retained_epochs: 0,
+                retained_bytes: 0,
+                retained_operations: 0,
+                active_waiters: 0,
+                in_flight: false,
+                retry_required: false,
+                outcome_unknown: false,
+                max_bytes: 10 * 1024 * 1024,
+                max_epochs: 64,
+                max_waiters: MAX_GROUP_COMMIT_WAITERS,
+            }
+        );
+        group.shutdown().await.unwrap();
+        drop(group);
+        drop(db);
+        let reopened_db = Arc::new(
+            ShardDb::builder("unknown-flush-gated", store)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let reopened = PhysicalCommitGroup::open(reopened_db.clone())
+            .await
+            .unwrap();
+        assert_eq!(reopened.committed_epoch(), Some(4));
+        assert_eq!(
+            reopened_db.get(b"third_k").await.unwrap(),
+            Some(bytes::Bytes::from_static(b"third_v"))
+        );
+        assert_eq!(
+            reopened_db.get(b"fourth_k").await.unwrap(),
+            Some(bytes::Bytes::from_static(b"fourth_v"))
+        );
+        assert_eq!(reopened.fill(), empty_reopened_fill());
     }
 
     #[tokio::test]
-    async fn cancelled_request_at_each_storage_gate_keeps_both_epochs() {
+    async fn cancelled_or_timed_out_request_at_each_storage_gate_keeps_both_epochs() {
         for cut in ["before_write", "after_write", "after_flush"] {
-            let dir = tempdir().unwrap();
-            let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-            let db = Arc::new(
-                ShardDb::builder("cancelled-cut", store.clone())
-                    .build()
-                    .await
-                    .unwrap(),
-            );
-            let group = Arc::new(PhysicalCommitGroup::with_config(
-                db.clone(),
-                5000,
-                10 * 1024 * 1024,
-                64,
-            ));
-            let gate = TestGate::new();
-            let mut gates = TestGates::default();
-            match cut {
-                "before_write" => gates.before_write = Some(gate.clone()),
-                "after_write" => gates.after_write = Some(gate.clone()),
-                "after_flush" => gates.after_flush = Some(gate.clone()),
-                _ => unreachable!(),
-            }
-            group.inner.test_gates.lock().replace(gates);
-            let mut first = WriteBatch::new();
-            first.put(b"a", b"first");
-            let mut second = WriteBatch::new();
-            second.put(b"b", b"later");
-            let first_bytes = first.byte_size();
-            let second_bytes = second.byte_size();
-            group.add_epoch(1, first).unwrap();
-            let mut flushing = {
-                let group = group.clone();
-                tokio::spawn(async move { group.flush().await })
-            };
-            tokio::time::timeout(Duration::from_secs(2), gate.reached.notified())
-                .await
-                .unwrap();
-            assert!(tokio::time::timeout(Duration::ZERO, &mut flushing)
-                .await
-                .is_err());
-            flushing.abort();
-            assert!(flushing.await.unwrap_err().is_cancelled());
-            group.add_epoch(2, second).unwrap();
-            assert_eq!(
-                group.fill(),
-                PhysicalCommitFill {
-                    pending_epochs: 1,
-                    retained_epochs: 2,
-                    retained_bytes: first_bytes + second_bytes,
-                    retained_operations: 2,
-                    active_waiters: 0,
-                    in_flight: true,
-                    retry_required: false,
-                    outcome_unknown: false,
-                    max_bytes: 10 * 1024 * 1024,
-                    max_epochs: 64,
-                    max_waiters: MAX_GROUP_COMMIT_WAITERS,
-                },
-                "{cut}"
-            );
-            group.inner.test_gates.lock().take();
-            gate.proceed.notify_one();
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while group.last_committed() != 1 {
-                    tokio::task::yield_now().await;
+            for timed_out in [false, true] {
+                let dir = tempdir().unwrap();
+                let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+                let db = Arc::new(
+                    ShardDb::builder("cancelled-cut", store.clone())
+                        .build()
+                        .await
+                        .unwrap(),
+                );
+                let group = Arc::new(PhysicalCommitGroup::with_config(
+                    db.clone(),
+                    5000,
+                    10 * 1024 * 1024,
+                    64,
+                ));
+                let gate = TestGate::new();
+                let mut gates = TestGates::default();
+                match cut {
+                    "before_write" => gates.before_write = Some(gate.clone()),
+                    "after_write" => gates.after_write = Some(gate.clone()),
+                    "after_flush" => gates.after_flush = Some(gate.clone()),
+                    _ => unreachable!(),
                 }
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                group.fill(),
-                PhysicalCommitFill {
-                    pending_epochs: 1,
-                    retained_epochs: 1,
-                    retained_bytes: second_bytes,
-                    retained_operations: 1,
-                    active_waiters: 0,
-                    in_flight: false,
-                    retry_required: false,
-                    outcome_unknown: false,
-                    max_bytes: 10 * 1024 * 1024,
-                    max_epochs: 64,
-                    max_waiters: MAX_GROUP_COMMIT_WAITERS,
-                },
-                "{cut}"
-            );
-            assert_eq!(group.flush().await.unwrap(), vec![2], "{cut}");
-            assert_eq!(group.last_committed(), 2);
-            assert_eq!(
-                group.fill(),
-                PhysicalCommitFill {
-                    pending_epochs: 0,
-                    retained_epochs: 0,
-                    retained_bytes: 0,
-                    retained_operations: 0,
-                    active_waiters: 0,
-                    in_flight: false,
-                    retry_required: false,
-                    outcome_unknown: false,
-                    max_bytes: 10 * 1024 * 1024,
-                    max_epochs: 64,
-                    max_waiters: MAX_GROUP_COMMIT_WAITERS,
-                },
-                "{cut}"
-            );
-            group.shutdown().await.unwrap();
-            drop(group);
-            drop(db);
-            let reopened_db = Arc::new(
-                ShardDb::builder("cancelled-cut", store)
-                    .build()
-                    .await
-                    .unwrap(),
-            );
-            let reopened = PhysicalCommitGroup::open(reopened_db.clone())
+                group.inner.test_gates.lock().replace(gates);
+                let mut first = WriteBatch::new();
+                first.put(b"a", b"first");
+                let mut second = WriteBatch::new();
+                second.put(b"b", b"later");
+                let first_bytes = first.byte_size();
+                let second_bytes = second.byte_size();
+                group.add_epoch(1, first).unwrap();
+                let mut flushing = Box::pin(group.flush());
+                let reached = tokio::time::timeout(Duration::from_secs(2), gate.reached.notified());
+                tokio::pin!(reached);
+                tokio::select! {
+                    reached = &mut reached => assert!(reached.is_ok(), "{cut}: gate was not reached"),
+                    result = &mut flushing => panic!("{cut}: request completed before gate (ok={})", result.is_ok()),
+                }
+                if timed_out {
+                    assert!(tokio::time::timeout(Duration::ZERO, flushing)
+                        .await
+                        .is_err());
+                } else {
+                    drop(flushing);
+                }
+                group.add_epoch(2, second).unwrap();
+                assert_eq!(
+                    group.fill(),
+                    PhysicalCommitFill {
+                        pending_epochs: 1,
+                        retained_epochs: 2,
+                        retained_bytes: first_bytes + second_bytes,
+                        retained_operations: 2,
+                        active_waiters: 0,
+                        in_flight: true,
+                        retry_required: false,
+                        outcome_unknown: false,
+                        max_bytes: 10 * 1024 * 1024,
+                        max_epochs: 64,
+                        max_waiters: MAX_GROUP_COMMIT_WAITERS,
+                    },
+                    "{cut}, timed_out={timed_out}"
+                );
+                group.inner.test_gates.lock().take();
+                gate.proceed.notify_one();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while group.last_committed() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
                 .await
                 .unwrap();
-            assert_eq!(reopened.committed_epoch(), Some(2), "{cut}");
-            assert_eq!(
-                reopened_db.get(b"a").await.unwrap(),
-                Some(bytes::Bytes::from_static(b"first")),
-                "{cut}"
-            );
-            assert_eq!(
-                reopened_db.get(b"b").await.unwrap(),
-                Some(bytes::Bytes::from_static(b"later")),
-                "{cut}"
-            );
-            assert_eq!(reopened.fill(), empty_reopened_fill(), "{cut}");
+                assert_eq!(
+                    group.fill(),
+                    PhysicalCommitFill {
+                        pending_epochs: 1,
+                        retained_epochs: 1,
+                        retained_bytes: second_bytes,
+                        retained_operations: 1,
+                        active_waiters: 0,
+                        in_flight: false,
+                        retry_required: false,
+                        outcome_unknown: false,
+                        max_bytes: 10 * 1024 * 1024,
+                        max_epochs: 64,
+                        max_waiters: MAX_GROUP_COMMIT_WAITERS,
+                    },
+                    "{cut}, timed_out={timed_out}"
+                );
+                assert_eq!(
+                    group.flush().await.unwrap(),
+                    vec![2],
+                    "{cut}, timed_out={timed_out}"
+                );
+                assert_eq!(group.last_committed(), 2, "{cut}, timed_out={timed_out}");
+                assert_eq!(
+                    group.fill(),
+                    PhysicalCommitFill {
+                        pending_epochs: 0,
+                        retained_epochs: 0,
+                        retained_bytes: 0,
+                        retained_operations: 0,
+                        active_waiters: 0,
+                        in_flight: false,
+                        retry_required: false,
+                        outcome_unknown: false,
+                        max_bytes: 10 * 1024 * 1024,
+                        max_epochs: 64,
+                        max_waiters: MAX_GROUP_COMMIT_WAITERS,
+                    },
+                    "{cut}, timed_out={timed_out}"
+                );
+                group.shutdown().await.unwrap();
+                drop(group);
+                drop(db);
+                let reopened_db = Arc::new(
+                    ShardDb::builder("cancelled-cut", store)
+                        .build()
+                        .await
+                        .unwrap(),
+                );
+                let reopened = PhysicalCommitGroup::open(reopened_db.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reopened.committed_epoch(),
+                    Some(2),
+                    "{cut}, timed_out={timed_out}"
+                );
+                assert_eq!(
+                    reopened_db.get(b"a").await.unwrap(),
+                    Some(bytes::Bytes::from_static(b"first")),
+                    "{cut}, timed_out={timed_out}"
+                );
+                assert_eq!(
+                    reopened_db.get(b"b").await.unwrap(),
+                    Some(bytes::Bytes::from_static(b"later")),
+                    "{cut}, timed_out={timed_out}"
+                );
+                assert_eq!(
+                    reopened.fill(),
+                    empty_reopened_fill(),
+                    "{cut}, timed_out={timed_out}"
+                );
+            }
         }
     }
 
