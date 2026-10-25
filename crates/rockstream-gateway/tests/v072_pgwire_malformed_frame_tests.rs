@@ -173,7 +173,10 @@ async fn read_backend_frame(socket: &mut TcpStream) -> (u8, Vec<u8>) {
         let length = socket.read_u32().await.expect("backend frame length");
         assert!((4..=65_536).contains(&length), "invalid backend frame");
         let mut body = vec![0u8; length as usize - 4];
-        socket.read_exact(&mut body).await.expect("backend frame body");
+        socket
+            .read_exact(&mut body)
+            .await
+            .expect("backend frame body");
         (tag, body)
     })
     .await
