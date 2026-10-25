@@ -62,7 +62,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v072-pragmatic-smoke-${{ github.sha }}-${{ github.run_attempt }}
+          name: v072-pragmatic-smoke-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
           path: target/v072-release-smoke/
           retention-days: 90
           if-no-files-found: error
