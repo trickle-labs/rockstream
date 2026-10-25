@@ -102,6 +102,11 @@ async fn malformed_frames_fail_closed_and_next_client_still_works() {
     send_bad_frame_and_confirm_disconnect(addr, b"d\x00\x00\x00\x00").await;
     send_bad_frame_and_confirm_disconnect(addr, b"Q\x00\x00\x00\x06xy").await;
 
+    // Truncated Close/Describe must disconnect without panicking in the
+    // authenticated production socket path (not just the raw decoder).
+    send_bad_frame_and_confirm_disconnect(addr, b"C\x00\x00\x00\x04").await;
+    send_bad_frame_and_confirm_disconnect(addr, b"D\x00\x00\x00\x04").await;
+
     // The bad clients must not poison global gateway availability.
     let (client, connection) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={} user=test dbname=test", addr.port()),
