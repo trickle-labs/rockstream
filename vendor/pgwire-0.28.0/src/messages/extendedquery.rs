@@ -118,6 +118,20 @@ pub const TARGET_TYPE_BYTE_PORTAL: u8 = b'P';
 
 pub const MESSAGE_TYPE_BYTE_CLOSE: u8 = b'C';
 
+/// Close and Describe carry a target kind followed by exactly one C-string.
+/// Check the entire body before reading any field: raw decoder fuzzing uses
+/// panic=abort, where the outer decode_packet catch_unwind cannot recover.
+fn validate_targeted_name_body(buf: &bytes::BytesMut) -> PgWireResult<()> {
+    if buf.len() < 2
+        || !matches!(buf[0], TARGET_TYPE_BYTE_STATEMENT | TARGET_TYPE_BYTE_PORTAL)
+        || buf[buf.len() - 1] != 0
+        || buf[1..buf.len() - 1].contains(&0)
+    {
+        return Err(crate::error::PgWireError::InvalidMessageBody);
+    }
+    Ok(())
+}
+
 impl Message for Close {
     #[inline]
     fn message_type() -> Option<u8> {
@@ -135,6 +149,7 @@ impl Message for Close {
     }
 
     fn decode_body(buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
+        validate_targeted_name_body(buf)?;
         let target_type = buf.get_u8();
         let name = codec::get_cstring(buf);
 
@@ -329,6 +344,7 @@ impl Message for Describe {
     }
 
     fn decode_body(buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
+        validate_targeted_name_body(buf)?;
         let target_type = buf.get_u8();
         let name = codec::get_cstring(buf);
 
@@ -455,5 +471,59 @@ impl Message for PortalSuspended {
 
     fn decode_body(_buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
         Ok(PortalSuspended)
+    }
+}
+
+#[cfg(test)]
+mod targeted_name_regressions {
+    use super::{Close, Describe, Message, TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT};
+    use bytes::BytesMut;
+
+    #[test]
+    fn malformed_close_and_describe_bodies_do_not_panic_or_consume_input() {
+        for body in [
+            &b""[..],                    // no target byte
+            &b"P"[..],                   // target without name terminator
+            &b"X\x00"[..],               // unsupported target kind
+            &b"Sunterminated"[..],       // missing NUL
+            &b"S\x00junk"[..],           // extra bytes following NUL
+            &b"P\x00\x00"[..],            // duplicate NUL
+        ] {
+            for tag in [b'C', b'D'] {
+                let mut input = BytesMut::from(body);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if tag == b'C' {
+                        Close::decode_body(&mut input, body.len() + 4).map(|_| ())
+                    } else {
+                        Describe::decode_body(&mut input, body.len() + 4).map(|_| ())
+                    }
+                }));
+                assert!(result.is_ok(), "tag {tag} must not panic on {body:?}");
+                assert!(result.unwrap().is_err(), "tag {tag} must reject {body:?}");
+                assert_eq!(&input[..], body, "invalid body must not be consumed");
+            }
+        }
+    }
+
+    #[test]
+    fn valid_close_and_describe_frames_keep_existing_roundtrips() {
+        for target_type in [TARGET_TYPE_BYTE_STATEMENT, TARGET_TYPE_BYTE_PORTAL] {
+            for name in [None, Some("named".to_owned())] {
+                let close = Close {
+                    target_type,
+                    name: name.clone(),
+                };
+                let mut close_frame = BytesMut::new();
+                close.encode(&mut close_frame).unwrap();
+                assert_eq!(Close::decode(&mut close_frame).unwrap(), Some(close));
+                assert!(close_frame.is_empty());
+
+                let describe = Describe { target_type, name };
+                let mut describe_frame = BytesMut::new();
+                describe.encode(&mut describe_frame).unwrap();
+                assert_eq!(Describe::decode(&mut describe_frame).unwrap(), Some(describe));
+                assert!(describe_frame.is_empty());
+            }
+        }
     }
 }
