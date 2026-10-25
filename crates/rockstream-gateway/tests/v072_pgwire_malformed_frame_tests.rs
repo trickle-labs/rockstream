@@ -237,10 +237,32 @@ async fn expect_socket_close(socket: &mut TcpStream) {
     let read = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut byte))
         .await
         .expect("bad COPY client must not remain connected");
-    assert!(
-        matches!(read, Ok(0) | Err(_)),
-        "malformed COPY client received unexpected server data: {read:?}"
-    );
+    match read {
+        Ok(0) | Err(_) => {}
+        // A well-formed ErrorResponse before close is allowed, but it must
+        // not be followed by ReadyForQuery or another successful message.
+        Ok(1) if byte[0] == b'E' => {
+            let length = tokio::time::timeout(Duration::from_secs(5), socket.read_u32())
+                .await
+                .expect("error frame header timed out")
+                .expect("truncated error frame");
+            assert!((4..=65_536).contains(&length), "invalid error frame size");
+            let mut body = vec![0; length as usize - 4];
+            tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut body))
+                .await
+                .expect("error frame body timed out")
+                .expect("truncated error frame body");
+            assert_eq!(body.last(), Some(&0), "invalid ErrorResponse terminator");
+            let next = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut byte))
+                .await
+                .expect("bad COPY client did not close after ErrorResponse");
+            assert!(
+                matches!(next, Ok(0) | Err(_)),
+                "connection was not closed after ErrorResponse: {next:?}"
+            );
+        }
+        _ => panic!("malformed COPY client received unexpected server data: {read:?}"),
+    }
 }
 
 /// A parser abort must not strand a COPY session or its buffered-row gauge.
