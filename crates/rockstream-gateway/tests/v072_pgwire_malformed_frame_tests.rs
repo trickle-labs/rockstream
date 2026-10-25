@@ -160,7 +160,6 @@ fn raw_decoder_rejects_original_and_minimized_fuzz_inputs_without_panics() {
     ));
 }
 
-
 fn frontend_frame(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut frame = vec![tag];
     frame.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_be_bytes());
@@ -288,21 +287,21 @@ async fn malformed_copy_in_transport_cleans_session_and_keeps_gateway_healthy() 
         .expect("setup task panicked");
     wait_for_clean_session(&handler, baseline, baseline_rows).await;
 
-    // Three ways for an active, authenticated COPY session to end without
+    // Four cases exercise an active, authenticated COPY session without
     // CopyDone: malformed zero-length and negative-length messages, and EOF
     // midway through a framed CopyData payload. Each case first buffers a
     // valid row so leaked resource accounting cannot be masked.
-    for bad_frame in [
-        &b"d\x00\x00\x00\x00"[..],
-        &b"d\xff\xff\xff\xff"[..],
-    ] {
+    for bad_frame in [&b"d\x00\x00\x00\x00"[..], &b"d\xff\xff\xff\xff"[..]] {
         let mut socket = enter_copy_in(addr).await;
         socket
             .write_all(&frontend_frame(b'd', b"1\thello\n"))
             .await
             .unwrap();
         wait_for_one_buffered_row(baseline_rows).await;
-        assert_eq!(handler.connection_state_totals().copy_states, baseline.copy_states + 1);
+        assert_eq!(
+            handler.connection_state_totals().copy_states,
+            baseline.copy_states + 1
+        );
         socket.write_all(bad_frame).await.unwrap();
         expect_socket_close(&mut socket).await;
         drop(socket);
@@ -335,8 +334,28 @@ async fn malformed_copy_in_transport_cleans_session_and_keeps_gateway_healthy() 
         wait_for_clean_session(&handler, baseline, baseline_rows).await;
     }
 
-    // Failed COPY clients cannot poison availability or commit their buffered
-    // rows. A new normal client must still be able to query the gateway.
+    // A fragmented valid CopyData frame must remain buffered until it is
+    // complete, then be dispatched exactly once. An EOF without CopyDone
+    // must also release the buffered row.
+    let mut socket = enter_copy_in(addr).await;
+    let frame = frontend_frame(b'd', b"3\tfragmented\n");
+    socket.write_all(&frame[..3]).await.unwrap();
+    let mut byte = [0u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), socket.read(&mut byte))
+            .await
+            .is_err(),
+        "partial header must not be decoded or cause a response"
+    );
+    socket.write_all(&frame[3..]).await.unwrap();
+    wait_for_one_buffered_row(baseline_rows).await;
+    socket.shutdown().await.unwrap();
+    expect_socket_close(&mut socket).await;
+    drop(socket);
+    wait_for_clean_session(&handler, baseline, baseline_rows).await;
+
+    // Failed COPY clients cannot poison availability or leave buffered rows.
+    // A new normal client must still be able to query the gateway.
     let (client, connection) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={} user=test dbname=test", addr.port()),
         NoTls,
