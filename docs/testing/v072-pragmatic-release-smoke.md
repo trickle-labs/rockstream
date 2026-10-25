@@ -14,6 +14,12 @@ V072_EXPECTED_SHA=<qualified-candidate-sha> bash scripts/run-v072-pragmatic-smok
 
 The script fails on a dirty tree, mismatched SHA, test process failure, zero executed tests, or ignored tests. It keeps per-command logs and the candidate SHA in `target/v072-release-smoke/<sha>/`. Record the compiler version, `Cargo.lock` hash, the finished status for each case and links to exact-commit CI/fuzz/chaos jobs before closing #132.
 
+## Automated exact-commit execution
+
+The [v0.72 pragmatic release smoke workflow](../../.github/workflows/v072-pragmatic-release-smoke.yml) runs the same 17-case script on a clean, pinned commit with Rust 1.88, and uploads the SHA, compiler version, lockfile digest, report and individual test logs **even on failure**. A passing job requires exactly 17 recorded PASS results, no skips, and zero failed processes. Pull-request execution tests the PR head; on merging this workflow into `main`, its push execution tests the resulting integrated commit. To qualify any later candidate without editing source, use **Actions → v0.72 pragmatic release smoke → Run workflow** on `main`, then verify the workflow's recorded `source-sha.txt` equals the immutable proposed tag commit.
+
+This is a representative loopback/local supported-path smoke executed on a CI runner, **not** an Apple M5 Pro benchmark, an external cloud-capacity qualification, or proof of all distributed failures. Retain the exact-head CI, decoder fuzz and real Docker-enabled cluster-chaos links separately. Do not close #132, mark the roadmap Done or sign a release merely because the workflow was created: first inspect a successful executed report for the final integrated SHA, including an overload/cancel/restart path, and record its artifact and limitations.
+
 ## Observable checks
 
 | Requirement | Representative exercised path and expected result |
