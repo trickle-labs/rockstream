@@ -50,6 +50,22 @@ impl CopyState {
     }
 }
 
+// Every removal path (including malformed-frame disconnect and DISCARD ALL)
+// drops the COPY state. Reconcile buffered-row accounting here, not only on
+// CopyDone/CopyFail, so an abruptly disconnected client cannot leak the gauge.
+impl Drop for CopyState {
+    fn drop(&mut self) {
+        let unflushed = self.buf_rows.len() as u64;
+        if unflushed != 0 {
+            let _ = COPY_IN_BUFFER_ROWS.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |current| Some(current.saturating_sub(unflushed)),
+            );
+        }
+    }
+}
+
 /// Parse `COPY <table> [(<col1>, <col2>, ...)] FROM STDIN [WITH (...)]`.
 ///
 /// Returns `(table_name, columns)` on success.  Column names are lowercased.
