@@ -2,7 +2,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use super::codec;
 use super::Message;
-use crate::error::PgWireResult;
+use crate::error::{PgWireError, PgWireResult};
 
 pub const MESSAGE_TYPE_BYTE_COPY_DATA: u8 = b'd';
 
@@ -28,7 +28,13 @@ impl Message for CopyData {
     }
 
     fn decode_body(buf: &mut BytesMut, len: usize) -> PgWireResult<Self> {
-        let data = buf.split_to(len - 4).freeze();
+        // A direct decoder caller must not be able to underflow or over-read
+        // the body even if the surrounding frame decoder was bypassed.
+        let body_len = len.checked_sub(4).ok_or(PgWireError::InvalidMessageBody)?;
+        if buf.len() < body_len {
+            return Err(PgWireError::InvalidMessageBody);
+        }
+        let data = buf.split_to(body_len).freeze();
         Ok(Self::new(data))
     }
 }
@@ -207,5 +213,28 @@ impl Message for CopyBothResponse {
         }
 
         Ok(Self::new(format, columns, column_formats))
+    }
+}
+
+#[cfg(test)]
+mod copy_data_regressions {
+    use super::*;
+
+    #[test]
+    fn copy_data_rejects_bad_lengths_before_splitting() {
+        for (len, contents) in [(0usize, &b"abc"[..]), (3, &b"abc"[..]), (5, &b""[..])] {
+            let mut body = BytesMut::from(contents);
+            let before = body.clone();
+            assert!(matches!(
+                CopyData::decode_body(&mut body, len),
+                Err(PgWireError::InvalidMessageBody)
+            ));
+            assert_eq!(body, before, "invalid length consumed body");
+        }
+
+        let mut body = BytesMut::from(&b"abcxyz"[..]);
+        let message = CopyData::decode_body(&mut body, 7).unwrap();
+        assert_eq!(message.data.as_ref(), b"abc");
+        assert_eq!(body.as_ref(), b"xyz");
     }
 }

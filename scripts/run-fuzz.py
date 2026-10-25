@@ -19,7 +19,7 @@ MANDATORY = {
     "fuzz_control_worker_decoder", "fuzz_raft_rpc_decoder",
     "fuzz_kafka_payload_decoder", "fuzz_oidc_jwt_decoder",
 }
-SCOPE = "byte-decoder panic/sanitizer safety only; no stateful protocol or semantic-equivalence coverage"
+SCOPE = "byte-decoder panic/sanitizer safety and bounded PgWire round trips; no stateful protocol coverage"
 
 
 def hashes(directory):
@@ -39,6 +39,14 @@ def registered_targets(root):
         if not corpus.is_dir() or not any(corpus.glob("valid-*")):
             raise ValueError(f"missing known-valid seed: {entry['name']}")
     return targets
+
+
+def selected_targets(registered, requested):
+    if requested is None:
+        return registered
+    if requested not in registered:
+        raise ValueError(f"unregistered fuzz target: {requested}")
+    return [requested]
 
 
 def execute(command, log, deadline):
@@ -146,6 +154,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--seconds", type=positive, default=120)
+    parser.add_argument("--target", help="run one registered decoder target")
     args = parser.parse_args()
     destination = ROOT / "target/fuzz-results"
     destination.mkdir(parents=True, exist_ok=True)
@@ -163,6 +172,8 @@ def main():
             report[key] = subprocess.check_output(command, cwd=ROOT, text=True).strip()
         targets = registered_targets(ROOT)
         report["registered_targets"] = targets
+        targets = selected_targets(targets, args.target)
+        report["selected_targets"] = targets
         budget = {"seconds": args.seconds, "timeout_seconds": 5, "rss_mb": 2048,
                   "minimize_seconds": 30, "seed": 130}
         for target in targets:

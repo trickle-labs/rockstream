@@ -677,6 +677,21 @@ evidence = [
 ]
 
 [[claims]]
+id = "VS7-03"
+status = "adapter-qualified"
+domain = "PgWire length reads succeed only within the received bytes; complete bounded frames advance exactly past their own header and body; incomplete frames preserve input until more bytes arrive."
+assumptions = ["The vendored PgWire decoder passes the received buffer and wire length into the executable kernel; per-message body parsers validate their own fields after frame isolation."]
+implementation = ["crates/rockstream-verified/src/pgwire_framing.rs::read_length", "crates/rockstream-verified/src/pgwire_framing.rs::frame_span", "vendor/pgwire-0.28.0/src/messages/codec.rs::decode_packet"]
+theorems = ["crates/rockstream-verified/src/pgwire_framing.rs::read_length", "crates/rockstream-verified/src/pgwire_framing.rs::frame_span"]
+production_callers = ["vendor/pgwire-0.28.0/src/messages/codec.rs::get_length", "vendor/pgwire-0.28.0/src/messages/codec.rs::decode_packet", "vendor/pgwire-0.28.0/src/messages/mod.rs::decode"]
+regression_tests = ["vendor/pgwire-0.28.0/src/messages/codec.rs::every_valid_frame_split_preserves_bytes_then_consumes_only_its_frame", "vendor/pgwire-0.28.0/src/messages/codec.rs::invalid_lengths_fail_without_consumption_and_complete_bad_bodies_leave_next_frame", "crates/rockstream-gateway/tests/v072_pgwire_malformed_frame_tests.rs::malformed_frames_fail_closed_and_next_client_still_works"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p pgwire --lib framing_properties",
+    "cargo test --locked -p rockstream-gateway --test v072_pgwire_malformed_frame_tests",
+]
+
+[[claims]]
 id = "VS7-02"
 status = "adapter-qualified"
 domain = "Physical commit transfers each epoch between pending, in-flight, uncertain, and committed ownership; retained counts decrease only after durable completion, frontiers are monotone, and ACKs require durable success."

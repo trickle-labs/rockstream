@@ -4217,6 +4217,7 @@ dependencies = [
  "md5",
  "postgres-types",
  "rand 0.8.6",
+ "rockstream-verified",
  "rust_decimal",
  "thiserror 2.0.18",
  "tokio",

@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use super::{codec, Message};
-use crate::error::PgWireResult;
+use crate::error::{PgWireError, PgWireResult};
 
 /// Request from frontend to parse a prepared query string
 #[non_exhaustive]
@@ -39,26 +39,22 @@ impl Message for Parse {
     }
 
     fn decode_body(buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
-        // A Parse body contains two NUL-terminated strings followed by an
-        // unsigned 16-bit OID count and exactly that many four-byte OIDs.
-        // Preflight before using Buf getters: fuzz builds may abort on panic.
+        // Check the complete Parse body before consuming any bytes.
         let Some(name_end) = buf.iter().position(|byte| *byte == 0) else {
-            return Err(crate::error::PgWireError::InvalidMessageBody);
+            return Err(PgWireError::InvalidMessageBody);
         };
         let remaining = &buf[name_end + 1..];
         let Some(query_end) = remaining.iter().position(|byte| *byte == 0) else {
-            return Err(crate::error::PgWireError::InvalidMessageBody);
+            return Err(PgWireError::InvalidMessageBody);
         };
-        let fields_start = name_end + 1 + query_end + 1;
-        let fields = &buf[fields_start..];
+        let fields = &remaining[query_end + 1..];
         if fields.len() < 2 {
-            return Err(crate::error::PgWireError::InvalidMessageBody);
+            return Err(PgWireError::InvalidMessageBody);
         }
-        let type_oid_count = u16::from_be_bytes([fields[0], fields[1]]) as usize;
-        if fields.len() - 2 != type_oid_count * 4 {
-            return Err(crate::error::PgWireError::InvalidMessageBody);
+        let count = u16::from_be_bytes([fields[0], fields[1]]) as usize;
+        if fields.len() - 2 != count * 4 {
+            return Err(PgWireError::InvalidMessageBody);
         }
-
         let name = codec::get_cstring(buf);
         let query = codec::get_cstring(buf).unwrap_or_else(|| "".to_owned());
         let type_oid_count = buf.get_u16();
@@ -246,10 +242,22 @@ impl Message for Bind {
     }
 
     fn decode_body(buf: &mut bytes::BytesMut, _: usize) -> PgWireResult<Self> {
+        if !buf.contains(&0) {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let portal_name = codec::get_cstring(buf);
+        if !buf.contains(&0) {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let statement_name = codec::get_cstring(buf);
 
+        if buf.remaining() < 2 {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let parameter_format_code_len = buf.get_u16();
+        if buf.remaining() < parameter_format_code_len as usize * 2 + 2 {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let mut parameter_format_codes = Vec::with_capacity(parameter_format_code_len as usize);
 
         for _ in 0..parameter_format_code_len {
@@ -259,16 +267,32 @@ impl Message for Bind {
         let parameter_len = buf.get_u16();
         let mut parameters = Vec::with_capacity(parameter_len as usize);
         for _ in 0..parameter_len {
+            if buf.remaining() < 4 {
+                return Err(PgWireError::InvalidMessageBody);
+            }
             let data_len = buf.get_i32();
 
             if data_len >= 0 {
+                if buf.remaining() < data_len as usize {
+                    return Err(PgWireError::InvalidMessageBody);
+                }
                 parameters.push(Some(buf.split_to(data_len as usize).freeze()));
-            } else {
+            } else if data_len == -1 {
                 parameters.push(None);
+            } else {
+                return Err(PgWireError::InvalidMessageBody);
             }
         }
 
+        if buf.remaining() < 2 {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let result_column_format_code_len = buf.get_i16();
+        if result_column_format_code_len < 0
+            || buf.remaining() < result_column_format_code_len as usize * 2
+        {
+            return Err(PgWireError::InvalidMessageBody);
+        }
         let mut result_column_format_codes =
             Vec::with_capacity(result_column_format_code_len as usize);
         for _ in 0..result_column_format_code_len {
