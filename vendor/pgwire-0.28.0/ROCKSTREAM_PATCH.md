@@ -46,3 +46,21 @@ trips. The authenticated TCP regression sends empty-body Close/Describe frames
 and verifies a subsequent healthy client remains usable. This specifically
 hardens abort-on-panic fuzzing; it is not exhaustive PgWire protocol security
 qualification and does not replace exact-head CI and fuzz verification.
+
+## 2026-10-25 active-COPY TCP and disconnect follow-up
+
+The existing malformed `CopyData` socket regression sent the minimized frame
+after authentication but outside an active `COPY FROM STDIN` session.
+The gateway regression now creates a real table, enters COPY IN and verifies
+the server's `CopyInResponse` before sending malformed zero/negative-length
+`CopyData` frames and incomplete header/body input. Complete valid split frames
+still reach COPY's row buffer. EOF and malformed-frame disconnects must release
+the COPY session and return all connection-state maps and the buffered-row
+metric to baseline. A separate healthy PostgreSQL client remains usable.
+
+The gateway's `CopyState` destructor now reconciles unflushed buffered-row
+accounting when a connection is aborted or discarded without CopyDone/CopyFail.
+These tests exercise the production TCP path but do not prove that every
+PgWire frame, all stateful COPY semantics, or all network-failure classes
+are safe. Require exact-head CI, longer decoder fuzz, and failure/cancellation
+runner checks before integration.
