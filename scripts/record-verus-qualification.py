@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import tomllib
@@ -36,12 +37,50 @@ def tool_version(command: str) -> str:
     return result.stdout.strip()
 
 
+def mutation_evidence(directory: Path, root: Path, inventory: list[dict]) -> dict[str, str]:
+    results = directory / "results.json"
+    data = json.loads(results.read_text())
+    if data.get("command") != ["cargo", "verus", "verify", "-p", "rockstream-verified", "--locked"]:
+        raise ValueError("production mutation verifier command mismatch")
+    expected_baselines = {"baseline-before.log", "baseline-after.log"}
+    if set(data.get("baselines", {})) != expected_baselines:
+        raise ValueError("production mutation baselines are incomplete")
+    files = {"results.json": sha256(results)}
+    for name, checksum in data["baselines"].items():
+        path = directory / name
+        if sha256(path) != checksum or not re.search(r"verification results:: \d+ verified, 0 errors", path.read_text()):
+            raise ValueError(f"production mutation baseline is invalid: {name}")
+        files[name] = checksum
+    records = data.get("mutations", [])
+    if [record.get("id") for record in records] != [case["id"] for case in inventory]:
+        raise ValueError("production mutation results are incomplete")
+    for case, record in zip(inventory, records):
+        relative = case["target"].split("::", 1)[0]
+        name = f"{case['id']}.log"
+        if any(record.get(key) != case[key] for key in ("id", "claim", "target", "kind")) or \
+                record.get("original_sha256") != sha256(root / relative) or \
+                not isinstance(record.get("mutant_sha256"), str) or \
+                not re.fullmatch(r"[0-9a-f]{64}", record["mutant_sha256"]) or \
+                record.get("mutant_sha256") == record.get("original_sha256") or \
+                record.get("log") != name or type(record.get("verifier_exit")) is not int or \
+                record["verifier_exit"] == 0:
+            raise ValueError(f"production mutation result is invalid: {case['id']}")
+        path = directory / name
+        proof = path.read_text()
+        if sha256(path) != record.get("log_sha256") or relative not in proof or \
+                not re.search(r"verification results:: \d+ verified, [1-9]\d* errors", proof):
+            raise ValueError(f"production mutation rejection is invalid: {case['id']}")
+        files[name] = record["log_sha256"]
+    return {f"mutations/{name}": checksum for name, checksum in files.items()}
+
+
 def merge_phases(directory: Path, output: Path, revision: str, target: str,
-                 artifacts: dict, budgets: dict) -> tuple[list[str], list[Path], dict]:
+                 artifacts: dict, budgets: dict, root: Path, inventory: list[dict]) -> tuple[list[str], list[Path], dict, dict]:
     """Only complete, matching phase evidence can become full qualification."""
     steps, binaries, versions = [], [], {}
+    mutations = mutation_evidence(directory / "debug/mutations", root, inventory)
     for phase, ids in (
-        ("debug", ["verifier", "verifier-incremental", "cargo-debug", "cargo-check", "cargo-all-features"]),
+        ("debug", ["verifier", "production-mutations", "verifier-incremental", "cargo-debug", "cargo-check", "cargo-all-features"]),
         ("release", ["cargo-release"]),
     ):
         record = json.loads((directory / phase / "phase.json").read_text())
@@ -75,7 +114,11 @@ def merge_phases(directory: Path, output: Path, revision: str, target: str,
         temporary.chmod(0o755)  # Artifact downloads do not retain executable mode.
         temporary.replace(destination)
         staged.append(destination)
-    return steps, staged, versions
+    mutation_destination = output / "mutations"
+    if mutation_destination.exists():
+        shutil.rmtree(mutation_destination)
+    shutil.copytree(directory / "debug/mutations", mutation_destination)
+    return steps, staged, versions, mutations
 
 
 def main() -> int:
@@ -107,11 +150,12 @@ def main() -> int:
         artifacts[relative] = sha256(path)
     revision = git_revision(root) if args.merge else None
     phase_versions = None
+    mutations = None
     if args.merge:
         try:
-            steps, args.runtime_artifact, phase_versions = merge_phases(
+            steps, args.runtime_artifact, phase_versions, mutations = merge_phases(
                 args.merge, args.output.parent, revision, args.target or "host",
-                artifacts, qualification["budgets"])
+                artifacts, qualification["budgets"], root, qualification["production_mutations"])
         except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
             raise SystemExit(f"RS-0906: incomplete qualification: {error}") from error
     else:
@@ -121,6 +165,12 @@ def main() -> int:
         if not args.runtime_artifact or missing_runtime:
             missing = missing_runtime[0] if missing_runtime else "<none supplied>"
             raise SystemExit(f"RS-0906: missing runtime artifact: {missing}")
+        if args.phase == "all" and not args.merge:
+            try:
+                mutations = mutation_evidence(args.output.parent / "mutations", root,
+                                              qualification["production_mutations"])
+            except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+                raise SystemExit(f"RS-0906: incomplete qualification: {error}") from error
     runtime_artifacts = {
         path.name: sha256(path) for path in args.runtime_artifact if path.is_file()
     }
@@ -144,6 +194,8 @@ def main() -> int:
     }
     if phase_versions is not None:
         record["phase_tool_versions"] = phase_versions
+    if mutations is not None:
+        record["production_mutations"] = mutations
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     print(f"verus qualification: recorded {args.output}")

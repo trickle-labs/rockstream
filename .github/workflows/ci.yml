@@ -199,6 +199,7 @@ jobs:
     env:
       VERUS_QUALIFICATION_TARGET: ${{ matrix.target }}
       VERUS_QUALIFICATION_OUTPUT: evidence/verus/${{ matrix.target }}/${{ matrix.phase }}
+      VERUS_MUTATION_OUTPUT: evidence/verus/${{ matrix.target }}/${{ matrix.phase }}/mutations
       VERUS_QUALIFICATION_PHASE: ${{ matrix.phase }}
     steps:
       - name: Validate qualification selection

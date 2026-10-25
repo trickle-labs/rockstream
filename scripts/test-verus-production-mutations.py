@@ -94,6 +94,7 @@ def main() -> int:
                     "mutant_sha256": digest(changed),
                     "verifier_exit": status,
                     "log": log.name,
+                    "log_sha256": digest(log.read_bytes()),
                 })
                 print(f"{name}: verifier rejected {case['target']}")
             finally:
@@ -103,7 +104,11 @@ def main() -> int:
     if any(digest((ROOT / path).read_bytes()) != checksum for path, checksum in source_hashes.items()):
         raise RuntimeError("production source changed during isolated mutation run")
 
-    (output / "results.json").write_text(json.dumps({"command": VERIFY, "mutations": records}, indent=2) + "\n")
+    baselines = {
+        name: digest((output / name).read_bytes())
+        for name in ("baseline-before.log", "baseline-after.log")
+    }
+    (output / "results.json").write_text(json.dumps({"command": VERIFY, "baselines": baselines, "mutations": records}, indent=2) + "\n")
     print(f"production mutations: {len(records)} rejected; full logs: {output}")
     return 0
 

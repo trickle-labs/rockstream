@@ -15,7 +15,9 @@ require the same review and an updated `assumptions.toml` entry.
 The negative fixtures are verifier smoke and trust-policy checks. The
 `production_mutations` inventory runs each executable-source change in an
 isolated copy, requires a verifier error at that source target, and retains
-baseline and mutant logs. A compile or setup failure does not count.
+baseline and mutant logs in the qualification artifact. Full qualification
+requires all six results and their unchanged log digests. A compile or setup
+failure does not count.
 
 Use the frozen R1 profile and thresholds for runtime, allocation, RSS, commit,
 and freshness comparisons. A missing backend, unavailable tool, skipped test,

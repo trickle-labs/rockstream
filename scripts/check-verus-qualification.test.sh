@@ -372,13 +372,14 @@ root = pathlib.Path(sys.argv[1])
 records = {phase: json.loads((root / "phases" / phase / "phase.json").read_text()) for phase in ("debug", "release")}
 commands = [
     "env RUSTUP_TOOLCHAIN=1.98.1 cargo verus verify -p rockstream-verified --locked --target x86_64-unknown-linux-gnu",
+    "env VERUS_MUTATION_OUTPUT=" + str(root / "phases/debug/mutations") + " python3 " + str(pathlib.Path.cwd() / "scripts/test-verus-production-mutations.py"),
     "env CARGO_INCREMENTAL=1 RUSTUP_TOOLCHAIN=1.98.1 cargo verus verify -p rockstream-verified --locked --target x86_64-unknown-linux-gnu",
     "env RUSTUP_TOOLCHAIN=1.88 CARGO_PROFILE_DEV_DEBUG=0 cargo build --workspace --locked --target x86_64-unknown-linux-gnu",
     "env RUSTUP_TOOLCHAIN=1.88 cargo check --workspace --locked --target x86_64-unknown-linux-gnu",
     "env RUSTUP_TOOLCHAIN=1.88 cargo check --workspace --all-features --locked --target x86_64-unknown-linux-gnu",
     "env RUSTUP_TOOLCHAIN=1.88 cargo build --workspace --locked --release --target x86_64-unknown-linux-gnu",
 ]
-for phase, expected in (("debug", commands[:5]), ("release", commands[5:])):
+for phase, expected in (("debug", commands[:6]), ("release", commands[6:])):
     assert records[phase]["phase"] == phase
     assert [step.split("\t", 3)[3] for step in records[phase]["steps"]] == expected
     assert list(records[phase]["runtime_artifacts"]) == ["rockstream-" + phase]
@@ -388,6 +389,15 @@ assert complete["tool_versions"] == records["debug"]["tool_versions"]
 assert complete["phase_tool_versions"] == {phase: record["tool_versions"] for phase, record in records.items()}
 assert complete["steps"] == records["debug"]["steps"] + records["release"]["steps"]
 assert complete["runtime_artifacts"] == {**records["debug"]["runtime_artifacts"], **records["release"]["runtime_artifacts"]}
+import hashlib
+mutation_dir = root / "phases/debug/mutations"
+assert complete["production_mutations"] == {
+    "mutations/" + path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in mutation_dir.iterdir()
+}
+assert complete["production_mutations"] == {
+    "mutations/" + path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in (root / "complete/mutations").iterdir()
+}
 ' "$TMP_ROOT" || fail "parallel phase evidence differs from the full qualification commands"
 python3 -c 'import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); d=json.loads(p.read_text()); d["status"]="failed"; p.write_text(json.dumps(d))' \
   "$TMP_ROOT/phases/release/phase.json"

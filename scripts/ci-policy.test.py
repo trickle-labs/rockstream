@@ -91,6 +91,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("phase: [debug, release]", blocks["verus-qualify"])
         self.assertIn("os: [ubuntu-latest, macos-14]", blocks["verus-qualify"])
         self.assertIn("VERUS_QUALIFICATION_PHASE: ${{ matrix.phase }}", blocks["verus-qualify"])
+        self.assertIn("VERUS_MUTATION_OUTPUT: evidence/verus/${{ matrix.target }}/${{ matrix.phase }}/mutations", blocks["verus-qualify"])
         self.assertIn("needs: [ci-policy, verus-qualify]\n    if: always()", blocks["verus-verify"])
         self.assertIn("run: python3 scripts/ci-scope.py check-verus", blocks["verus-verify"])
         self.assertIn("--status passed --merge target/verus-phases", blocks["verus-verify"])
