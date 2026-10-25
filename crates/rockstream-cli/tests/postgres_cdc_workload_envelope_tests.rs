@@ -155,15 +155,20 @@ async fn test_cdc_sustained_workload_and_shard_migration() {
     );
 
     // Read p99 <= 10ms
-    let read_start = Instant::now();
-    let _sample = db
-        .get(b"source_checkpoint/committed/0000000000000000")
-        .await;
-    let read_duration = read_start.elapsed();
+    let mut read_durations = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let read_start = Instant::now();
+        let _sample = db
+            .get(b"source_checkpoint/committed/0000000000000000")
+            .await;
+        read_durations.push(read_start.elapsed());
+    }
+    read_durations.sort();
+    let read_p99 = read_durations[98];
     assert!(
-        read_duration.as_millis() <= 10,
+        read_p99.as_millis() <= 10,
         "read latency must be <= 10ms, got {:?}",
-        read_duration
+        read_p99
     );
 
     // ─── 3. Large State & Spill Verification: Memory bounded, State safely maintained ───

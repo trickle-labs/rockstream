@@ -45,7 +45,8 @@ cp "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" "$ROOT/rust-toolchain.toml" "$TMP_ROOT/
 cp "$ROOT/Makefile" "$TMP_ROOT/"
 cp "$ROOT/.github/workflows/ci.yml" "$TMP_ROOT/.github/workflows/"
 cp "$ROOT/scripts/check-verus-qualification.py" "$TMP_ROOT/scripts/"
-cp "$ROOT/scripts/run-verus-qualification.sh" "$ROOT/scripts/record-verus-qualification.py" "$TMP_ROOT/scripts/"
+cp "$ROOT/scripts/run-verus-qualification.sh" "$ROOT/scripts/record-verus-qualification.py" \
+  "$ROOT/scripts/test-verus-production-mutations.py" "$TMP_ROOT/scripts/"
 cp "$ROOT/benchmarks/r1-local/profile-v0611.toml" "$ROOT/benchmarks/r1-local/thresholds-v0611.toml" \
   "$TMP_ROOT/benchmarks/r1-local/"
 mkdir -p "$TMP_ROOT/crates/rockstream-verified/src" "$TMP_ROOT/crates/rockstream-storage/src"
@@ -53,13 +54,14 @@ cp "$ROOT/crates/rockstream-verified/src/arithmetic.rs" \
   "$ROOT/crates/rockstream-verified/src/keys.rs" \
   "$ROOT/crates/rockstream-verified/src/frontier.rs" \
   "$ROOT/crates/rockstream-verified/src/persistence.rs" \
+  "$ROOT/crates/rockstream-verified/src/aggregate.rs" \
   "$ROOT/crates/rockstream-verified/src/lib.rs" \
   "$TMP_ROOT/crates/rockstream-verified/src/"
 cp "$ROOT/crates/rockstream-storage/src/keys.rs" "$TMP_ROOT/crates/rockstream-storage/src/"
 
 bash "$CHECKER" "$ROOT" >/dev/null || fail "real qualification contract did not pass"
 
-expected="verus qualification: 33 claims classified; 6 builds and 7 mutation controls registered."
+expected="verus qualification: 33 claims classified; 6 builds, 7 smoke/policy controls, and 6 production mutations registered."
 actual="$(bash "$CHECKER" "$ROOT")"
 [[ "$actual" == "$expected" ]] || fail "positive checker output changed: $actual"
 
@@ -99,6 +101,20 @@ if [[ "$release_output" != "verus qualification: RS-0906: release-qualified clai
   fail "release-qualified blocked evidence was accepted"
 fi
 
+cp "$ROOT/formal/verus/qualification.toml" "$TMP_ROOT/formal/verus/qualification.toml"
+cp "$ROOT/formal/verus/manifest.toml" "$TMP_ROOT/formal/verus/manifest.toml"
+python3 -c 'from pathlib import Path; import re,sys; p=Path(sys.argv[1]); s,n=re.subn(r"(?ms)^\[\[production_mutations\]\]\nid = \"PM06\".*?(?=^\[\[claim_evidence\]\])", "", p.read_text()); assert n==1; p.write_text(s)' \
+  "$TMP_ROOT/formal/verus/qualification.toml"
+expect_failure "$TMP_ROOT/missing-production.log" python3 "$TMP_ROOT/scripts/check-verus-qualification.py" --root "$TMP_ROOT"
+[[ "$(<"$TMP_ROOT/missing-production.log")" == "verus qualification: RS-0906: exactly six production mutations are required" ]] || \
+  fail "missing production mutation was accepted: $(<"$TMP_ROOT/missing-production.log")"
+
+cp "$ROOT/formal/verus/qualification.toml" "$TMP_ROOT/formal/verus/qualification.toml"
+sed -i.bak '/id = "PM06"/,/required = true/s/required = true/required = false/' "$TMP_ROOT/formal/verus/qualification.toml"
+expect_failure "$TMP_ROOT/skipped-production.log" python3 "$TMP_ROOT/scripts/check-verus-qualification.py" --root "$TMP_ROOT"
+[[ "$(<"$TMP_ROOT/skipped-production.log")" == "verus qualification: RS-0906: PM06 must require a verifier error" ]] || \
+  fail "skipped production mutation was accepted"
+
 echo "OK: VS6 qualification checker rejects unknown, skipped, and blocked release evidence."
 
 # Setup temporary shims for runner regression tests
@@ -116,6 +132,24 @@ chmod +x "$SHIM_BIN/verus"
 printf '#!/usr/bin/env bash\n' > "$SHIM_BIN/cargo"
 printf 'if [ "${1:-}" = "--version" ]; then\n' >> "$SHIM_BIN/cargo"
 printf '  echo "cargo 1.88.0"\n' >> "$SHIM_BIN/cargo"
+printf '  exit 0\n' >> "$SHIM_BIN/cargo"
+printf 'fi\n' >> "$SHIM_BIN/cargo"
+printf 'if [ "${1:-}" = "verus" ]; then\n' >> "$SHIM_BIN/cargo"
+printf '  if [ -n "${VERUS_MUTATION_ID:-}" ]; then\n' >> "$SHIM_BIN/cargo"
+printf '    if [ "${MOCK_VERUS_MODE:-}" = "compile_error" ]; then\n' >> "$SHIM_BIN/cargo"
+printf '      echo "error: simulated compiler failure"\n' >> "$SHIM_BIN/cargo"
+printf '      exit 1\n' >> "$SHIM_BIN/cargo"
+printf '    fi\n' >> "$SHIM_BIN/cargo"
+printf '    case "$VERUS_MUTATION_ID" in\n' >> "$SHIM_BIN/cargo"
+printf '      PM01|PM03) target="crates/rockstream-verified/src/frontier.rs" ;;\n' >> "$SHIM_BIN/cargo"
+printf '      PM02|PM04|PM05) target="crates/rockstream-verified/src/persistence.rs" ;;\n' >> "$SHIM_BIN/cargo"
+printf '      PM06) target="crates/rockstream-verified/src/aggregate.rs" ;;\n' >> "$SHIM_BIN/cargo"
+printf '    esac\n' >> "$SHIM_BIN/cargo"
+printf '    echo "$target: assertion failed"\n' >> "$SHIM_BIN/cargo"
+printf '    echo "verification results:: 67 verified, 1 errors"\n' >> "$SHIM_BIN/cargo"
+printf '    exit 1\n' >> "$SHIM_BIN/cargo"
+printf '  fi\n' >> "$SHIM_BIN/cargo"
+printf '  echo "verification results:: 68 verified, 0 errors"\n' >> "$SHIM_BIN/cargo"
 printf '  exit 0\n' >> "$SHIM_BIN/cargo"
 printf 'fi\n' >> "$SHIM_BIN/cargo"
 printf 'target_prefix=""\n' >> "$SHIM_BIN/cargo"
@@ -185,6 +219,16 @@ printf '    ;;\n' >> "$SHIM_BIN/cp"
 printf 'esac\n' >> "$SHIM_BIN/cp"
 chmod +x "$SHIM_BIN/cp"
 
+"$REAL_CP" "$ROOT/crates/rockstream-verified/src/frontier.rs" "$TMP_ROOT/original-frontier.rs"
+COMPILE_ERROR_OUT="$TMP_ROOT/compile-error-evidence"
+expect_failure "$TMP_ROOT/compile-error.log" env PATH="$SHIM_BIN:$PATH" \
+  MOCK_VERUS_MODE="compile_error" VERUS_MUTATION_OUTPUT="$COMPILE_ERROR_OUT" \
+  python3 "$ROOT/scripts/test-verus-production-mutations.py"
+expected_compile_error="production mutations: PM01: intended verifier rejection was not observed; full log: $COMPILE_ERROR_OUT/PM01.log"
+[[ "$(<"$TMP_ROOT/compile-error.log")" == "$expected_compile_error" ]] || fail "compiler error counted as mutation detection"
+[[ "$(<"$COMPILE_ERROR_OUT/PM01.log")" == "error: simulated compiler failure" ]] || fail "compiler failure log was lost"
+cmp -s "$ROOT/crates/rockstream-verified/src/frontier.rs" "$TMP_ROOT/original-frontier.rs" || \
+  fail "production mutation changed the source worktree"
 # Exercise legacy all-phase artifact failure cases independent of CI's split phase.
 export VERUS_QUALIFICATION_PHASE=all
 

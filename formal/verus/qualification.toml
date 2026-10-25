@@ -4,6 +4,7 @@ manifest = "formal/verus/manifest.toml"
 sign_off = "sign-offs/verus/VS6.md"
 maintenance = "formal/verus/MAINTENANCE.md"
 runner = "scripts/run-verus-qualification.sh"
+mutation_runner = "scripts/test-verus-production-mutations.py"
 recorder = "scripts/record-verus-qualification.py"
 evidence_root = "evidence/verus"
 source_revision_command = "git rev-parse HEAD"
@@ -169,6 +170,79 @@ required_kinds = [
     "undeclared-assumption",
     "missing-proof-target",
 ]
+
+# The fixtures above exercise verifier and trust-policy plumbing. These cases
+# mutate the executable kernel in an isolated source copy.
+[[production_mutations]]
+id = "PM01"
+claim = "VS4-01"
+target = "crates/rockstream-verified/src/frontier.rs::admit_frontier_report"
+kind = "unsafe-acceptance"
+before = 'if version != 1 || !active || !generation_matches || !incarnation_matches {'
+after = 'if version != 1 || !active || !generation_matches {'
+expected = "verifier-error"
+required = true
+
+[[production_mutations]]
+id = "PM02"
+claim = "VS5-02"
+target = "crates/rockstream-verified/src/persistence.rs::epoch_is_admissible"
+kind = "unsafe-acceptance"
+before = 'current_epoch.checked_add(1) == Some(candidate_epoch)'
+after = 'true'
+expected = "verifier-error"
+required = true
+
+[[production_mutations]]
+id = "PM03"
+claim = "VS4-01"
+target = "crates/rockstream-verified/src/frontier.rs::admit_frontier_report"
+kind = "incorrect-result"
+before = 'Some(reported_epoch)'
+after = 'Some(u64::MAX)'
+expected = "verifier-error"
+required = true
+
+[[production_mutations]]
+id = "PM04"
+claim = "VS5-03"
+target = "crates/rockstream-verified/src/persistence.rs::coupled_commit_is_durable"
+kind = "unsafe-acceptance"
+before = '''            && frontier_written
+            && write_succeeded
+            && flush_succeeded
+    }'''
+after = '''            && write_succeeded
+            && flush_succeeded
+    }'''
+expected = "verifier-error"
+required = true
+
+[[production_mutations]]
+id = "PM05"
+claim = "VS5-04"
+target = "crates/rockstream-verified/src/persistence.rs::recovery_scan_status"
+kind = "incorrect-result"
+before = '''if end >= total_rows {
+                SCAN_COMPLETE
+            } else {
+                SCAN_MORE'''
+after = '''if end >= total_rows {
+                SCAN_COMPLETE
+            } else {
+                SCAN_COMPLETE'''
+expected = "verifier-error"
+required = true
+
+[[production_mutations]]
+id = "PM06"
+claim = "VS3-04"
+target = "crates/rockstream-verified/src/aggregate.rs::transition"
+kind = "erroneous-rejection"
+before = 'if old_count < 0 || (old_count == 0 && old_sum != 0) {'
+after = 'if true {'
+expected = "verifier-error"
+required = true
 
 [[claim_evidence]]
 id = "VS0-02"
