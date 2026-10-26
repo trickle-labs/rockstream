@@ -578,6 +578,10 @@ pub const RS_3610: ErrorCode = ErrorCode::new(3610);
 pub const RS_3611: ErrorCode = ErrorCode::new(3611);
 /// Worker drain queue reached its configured bound; backpressure applied.
 pub const RS_3612: ErrorCode = ErrorCode::new(3612);
+/// Checkpoint export is already in progress.
+pub const RS_3613: ErrorCode = ErrorCode::new(3613);
+/// Checkpoint export or restore failed validation or storage access.
+pub const RS_3614: ErrorCode = ErrorCode::new(3614);
 /// Missing payload file or truncated/unfinalized manifest.
 pub const RS_3615: ErrorCode = ErrorCode::new(3615);
 /// Checksum mismatch on manifest or data file.

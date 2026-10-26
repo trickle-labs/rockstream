@@ -22,13 +22,13 @@ const EXPORT_PREFIX: &str = "checkpoint-exports";
 
 #[derive(Debug, Error)]
 pub enum CheckpointExportError {
-    #[error("RS-5035: checkpoint export is already in progress; next_steps: wait for the active export to finish and retry")]
+    #[error("RS-3613: checkpoint export is already in progress; next_steps: wait for the active export to finish and retry")]
     InFlight,
-    #[error("RS-5035: checkpoint export integrity validation failed: {0}; next_steps: discard the incomplete generation and retry from the same committed checkpoint")]
+    #[error("RS-3614: checkpoint export integrity validation failed: {0}; next_steps: discard the incomplete generation and retry from the same committed checkpoint")]
     Integrity(String),
-    #[error("RS-5035: checkpoint export object-store operation failed: {0}; next_steps: verify source and destination access, then retry the same generation")]
+    #[error("RS-3614: checkpoint export object-store operation failed: {0}; next_steps: verify source and destination access, then retry the same generation")]
     ObjectStore(String),
-    #[error("RS-5035: checkpoint export was interrupted at {0}; next_steps: retry the same generation so validated objects can be resumed")]
+    #[error("RS-3614: checkpoint export was interrupted at {0}; next_steps: retry the same generation so validated objects can be resumed")]
     Interrupted(&'static str),
 }
 
@@ -1209,7 +1209,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "RS-5035: checkpoint export integrity validation failed: destination object checkpoint-exports/generation-b/objects/00000000000000000000 failed validation; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
+            "RS-3614: checkpoint export integrity validation failed: destination object checkpoint-exports/generation-b/objects/00000000000000000000 failed validation; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
         );
     }
 
@@ -1239,7 +1239,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "RS-5035: checkpoint export integrity validation failed: source prefix scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW=1024; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
+            "RS-3614: checkpoint export integrity validation failed: source prefix scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW=1024; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
         );
         assert_eq!(
             rockstream_types::metrics::read_checkpoint_export_scan_window_fill_level(),
@@ -1270,7 +1270,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "RS-5035: checkpoint export integrity validation failed: generation must be a non-empty path segment; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
+            "RS-3614: checkpoint export integrity validation failed: generation must be a non-empty path segment; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
         );
     }
 

@@ -1465,6 +1465,26 @@ default_next_steps = "Wait for in-flight shard drain tasks to complete before en
 doc_anchor = "rs-3612"
 
 [[error]]
+code = "RS-3613"
+key = "checkpoint.export_in_progress"
+title = "Checkpoint export is already in progress"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Wait for the active checkpoint export to finish, then retry the operation."
+doc_anchor = "rs-3613"
+
+[[error]]
+code = "RS-3614"
+key = "checkpoint.export_or_restore_failed"
+title = "Checkpoint export or restore failed validation or storage access"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Inspect the committed checkpoint and object-store access, discard incomplete exports, and retry from a verified generation."
+doc_anchor = "rs-3614"
+
+[[error]]
 code = "RS-3615"
 key = "backup.missing_file_or_manifest"
 title = "Missing payload file or truncated/unfinalized manifest"
