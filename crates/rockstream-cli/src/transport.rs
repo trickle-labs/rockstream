@@ -22,8 +22,7 @@ use rockstream_types::diagnostic::{
 };
 use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_0005, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014,
-    RS_2006, RS_2401, RS_2410, RS_2411, RS_3612, RS_3613, RS_3614, RS_3615, RS_3616,
-    RS_4009,
+    RS_2006, RS_2401, RS_2410, RS_2411, RS_3612, RS_3613, RS_3614, RS_3615, RS_3616, RS_4009,
 };
 use rockstream_types::mutation_policy::cli_mutation_policy;
 pub use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
