@@ -358,7 +358,7 @@
     },
     {
       "id": "claim_d53275ff7fdd42109a26d58373d8b646",
-      "statement": "DR recovery requires fresh offline target storage, leaves RS-5035 failures offline, and validates complete sorted view rows plus checkpoint/catalog/topology/leases and connector resume state after startup; measured drill RPO/RTO are not general guarantees.",
+      "statement": "DR recovery requires fresh offline target storage, leaves RS-3614 failures offline, and validates complete sorted view rows plus checkpoint/catalog/topology/leases and connector resume state after startup; measured drill RPO/RTO are not general guarantees.",
       "evidence": [
         {
           "resource": "repo://docs/disaster-recovery.md#L17-L50",

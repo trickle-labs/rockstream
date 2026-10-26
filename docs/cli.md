@@ -162,7 +162,7 @@ Inspect, export, and restore durable cluster checkpoints.
 
 Both commands require the Admin role and emit `checkpoint.export` or
 `checkpoint.restore` audit events. Integrity, truncation, mixed-generation,
-and partial-restore failures return `RS-5035` with recovery steps.
+and partial-restore failures return `RS-3614` with recovery steps; a concurrent export returns `RS-3613`.
 
 ---
 

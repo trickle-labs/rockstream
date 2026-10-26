@@ -165,7 +165,7 @@ Use the [DR runbook](../../docs/disaster-recovery.md) for `checkpoint export` an
 1. Export a committed recovery point into a separate bucket, account, or region. **Never copy the mutable live object-store prefix as a backup.** Retain checkpoint ID, object/byte totals and `SUCCESS` outcome.
 2. Validate the generation: terminal commit marker, generation/checkpoint consistency, shard checkpoint epochs, object lengths/SHA-256 values, inventory digest and total bytes must agree. Validation does not require the original control plane.
 3. Restore only into fresh, offline target storage. Restore validates first, stages and verifies objects, and publishes the bootstrap active-generation pointer after reconstruction. A different existing active generation is rejected; a matching pointer permits an idempotent result.
-4. On `RS-5035`, keep the target offline, repair access or replace the incomplete/inconsistent export, and retry into fresh storage. Do not start serving from a partial restore.
+4. On `RS-3614` (legacy `RS-5035`), keep the target offline, repair access or replace the incomplete/inconsistent export, and retry into fresh storage. Do not start serving from a partial restore.
 5. After starting against restored storage, compare complete sorted view rows and verify checkpoint epoch, catalog, topology/leases, connector offsets and resume positions. A published bootstrap pointer is not application validation. Measure RPO/RTO in a drill rather than adopting historical local measurements as guarantees.
 
 See [storage and replay](../concepts/storage-and-replay.md) for the relation between durable checkpoints, replay and source resume state.

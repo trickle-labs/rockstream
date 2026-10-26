@@ -9,7 +9,7 @@
 - **Authorized read-only queries:** SQL authorization, bounded query and cursor producers, checked complete-result semantics, cancellation/timeout cleanup, and normal PostgreSQL-client coverage. The standalone DataFusion SELECT fallback admits at most **10,000 result rows, 8 MiB retained Arrow-array bytes, 5 seconds, and 16 concurrent producers**. Ordinary local ShardDb-backed SELECT source scans have a **64 MiB scanned-key/value and 1,000,000-row ceiling**.
 - **Committed subscriptions:** Bounded authorized snapshot/replay/update publication, whole committed epochs and explicit resnapshot when retained replay history is unavailable.
 - **Revision-checked workload control:** Reject conflicting revisions and memory-cap decreases below live usage; report requested and effective/pending state distinctly rather than claiming asynchronously applied changes have taken effect.
-- **PgWire decoder hardening:** A compatible security patch to the pinned `pgwire 0.28.0` dependency rejects invalid frame lengths, truncated CopyData and Execute bodies, and malformed simple-query strings without unchecked reads. Exact crash-input, valid-boundary, fuzz and normal-client TCP tests are included.
+- **PgWire decoder hardening:** The pinned `pgwire 0.28.0` backport bounds malformed and incomplete frames, preflights CopyData, Execute, Parse, Close and Describe bodies, and retains raw decoder fuzz plus authenticated TCP/COPY-mode cleanup regressions. The known reproducible panic investigation #227 was closed after exact-main CI and independent decoder fuzz.
 
 ## Operational limits and compatibility
 
@@ -18,7 +18,7 @@
 - Subscription replay is retained only within its bounded history; clients must resnapshot when replay is unavailable.
 - The v0.72 quota, memory and scheduling tests are practical regressions, **not** measured guarantees of p99 latency, 8-worker scaling, beyond-RAM recovery, or cloud cost. No universal production qualification or all-configuration memory/RSS guarantee is asserted.
 - Existing v0.71 storage/checkpoint deployments should be backed up and exercised through recovery before upgrades. The release does not introduce a new migration guarantee.
-- **Pending release-safety triage:** [#221](https://github.com/trickle-labs/rockstream/issues/221) questions whether CLI checkpoint export can incorrectly report a successful backup when a committed checkpoint references missing shard objects. Do not rely on a reported export success alone: validate recovery on an isolated target. Resolve the suspicion (and conflicting integrity-error code) before treating CLI exports as release-safe.
+- **Checkpoint export safety:** [#221](https://github.com/trickle-labs/rockstream/issues/221) is fixed: the export uses the selected committed-checkpoint inventory and fails closed on missing referenced shard objects without publishing a terminal success marker. The catalog now assigns `RS-3613` to export-in-progress and `RS-3614` to export/restore failures; `RS-5035` remains a skew-SLO error. Operators should still verify recovery against isolated storage.
 - This is not the complete typed console API or a claim that every PostgreSQL message is supported. Malformed-frame coverage is bounded by the included regressions and decoder fuzzing.
 
 ## Verification and reproducibility
