@@ -38,7 +38,7 @@ A separate report should include one overload/cancel/restart reproduction **on t
 ## Release decision
 
 - Confirm signed tag policy and required CI on the version-bumped candidate commit.
-- Confirm decoder fuzz is green on the exact candidate (not an earlier PR head), and check any newer scheduled fuzz findings.
-- Resolve the potential CLI checkpoint export false-success in [#221](https://github.com/trickle-labs/rockstream/issues/221) before publishing. Its targeted real-shard negative regression on [PR #231](https://github.com/trickle-labs/rockstream/pull/231) is pending; if it confirms a bug, require a fail-closed repair, no success marker, and a successful intact export/restore on the final candidate. An untested backup is not acceptance evidence.
-- Close security issue #227 only when the known crashes and final integrated decoder checks are satisfied; close parent #132 only when this smoke and its limitations are recorded.
-- Publish signed immutable `v0.72.0` tag via an authorized maintainer and release notes only after all gates pass. No retagging or branch-protection bypasses.
+- Confirm the decoder engine actually ran on the exact candidate SHA; inspect its per-target reports and runner failure/cancellation evidence, and check newer scheduled findings.
+- Checkpoint export safety issue [#221](https://github.com/trickle-labs/rockstream/issues/221) is fixed and closed; security decoder issue [#227](https://github.com/trickle-labs/rockstream/issues/227) is closed following verified fixes. Reopen either only if new evidence identifies a regression.
+- Close parent [#132](https://github.com/trickle-labs/rockstream/issues/132) only after its 2026-10-19 pragmatic acceptance outcomes, exact candidate SHA, commands, actual results, limitations, and retained-evidence links are recorded.
+- Publish signed immutable `v0.72.0` only from the exact fully qualified `main` SHA and through an authorized maintainer. No retagging or branch-protection bypasses.

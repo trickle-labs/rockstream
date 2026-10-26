@@ -31,6 +31,12 @@ bash scripts/run-v072-pragmatic-smoke.sh
 
 That script records the candidate SHA, exact per-case logs and an execution summary under `target/v072-release-smoke/<sha>/`; a locally generated report is **not** a cloud or release-process performance benchmark. Preserve current decoder fuzz and release qualifications separately; do not turn previous failed older-head runs into claims about the final candidate.
 
+The current exact-commit qualification entry, including the final integrated
+SHA, CI, smoke, fuzz, and real-cluster recovery run links and retained artifact
+locations, is recorded in [issue #132](https://github.com/trickle-labs/rockstream/issues/132).
+The signed release tag remains an authorized maintainer action under
+[release governance](release-governance.md).
+
 The broader historical eight-workload / 16-cell frozen matrix, exact Apple M5 Pro capacity comparisons, fixed 30-minute fault soaks and cloud-cost studies were explicitly retired as **mandatory v0.72 shipping gates** by [issue #132's 2026-10-19 scope override](https://github.com/trickle-labs/rockstream/issues/132). Their absence must not be described as passing them.
 
 ## Source and tracking
