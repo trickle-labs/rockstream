@@ -56,7 +56,7 @@ object_store = { version = "0.14", features = ["aws"] }
 tempfile = "3"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["minio"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 regex = "1"
 hex = "0.4"
 hmac = "0.12"
