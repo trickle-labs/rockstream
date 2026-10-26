@@ -47,7 +47,7 @@ async fn m3_export_selection_is_single_epoch_under_buggify() {
         .unwrap_err();
     assert_eq!(
         selected.to_string(),
-        "RS-5035: checkpoint export was interrupted at dr.export.after_m3_selection; next_steps: retry the same generation so validated objects can be resumed"
+        "RS-3614: checkpoint export was interrupted at dr.export.after_m3_selection; next_steps: retry the same generation so validated objects can be resumed"
     );
 
     buggify_focus("dr.export.before_terminal_marker");
@@ -63,7 +63,7 @@ async fn m3_export_selection_is_single_epoch_under_buggify() {
         .unwrap_err();
     assert_eq!(
         interrupted.to_string(),
-        "RS-5035: checkpoint export was interrupted at dr.export.before_terminal_marker; next_steps: retry the same generation so validated objects can be resumed"
+        "RS-3614: checkpoint export was interrupted at dr.export.before_terminal_marker; next_steps: retry the same generation so validated objects can be resumed"
     );
 
     buggify_disable();

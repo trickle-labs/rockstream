@@ -189,7 +189,7 @@ async fn lfs_export_under_writes_restores_one_committed_epoch() {
 }
 
 #[tokio::test]
-async fn lfs_truncated_export_fails_closed_rs5035() {
+async fn lfs_truncated_export_fails_closed_rs3614() {
     let source_dir = tempfile::tempdir().unwrap();
     let export_dir = tempfile::tempdir().unwrap();
     let target_dir = tempfile::tempdir().unwrap();
@@ -223,7 +223,7 @@ async fn lfs_truncated_export_fails_closed_rs5035() {
         .restore_generation(export, target.clone(), "lfs-truncated")
         .await
         .unwrap_err();
-    assert!(error.to_string().starts_with("RS-5035:"));
+    assert!(error.to_string().starts_with("RS-3614:"));
     assert!(target
         .head(&Path::from("control/bootstrap/active-generation"))
         .await
@@ -313,7 +313,7 @@ async fn minio_tc_export_under_writes_restores_one_committed_epoch() {
 }
 
 #[tokio::test]
-async fn minio_tc_truncated_export_fails_closed_rs5035() {
+async fn minio_tc_truncated_export_fails_closed_rs3614() {
     let Some((_container, source, export, target)) = minio_stores("truncated").await else {
         return;
     };
@@ -340,7 +340,7 @@ async fn minio_tc_truncated_export_fails_closed_rs5035() {
         .restore_generation(export, target.clone(), "minio-truncated")
         .await
         .unwrap_err();
-    assert!(error.to_string().starts_with("RS-5035:"));
+    assert!(error.to_string().starts_with("RS-3614:"));
     assert!(target
         .head(&Path::from("control/bootstrap/active-generation"))
         .await
