@@ -857,7 +857,10 @@ mod boundary_tests {
         assert_eq!(group.last_committed(), 0);
         group.inner.test_gates.lock().take();
         gate.proceed.notify_one();
-        assert!(flushing.await.unwrap().is_err());
+        assert_eq!(
+            flushing.await.unwrap().unwrap_err().to_string(),
+            "[RS-0001] Internal error: unsupported operation: injected storage flush failure; next_steps: report this issue"
+        );
         assert_eq!(
             group.fill(),
             PhysicalCommitFill {
