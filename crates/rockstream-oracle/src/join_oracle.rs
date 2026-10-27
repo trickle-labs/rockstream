@@ -79,11 +79,11 @@ fn empty_kv_batch() -> ArrowZSet {
 /// - `left_acc`: (l_k, l_v) → net_weight
 /// - `right_acc`: (r_k, r_w) → net_weight
 ///
-/// Returns a sorted list of `(l_k, l_v, r_w, net_weight)` with positive weight.
+/// Returns sorted `(l_k, l_v, r_w, net_weight)` rows for nonzero multiplicities.
 pub fn batch_reference_join(
     left_acc: &BTreeMap<(i64, i64), i64>,
     right_acc: &BTreeMap<(i64, i64), i64>,
-) -> Vec<(i64, i64, i64)> {
+) -> Vec<(i64, i64, i64, i64)> {
     // Group right by key: r_k → Vec<(r_v, weight)>
     let mut right_by_key: BTreeMap<i64, Vec<(i64, i64)>> = BTreeMap::new();
     for (&(rk, rv), &w) in right_acc {
@@ -108,11 +108,11 @@ pub fn batch_reference_join(
         }
     }
 
-    // Keep only positive-weight tuples (Z-set semantics).
-    let mut result: Vec<(i64, i64, i64)> = result_map
+    // Preserve every nonzero signed multiplicity for the full bag comparison.
+    let mut result: Vec<(i64, i64, i64, i64)> = result_map
         .into_iter()
-        .filter(|(_, w)| *w > 0)
-        .map(|((lk, lv, rv), _)| (lk, lv, rv))
+        .filter(|(_, w)| *w != 0)
+        .map(|((lk, lv, rv), w)| (lk, lv, rv, w))
         .collect();
     result.sort();
     result
@@ -120,10 +120,49 @@ pub fn batch_reference_join(
 
 // ─── Incremental output accumulator ─────────────────────────────────────────
 
+fn accumulate_join_output(output: &ArrowZSet, output_acc: &mut BTreeMap<(i64, i64, i64), i64>) {
+    if output.is_empty() {
+        return;
+    }
+    let lk_col = output
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let lv_col = output
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let rw_col = output
+        .data
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for i in 0..output.num_rows() {
+        let key = (lk_col.value(i), lv_col.value(i), rw_col.value(i));
+        let entry = output_acc.entry(key).or_insert(0);
+        *entry += output.weights[i];
+        if *entry == 0 {
+            output_acc.remove(&key);
+        }
+    }
+}
+
+fn weighted_join_output(output_acc: &BTreeMap<(i64, i64, i64), i64>) -> Vec<(i64, i64, i64, i64)> {
+    output_acc
+        .iter()
+        .map(|(&(lk, lv, rv), &weight)| (lk, lv, rv, weight))
+        .collect()
+}
+
 /// Accumulate the incremental output of a join over multiple epochs.
 ///
-/// Returns sorted `Vec<(l_k, l_v, r_w)>` for all live join tuples.
-pub fn incremental_join_output(epochs: &[JoinEpoch]) -> Vec<(i64, i64, i64)> {
+/// Returns sorted `(l_k, l_v, r_w, net_weight)` rows for all nonzero join tuples.
+pub fn incremental_join_output(epochs: &[JoinEpoch]) -> Vec<(i64, i64, i64, i64)> {
     let op = JoinOp::new(OperatorId(0), vec![0], vec![0]);
     let mut output_acc: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
 
@@ -144,46 +183,10 @@ pub fn incremental_join_output(epochs: &[JoinEpoch]) -> Vec<(i64, i64, i64)> {
         let output = op
             .process_epoch(left, right)
             .expect("JoinOp::process_epoch failed");
-        if output.is_empty() {
-            continue;
-        }
-        // Output schema with 2-col inputs: (l_0=l_k, l_1=l_v, r_0=r_k, r_1=r_v)
-        let lk_col = output
-            .data
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let lv_col = output
-            .data
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let rw_col = output
-            .data
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap(); // r_v at col3
-        for i in 0..output.num_rows() {
-            let key = (lk_col.value(i), lv_col.value(i), rw_col.value(i));
-            let w = output.weights[i];
-            let entry = output_acc.entry(key).or_insert(0);
-            *entry += w;
-            if *entry == 0 {
-                output_acc.remove(&key);
-            }
-        }
+        accumulate_join_output(&output, &mut output_acc);
     }
 
-    let mut result: Vec<(i64, i64, i64)> = output_acc
-        .into_iter()
-        .filter(|(_, w)| *w > 0)
-        .map(|(k, _)| k)
-        .collect();
-    result.sort();
-    result
+    weighted_join_output(&output_acc)
 }
 
 // ─── 3-way join ───────────────────────────────────────────────────────────────
@@ -191,12 +194,12 @@ pub fn incremental_join_output(epochs: &[JoinEpoch]) -> Vec<(i64, i64, i64)> {
 /// Batch reference for a 3-way join:
 /// `SELECT l.k, l.v, m.v, r.v FROM l JOIN m ON l.k = m.k JOIN r ON m.k = r.k`
 ///
-/// Returns sorted `Vec<(k, l_v, m_v, r_v)>`.
+/// Returns sorted `(k, l_v, m_v, r_v, net_weight)` rows for nonzero multiplicities.
 pub fn batch_reference_3way(
     left_acc: &BTreeMap<(i64, i64), i64>,
     mid_acc: &BTreeMap<(i64, i64), i64>,
     right_acc: &BTreeMap<(i64, i64), i64>,
-) -> Vec<(i64, i64, i64, i64)> {
+) -> Vec<(i64, i64, i64, i64, i64)> {
     // First: L ⋈ M
     let mut lm_map: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
     for (&(lk, lv), &lw) in left_acc {
@@ -225,10 +228,10 @@ pub fn batch_reference_3way(
             *result_map.entry(key).or_insert(0) += lmw * rw;
         }
     }
-    let mut result: Vec<(i64, i64, i64, i64)> = result_map
+    let mut result: Vec<(i64, i64, i64, i64, i64)> = result_map
         .into_iter()
-        .filter(|(_, w)| *w > 0)
-        .map(|(k, _)| k)
+        .filter(|(_, w)| *w != 0)
+        .map(|((k, lv, mv, rv), weight)| (k, lv, mv, rv, weight))
         .collect();
     result.sort();
     result
@@ -236,12 +239,88 @@ pub fn batch_reference_3way(
 
 /// Accumulate the incremental output of a 3-way join.
 ///
-/// Uses two chained `JoinOp` instances:
-/// 1. `lm_op`: L ⋈ M → output schema (l_k, l_v, m_v) = 3 columns
-/// 2. `lmr_op`: LM ⋈ R → output schema (l_k, l_v, m_v, r_k, r_v) = 5 columns
+fn process_3way_epoch(
+    lm_op: &JoinOp,
+    lmr_op: &JoinOp,
+    left_epoch: &[DeltaRow],
+    mid_epoch: &[DeltaRow],
+    right_epoch: &[DeltaRow],
+) -> ArrowZSet {
+    let left = if left_epoch.is_empty() {
+        empty_kv_batch()
+    } else {
+        make_kv_batch(left_epoch)
+    };
+    let mid = if mid_epoch.is_empty() {
+        empty_kv_batch()
+    } else {
+        make_kv_batch(mid_epoch)
+    };
+    let lm_out = lm_op.process_epoch(left, mid).expect("lm join failed");
+    let right = if right_epoch.is_empty() {
+        empty_kv_batch()
+    } else {
+        make_kv_batch(right_epoch)
+    };
+    lmr_op
+        .process_epoch(lm_out, right)
+        .expect("lmr join failed")
+}
+
+fn accumulate_3way_join_output(
+    output: &ArrowZSet,
+    output_acc: &mut BTreeMap<(i64, i64, i64, i64), i64>,
+) {
+    if output.is_empty() {
+        return;
+    }
+    let col0 = output
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let col1 = output
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let col3 = output
+        .data
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let col5 = output
+        .data
+        .column(5)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for i in 0..output.num_rows() {
+        let key = (col0.value(i), col1.value(i), col3.value(i), col5.value(i));
+        let entry = output_acc.entry(key).or_insert(0);
+        *entry += output.weights[i];
+        if *entry == 0 {
+            output_acc.remove(&key);
+        }
+    }
+}
+
+fn weighted_3way_join_output(
+    output_acc: &BTreeMap<(i64, i64, i64, i64), i64>,
+) -> Vec<(i64, i64, i64, i64, i64)> {
+    output_acc
+        .iter()
+        .map(|(&(k, lv, mv, rv), &weight)| (k, lv, mv, rv, weight))
+        .collect()
+}
+
+/// Accumulate the incremental output of a 3-way join over multiple epochs.
 ///
-/// Returns sorted `Vec<(k, l_v, m_v, r_v)>` (dropping the duplicate r_k column at index 3).
-pub fn incremental_3way_join_output(epochs: &[Join3Epoch]) -> Vec<(i64, i64, i64, i64)> {
+/// Uses two chained `JoinOp` instances and returns sorted nonzero weighted rows.
+pub fn incremental_3way_join_output(epochs: &[Join3Epoch]) -> Vec<(i64, i64, i64, i64, i64)> {
     // LM join: 2-col L ⋈ 2-col M → output (l_k, l_v, m_k, m_v) = 4 columns
     let lm_op = JoinOp::with_schema(OperatorId(1), vec![0], vec![0], 2, 2);
 
@@ -252,76 +331,54 @@ pub fn incremental_3way_join_output(epochs: &[Join3Epoch]) -> Vec<(i64, i64, i64
     let mut output_acc: BTreeMap<(i64, i64, i64, i64), i64> = BTreeMap::new();
 
     for (left_epoch, mid_epoch, right_epoch) in epochs {
-        // Stage lm epoch.
-        let left = if left_epoch.is_empty() {
-            empty_kv_batch()
-        } else {
-            make_kv_batch(left_epoch)
-        };
-        let mid = if mid_epoch.is_empty() {
-            empty_kv_batch()
-        } else {
-            make_kv_batch(mid_epoch)
-        };
-        let lm_out = lm_op.process_epoch(left, mid).expect("lm join failed");
-        // lm_out schema: (l_0=l_k, l_1=l_v, r_0=m_k, r_1=m_v)
-
-        let right = if right_epoch.is_empty() {
-            empty_kv_batch()
-        } else {
-            make_kv_batch(right_epoch)
-        };
-        let lmr_out = lmr_op
-            .process_epoch(lm_out, right)
-            .expect("lmr join failed");
-        // lmr_out schema: (l_0=l_k, l_1=l_v, l_2=m_k, l_3=m_v, r_0=r_k, r_1=r_v)
-
-        if lmr_out.is_empty() {
-            continue;
-        }
-        // Extract columns: k=col0, l_v=col1, m_v=col3, r_v=col5
-        let col0 = lmr_out
-            .data
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let col1 = lmr_out
-            .data
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let col3 = lmr_out
-            .data
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let col5 = lmr_out
-            .data
-            .column(5)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        for i in 0..lmr_out.num_rows() {
-            let key = (col0.value(i), col1.value(i), col3.value(i), col5.value(i));
-            let w = lmr_out.weights[i];
-            let entry = output_acc.entry(key).or_insert(0);
-            *entry += w;
-            if *entry == 0 {
-                output_acc.remove(&key);
-            }
-        }
+        let output = process_3way_epoch(&lm_op, &lmr_op, left_epoch, mid_epoch, right_epoch);
+        accumulate_3way_join_output(&output, &mut output_acc);
     }
 
-    let mut result: Vec<(i64, i64, i64, i64)> = output_acc
-        .into_iter()
-        .filter(|(_, w)| *w > 0)
-        .map(|(k, _)| k)
-        .collect();
-    result.sort();
-    result
+    weighted_3way_join_output(&output_acc)
+}
+
+/// Compare the chained incremental join with an independent batch result after each epoch.
+pub fn assert_oracle_3way(epochs: &[Join3Epoch]) {
+    let lm_op = JoinOp::with_schema(OperatorId(1), vec![0], vec![0], 2, 2);
+    let lmr_op = JoinOp::with_schema(OperatorId(2), vec![0], vec![0], 4, 2);
+    let mut left_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+    let mut mid_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+    let mut right_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+    let mut output_acc: BTreeMap<(i64, i64, i64, i64), i64> = BTreeMap::new();
+
+    for (epoch, (left, mid, right)) in epochs.iter().enumerate() {
+        for &(k, v, weight) in left {
+            let entry = left_acc.entry((k, v)).or_insert(0);
+            *entry += weight;
+            if *entry == 0 {
+                left_acc.remove(&(k, v));
+            }
+        }
+        for &(k, v, weight) in mid {
+            let entry = mid_acc.entry((k, v)).or_insert(0);
+            *entry += weight;
+            if *entry == 0 {
+                mid_acc.remove(&(k, v));
+            }
+        }
+        for &(k, v, weight) in right {
+            let entry = right_acc.entry((k, v)).or_insert(0);
+            *entry += weight;
+            if *entry == 0 {
+                right_acc.remove(&(k, v));
+            }
+        }
+
+        let output = process_3way_epoch(&lm_op, &lmr_op, left, mid, right);
+        accumulate_3way_join_output(&output, &mut output_acc);
+        let incremental = weighted_3way_join_output(&output_acc);
+        let batch = batch_reference_3way(&left_acc, &mid_acc, &right_acc);
+        assert_eq!(
+            incremental, batch,
+            "3-way join oracle failed at epoch {epoch}: incremental={incremental:?} batch={batch:?}"
+        );
+    }
 }
 
 // ─── Oracle assertion ─────────────────────────────────────────────────────────
@@ -329,13 +386,14 @@ pub fn incremental_3way_join_output(epochs: &[Join3Epoch]) -> Vec<(i64, i64, i64
 /// Assert `incremental == batch` for the 2-table inner equi-join.
 ///
 /// `epochs`: sequence of `(left_delta, right_delta)` pairs.
-/// Each delta is a `Vec<(k, v, weight)>` where weight ∈ {+1, -1}.
+/// Each delta is a `Vec<(k, v, weight)>` with signed integer weights.
 pub fn assert_oracle_join(epochs: &[JoinEpoch]) {
-    // Accumulate input Z-sets.
+    let op = JoinOp::new(OperatorId(0), vec![0], vec![0]);
     let mut left_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
     let mut right_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+    let mut output_acc: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
 
-    for (left_epoch, right_epoch) in epochs {
+    for (epoch, (left_epoch, right_epoch)) in epochs.iter().enumerate() {
         for &(k, v, w) in left_epoch {
             let entry = left_acc.entry((k, v)).or_insert(0);
             *entry += w;
@@ -350,24 +408,29 @@ pub fn assert_oracle_join(epochs: &[JoinEpoch]) {
                 right_acc.remove(&(k, v));
             }
         }
+
+        if !left_epoch.is_empty() || !right_epoch.is_empty() {
+            let left = if left_epoch.is_empty() {
+                empty_kv_batch()
+            } else {
+                make_kv_batch(left_epoch)
+            };
+            let right = if right_epoch.is_empty() {
+                empty_kv_batch()
+            } else {
+                make_kv_batch(right_epoch)
+            };
+            let output = op.process_epoch(left, right).expect("join failed");
+            accumulate_join_output(&output, &mut output_acc);
+        }
+
+        let incremental = weighted_join_output(&output_acc);
+        let batch = batch_reference_join(&left_acc, &right_acc);
+        assert_eq!(
+            incremental, batch,
+            "Join oracle failed at epoch {epoch}: incremental={incremental:?} batch={batch:?}"
+        );
     }
-
-    let mut batch = batch_reference_join(&left_acc, &right_acc);
-    batch.sort();
-
-    let mut inc = incremental_join_output(epochs);
-    inc.sort();
-
-    assert_eq!(
-        inc,
-        batch,
-        "Join oracle property FAILED: incremental != batch\n\
-         Query: SELECT l.k, l.v, r.v FROM l JOIN r ON l.k = r.k\n\
-         incremental ({} rows): {inc:?}\n\
-         batch      ({} rows): {batch:?}",
-        inc.len(),
-        batch.len()
-    );
 }
 
 #[cfg(test)]
@@ -375,7 +438,7 @@ fn bucketed_join_output(
     epochs: &[JoinEpoch],
     bucket_count: u16,
     replication_state_quota: usize,
-) -> Result<Vec<(i64, i64, i64)>, ErrorCode> {
+) -> Result<Vec<(i64, i64, i64, i64)>, ErrorCode> {
     let replicated_rows: usize = epochs.iter().map(|(_, right)| right.len()).sum();
     if replicated_rows.saturating_mul(bucket_count as usize) > replication_state_quota {
         return Err(RS_5035);
@@ -438,7 +501,7 @@ mod tests {
         let result = incremental_join_output(&[(vec![(5, 50, 1)], vec![(5, 500, 1)])]);
         assert_eq!(
             result,
-            vec![(5, 50, 500)],
+            vec![(5, 50, 500, 1)],
             "single match: expected [(k=5, lv=50, rv=500)]"
         );
     }
@@ -478,7 +541,7 @@ mod tests {
         let result = incremental_join_output(&[(vec![(1, 10, 1)], vec![(1, 100, 1), (1, 200, 1)])]);
         assert_eq!(
             result,
-            vec![(1, 10, 100), (1, 10, 200)],
+            vec![(1, 10, 100, 1), (1, 10, 200, 1)],
             "multiple right matches: expected [(1,10,100),(1,10,200)]"
         );
     }
@@ -493,7 +556,7 @@ mod tests {
         got.sort();
         assert_eq!(
             got,
-            vec![(2, 10, 300), (2, 20, 300)],
+            vec![(2, 10, 300, 1), (2, 20, 300, 1)],
             "multiple left matches: expected [(2,10,300),(2,20,300)]"
         );
     }
@@ -516,9 +579,39 @@ mod tests {
         ]);
         assert_eq!(
             result,
-            vec![(2, 20, 200)],
+            vec![(2, 20, 200, 1)],
             "multiple_epochs: expected only (2,20,200) after deleting (1,10)"
         );
+    }
+
+    #[test]
+    fn oracle_join_weighted_deltas_across_epochs() {
+        let epochs = vec![
+            (vec![(1, 10, 2)], vec![(1, 100, 3)]),
+            (vec![(1, 10, 1)], vec![]),
+            (vec![], vec![(1, 100, -1)]),
+            (vec![(1, 10, -1)], vec![(1, 100, -1)]),
+            (vec![(1, 10, -2)], vec![]),
+            (vec![(1, 10, 2)], vec![(1, 100, 1)]),
+        ];
+        let expected = vec![
+            vec![(1, 10, 100, 6)],
+            vec![(1, 10, 100, 9)],
+            vec![(1, 10, 100, 6)],
+            vec![(1, 10, 100, 2)],
+            vec![],
+            vec![(1, 10, 100, 4)],
+        ];
+
+        for (epoch, expected) in expected.iter().enumerate() {
+            let prefix = &epochs[..=epoch];
+            assert_oracle_join(prefix);
+            assert_eq!(
+                incremental_join_output(prefix),
+                *expected,
+                "weighted join result after epoch {epoch}"
+            );
+        }
     }
 
     #[test]
@@ -550,7 +643,7 @@ mod tests {
         ra.insert((1, 100), 1);
         ra.insert((1, 200), 1);
         let result = batch_reference_join(&la, &ra);
-        assert_eq!(result, vec![(1, 10, 100), (1, 10, 200)]);
+        assert_eq!(result, vec![(1, 10, 100, 1), (1, 10, 200, 1)]);
     }
 
     #[test]
@@ -563,7 +656,7 @@ mod tests {
         got.sort();
         assert_eq!(
             got,
-            vec![(3, 1, 10), (3, 1, 20), (3, 2, 10), (3, 2, 20)],
+            vec![(3, 1, 10, 1), (3, 1, 20, 1), (3, 2, 10, 1), (3, 2, 20, 1)],
             "cross product: expected 4 tuples"
         );
     }
@@ -573,18 +666,14 @@ mod tests {
     #[cfg(test)]
     mod proptest_oracle {
         use proptest::prelude::*;
-        use std::collections::BTreeMap;
 
         use super::super::{
-            assert_oracle_join, batch_reference_3way, incremental_3way_join_output, JoinEpoch,
+            assert_oracle_3way, assert_oracle_join, incremental_3way_join_output, JoinEpoch,
         };
 
-        /// Random delta: key ∈ [0,4], value ∈ [0,9], weight ∈ {+1, -1}.
+        /// Random delta: key ∈ [0,4], value ∈ [0,9], weight ∈ [-3,3].
         fn arb_delta() -> impl Strategy<Value = Vec<(i64, i64, i64)>> {
-            proptest::collection::vec(
-                (0i64..5, 0i64..10, prop_oneof![Just(1i64), Just(-1i64)]),
-                0..8,
-            )
+            proptest::collection::vec((0i64..5, 0i64..10, -3i64..=3), 0..8)
         }
 
         /// Random epoch: a pair of (left_delta, right_delta).
@@ -611,25 +700,16 @@ mod tests {
         /// 3-way join deterministic oracle: incremental == batch on a known input.
         #[test]
         fn oracle_3way_join_deterministic() {
-            // l: (k=1,lv=10), m: (k=1,mv=100), r: (k=1,rv=1000)
-            // batch: (k=1, lv=10, mv=100, rv=1000)
-            // inc: (k=1, lv=10, mv=100, rv=1000)
+            // Multiplicities multiply across the two joins: 2 * 3 * 4 = 24.
             let epochs = vec![(
-                vec![(1i64, 10i64, 1i64)],
-                vec![(1i64, 100i64, 1i64)],
-                vec![(1i64, 1000i64, 1i64)],
+                vec![(1i64, 10i64, 2i64)],
+                vec![(1i64, 100i64, 3i64)],
+                vec![(1i64, 1000i64, 4i64)],
             )];
-            let mut l_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
-            let mut m_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
-            let mut r_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
-            l_acc.insert((1, 10), 1);
-            m_acc.insert((1, 100), 1);
-            r_acc.insert((1, 1000), 1);
-            let batch = batch_reference_3way(&l_acc, &m_acc, &r_acc);
-            let inc = incremental_3way_join_output(&epochs);
+            super::super::assert_oracle_3way(&epochs);
             assert_eq!(
-                inc, batch,
-                "3-way join deterministic FAILED: inc={inc:?} batch={batch:?}"
+                super::super::incremental_3way_join_output(&epochs),
+                vec![(1, 10, 100, 1000, 24)]
             );
         }
 
@@ -644,26 +724,7 @@ mod tests {
                     1..4
                 )
             ) {
-                // Build accumulated state.
-                let mut l_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
-                let mut m_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
-                let mut r_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
-                for (le, me, re) in &epochs {
-                    for &(k, v, w) in le { *l_acc.entry((k, v)).or_insert(0) += w; }
-                    for &(k, v, w) in me { *m_acc.entry((k, v)).or_insert(0) += w; }
-                    for &(k, v, w) in re { *r_acc.entry((k, v)).or_insert(0) += w; }
-                }
-                // Clean up zero-weight entries.
-                l_acc.retain(|_, w| *w != 0);
-                m_acc.retain(|_, w| *w != 0);
-                r_acc.retain(|_, w| *w != 0);
-
-                let mut batch = batch_reference_3way(&l_acc, &m_acc, &r_acc);
-                batch.sort();
-                let mut inc = incremental_3way_join_output(&epochs);
-                inc.sort();
-                assert_eq!(inc, batch,
-                    "3-way join oracle FAILED: incremental != batch\ninc={inc:?}\nbatch={batch:?}");
+                super::super::assert_oracle_3way(&epochs);
             }
         }
 

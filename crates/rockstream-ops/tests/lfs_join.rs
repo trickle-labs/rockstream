@@ -85,8 +85,8 @@ fn extract_output(batch: &ArrowZSet) -> Vec<(i64, i64, i64, i64)> {
     rows
 }
 
-/// Accumulate a join output Z-set: (l_k, l_v, r_v) → net_weight.
-fn accumulate_output(batches: &[ArrowZSet]) -> Vec<(i64, i64, i64)> {
+/// Accumulate a join output Z-set, preserving each tuple's signed multiplicity.
+fn accumulate_output(batches: &[ArrowZSet]) -> Vec<(i64, i64, i64, i64)> {
     use std::collections::BTreeMap;
     let mut acc: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
     for batch in batches {
@@ -99,8 +99,8 @@ fn accumulate_output(batches: &[ArrowZSet]) -> Vec<(i64, i64, i64)> {
         }
     }
     acc.into_iter()
-        .filter(|(_, w)| *w > 0)
-        .map(|(k, _)| k)
+        .filter(|(_, w)| *w != 0)
+        .map(|((lk, lv, rv), weight)| (lk, lv, rv, weight))
         .collect()
 }
 
@@ -180,7 +180,9 @@ async fn lfs_join_crash_replay_bit_identical() {
     // Epoch 2 (reference): add (k=5, v=600) right.
     let r2 = make_kv_batch(&[(5, 600, 1)]);
     let ref_out2 = ref_op.process_epoch(empty_kv(), r2.clone()).unwrap();
-    let _ref_acc = accumulate_output(&[ref_out1, ref_out2.clone()]);
+    let ref_rows = accumulate_output(&[ref_out1.clone(), ref_out2]);
+    let expected = vec![(5, 50, 500, 1), (5, 50, 600, 1)];
+    assert_eq!(ref_rows, expected, "reference full join result");
 
     // Crash-replay: new op loaded from storage (state = after epoch 1 only).
     // epoch 2 is re-processed.
@@ -189,26 +191,14 @@ async fn lfs_join_crash_replay_bit_identical() {
         .await
         .unwrap();
 
-    // Replay epoch 1 output (reconstructed from persisted state × epoch 1 delta = 0
-    // since the arrangement already reflects epoch 1 after persist).
-    // On replay: the frontier was at epoch 1, so we need epoch 2's output.
-    // epoch 1 delta on a freshly loaded op should equal epoch 1 output on the original op.
-    // Actually, the crash-replay means the shard was at epoch 1 state already.
-    // We just reprocess epoch 2.
+    // The loaded operator already has epoch-1 arrangements, so replay epoch 2.
     let replay_out2 = replay_op.process_epoch(empty_kv(), r2).unwrap();
 
-    // The accumulated output should be: epoch 1 ΔL⋈ΔR = (5, 50, 500, +1) PLUS
-    // epoch 2 L₀⋈ΔR = (5, 50, 600, +1).
-    // After crash-replay, epoch 2 output = (5, 50, 600, +1) same as reference epoch 2.
-    let mut replay_rows = extract_output(&replay_out2);
-    replay_rows.sort();
-    let mut ref_rows = extract_output(&ref_out2);
-    ref_rows.sort();
+    // Combine the known epoch-1 result with the replayed epoch-2 delta.
+    let replay_rows = accumulate_output(&[ref_out1, replay_out2]);
     assert_eq!(
-        replay_rows, ref_rows,
-        "crash-replay epoch 2 output must be bit-identical to reference.\n\
-         replay: {replay_rows:?}\n\
-         reference: {ref_rows:?}"
+        replay_rows, expected,
+        "crash-replay must recover the complete weighted join result"
     );
 }
 
