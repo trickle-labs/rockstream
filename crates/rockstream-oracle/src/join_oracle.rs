@@ -594,7 +594,7 @@ mod tests {
             (vec![(1, 10, -2)], vec![]),
             (vec![(1, 10, 2)], vec![(1, 100, 1)]),
         ];
-        let expected = vec![
+        let expected = [
             vec![(1, 10, 100, 6)],
             vec![(1, 10, 100, 9)],
             vec![(1, 10, 100, 6)],
@@ -667,9 +667,7 @@ mod tests {
     mod proptest_oracle {
         use proptest::prelude::*;
 
-        use super::super::{
-            assert_oracle_3way, assert_oracle_join, incremental_3way_join_output, JoinEpoch,
-        };
+        use super::super::{assert_oracle_join, JoinEpoch};
 
         /// Random delta: key ∈ [0,4], value ∈ [0,9], weight ∈ [-3,3].
         fn arb_delta() -> impl Strategy<Value = Vec<(i64, i64, i64)>> {
