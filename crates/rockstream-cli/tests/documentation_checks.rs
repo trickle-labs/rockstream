@@ -78,7 +78,7 @@ fn maintainer_taxonomy_matches_repo_commands() {
             .contains("$ make check")
     );
     assert!(ci.contains("bash scripts/check-documentation.sh"));
-    assert!(scheduled.contains("cron: \"0 3 * * *\""));
+    assert!(scheduled.contains("cron: \"37 3 * * *\""));
 }
 
 #[test]
