@@ -1,7 +1,7 @@
 [advisories]
 version = 2
 unused-ignored-advisory = "allow"
-# Transitive deps from SlateDB that are unmaintained but not a security concern.
+# Reviewed transitive advisory exceptions; rationale and review dates are in DEPENDENCY_POLICY.md.
 ignore = [
     "RUSTSEC-2025-0141", # bincode - unmaintained (SlateDB transitive dep)
     "RUSTSEC-2024-0436", # paste - unmaintained (SlateDB transitive dep)
@@ -10,6 +10,9 @@ ignore = [
     "RUSTSEC-2026-0194", # quick-xml - pinned by object_store 0.12.x transitive constraint
     "RUSTSEC-2026-0195", # quick-xml - pinned by object_store 0.12.x transitive constraint
     "RUSTSEC-2026-0235", # rkyv - inactive optional rust_decimal feature in the lockfile
+    "RUSTSEC-2026-0391", # zstd 0.13 remains in Arrow/DataFusion 53/58; inspected paths use bulk APIs, while RockStream's direct zstd dependency is patched 0.14.3
+    "RUSTSEC-2026-0398", # zstd-safe 7 remains in Arrow/DataFusion 53/58 without the seekable feature that exposes the affected API
+    "RUSTSEC-2026-0403", # zstd-safe 7 remains in Arrow/DataFusion bulk paths, which RustSec marks unaffected; async codecs and direct use are on patched zstd-safe 8.2.0
     "RUSTSEC-2024-0449", # unsafe-libyaml - pre-existing serde_yaml dependency; unmaintained, no reported vulnerability
 ]
 
