@@ -6,11 +6,11 @@ name: Dependency Audit
 # only runs when a PR touches the repo, so a newly-published advisory against
 # an unchanged Cargo.lock would otherwise go undetected until the next PR.
 #
-# Schedule: daily at 03:00 UTC (period <= 24h, per DEPENDENCY_POLICY.md).
+# Schedule: daily at 03:37 UTC (period <= 24h, per DEPENDENCY_POLICY.md).
 
 on:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "37 3 * * *"
   workflow_dispatch:
 
 concurrency:

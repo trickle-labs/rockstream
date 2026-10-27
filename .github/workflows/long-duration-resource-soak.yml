@@ -3,7 +3,7 @@ name: Long-Duration Resource Soak
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "23 1 * * *"
 
 concurrency:
   group: long-duration-resource-soak-${{ github.ref }}

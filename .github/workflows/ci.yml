@@ -16,7 +16,8 @@ on:
       - "**/.openwikiignore"
   workflow_dispatch:
   schedule:
-    - cron: "45 3 * * *"
+    # PRs and main pushes retain the full gate; this clean-state pass is weekly.
+    - cron: "47 20 * * 1"
 
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}

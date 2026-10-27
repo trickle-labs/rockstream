@@ -2,7 +2,7 @@ name: Test Accounting — Expensive Suites
 
 on:
   schedule:
-    - cron: "15 2 * * *"
+    - cron: "23 7 * * *"
   workflow_dispatch:
     inputs:
       run_release_docker:

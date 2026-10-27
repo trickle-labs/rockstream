@@ -2,13 +2,15 @@ name: Scheduled Fuzz Soak
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "41 4,10,16,22 * * *"
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "**/AGENTS.md"
-      - "**/openwiki/**"
-      - "**/.openwikiignore"
+    paths:
+      - ".github/workflows/fuzz-soak.yml"
+      - "Cargo.lock"
+      - "scripts/run-fuzz.py"
+      - "scripts/run-fuzz.test.py"
+      - "scripts/fixtures/fuzz-engine/**"
   workflow_dispatch:
 
 permissions:
