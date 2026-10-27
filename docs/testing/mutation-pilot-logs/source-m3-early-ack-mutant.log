@@ -1,0 +1,65 @@
+
+running 1 test
+test replayable_m3_write_failure_withholds_ack_and_recovers_empty_lfs ... FAILED
+
+failures:
+
+---- replayable_m3_write_failure_withholds_ack_and_recovers_empty_lfs stdout ----
+
+thread 'replayable_m3_write_failure_withholds_ack_and_recovers_empty_lfs' (20818819) panicked at crates/rockstream-connectors/tests/cdc_transaction_durability_lfs_tests.rs:262:5:
+assertion `left == right` failed
+  left: (Ok(()), [(1, OffsetToken([48, 47, 53, 51]))], OffsetToken([48, 47, 53, 51]), None, None, None, None, None, None)
+ right: (Err("RS-4001: source I/O error: RS-4001: source I/O error: RS-4010: durable source checkpoint operation failed: unsupported operation: injected storage write failure; next steps: keep the source paused, recover the highest committed checkpoint, then retry"), [], OffsetToken([]), None, None, None, None, None, None)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    replayable_m3_write_failure_withholds_ack_and_recovers_empty_lfs
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.03s
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/rockstream-types/src/checkpoint.rs:268:14
+    |
+268 |             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+268 -             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+268 +             .try_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/rockstream-types/src/state_budget.rs:1023:14
+     |
+1023 |             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+     |              ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1023 -             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+1023 +             .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+     |
+
+warning: `rockstream-types` (lib) generated 2 warnings (run `cargo fix --lib -p rockstream-types` to apply 2 suggestions)
+   Compiling rockstream-connectors v0.72.0 (/private/tmp/rockstream-pr260-fix-20261027-01/crates/rockstream-connectors)
+   Compiling rockstream-ops v0.72.0 (/private/tmp/rockstream-pr260-fix-20261027-01/crates/rockstream-ops)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/rockstream-ops/src/index_arrange.rs:176:22
+    |
+176 |                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+    |                      ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+176 -                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+176 +                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+    |
+
+warning: `rockstream-ops` (lib) generated 1 warning (run `cargo fix --lib -p rockstream-ops` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.96s
+     Running tests/cdc_transaction_durability_lfs_tests.rs (target/debug/deps/cdc_transaction_durability_lfs_tests-656f8a30a7feeafa)
+error: test failed, to rerun pass `-p rockstream-connectors --test cdc_transaction_durability_lfs_tests`

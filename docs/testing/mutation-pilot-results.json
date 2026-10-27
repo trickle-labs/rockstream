@@ -1,0 +1,243 @@
+{
+  "schema_version": 1,
+  "status": "partial_evidence_not_qualification",
+  "shortlist_pr": 268,
+  "human_review_approved_before_runs": true,
+  "source_baseline_sha": "2bb60012318fa966e1dc98866122daceabc59607",
+  "join_baseline_sha": "b66f71f6f1eb67f6644805f5c4c797ad9b5866b3",
+  "toolchain": {
+    "rustc": "1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+    "cargo": "1.99.1 (5f94df478 2026-08-27) (Homebrew)",
+    "features": "default",
+    "network": "offline",
+    "locked": true
+  },
+  "mutation_method": "Exact source replacements applied one at a time in isolated Git worktrees; each edit was reverted and its baseline rerun before recording the case.",
+  "mutation_spec_hash": "sha256 of UTF-8 source path followed by exact removed and added source lines, each prefixed with '-' or '+'.",
+  "source_cleanliness": {
+    "source_baseline_worktree_clean_after_runs": true,
+    "join_baseline_worktree_clean_after_runs": true,
+    "write_unknown_mutant_restored_before_baseline_rerun": true,
+    "production_source_changes_in_review_branch": false
+  },
+  "local_cost_observations": {
+    "mutant_command_wall_seconds_range": [4.4, 11.3],
+    "mutant_test_body_seconds_range": [0.0, 5.03],
+    "cold_isolated_package_build_seconds_approx_range": [88, 113],
+    "cpu_or_rss_measured": false,
+    "repeat_flake_or_timeout_sample": false,
+    "ci_runner_cost_measured": false
+  },
+  "llm_evaluation": {
+    "model_family": "Codex / GPT-6 family",
+    "model_build_id": null,
+    "prompt_revision": "safety-shortlist-v1",
+    "shortlisted_scenarios": 15,
+    "weak_detector_cases_examined": 2,
+    "actionable_gaps_confirmed_and_fixed": 2,
+    "false_positive_weakness_flags": 0,
+    "observed_precision": 1.0,
+    "precision_limit": "2/2 in a tiny stratified sample; not a stable estimate for the full shortlist.",
+    "targeted_command_seconds_per_confirmed_gap_range": [4.4, 11.3],
+    "cost_limit": "Selected mutant test commands only; excludes authoring, review, baseline reruns, cold package builds, and CI resource cost."
+  },
+  "selection_baseline": {
+    "method": "Static non-LLM selection from the issue-enumerated patterns: unknown outcome mapped to durable, frontier identity predicate forced true, and a join weight factor doubled.",
+    "case_ids": [
+      "P0-GROUP-WRITE-UNKNOWN-AS-DURABLE",
+      "P1-FRONTIER-GENERATION-ALWAYS-MATCHES",
+      "P1-JOIN-DOUBLE-MULTIPLICITY"
+    ],
+    "results": {
+      "caught_by_intended_assertion": 2,
+      "target_passed_without_exercising_mutation": 1,
+      "additional_actionable_gap_found": 0
+    },
+    "limit": "Small deterministic comparison only; no random sample or statistically useful precision estimate."
+  },
+  "cases": [
+    {
+      "id": "P0-GROUP-WRITE-UNKNOWN-AS-DURABLE",
+      "severity": "P0",
+      "source_sha": "2bb60012318fa966e1dc98866122daceabc59607",
+      "source_path": "crates/rockstream-ops/src/group_commit/physical.rs",
+      "mutation": {
+        "before": [
+          "Outcome::FlushUnknown(error) | Outcome::WriteUnknown(error) => {",
+          "    (physical_commit::OUTCOME_UNKNOWN, Some(error))",
+          "}"
+        ],
+        "after": [
+          "Outcome::FlushUnknown(error) => {",
+          "    (physical_commit::OUTCOME_UNKNOWN, Some(error))",
+          "}",
+          "Outcome::WriteUnknown(_) => (physical_commit::DURABLE, None),"
+        ],
+        "mutation_spec_sha256": "131acce41324d477583ce411c5dc693dccf0b3d463c3e9c295fe0c62c808126b"
+      },
+      "detector": {
+        "package": "rockstream-ops",
+        "target": "lib",
+        "test_id": "group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs",
+        "command": "rtk cargo test --locked --offline -p rockstream-ops --lib unknown_write_withholds_ack_and_recovers_committed_lfs",
+        "features": "default",
+        "services": ["LocalFileSystem", "persisted-put response gate"]
+      },
+      "original_detector": {
+        "test_id": "group_commit::physical::boundary_tests::unknown_flush_keeps_later_epoch_queued_until_reconciliation",
+        "command": "rtk cargo test --locked --offline -p rockstream-ops --lib unknown_flush_keeps_later_epoch_queued_until_reconciliation",
+        "baseline_before": "passed; 1 test, 0.35s test body",
+        "mutant_result": "passed; 1 test, 0.34s test body; FlushUnknown fixture does not invoke WriteUnknown",
+        "baseline_after": "passed; 1 test, 0.34s test body"
+      },
+      "baseline_before": "passed; 1 test, 5.03s test body",
+      "mutant": {
+        "classification": "caught_by_intended_assertion",
+        "observed": "mutant returned Ok([1]) instead of withholding the ACK",
+        "test_body_seconds": 5.01,
+        "repeated_mutant_command_wall_seconds": 5.75,
+        "cold_worktree_build_seconds_approx": 90,
+        "log": "mutation-pilot-logs/unknown-write-mutant.log"
+      },
+      "baseline_after": "passed; 1 test, 5.03s test body",
+      "limit": "The LocalFileSystem-backed test persists a put before delaying its response past the timeout, then verifies exact ACK and reopened state. It does not simulate power loss after ACK or establish behavior on a remote backend."
+    },
+    {
+      "id": "P0-SOURCE-RECOVERY-EMPTY-OFFSET-MAP",
+      "severity": "P0",
+      "source_sha": "2bb60012318fa966e1dc98866122daceabc59607",
+      "source_path": "crates/rockstream-connectors/src/source_epoch.rs",
+      "mutation": {
+        "before": ["partition_offsets,"],
+        "after": ["partition_offsets: BTreeMap::new(),"],
+        "mutation_spec_sha256": "3a90c72198f045f3cbdd4998036b41a9b06f98234184a76b95f1d817854afe79"
+      },
+      "detector": {
+        "package": "rockstream-connectors",
+        "target": "test:source_proof_tests",
+        "test_id": "test_source_offset_replay_lfs",
+        "command": "rtk cargo test --locked --offline -p rockstream-connectors --test source_proof_tests test_source_offset_replay_lfs",
+        "features": "default",
+        "services": ["LocalFileSystem"]
+      },
+      "baseline_before": "passed; 1 test, 0.12s test body",
+      "mutant": {
+        "classification": "caught_by_intended_assertion",
+        "test_body_seconds": 0.20,
+        "expected": "value 20 from partition 1",
+        "observed": "value 10 replayed from partition 0",
+        "log": "mutation-pilot-logs/source-offset-mutant.log"
+      },
+      "baseline_after": "passed; 1 test, 0.13s test body",
+      "limit": "The test closes/reopens ShardDb and restores the registry, but reuses the original RecordedSource instance."
+    },
+    {
+      "id": "P0-REPLAYABLE-M3-FAILURE-ACK",
+      "severity": "P0",
+      "source_sha": "2bb60012318fa966e1dc98866122daceabc59607",
+      "source_path": "crates/rockstream-connectors/src/source_runtime.rs",
+      "mutation": {
+        "before": ["return self.block(&storage_error(error).to_string());"],
+        "after": ["let _: Result<(), SourceError> = self.block(&storage_error(error).to_string());"],
+        "mutation_spec_sha256": "18f51de473570f9535ed81e3c7687750348f2978c7fdb0e576b517985ced6c6c"
+      },
+      "production_caller": "GatewayServer::commit_replayable_epoch at crates/rockstream-gateway/src/server.rs:4709",
+      "detectors": [
+        {
+          "package": "rockstream-connectors",
+          "target": "test:cdc_transaction_durability_lfs_tests",
+          "test_id": "two_table_envelope_commits_or_replays_whole_lfs",
+          "command": "rtk cargo test --locked --offline -p rockstream-connectors --test cdc_transaction_durability_lfs_tests two_table_envelope_commits_or_replays_whole_lfs",
+          "mutant_result": "passed; success-only path, so it did not exercise the M3 failure branch"
+        },
+        {
+          "package": "rockstream-connectors",
+          "target": "test:cdc_transaction_durability_lfs_tests",
+          "test_id": "replayable_m3_write_failure_withholds_ack_and_recovers_empty_lfs",
+          "command": "rtk cargo test --locked --offline -p rockstream-connectors --test cdc_transaction_durability_lfs_tests replayable_m3_write_failure_withholds_ack_and_recovers_empty_lfs",
+          "features": "default",
+          "services": ["LocalFileSystem"]
+        }
+      ],
+      "baseline_before": "passed; 1 new test, 0.04s; full target suite 6 passed, 0.15s",
+      "mutant": {
+        "classification": "caught_by_intended_exact_transcript_after_reopen",
+        "test_body_seconds": 0.03,
+        "expected": "M3 error, no ACK, empty committed offset, checkpoint, row and frontier before and after reopen",
+        "observed": "Ok(()), ACK (epoch 1, offset 0/53), in-memory offset 0/53, but no checkpoint, row or frontier after reopen",
+        "log": "mutation-pilot-logs/source-m3-early-ack-mutant.log"
+      },
+      "baseline_after": "passed; 1 test, 0.03s; full target suite 6 passed",
+      "mutation_attempts": [
+        {
+          "status": "unbuildable_not_counted",
+          "reason": "The first ignored generic block result lacked a type (E0282); the compiled mutation used the explicit Result<(), SourceError> annotation above."
+        }
+      ],
+      "limit": "Uses a production LocalFileSystem-backed ShardDb and injected write failure before I/O; does not simulate power loss after an ACK."
+    },
+    {
+      "id": "P1-FRONTIER-GENERATION-ALWAYS-MATCHES",
+      "severity": "P1",
+      "source_sha": "2bb60012318fa966e1dc98866122daceabc59607",
+      "source_path": "crates/rockstream-control/src/frontier.rs",
+      "mutation": {
+        "before": ["let generation_matches = report.generation == membership.generation;"],
+        "after": ["let generation_matches = true;"],
+        "mutation_spec_sha256": "c619d08ea261ccf171ce4cb944d888aa8bd34d50941772aceba015b0a9f8aa6c"
+      },
+      "detector": {
+        "package": "rockstream-control",
+        "target": "lib",
+        "test_id": "frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged",
+        "command": "rtk cargo test --locked --offline -p rockstream-control --lib stale_generation_and_incarnation_reports_leave_state_unchanged",
+        "features": "default",
+        "services": []
+      },
+      "baseline_before": "passed; 1 test, 0.00s test body",
+      "mutant": {
+        "classification": "caught_by_intended_assertion",
+        "test_body_seconds": 0.00,
+        "observed": "stale report did not return AggregatorError::GenerationMismatch",
+        "log": "mutation-pilot-logs/frontier-generation-mutant.log"
+      },
+      "baseline_after": "passed; 1 test, 0.00s test body",
+      "limit": "Covers the caller-derived predicate at the Rust adapter/kernel boundary, not every distributed publication path."
+    },
+    {
+      "id": "P1-JOIN-DOUBLE-MULTIPLICITY",
+      "severity": "P1",
+      "source_sha": "b66f71f6f1eb67f6644805f5c4c797ad9b5866b3",
+      "source_path": "crates/rockstream-ops/src/join.rs",
+      "mutation": {
+        "before": ["out_weights.push(l_w * r_w); // bilinear weight product"],
+        "after": ["out_weights.push(2 * l_w * r_w); // deliberate multiplicity mutant"],
+        "mutation_spec_sha256": "0600b54438b7c19b3bb3afab518af398a6b24f537446dda447ebe471280f8aff"
+      },
+      "detector": {
+        "package": "rockstream-oracle",
+        "target": "lib",
+        "test_id": "join_oracle::tests::oracle_join_weighted_deltas_across_epochs",
+        "command": "rtk cargo test --locked --offline -p rockstream-oracle --lib oracle_join_weighted_deltas_across_epochs",
+        "features": "default",
+        "services": []
+      },
+      "baseline_before": "passed; 1 test, 0.01s test body",
+      "mutant": {
+        "classification": "caught_by_intended_assertion",
+        "test_body_seconds": 0.03,
+        "expected": "[(1,10,100,6)] at epoch 0",
+        "observed": "[(1,10,100,12)] at epoch 0",
+        "log": "mutation-pilot-logs/join-double-weight-mutant.log"
+      },
+      "baseline_after": "passed; 1 test, 0.01s test body",
+      "limit": "Existing control correction_preserves_exact_weighted_many_to_many_join_rows protects one correction history; this run validates the new cross-epoch oracle."
+    }
+  ],
+  "remaining_gaps": [
+    "No physical power-loss-after-ACK execution.",
+    "No detector invokes the WriteUnknown timed-out-write arm; its mutation passed the selected flush test.",
+    "No random candidate baseline, repeated flake/timeout sample, CPU/RSS measurement, or cost on the CI-pinned compiler.",
+    "No approved recurring runner bound; no scheduled mutation workflow is qualified."
+  ]
+}

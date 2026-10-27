@@ -774,9 +774,113 @@ async fn drive(owner: Weak<Inner>, notify: Arc<Notify>) {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
     use object_store::local::LocalFileSystem;
+    use object_store::path::Path as ObjPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    };
     use rockstream_storage::MergeOperatorRegistry;
     use tempfile::tempdir;
+
+    #[derive(Debug)]
+    struct PersistedPutResponseGate {
+        inner: Arc<dyn ObjectStore>,
+        armed: AtomicBool,
+        reached: Notify,
+        release: Notify,
+    }
+
+    impl PersistedPutResponseGate {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                armed: AtomicBool::new(false),
+                reached: Notify::new(),
+                release: Notify::new(),
+            }
+        }
+    }
+
+    impl std::fmt::Display for PersistedPutResponseGate {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PersistedPutResponseGate({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for PersistedPutResponseGate {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            let result = self.inner.put_opts(location, payload, opts).await?;
+            if self.armed.swap(false, Ordering::SeqCst) {
+                // Persist first, then withhold the response so the caller sees an unknown outcome.
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            Ok(result)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjPath>,
+            offset: &ObjPath,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     fn publish_transcript(path: &std::path::Path, value: &[u8]) {
         let staging = path.with_extension("writing");
@@ -1003,6 +1107,97 @@ mod boundary_tests {
             Some(bytes::Bytes::from_static(b"fourth_v"))
         );
         assert_eq!(reopened.fill(), empty_reopened_fill());
+    }
+
+    #[tokio::test]
+    async fn unknown_write_withholds_ack_and_recovers_committed_lfs() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(PersistedPutResponseGate::new(Arc::new(
+            LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+        )));
+        let db = Arc::new(
+            ShardDb::builder("unknown-write-gated", store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let group = Arc::new(PhysicalCommitGroup::with_config(
+            db.clone(),
+            5000,
+            10 * 1024 * 1024,
+            64,
+        ));
+        let mut batch = WriteBatch::new();
+        batch.put(b"written_k", b"written_v");
+        batch.put(&ShardKeyEncoder::frontier_key(), &1_u64.to_be_bytes());
+        let bytes = batch.byte_size();
+        group.add_epoch(1, batch).unwrap();
+        store.armed.store(true, Ordering::SeqCst);
+
+        let flushing = {
+            let group = group.clone();
+            tokio::spawn(async move { group.flush().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), store.reached.notified())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(GROUP_COMMIT_IO_TIMEOUT_MS / 1000 + 3),
+            flushing,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        store.release.notify_one();
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "[RS-0001] Internal error: physical write timed out; its outcome is unknown and must be reconciled after reopening the shard; next_steps: report this issue"
+        );
+        assert_eq!(
+            group.fill(),
+            PhysicalCommitFill {
+                pending_epochs: 0,
+                retained_epochs: 1,
+                retained_bytes: bytes,
+                retained_operations: 2,
+                active_waiters: 0,
+                in_flight: false,
+                retry_required: true,
+                outcome_unknown: true,
+                max_bytes: 10 * 1024 * 1024,
+                max_epochs: 64,
+                max_waiters: MAX_GROUP_COMMIT_WAITERS,
+            }
+        );
+        assert_eq!(group.last_committed(), 0);
+
+        drop(group);
+        let db = match Arc::try_unwrap(db) {
+            Ok(db) => db,
+            Err(_) => panic!("single shard db owner"),
+        };
+        db.close().await.unwrap();
+
+        let reopened = Arc::new(
+            ShardDb::builder("unknown-write-gated", store)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let recovered = PhysicalCommitGroup::open(reopened.clone()).await.unwrap();
+        assert_eq!(recovered.last_committed(), 1);
+        assert_eq!(
+            reopened.get(b"written_k").await.unwrap(),
+            Some(bytes::Bytes::from_static(b"written_v"))
+        );
+        assert_eq!(
+            reopened
+                .get(&ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap(),
+            Some(bytes::Bytes::from(1_u64.to_be_bytes().to_vec()))
+        );
     }
 
     #[tokio::test]

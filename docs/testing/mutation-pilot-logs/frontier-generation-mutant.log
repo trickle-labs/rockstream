@@ -1,0 +1,110 @@
+
+running 1 test
+test frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged ... FAILED
+
+failures:
+
+---- frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged stdout ----
+
+thread 'frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged' (20761893) panicked at crates/rockstream-control/src/frontier.rs:1542:9:
+assertion failed: matches!(agg.ingest_membership_report(membership_report(2, 1, 7, 99)),
+    Err(AggregatorError::GenerationMismatch { .. }))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 161 filtered out; finished in 0.00s
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/rockstream-types/src/checkpoint.rs:268:14
+    |
+268 |             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+268 -             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+268 +             .try_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/rockstream-types/src/state_budget.rs:1023:14
+     |
+1023 |             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+     |              ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1023 -             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+1023 +             .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+     |
+
+warning: `rockstream-types` (lib) generated 2 warnings (run `cargo fix --lib -p rockstream-types` to apply 2 suggestions)
+   Compiling rockstream-control v0.72.0 (/private/tmp/rockstream-mutation-p0/crates/rockstream-control)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/rockstream-ops/src/index_arrange.rs:176:22
+    |
+176 |                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+    |                      ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+176 -                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+176 +                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+    |
+
+warning: `rockstream-ops` (lib) generated 1 warning (run `cargo fix --lib -p rockstream-ops` to apply 1 suggestion)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/rockstream-runtime/src/spill_governor.rs:137:14
+    |
+137 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+137 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+137 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+    |
+
+warning: `rockstream-runtime` (lib) generated 1 warning (run `cargo fix --lib -p rockstream-runtime` to apply 1 suggestion)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/pgwire-0.28.0/src/api/auth/mod.rs:122:40
+    |
+122 |     pub fn from_client_info<C>(client: &C) -> LoginInfo
+    |                                        ^^     ^^^^^^^^^ the same lifetime is hidden here
+    |                                        |
+    |                                        the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+122 |     pub fn from_client_info<C>(client: &C) -> LoginInfo<'_>
+    |                                                        ++++
+
+warning: `pgwire` (lib) generated 1 warning (run `cargo fix --lib -p pgwire` to apply 1 suggestion)
+   Compiling rockstream-sql v0.72.0 (/private/tmp/rockstream-mutation-p0/crates/rockstream-sql)
+   Compiling rockstream-gateway v0.72.0 (/private/tmp/rockstream-mutation-p0/crates/rockstream-gateway)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> crates/rockstream-gateway/src/copy_state.rs:60:41
+   |
+60 |             let _ = COPY_IN_BUFFER_ROWS.fetch_update(
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+60 -             let _ = COPY_IN_BUFFER_ROWS.fetch_update(
+60 +             let _ = COPY_IN_BUFFER_ROWS.try_update(
+   |
+
+   Compiling rockstream-cli v0.72.0 (/private/tmp/rockstream-mutation-p0/crates/rockstream-cli)
+warning: `rockstream-gateway` (lib) generated 1 warning (run `cargo fix --lib -p rockstream-gateway` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.56s
+     Running unittests src/lib.rs (target/debug/deps/rockstream_control-99774b7fe9680777)
+error: test failed, to rerun pass `-p rockstream-control --lib`

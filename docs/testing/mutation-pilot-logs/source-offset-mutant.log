@@ -1,0 +1,74 @@
+
+running 1 test
+test test_source_offset_replay_lfs ... FAILED
+
+failures:
+
+---- test_source_offset_replay_lfs stdout ----
+
+thread 'test_source_offset_replay_lfs' (20720411) panicked at crates/rockstream-connectors/tests/source_proof_tests.rs:445:5:
+assertion `left == right` failed
+  left: 10
+ right: 20
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_source_offset_replay_lfs
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.20s
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/rockstream-types/src/checkpoint.rs:268:14
+    |
+268 |             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+268 -             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+268 +             .try_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/rockstream-types/src/state_budget.rs:1023:14
+     |
+1023 |             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+     |              ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1023 -             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+1023 +             .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+     |
+
+warning: `rockstream-types` (lib) generated 2 warnings (run `cargo fix --lib -p rockstream-types` to apply 2 suggestions)
+   Compiling rockstream-connectors v0.72.0 (/private/tmp/rockstream-mutation-p0/crates/rockstream-connectors)
+warning: unused variable: `partition_offsets`
+   --> crates/rockstream-connectors/src/source_epoch.rs:638:9
+    |
+638 |         partition_offsets: BTreeMap<u64, OffsetToken>,
+    |         ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_partition_offsets`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling rockstream-ops v0.72.0 (/private/tmp/rockstream-mutation-p0/crates/rockstream-ops)
+warning: `rockstream-connectors` (lib) generated 1 warning (run `cargo fix --lib -p rockstream-connectors` to apply 1 suggestion)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/rockstream-ops/src/index_arrange.rs:176:22
+    |
+176 |                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+    |                      ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+176 -                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+176 +                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+    |
+
+warning: `rockstream-ops` (lib) generated 1 warning (run `cargo fix --lib -p rockstream-ops` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.25s
+     Running tests/source_proof_tests.rs (target/debug/deps/source_proof_tests-8fe3024be96a4f2a)
+error: test failed, to rerun pass `-p rockstream-connectors --test source_proof_tests`
