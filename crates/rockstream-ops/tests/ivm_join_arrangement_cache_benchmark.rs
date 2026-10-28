@@ -30,6 +30,7 @@ use rockstream_storage::storage_context::WorkerStorageContext;
 use rockstream_storage::{JoinSide, ShardKeyEncoder, WriteBatch};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::{KeyCapsule, KeyValue};
+use slatedb::object_store_tag::{ObjectStoreCallTag, TableStoreKind};
 
 #[derive(Debug)]
 struct CountingObjectStore {
@@ -73,7 +74,12 @@ impl ObjectStore for CountingObjectStore {
         location: &ObjPath,
         options: GetOptions,
     ) -> ObjectStoreResult<GetResult> {
-        self.get_count.fetch_add(1, Ordering::SeqCst);
+        // Compaction bypasses the cache too, but is not a foreground lookup.
+        if ObjectStoreCallTag::from_extensions(&options.extensions)
+            .is_some_and(|tag| matches!(tag.kind, TableStoreKind::Main | TableStoreKind::Reader))
+        {
+            self.get_count.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.get_opts(location, options).await
     }
 
