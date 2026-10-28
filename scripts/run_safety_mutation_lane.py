@@ -80,7 +80,7 @@ def validate_inventory(inventory: dict, head: str) -> None:
             flag not in case["test_command"] for flag in ("--locked", "--offline")
         ):
             raise RuntimeError(f"{case['id']}: detector must use locked offline Cargo tests")
-        if "--exact" not in case["test_command"] or case["test_command"][-1] != case["test_id"]:
+        if case["test_command"][-2:] != ["--", "--exact"] or case["test_id"] not in case["test_command"][:-2]:
             raise RuntimeError(f"{case['id']}: detector test ID is not exact")
 
 

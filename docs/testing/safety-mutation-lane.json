@@ -32,7 +32,8 @@
       "test_id": "group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs",
       "test_command": [
         "cargo", "test", "--locked", "--offline", "-p", "rockstream-ops", "--lib",
-        "--exact", "group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs"
+        "group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs",
+        "--", "--exact"
       ],
       "expected_failure_marker": "unwrap_err() on an Ok value: [1]",
       "known_limit": "LocalFileSystem write response is delayed after the put; this does not simulate power loss after ACK."
@@ -49,8 +50,8 @@
       "test_id": "test_snapshot_retry_preserves_deleted_table_and_objects",
       "test_command": [
         "cargo", "test", "--locked", "--offline", "-p", "rockstream-storage",
-        "--test", "catalog_storage_tests", "--exact",
-        "test_snapshot_retry_preserves_deleted_table_and_objects"
+        "--test", "catalog_storage_tests", "test_snapshot_retry_preserves_deleted_table_and_objects",
+        "--", "--exact"
       ],
       "expected_failure_marker": "left: (1, 1, [CatalogTable",
       "known_limit": "The detector uses object_store::memory::InMemory, not a physical object store."
@@ -69,7 +70,8 @@
       "test_id": "frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged",
       "test_command": [
         "cargo", "test", "--locked", "--offline", "-p", "rockstream-control", "--lib",
-        "--exact", "frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged"
+        "frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged",
+        "--", "--exact"
       ],
       "expected_failure_marker": "GenerationMismatch",
       "known_limit": "This checks the Rust membership adapter and kernel boundary, not every distributed publication path."
@@ -88,7 +90,7 @@
       "test_id": "join_oracle::tests::oracle_join_weighted_deltas_across_epochs",
       "test_command": [
         "cargo", "test", "--locked", "--offline", "-p", "rockstream-oracle", "--lib",
-        "--exact", "join_oracle::tests::oracle_join_weighted_deltas_across_epochs"
+        "join_oracle::tests::oracle_join_weighted_deltas_across_epochs", "--", "--exact"
       ],
       "expected_failure_marker": "incremental=[(1, 10, 100, 12)] batch=[(1, 10, 100, 6)]",
       "known_limit": "This is a strong control and covers one weighted history, not every join delta term."
