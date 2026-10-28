@@ -56,9 +56,9 @@ Cost labels are observed only where a prior report gives a measurement. Otherwis
 
 - **Path and invariant:** `CheckpointExportService::export_latest_prefix` at `crates/rockstream-control/src/checkpoint_export.rs:169-197` must inventory objects referenced by the committed checkpoint before writing a terminal success marker.
 - **Legal history and mutation:** keep a committed checkpoint manifest, delete its referenced shard objects, then export. Replace `list_checkpoint_objects` with a listing of only currently visible prefix objects.
-- **Expected wrong observation:** export reports `SUCCESS` and writes a commit marker despite the checkpoint referencing missing shard state.
-- **Detector and prediction:** `rockstream-control --test disaster_recovery_tests cli_prefix_export_rejects_missing_committed_shard_objects_before_success`; in-memory object store, no external service. It asserts the integrity error and absence of the terminal marker. Strong expected catch; runtime unmeasured. The test calls the same service method used by the storage export path, not a separate management export path.
-- **Counterevidence / limit:** current regression is a strong control; no isolated mutation result is recorded.
+- **Expected wrong observation:** export reports `SUCCESS` although the committed checkpoint's shard objects are missing.
+- **Detector and observed result:** `rockstream-control --test disaster_recovery_tests cli_prefix_export_rejects_missing_committed_shard_objects_before_success`; `InMemory`, no external service. The unchanged test passed before and after (0.11s and 0.13s test body). Removing the checkpoint shard-object inventory was caught by the intended assertion: the mutant returned `Ok(CheckpointExportOutcome { checkpoint_id: 37, generation: "missing-shard-preinventory", object_count: 3, byte_count: 166, status: "SUCCESS" })`. The mutant test body took 0.12s; the command took about 12.8s including incremental rebuild. See `mutation-pilot-results.json` and the retained failure log.
+- **Counterevidence / limit:** this is the same service method used by the storage export path, but the fixture uses `InMemory`; the mutant's early assertion failure means the test did not reach its subsequent terminal-marker absence assertion. It does not qualify a physical or remote object store.
 
 ### 7. P1 — accept a stale source-owner lease
 

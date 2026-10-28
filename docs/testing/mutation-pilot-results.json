@@ -232,11 +232,63 @@
       },
       "baseline_after": "passed; 1 test, 0.01s test body",
       "limit": "Existing control correction_preserves_exact_weighted_many_to_many_join_rows protects one correction history; this run validates the new cross-epoch oracle."
+    },
+    {
+      "id": "P0-CHECKPOINT-EXPORT-MISSING-COMMITTED-SHARDS",
+      "severity": "P0",
+      "source_sha": "a0acebe3c71e0f55ad5ffd2b81cefbcdfadd00aa",
+      "source_path": "crates/rockstream-control/src/checkpoint_export.rs",
+      "mutation": {
+        "before": [
+          "        for (shard_id, shard_checkpoint) in &checkpoint.shards {",
+          "            let shard_path = format!(\"shards/{}\", shard_id.0);",
+          "            let shard_objects = match shard_checkpoint.snapshot_id.as_deref() {",
+          "                Some(snapshot_id) => {",
+          "                    snapshot_object_paths(source.clone(), &shard_path, snapshot_id).await?",
+          "                }",
+          "                None => {",
+          "                    manifest_object_paths(",
+          "                        source.clone(),",
+          "                        &shard_path,",
+          "                        shard_checkpoint.shard_checkpoint_id,",
+          "                    )",
+          "                    .await?",
+          "                }",
+          "            };",
+          "            objects.extend(shard_objects);",
+          "            if objects.len() > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {",
+          "                return Err(CheckpointExportError::Integrity(format!(",
+          "                    \"checkpoint object inventory exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}\"",
+          "                )));",
+          "            }",
+          "        }"
+        ],
+        "after": [],
+        "mutation_spec_sha256": "a3b5cacf905b2d06227b9df665717a3981529ed909a0a30e71dddf1843f8590a"
+      },
+      "detector": {
+        "package": "rockstream-control",
+        "target": "test:disaster_recovery_tests",
+        "test_id": "cli_prefix_export_rejects_missing_committed_shard_objects_before_success",
+        "command": "rtk cargo test --locked --offline -p rockstream-control --test disaster_recovery_tests cli_prefix_export_rejects_missing_committed_shard_objects_before_success",
+        "features": "default",
+        "services": ["object_store::memory::InMemory"]
+      },
+      "baseline_before": "passed; 1 test, 0.11s test body",
+      "mutant": {
+        "classification": "caught_by_intended_assertion",
+        "test_body_seconds": 0.12,
+        "command_wall_seconds_approx": 12.8,
+        "expected": "Err(CheckpointExportError::Integrity(_)); no successful export",
+        "observed": "Ok(CheckpointExportOutcome { checkpoint_id: 37, generation: missing-shard-preinventory, object_count: 3, byte_count: 166, status: SUCCESS })",
+        "log": "mutation-pilot-logs/checkpoint-export-missing-shards-mutant.log"
+      },
+      "baseline_after": "passed; 1 test, 0.13s test body",
+      "limit": "The test uses object_store::memory::InMemory. The mutant's early success assertion fails before the later terminal-marker absence assertion; this does not qualify a physical or remote object store."
     }
   ],
   "remaining_gaps": [
     "No physical power-loss-after-ACK execution.",
-    "No detector invokes the WriteUnknown timed-out-write arm; its mutation passed the selected flush test.",
     "No random candidate baseline, repeated flake/timeout sample, CPU/RSS measurement, or cost on the CI-pinned compiler.",
     "No approved recurring runner bound; no scheduled mutation workflow is qualified."
   ]
