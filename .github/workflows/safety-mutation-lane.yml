@@ -1,7 +1,9 @@
-name: On-demand Safety Mutation Evidence
+name: Safety Mutation Evidence
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * 3"
 
 permissions:
   contents: read
