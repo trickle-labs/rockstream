@@ -786,45 +786,41 @@ mod boundary_tests {
     use tempfile::tempdir;
 
     #[derive(Debug)]
-    struct PersistedPutResponseGate {
+    struct UnpersistedPutTimeoutGate {
         inner: Arc<dyn ObjectStore>,
         armed: AtomicBool,
         reached: Notify,
-        release: Notify,
     }
 
-    impl PersistedPutResponseGate {
+    impl UnpersistedPutTimeoutGate {
         fn new(inner: Arc<dyn ObjectStore>) -> Self {
             Self {
                 inner,
                 armed: AtomicBool::new(false),
                 reached: Notify::new(),
-                release: Notify::new(),
             }
         }
     }
 
-    impl std::fmt::Display for PersistedPutResponseGate {
+    impl std::fmt::Display for UnpersistedPutTimeoutGate {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "PersistedPutResponseGate({})", self.inner)
+            write!(f, "UnpersistedPutTimeoutGate({})", self.inner)
         }
     }
 
     #[async_trait]
-    impl ObjectStore for PersistedPutResponseGate {
+    impl ObjectStore for UnpersistedPutTimeoutGate {
         async fn put_opts(
             &self,
             location: &ObjPath,
             payload: PutPayload,
             opts: PutOptions,
         ) -> ObjectStoreResult<PutResult> {
-            let result = self.inner.put_opts(location, payload, opts).await?;
             if self.armed.swap(false, Ordering::SeqCst) {
-                // Persist first, then withhold the response so the caller sees an unknown outcome.
                 self.reached.notify_one();
-                self.release.notified().await;
+                std::future::pending::<()>().await;
             }
-            Ok(result)
+            self.inner.put_opts(location, payload, opts).await
         }
 
         async fn put_multipart_opts(
@@ -1113,9 +1109,9 @@ mod boundary_tests {
     }
 
     #[tokio::test]
-    async fn unknown_write_withholds_ack_and_recovers_committed_lfs() {
+    async fn unknown_unpersisted_write_is_not_acked_and_retry_recovers_lfs() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(PersistedPutResponseGate::new(Arc::new(
+        let store = Arc::new(UnpersistedPutTimeoutGate::new(Arc::new(
             LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
         )));
         let db = Arc::new(
@@ -1134,7 +1130,7 @@ mod boundary_tests {
         batch.put(b"written_k", b"written_v");
         batch.put(&ShardKeyEncoder::frontier_key(), &1_u64.to_be_bytes());
         let bytes = batch.byte_size();
-        group.add_epoch(1, batch).unwrap();
+        group.add_epoch(1, batch.clone()).unwrap();
         store.armed.store(true, Ordering::SeqCst);
 
         let flushing = {
@@ -1151,14 +1147,30 @@ mod boundary_tests {
         .await
         .unwrap()
         .unwrap();
-        store.release.notify_one();
+        let acked_epochs = result.as_ref().ok().cloned();
+        let error = result.as_ref().err().map(ToString::to_string);
+        let fill = group.fill();
+        let committed_before_crash = group.last_committed();
 
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "[RS-0001] Internal error: physical write timed out; its outcome is unknown and must be reconciled after reopening the shard; next_steps: report this issue"
+        drop(group);
+        drop(db);
+
+        let reopened = Arc::new(
+            ShardDb::builder("unknown-write-gated", store.clone())
+                .build()
+                .await
+                .unwrap(),
         );
+        let recovered = PhysicalCommitGroup::open(reopened.clone()).await.unwrap();
         assert_eq!(
-            group.fill(),
+            acked_epochs, None,
+            "unknown write was acknowledged before recovery: ack={acked_epochs:?}, frontier={:?}, value={:?}",
+            recovered.last_committed(),
+            reopened.get(b"written_k").await.unwrap()
+        );
+        assert_eq!(error.as_deref(), Some("[RS-0001] Internal error: physical write timed out; its outcome is unknown and must be reconciled after reopening the shard; next_steps: report this issue"));
+        assert_eq!(
+            fill,
             PhysicalCommitFill {
                 pending_epochs: 0,
                 retained_epochs: 1,
@@ -1173,22 +1185,19 @@ mod boundary_tests {
                 max_waiters: MAX_GROUP_COMMIT_WAITERS,
             }
         );
-        assert_eq!(group.last_committed(), 0);
-
-        drop(group);
-        let db = match Arc::try_unwrap(db) {
-            Ok(db) => db,
-            Err(_) => panic!("single shard db owner"),
-        };
-        db.close().await.unwrap();
-
-        let reopened = Arc::new(
-            ShardDb::builder("unknown-write-gated", store)
-                .build()
+        assert_eq!(committed_before_crash, 0);
+        assert_eq!(recovered.last_committed(), 0);
+        assert_eq!(reopened.get(b"written_k").await.unwrap(), None);
+        assert_eq!(
+            reopened
+                .get(&ShardKeyEncoder::frontier_key())
                 .await
                 .unwrap(),
+            None
         );
-        let recovered = PhysicalCommitGroup::open(reopened.clone()).await.unwrap();
+
+        recovered.add_epoch(1, batch).unwrap();
+        assert_eq!(recovered.flush().await.unwrap(), vec![1]);
         assert_eq!(recovered.last_committed(), 1);
         assert_eq!(
             reopened.get(b"written_k").await.unwrap(),

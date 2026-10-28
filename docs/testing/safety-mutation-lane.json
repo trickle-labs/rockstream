@@ -5,7 +5,7 @@
   "max_cases_per_run": 4,
   "command_timeout_seconds": 600,
   "source_files": {
-    "crates/rockstream-ops/src/group_commit/physical.rs": "34c642f037ca4afdc4c0635e1134fc0250b98bcd36c19c685614d9569bfbd145",
+    "crates/rockstream-ops/src/group_commit/physical.rs": "934a22ef371a4f52a90c281451af9ce2d8d49c9d3ed6e30327d493a4beea0c13",
     "crates/rockstream-storage/src/catalog/store.rs": "4a2227545412be1cf5cb7b748f9d5d57cf293956ca3e6270f10e11778ab37636",
     "crates/rockstream-storage/tests/catalog_storage_tests.rs": "44f18445608662c6857a83b9fa59df50144901ea9fce3d2aabecc12dd178acac",
     "crates/rockstream-control/src/frontier.rs": "70ae82f046c37cb144c21feee8ede62bc12297c800d56aed45ed783d3f59693c",
@@ -29,14 +29,14 @@
         "        }",
         "        Outcome::WriteUnknown(_) => (physical_commit::DURABLE, None),"
       ],
-      "test_id": "group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs",
+      "test_id": "group_commit::physical::boundary_tests::unknown_unpersisted_write_is_not_acked_and_retry_recovers_lfs",
       "test_command": [
         "cargo", "test", "--locked", "--offline", "-p", "rockstream-ops", "--lib",
-        "group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs",
+        "group_commit::physical::boundary_tests::unknown_unpersisted_write_is_not_acked_and_retry_recovers_lfs",
         "--", "--exact"
       ],
-      "expected_failure_marker": "called `Result::unwrap_err()` on an `Ok` value: [1]",
-      "known_limit": "LocalFileSystem write response is delayed after the put; this does not simulate power loss after ACK."
+      "expected_failure_marker": "unknown write was acknowledged before recovery: ack=Some([1]), frontier=0, value=None",
+      "known_limit": "The test wrapper blocks the first LocalFileSystem put before persistence; dropping and reopening the shard is a process-like test, not a physical power-loss simulation."
     },
     {
       "id": "P0-CATALOG-RECOVERY-LOST-COMMITTED-OPERATION",
