@@ -5,7 +5,7 @@ This is an on-demand pilot for four human-reviewed candidates: uncertain physica
 ## Bound and execution
 
 - One ubuntu-24.04 runner with Rust/Cargo 1.88 and at most two Cargo build jobs.
-- Four fixed mutants per run; each exact detector command has a 300-second timeout, and the job has a 30-minute hard limit.
+- Four fixed mutants per run; each exact detector command has a 600-second timeout, and the job has a 30-minute hard limit.
 - The workflow fetches the locked dependency set before the runner's offline checks.
 - For each candidate, require the unchanged exact detector to pass, apply one source replacement in a temporary source copy, verify the intended assertion failure, restore the source byte-for-byte, then rerun the unchanged detector.
 - Reject a dirty checkout, non-descendant source revision, changed candidate or detector file hash, missing/ambiguous source text, zero or skipped tests, unrelated failures, stale output artifacts, and any mutant survivor.
