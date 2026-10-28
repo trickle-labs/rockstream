@@ -31,6 +31,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: safety-mutation-lane-rust-1.88
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
       - name: Test exact source, execution, and reporting gates
         run: python3 scripts/run_safety_mutation_lane_test.py -q
       - name: Run the fixed reviewed candidate set
