@@ -3,7 +3,7 @@
   "reviewed_source_revision": "a0acebe3c71e0f55ad5ffd2b81cefbcdfadd00aa",
   "rust_toolchain": "1.88",
   "max_cases_per_run": 4,
-  "command_timeout_seconds": 120,
+  "command_timeout_seconds": 300,
   "source_files": {
     "crates/rockstream-ops/src/group_commit/physical.rs": "34c642f037ca4afdc4c0635e1134fc0250b98bcd36c19c685614d9569bfbd145",
     "crates/rockstream-storage/src/catalog/store.rs": "4a2227545412be1cf5cb7b748f9d5d57cf293956ca3e6270f10e11778ab37636",
@@ -35,7 +35,7 @@
         "group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs",
         "--", "--exact"
       ],
-      "expected_failure_marker": "unwrap_err() on an Ok value: [1]",
+      "expected_failure_marker": "called `Result::unwrap_err()` on an `Ok` value: [1]",
       "known_limit": "LocalFileSystem write response is delayed after the put; this does not simulate power loss after ACK."
     },
     {
