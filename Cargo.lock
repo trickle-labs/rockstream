@@ -5468,7 +5468,7 @@ dependencies = [
  "serial_test",
  "sha2 0.10.9",
  "slatedb",
- "slatedb-common 0.16.0",
+ "slatedb-common",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
@@ -6043,7 +6043,7 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
- "slatedb-common 0.17.0",
+ "slatedb-common",
  "slatedb-txn-obj",
  "smallvec",
  "sysinfo",
@@ -6055,21 +6055,6 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "slatedb-common"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b77f238f348e95e1653a5235f880ac703011b82582bd556f2aba405abf8180e"
-dependencies = [
- "chrono",
- "log",
- "object_store 0.14.2",
- "rand 0.9.4",
- "rand_xoshiro",
- "thread_local",
- "tokio",
 ]
 
 [[package]]
@@ -6101,7 +6086,7 @@ dependencies = [
  "log",
  "object_store 0.14.2",
  "parking_lot",
- "slatedb-common 0.17.0",
+ "slatedb-common",
  "thiserror 1.0.69",
 ]
 
