@@ -10,7 +10,7 @@
     "crates/rockstream-storage/tests/catalog_storage_tests.rs": "44f18445608662c6857a83b9fa59df50144901ea9fce3d2aabecc12dd178acac",
     "crates/rockstream-control/src/frontier.rs": "70ae82f046c37cb144c21feee8ede62bc12297c800d56aed45ed783d3f59693c",
     "crates/rockstream-ops/src/join.rs": "b2ac80b2c3ff15414ee4fe85d2ed352b5ab363ae2d7bab9b8bbdd21db4bb6b48",
-    "crates/rockstream-oracle/src/join_oracle.rs": "337dc8b5d7f995367d7f1f48602d48a337aaa8e90583f5737573902cf30d0993"
+    "crates/rockstream-oracle/src/join_oracle.rs": "c517f2f44c86f4a4e1b07ebbaf38970b45fdb5a7ab4b4bf53f7460675fa5bc1c"
   },
   "cases": [
     {
