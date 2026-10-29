@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use futures::StreamExt;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt};
 use rockstream_control::{CheckpointExportService, CheckpointManifestStore};
 use rockstream_runtime::RecoveryDriver;
@@ -103,6 +104,17 @@ async fn export_restore_and_assert(
             .unwrap()
             .as_ref(),
         b"view=v committed_epoch=7"
+    );
+    assert_eq!(
+        target
+            .get(&Path::from("control/connectors/source-resume"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        b"offset=42"
     );
     let recovery = RecoveryDriver::new();
     recovery.load_checkpoint(checkpoint);
@@ -243,10 +255,9 @@ async fn minio_stores(
         return None;
     }
     let source_bucket = format!("rs-dr-source-{suffix}");
-    let (container, port) = match start_minio(&source_bucket).await {
-        Some(res) => res,
-        None => return None,
-    };
+    let (container, port) = start_minio(&source_bucket)
+        .await
+        .expect("MinIO must start when Docker is available");
     let export_bucket = format!("rs-dr-export-{suffix}");
     let target_bucket = format!("rs-dr-target-{suffix}");
     create_minio_bucket(port, &export_bucket).await;
@@ -340,11 +351,11 @@ async fn minio_tc_truncated_export_fails_closed_rs3614() {
         .restore_generation(export, target.clone(), "minio-truncated")
         .await
         .unwrap_err();
-    assert!(error.to_string().starts_with("RS-3614:"));
-    assert!(target
-        .head(&Path::from("control/bootstrap/active-generation"))
-        .await
-        .is_err());
+    assert_eq!(
+        error.to_string(),
+        "RS-3614: checkpoint export integrity validation failed: destination object checkpoint-exports/minio-truncated/objects/00000000000000000000 failed validation; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
+    );
+    assert!(target.list(None).next().await.is_none());
 }
 
 #[tokio::test]
