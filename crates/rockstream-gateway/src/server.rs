@@ -11378,11 +11378,7 @@ impl GatewayHandler {
                             table: t,
                             row_key: rk,
                             ..
-                        } if t.eq_ignore_ascii_case(table) => {
-                            if rk == row_key {
-                                return Ok(true);
-                            }
-                        }
+                        } if t.eq_ignore_ascii_case(table) && rk == row_key => return Ok(true),
                         DmlOp::Update {
                             table: t,
                             new_row_key,
@@ -15245,12 +15241,8 @@ fn account_fallback_query_batch(
     previous_bytes: usize,
     batch: &RecordBatch,
 ) -> Result<(usize, usize), GatewayError> {
-    let rows = previous_rows
-        .checked_add(batch.num_rows())
-        .unwrap_or(usize::MAX);
-    let bytes = previous_bytes
-        .checked_add(batch.get_array_memory_size())
-        .unwrap_or(usize::MAX);
+    let rows = previous_rows.saturating_add(batch.num_rows());
+    let bytes = previous_bytes.saturating_add(batch.get_array_memory_size());
     if rows > FALLBACK_QUERY_MAX_ROWS || bytes > FALLBACK_QUERY_MAX_ARRAY_BYTES {
         return Err(GatewayError::QueryTimeExecutionFailed {
             detail: format!(
