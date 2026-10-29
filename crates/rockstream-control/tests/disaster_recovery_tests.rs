@@ -545,6 +545,94 @@ async fn minio_tc_truncated_export_fails_closed_rs3614() {
 }
 
 #[tokio::test]
+async fn minio_tc_export_rejects_missing_committed_shard_objects_before_success() {
+    let Some((_container, source, export, target)) = minio_stores("missing-shard").await else {
+        return;
+    };
+    let checkpoint = seed_checkpoint(source.clone(), 13).await;
+    let manifests = CheckpointManifestStore::new(source.clone());
+    let shard_prefix = Path::from("shards/0");
+    let mut listing = source.list(Some(&shard_prefix));
+    let mut paths = Vec::new();
+    let mut inventory_before = Vec::new();
+    while let Some(entry) = listing.next().await {
+        let entry = entry.expect("MinIO shard inventory must list successfully");
+        paths.push(entry.location.clone());
+        inventory_before.push(serde_json::json!({
+            "path": entry.location.to_string(),
+            "size": entry.size,
+            "etag": entry.e_tag,
+        }));
+    }
+    drop(listing);
+    assert!(
+        !paths.is_empty(),
+        "checkpoint must reference MinIO shard objects"
+    );
+    for path in paths {
+        source.delete(&path).await.unwrap();
+    }
+    assert_eq!(
+        manifests.load_latest_manifest().await.unwrap(),
+        Some(checkpoint.clone())
+    );
+    assert!(source.list(Some(&shard_prefix)).next().await.is_none());
+
+    let generation = "minio-missing-shard";
+    let error = CheckpointExportService::new()
+        .export_latest_prefix(
+            source,
+            export.clone(),
+            &manifests,
+            generation,
+            &Path::from(""),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "RS-3614: checkpoint export integrity validation failed: SlateDB database for shard `shards/0` is missing; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
+    );
+    let marker = Path::from("checkpoint-exports/minio-missing-shard/commit");
+    assert!(matches!(
+        export.head(&marker).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    assert!(export.list(None).next().await.is_none());
+    assert!(target.list(None).next().await.is_none());
+
+    let revision = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let artifact_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ci-test-results");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    std::fs::write(
+        artifact_dir.join("checkpoint-export-minio-missing-object.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "source_sha": String::from_utf8(revision.stdout).unwrap().trim(),
+            "minio_image": "codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+            "source_bucket": "rs-dr-source-missing-shard",
+            "export_bucket": "rs-dr-export-missing-shard",
+            "target_bucket": "rs-dr-target-missing-shard",
+            "checkpoint": checkpoint,
+            "generation": generation,
+            "fault": "deleted all committed shard objects before export",
+            "source_inventory_before": inventory_before,
+            "source_inventory_after": [],
+            "export_inventory_after": [],
+            "target_inventory_after": [],
+            "failure": error.to_string(),
+            "terminal_success_marker_present": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
 async fn test_disaster_recovery_lfs_full_lifecycle() {
     let source_dir = tempfile::tempdir().unwrap();
     let export_dir = tempfile::tempdir().unwrap();
