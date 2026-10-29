@@ -10,5 +10,5 @@ unsafe_code_added = false
 verus = "formal/verus/toolchain.lock.toml"
 solver = "The bundled Z3 identified by the pinned Verus archive."
 support_library = "The exact vstd and builtin package versions in toolchain.lock.toml."
-compiler = "Rust 1.88, as pinned by rust-toolchain.toml."
+compiler = "Rust 1.95, as pinned by rust-toolchain.toml."
 platform = "The declared Rust target and standard-library behavior."

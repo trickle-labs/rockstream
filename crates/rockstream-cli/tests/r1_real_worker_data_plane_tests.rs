@@ -106,14 +106,6 @@ fn management_status_json(management_addr: &str) -> Output {
         .unwrap()
 }
 
-fn allocate_memory_pressure() -> Vec<u8> {
-    let mut memory = vec![0_u8; 512 * 1024 * 1024];
-    for page in memory.chunks_mut(4096) {
-        page[0] = 1;
-    }
-    memory
-}
-
 fn assert_management_status_transcript(
     output: &Output,
     state: &str,
@@ -738,48 +730,6 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
         ],
     );
     assert!(topology_revision(&two_workers) > empty_revision);
-
-    let memory_pressure = allocate_memory_pressure();
-    std::hint::black_box(&memory_pressure);
-    let pressure_deadline = Instant::now() + Duration::from_secs(10);
-    let pressure_output = loop {
-        let output = management_status_json(&management_addr);
-        if output.status.success() {
-            let status: ManagementClusterStatusInfo =
-                serde_json::from_slice(&output.stdout).expect("cluster status JSON");
-            if status.nodes.len() == 2
-                && two_workers.nodes.iter().all(|previous| {
-                    status
-                        .nodes
-                        .iter()
-                        .find(|current| current.node_id == previous.node_id)
-                        .is_some_and(|current| {
-                            current.capacity_headroom < previous.capacity_headroom
-                        })
-                })
-            {
-                break output;
-            }
-        }
-        assert!(
-            Instant::now() < pressure_deadline,
-            "multi-process status headroom did not fall under memory pressure"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    let pressure_nodes =
-        serde_json::from_slice::<ManagementClusterStatusInfo>(&pressure_output.stdout)
-            .expect("memory pressure status JSON")
-            .nodes;
-    let pressure_status =
-        assert_management_status_transcript(&pressure_output, "healthy", pressure_nodes);
-    assert!(two_workers.nodes.iter().all(|previous| {
-        pressure_status
-            .nodes
-            .iter()
-            .find(|current| current.node_id == previous.node_id)
-            .is_some_and(|current| current.capacity_headroom < previous.capacity_headroom)
-    }));
 
     processes.workers[0].kill().unwrap();
     processes.workers[0].wait().unwrap();

@@ -1,7 +1,9 @@
-name: On-demand Safety Mutation Evidence
+name: Safety Mutation Evidence
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * 3"
 
 permissions:
   contents: read
@@ -27,10 +29,10 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: safety-mutation-lane-rust-1.88
+          shared-key: safety-mutation-lane-rust-1.95
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked
       - name: Test exact source, execution, and reporting gates

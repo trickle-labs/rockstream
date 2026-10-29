@@ -53,7 +53,7 @@ class PolicyTests(unittest.TestCase):
         check = blocks["check"]
         dependencies = re.findall(r"^      - ([\w-]+)$", check, re.M)
         self.assertEqual(dependencies, [
-            "ci-policy", "check-quality", "check-tests", "gateway",
+            "ci-policy", "check-quality", "current-stable-compile", "check-tests", "gateway",
             "postgres-differential", "control-plane-ha", "formal-verify",
             "verus-verify", "verus-consumer", "nexmark-regression-gate", "benchmark", "docker-build",
         ])

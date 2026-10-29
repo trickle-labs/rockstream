@@ -4,7 +4,7 @@ VS0 pins the Verus release, solver source, support-crate versions, and Rust
 compiler in [`toolchain.lock.toml`](toolchain.lock.toml). The archive contains
 `verus`, `cargo-verus`, and the matching solver.
 
-RockStream production code uses Rust 1.88. Verus uses its own pinned verifier
+RockStream production code uses Rust 1.95. Verus uses its own pinned verifier
 compiler, currently Rust 1.98.1 on supported macOS and Linux hosts. Install
 that compiler before running the proof gate if Verus requests it.
 

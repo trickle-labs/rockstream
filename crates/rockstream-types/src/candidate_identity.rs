@@ -59,7 +59,7 @@ impl CandidateIdentity {
                         }
                     }
                 }
-                "rustc 1.88.0".to_string()
+                "rustc 1.95.0".to_string()
             });
 
         let lockfile_digest = Self::compute_lockfile_digest();

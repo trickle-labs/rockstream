@@ -1,10 +1,10 @@
 # Bounded safety mutation lane
 
-This is an on-demand pilot for four human-reviewed candidates: uncertain physical write ACK, catalog replay identity, stale frontier generation, and weighted join multiplicity. It is not a pull-request gate and does not claim end-to-end safety qualification.
+This is a weekly scheduled and manually dispatched pilot for four human-reviewed candidates: uncertain physical write ACK, catalog replay identity, stale frontier generation, and weighted join multiplicity. It is not a pull-request gate and does not claim end-to-end safety qualification.
 
 ## Bound and execution
 
-- One ubuntu-24.04 runner with Rust/Cargo 1.88 and at most two Cargo build jobs.
+- One ubuntu-24.04 runner with Rust/Cargo 1.95 and at most two Cargo build jobs.
 - Four fixed mutants per run; each exact detector command has a 600-second timeout, and the job has a 30-minute hard limit.
 - The workflow fetches the locked dependency set before the runner's offline checks.
 - For each candidate, require the unchanged exact detector to pass, apply one source replacement in a temporary source copy, verify the intended assertion failure, restore the source byte-for-byte, then rerun the unchanged detector.
@@ -17,4 +17,11 @@ The inventory pins the reviewed source revision and SHA-256 of each mutation and
 
 The selected tests exercise an uncertain write response, in-memory catalog recovery, the Rust frontier adapter/kernel boundary, and one exact weighted join history. They do not simulate power loss after ACK, qualify a remote object store, or test a separate stale-owner lease mutant. These remain explicit unsupported or not-run entries in the inventory and run report.
 
-The first GitHub Actions run must supply total and median mutant time, setup time, CPU, peak RSS, and timeout behavior. The proposed hard cap is 30 minutes; a recurring schedule is not enabled until that run establishes the cost and the bound is approved. The manual workflow does not run on pull requests or change branch protection.
+The schedule runs Wednesdays at 02:30 UTC on `main`; `workflow_dispatch` remains available. Each run is capped at 30 minutes and retains artifacts for 30 days. It does not run on pull requests or change branch protection.
+
+## Observed cost
+
+- Hosted mutation runs used 12.62 runner-minutes (40673174392) and 18.13 runner-minutes (40682424016). The latest measured campaign took 1,044.838 seconds, used 1,632.72 child CPU seconds, and peaked at 2.59 GB RSS. It ran four mutants; the two hosted runs after the per-command timeout increased from 300 to 600 seconds succeeded. One earlier attempt hit the old timeout.
+- In run 40682424016, the four mutant invocations took 168.074 seconds total and 52.346 seconds median. Inventory/setup verification took 0.624 seconds; the first unchanged baseline took 367.956 seconds, including the cold target build. One of three hosted attempts hit the old command timeout; neither of the two attempts under the 600-second limit timed out. Two post-fix runs are too few to estimate a flake rate.
+- At the weekly cadence, the latest observed run implies about 15.7 runner-hours per year; the 30-minute hard cap bounds this at 26 hours per year.
+- Adjacent standard CI runs each had 31 completed jobs: PR #271 run 40639005694 used 470.77 aggregate runner-minutes, and PR #272 run 40656388591 used 450.95. These are representative, non-controlled runs; the difference is not attributable to this lane. The mutation job is separate, so it adds no PR-gate jobs.

@@ -391,7 +391,7 @@ impl KafkaSink {
         consumer.assign(&assignment).map_err(setup)?;
         while Instant::now() < deadline {
             match consumer.poll(remaining().min(Duration::from_millis(100))) {
-                Some(Ok(message)) => {
+                Some(Ok(message))
                     if message
                         .payload_view::<str>()
                         .and_then(Result::ok)
@@ -405,19 +405,19 @@ impl KafkaSink {
                             }
                             payload.get("epoch").and_then(serde_json::Value::as_u64)
                         })
-                        == Some(epoch)
+                        == Some(epoch) =>
+                {
+                    if expected
+                        .is_some_and(|expected| message.payload() != Some(expected.as_bytes()))
                     {
-                        if expected
-                            .is_some_and(|expected| message.payload() != Some(expected.as_bytes()))
-                        {
-                            return Err(SinkError::CommitFailed {
-                                epoch,
-                                reason: "conflicting Kafka payload for transaction".into(),
-                            });
-                        }
-                        return Ok(true);
+                        return Err(SinkError::CommitFailed {
+                            epoch,
+                            reason: "conflicting Kafka payload for transaction".into(),
+                        });
                     }
+                    return Ok(true);
                 }
+                Some(Ok(_)) => {}
                 Some(Err(KafkaError::PartitionEOF(partition))) => {
                     // EOF proves absence only if the partition was stable through
                     // the captured high watermark before this scan began.

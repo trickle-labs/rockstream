@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn oracle_join_weighted_deltas_across_epochs() {
-        let epochs = vec![
+        let epochs = [
             (vec![(1, 10, 2)], vec![(1, 100, 3)]),
             (vec![(1, 10, 1)], vec![]),
             (vec![], vec![(1, 100, -1)]),
