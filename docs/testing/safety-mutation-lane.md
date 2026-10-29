@@ -11,6 +11,14 @@ This is a weekly scheduled and manually dispatched pilot for four human-reviewed
 - Reject a dirty checkout, non-descendant source revision, changed candidate or detector file hash, missing/ambiguous source text, zero or skipped tests, unrelated failures, stale output artifacts, and any mutant survivor.
 - Retain the candidate inventory, exact mutation diffs, full command logs, JSON result, human-readable matrix, wall time, child CPU, and peak child RSS for 30 days.
 
+## Disk budget and cleanup
+
+- The lane owns `target/safety-mutation-lane` as its Cargo target and keeps that cache at the existing workspace target path. Before compiling, it records free/available bytes and sizes for that target, candidate scratch, and output artifacts on every involved filesystem.
+- Preflight requires 10 GiB available. If space is lower, only the lane-owned Cargo target is pruned and preflight is repeated; the lane exits `not_qualified` before compilation if the reserve is still short.
+- Filesystem usage is sampled every 5 seconds. The runner stops the current Cargo process group and reports `resource_limit_not_qualified` below a 2 GiB reserve. An `ENOSPC` or quota error is reported as `disk_full_not_qualified`; neither can count as a caught mutant.
+- The source copy lives under `$RUNNER_TEMP/safety-mutation-work`, is removed on normal exit and exception, and has an `always()` workflow cleanup step for cancellation/timeout. The workflow-owned Cargo cache is retained and only pruned when preflight needs space.
+- The exact preflight threshold and measured cold/warm disk growth are recorded with the qualification evidence; self-tests use an injected capacity snapshot and an actual timed child process rather than consuming the runner's disk.
+
 The inventory pins the reviewed source revision and SHA-256 of each mutation and detector file. A documentation-only commit can follow that revision; any change to a pinned source or detector file makes the run not qualified until the inventory is reviewed again.
 
 ## Current matrix limits
