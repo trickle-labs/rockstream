@@ -20,6 +20,13 @@ async fn seed_checkpoint(store: Arc<dyn ObjectStore>, checkpoint_id: u64) -> Clu
         .await
         .unwrap();
     db.put(b"view/rows", b"committed").await.unwrap();
+    db.put(b"view/rows/1", b"before-overwrite").await.unwrap();
+    db.put(b"view/rows/2", b"deleted").await.unwrap();
+    db.put(b"view/rows/1", b"committed").await.unwrap();
+    db.delete(b"view/rows/2").await.unwrap();
+    db.put(b"view/rows/3", b"committed-second-row")
+        .await
+        .unwrap();
     db.put(
         &ShardKeyEncoder::frontier_key(),
         &checkpoint_id.to_be_bytes(),
@@ -137,6 +144,27 @@ async fn export_restore_and_assert(
             .unwrap()
             .as_ref(),
         b"committed"
+    );
+    assert_eq!(
+        shard
+            .reader
+            .get(b"view/rows/1")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"committed"
+    );
+    assert!(shard.reader.get(b"view/rows/2").await.unwrap().is_none());
+    assert_eq!(
+        shard
+            .reader
+            .get(b"view/rows/3")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"committed-second-row"
     );
 }
 
@@ -314,6 +342,9 @@ async fn minio_restore_process_fixture() {
         .await
         .unwrap();
     let row = shard.reader.get(b"view/rows").await.unwrap().unwrap();
+    let row_1 = shard.reader.get(b"view/rows/1").await.unwrap().unwrap();
+    let row_2 = shard.reader.get(b"view/rows/2").await.unwrap();
+    let row_3 = shard.reader.get(b"view/rows/3").await.unwrap().unwrap();
     let frontier = shard
         .reader
         .get(&ShardKeyEncoder::frontier_key())
@@ -340,6 +371,11 @@ async fn minio_restore_process_fixture() {
         "restore": restore,
         "checkpoint": checkpoint,
         "row": String::from_utf8(row.to_vec()).unwrap(),
+        "rows": {
+            "1": String::from_utf8(row_1.to_vec()).unwrap(),
+            "2": row_2.map(|value| String::from_utf8(value.to_vec()).unwrap()),
+            "3": String::from_utf8(row_3.to_vec()).unwrap(),
+        },
         "frontier": u64::from_be_bytes(frontier.as_ref().try_into().unwrap()),
         "catalog": String::from_utf8(catalog.to_vec()).unwrap(),
         "source_resume": String::from_utf8(source_resume.to_vec()).unwrap(),
@@ -422,6 +458,11 @@ async fn minio_tc_restore_in_fresh_process_preserves_exact_state() {
             },
             "checkpoint": checkpoint,
             "row": "committed",
+            "rows": {
+                "1": "committed",
+                "2": null,
+                "3": "committed-second-row",
+            },
             "frontier": 12,
             "catalog": "view=v committed_epoch=7",
             "source_resume": "offset=42",
