@@ -1100,7 +1100,7 @@ async fn run_case_with_deltas(
     let mut accumulated: Option<TypedResult> = None;
     let mut current_dataset = initial_dataset.clone();
     let mut compared_epochs = Vec::new();
-    let epochs = std::iter::once(("snapshot", initial_dataset)).chain(deltas.into_iter());
+    let epochs = std::iter::once(("snapshot", initial_dataset)).chain(deltas);
 
     for (epoch_id, (phase, inputs)) in epochs.enumerate() {
         if epoch_id > 0 {

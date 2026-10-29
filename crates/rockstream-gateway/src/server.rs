@@ -203,6 +203,15 @@ impl QueryParser for PreparedStatementCache {
     type Statement = PreparedStatement;
 
     async fn parse_sql(&self, sql: &str, types: &[Type]) -> PgWireResult<Self::Statement> {
+        if looks_like_dml(sql).is_some() {
+            if let Err(error) = rockstream_sql::dml::validate_sql_parenthesis_depth(sql) {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    error.to_string(),
+                ))));
+            }
+        }
         let mut parameter_types = infer_parameter_types(&self.catalog, sql).await?;
         for (inferred, supplied) in parameter_types.iter_mut().zip(types) {
             if *supplied != Type::UNKNOWN {
@@ -12767,6 +12776,14 @@ impl SimpleQueryHandler for GatewayHandler {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Ok(vec![Response::EmptyQuery]);
+        }
+
+        if looks_like_dml(trimmed).is_some() {
+            if let Err(error) = rockstream_sql::dml::validate_sql_parenthesis_depth(trimmed) {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), error.to_string()),
+                )))]);
+            }
         }
 
         // Parse query using sqlparser to check for semicolon-separated statements.
