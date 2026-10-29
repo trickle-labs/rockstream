@@ -28,6 +28,7 @@ on:
       - "formal/edge_*.fizz"
       - "Dockerfile"
       - "docs/testing/worker-failure-kafka-minio-v1.json"
+      - "docs/testing/worker-stale-owner-kafka-minio-v1.json"
       - "scripts/release-qualification*"
       - "scripts/run-release-qualification.sh"
       - ".github/workflows/real-cluster-chaos.yml"
@@ -58,6 +59,10 @@ jobs:
           cargo test --locked -p rockstream-sim --lib qualification::worker_failure
       - name: Qualify observed worker-failure recovery and corrupted records
         run: bash scripts/run-release-qualification.sh --suite recovery --output target/real-cluster-chaos/qualification.json
+      - name: Reject stale-owner writes, ACKs, and frontier reports
+        env:
+          ROCKSTREAM_CHAOS_ARTIFACT_DIR: ${{ github.workspace }}/target/real-cluster-chaos/stale-owner
+        run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests stale_worker_write_and_frontier_report_are_rejected_after_reassignment -- --exact --test-threads=1
       - name: Upload real-cluster chaos artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -67,4 +72,6 @@ jobs:
           if-no-files-found: error
       - name: Append chaos summary to job summary
         if: always()
-        run: cat target/real-cluster-chaos/recovery-*/real-cluster-chaos-summary.md >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          cat target/real-cluster-chaos/recovery-*/real-cluster-chaos-summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f target/real-cluster-chaos/stale-owner/stale-owner-summary.md ]; then cat target/real-cluster-chaos/stale-owner/stale-owner-summary.md >> "$GITHUB_STEP_SUMMARY"; fi

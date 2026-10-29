@@ -2,15 +2,19 @@
   "schema_version": 1,
   "reviewed_source_revision": "a0acebe3c71e0f55ad5ffd2b81cefbcdfadd00aa",
   "rust_toolchain": "1.95",
-  "max_cases_per_run": 4,
+  "max_cases_per_run": 5,
   "command_timeout_seconds": 600,
   "source_files": {
     "crates/rockstream-ops/src/group_commit/physical.rs": "934a22ef371a4f52a90c281451af9ce2d8d49c9d3ed6e30327d493a4beea0c13",
     "crates/rockstream-storage/src/catalog/store.rs": "4a2227545412be1cf5cb7b748f9d5d57cf293956ca3e6270f10e11778ab37636",
     "crates/rockstream-storage/tests/catalog_storage_tests.rs": "44f18445608662c6857a83b9fa59df50144901ea9fce3d2aabecc12dd178acac",
     "crates/rockstream-control/src/frontier.rs": "70ae82f046c37cb144c21feee8ede62bc12297c800d56aed45ed783d3f59693c",
+    "crates/rockstream-control/src/service.rs": "ccd479c06f34f5d971ae5ac2416043325fcd9dace6b6a18eedeeadfb28a11a62",
+    "crates/rockstream-runtime/src/client.rs": "a1ff9e38096a3d2a65253f1a10e03f55f625283d8d857de787613f2e1e5522b0",
+    "crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs": "2829f285bfd6e145897460f7530771004f4141ff378222a70284b22d172a9012",
+    "docs/testing/worker-stale-owner-kafka-minio-v1.json": "cae21e7ea37f4100d33294030ee11ce58d524ae959881b20bb7826a5a78708eb",
     "crates/rockstream-ops/src/join.rs": "b2ac80b2c3ff15414ee4fe85d2ed352b5ab363ae2d7bab9b8bbdd21db4bb6b48",
-    "crates/rockstream-oracle/src/join_oracle.rs": "337dc8b5d7f995367d7f1f48602d48a337aaa8e90583f5737573902cf30d0993"
+    "crates/rockstream-oracle/src/join_oracle.rs": "c517f2f44c86f4a4e1b07ebbaf38970b45fdb5a7ab4b4bf53f7460675fa5bc1c"
   },
   "cases": [
     {
@@ -77,6 +81,36 @@
       "known_limit": "This checks the Rust membership adapter and kernel boundary, not every distributed publication path."
     },
     {
+      "id": "P1-STALE-WORKER-FENCE-ALWAYS-VALID",
+      "severity": "P1",
+      "invariant": "A delayed worker write admission is rejected after the control plane assigns a higher shard lease.",
+      "source_path": "crates/rockstream-control/src/service.rs",
+      "before": [
+        "                    && shard_manager.is_valid_writer(shard_id, lease_token);"
+      ],
+      "after": [
+        "                    && true;"
+      ],
+      "test_id": "stale_worker_write_and_frontier_report_are_rejected_after_reassignment",
+      "test_command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "rockstream-sim",
+        "--features",
+        "simulation,docker_tests",
+        "--test",
+        "real_cluster_chaos_soak_tests",
+        "stale_worker_write_and_frontier_report_are_rejected_after_reassignment",
+        "--",
+        "--exact"
+      ],
+      "expected_failure_marker": "left: Bool(true)",
+      "known_limit": "This runs a one-shard forced reassignment with separate Kafka source groups; it does not emulate a network partition or consumer-group rebalance."
+    },
+    {
       "id": "P1-JOIN-DOUBLE-MULTIPLICITY",
       "severity": "P1",
       "invariant": "Committed join output preserves complete signed multiplicities.",
@@ -108,12 +142,6 @@
       "severity": "P0",
       "status": "not_run",
       "reason": "The selected recovery detector uses InMemory and does not qualify a remote backend."
-    },
-    {
-      "id": "P1-STALE-OWNER-LEASE-REPLACEMENT",
-      "severity": "P1",
-      "status": "not_run",
-      "reason": "The reviewed sample selects stale frontier generation, not a separate stale-owner mutation."
     }
   ]
 }

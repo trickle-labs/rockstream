@@ -1,11 +1,11 @@
 # Bounded safety mutation lane
 
-This is a weekly scheduled and manually dispatched pilot for four human-reviewed candidates: uncertain physical write ACK, catalog replay identity, stale frontier generation, and weighted join multiplicity. It is not a pull-request gate and does not claim end-to-end safety qualification.
+This is a weekly scheduled and manually dispatched pilot for five human-reviewed candidates: uncertain physical write ACK, catalog replay identity, stale frontier generation, stale worker lease admission, and weighted join multiplicity. It is not a pull-request gate and does not claim end-to-end safety qualification.
 
 ## Bound and execution
 
 - One ubuntu-24.04 runner with Rust/Cargo 1.95 and at most two Cargo build jobs.
-- Four fixed mutants per run; each exact detector command has a 600-second timeout, and the job has a 30-minute hard limit.
+- Five fixed mutants per run; each exact detector command has a 600-second timeout, and the job has a 30-minute hard limit.
 - The workflow fetches the locked dependency set before the runner's offline checks.
 - For each candidate, require the unchanged exact detector to pass, apply one source replacement in a temporary source copy, verify the intended assertion failure, restore the source byte-for-byte, then rerun the unchanged detector.
 - Reject a dirty checkout, non-descendant source revision, changed candidate or detector file hash, missing/ambiguous source text, zero or skipped tests, unrelated failures, stale output artifacts, and any mutant survivor.
@@ -15,7 +15,7 @@ The inventory pins the reviewed source revision and SHA-256 of each mutation and
 
 ## Current matrix limits
 
-The selected tests exercise an uncertain write response, in-memory catalog recovery, the Rust frontier adapter/kernel boundary, and one exact weighted join history. They do not simulate power loss after ACK, qualify a remote object store, or test a separate stale-owner lease mutant. These remain explicit unsupported or not-run entries in the inventory and run report.
+The selected tests exercise an uncertain write response, in-memory catalog recovery, the Rust frontier adapter/kernel boundary, a real Kafka/MinIO stale-worker fence, and one exact weighted join history. The stale-worker detector requires Docker and its hosted baseline/mutant/restored result is pending. This lane still does not simulate power loss after ACK or qualify a remote object store.
 
 The schedule runs Wednesdays at 02:30 UTC on `main`; `workflow_dispatch` remains available. Each run is capped at 30 minutes and retains artifacts for 30 days. It does not run on pull requests or change branch protection.
 

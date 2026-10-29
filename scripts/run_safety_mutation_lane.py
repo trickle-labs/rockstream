@@ -113,12 +113,16 @@ def classify_mutant(status: int | None, output: str, case: dict) -> str:
 def run_test(case: dict, cwd: Path, env: dict[str, str], log: Path, timeout_seconds: int) -> tuple[dict, str]:
     started = time.monotonic()
     usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    test_env = env.copy()
+    test_env["ROCKSTREAM_CHAOS_ARTIFACT_DIR"] = str(
+        log.with_name(f"{log.stem}-artifacts").resolve()
+    )
     with log.open("wb") as output:
         try:
             result = subprocess.run(
                 case["test_command"],
                 cwd=cwd,
-                env=env,
+                env=test_env,
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 check=False,
@@ -293,6 +297,7 @@ def run_lane(output: Path) -> int:
             "CARGO_PROFILE_DEV_DEBUG": "0",
             "CARGO_PROFILE_TEST_DEBUG": "0",
             "CARGO_BUILD_JOBS": "2",
+            "ROCKSTREAM_QUALIFICATION_REVISION": report["source_sha"],
         })
         target = Path(env.get("CARGO_TARGET_DIR", ROOT / "target/safety-mutation-lane"))
         target.mkdir(parents=True, exist_ok=True)

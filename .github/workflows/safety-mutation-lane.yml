@@ -33,6 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: safety-mutation-lane-rust-1.95
+      - name: Require Docker for the stale-owner real-process detector
+        run: docker info
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked
       - name: Test exact source, execution, and reporting gates
