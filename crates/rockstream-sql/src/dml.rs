@@ -655,6 +655,32 @@ pub fn lower_predicate(expr: &SpExpr) -> Result<DmlPredicate, SqlError> {
 
 // ─── Depth and Size Boundary Checks ──────────────────────────────────────────
 
+/// Reject excessive parenthesis nesting before a parser can recurse on it.
+pub fn validate_sql_parenthesis_depth(sql: &str) -> Result<(), SqlError> {
+    let mut paren_depth = 0usize;
+    let mut in_single_quote = false;
+    for ch in sql.chars() {
+        match ch {
+            '\'' => in_single_quote = !in_single_quote,
+            '(' if !in_single_quote => {
+                paren_depth += 1;
+                if paren_depth > MAX_EXPR_DEPTH {
+                    return Err(SqlError::ParseError {
+                        message: format!(
+                            "[RS-1012] Expression depth limit exceeded (maximum allowed is {MAX_EXPR_DEPTH})"
+                        ),
+                    });
+                }
+            }
+            ')' if !in_single_quote => {
+                paren_depth = paren_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Recursively check that expression depth does not exceed `max_depth`.
 pub fn check_expr_depth(expr: &SpExpr, depth: usize, max_depth: usize) -> Result<(), SqlError> {
     if depth > max_depth {
@@ -782,27 +808,7 @@ pub fn parse_dml_statement(sql: &str) -> Result<DmlStatement, SqlError> {
     }
 
     // 2. Pre-parse expression nesting depth bound check (protect against stack overflow)
-    let mut paren_depth = 0usize;
-    let mut in_single_quote = false;
-    for ch in sql.chars() {
-        match ch {
-            '\'' => in_single_quote = !in_single_quote,
-            '(' if !in_single_quote => {
-                paren_depth += 1;
-                if paren_depth > MAX_EXPR_DEPTH {
-                    return Err(SqlError::ParseError {
-                        message: format!(
-                            "[RS-1012] Expression depth limit exceeded (maximum allowed is {MAX_EXPR_DEPTH})"
-                        ),
-                    });
-                }
-            }
-            ')' if !in_single_quote => {
-                paren_depth = paren_depth.saturating_sub(1);
-            }
-            _ => {}
-        }
-    }
+    validate_sql_parenthesis_depth(sql)?;
 
     // 3. Parse via sqlparser with PostgreSQL dialect
     let dialect = PostgreSqlDialect {};

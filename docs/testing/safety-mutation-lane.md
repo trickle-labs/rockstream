@@ -4,7 +4,7 @@ This is a weekly scheduled and manually dispatched pilot for four human-reviewed
 
 ## Bound and execution
 
-- One ubuntu-24.04 runner with Rust/Cargo 1.88 and at most two Cargo build jobs.
+- One ubuntu-24.04 runner with Rust/Cargo 1.95 and at most two Cargo build jobs.
 - Four fixed mutants per run; each exact detector command has a 600-second timeout, and the job has a 30-minute hard limit.
 - The workflow fetches the locked dependency set before the runner's offline checks.
 - For each candidate, require the unchanged exact detector to pass, apply one source replacement in a temporary source copy, verify the intended assertion failure, restore the source byte-for-byte, then rerun the unchanged detector.

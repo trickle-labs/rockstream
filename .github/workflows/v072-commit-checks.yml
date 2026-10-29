@@ -42,7 +42,7 @@ jobs:
           retention-days: 14
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.88'
+          toolchain: '1.95'
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:

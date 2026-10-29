@@ -4,7 +4,7 @@ This smoke is **scope-specific** to the 2026-10-19 override in [issue #132](http
 
 ## Candidate and prerequisites
 
-Run from a clean checkout of the exact candidate on an environment with Rust 1.88, locked dependencies, sufficient RAM/disk, loopback binding, and available ports. Run real-cluster chaos/worker recovery in its dedicated Docker-enabled CI job; Docker-free in-memory tests are not a substitute for that real-cluster failure path. Set `V072_EXPECTED_SHA` to the exact planned tag SHA. Do not run against `main` while it advances.
+Run from a clean checkout of the exact candidate on an environment with Rust 1.95, locked dependencies, sufficient RAM/disk, loopback binding, and available ports. Run real-cluster chaos/worker recovery in its dedicated Docker-enabled CI job; Docker-free in-memory tests are not a substitute for that real-cluster failure path. Set `V072_EXPECTED_SHA` to the exact planned tag SHA. Do not run against `main` while it advances.
 
 ```bash
 git fetch origin main
@@ -16,7 +16,7 @@ The script fails on a dirty tree, mismatched SHA, test process failure, zero exe
 
 ## Automated exact-commit execution
 
-The [v0.72 pragmatic release smoke workflow](../../.github/workflows/v072-pragmatic-release-smoke.yml) runs the same 17-case script on a clean, pinned commit with Rust 1.88, and uploads the SHA, compiler version, lockfile digest, report and individual test logs **even on failure**. A passing job requires exactly 17 recorded PASS results, no skips, and zero failed processes. Pull-request execution tests the PR head; on merging this workflow into `main`, its push execution tests the resulting integrated commit. To qualify any later candidate without editing source, use **Actions → v0.72 pragmatic release smoke → Run workflow** on `main`, then verify the workflow's recorded `source-sha.txt` equals the immutable proposed tag commit.
+The [v0.72 pragmatic release smoke workflow](../../.github/workflows/v072-pragmatic-release-smoke.yml) runs the same 17-case script on a clean, pinned commit with Rust 1.95, and uploads the SHA, compiler version, lockfile digest, report and individual test logs **even on failure**. A passing job requires exactly 17 recorded PASS results, no skips, and zero failed processes. Pull-request execution tests the PR head; on merging this workflow into `main`, its push execution tests the resulting integrated commit. To qualify any later candidate without editing source, use **Actions → v0.72 pragmatic release smoke → Run workflow** on `main`, then verify the workflow's recorded `source-sha.txt` equals the immutable proposed tag commit.
 
 This is a representative loopback/local supported-path smoke executed on a CI runner, **not** an Apple M5 Pro benchmark, an external cloud-capacity qualification, or proof of all distributed failures. Retain the exact-head CI, decoder fuzz and real Docker-enabled cluster-chaos links separately. Do not close #132, mark the roadmap Done or sign a release merely because the workflow was created: first inspect a successful executed report for the final integrated SHA, including an overload/cancel/restart path, and record its artifact and limitations.
 

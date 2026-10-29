@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
       - name: Require Docker
         run: docker info
@@ -87,7 +87,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         if: needs.ci-policy.outputs.scope == 'full'
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         if: needs.ci-policy.outputs.scope == 'full'
@@ -181,6 +181,23 @@ jobs:
       - name: qualification execution gate self-tests
         run: bash scripts/check-qualification-mutations.test.sh
 
+  current-stable-compile:
+    name: Current stable compile (Rust 1.99.1)
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile all workspace targets on current stable
+        run: cargo check --workspace --all-targets --locked
+
   verus-qualify:
     name: VS6 clean phase (${{ matrix.os }}, ${{ matrix.phase }})
     strategy:
@@ -212,7 +229,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         if: needs.ci-policy.outputs.expensive == 'true'
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
           components: rustfmt, clippy
           targets: ${{ matrix.target }}
       - uses: dtolnay/rust-toolchain@master
@@ -275,7 +292,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         if: needs.ci-policy.outputs.scope == 'full'
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         if: needs.ci-policy.outputs.scope == 'full'
       - uses: actions/download-artifact@v4
@@ -328,7 +345,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: verus-ordinary-consumer
@@ -362,7 +379,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -416,7 +433,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: check-tests-gateway
@@ -453,7 +470,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
       - name: Require reference infrastructure
         run: |
@@ -475,6 +492,7 @@ jobs:
     needs:
       - ci-policy
       - check-quality
+      - current-stable-compile
       - check-tests
       - gateway
       - postgres-differential
@@ -605,7 +623,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         if: needs.ci-policy.outputs.expensive == 'true'
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         if: needs.ci-policy.outputs.expensive == 'true'
       - name: run nexmark bench
@@ -646,7 +664,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: benchmark-${{ matrix.suite }}

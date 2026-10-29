@@ -203,6 +203,15 @@ impl QueryParser for PreparedStatementCache {
     type Statement = PreparedStatement;
 
     async fn parse_sql(&self, sql: &str, types: &[Type]) -> PgWireResult<Self::Statement> {
+        if looks_like_dml(sql).is_some() {
+            if let Err(error) = rockstream_sql::dml::validate_sql_parenthesis_depth(sql) {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    error.to_string(),
+                ))));
+            }
+        }
         let mut parameter_types = infer_parameter_types(&self.catalog, sql).await?;
         for (inferred, supplied) in parameter_types.iter_mut().zip(types) {
             if *supplied != Type::UNKNOWN {
@@ -11369,11 +11378,7 @@ impl GatewayHandler {
                             table: t,
                             row_key: rk,
                             ..
-                        } if t.eq_ignore_ascii_case(table) => {
-                            if rk == row_key {
-                                return Ok(true);
-                            }
-                        }
+                        } if t.eq_ignore_ascii_case(table) && rk == row_key => return Ok(true),
                         DmlOp::Update {
                             table: t,
                             new_row_key,
@@ -12767,6 +12772,14 @@ impl SimpleQueryHandler for GatewayHandler {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Ok(vec![Response::EmptyQuery]);
+        }
+
+        if looks_like_dml(trimmed).is_some() {
+            if let Err(error) = rockstream_sql::dml::validate_sql_parenthesis_depth(trimmed) {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), error.to_string()),
+                )))]);
+            }
         }
 
         // Parse query using sqlparser to check for semicolon-separated statements.
@@ -15228,12 +15241,8 @@ fn account_fallback_query_batch(
     previous_bytes: usize,
     batch: &RecordBatch,
 ) -> Result<(usize, usize), GatewayError> {
-    let rows = previous_rows
-        .checked_add(batch.num_rows())
-        .unwrap_or(usize::MAX);
-    let bytes = previous_bytes
-        .checked_add(batch.get_array_memory_size())
-        .unwrap_or(usize::MAX);
+    let rows = previous_rows.saturating_add(batch.num_rows());
+    let bytes = previous_bytes.saturating_add(batch.get_array_memory_size());
     if rows > FALLBACK_QUERY_MAX_ROWS || bytes > FALLBACK_QUERY_MAX_ARRAY_BYTES {
         return Err(GatewayError::QueryTimeExecutionFailed {
             detail: format!(

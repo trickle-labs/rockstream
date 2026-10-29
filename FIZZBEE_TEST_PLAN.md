@@ -767,6 +767,15 @@ The exact oracle rejects wrong values, omitted deletions, and duplicate changes.
 `sink.kafka` remains Experimental pending full Core release qualification;
 marker tests alone cannot qualify row delivery.
 
+The Rust 1.95 `collapsible_match` cleanup in `kafka_source.rs` and `kafka_sink.rs`
+only moves existing predicates into match guards. Schema mismatches still
+quarantine as `RS-1003`, and Kafka `CheckBeforeCommit` still retries unresolved
+lookups without confirming absence. Existing coverage is
+`kafka_poison_dlq_diagnostic_tests::test_poison_dlq_quarantines_schema_mismatch`,
+`kafka_sink_guarantee_matrix_tests::kafka_sink_uncertain_broker_response_recovers_exactly_once_within_slo`,
+and `kafka_sink_guarantee_matrix_tests::kafka_sink_lookup_timeout_does_not_confirm_absence_before_stable_end`;
+no FizzBee transition changes.
+
 Issue #133 / v0.72 R6 additionally bounds *suspended* worker-local exchange
 credit waiters, separately from accepted in-flight batches and bytes.
 `FlowController::acquire_credit` and `acquire_batch_permit` reserve one

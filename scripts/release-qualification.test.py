@@ -80,7 +80,7 @@ class QualificationTests(unittest.TestCase):
                          self.expected(errors=("zero mandatory execution",), processes=False))
 
     def test_toolchain_diagnostics_do_not_change_executed_evidence(self):
-        build = subprocess.CompletedProcess(["rustc"], 0, "", "info: syncing channel updates for 1.88\n")
+        build = subprocess.CompletedProcess(["rustc"], 0, "", "info: syncing channel updates for 1.95\n")
         execution = subprocess.CompletedProcess(["fixture"], 0, VALID, "")
         with patch.object(subprocess, "run", side_effect=[build, execution]):
             result = self.run_fixture("// compiler diagnostic fixture\n")

@@ -18,7 +18,7 @@ demo and local-project transcripts.
 
 ## Try it
 
-RockStream currently builds with Rust 1.88. From a clone of this repository:
+RockStream currently builds with Rust 1.95. From a clone of this repository:
 
 ```bash
 cargo build -p rockstream-cli
