@@ -203,6 +203,25 @@ async fn enospc_withholds_ack_and_recovers_a_complete_epoch() {
         frontier: Some(2u64.to_be_bytes().to_vec()),
         operation_id: Some(b"epoch-2".to_vec()),
     };
+    if let Ok(root) = std::env::var("ROCKSTREAM_ENOSPC_RECOVERY_DIR") {
+        let store = Arc::new(EnospcStore {
+            inner: Arc::new(LocalFileSystem::new_with_prefix(root).unwrap()),
+            fail_puts: AtomicBool::new(false),
+            failures: AtomicUsize::new(0),
+            fault_path: Mutex::new(None),
+            fault_reached: Notify::new(),
+        });
+        let recovered = open_shard(store).await;
+        let actual = state(&recovered).await;
+        assert_eq!(actual, expected_epoch_2, "fresh-process recovered state");
+        std::fs::write(
+            std::env::var("ROCKSTREAM_ENOSPC_RECOVERY_RESULT").unwrap(),
+            format!("{actual:?}"),
+        )
+        .unwrap();
+        recovered.close().await.unwrap();
+        return;
+    }
 
     let db = open_shard(store.clone()).await;
     let mut epoch_1 = WriteBatch::new();
@@ -279,12 +298,35 @@ async fn enospc_withholds_ack_and_recovers_a_complete_epoch() {
         actual == expected_epoch_2,
         "recovery after restored capacity must expose the complete later epoch: {actual:?}"
     );
+    recovered.close().await.unwrap();
+
+    let result_dir = tempfile::tempdir().unwrap();
+    let result_path = result_dir.path().join("fresh-process-state.txt");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "enospc_withholds_ack_and_recovers_a_complete_epoch",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ROCKSTREAM_ENOSPC_RECOVERY_DIR", dir.path())
+        .env("ROCKSTREAM_ENOSPC_RECOVERY_RESULT", &result_path)
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+    assert_ne!(child_pid, std::process::id());
+    let child = child.wait_with_output().unwrap();
+    assert!(
+        child.status.success(),
+        "fresh-process ENOSPC recovery failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let fresh_process_state = std::fs::read_to_string(&result_path).unwrap();
+    assert_eq!(fresh_process_state, format!("{expected_epoch_2:?}"));
     let revision = std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_owned());
     eprintln!(
-        "post_ack_enospc_v1 source_sha={revision} backend=LocalFileSystem fault=object-store-put path={:?} errno={} failures={} ack_at_fault=withheld fault_response={fault_response} ack_after_recovery={ack_after_recovery} before={expected_epoch_1:?} recovered={actual:?}",
+        "post_ack_enospc_v1 source_sha={revision} backend=LocalFileSystem fault=object-store-put path={:?} errno={} failures={} ack_at_fault=withheld fault_response={fault_response} ack_after_recovery={ack_after_recovery} before={expected_epoch_1:?} recovered={actual:?} fresh_process_pid={child_pid} fresh_process={fresh_process_state:?}",
         store.fault_path.lock().unwrap(),
         libc::ENOSPC,
         store.failures.load(Ordering::SeqCst)
     );
-    recovered.close().await.unwrap();
 }
