@@ -57,6 +57,10 @@ LIVE_OBSERVATIONS = {
 }
 APPLICATION_TARGET = "real_cluster_chaos_soak_tests"
 APPLICATION_CASE = "worker_failure_recovery_from_view_and_kafka"
+APPLICATION_LIST_COMMAND = [
+    "cargo", "test", "--locked", "-p", "rockstream-sim", "--features", "simulation,docker_tests",
+    "--test", APPLICATION_TARGET, "--", "--list",
+]
 CONTROL_FAILURES = {
     "missing_event": "MissingObservation", "constant_timings": "Timings",
     "stale_query": "Progress", "changed_value": "ViewOutput",
@@ -64,10 +68,24 @@ CONTROL_FAILURES = {
 }
 UNSUPPORTED = ["general-kafka-recovery", "postgres-cdc", "distributed-control-ha", "pgwire-transport", "recovery-p99"]
 CASE = re.compile(r"test (\S+) \.\.\. (ok|FAILED|ignored)(?:, .*)?")
+TEST_LIST_ENTRY = re.compile(r"(\S+): test")
 SUMMARY = re.compile(
     r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
     r"(\d+) measured; (\d+) filtered out; finished in .+"
 )
+
+
+def parse_test_list(output):
+    return [match.group(1) for line in output.splitlines()
+            if (match := TEST_LIST_ENTRY.fullmatch(line))]
+
+
+def validate_test_inventory(test_name, names, exit_code):
+    if exit_code or not names or len(names) != len(set(names)):
+        return "invalid test inventory"
+    if test_name not in names:
+        return "required application test is absent"
+    return None
 
 
 def execute(command, **kwargs):
@@ -265,26 +283,38 @@ def main():
             artifact_root = args.output.parent if args.output else ROOT / "target/qualification"
             artifact_root.mkdir(parents=True, exist_ok=True)
             artifact_dir = Path(tempfile.mkdtemp(prefix="recovery-", dir=artifact_root)).resolve()
+            listing = execute(APPLICATION_LIST_COMMAND)
+            test_inventory = parse_test_list(listing.stdout)
+            inventory_error = validate_test_inventory(APPLICATION_CASE, test_inventory, listing.returncode)
+            list_errors = ([f"{APPLICATION_TARGET}: {inventory_error}"] if inventory_error else [])
             command = ["cargo", "test", "--locked", "-p", "rockstream-sim",
                        "--features", "simulation,docker_tests", "--test", APPLICATION_TARGET,
                        APPLICATION_CASE, "--", "--exact", "--format=pretty", "--color=never", "--test-threads=1"]
-            result = execute(command, env={**os.environ,
-                "ROCKSTREAM_CHAOS_ARTIFACT_DIR": str(artifact_dir),
-                "ROCKSTREAM_QUALIFICATION_CANDIDATE": json.dumps(candidate)})
-            scenarios, errors = parse_results(APPLICATION_TARGET, result.stdout, filtered=1)
-            try:
-                application = json.loads((artifact_dir / "qualification-records.json").read_text())
-            except (OSError, ValueError):
-                errors.append("missing or malformed executed recovery qualification records")
-            try:
-                if candidate_identity() != candidate:
-                    errors.append("candidate changed during qualification")
-            except (ValueError, OSError):
-                errors.append("cannot determine final candidate identity")
-            processes.append({"target": APPLICATION_TARGET, "command": command,
-                              "exit_code": result.returncode, "scenarios": scenarios, "errors": errors})
-            if result.returncode or errors:
-                print(result.stdout + result.stderr, file=sys.stderr)
+            if list_errors:
+                processes.append({"target": APPLICATION_TARGET, "command": APPLICATION_LIST_COMMAND,
+                                  "exit_code": listing.returncode, "scenarios": [], "errors": list_errors,
+                                  "test_inventory": test_inventory, "filtered_count": None})
+                print(listing.stdout + listing.stderr, file=sys.stderr)
+            else:
+                result = execute(command, env={**os.environ,
+                    "ROCKSTREAM_CHAOS_ARTIFACT_DIR": str(artifact_dir),
+                    "ROCKSTREAM_QUALIFICATION_CANDIDATE": json.dumps(candidate)})
+                filtered_count = len(test_inventory) - 1
+                scenarios, errors = parse_results(APPLICATION_TARGET, result.stdout, filtered=filtered_count)
+                try:
+                    application = json.loads((artifact_dir / "qualification-records.json").read_text())
+                except (OSError, ValueError):
+                    errors.append("missing or malformed executed recovery qualification records")
+                try:
+                    if candidate_identity() != candidate:
+                        errors.append("candidate changed during qualification")
+                except (ValueError, OSError):
+                    errors.append("cannot determine final candidate identity")
+                processes.append({"target": APPLICATION_TARGET, "command": command,
+                                  "exit_code": result.returncode, "scenarios": scenarios, "errors": errors,
+                                  "test_inventory": test_inventory, "filtered_count": filtered_count})
+                if result.returncode or errors:
+                    print(result.stdout + result.stderr, file=sys.stderr)
     report = make_report(SUITES[args.suite], processes, candidate, settings, services, application)
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output:
