@@ -405,6 +405,19 @@ jobs:
       - name: Record balanced package shard execution
         if: contains(fromJSON('["oracle", "ops", "storage-sql", "gateway-components"]'), matrix.shard)
         run: python3 scripts/ci-test-inventory.py run --job pr-${{ matrix.shard }}
+      - name: Capture bounded post-ack ENOSPC evidence
+        if: matrix.shard == 'storage-sql'
+        run: |
+          set -o pipefail
+          mkdir -p target
+          cargo test --locked --offline -p rockstream-storage --test enospc_recovery_tests -- --exact enospc_withholds_ack_and_recovers_a_complete_epoch --nocapture 2>&1 | tee target/post-ack-enospc.log
+      - name: Upload bounded post-ack ENOSPC evidence
+        if: always() && matrix.shard == 'storage-sql'
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-ack-enospc
+          path: target/post-ack-enospc.log
+          if-no-files-found: warn
       - name: Qualification helper checks (not release evidence)
         if: matrix.shard == 'sim-integration'
         run: bash scripts/run-release-qualification.sh --fast --output target/qualification-helpers.json
