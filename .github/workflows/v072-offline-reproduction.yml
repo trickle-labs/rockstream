@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
           components: rustfmt, clippy
       - name: Retain pinned toolchain without credentials
         run: |
@@ -34,9 +34,9 @@ jobs:
           rustc --version --verbose > "$RUNNER_TEMP/v072-toolchain/rustc-version.txt"
           cargo --version > "$RUNNER_TEMP/v072-toolchain/cargo-version.txt"
           git rev-parse HEAD > "$RUNNER_TEMP/v072-toolchain/source-revision.txt"
-          tar -C "$(rustc --print sysroot)" -czf "$RUNNER_TEMP/v072-toolchain/rust-1.88-linux-x86_64.tar.gz" bin lib
+          tar -C "$(rustc --print sysroot)" -czf "$RUNNER_TEMP/v072-toolchain/rust-1.95-linux-x86_64.tar.gz" bin lib
           cd "$RUNNER_TEMP/v072-toolchain"
-          sha256sum rust-1.88-linux-x86_64.tar.gz > SHA256SUMS
+          sha256sum rust-1.95-linux-x86_64.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: v072-rust-toolchain-${{ github.run_id }}

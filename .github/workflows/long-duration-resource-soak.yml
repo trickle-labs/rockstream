@@ -3,7 +3,7 @@ name: Long-Duration Resource Soak
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "23 1 * * *"
 
 concurrency:
   group: long-duration-resource-soak-${{ github.ref }}
@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - name: Require Docker
         run: docker info
       - name: Build unified-binary test image

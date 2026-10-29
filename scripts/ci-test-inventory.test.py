@@ -68,7 +68,7 @@ class GateSelfTests(unittest.TestCase):
                              [(family, rows, chunk) for family in (
                                  "stateless_project", "aggregate", "join", "session_window")])
         workflow = (ROOT / ".github/workflows/test-accounting-expensive.yml").read_text()
-        self.assertIn('cron: "15 2 * * *"', workflow)
+        self.assertIn('cron: "23 7 * * *"', workflow)
         self.assertIn("run: python3 scripts/ci-test-inventory.py run --job nightly-seeds", workflow)
         self.assertIn("name: nightly-seeds-test-evidence", workflow)
 

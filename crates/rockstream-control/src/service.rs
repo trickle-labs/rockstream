@@ -1770,7 +1770,7 @@ impl ManagementBackupRuntime {
             Ok(_) => {
                 self.fail(
                     operation_id,
-                    "RS-5035",
+                    "RS-3614",
                     "export commit marker did not match the accepted backup",
                 )
                 .await
@@ -1935,7 +1935,7 @@ impl ManagementBackupRuntime {
     ) {
         match error {
             crate::checkpoint_export::CheckpointExportError::Integrity(message) => {
-                self.fail(operation_id, "RS-5035", &message).await;
+                self.fail(operation_id, "RS-3614", &message).await;
             }
             error => self.wait(operation_id, &error.to_string()).await,
         }

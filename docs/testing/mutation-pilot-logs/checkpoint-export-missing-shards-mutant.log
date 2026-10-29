@@ -1,0 +1,8 @@
+---- cli_prefix_export_rejects_missing_committed_shard_objects_before_success stdout ----
+
+thread 'cli_prefix_export_rejects_missing_committed_shard_objects_before_success' panicked at crates/rockstream-control/tests/disaster_recovery_tests.rs:433:18:
+missing committed shard storage must not export SUCCESS: Ok(CheckpointExportOutcome { checkpoint_id: 37, generation: "missing-shard-preinventory", object_count: 3, byte_count: 166, inventory_digest: "7ff7b3a7bf663b9489aef7a6e1d39bad63e8ac78d4b0920594a8ee720965c0e8", status: "SUCCESS" })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.12s

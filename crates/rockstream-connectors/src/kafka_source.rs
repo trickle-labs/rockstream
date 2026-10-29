@@ -999,32 +999,32 @@ impl KafkaSource {
                 arrow::datatypes::DataType::Int64
                 | arrow::datatypes::DataType::Int32
                 | arrow::datatypes::DataType::Int16
-                | arrow::datatypes::DataType::Int8 => {
-                    if !val.is_i64() && !val.is_u64() {
-                        return Err(format!(
-                            "RS-1003: field '{}' expected integer, got {}",
-                            field.name(),
-                            val
-                        ));
-                    }
+                | arrow::datatypes::DataType::Int8
+                    if !val.is_i64() && !val.is_u64() =>
+                {
+                    return Err(format!(
+                        "RS-1003: field '{}' expected integer, got {}",
+                        field.name(),
+                        val
+                    ));
                 }
-                arrow::datatypes::DataType::Float64 | arrow::datatypes::DataType::Float32 => {
-                    if !val.is_number() {
-                        return Err(format!(
-                            "RS-1003: field '{}' expected float, got {}",
-                            field.name(),
-                            val
-                        ));
-                    }
+                arrow::datatypes::DataType::Float64 | arrow::datatypes::DataType::Float32
+                    if !val.is_number() =>
+                {
+                    return Err(format!(
+                        "RS-1003: field '{}' expected float, got {}",
+                        field.name(),
+                        val
+                    ));
                 }
-                arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => {
-                    if !val.is_string() {
-                        return Err(format!(
-                            "RS-1003: field '{}' expected string, got {}",
-                            field.name(),
-                            val
-                        ));
-                    }
+                arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8
+                    if !val.is_string() =>
+                {
+                    return Err(format!(
+                        "RS-1003: field '{}' expected string, got {}",
+                        field.name(),
+                        val
+                    ));
                 }
                 arrow::datatypes::DataType::Boolean if !val.is_boolean() => {
                     return Err(format!(

@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "reviewed_source_revision": "a0acebe3c71e0f55ad5ffd2b81cefbcdfadd00aa",
+  "rust_toolchain": "1.95",
+  "max_cases_per_run": 4,
+  "command_timeout_seconds": 600,
+  "source_files": {
+    "crates/rockstream-ops/src/group_commit/physical.rs": "934a22ef371a4f52a90c281451af9ce2d8d49c9d3ed6e30327d493a4beea0c13",
+    "crates/rockstream-storage/src/catalog/store.rs": "4a2227545412be1cf5cb7b748f9d5d57cf293956ca3e6270f10e11778ab37636",
+    "crates/rockstream-storage/tests/catalog_storage_tests.rs": "44f18445608662c6857a83b9fa59df50144901ea9fce3d2aabecc12dd178acac",
+    "crates/rockstream-control/src/frontier.rs": "70ae82f046c37cb144c21feee8ede62bc12297c800d56aed45ed783d3f59693c",
+    "crates/rockstream-ops/src/join.rs": "b2ac80b2c3ff15414ee4fe85d2ed352b5ab363ae2d7bab9b8bbdd21db4bb6b48",
+    "crates/rockstream-oracle/src/join_oracle.rs": "337dc8b5d7f995367d7f1f48602d48a337aaa8e90583f5737573902cf30d0993"
+  },
+  "cases": [
+    {
+      "id": "P0-GROUP-WRITE-UNKNOWN-AS-DURABLE",
+      "severity": "P0",
+      "invariant": "An unknown physical write outcome must not be acknowledged as durable.",
+      "source_path": "crates/rockstream-ops/src/group_commit/physical.rs",
+      "before": [
+        "        Outcome::FlushUnknown(error) | Outcome::WriteUnknown(error) => {",
+        "            (physical_commit::OUTCOME_UNKNOWN, Some(error))",
+        "        }"
+      ],
+      "after": [
+        "        Outcome::FlushUnknown(error) => {",
+        "            (physical_commit::OUTCOME_UNKNOWN, Some(error))",
+        "        }",
+        "        Outcome::WriteUnknown(_) => (physical_commit::DURABLE, None),"
+      ],
+      "test_id": "group_commit::physical::boundary_tests::unknown_unpersisted_write_is_not_acked_and_retry_recovers_lfs",
+      "test_command": [
+        "cargo", "test", "--locked", "--offline", "-p", "rockstream-ops", "--lib",
+        "group_commit::physical::boundary_tests::unknown_unpersisted_write_is_not_acked_and_retry_recovers_lfs",
+        "--", "--exact"
+      ],
+      "expected_failure_marker": "unknown write was acknowledged before recovery: ack=Some([1]), frontier=0, value=None",
+      "known_limit": "The test wrapper blocks the first LocalFileSystem put before persistence; dropping and reopening the shard is a process-like test, not a physical power-loss simulation."
+    },
+    {
+      "id": "P0-CATALOG-RECOVERY-LOST-COMMITTED-OPERATION",
+      "severity": "P0",
+      "invariant": "Snapshot recovery preserves operation identities so retry cannot resurrect deleted metadata.",
+      "source_path": "crates/rockstream-storage/src/catalog/store.rs",
+      "before": [
+        "            recovered_state.committed_operations = snap.committed_operations.into_iter().collect();"
+      ],
+      "after": [],
+      "test_id": "test_snapshot_retry_preserves_deleted_table_and_objects",
+      "test_command": [
+        "cargo", "test", "--locked", "--offline", "-p", "rockstream-storage",
+        "--test", "catalog_storage_tests", "test_snapshot_retry_preserves_deleted_table_and_objects",
+        "--", "--exact"
+      ],
+      "expected_failure_marker": "left: (1, 1, [CatalogTable",
+      "known_limit": "The detector uses object_store::memory::InMemory, not a physical object store."
+    },
+    {
+      "id": "P1-FRONTIER-GENERATION-ALWAYS-MATCHES",
+      "severity": "P1",
+      "invariant": "A stale membership generation cannot advance the committed frontier.",
+      "source_path": "crates/rockstream-control/src/frontier.rs",
+      "before": [
+        "        let generation_matches = report.generation == membership.generation;"
+      ],
+      "after": [
+        "        let generation_matches = true;"
+      ],
+      "test_id": "frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged",
+      "test_command": [
+        "cargo", "test", "--locked", "--offline", "-p", "rockstream-control", "--lib",
+        "frontier::lease_tests::stale_generation_and_incarnation_reports_leave_state_unchanged",
+        "--", "--exact"
+      ],
+      "expected_failure_marker": "GenerationMismatch",
+      "known_limit": "This checks the Rust membership adapter and kernel boundary, not every distributed publication path."
+    },
+    {
+      "id": "P1-JOIN-DOUBLE-MULTIPLICITY",
+      "severity": "P1",
+      "invariant": "Committed join output preserves complete signed multiplicities.",
+      "source_path": "crates/rockstream-ops/src/join.rs",
+      "before": [
+        "                    out_weights.push(l_w * r_w); // bilinear weight product"
+      ],
+      "after": [
+        "                    out_weights.push(2 * l_w * r_w); // deliberate multiplicity mutant"
+      ],
+      "test_id": "join_oracle::tests::oracle_join_weighted_deltas_across_epochs",
+      "test_command": [
+        "cargo", "test", "--locked", "--offline", "-p", "rockstream-oracle", "--lib",
+        "join_oracle::tests::oracle_join_weighted_deltas_across_epochs", "--", "--exact"
+      ],
+      "expected_failure_marker": "incremental=[(1, 10, 100, 12)] batch=[(1, 10, 100, 6)]",
+      "known_limit": "This is a strong control and covers one weighted history, not every join delta term."
+    }
+  ],
+  "uncovered_invariants": [
+    {
+      "id": "P0-PHYSICAL-POWER-LOSS-AFTER-ACK",
+      "severity": "P0",
+      "status": "unsupported",
+      "reason": "No test backend currently simulates loss of an acknowledged write after process or power failure."
+    },
+    {
+      "id": "P0-REMOTE-OBJECT-STORE-RECOVERY",
+      "severity": "P0",
+      "status": "not_run",
+      "reason": "The selected recovery detector uses InMemory and does not qualify a remote backend."
+    },
+    {
+      "id": "P1-STALE-OWNER-LEASE-REPLACEMENT",
+      "severity": "P1",
+      "status": "not_run",
+      "reason": "The reviewed sample selects stale frontier generation, not a separate stale-owner mutation."
+    }
+  ]
+}

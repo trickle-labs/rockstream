@@ -4,7 +4,7 @@
 //! 1. Two-digest N->N+1 rolling upgrade under load across distinct immutable image digests
 //! 2. Fail-closed rejection of incompatible/future storage formats (RS-4019 / RS-5001)
 //! 3. Fresh-cluster disaster restore from independent export after total destruction of primary state
-//! 4. Fail-closed corrupt export archive rejection (RS-4020 / RS-5035)
+//! 4. Fail-closed corrupt export archive rejection (RS-4020 / RS-3614)
 
 use std::sync::Arc;
 
@@ -352,7 +352,7 @@ async fn test_corrupt_export_rejected_fail_closed() {
         .await
         .unwrap();
 
-    // Restore attempt against corrupted export must fail closed (RS-4020 / RS-5035 integrity error)
+    // Restore attempt against corrupted export must fail closed (RS-4020 / RS-3614 integrity error)
     let restore_res = export_service
         .restore_generation(export_store, target_store.clone(), "gen-corrupt-test-5")
         .await;
@@ -363,7 +363,7 @@ async fn test_corrupt_export_rejected_fail_closed() {
     );
     let err_str = restore_res.unwrap_err().to_string();
     assert!(
-        err_str.contains("RS-5035")
+        err_str.contains("RS-3614")
             || err_str.contains("integrity")
             || err_str.contains("validation"),
         "Error must identify export integrity failure: {err_str}"

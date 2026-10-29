@@ -17,7 +17,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (38 codes)
 - [24xx: Authentication, mTLS & Secrets](#24xx-authentication-mtls--secrets) (18 codes)
 - [25xx-26xx: Extended Query, Cursors & Transactions](#25xx-26xx-extended-query-cursors--transactions) (9 codes)
-- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (56 codes)
+- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (58 codes)
 - [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (24 codes)
 - [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (17 codes)
 - [6xxx: Connector Schema Evolution](#6xxx-connector-schema-evolution) (1 codes)
@@ -1034,6 +1034,8 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-3610`](#rs-3610) | `worker.drain_target_not_found` | Worker drain target does not exist in the current topology | `Error` | `55000` | `Immediate` |
 | [`RS-3611`](#rs-3611) | `worker.no_active_drain_recipient` | Worker drain cannot proceed because no active recipient worker is available | `Error` | `55000` | `Immediate` |
 | [`RS-3612`](#rs-3612) | `worker.drain_queue_capacity_reached` | Worker drain queue reached its configured bound; backpressure applied | `Error` | `53200` | `ExponentialBackoff` |
+| [`RS-3613`](#rs-3613) | `checkpoint.export_in_progress` | Checkpoint export is already in progress | `Error` | `55000` | `Immediate` |
+| [`RS-3614`](#rs-3614) | `checkpoint.export_or_restore_failed` | Checkpoint export or restore failed validation or storage access | `Error` | `XX000` | `AfterClusterRecovery` |
 | [`RS-3615`](#rs-3615) | `backup.missing_file_or_manifest` | Missing payload file or truncated/unfinalized manifest | `Fatal` | `58030` | `NonRetryable` |
 | [`RS-3616`](#rs-3616) | `backup.checksum_mismatch` | Checksum mismatch on manifest or data file | `Fatal` | `XX000` | `NonRetryable` |
 | [`RS-3617`](#rs-3617) | `backup.incompatible_format` | Incompatible backup manifest format version or unsupported storage layout | `Fatal` | `0A000` | `NonRetryable` |
@@ -1398,6 +1400,22 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `53200`
 - **Retry Class**: `ExponentialBackoff`
 - **Default Next Steps**: Wait for in-flight shard drain tasks to complete before enqueueing additional assignments.
+
+### <a id="rs-3613"></a> `RS-3613` — Checkpoint export is already in progress
+
+- **Key**: `checkpoint.export_in_progress`
+- **Severity**: `Error`
+- **SQLSTATE**: `55000`
+- **Retry Class**: `Immediate`
+- **Default Next Steps**: Wait for the active checkpoint export to finish, then retry the operation.
+
+### <a id="rs-3614"></a> `RS-3614` — Checkpoint export or restore failed validation or storage access
+
+- **Key**: `checkpoint.export_or_restore_failed`
+- **Severity**: `Error`
+- **SQLSTATE**: `XX000`
+- **Retry Class**: `AfterClusterRecovery`
+- **Default Next Steps**: Inspect the committed checkpoint and object-store access, discard incomplete exports, and retry from a verified generation.
 
 ### <a id="rs-3615"></a> `RS-3615` — Missing payload file or truncated/unfinalized manifest
 

@@ -160,7 +160,7 @@ fn checkpoint_export_restore_cli_outputs_and_audits_exactly() {
 }
 
 #[test]
-fn checkpoint_restore_rejects_missing_export_with_rs5035() {
+fn checkpoint_restore_rejects_missing_export_with_rs3614() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("missing-export");
     let target = root.path().join("target");
@@ -184,6 +184,6 @@ fn checkpoint_restore_rejects_missing_export_with_rs5035() {
     assert_eq!(String::from_utf8(result.stdout).unwrap(), "");
     assert_eq!(
         normalize_correlation_id(result.stderr),
-        "[RS-5035] skew.slo_cannot_be_met: Skew-bound SLO cannot be met without composable partial-state splitting (detail=checkpoint export integrity validation failed: no committed export generation exists; next_steps: discard the incomplete generation and retry from the same committed checkpoint) (correlation_id=<correlation_id> context=detail=checkpoint export integrity validation failed: no committed export generation exists; next_steps: discard the incomplete generation and retry from the same committed checkpoint) next_steps: Add composable partial-state semantics for this operator, reduce the hot key's skew at the source, or route the workload to a spill-shard plan that can tolerate the SLO miss.\n  next steps: Verify the committed export, object-store access, and target freshness, then retry.\n"
+        "[RS-3614] checkpoint.export_or_restore_failed: Checkpoint export or restore failed validation or storage access (detail=checkpoint export integrity validation failed: no committed export generation exists; next_steps: discard the incomplete generation and retry from the same committed checkpoint) (correlation_id=<correlation_id> context=detail=checkpoint export integrity validation failed: no committed export generation exists; next_steps: discard the incomplete generation and retry from the same committed checkpoint) next_steps: Inspect the committed checkpoint and object-store access, discard incomplete exports, and retry from a verified generation.\n  next steps: Verify the committed export, object-store access, and target freshness, then retry.\n"
     );
 }

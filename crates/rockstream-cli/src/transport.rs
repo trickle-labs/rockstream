@@ -22,7 +22,7 @@ use rockstream_types::diagnostic::{
 };
 use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_0005, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014,
-    RS_2006, RS_2401, RS_2410, RS_2411, RS_3612, RS_3615, RS_3616, RS_4009, RS_5035,
+    RS_2006, RS_2401, RS_2410, RS_2411, RS_3612, RS_3613, RS_3614, RS_3615, RS_3616, RS_4009,
 };
 use rockstream_types::mutation_policy::cli_mutation_policy;
 pub use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
@@ -65,12 +65,16 @@ fn required_role(operation: &str) -> Role {
 }
 
 fn checkpoint_dr_error(error: String) -> CliError {
+    let (code, detail) = if let Some(detail) = error.strip_prefix("RS-3613: ") {
+        (RS_3613, detail)
+    } else if let Some(detail) = error.strip_prefix("RS-3614: ") {
+        (RS_3614, detail)
+    } else {
+        (RS_3614, error.as_str())
+    };
     CliError::new(
-        RS_5035,
-        error
-            .strip_prefix("RS-5035: ")
-            .unwrap_or(&error)
-            .to_string(),
+        code,
+        detail.to_string(),
         "Verify the committed export, object-store access, and target freshness, then retry.",
     )
 }
@@ -2756,7 +2760,7 @@ impl StorageClient {
         .join()
         .map_err(|_| {
             CliError::new(
-                RS_5035,
+                RS_3614,
                 "checkpoint export worker panicked",
                 "Retry the export.",
             )
@@ -2848,7 +2852,7 @@ impl StorageClient {
         .join()
         .map_err(|_| {
             CliError::new(
-                RS_5035,
+                RS_3614,
                 "checkpoint restore worker panicked",
                 "Retry the restore.",
             )
@@ -3332,7 +3336,7 @@ impl StorageClient {
 
         let manifest_json = manifest.to_json().map_err(|e| {
             CliError::new(
-                RS_5035,
+                RS_3614,
                 format!("failed to serialize backup manifest: {e}"),
                 "Retry backup",
             )

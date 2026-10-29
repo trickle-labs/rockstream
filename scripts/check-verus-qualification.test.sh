@@ -131,7 +131,7 @@ chmod +x "$SHIM_BIN/verus"
 
 printf '#!/usr/bin/env bash\n' > "$SHIM_BIN/cargo"
 printf 'if [ "${1:-}" = "--version" ]; then\n' >> "$SHIM_BIN/cargo"
-printf '  echo "cargo 1.88.0"\n' >> "$SHIM_BIN/cargo"
+printf '  echo "cargo 1.95.0"\n' >> "$SHIM_BIN/cargo"
 printf '  exit 0\n' >> "$SHIM_BIN/cargo"
 printf 'fi\n' >> "$SHIM_BIN/cargo"
 printf 'if [ "${1:-}" = "verus" ]; then\n' >> "$SHIM_BIN/cargo"
@@ -374,10 +374,10 @@ commands = [
     "env RUSTUP_TOOLCHAIN=1.98.1 cargo verus verify -p rockstream-verified --locked --target x86_64-unknown-linux-gnu",
     "env VERUS_MUTATION_OUTPUT=" + str(root / "phases/debug/mutations") + " python3 " + str(pathlib.Path.cwd() / "scripts/test-verus-production-mutations.py"),
     "env CARGO_INCREMENTAL=1 RUSTUP_TOOLCHAIN=1.98.1 cargo verus verify -p rockstream-verified --locked --target x86_64-unknown-linux-gnu",
-    "env RUSTUP_TOOLCHAIN=1.88 CARGO_PROFILE_DEV_DEBUG=0 cargo build --workspace --locked --target x86_64-unknown-linux-gnu",
-    "env RUSTUP_TOOLCHAIN=1.88 cargo check --workspace --locked --target x86_64-unknown-linux-gnu",
-    "env RUSTUP_TOOLCHAIN=1.88 cargo check --workspace --all-features --locked --target x86_64-unknown-linux-gnu",
-    "env RUSTUP_TOOLCHAIN=1.88 cargo build --workspace --locked --release --target x86_64-unknown-linux-gnu",
+    "env RUSTUP_TOOLCHAIN=1.95 CARGO_PROFILE_DEV_DEBUG=0 cargo build --workspace --locked --target x86_64-unknown-linux-gnu",
+    "env RUSTUP_TOOLCHAIN=1.95 cargo check --workspace --locked --target x86_64-unknown-linux-gnu",
+    "env RUSTUP_TOOLCHAIN=1.95 cargo check --workspace --all-features --locked --target x86_64-unknown-linux-gnu",
+    "env RUSTUP_TOOLCHAIN=1.95 cargo build --workspace --locked --release --target x86_64-unknown-linux-gnu",
 ]
 for phase, expected in (("debug", commands[:6]), ("release", commands[6:])):
     assert records[phase]["phase"] == phase

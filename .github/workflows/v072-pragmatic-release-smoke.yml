@@ -1,0 +1,68 @@
+name: v0.72 pragmatic release smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/v072-pragmatic-release-smoke.yml"
+      - "scripts/run-v072-pragmatic-smoke.sh"
+      - "docs/testing/v072-pragmatic-release-smoke.md"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/v072-pragmatic-release-smoke.yml"
+      - "scripts/run-v072-pragmatic-smoke.sh"
+      - "docs/testing/v072-pragmatic-release-smoke.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A release-candidate smoke must finish, even if another branch is updated.
+concurrency:
+  group: v072-pragmatic-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  supported-path-smoke:
+    name: Exact-revision overload, cancellation and recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_INCREMENTAL: "false"
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+      - name: Run all 17 non-skipped pragmatic smoke cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          V072_EXPECTED_SHA="$sha" bash scripts/run-v072-pragmatic-smoke.sh
+          report="target/v072-release-smoke/$sha/report.tsv"
+          test -f "$report"
+          passed="$(awk -F '\t' 'NR > 1 && $2 == "PASS" { n++ } END { print n+0 }' "$report")"
+          total="$(awk 'END { print NR-1 }' "$report")"
+          if [[ "$passed" -ne 17 || "$total" -ne 17 ]]; then
+            echo "Expected exactly 17 passing release smoke cases; found $passed/$total" >&2
+            exit 1
+          fi
+          cat "$report"
+      - name: Retain exact candidate identity and per-case logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v072-pragmatic-smoke-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
+          path: target/v072-release-smoke/
+          retention-days: 90
+          if-no-files-found: error

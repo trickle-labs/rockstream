@@ -1,0 +1,17 @@
+
+running 1 test
+test group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs ... FAILED
+
+failures:
+
+---- group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs stdout ----
+
+thread 'group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs' (20882098) panicked at crates/rockstream-ops/src/group_commit/physical.rs:1154:20:
+called `Result::unwrap_err()` on an `Ok` value: [1]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    group_commit::physical::boundary_tests::unknown_write_withholds_ack_and_recovers_committed_lfs
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 201 filtered out; finished in 5.01s

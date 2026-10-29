@@ -88,7 +88,7 @@ fn test_docs_cli_conformance_and_coverage() {
     let required_codes = [
         "RS-0002", "RS-0003", "RS-0004", "RS-0005", "RS-1001", "RS-1004", "RS-1005", "RS-1006",
         "RS-1007", "RS-1008", "RS-1012", "RS-1014", "RS-1020", "RS-1021", "RS-1731", "RS-2006",
-        "RS-2401", "RS-4009", "RS-5030", "RS-5035",
+        "RS-2401", "RS-4009", "RS-5030", "RS-3613", "RS-3614",
     ];
 
     for code in &required_codes {
@@ -152,5 +152,5 @@ fn test_cli_documentation_covers_checkpoint_export_and_restore() {
     assert!(docs.contains(
         "rockstream checkpoint restore --source <file://...|s3://...> --storage <file://...|s3://...> --yes"
     ));
-    assert!(docs.contains("RS-5035"));
+    assert!(docs.contains("RS-3614"));
 }

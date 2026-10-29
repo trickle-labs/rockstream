@@ -321,7 +321,7 @@ pub fn deliver_snapshot_checked(
             continue;
         }
         let projected = apply_projection(&value, req.projection.as_deref(), col_names);
-        bytes = bytes.checked_add(projected.len()).unwrap_or(usize::MAX);
+        bytes = bytes.saturating_add(projected.len());
         if bytes > CHANGE_LOG_MAX_BUFFER_BYTES {
             return Err(SubscribeError::LimitExceeded {
                 resource: "snapshot_bytes",
@@ -420,9 +420,7 @@ impl SubscriberHandle {
                 current_epoch = Some(entry.epoch);
                 bytes_in_epoch = 0;
             }
-            bytes_in_epoch = bytes_in_epoch
-                .checked_add(projected.len())
-                .unwrap_or(usize::MAX);
+            bytes_in_epoch = bytes_in_epoch.saturating_add(projected.len());
             if bytes_in_epoch > CHANGE_LOG_MAX_EPOCH_BYTES {
                 return Err(SubscribeError::LimitExceeded {
                     resource: "epoch_bytes",

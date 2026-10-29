@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "14852a383a5faeee1df450b1ca0c30732e2f76e13862c26ff9a9e3372e8e1956",
+    "candidate_identity_digest": "dba48692c99f7a85c4b71bfe1023c88c2e5ab71b624a7357db0223120f684022",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -7626,6 +7626,26 @@
         "retry_class": "ExponentialBackoff",
         "default_next_steps": "Wait for in-flight shard drain tasks to complete before enqueueing additional assignments.",
         "doc_anchor": "rs-3612"
+      },
+      {
+        "code": "RS-3613",
+        "key": "checkpoint.export_in_progress",
+        "title": "Checkpoint export is already in progress",
+        "severity": "ERROR",
+        "sqlstate": "55000",
+        "retry_class": "Immediate",
+        "default_next_steps": "Wait for the active checkpoint export to finish, then retry the operation.",
+        "doc_anchor": "rs-3613"
+      },
+      {
+        "code": "RS-3614",
+        "key": "checkpoint.export_or_restore_failed",
+        "title": "Checkpoint export or restore failed validation or storage access",
+        "severity": "ERROR",
+        "sqlstate": "XX000",
+        "retry_class": "AfterClusterRecovery",
+        "default_next_steps": "Inspect the committed checkpoint and object-store access, discard incomplete exports, and retry from a verified generation.",
+        "doc_anchor": "rs-3614"
       },
       {
         "code": "RS-3615",

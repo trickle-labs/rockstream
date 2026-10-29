@@ -767,6 +767,15 @@ The exact oracle rejects wrong values, omitted deletions, and duplicate changes.
 `sink.kafka` remains Experimental pending full Core release qualification;
 marker tests alone cannot qualify row delivery.
 
+The Rust 1.95 `collapsible_match` cleanup in `kafka_source.rs` and `kafka_sink.rs`
+only moves existing predicates into match guards. Schema mismatches still
+quarantine as `RS-1003`, and Kafka `CheckBeforeCommit` still retries unresolved
+lookups without confirming absence. Existing coverage is
+`kafka_poison_dlq_diagnostic_tests::test_poison_dlq_quarantines_schema_mismatch`,
+`kafka_sink_guarantee_matrix_tests::kafka_sink_uncertain_broker_response_recovers_exactly_once_within_slo`,
+and `kafka_sink_guarantee_matrix_tests::kafka_sink_lookup_timeout_does_not_confirm_absence_before_stable_end`;
+no FizzBee transition changes.
+
 Issue #133 / v0.72 R6 additionally bounds *suspended* worker-local exchange
 credit waiters, separately from accepted in-flight batches and bytes.
 `FlowController::acquire_credit` and `acquire_batch_permit` reserve one
@@ -1466,4 +1475,4 @@ complete/truncated/row-over-budget responses and v3 logical-key/failure behavior
 
 ## v0.72 CLI checkpoint export integrity (#221)
 
-The CLI backup operation selects one committed control checkpoint and must enumerate its required immutable shard manifest, WAL and SST objects before exporting. A merely visible-prefix inventory is insufficient: missing referenced shard storage must fail with a checkpoint-integrity error and must not create a terminal success marker. The management and CLI export paths now share the existing checkpoint-aware inventory; this does not alter M3 cluster checkpoint durability, lease fencing or the committed checkpoint itself. Concrete coverage: `cli_prefix_export_rejects_missing_committed_shard_objects_before_success` deletes a real checkpointed shard before CLI export and requires failure without a commit marker; `lfs_export_restore_fresh_cluster_is_bit_identical` preserves the positive committed state recovery contract. Error-code catalog aliasing for RS-5035 is tracked separately as D1 in #221.
+The CLI backup operation selects one committed control checkpoint and must enumerate its required immutable shard manifest, WAL and SST objects before exporting. A merely visible-prefix inventory is insufficient: missing referenced shard storage must fail with a checkpoint-integrity error and must not create a terminal success marker. The management and CLI export paths now share the existing checkpoint-aware inventory; this does not alter M3 cluster checkpoint durability, lease fencing or the committed checkpoint itself. Concrete coverage: `cli_prefix_export_rejects_missing_committed_shard_objects_before_success` deletes a real checkpointed shard before CLI export and requires failure without a commit marker; `lfs_export_restore_fresh_cluster_is_bit_identical` preserves the positive committed state recovery contract. Checkpoint-export error-code aliasing has been corrected: RS-3613 identifies export-in-progress and RS-3614 identifies export/restore failure; RS-5035 remains the cataloged skew-SLO error. This is an operator diagnostics change, not a new checkpoint durability claim.

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -15,7 +15,10 @@ use rockstream_storage::{
 use rockstream_types::{connector::PartitionFilter, ids::ConnectorId, timestamp::Epoch};
 use tempfile::TempDir;
 
-struct AckSource;
+#[derive(Clone)]
+struct AckSource {
+    acknowledgements: Arc<Mutex<Vec<(Epoch, OffsetToken)>>>,
+}
 
 #[async_trait]
 impl SourceConnector for AckSource {
@@ -46,7 +49,12 @@ impl SourceConnector for AckSource {
         unreachable!("durability tests commit explicit envelopes")
     }
 
-    async fn commit_offset(&mut self, _: Epoch, _: OffsetToken) -> Result<(), SourceError> {
+    async fn commit_offset(
+        &mut self,
+        epoch: Epoch,
+        offset: OffsetToken,
+    ) -> Result<(), SourceError> {
+        self.acknowledgements.lock().unwrap().push((epoch, offset));
         Ok(())
     }
 
@@ -71,7 +79,9 @@ async fn recover_exactly(dir: &TempDir, connector_id: ConnectorId, payload: &[u8
     );
     let store = SourceCheckpointStore::new(Arc::clone(&db), 0, connector_id);
     let mut runtime = SourceRuntimeCoordinator::new(
-        AckSource,
+        AckSource {
+            acknowledgements: Arc::new(Mutex::new(Vec::new())),
+        },
         connector_id,
         OffsetToken::new(vec![]),
         store.clone(),
@@ -188,6 +198,95 @@ async fn relation_history_and_rs1002_survive_restart_lfs() {
         b"schema=2;blocked=RS-1002",
     )
     .await;
+}
+
+#[tokio::test]
+async fn replayable_m3_write_failure_withholds_ack_and_recovers_empty_lfs() {
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(
+        ShardDb::builder(
+            "cdc-m3-write-failure",
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
+        )
+        .build()
+        .await
+        .unwrap(),
+    );
+    let connector_id = ConnectorId(52205);
+    let checkpoints = SourceCheckpointStore::new(Arc::clone(&db), 0, connector_id);
+    let acknowledgements = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = SourceRuntimeCoordinator::new(
+        AckSource {
+            acknowledgements: Arc::clone(&acknowledgements),
+        },
+        connector_id,
+        OffsetToken::new(vec![]),
+        checkpoints.clone(),
+    );
+    runtime.recover().await.unwrap();
+    let lease = runtime.acquire_owner("write-failure").unwrap();
+    let offset = OffsetToken::new(b"0/53".to_vec());
+    let mut batch = WriteBatch::new();
+    batch.put(&[ShardPrefix::OpState.as_byte(), 2], b"state");
+    batch.put(&[ShardPrefix::ViewOutput.as_byte(), 2], b"view");
+    batch.put(b"source_input/orders/0002", b"payload");
+    batch.put(&ShardKeyEncoder::frontier_key(), &1_u64.to_be_bytes());
+    db.set_fail_writes(true);
+
+    let commit = runtime
+        .commit_replayable_epoch(&lease, 1, offset, &[], batch)
+        .await
+        .map_err(|error| error.to_string());
+    db.set_fail_writes(false);
+    let source_offset = runtime.committed_offset().clone();
+    let acknowledgements = acknowledgements.lock().unwrap().clone();
+    let row_before_reopen = db.get(b"source_input/orders/0002").await.unwrap();
+    let frontier_key = ShardKeyEncoder::frontier_key();
+    let frontier_before_reopen = db.get(&frontier_key).await.unwrap();
+    let checkpoint_before_reopen = checkpoints.highest_committed().await.unwrap();
+
+    drop(runtime);
+    drop(checkpoints);
+    let db = match Arc::try_unwrap(db) {
+        Ok(db) => db,
+        Err(_) => panic!("single shard db owner"),
+    };
+    db.close().await.unwrap();
+
+    let reopened = Arc::new(
+        ShardDb::builder(
+            "cdc-m3-write-failure",
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
+        )
+        .build()
+        .await
+        .unwrap(),
+    );
+    let recovered = SourceCheckpointStore::new(Arc::clone(&reopened), 0, connector_id);
+    assert_eq!(
+        (
+            commit,
+            acknowledgements,
+            source_offset,
+            checkpoint_before_reopen,
+            row_before_reopen,
+            frontier_before_reopen,
+            recovered.highest_committed().await.unwrap(),
+            reopened.get(b"source_input/orders/0002").await.unwrap(),
+            reopened.get(&frontier_key).await.unwrap(),
+        ),
+        (
+            Err("RS-4001: source I/O error: RS-4001: source I/O error: RS-4010: durable source checkpoint operation failed: unsupported operation: injected storage write failure; next steps: keep the source paused, recover the highest committed checkpoint, then retry".to_string()),
+            Vec::new(),
+            OffsetToken::new(vec![]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    );
 }
 
 #[test]

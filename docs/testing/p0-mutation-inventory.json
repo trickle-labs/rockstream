@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "status": "partial_evidence_not_qualification",
+  "baseline_sha": "2bb60012318fa966e1dc98866122daceabc59607",
+  "run_date": "2026-10-27",
+  "selection_basis": "The two P0 scenarios explicitly named by issue #263; no score-based or LLM-ranked selection was used.",
+  "cases": [
+    {
+      "id": "P0-GROUP-COMMIT-UNKNOWN-AS-DURABLE",
+      "invariant": "A failed or unknown write/flush outcome must not be acknowledged as durable, advance the committed frontier, or release retained work.",
+      "production_entry": "PhysicalCommitGroup::flush",
+      "source_path": "crates/rockstream-ops/src/group_commit/physical.rs",
+      "history": "A LocalFileSystem-backed ShardDb writes epoch 1, pauses after write, queues epoch 2, then receives an injected flush failure before the backend flush. The test checks the returned result, committed frontier, retained accounting, and exact key/value state before retrying epochs 1 and 2.",
+      "mutation": {
+        "before": [
+          "Outcome::FlushUnknown(error) | Outcome::WriteUnknown(error) => {",
+          "    (physical_commit::OUTCOME_UNKNOWN, Some(error))",
+          "}"
+        ],
+        "after": [
+          "Outcome::FlushUnknown(_) | Outcome::WriteUnknown(_) => (physical_commit::DURABLE, None),"
+        ]
+      },
+      "detector": {
+        "package": "rockstream-ops",
+        "test_id": "group_commit::physical::boundary_tests::unknown_flush_keeps_later_epoch_queued_until_reconciliation",
+        "command": "rtk cargo test -p rockstream-ops unknown_flush_keeps_later_epoch_queued_until_reconciliation --lib"
+      },
+      "baseline": {
+        "result": "pass",
+        "summary": "1 passed, 200 filtered out; 0.33s"
+      },
+      "mutant": {
+        "result": "killed_by_expected_assertion",
+        "output": "called Result::unwrap_err() on an Ok value: [1]",
+        "summary": "0 passed, 1 failed, 200 filtered out; 0.14s"
+      },
+      "limit": "This injects a flush error before the backend flush. It does not simulate power loss after an acknowledged write or claim a physical durability guarantee."
+    },
+    {
+      "id": "P0-CATALOG-RECOVERY-LOST-COMMITTED-OPERATION",
+      "invariant": "Snapshot recovery must restore operation identities so replaying an already committed transaction cannot resurrect deleted metadata or change durable objects.",
+      "production_entry": "DurableCatalogStore::recover",
+      "source_path": "crates/rockstream-storage/src/catalog/store.rs",
+      "history": "Create table with operation 555 at revision 1, delete it with operation 556 at revision 2, snapshot revision 2, compact both log entries, then recover twice and retry operation 555. The baseline inventory contains only retry/catalog/snapshots/00000000000000000002.snap.",
+      "mutation": {
+        "before": "recovered_state.committed_operations = snap.committed_operations.into_iter().collect();",
+        "after": null
+      },
+      "detector": {
+        "package": "rockstream-storage",
+        "test_target": "catalog_storage_tests",
+        "test_id": "test_snapshot_retry_preserves_deleted_table_and_objects",
+        "command": "rtk cargo test -p rockstream-storage --test catalog_storage_tests test_snapshot_retry_preserves_deleted_table_and_objects"
+      },
+      "baseline": {
+        "result": "pass",
+        "summary": "1 passed, 9 filtered out; 0.00s",
+        "replay_result": "(2, 2, [])",
+        "stored_objects_unchanged": true
+      },
+      "mutant": {
+        "result": "killed_by_expected_assertion",
+        "output": "left: (1, 1, [CatalogTable { id: TableId(10), name: \"deleted_table\", namespace_id: NamespaceId(1), columns: [], pk_cols: [] }]); right: (2, 2, [])",
+        "summary": "0 passed, 1 failed, 9 filtered out; 0.00s"
+      },
+      "limit": "The test exercises production catalog recovery over object_store::memory::InMemory, not a process kill or physical storage backend. The mutant fails on resurrected metadata before the later object-inventory assertion runs."
+    }
+  ],
+  "qualification_gaps": [
+    "No mutation runner, schedule, per-run resource bound, or random/static selection comparison was evaluated.",
+    "No process-kill-after-ACK durability mutant or external object-store recovery mutant was executed.",
+    "Runner and setup cost were not measured."
+  ]
+}

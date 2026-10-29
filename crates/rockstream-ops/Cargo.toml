@@ -57,6 +57,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
+slatedb = { workspace = true }
 rockstream-plan = { workspace = true }
 rockstream-gateway = { workspace = true }
 rockstream-sim = { workspace = true }

@@ -72,7 +72,7 @@ def get_rustc_version() -> str:
         res = subprocess.run(["rustc", "--version"], capture_output=True, text=True, check=True)
         return res.stdout.strip()
     except Exception:
-        return "rustc 1.88.0"
+        return "rustc 1.95.0"
 
 def get_workspace_version(root: Path) -> str:
     cargo_toml = root / "Cargo.toml"

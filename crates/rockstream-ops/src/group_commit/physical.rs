@@ -774,9 +774,109 @@ async fn drive(owner: Weak<Inner>, notify: Arc<Notify>) {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
     use object_store::local::LocalFileSystem;
+    use object_store::path::Path as ObjPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    };
     use rockstream_storage::MergeOperatorRegistry;
     use tempfile::tempdir;
+
+    #[derive(Debug)]
+    struct UnpersistedPutTimeoutGate {
+        inner: Arc<dyn ObjectStore>,
+        armed: AtomicBool,
+        reached: Notify,
+    }
+
+    impl UnpersistedPutTimeoutGate {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                armed: AtomicBool::new(false),
+                reached: Notify::new(),
+            }
+        }
+    }
+
+    impl std::fmt::Display for UnpersistedPutTimeoutGate {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "UnpersistedPutTimeoutGate({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for UnpersistedPutTimeoutGate {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.reached.notify_one();
+                std::future::pending::<()>().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjPath>,
+            offset: &ObjPath,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     fn publish_transcript(path: &std::path::Path, value: &[u8]) {
         let staging = path.with_extension("writing");
@@ -857,7 +957,10 @@ mod boundary_tests {
         assert_eq!(group.last_committed(), 0);
         group.inner.test_gates.lock().take();
         gate.proceed.notify_one();
-        assert!(flushing.await.unwrap().is_err());
+        assert_eq!(
+            flushing.await.unwrap().unwrap_err().to_string(),
+            "[RS-0001] Internal error: unsupported operation: injected storage flush failure; next_steps: report this issue"
+        );
         assert_eq!(
             group.fill(),
             PhysicalCommitFill {
@@ -1003,6 +1106,110 @@ mod boundary_tests {
             Some(bytes::Bytes::from_static(b"fourth_v"))
         );
         assert_eq!(reopened.fill(), empty_reopened_fill());
+    }
+
+    #[tokio::test]
+    async fn unknown_unpersisted_write_is_not_acked_and_retry_recovers_lfs() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(UnpersistedPutTimeoutGate::new(Arc::new(
+            LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+        )));
+        let db = Arc::new(
+            ShardDb::builder("unknown-write-gated", store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let group = Arc::new(PhysicalCommitGroup::with_config(
+            db.clone(),
+            5000,
+            10 * 1024 * 1024,
+            64,
+        ));
+        let mut batch = WriteBatch::new();
+        batch.put(b"written_k", b"written_v");
+        batch.put(&ShardKeyEncoder::frontier_key(), &1_u64.to_be_bytes());
+        let bytes = batch.byte_size();
+        group.add_epoch(1, batch.clone()).unwrap();
+        store.armed.store(true, Ordering::SeqCst);
+
+        let flushing = {
+            let group = group.clone();
+            tokio::spawn(async move { group.flush().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), store.reached.notified())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(GROUP_COMMIT_IO_TIMEOUT_MS / 1000 + 3),
+            flushing,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let acked_epochs = result.as_ref().ok().cloned();
+        let error = result.as_ref().err().map(ToString::to_string);
+        let fill = group.fill();
+        let committed_before_crash = group.last_committed();
+
+        drop(group);
+        drop(db);
+
+        let reopened = Arc::new(
+            ShardDb::builder("unknown-write-gated", store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let recovered = PhysicalCommitGroup::open(reopened.clone()).await.unwrap();
+        assert_eq!(
+            acked_epochs, None,
+            "unknown write was acknowledged before recovery: ack={acked_epochs:?}, frontier={:?}, value={:?}",
+            recovered.last_committed(),
+            reopened.get(b"written_k").await.unwrap()
+        );
+        assert_eq!(error.as_deref(), Some("[RS-0001] Internal error: physical write timed out; its outcome is unknown and must be reconciled after reopening the shard; next_steps: report this issue"));
+        assert_eq!(
+            fill,
+            PhysicalCommitFill {
+                pending_epochs: 0,
+                retained_epochs: 1,
+                retained_bytes: bytes,
+                retained_operations: 2,
+                active_waiters: 0,
+                in_flight: false,
+                retry_required: true,
+                outcome_unknown: true,
+                max_bytes: 10 * 1024 * 1024,
+                max_epochs: 64,
+                max_waiters: MAX_GROUP_COMMIT_WAITERS,
+            }
+        );
+        assert_eq!(committed_before_crash, 0);
+        assert_eq!(recovered.last_committed(), 0);
+        assert_eq!(reopened.get(b"written_k").await.unwrap(), None);
+        assert_eq!(
+            reopened
+                .get(&ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap(),
+            None
+        );
+
+        recovered.add_epoch(1, batch).unwrap();
+        assert_eq!(recovered.flush().await.unwrap(), vec![1]);
+        assert_eq!(recovered.last_committed(), 1);
+        assert_eq!(
+            reopened.get(b"written_k").await.unwrap(),
+            Some(bytes::Bytes::from_static(b"written_v"))
+        );
+        assert_eq!(
+            reopened
+                .get(&ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap(),
+            Some(bytes::Bytes::from(1_u64.to_be_bytes().to_vec()))
+        );
     }
 
     #[tokio::test]
