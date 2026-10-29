@@ -861,15 +861,10 @@ async fn manifest_object_paths_at(
         manifest_id
     )));
     let mut add_view = |view: &slatedb::manifest::SsTableView, root: &str| {
-        let path = match view.sst.id {
-            slatedb::manifest::SsTableId::Wal(id) => {
-                format!("{root}/wal/{id:020}.sst")
-            }
-            slatedb::manifest::SsTableId::Compacted(id) => {
-                format!("{root}/compacted/{id}.sst")
-            }
-        };
-        objects.insert(Path::from(path));
+        objects.insert(Path::from(format!(
+            "{root}/compacted/{}.sst",
+            view.sst.id.value()
+        )));
     };
     for view in manifest.l0() {
         add_view(view, shard_path);
@@ -891,15 +886,11 @@ async fn manifest_object_paths_at(
     }
     for external in manifest.external_dbs() {
         for id in &external.sst_ids {
-            let path = match id {
-                slatedb::manifest::SsTableId::Wal(id) => {
-                    format!("{}/wal/{id:020}.sst", external.path)
-                }
-                slatedb::manifest::SsTableId::Compacted(id) => {
-                    format!("{}/compacted/{id}.sst", external.path)
-                }
-            };
-            objects.insert(Path::from(path));
+            objects.insert(Path::from(format!(
+                "{}/compacted/{}.sst",
+                external.path,
+                id.value()
+            )));
         }
     }
     let wal_prefix = Path::from(format!("{shard_path}/wal"));
