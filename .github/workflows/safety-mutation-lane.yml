@@ -23,7 +23,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/safety-mutation-lane
-      ROCKSTREAM_MUTATION_TMP: ${{ runner.temp }}/safety-mutation-work
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +39,8 @@ jobs:
       - name: Test exact source, execution, and reporting gates
         run: python3 scripts/run_safety_mutation_lane_test.py -q
       - name: Run the fixed reviewed candidate set
+        env:
+          ROCKSTREAM_MUTATION_TMP: ${{ runner.temp }}/safety-mutation-work
         run: python3 scripts/run_safety_mutation_lane.py --output-dir "$RUNNER_TEMP/safety-mutation-results"
       - name: Remove safety mutation source scratch
         if: always()
