@@ -776,6 +776,13 @@ lookups without confirming absence. Existing coverage is
 and `kafka_sink_guarantee_matrix_tests::kafka_sink_lookup_timeout_does_not_confirm_absence_before_stable_end`;
 no FizzBee transition changes.
 
+The SlateDB 0.17 adapter supplies a stable SHA-256-derived cache ID per shard
+path, isolating cached entries in a worker-shared cache and reusing the same
+namespace on reopen. `shard_db::db_cache_id_tests::db_cache_ids_are_stable_per_database_path`
+pins the IDs; `shard_construction_tests::test_every_production_shard_receives_shared_storage_context`
+covers shared-context wiring. This changes implementation cache identity, not
+an M1–M7 transition.
+
 Issue #133 / v0.72 R6 additionally bounds *suspended* worker-local exchange
 credit waiters, separately from accepted in-flight batches and bytes.
 `FlowController::acquire_credit` and `acquire_batch_permit` reserve one
