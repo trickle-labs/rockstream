@@ -1,4 +1,4 @@
-# One worker failure against real Kafka and MinIO; one sample, no p99 claim.
+# Real Kafka and MinIO worker and source-ACK recovery; no p99 claim.
 
 name: Real Cluster Chaos Soak
 
@@ -28,6 +28,8 @@ on:
       - "formal/edge_*.fizz"
       - "Dockerfile"
       - "docs/testing/worker-failure-kafka-minio-v1.json"
+      - "docs/testing/worker-source-ack-gap-kafka-minio-v1.json"
+      - "docs/testing/worker-source-ack-gap-recovery.md"
       - "scripts/release-qualification*"
       - "scripts/run-release-qualification.sh"
       - ".github/workflows/real-cluster-chaos.yml"
@@ -58,6 +60,8 @@ jobs:
           cargo test --locked -p rockstream-sim --lib qualification::worker_failure
       - name: Qualify observed worker-failure recovery and corrupted records
         run: bash scripts/run-release-qualification.sh --suite recovery --output target/real-cluster-chaos/qualification.json
+      - name: Prove real-process source acknowledgment gap recovery
+        run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests source_ack_gap_recovery_from_kafka_and_minio -- --exact
       - name: Upload real-cluster chaos artifacts
         if: always()
         uses: actions/upload-artifact@v4

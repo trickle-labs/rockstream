@@ -49,6 +49,12 @@ This replaces the former copied-input multi-category chaos result. Other failure
 categories retain their simulation coverage and explicitly lack this real-backend
 evidence; this scenario must not qualify them.
 
+The companion [`worker-source-ack-gap-recovery.md`](worker-source-ack-gap-recovery.md)
+scenario uses a separately versioned history to stop after its M3 commit but
+before the Kafka source acknowledgment. Together, the two scenarios cover the
+source acknowledgment and pending sink transaction boundaries for Kafka to
+Kafka recovery; they do not qualify PostgreSQL CDC or other connector types.
+
 For qualification, run:
 
 ```sh
