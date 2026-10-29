@@ -60,7 +60,11 @@ fn committed_group_offset(bootstrap: &str, group: &str, topic: &str) -> i64 {
         .set("group.id", group)
         .create()
         .unwrap();
-    let offsets = consumer.committed(Duration::from_secs(10)).unwrap();
+    let mut partitions = TopicPartitionList::new();
+    partitions.add_partition(topic, 0);
+    let offsets = consumer
+        .committed_offsets(partitions, Duration::from_secs(10))
+        .unwrap();
     match offsets
         .elements()
         .iter()
