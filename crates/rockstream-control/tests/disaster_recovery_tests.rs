@@ -4,7 +4,7 @@ use futures::StreamExt;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt};
 use rockstream_control::{CheckpointExportService, CheckpointManifestStore};
 use rockstream_runtime::RecoveryDriver;
-use rockstream_storage::ShardDb;
+use rockstream_storage::{keys::ShardKeyEncoder, ShardDb};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{
     create_minio_bucket, minio_object_store, start_minio, MinIO2024,
@@ -20,6 +20,12 @@ async fn seed_checkpoint(store: Arc<dyn ObjectStore>, checkpoint_id: u64) -> Clu
         .await
         .unwrap();
     db.put(b"view/rows", b"committed").await.unwrap();
+    db.put(
+        &ShardKeyEncoder::frontier_key(),
+        &checkpoint_id.to_be_bytes(),
+    )
+    .await
+    .unwrap();
     db.flush().await.unwrap();
     let handle = db.create_checkpoint().await.unwrap();
     let id = CheckpointId(checkpoint_id);
@@ -268,6 +274,186 @@ async fn minio_stores(
         minio_object_store(port, &export_bucket),
         minio_object_store(port, &target_bucket),
     ))
+}
+
+#[tokio::test]
+async fn minio_restore_process_fixture() {
+    let Ok(port) = std::env::var("ROCKSTREAM_MINIO_RESTORE_PORT") else {
+        return;
+    };
+    let port = port.parse().unwrap();
+    let export_bucket = std::env::var("ROCKSTREAM_MINIO_RESTORE_EXPORT_BUCKET").unwrap();
+    let target_bucket = std::env::var("ROCKSTREAM_MINIO_RESTORE_TARGET_BUCKET").unwrap();
+    let generation = std::env::var("ROCKSTREAM_MINIO_RESTORE_GENERATION").unwrap();
+    let result_path = std::env::var("ROCKSTREAM_MINIO_RESTORE_RESULT").unwrap();
+    let export = minio_object_store(port, &export_bucket);
+    let target = minio_object_store(port, &target_bucket);
+    let service = CheckpointExportService::new();
+    let validated_export = service
+        .validate_generation(export.clone(), &generation)
+        .await
+        .unwrap();
+    let restore = service
+        .restore_generation(export, target.clone(), &generation)
+        .await
+        .unwrap();
+    let checkpoint = CheckpointManifestStore::new(target.clone())
+        .load_manifest(CheckpointId(12))
+        .await
+        .unwrap();
+    let recovery = RecoveryDriver::new();
+    recovery.load_checkpoint(checkpoint.clone());
+    let shard = recovery
+        .recover_shard(
+            ShardId(0),
+            "shards/0",
+            target.clone(),
+            LeaseToken(1),
+            LeaseToken(1),
+        )
+        .await
+        .unwrap();
+    let row = shard.reader.get(b"view/rows").await.unwrap().unwrap();
+    let frontier = shard
+        .reader
+        .get(&ShardKeyEncoder::frontier_key())
+        .await
+        .unwrap()
+        .unwrap();
+    let catalog = target
+        .get(&Path::from("control/catalog/views"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let source_resume = target
+        .get(&Path::from("control/connectors/source-resume"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let result = serde_json::json!({
+        "pid": std::process::id(),
+        "export": validated_export,
+        "restore": restore,
+        "checkpoint": checkpoint,
+        "row": String::from_utf8(row.to_vec()).unwrap(),
+        "frontier": u64::from_be_bytes(frontier.as_ref().try_into().unwrap()),
+        "catalog": String::from_utf8(catalog.to_vec()).unwrap(),
+        "source_resume": String::from_utf8(source_resume.to_vec()).unwrap(),
+    });
+    std::fs::write(result_path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn minio_tc_restore_in_fresh_process_preserves_exact_state() {
+    if !docker_available() {
+        eprintln!("SKIP MinIO fresh-process restore test: Docker not available");
+        return;
+    }
+    let source_bucket = "rs-dr-source-fresh-process";
+    let export_bucket = "rs-dr-export-fresh-process";
+    let target_bucket = "rs-dr-target-fresh-process";
+    let (_container, port) = start_minio(source_bucket)
+        .await
+        .expect("MinIO must start when Docker is available");
+    create_minio_bucket(port, export_bucket).await;
+    create_minio_bucket(port, target_bucket).await;
+
+    let source = minio_object_store(port, source_bucket);
+    let export = minio_object_store(port, export_bucket);
+    let target = minio_object_store(port, target_bucket);
+    assert!(target.list(None).next().await.is_none());
+    let checkpoint = seed_checkpoint(source.clone(), 12).await;
+    let generation = "minio-fresh-process";
+    let service = CheckpointExportService::new();
+    let export_outcome = service
+        .export_latest_prefix(
+            source.clone(),
+            export.clone(),
+            &CheckpointManifestStore::new(source),
+            generation,
+            &Path::from(""),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .validate_generation(export.clone(), generation)
+            .await
+            .unwrap(),
+        export_outcome
+    );
+
+    let result_dir = tempfile::tempdir().unwrap();
+    let result_path = result_dir.path().join("restore.json");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["minio_restore_process_fixture", "--exact", "--nocapture"])
+        .env("ROCKSTREAM_MINIO_RESTORE_PORT", port.to_string())
+        .env("ROCKSTREAM_MINIO_RESTORE_EXPORT_BUCKET", export_bucket)
+        .env("ROCKSTREAM_MINIO_RESTORE_TARGET_BUCKET", target_bucket)
+        .env("ROCKSTREAM_MINIO_RESTORE_GENERATION", generation)
+        .env("ROCKSTREAM_MINIO_RESTORE_RESULT", &result_path)
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "fresh-process restore failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let mut observed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&result_path).unwrap()).unwrap();
+    let child_pid = observed["pid"].as_u64().unwrap();
+    assert_ne!(child_pid, std::process::id() as u64);
+    observed.as_object_mut().unwrap().remove("pid");
+    assert_eq!(
+        observed,
+        serde_json::json!({
+            "export": export_outcome,
+            "restore": rockstream_control::CheckpointRestoreOutcome {
+                checkpoint_id: 12,
+                generation: generation.to_string(),
+                object_count: export_outcome.object_count,
+                byte_count: export_outcome.byte_count,
+                restored_shards: 1,
+                status: "SUCCESS".to_string(),
+            },
+            "checkpoint": checkpoint,
+            "row": "committed",
+            "frontier": 12,
+            "catalog": "view=v committed_epoch=7",
+            "source_resume": "offset=42",
+        })
+    );
+
+    let revision = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let artifact_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ci-test-results");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    std::fs::write(
+        artifact_dir.join("checkpoint-export-minio-fresh-process.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "source_sha": String::from_utf8(revision.stdout).unwrap().trim(),
+            "minio_image": "codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+            "endpoint": format!("http://127.0.0.1:{port}"),
+            "source_bucket": source_bucket,
+            "export_bucket": export_bucket,
+            "target_bucket": target_bucket,
+            "checkpoint": checkpoint,
+            "generation": generation,
+            "export": export_outcome,
+            "restored_by_pid": child_pid,
+            "observed_state": observed,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]
