@@ -79,6 +79,17 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(Q.make_report((), [], CANDIDATE, SETTINGS),
                          self.expected(errors=("zero mandatory execution",), processes=False))
 
+    def test_test_list_reports_exact_inventory(self):
+        output = "worker_process_fixture: test\nsource_ack_gap_recovery_from_kafka_and_minio: test\n"
+        names = ["worker_process_fixture", "source_ack_gap_recovery_from_kafka_and_minio"]
+        self.assertEqual(Q.parse_test_list(output), names)
+        self.assertIsNone(Q.validate_test_inventory(names[1], names, 0))
+        self.assertEqual(Q.validate_test_inventory(names[1], names + [names[1]], 0),
+                         "invalid test inventory")
+        self.assertEqual(Q.validate_test_inventory("missing", names, 0),
+                         "required application test is absent")
+        self.assertEqual(Q.validate_test_inventory(names[1], names, 1), "invalid test inventory")
+
     def test_toolchain_diagnostics_do_not_change_executed_evidence(self):
         build = subprocess.CompletedProcess(["rustc"], 0, "", "info: syncing channel updates for 1.95\n")
         execution = subprocess.CompletedProcess(["fixture"], 0, VALID, "")
@@ -356,9 +367,14 @@ class RecoveryQualificationTests(unittest.TestCase):
     def run_entrypoint(self, publish=True, changed=False):
         helper_output = ("running 1 test\ntest helper ... ok\n"
                          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n")
+        test_list_output = ("worker_process_fixture: test\n"
+                            f"{Q.APPLICATION_CASE}: test\n"
+                            "source_ack_gap_recovery_from_kafka_and_minio: test\n")
         application_output = (f"running 1 test\ntest {Q.APPLICATION_CASE} ... ok\n"
-                              "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0s\n")
+                              "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0s\n")
         def execute(command, **kwargs):
+            if command == Q.APPLICATION_LIST_COMMAND:
+                return subprocess.CompletedProcess(command, 0, test_list_output, "")
             if kwargs:
                 env = kwargs["env"]
                 self.assertEqual(json.loads(env["ROCKSTREAM_QUALIFICATION_CANDIDATE"]), CANDIDATE)
@@ -389,6 +405,8 @@ class RecoveryQualificationTests(unittest.TestCase):
             self.processes[1]["errors"] = list(errors)
             if not publish:
                 errors.append("mandatory checks or observations omitted")
+            self.processes[1]["test_inventory"] = Q.parse_test_list(test_list_output)
+            self.processes[1]["filtered_count"] = len(self.processes[1]["test_inventory"]) - 1
             expected = self.expected(self.records if publish else None, errors=errors,
                                      omissions=() if publish else ("live::worker-failure-kafka-minio-v1",))
             self.assertEqual(path.read_text(), json.dumps(expected, indent=2, sort_keys=True) + "\n")
@@ -397,6 +415,7 @@ class RecoveryQualificationTests(unittest.TestCase):
             self.assertEqual([call.args[0] for call in execution.call_args_list], [
                 ["cargo", "test", "--locked", "-p", "fixture-package", "--test", self.target,
                  "--", "--format=pretty", "--color=never", "--test-threads=1"],
+                Q.APPLICATION_LIST_COMMAND,
                 ["cargo", "test", "--locked", "-p", "rockstream-sim", "--features", "simulation,docker_tests",
                  "--test", Q.APPLICATION_TARGET, Q.APPLICATION_CASE, "--", "--exact", "--format=pretty",
                  "--color=never", "--test-threads=1"],
