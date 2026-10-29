@@ -15,12 +15,12 @@ exercises the existing single-payload PgOutput and Wal2Json entry points.
 
 ## Run locally
 
-Use Python 3.11+ and Rust `nightly-2026-02-01` with `cargo-fuzz` 0.13.1:
+Use Python 3.11+ and Rust `nightly-2026-04-17` with `cargo-fuzz` 0.13.1:
 
 ```sh
 cargo install cargo-fuzz --version 0.13.1 --locked
-CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_INCREMENTAL=false cargo +nightly-2026-02-01 fuzz build --dev --target-dir target/fuzz
-RUSTUP_TOOLCHAIN=nightly-2026-02-01 python3 scripts/run-fuzz.py --bin-dir target/fuzz/<host-triple>/debug
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_INCREMENTAL=false cargo +nightly-2026-04-17 fuzz build --dev --target-dir target/fuzz
+RUSTUP_TOOLCHAIN=nightly-2026-04-17 python3 scripts/run-fuzz.py --bin-dir target/fuzz/<host-triple>/debug
 ```
 
 Each target gets 120 engine seconds, a five-second per-input timeout, a 2048 MiB
@@ -72,7 +72,7 @@ rather than the random seed alone, are the authoritative reproducer.
 ## Runner self-test
 
 ```sh
-cargo +nightly-2026-02-01 fuzz build --dev --fuzz-dir scripts/fixtures/fuzz-engine --target-dir target/fuzz-fixtures
+cargo +nightly-2026-04-17 fuzz build --dev --fuzz-dir scripts/fixtures/fuzz-engine --target-dir target/fuzz-fixtures
 python3 scripts/run-fuzz.test.py --bin-dir target/fuzz-fixtures/<host-triple>/debug -q
 ```
 
