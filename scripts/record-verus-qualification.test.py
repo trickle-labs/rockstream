@@ -57,7 +57,7 @@ class MergeTests(unittest.TestCase):
                 "status": "passed", "artifacts": {"Cargo.lock": "digest"},
                 "runtime_artifacts": {binary.name: recorder.sha256(binary)},
                 "steps": [f"{name}\t0\t1\tcommand {name}" for name in ids],
-                "tool_versions": {"rustc": "1.88", "cargo": "1.88", "verus": "pinned"},
+                "tool_versions": {"rustc": "1.95", "cargo": "1.95", "verus": "pinned"},
             }
         return records
 

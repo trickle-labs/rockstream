@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Overlay only the scenario adapter when qualifying an older source revision.
-FROM rust:1.88-slim-bookworm AS builder
+FROM rust:1.95-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y g++ make cmake pkg-config libssl-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
 WORKDIR /usr/src/rockstream
 COPY Cargo.toml Cargo.lock capabilities.toml ./

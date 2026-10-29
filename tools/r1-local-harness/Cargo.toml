@@ -2,7 +2,7 @@
 name = "r1-local-harness"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "Apache-2.0"
 default-run = "r1-local-harness"
 
