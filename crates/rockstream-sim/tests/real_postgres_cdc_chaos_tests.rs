@@ -2,6 +2,7 @@
 #![cfg(feature = "docker_tests")]
 #![recursion_limit = "256"]
 
+#[allow(dead_code)]
 #[path = "common/recovery.rs"]
 mod recovery;
 use recovery::save;
