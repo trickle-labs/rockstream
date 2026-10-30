@@ -3,7 +3,7 @@ use rdkafka::{
     error::KafkaError,
     ClientConfig, Message, Offset, TopicPartitionList,
 };
-use rockstream_connectors::{KafkaSource, SourceRuntimeCoordinator};
+use rockstream_connectors::{SourceConnector, SourceRuntimeCoordinator};
 use rockstream_ops::sink::{materialize_view_state, read_view_output, ColumnValue};
 use rockstream_runtime::exchange::persistence::committed_frontier;
 use rockstream_sim::qualification::worker_failure::WorkerObservation;
@@ -43,10 +43,10 @@ pub fn typed(values: &[ColumnValue]) -> Vec<Value> {
         .collect()
 }
 
-pub async fn observe(
+pub async fn observe<S: SourceConnector>(
     db: &ShardDb,
     worker: &rockstream_runtime::WorkerClientHandle,
-    source: &SourceRuntimeCoordinator<KafkaSource>,
+    source: &SourceRuntimeCoordinator<S>,
 ) -> WorkerObservation {
     let output = read_view_output(db, OperatorId(ID), 2).await.unwrap();
     let weighted_output = json!(output
@@ -81,6 +81,10 @@ pub async fn observe(
 }
 
 pub fn consume(bootstrap: &str) -> Value {
+    consume_topic(bootstrap, "worker-failure-output")
+}
+
+pub fn consume_topic(bootstrap: &str, topic: &str) -> Value {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("group.id", "worker-recovery-oracle")
@@ -91,7 +95,7 @@ pub fn consume(bootstrap: &str) -> Value {
         .unwrap();
     let mut assignment = TopicPartitionList::new();
     assignment
-        .add_partition_offset("worker-failure-output", 0, Offset::Beginning)
+        .add_partition_offset(topic, 0, Offset::Beginning)
         .unwrap();
     consumer.assign(&assignment).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);

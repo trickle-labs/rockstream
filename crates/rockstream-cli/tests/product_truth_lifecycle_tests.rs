@@ -119,7 +119,7 @@ fn wait_for_status(binary: &Path, management_addr: &str, expected_nodes: usize) 
 }
 
 fn allocate_memory_pressure() -> Vec<u8> {
-    let mut memory = vec![0_u8; 128 * 1024 * 1024];
+    let mut memory = vec![0_u8; 512 * 1024 * 1024];
     for page in memory.chunks_mut(4096) {
         page[0] = 1;
     }

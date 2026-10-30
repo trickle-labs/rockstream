@@ -1,0 +1,17 @@
+# Post-ack durability fault matrix (v1)
+
+This matrix distinguishes what the existing crash and commit tests establish from storage failures they do not model. All new fault data stays under a disposable `TempDir`.
+
+| Evidence | Operation and cut point | Checked outcome | Limit |
+| --- | --- | --- | --- |
+| [#109 process recovery](../../crates/rockstream-cli/tests/aggregate_crash_recovery_tests.rs), `test_issue_109_immediate_crash_recovery_without_recreation` | Multi-operation SQL history; immediately kill the gateway after the successful COMMIT response; reopen the same local storage directory in a fresh gateway process. | Exact base rows, aggregate rows, catalog definitions, committed frontier, and idempotency metadata match the expected state without recreating the schema. | Process termination does not model host power loss or device/controller caches. |
+| [#109 flush error](../../crates/rockstream-cli/tests/aggregate_crash_recovery_tests.rs), `test_issue_109_injected_flush_failure_returns_exact_error` | Inject `ShardDb::set_fail_flushes(true)` before COMMIT using the in-memory object store. | COMMIT returns PostgreSQL `XX000`; the storage error is not acknowledged as success. | This is an injected flush error, not an `ENOSPC` or crash-recovery test. |
+| [#109 uncertain write](../../crates/rockstream-cli/tests/aggregate_crash_recovery_tests.rs), `test_issue_109_unacknowledged_writes_unknown_outcome_contract` | Kill the gateway after sending COMMIT for an unacknowledged write. | The prior acknowledged row must survive; the uncertain row may be wholly present or absent. | Does not qualify physical power loss. |
+| [#237 gated commit recovery](../../crates/rockstream-ops/src/group_commit/physical.rs), `unknown_flush_keeps_later_epoch_queued_until_reconciliation` | Pause after storage submission, queue a later epoch, inject a flush error, then allow reconciliation. | Exact retained-operation accounting and frontier state; retry commits the first epoch before the queued second epoch. | The injected `set_fail_flushes` fault is not an OS disk-full event. |
+| #276 bounded ENOSPC adapter, `enospc_withholds_ack_and_recovers_a_complete_epoch` | Commit a known epoch, then keep returning `std::io::Error` with `libc::ENOSPC` from object-store puts while the next durable write is in flight. Restore capacity and retry if the write returned an error. | The durable write cannot return success while ENOSPC is active; after capacity returns, same-process and fresh-process reopen checks compare exact rows, source offset, operation ID, and frontier for the complete later epoch. | The adapter does not exhaust a real filesystem or simulate process/host loss at the fault boundary. |
+
+The new ENOSPC test belongs in the normal `rockstream-storage` integration-test suite. Its bounded adapter avoids runner-wide disk pressure. A local execution took 0.15 seconds after compilation, so it runs in the existing PR `storage-sql` leg; CI retains the test log with the source revision, injected errno, write response at the fault, and complete recovered state. The `post_ack_enospc_v1` line records these values.
+
+## Unqualified failure models
+
+No result here establishes physical power-loss safety, device/controller cache behavior, real filesystem exhaustion at the syscall boundary, or guarantees for remote object-store providers. These remain storage-backend assumptions until exercised with a representative fault model.

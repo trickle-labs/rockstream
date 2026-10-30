@@ -817,6 +817,37 @@ impl SourceConnector for KafkaSource {
                     ),
                 })?;
         }
+        let mut assigned = self.refresh_assignment()?;
+        if assigned.is_empty() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while assigned.is_empty() && tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(self.idle_partition_timeout, self.consumer.recv()).await
+                {
+                    Ok(Ok(_message)) => {}
+                    Err(_) => {}
+                    Ok(Err(error)) => {
+                        self.pending_retryable_broker_ack = Some((epoch, offset.clone()));
+                        return Err(SourceError::CommitOffsetFailed {
+                            epoch,
+                            reason: format!(
+                                "Kafka group assignment poll failed: {error}. Next steps: retry the source checkpoint acknowledgement"
+                            ),
+                        });
+                    }
+                }
+                assigned = self.refresh_assignment()?;
+            }
+            if assigned.is_empty() {
+                self.pending_retryable_broker_ack = Some((epoch, offset.clone()));
+                return Err(SourceError::CommitOffsetFailed {
+                    epoch,
+                    reason: "Kafka consumer has no group assignment for the source checkpoint ACK. Next steps: retry after consumer-group assignment"
+                        .to_string(),
+                });
+            }
+            // The first poll may fetch an older, unacknowledged group position; M3's token is authoritative.
+            self.seek_recovery_offset(&offset, &assigned)?;
+        }
         if let Err(error) = self.consumer.commit(&commit, CommitMode::Sync) {
             self.pending_retryable_broker_ack = Some((epoch, offset));
             return Err(SourceError::CommitOffsetFailed {

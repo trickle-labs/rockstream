@@ -765,6 +765,19 @@ This is one measured recovery sample, not a p99 estimate or qualification of
 other chaos categories; process scheduling, broker/storage I/O, and elapsed time
 remain implementation evidence outside the abstract FizzBee models.
 
+Issue #278 covers the Kafka source-ack gap after an M3 checkpoint is durable.
+When a restarted `KafkaSource` has no group assignment, it polls for assignment
+and seeks assigned partitions to the checkpoint token before committing the
+source ACK; poll errors or the 60-second deadline leave the ACK retryable. The
+versioned Kafka+MinIO process test kills worker 1 after epoch 3 commits but before
+offset 3 is acknowledged, then requires worker 2 to restore and acknowledge offset
+3. Its independent oracle checks the complete weighted relation, sink log and
+cursor, broker offsets, frontier, and worker identities; an offset-4 control must
+fail before another poll. M1–M7 do not model Kafka group assignment or source
+offsets, so this documents the external source boundary without adding an abstract
+invariant or qualifying PostgreSQL CDC (see
+`docs/testing/worker-source-ack-gap-recovery.md`).
+
 Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
 still abstracts epochs, not row contents. The adapter persists the full pending
 envelope and view cursor before Kafka commit, then finalizes progress. Restart
