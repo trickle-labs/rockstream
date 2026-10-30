@@ -747,6 +747,21 @@ after retained-key recovery. The suite also covers concurrent operations,
 successful rotation, legacy mixed generations, and catalog/audit redaction.
 These tests do not claim live KMS or abrupt process-termination qualification.
 
+Issue #276 qualifies the local filesystem object-store durability boundary below
+the M1–M7 coordination state machines. Runtime, migration, and validated-file
+store builders enable `LocalFileSystem::with_fsync(true)`, so successful local
+object writes sync file data and affected parent directories. The bounded
+`dm-log-writes` workflow marks after a successful `ShardDb::flush`, kills the
+writer, and requires fresh-process recovery to match the complete epoch-2 state.
+Its initial no-fsync run recovered epoch 1 after acknowledging epoch 2; the
+fsync-enabled run passed on source `23f102add4f431c6a73d88b44a0cb073984b301b`
+([run](https://github.com/trickle-labs/rockstream/actions/runs/41130677912)).
+This is backend evidence, not a new formal transition. It qualifies only the
+hosted Linux ext4/loop/`dm-log-writes` path; physical power loss, device caches,
+and remote object-store guarantees remain unqualified. Full ACK and recovery
+evidence is in the [versioned fault matrix](docs/testing/post-ack-durability-fault-matrix.md)
+and the workflow artifact.
+
 Issue #126 observes the existing M4 worker-disconnect and lease-reassignment
 path together with M3 Kafka transaction recovery. `ControlService` emits the
 `worker.disconnected` audit event when the worker session ends, before removing
