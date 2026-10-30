@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/post-ack-block-crash.yml
+      - crates/rockstream-storage/src/tiered_store.rs
       - crates/rockstream-storage/tests/enospc_recovery_tests.rs
       - docs/testing/post-ack-durability-fault-matrix.md
       - scripts/replay-dm-log-writes.py
@@ -17,6 +18,8 @@ jobs:
   dm-log-writes:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      ROCKSTREAM_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -33,4 +36,4 @@ jobs:
           name: post-ack-dm-log-writes
           path: .artifacts/post-ack-block-crash/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 90

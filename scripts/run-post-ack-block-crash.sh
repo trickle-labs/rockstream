@@ -59,8 +59,11 @@ sudo mount -o nodiscard "/dev/mapper/$mapper" "$mount_dir"
 mounted=1
 sudo mkdir -p "$mount_dir/shard"
 sudo chown -R "$(id -u):$(id -g)" "$mount_dir/shard"
+source_sha="${ROCKSTREAM_SOURCE_SHA:-$GITHUB_SHA}"
+export ROCKSTREAM_SOURCE_SHA="$source_sha"
 {
-    printf 'source_sha=%s\n' "$GITHUB_SHA"
+    printf 'source_sha=%s\nworkflow_sha=%s\ncheckout_sha=%s\n' \
+        "$source_sha" "$GITHUB_SHA" "$(git rev-parse HEAD)"
     rustc --version
     cargo --version
     uname -a
@@ -71,11 +74,11 @@ sudo chown -R "$(id -u):$(id -g)" "$mount_dir/shard"
     findmnt --noheadings --output FSTYPE,OPTIONS "$mount_dir"
 } >"$evidence_dir/environment.txt" 2>&1
 
-export GITHUB_SHA
 export ROCKSTREAM_POST_ACK_MODE=write
 export ROCKSTREAM_POST_ACK_ROOT="$mount_dir/shard"
 export ROCKSTREAM_POST_ACK_SIGNAL="$ack_file"
-cargo test --locked -p rockstream-storage --test enospc_recovery_tests \
+env -u ROCKSTREAM_OBJECT_STORE_ENDPOINT \
+    cargo test --locked -p rockstream-storage --test enospc_recovery_tests \
     dm_log_writes_replays_the_exact_post_ack_epoch -- --ignored --exact --nocapture \
     >"$writer_log" 2>&1 &
 cargo_pid=$!
@@ -133,10 +136,11 @@ sudo mount -o nodiscard "$loop_cut" "$recovery_mount"
 recovery_mounted=1
 sudo chown -R "$(id -u):$(id -g)" "$recovery_mount/shard"
 ROCKSTREAM_POST_ACK_MODE=recover \
-ROCKSTREAM_POST_ACK_ROOT="$recovery_mount/shard" \
-    cargo test --locked -p rockstream-storage --test enospc_recovery_tests \
+    ROCKSTREAM_POST_ACK_ROOT="$recovery_mount/shard" \
+    env -u ROCKSTREAM_OBJECT_STORE_ENDPOINT \
+        cargo test --locked -p rockstream-storage --test enospc_recovery_tests \
         dm_log_writes_replays_the_exact_post_ack_epoch -- --ignored --exact --nocapture \
         2>&1 | tee "$recovery_log"
 printf 'post_ack_dm_log_writes_result=passed source_sha=%s runtime_seconds=%s\n' \
-    "$GITHUB_SHA" "$((SECONDS - started_seconds))" \
+    "$source_sha" "$((SECONDS - started_seconds))" \
     | tee "$evidence_dir/result.txt"

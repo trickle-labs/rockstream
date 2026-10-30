@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 
 struct EnospcStore {
-    inner: Arc<LocalFileSystem>,
+    inner: Arc<dyn ObjectStore>,
     fail_puts: AtomicBool,
     failures: AtomicUsize,
     fault_path: Mutex<Option<String>>,
@@ -330,7 +330,9 @@ async fn enospc_withholds_ack_and_recovers_a_complete_epoch() {
     );
     let fresh_process_state = std::fs::read_to_string(&result_path).unwrap();
     assert_eq!(fresh_process_state, format!("{expected_epoch_2:?}"));
-    let revision = std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_owned());
+    let revision = std::env::var("ROCKSTREAM_SOURCE_SHA")
+        .or_else(|_| std::env::var("GITHUB_SHA"))
+        .unwrap_or_else(|_| "local".to_owned());
     eprintln!(
         "post_ack_enospc_v1 source_sha={revision} backend=LocalFileSystem fault=object-store-put path={:?} errno={} failures={} ack_at_fault=withheld fault_response={fault_response} ack_after_recovery={ack_after_recovery} before={expected_epoch_1:?} recovered={actual:?} fresh_process_pid={child_pid} fresh_process={fresh_process_state:?}",
         store.fault_path.lock().unwrap(),
@@ -345,7 +347,8 @@ async fn dm_log_writes_replays_the_exact_post_ack_epoch() {
     let root = std::env::var("ROCKSTREAM_POST_ACK_ROOT").unwrap();
     let mode = std::env::var("ROCKSTREAM_POST_ACK_MODE").unwrap();
     let store = Arc::new(EnospcStore {
-        inner: Arc::new(LocalFileSystem::new_with_prefix(root).unwrap()),
+        inner: rockstream_storage::build_runtime_object_store(std::path::Path::new(&root), "shard")
+            .unwrap(),
         fail_puts: AtomicBool::new(false),
         failures: AtomicUsize::new(0),
         fault_path: Mutex::new(None),
@@ -367,7 +370,9 @@ async fn dm_log_writes_replays_the_exact_post_ack_epoch() {
         frontier: Some(2u64.to_be_bytes().to_vec()),
         operation_id: Some(b"epoch-2".to_vec()),
     };
-    let revision = std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_owned());
+    let revision = std::env::var("ROCKSTREAM_SOURCE_SHA")
+        .or_else(|_| std::env::var("GITHUB_SHA"))
+        .unwrap_or_else(|_| "local".to_owned());
 
     if mode == "recover" {
         let recovered = open_shard_for_crash_test(store).await;

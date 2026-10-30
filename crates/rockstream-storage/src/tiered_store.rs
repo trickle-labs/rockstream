@@ -387,9 +387,10 @@ pub fn build_s3_backend_from_config(
 
 /// Build the store used by a real node's shard database.
 ///
-/// Local filesystem storage remains the default.  Setting the complete
-/// `ROCKSTREAM_OBJECT_STORE_*` endpoint contract switches the same node path
-/// to an S3-compatible store (including MinIO) while keeping each shard in a
+/// Local filesystem storage remains the default; local writes fsync data and
+/// parent directories before success. Setting the complete
+/// `ROCKSTREAM_OBJECT_STORE_*` endpoint contract switches the same node path to
+/// an S3-compatible store (including MinIO) while keeping each shard in a
 /// bounded object-key prefix.
 pub fn build_runtime_object_store(
     local_path: &LocalPath,
@@ -399,7 +400,8 @@ pub fn build_runtime_object_store(
         std::fs::create_dir_all(local_path)
             .map_err(|error| format!("failed to create {}: {error}", local_path.display()))?;
         let store = object_store::local::LocalFileSystem::new_with_prefix(local_path)
-            .map_err(|error| format!("failed to open {}: {error}", local_path.display()))?;
+            .map_err(|error| format!("failed to open {}: {error}", local_path.display()))?
+            .with_fsync(true);
         return Ok(Arc::new(store));
     };
 
@@ -445,7 +447,8 @@ pub fn build_migration_object_store(storage_url: &str) -> Result<Arc<dyn ObjectS
             .map_err(|error| format!("failed to create {}: {error}", local_path.display()))?;
         return Ok(Arc::new(
             object_store::local::LocalFileSystem::new_with_prefix(local_path)
-                .map_err(|error| format!("failed to open {}: {error}", local_path.display()))?,
+                .map_err(|error| format!("failed to open {}: {error}", local_path.display()))?
+                .with_fsync(true),
         ));
     }
     if scheme != "s3" {
@@ -500,7 +503,8 @@ pub fn build_storage_backend_from_url(
             std::fs::create_dir_all(path)
                 .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
             let store = object_store::local::LocalFileSystem::new_with_prefix(path)
-                .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+                .map_err(|error| format!("failed to open {}: {error}", path.display()))?
+                .with_fsync(true);
             Ok(Arc::new(store))
         }
         rockstream_types::config::StorageUrl::S3 { bucket, prefix } => {
