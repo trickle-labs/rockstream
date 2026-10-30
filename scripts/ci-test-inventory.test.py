@@ -143,6 +143,31 @@ class GateSelfTests(unittest.TestCase):
         self.assertEqual([t["outcome"] for t in tests], ["limitation", "passed"])
         self.assertEqual(passed, 1)
 
+    def test_post_ack_block_crash_case_is_qualified_outside_package_shard(self):
+        target = {"package": "rockstream-storage", "kind": "test", "name": "enospc_recovery_tests"}
+        case = "dm_log_writes_replays_the_exact_post_ack_epoch"
+        ordinary_case = "enospc_withholds_ack_and_recovers_a_complete_epoch"
+        cid = gate.case_id(**target, case=case)
+        ordinary_cid = gate.case_id(**target, case=ordinary_case)
+        reason = (
+            "Requires Linux root and dm-log-writes device-mapper support; the dedicated "
+            "post-ack-block-crash workflow runs this ignored case and captures source-bound "
+            "recovery evidence, so the ordinary package shard does not execute it."
+        )
+        self.assertEqual(POLICY["known_limitations"][cid], reason)
+        tests, errors, passed = gate.observed_results(
+            target, [case, ordinary_case], [
+                {"type": "test", "name": case, "event": "ignored"},
+                {"type": "test", "name": ordinary_case, "event": "ok"},
+            ], POLICY["known_limitations"],
+        )
+        self.assertEqual((tests, errors, passed), (
+            [
+                {"id": cid, "outcome": "limitation", "reason": reason},
+                {"id": ordinary_cid, "outcome": "passed", "reason": None},
+            ], [], 1,
+        ))
+
     def test_empty_selection_with_only_waiver(self):
         cid = gate.case_id("rockstream-sim", "test", "chaos_tests", "old_case")
         events = [{"type": "test", "name": "old_case", "event": "ignored"}]
