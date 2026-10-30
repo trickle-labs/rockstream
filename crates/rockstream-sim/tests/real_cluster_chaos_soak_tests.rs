@@ -305,9 +305,9 @@ async fn worker_process_fixture() {
                 .report_shard_frontier(ShardId(ID), 99)
                 .await
                 .unwrap_err();
-            assert_eq!(
-                frontier_report_error,
-                "RS-8004: frontier report lacks the current shard lease"
+            assert!(
+                frontier_report_error == "RS-8004: frontier report lacks the current shard lease",
+                "M4-S5: stale frontier report returned {frontier_report_error}"
             );
             let fence_after_report = worker
                 .check_fence_write(ShardId(ID), lease.lease_token)

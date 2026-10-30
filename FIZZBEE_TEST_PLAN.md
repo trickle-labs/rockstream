@@ -156,6 +156,10 @@ Verification targets:
   eventually re-acquires every orphaned shard's lease and resumes committing
   epochs (the [DESIGN.md §11.5](DESIGN.md) recovery-time invariant, modeled as
   eventual progress, not a wall-clock bound).
+- **Frontier-report fencing**: after reassignment, a delayed report from the
+  former worker is rejected; the model records a report token only while it
+  matches the current shard lease. The exact frontier value and RPC response
+  remain covered by the real-process test.
 
 ### 1.2 What Is Explicitly Out of Scope
 
@@ -714,6 +718,14 @@ persistence, lifecycle and audit redaction. Local protocol fixtures do not prove
 AWS authorization enforcement: `real_kms_enforces_key_and_principal_permissions`
 requires scoped live AWS fixtures and remains explicitly ignored and recorded
 as unexecuted in `scripts/ci-test-matrix.json` until those fixtures are supplied.
+
+Issue #279 fences `ReportShardFrontier` by the current worker assignment and
+lease token. M4-S5 records this authorization invariant; the real-process test
+`stale_worker_write_and_frontier_report_are_rejected_after_reassignment`
+checks the delayed former owner's exact `RS-8004` response, confirms its source
+ACK is not attempted, and observes the new owner commit through frontier 5.
+The token-only model does not represent the numeric report value, Kafka group
+behavior, or the wire response; those details remain in the real-cluster evidence.
 
 Issue #202 preserves secret readability across failed or interrupted KEK
 rotation in `crates/rockstream-control`. Rotation excludes secret reads and

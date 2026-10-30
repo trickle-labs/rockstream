@@ -62,6 +62,7 @@ action Init:
 
     # Coverage ghost variables.
     fence_rejection_observed = False
+    frontier_report_rejection_observed = False
     fencing_occurred = False
     crash_occurred = False
     outage_count = 0
@@ -98,6 +99,7 @@ role Shard:
         self.committed_epoch = 0
         # fence_epoch mirrors ControlPlane for write CAS; always durable.
         self.fence_epoch = 0
+        self.frontier_report_token = -1
 
 # Worker: ephemeral process state.
 @state(ephemeral=["isolation_steps", "held_lease_epoch", "can_reach_control", "can_reach_object_store", "status"])
@@ -123,6 +125,7 @@ atomic fair action GrantLease:
 
     w = workers[worker_id]
     cp = controlplane
+    s = shards[shard_id]
 
     require w.status == "active"
     # v0.42.3 fix: a worker the failure detector has already declared dead
@@ -146,6 +149,7 @@ atomic fair action GrantLease:
 
     # Tell worker its new lease epoch for that shard.
     w.held_lease_epoch[shard_id] = cp.fence_epoch[shard_id]
+    s.frontier_report_token = -1
 
 # Worker commits an epoch on a shard (CAS on fence_epoch).
 atomic fair action WorkerCommit:
@@ -170,6 +174,24 @@ atomic fair action WorkerCommit:
     else:
         # CAS rejected — stale write. Worker must back off.
         fence_rejection_observed = True
+
+# A worker report is accepted only while its lease is current.
+atomic fair action WorkerReportFrontier:
+    worker_id = oneof range(NUM_WORKERS)
+    shard_id = oneof range(NUM_SHARDS)
+
+    w = workers[worker_id]
+    cp = controlplane
+    s = shards[shard_id]
+
+    require w.status == "active"
+    require w.held_lease_epoch[shard_id] >= 0
+
+    if (cp.leases[shard_id] == worker_id and
+            w.held_lease_epoch[shard_id] == cp.fence_epoch[shard_id]):
+        s.frontier_report_token = w.held_lease_epoch[shard_id]
+    else:
+        frontier_report_rejection_observed = True
 
 # Worker loses contact with the control plane (network partition).
 atomic action LoseControlContact:
@@ -247,6 +269,7 @@ atomic fair action HeartbeatTick:
         for shard_id in range(NUM_SHARDS):
             if cp.leases[shard_id] == worker_id:
                 cp.leases[shard_id] = -1
+                shards[shard_id].frontier_report_token = -1
 
 # Failure detector marks a worker dead (e.g. missed heartbeats).
 atomic action MarkDead:
@@ -264,6 +287,7 @@ atomic action MarkDead:
     for shard_id in range(NUM_SHARDS):
         if cp.leases[shard_id] == worker_id:
             cp.leases[shard_id] = -1
+            shards[shard_id].frontier_report_token = -1
 
 # Restart a terminated worker (operational reality: the control plane
 # replaces/restarts a dead worker process). Without this, a worker that
@@ -356,6 +380,16 @@ always assertion M4_S4_ObjectStoreOnlyPartitionBlocks:
                 return False
     return True
 
+# M4-S5: a frontier report accepted during the current lease must come from
+# its worker with the current fencing token.
+always assertion M4_S5_CurrentLeaseFrontierReports:
+    for shard_id in range(NUM_SHARDS):
+        s = shards[shard_id]
+        if (s.frontier_report_token >= 0 and
+                s.frontier_report_token != controlplane.fence_epoch[shard_id]):
+            return False
+    return True
+
 # M4-L1: Recovery progress — after a crash/partition, every orphaned shard
 # is eventually re-leased to a live worker.
 always eventually assertion M4_L1_RecoveryProgress:
@@ -377,7 +411,7 @@ eventually always assertion M4_L2_NoPermanentBlock:
             return False
     return True
 
-# COV-M4: Coverage — a partitioned-but-alive worker attempts a commit
-# and is rejected by the fence epoch.
+# COV-M4: Coverage — a superseded worker's commit and frontier report are
+# rejected by their current fencing lease.
 exists assertion COV_M4:
-    return fence_rejection_observed
+    return fence_rejection_observed and frontier_report_rejection_observed
