@@ -1,0 +1,36 @@
+name: Post-ACK block crash qualification
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/post-ack-block-crash.yml
+      - crates/rockstream-storage/tests/enospc_recovery_tests.rs
+      - docs/testing/post-ack-durability-fault-matrix.md
+      - scripts/replay-dm-log-writes.py
+      - scripts/run-post-ack-block-crash.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dm-log-writes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify replay parser self-test
+        run: python3 scripts/replay-dm-log-writes.py --self-test
+      - name: Run bounded post-ACK crash recovery
+        run: bash scripts/run-post-ack-block-crash.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: post-ack-dm-log-writes
+          path: .artifacts/post-ack-block-crash/
+          if-no-files-found: warn
+          retention-days: 14
