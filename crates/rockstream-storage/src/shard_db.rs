@@ -13,12 +13,26 @@ use rockstream_types::compatibility::SupportedStorageFormatRange;
 use rockstream_types::frontier::ShardFrontierReport;
 use rockstream_types::ids::ShardId;
 use rockstream_types::merge_law::{ArrangementHeader, MergeLawId};
+use sha2::{Digest, Sha256};
 use slatedb::config::{CheckpointOptions, CheckpointScope, Settings};
 use slatedb::Db;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ALLOW_LAW_OPERAND_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+fn db_cache_id(path: &str) -> u64 {
+    u64::from_be_bytes(Sha256::digest(path.as_bytes())[..8].try_into().unwrap())
+}
+
+#[cfg(test)]
+mod db_cache_id_tests {
+    #[test]
+    fn db_cache_ids_are_stable_per_database_path() {
+        assert_eq!(super::db_cache_id("shard-a"), 3_139_393_159_774_786_773);
+        assert_eq!(super::db_cache_id("shard-b"), 6_379_895_736_456_045_017);
+    }
+}
 
 /// Max rows (groups) returned by a single shard's partial_query.
 /// Bound: MAX_PARTIAL_AGG_RESULT_ROWS; fill metric: partial_agg_result_rows gauge.
@@ -419,7 +433,7 @@ impl ShardDbBuilder {
         let mut builder = Db::builder(self.path.as_str(), self.object_store.clone())
             .with_settings(self.settings)
             .with_merge_operator(Arc::new(SumCountMergeOperator))
-            .with_db_cache(db_cache);
+            .with_db_cache(db_cache, db_cache_id(&self.path));
 
         if let Some(policies) = self.filter_policies {
             builder = builder.with_filter_policies(policies);

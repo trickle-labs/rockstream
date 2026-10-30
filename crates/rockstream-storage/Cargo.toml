@@ -16,7 +16,8 @@ rockstream-verified = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 slatedb = { workspace = true }
-slatedb-common = "0.16"
+slatedb-common = "0.17"
+sha2 = { workspace = true }
 moka = { version = "0.12.15", features = ["future"] }
 object_store = { workspace = true }
 thiserror = { workspace = true }
@@ -39,7 +40,6 @@ testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 object_store = { workspace = true }
 reqwest = { workspace = true }
-sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
