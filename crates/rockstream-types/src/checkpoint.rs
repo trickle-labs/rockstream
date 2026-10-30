@@ -263,12 +263,18 @@ impl AlignmentCreditTracker {
     /// Release one credit after a shard confirmation is received.
     pub fn release(&self) {
         // Saturating to 0 to guard against double-release bugs.
-        let prev = self
-            .credits_used
-            .try_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
-        let _ = prev; // fetch_update always returns Ok when closure is Some
+        let mut current = self.credits_used.load(Ordering::Relaxed);
+        loop {
+            match self.credits_used.compare_exchange_weak(
+                current,
+                current.saturating_sub(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Returns `true` if any credits remain available.
