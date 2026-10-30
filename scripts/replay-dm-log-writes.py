@@ -40,9 +40,10 @@ def replay(log_path: Path, image_path: Path, end_mark: str) -> str:
             sector, number, flags, data_len = ENTRY.unpack_from(block)
             entries += 1
             if flags & MARK:
-                mark = block[ENTRY.size :].split(b"\0", 1)[0].decode("utf-8")
                 if not data_len or data_len > sector_size - ENTRY.size:
                     raise ValueError(f"invalid mark length: {data_len}")
+                mark_data = block[ENTRY.size : ENTRY.size + data_len]
+                mark = mark_data.decode("utf-8")
                 if mark == end_mark:
                     image.flush()
                     os.fsync(image.fileno())
@@ -83,10 +84,9 @@ def self_test() -> str:
 
     def mark_entry(mark: bytes) -> bytes:
         return (
-            ENTRY.pack(0, 0, MARK, len(mark) + 1)
+            ENTRY.pack(0, 0, MARK, len(mark))
             + mark
-            + b"\0"
-            + bytes(sector_size - ENTRY.size - len(mark) - 1)
+            + bytes(sector_size - ENTRY.size - len(mark))
         )
 
     after_mark = ENTRY.pack(2, 1, 0, 0) + bytes(sector_size - ENTRY.size) + b"B" * sector_size
