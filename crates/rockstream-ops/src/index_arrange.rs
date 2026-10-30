@@ -173,7 +173,7 @@ impl IndexArrangeOp {
                 self.row_count.fetch_sub(1, Ordering::Relaxed);
                 let _ = self
                     .state_bytes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                         Some(b.saturating_sub(len))
                     });
             }

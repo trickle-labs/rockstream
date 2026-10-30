@@ -57,7 +57,7 @@ impl Drop for CopyState {
     fn drop(&mut self) {
         let unflushed = self.buf_rows.len() as u64;
         if unflushed != 0 {
-            let _ = COPY_IN_BUFFER_ROWS.fetch_update(
+            let _ = COPY_IN_BUFFER_ROWS.try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |current| Some(current.saturating_sub(unflushed)),

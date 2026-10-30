@@ -134,7 +134,7 @@ impl SpillGovernor {
     pub fn flush_spill_write_buffer(&self, bytes: u64) {
         let sub = self
             .current_write_buffer_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(bytes))
             })
             .unwrap_or(0);
