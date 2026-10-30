@@ -281,7 +281,7 @@ async fn worker_process_fixture() {
     let bootstrap = std::env::var("ROCKSTREAM_RECOVERY_KAFKA").unwrap();
     let stale_owner_mode = std::env::var_os("ROCKSTREAM_RECOVERY_STALE_OWNER").is_some();
     let ack_gap = std::env::var_os("ROCKSTREAM_RECOVERY_ACK_GAP").is_some();
-    let sink_cursor_gap = std::env::var_os("ROCKSTREAM_TEST_SINK_CURSOR_GAP_ROOT").is_some();
+    let sink_cursor_gap = std::env::var_os("ROCKSTREAM_RECOVERY_SINK_CURSOR_GAP").is_some();
     let ack_gap_manifest: Value = serde_json::from_str(ACK_GAP_MANIFEST).unwrap();
     let sink_cursor_gap_manifest: Value = serde_json::from_str(SINK_CURSOR_GAP_MANIFEST).unwrap();
     let (source_topic, sink_topic, source_group) = if ack_gap {
@@ -535,6 +535,7 @@ async fn worker_process_fixture() {
             );
         }
         if id == 1 && epoch == 3 && !sink_cursor_gap {
+            assert!(sink.stage_next().await.unwrap());
             save(
                 &root.join("staged.json"),
                 &observe(&db, &worker, &source).await,
@@ -1106,6 +1107,7 @@ async fn sink_transaction_cursor_gap_recovers_exactly_once() {
             .stderr(Stdio::from(log));
         if id == 1 {
             command
+                .env("ROCKSTREAM_RECOVERY_SINK_CURSOR_GAP", "1")
                 .env("ROCKSTREAM_TEST_SINK_CURSOR_GAP_ROOT", root.path())
                 .env(
                     "ROCKSTREAM_TEST_SINK_CURSOR_GAP_EPOCH",
@@ -1116,6 +1118,7 @@ async fn sink_transaction_cursor_gap_recovers_exactly_once() {
                 );
         } else {
             command
+                .env_remove("ROCKSTREAM_RECOVERY_SINK_CURSOR_GAP")
                 .env_remove("ROCKSTREAM_TEST_SINK_CURSOR_GAP_ROOT")
                 .env_remove("ROCKSTREAM_TEST_SINK_CURSOR_GAP_EPOCH");
         }

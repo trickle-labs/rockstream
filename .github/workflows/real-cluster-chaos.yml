@@ -81,6 +81,6 @@ jobs:
       - name: Append chaos summary to job summary
         if: always()
         run: |
-          cat target/real-cluster-chaos/recovery-*/real-cluster-chaos-summary.md >> "$GITHUB_STEP_SUMMARY"
+          for summary in target/real-cluster-chaos/recovery-*/real-cluster-chaos-summary.md; do if [ -f "$summary" ]; then cat "$summary" >> "$GITHUB_STEP_SUMMARY"; fi; done
           if [ -f target/real-cluster-chaos/stale-owner/stale-owner-summary.md ]; then cat target/real-cluster-chaos/stale-owner/stale-owner-summary.md >> "$GITHUB_STEP_SUMMARY"; fi
           for summary in target/real-cluster-chaos/sink-cursor-gap-*/sink-cursor-gap-summary.md; do if [ -f "$summary" ]; then cat "$summary" >> "$GITHUB_STEP_SUMMARY"; fi; done
