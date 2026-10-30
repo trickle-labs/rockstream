@@ -27,45 +27,63 @@ use rockstream_types::{
 };
 
 #[derive(Debug)]
-struct FailOnNthPutStore {
+struct FaultInjectingStore {
     inner: Arc<dyn ObjectStore>,
-    fail_at: usize,
-    attempts: AtomicUsize,
+    fail_put_at: Option<usize>,
+    fail_get_path: Option<Path>,
+    put_attempts: AtomicUsize,
 }
 
-impl FailOnNthPutStore {
-    fn new(inner: Arc<dyn ObjectStore>, fail_at: usize) -> Self {
+impl FaultInjectingStore {
+    fn fail_nth_put(inner: Arc<dyn ObjectStore>, fail_at: usize) -> Self {
         Self {
             inner,
-            fail_at,
-            attempts: AtomicUsize::new(0),
+            fail_put_at: Some(fail_at),
+            fail_get_path: None,
+            put_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn fail_get_path(inner: Arc<dyn ObjectStore>, path: Path) -> Self {
+        Self {
+            inner,
+            fail_put_at: None,
+            fail_get_path: Some(path),
+            put_attempts: AtomicUsize::new(0),
         }
     }
 
     fn put_error() -> object_store::Error {
         object_store::Error::Generic {
-            store: "FailOnNthPutStore",
+            store: "FaultInjectingStore",
             source: std::io::Error::other("injected remote PUT failure").into(),
+        }
+    }
+
+    fn get_error() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "FaultInjectingStore",
+            source: std::io::Error::other("injected remote GET failure").into(),
         }
     }
 }
 
-impl Display for FailOnNthPutStore {
+impl Display for FaultInjectingStore {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "FailOnNthPutStore")
+        write!(formatter, "FaultInjectingStore")
     }
 }
 
 #[async_trait::async_trait]
-impl ObjectStore for FailOnNthPutStore {
+impl ObjectStore for FaultInjectingStore {
     async fn put_opts(
         &self,
         location: &Path,
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-        if attempt == self.fail_at {
+        let attempt = self.put_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if Some(attempt) == self.fail_put_at {
             return Err(Self::put_error());
         }
         self.inner.put_opts(location, payload, options).await
@@ -84,6 +102,9 @@ impl ObjectStore for FailOnNthPutStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if self.fail_get_path.as_ref() == Some(location) {
+            return Err(Self::get_error());
+        }
         self.inner.get_opts(location, options).await
     }
 
@@ -300,6 +321,7 @@ async fn restore_and_assert(
     });
     assert_eq!(observed_state, expected_state);
     serde_json::json!({
+        "restore_outcome": restored,
         "active_generation": active_generation,
         "expected_state": expected_state,
         "observed_state": observed_state,
@@ -764,7 +786,7 @@ async fn minio_tc_failed_export_put_has_no_success_and_retry_restores_exact_stat
     let source_before = object_inventory(&source).await;
     let target_before = object_inventory(&target).await;
     let generation = "minio-put-failure";
-    let injected = Arc::new(FailOnNthPutStore::new(export.clone(), 2));
+    let injected = Arc::new(FaultInjectingStore::fail_nth_put(export.clone(), 2));
     let faulting_destination: Arc<dyn ObjectStore> = injected.clone();
     let service = CheckpointExportService::new();
     let error = service
@@ -779,10 +801,10 @@ async fn minio_tc_failed_export_put_has_no_success_and_retry_restores_exact_stat
         .unwrap_err();
     let expected = format!(
         "RS-3614: checkpoint export object-store operation failed: {}; next_steps: verify source and destination access, then retry the same generation",
-        FailOnNthPutStore::put_error()
+        FaultInjectingStore::put_error()
     );
     assert_eq!(error.to_string(), expected);
-    assert_eq!(injected.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(injected.put_attempts.load(Ordering::SeqCst), 2);
 
     let source_after_failure = object_inventory(&source).await;
     let export_after_failure = object_inventory(&export).await;
@@ -850,10 +872,87 @@ async fn minio_tc_failed_export_put_has_no_success_and_retry_restores_exact_stat
             "export_inventory_after_retry": object_inventory(&export).await,
             "source_inventory_after_retry": object_inventory(&source).await,
             "restored_state": restored_state,
-            "source_inventory_after_retry": object_inventory(&source).await,
-            "export_inventory_after_retry": object_inventory(&export).await,
             "target_inventory_after_retry": object_inventory(&target).await,
             "terminal_success_marker_present_after_retry": true,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn minio_tc_failed_restore_get_leaves_target_unchanged_and_retry_restores_exact_state() {
+    let Some((_container, source, export, target)) = minio_stores("get-failure").await else {
+        return;
+    };
+    let checkpoint = seed_checkpoint(source.clone(), 16).await;
+    let source_inventory = object_inventory(&source).await;
+    let generation = "minio-get-failure";
+    let service = CheckpointExportService::new();
+    let export_outcome = service
+        .export_latest_prefix(
+            source.clone(),
+            export.clone(),
+            &CheckpointManifestStore::new(source.clone()),
+            generation,
+            &Path::from(""),
+        )
+        .await
+        .unwrap();
+    let export_records = export_inventory_records(&export, generation).await;
+    let failed_path = Path::from(
+        export_records
+            .first()
+            .expect("checkpoint export must contain an object")["record"]["destination"]
+            .as_str()
+            .unwrap(),
+    );
+    let target_before_failure = object_inventory(&target).await;
+    let faulting_export: Arc<dyn ObjectStore> = Arc::new(FaultInjectingStore::fail_get_path(
+        export.clone(),
+        failed_path.clone(),
+    ));
+    let error = service
+        .restore_generation(faulting_export, target.clone(), generation)
+        .await
+        .unwrap_err();
+    let expected = format!(
+        "RS-3614: checkpoint export object-store operation failed: {}; next_steps: verify source and destination access, then retry the same generation",
+        FaultInjectingStore::get_error()
+    );
+    assert_eq!(error.to_string(), expected);
+    let target_after_failure = object_inventory(&target).await;
+    assert_eq!(target_after_failure, target_before_failure);
+
+    let restored_state = restore_and_assert(
+        export.clone(),
+        target.clone(),
+        generation,
+        checkpoint.clone(),
+    )
+    .await;
+    write_export_evidence(
+        "checkpoint-export-minio-get-failure.json",
+        serde_json::json!({
+            "source_sha": source_revision(),
+            "minio_image": "codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+            "source_bucket": "rs-dr-source-get-failure",
+            "export_bucket": "rs-dr-export-get-failure",
+            "target_bucket": "rs-dr-target-get-failure",
+            "checkpoint": checkpoint,
+            "generation": generation,
+            "export_outcome": export_outcome,
+            "source_inventory": source_inventory,
+            "export_inventory_records": export_records,
+            "fault": {
+                "operation": "destination ObjectStore GET during object validation",
+                "path": failed_path.to_string(),
+                "error": error.to_string(),
+            },
+            "target_inventory_before_failure": target_before_failure,
+            "target_inventory_after_failure": target_after_failure,
+            "target_unchanged_after_failure": true,
+            "restored_state_after_retry": restored_state,
+            "export_inventory_after_retry": object_inventory(&export).await,
+            "target_inventory_after_retry": object_inventory(&target).await,
         }),
     );
 }
@@ -949,8 +1048,6 @@ async fn minio_tc_interrupted_export_has_no_success_and_retry_restores_exact_sta
             "export_inventory_after_retry": object_inventory(&export).await,
             "source_inventory_after_retry": object_inventory(&source).await,
             "restored_state": restored_state,
-            "source_inventory_after_retry": object_inventory(&source).await,
-            "export_inventory_after_retry": object_inventory(&export).await,
             "target_inventory_after_retry": object_inventory(&target).await,
             "terminal_success_marker_present_after_retry": true,
         }),
