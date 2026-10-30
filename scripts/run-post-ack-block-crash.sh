@@ -78,6 +78,7 @@ export ROCKSTREAM_POST_ACK_MODE=write
 export ROCKSTREAM_POST_ACK_ROOT="$mount_dir/shard"
 export ROCKSTREAM_POST_ACK_SIGNAL="$ack_file"
 env -u ROCKSTREAM_OBJECT_STORE_ENDPOINT \
+    CARGO_TERM_COLOR=never \
     cargo test --locked -p rockstream-storage --test enospc_recovery_tests \
     dm_log_writes_replays_the_exact_post_ack_epoch -- --ignored --exact --nocapture \
     >"$writer_log" 2>&1 &
@@ -102,6 +103,10 @@ printf '%s\n' "$ack"
 expected_state='EpochState { row_1: Some([49, 48, 58, 50, 48, 48]), row_2: None, row_3: Some([51, 48, 58, 55, 53]), source_offset: Some([49, 53]), frontier: Some([0, 0, 0, 0, 0, 0, 0, 2]), operation_id: Some([101, 112, 111, 99, 104, 45, 50]) }'
 ack_state="$(printf '%s\n' "$ack" | python3 -c 'import sys; print(sys.stdin.read().split(" state=", 1)[1])')"
 test "$ack_state" = "$expected_state"
+test_binary="$(sed -n 's/^ *Running tests\/enospc_recovery_tests.rs (\(.*\))$/\1/p' "$writer_log")"
+test -x "$test_binary"
+printf 'test_binary=%s\n' "$test_binary" >>"$evidence_dir/environment.txt"
+sha256sum "$test_binary" >"$evidence_dir/test-binary.sha256"
 test_pid="$(printf '%s\n' "$ack" | python3 -c 'import re,sys; print(re.search(r"\bpid=(\d+)\b", sys.stdin.read()).group(1))')"
 sudo dmsetup message "$mapper" 0 mark post_ack
 kill -KILL "$test_pid"
@@ -138,6 +143,7 @@ sudo chown -R "$(id -u):$(id -g)" "$recovery_mount/shard"
 ROCKSTREAM_POST_ACK_MODE=recover \
     ROCKSTREAM_POST_ACK_ROOT="$recovery_mount/shard" \
     env -u ROCKSTREAM_OBJECT_STORE_ENDPOINT \
+        CARGO_TERM_COLOR=never \
         cargo test --locked -p rockstream-storage --test enospc_recovery_tests \
         dm_log_writes_replays_the_exact_post_ack_epoch -- --ignored --exact --nocapture \
         2>&1 | tee "$recovery_log"
