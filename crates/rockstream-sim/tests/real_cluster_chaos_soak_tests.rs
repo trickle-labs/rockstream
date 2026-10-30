@@ -81,7 +81,7 @@ fn committed_group_offset(bootstrap: &str, group: &str, topic: &str) -> i64 {
     }
 }
 
-fn consume_topic(bootstrap: &str, topic: &str) -> Value {
+fn consume_stale_owner_topic(bootstrap: &str, topic: &str) -> Value {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("group.id", "worker-stale-owner-oracle")
@@ -1412,7 +1412,7 @@ async fn stale_worker_write_and_frontier_report_are_rejected_after_reassignment(
     let expected_query_rows: Vec<String> =
         serde_json::from_value(manifest["expected_query_rows"].clone()).unwrap();
     assert_eq!(query_rows, expected_query_rows);
-    let sink_records = consume_topic(&bootstrap, sink_topic);
+    let sink_records = consume_stale_owner_topic(&bootstrap, sink_topic);
     assert_eq!(sink_records, manifest["expected_sink"]);
 
     let revision = std::env::var("ROCKSTREAM_QUALIFICATION_REVISION")

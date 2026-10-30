@@ -11,7 +11,7 @@
     "crates/rockstream-control/src/frontier.rs": "70ae82f046c37cb144c21feee8ede62bc12297c800d56aed45ed783d3f59693c",
     "crates/rockstream-control/src/service.rs": "ccd479c06f34f5d971ae5ac2416043325fcd9dace6b6a18eedeeadfb28a11a62",
     "crates/rockstream-runtime/src/client.rs": "10de9f361583e822d07e9684ca30a68303d5fc33be7b3682dbb73501316855a8",
-    "crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs": "25b8b52ecd2b5bf5a5f8044194ad4ab2136758c5a89e9984d2155d764a012319",
+    "crates/rockstream-sim/tests/real_cluster_chaos_soak_tests.rs": "1effe6678541c83be06620df279eeb7506dc0ccb463e5cdcc71f2d085dd73511",
     "docs/testing/worker-stale-owner-kafka-minio-v1.json": "cae21e7ea37f4100d33294030ee11ce58d524ae959881b20bb7826a5a78708eb",
     "crates/rockstream-ops/src/join.rs": "b2ac80b2c3ff15414ee4fe85d2ed352b5ab363ae2d7bab9b8bbdd21db4bb6b48",
     "crates/rockstream-oracle/src/join_oracle.rs": "c517f2f44c86f4a4e1b07ebbaf38970b45fdb5a7ab4b4bf53f7460675fa5bc1c"
