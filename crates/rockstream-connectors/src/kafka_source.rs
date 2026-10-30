@@ -794,6 +794,29 @@ impl SourceConnector for KafkaSource {
             self.last_committed = Some((epoch, offset));
             return Ok(());
         }
+        let mut commit = TopicPartitionList::new();
+        for (partition, next_offset) in offsets {
+            let partition =
+                i32::try_from(partition).map_err(|_| SourceError::CommitOffsetFailed {
+                    epoch,
+                    reason: "Kafka partition exceeds i32. Next steps: commit a valid source token"
+                        .to_string(),
+                })?;
+            let next_offset =
+                i64::try_from(next_offset).map_err(|_| SourceError::CommitOffsetFailed {
+                    epoch,
+                    reason: "Kafka offset exceeds i64. Next steps: commit a valid source token"
+                        .to_string(),
+                })?;
+            commit
+                .add_partition_offset(&self.topic, partition, Offset::Offset(next_offset))
+                .map_err(|error| SourceError::CommitOffsetFailed {
+                    epoch,
+                    reason: format!(
+                        "Kafka commit setup failed: {error}. Next steps: retry after rebalance"
+                    ),
+                })?;
+        }
         let mut assigned = self.refresh_assignment()?;
         if assigned.is_empty() {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -824,29 +847,6 @@ impl SourceConnector for KafkaSource {
             }
             // The first poll may fetch an older, unacknowledged group position; M3's token is authoritative.
             self.seek_recovery_offset(&offset, &assigned)?;
-        }
-        let mut commit = TopicPartitionList::new();
-        for (partition, next_offset) in offsets {
-            let partition =
-                i32::try_from(partition).map_err(|_| SourceError::CommitOffsetFailed {
-                    epoch,
-                    reason: "Kafka partition exceeds i32. Next steps: commit a valid source token"
-                        .to_string(),
-                })?;
-            let next_offset =
-                i64::try_from(next_offset).map_err(|_| SourceError::CommitOffsetFailed {
-                    epoch,
-                    reason: "Kafka offset exceeds i64. Next steps: commit a valid source token"
-                        .to_string(),
-                })?;
-            commit
-                .add_partition_offset(&self.topic, partition, Offset::Offset(next_offset))
-                .map_err(|error| SourceError::CommitOffsetFailed {
-                    epoch,
-                    reason: format!(
-                        "Kafka commit setup failed: {error}. Next steps: retry after rebalance"
-                    ),
-                })?;
         }
         if let Err(error) = self.consumer.commit(&commit, CommitMode::Sync) {
             self.pending_retryable_broker_ack = Some((epoch, offset));
