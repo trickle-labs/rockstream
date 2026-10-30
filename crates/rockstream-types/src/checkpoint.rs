@@ -265,7 +265,7 @@ impl AlignmentCreditTracker {
         // Saturating to 0 to guard against double-release bugs.
         let prev = self
             .credits_used
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             });
         let _ = prev; // fetch_update always returns Ok when closure is Some
