@@ -1931,12 +1931,18 @@ where
                 }
                 ControlMessage::OperationFailed { code, message, .. } => {
                     if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
-                        let _ = waiter.send(Err(format!("{code}: {message}")));
+                        // Preserve the registered error code supplied by the control plane.
+                        let error = format!("{code}: {message}");
+                        let _ = waiter.send(Err(error));
                     }
                 }
                 ControlMessage::NotLeader { current_leader } => {
                     if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
-                        let _ = waiter.send(Err(format!("not leader: {current_leader:?}")));
+                        let error = format!(
+                            "{}: not leader: {current_leader:?}",
+                            rockstream_types::error_code::RS_1731
+                        );
+                        let _ = waiter.send(Err(error));
                     }
                 }
                 ControlMessage::SecretTokenIssued { token } => {
