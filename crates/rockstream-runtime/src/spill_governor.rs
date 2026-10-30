@@ -131,10 +131,12 @@ impl SpillGovernor {
     ///
     /// Releases bytes from the memory ledger and buffer counter, and advances
     /// the disk occupancy counter.
+    // The pinned fuzz toolchain predates AtomicU64::try_update stabilization.
+    #[allow(deprecated)]
     pub fn flush_spill_write_buffer(&self, bytes: u64) {
         let sub = self
             .current_write_buffer_bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(bytes))
             })
             .unwrap_or(0);

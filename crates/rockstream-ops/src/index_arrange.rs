@@ -133,6 +133,8 @@ impl IndexArrangeOp {
     /// - Weight == 0: no-op.
     ///
     /// NEVER performs range deletion.
+    // The pinned fuzz toolchain predates AtomicU64::try_update stabilization.
+    #[allow(deprecated)]
     pub async fn apply_delta(&self, delta: &ArrowZSet) -> Result<(), OpError> {
         let mut batch = WriteBatch::new();
         let num_rows = delta.data.num_rows();
@@ -173,7 +175,7 @@ impl IndexArrangeOp {
                 self.row_count.fetch_sub(1, Ordering::Relaxed);
                 let _ = self
                     .state_bytes
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                         Some(b.saturating_sub(len))
                     });
             }
