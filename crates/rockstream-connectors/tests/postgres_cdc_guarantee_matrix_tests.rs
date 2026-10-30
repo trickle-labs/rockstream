@@ -83,6 +83,7 @@ async fn postgres_cdc_snapshot_stream_fence_has_exact_transcript() {
         ConnectorId(5_251),
         schema(),
         config(&fixture, "snapshot_fence"),
+        false,
     )
     .await
     .unwrap();
@@ -327,6 +328,7 @@ async fn postgres_cdc_initial_snapshot_backfills_all_rows() {
         ConnectorId(5_255),
         schema(),
         config(&fixture, "initial_snapshot_backfill"),
+        false,
     )
     .await
     .unwrap();

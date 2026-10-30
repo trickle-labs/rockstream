@@ -124,22 +124,25 @@ struct PgAckBoundarySource {
     schema: arrow::datatypes::SchemaRef,
     pg_config: PgOutputConfig,
     connected: bool,
+    has_checkpoint: bool,
     root: PathBuf,
     worker_id: u64,
     unsafe_future_ack: bool,
 }
 
 impl PgAckBoundarySource {
-    async fn connect_pgoutput(&mut self) -> Result<(), SourceError> {
+    async fn connect_pgoutput(&mut self, has_checkpoint: bool) -> Result<(), SourceError> {
         if !self.connected {
             self.inner = PostgresCdcSource::connect_pgoutput(
                 self.connector_id,
                 self.schema.clone(),
                 self.pg_config.clone(),
+                self.has_checkpoint || has_checkpoint,
             )
             .await?;
             self.connected = true;
         }
+        self.has_checkpoint |= has_checkpoint;
         Ok(())
     }
 }
@@ -154,7 +157,7 @@ impl SourceConnector for PgAckBoundarySource {
         &mut self,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotDeltaFence, SourceError> {
-        self.connect_pgoutput().await?;
+        self.connect_pgoutput(self.has_checkpoint).await?;
         self.inner
             .capture_snapshot_delta_fence(partition_filter)
             .await
@@ -166,7 +169,7 @@ impl SourceConnector for PgAckBoundarySource {
         after: Option<OffsetToken>,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
-        self.connect_pgoutput().await?;
+        self.connect_pgoutput(self.has_checkpoint).await?;
         self.inner
             .start_snapshot(fence, after, partition_filter)
             .await
@@ -179,7 +182,7 @@ impl SourceConnector for PgAckBoundarySource {
         partition_filter: Option<PartitionFilter>,
         max_rows: usize,
     ) -> Result<SnapshotStream, SourceError> {
-        self.connect_pgoutput().await?;
+        self.connect_pgoutput(self.has_checkpoint).await?;
         self.inner
             .start_snapshot_bounded(fence, after, partition_filter, max_rows)
             .await
@@ -192,14 +195,18 @@ impl SourceConnector for PgAckBoundarySource {
         credits_available: usize,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
-        self.connect_pgoutput().await?;
+        self.connect_pgoutput(
+            self.has_checkpoint || PgLsn::from_offset_token(&after)? != PgLsn::ZERO,
+        )
+        .await?;
         self.inner
             .poll_delta(after, max_bytes, credits_available, partition_filter)
             .await
     }
 
     async fn commit_offset(&mut self, epoch: u64, offset: OffsetToken) -> Result<(), SourceError> {
-        self.connect_pgoutput().await?;
+        self.connect_pgoutput(self.has_checkpoint || epoch > 0)
+            .await?;
         let checkpoint_lsn = PgLsn::from_offset_token(&offset)?.to_string();
         if self.worker_id == 1 && epoch == FAULT_EPOCH {
             save(
@@ -321,6 +328,12 @@ async fn postgres_cdc_worker_process_fixture() {
     let source =
         PostgresCdcSource::configured_pgoutput(ConnectorId(ID), schema.clone(), pg_config.clone())
             .unwrap();
+    let checkpoint_store = SourceCheckpointStore::new(db.clone(), ID as u128, ConnectorId(ID));
+    let has_checkpoint = checkpoint_store
+        .highest_committed()
+        .await
+        .unwrap()
+        .is_some();
     let mut source = SourceRuntimeCoordinator::new(
         PgAckBoundarySource {
             inner: source,
@@ -328,13 +341,14 @@ async fn postgres_cdc_worker_process_fixture() {
             schema: schema.clone(),
             pg_config: pg_config.clone(),
             connected: false,
+            has_checkpoint,
             root: root.clone(),
             worker_id: id,
             unsafe_future_ack,
         },
         ConnectorId(ID),
         PgLsn::ZERO.to_offset_token(),
-        SourceCheckpointStore::new(db.clone(), ID as u128, ConnectorId(ID)),
+        checkpoint_store,
     );
     source.recover().await.unwrap();
     let owner = source.acquire_owner(format!("worker-{id}")).unwrap();

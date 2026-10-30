@@ -359,6 +359,7 @@ async fn postgres_cdc_matches_source() {
             publication: "orders_pub".to_string(),
             table: "orders".to_string(),
         },
+        false,
     )
     .await
     .expect("connect pgoutput");
