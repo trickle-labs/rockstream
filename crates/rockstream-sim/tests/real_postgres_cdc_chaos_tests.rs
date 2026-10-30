@@ -120,9 +120,28 @@ struct PostgresCdcEvidence {
 
 struct PgAckBoundarySource {
     inner: PostgresCdcSource,
+    connector_id: ConnectorId,
+    schema: arrow::datatypes::SchemaRef,
+    pg_config: PgOutputConfig,
+    connected: bool,
     root: PathBuf,
     worker_id: u64,
     unsafe_future_ack: bool,
+}
+
+impl PgAckBoundarySource {
+    async fn connect_pgoutput(&mut self) -> Result<(), SourceError> {
+        if !self.connected {
+            self.inner = PostgresCdcSource::connect_pgoutput(
+                self.connector_id,
+                self.schema.clone(),
+                self.pg_config.clone(),
+            )
+            .await?;
+            self.connected = true;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -135,6 +154,7 @@ impl SourceConnector for PgAckBoundarySource {
         &mut self,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotDeltaFence, SourceError> {
+        self.connect_pgoutput().await?;
         self.inner
             .capture_snapshot_delta_fence(partition_filter)
             .await
@@ -146,6 +166,7 @@ impl SourceConnector for PgAckBoundarySource {
         after: Option<OffsetToken>,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
+        self.connect_pgoutput().await?;
         self.inner
             .start_snapshot(fence, after, partition_filter)
             .await
@@ -158,6 +179,7 @@ impl SourceConnector for PgAckBoundarySource {
         partition_filter: Option<PartitionFilter>,
         max_rows: usize,
     ) -> Result<SnapshotStream, SourceError> {
+        self.connect_pgoutput().await?;
         self.inner
             .start_snapshot_bounded(fence, after, partition_filter, max_rows)
             .await
@@ -170,15 +192,14 @@ impl SourceConnector for PgAckBoundarySource {
         credits_available: usize,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
-        self.inner
-            .open_pgoutput(PgLsn::from_offset_token(&after)? != PgLsn::ZERO)
-            .await?;
+        self.connect_pgoutput().await?;
         self.inner
             .poll_delta(after, max_bytes, credits_available, partition_filter)
             .await
     }
 
     async fn commit_offset(&mut self, epoch: u64, offset: OffsetToken) -> Result<(), SourceError> {
+        self.connect_pgoutput().await?;
         let checkpoint_lsn = PgLsn::from_offset_token(&offset)?.to_string();
         if self.worker_id == 1 && epoch == FAULT_EPOCH {
             save(
@@ -195,7 +216,6 @@ impl SourceConnector for PgAckBoundarySource {
                 let target = wait_for_child_json(&self.root.join("unsafe-slot-lsn.json")).await;
                 let target_lsn = target["lsn"].as_str().unwrap();
                 let target_offset = PgLsn::parse(target_lsn)?.to_offset_token();
-                self.inner.open_pgoutput(true).await?;
                 self.inner.commit_offset(epoch, target_offset).await?;
                 let confirmed_flush_lsn = self.inner.confirmed_flush_lsn().await?;
                 save(
@@ -215,7 +235,6 @@ impl SourceConnector for PgAckBoundarySource {
             std::future::pending::<()>().await;
         }
         if self.worker_id == 2 && epoch == FAULT_EPOCH {
-            self.inner.open_pgoutput(true).await?;
             self.inner.commit_offset(epoch, offset).await?;
             let confirmed_flush_lsn = self.inner.confirmed_flush_lsn().await?;
             save(
@@ -232,12 +251,13 @@ impl SourceConnector for PgAckBoundarySource {
             wait_for_child_file(&self.root.join("continue-recovered-ack")).await;
             return Ok(());
         }
-        self.inner.open_pgoutput(epoch > 0).await?;
         self.inner.commit_offset(epoch, offset).await
     }
 
     async fn pause(&mut self, reason: String) -> Result<(), SourceError> {
-        self.inner.pause(reason).await
+        self.inner.pause(reason).await?;
+        self.connected = false;
+        Ok(())
     }
 
     async fn resume(&mut self) -> Result<(), SourceError> {
@@ -304,6 +324,10 @@ async fn postgres_cdc_worker_process_fixture() {
     let mut source = SourceRuntimeCoordinator::new(
         PgAckBoundarySource {
             inner: source,
+            connector_id: ConnectorId(ID),
+            schema: schema.clone(),
+            pg_config: pg_config.clone(),
+            connected: false,
             root: root.clone(),
             worker_id: id,
             unsafe_future_ack,
