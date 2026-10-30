@@ -2,6 +2,7 @@
 """Replay dm-log-writes v1 entries through a named durable-write mark."""
 
 import argparse
+import os
 import struct
 import tempfile
 from pathlib import Path
@@ -44,6 +45,7 @@ def replay(log_path: Path, image_path: Path, end_mark: str) -> str:
                     raise ValueError(f"invalid mark length: {data_len}")
                 if mark == end_mark:
                     image.flush()
+                    os.fsync(image.fileno())
                     return (
                         f"replayed_entries={entries} writes={writes} "
                         f"sectors={sectors} end_mark={mark}"
