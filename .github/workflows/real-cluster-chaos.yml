@@ -1,4 +1,4 @@
-# Real Kafka and MinIO worker and source-ACK recovery; no p99 claim.
+# Real Kafka and MinIO worker, source-ACK, and sink-cursor recovery; no p99 claim.
 
 name: Real Cluster Chaos Soak
 
@@ -31,6 +31,8 @@ on:
       - "docs/testing/worker-stale-owner-kafka-minio-v1.json"
       - "docs/testing/worker-source-ack-gap-kafka-minio-v1.json"
       - "docs/testing/worker-source-ack-gap-recovery.md"
+      - "docs/testing/worker-sink-cursor-gap-kafka-minio-v1.json"
+      - "docs/testing/worker-failure-recovery.md"
       - "scripts/release-qualification*"
       - "scripts/run-release-qualification.sh"
       - ".github/workflows/real-cluster-chaos.yml"
@@ -67,6 +69,8 @@ jobs:
         run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests stale_worker_write_and_frontier_report_are_rejected_after_reassignment -- --exact --test-threads=1
       - name: Prove real-process source acknowledgment gap recovery
         run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests source_ack_gap_recovery_from_kafka_and_minio -- --exact
+      - name: Prove real-process Kafka sink commit and MinIO cursor gap recovery
+        run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests sink_transaction_cursor_gap_recovers_exactly_once -- --exact
       - name: Upload real-cluster chaos artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -79,3 +83,4 @@ jobs:
         run: |
           cat target/real-cluster-chaos/recovery-*/real-cluster-chaos-summary.md >> "$GITHUB_STEP_SUMMARY"
           if [ -f target/real-cluster-chaos/stale-owner/stale-owner-summary.md ]; then cat target/real-cluster-chaos/stale-owner/stale-owner-summary.md >> "$GITHUB_STEP_SUMMARY"; fi
+          for summary in target/real-cluster-chaos/sink-cursor-gap-*/sink-cursor-gap-summary.md; do if [ -f "$summary" ]; then cat "$summary" >> "$GITHUB_STEP_SUMMARY"; fi; done

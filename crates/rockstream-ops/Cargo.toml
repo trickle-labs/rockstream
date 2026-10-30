@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Operator trait and per-operator implementations for RockStream"
 
+[features]
+test-hooks = []
+
 [[bench]]
 name = "minmax_bench"
 harness = false

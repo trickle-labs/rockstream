@@ -174,10 +174,52 @@ impl KafkaViewSink {
                 .commit(epoch, progress.pending.as_ref().unwrap())
                 .await?;
         }
+        #[cfg(feature = "test-hooks")]
+        {
+            let committed_epoch = progress
+                .transaction
+                .checked_sub(1)
+                .ok_or_else(|| io("invalid Kafka view transaction cursor"))?;
+            pause_after_commit_for_test(committed_epoch).await?;
+        }
         progress.pending = None;
         self.persist(&progress).await?;
         Ok(true)
     }
+}
+
+#[cfg(feature = "test-hooks")]
+async fn pause_after_commit_for_test(epoch: u64) -> Result<(), SinkError> {
+    let Some(root) = std::env::var_os("ROCKSTREAM_TEST_SINK_CURSOR_GAP_ROOT") else {
+        return Ok(());
+    };
+    let selected_epoch = std::env::var("ROCKSTREAM_TEST_SINK_CURSOR_GAP_EPOCH")
+        .map_err(io)?
+        .parse::<u64>()
+        .map_err(io)?;
+    if epoch != selected_epoch {
+        return Ok(());
+    }
+    let root = std::path::PathBuf::from(root);
+    std::fs::create_dir_all(&root).map_err(io)?;
+    let committed_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io)?
+        .as_millis() as u64;
+    let ready =
+        json!({"epoch":epoch,"process_id":std::process::id(),"committed_at_ms":committed_at_ms});
+    let marker = root.join("sink-transaction-committed.json");
+    let temporary = root.join("sink-transaction-committed.json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec(&ready).map_err(io)?).map_err(io)?;
+    std::fs::rename(temporary, marker).map_err(io)?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+    while !root.join("release-sink-cursor").exists() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io("sink cursor gap test hook timed out"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Ok(())
 }
 
 fn io(error: impl std::fmt::Display) -> SinkError {

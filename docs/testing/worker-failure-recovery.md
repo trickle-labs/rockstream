@@ -55,6 +55,16 @@ before the Kafka source acknowledgment. Together, the two scenarios cover the
 source acknowledgment and pending sink transaction boundaries for Kafka to
 Kafka recovery; they do not qualify PostgreSQL CDC or other connector types.
 
+The separately versioned `worker-sink-cursor-gap-kafka-minio-v1` scenario
+targets the later sink boundary: it kills worker 1 after Kafka transaction 2
+commits but before the MinIO-backed `KafkaViewSink` cursor clears its pending
+state. Worker 2 recovers and must produce the exact five-record sink stream,
+source offsets, weighted view, materialized relation, and query rows. Its
+one-shard forced replacement does not claim network partition or consumer-group
+rebalance coverage. The test writes a distinct artifact directory with fault,
+before/after observations, worker logs, versions, replay seed, and SHA-256
+digests.
+
 For qualification, run:
 
 ```sh

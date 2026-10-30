@@ -112,6 +112,8 @@ fn consume_stale_owner_topic(bootstrap: &str, topic: &str) -> Value {
 }
 const ACK_GAP_MANIFEST: &str =
     include_str!("../../../docs/testing/worker-source-ack-gap-kafka-minio-v1.json");
+const SINK_CURSOR_GAP_MANIFEST: &str =
+    include_str!("../../../docs/testing/worker-sink-cursor-gap-kafka-minio-v1.json");
 
 struct AckBoundarySource {
     inner: KafkaSource,
@@ -279,7 +281,9 @@ async fn worker_process_fixture() {
     let bootstrap = std::env::var("ROCKSTREAM_RECOVERY_KAFKA").unwrap();
     let stale_owner_mode = std::env::var_os("ROCKSTREAM_RECOVERY_STALE_OWNER").is_some();
     let ack_gap = std::env::var_os("ROCKSTREAM_RECOVERY_ACK_GAP").is_some();
+    let sink_cursor_gap = std::env::var_os("ROCKSTREAM_TEST_SINK_CURSOR_GAP_ROOT").is_some();
     let ack_gap_manifest: Value = serde_json::from_str(ACK_GAP_MANIFEST).unwrap();
+    let sink_cursor_gap_manifest: Value = serde_json::from_str(SINK_CURSOR_GAP_MANIFEST).unwrap();
     let (source_topic, sink_topic, source_group) = if ack_gap {
         (
             std::env::var("ROCKSTREAM_ACK_GAP_SOURCE_TOPIC")
@@ -530,14 +534,27 @@ async fn worker_process_fixture() {
                 epoch
             );
         }
-        if id == 1 && epoch == 3 {
-            assert!(sink.stage_next().await.unwrap());
+        if id == 1 && epoch == 3 && !sink_cursor_gap {
             save(
                 &root.join("staged.json"),
                 &observe(&db, &worker, &source).await,
             );
             // Keep the production transaction active until the parent kills us.
             std::future::pending::<()>().await;
+        }
+        if sink_cursor_gap
+            && id == 1
+            && epoch
+                == sink_cursor_gap_manifest["fault_after_source_epoch"]
+                    .as_u64()
+                    .unwrap()
+        {
+            save(
+                &root.join("sink-cursor-gap-before.json"),
+                &observe(&db, &worker, &source).await,
+            );
+            assert!(sink.deliver_next().await.unwrap());
+            panic!("sink cursor gap hook did not hold the worker");
         }
         assert!(sink.deliver_next().await.unwrap());
     }
@@ -963,6 +980,363 @@ async fn source_ack_gap_recovery_from_kafka_and_minio() {
         validate_source_ack_gap(&mutant, &manifest),
         Err(AckGapFailure::SourceAcknowledgement)
     );
+}
+
+async fn read_minio_view(port: u16, bucket: &str) -> (u64, Vec<String>, Value) {
+    let store = Arc::new(object_store::prefix::PrefixStore::new(
+        minio_object_store(port, bucket),
+        "shards/126",
+    ));
+    let reader = Arc::new(ShardReader::open("db", store).await.unwrap());
+    let frontier = reader
+        .get(&ShardKeyEncoder::frontier_key())
+        .await
+        .unwrap()
+        .unwrap();
+    let frontier = u64::from_be_bytes(frontier.as_ref().try_into().unwrap());
+    let sink_progress = reader.get(b"\x06kafka-view/126").await.unwrap().unwrap();
+    let sink_progress = serde_json::from_slice(&sink_progress).unwrap();
+    let rows = HotOnlyViewReader {
+        shard_reader: reader,
+        frontier_epoch: Some(frontier),
+    }
+    .read_view("letters", None, ViewReadStrategy::HotOnly)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| String::from_utf8(row).unwrap())
+    .collect();
+    (frontier, rows, sink_progress)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sink_transaction_cursor_gap_recovers_exactly_once() {
+    let info = Command::new("docker")
+        .arg("info")
+        .output()
+        .expect("Docker required");
+    assert!(info.status.success(), "Docker required");
+    let artifact_root = std::env::var_os("ROCKSTREAM_CHAOS_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/real-cluster-chaos")
+        });
+    fs::create_dir_all(&artifact_root).unwrap();
+    let manifest: Value = serde_json::from_str(SINK_CURSOR_GAP_MANIFEST).unwrap();
+    let suffix = now_ms().to_string();
+    let source_topic = format!("{}-{suffix}", manifest["source_topic"].as_str().unwrap());
+    let sink_topic = format!("{}-{suffix}", manifest["sink_topic"].as_str().unwrap());
+    let source_group = format!("{}-{suffix}", manifest["source_group"].as_str().unwrap());
+    let bucket = format!("worker-sink-cursor-gap-{suffix}");
+    let broker = apache::Kafka::default()
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .start()
+        .await
+        .unwrap();
+    let bootstrap = format!(
+        "127.0.0.1:{}",
+        broker.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
+    );
+    let (_minio, port) = start_minio(&bucket).await.expect("MinIO required");
+    let admin: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    for topic in [&source_topic, &sink_topic] {
+        assert_eq!(
+            admin
+                .create_topics(
+                    &[NewTopic::new(topic.as_str(), 1, TopicReplication::Fixed(1))],
+                    &AdminOptions::new()
+                )
+                .await
+                .unwrap(),
+            vec![Ok(topic.to_string())]
+        );
+    }
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    for row in manifest["history"].as_array().unwrap() {
+        producer
+            .send(
+                FutureRecord::to(&source_topic)
+                    .key("")
+                    .payload(&row.to_string()),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+    }
+    let root = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(root.path().join("audit.jsonl")).unwrap());
+    let manager = ShardManager::new();
+    let control = ControlService::new(TopologyCatalog::new())
+        .with_shard_manager(manager.clone())
+        .with_audit(audit.clone())
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
+    let artifact_dir = artifact_root.join(format!("sink-cursor-gap-{suffix}"));
+    fs::create_dir_all(&artifact_dir).unwrap();
+    let mut workers = Workers(Vec::new());
+    for id in [1, 2] {
+        let log = fs::File::create(artifact_dir.join(format!("worker-{id}.log"))).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["worker_process_fixture", "--exact", "--nocapture"])
+            .env("ROCKSTREAM_RECOVERY_WORKER_ROOT", root.path())
+            .env("ROCKSTREAM_RECOVERY_WORKER_ID", id.to_string())
+            .env("ROCKSTREAM_RECOVERY_CONTROL", control.addr.to_string())
+            .env("ROCKSTREAM_RECOVERY_KAFKA", &bootstrap)
+            .env("ROCKSTREAM_RECOVERY_SOURCE_TOPIC", &source_topic)
+            .env("ROCKSTREAM_RECOVERY_SINK_TOPIC", &sink_topic)
+            .env("ROCKSTREAM_RECOVERY_SOURCE_GROUP", &source_group)
+            .env(
+                "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
+                format!("http://127.0.0.1:{port}"),
+            )
+            .env("ROCKSTREAM_OBJECT_STORE_BUCKET", &bucket)
+            .env("ROCKSTREAM_OBJECT_STORE_REGION", "us-east-1")
+            .env("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY", MINIO_USER)
+            .env("ROCKSTREAM_OBJECT_STORE_SECRET_KEY", MINIO_PASS)
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
+        if id == 1 {
+            command
+                .env("ROCKSTREAM_TEST_SINK_CURSOR_GAP_ROOT", root.path())
+                .env(
+                    "ROCKSTREAM_TEST_SINK_CURSOR_GAP_EPOCH",
+                    manifest["fault_sink_transaction_epoch"]
+                        .as_u64()
+                        .unwrap()
+                        .to_string(),
+                );
+        } else {
+            command
+                .env_remove("ROCKSTREAM_TEST_SINK_CURSOR_GAP_ROOT")
+                .env_remove("ROCKSTREAM_TEST_SINK_CURSOR_GAP_EPOCH");
+        }
+        workers.0.push(command.spawn().unwrap());
+    }
+    let fault_boundary = wait_for_json(
+        &root.path().join("sink-transaction-committed.json"),
+        &mut workers.0[0],
+    )
+    .await;
+    let before = read_observation(
+        &root.path().join("sink-cursor-gap-before.json"),
+        &mut workers.0[0],
+    )
+    .await;
+    let fault_at_ms = fault_boundary["committed_at_ms"].as_u64().unwrap();
+    let fault_group_offset = kafka_committed_offset(&bootstrap, &source_group, &source_topic);
+    let sink_records_at_fault = consume_topic(&bootstrap, &sink_topic);
+    let (fault_query_frontier, fault_query_rows, fault_sink_progress) =
+        read_minio_view(port, &bucket).await;
+    let expected_fault_query_rows: Vec<String> = manifest["query_rows_at_fault"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        fault_boundary["epoch"],
+        manifest["fault_sink_transaction_epoch"]
+    );
+    assert_eq!(fault_boundary["process_id"], before.process_id);
+    assert_eq!(before.lease.worker_id.0, 1);
+    assert_eq!(before.source_epoch, manifest["fault_after_source_epoch"]);
+    assert_eq!(
+        before.source_offsets,
+        std::collections::BTreeMap::from([(0, 3)])
+    );
+    assert_eq!(before.view_frontier, manifest["frontier_at_fault"]);
+    assert_eq!(
+        before.weighted_output,
+        json!(&manifest["expected_weighted_output"].as_array().unwrap()[..3])
+    );
+    assert_eq!(before.relation, manifest["relation_at_fault"]);
+    assert_eq!(fault_sink_progress["view"], manifest["view_id"]);
+    assert_eq!(fault_sink_progress["columns"], 2);
+    assert_eq!(fault_sink_progress["topic"], sink_topic);
+    assert_eq!(fault_sink_progress["snapshot_complete"], true);
+    assert_eq!(
+        fault_sink_progress["transaction"],
+        manifest["sink_cursor_at_fault"]["transaction"]
+    );
+    assert_eq!(
+        fault_sink_progress["view_epoch"],
+        manifest["sink_cursor_at_fault"]["view_epoch"]
+    );
+    assert!(!fault_sink_progress["pending"].is_null());
+    assert_eq!(fault_group_offset, manifest["source_offset_at_fault"]);
+    assert_eq!(fault_query_frontier, manifest["frontier_at_fault"]);
+    assert_eq!(fault_query_rows, expected_fault_query_rows);
+    assert_eq!(sink_records_at_fault, manifest["sink_records_at_fault"]);
+
+    let kill_started = Instant::now();
+    workers.0[0].kill().unwrap();
+    workers.0[0].wait().unwrap();
+    let worker_kill_ms = kill_started.elapsed().as_millis() as u64;
+    let after = read_observation(&root.path().join("recovered.json"), &mut workers.0[1]).await;
+    let group_offset_after_recovery =
+        kafka_committed_offset(&bootstrap, &source_group, &source_topic);
+    let sink_records_after_recovery = consume_topic(&bootstrap, &sink_topic);
+    let (query_frontier, query_rows, recovered_sink_progress) =
+        read_minio_view(port, &bucket).await;
+    let expected_query_rows: Vec<String> = manifest["query_rows_after_recovery"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row.as_str().unwrap().to_owned())
+        .collect();
+    let query_at_ms = now_ms();
+    let lease_event: Value =
+        serde_json::from_slice(&fs::read(root.path().join("worker-2-lease.json")).unwrap())
+            .unwrap();
+    let detection = audit
+        .read_all()
+        .unwrap()
+        .into_iter()
+        .find(|event| event.action == "worker.disconnected")
+        .expect("control must detect killed worker");
+    let detection_ms = detection.timestamp_ms.saturating_sub(fault_at_ms);
+    let ownership_ms = lease_event["at_ms"]
+        .as_u64()
+        .unwrap()
+        .saturating_sub(fault_at_ms);
+    let query_ms = query_at_ms.saturating_sub(fault_at_ms);
+    assert_eq!(after.lease.worker_id.0, 2);
+    assert!(after.lease.lease_token.0 > before.lease.lease_token.0);
+    assert_ne!(after.process_id, before.process_id);
+    assert_eq!(after.source_epoch, manifest["required_frontier"]);
+    assert_eq!(
+        after.source_offsets,
+        std::collections::BTreeMap::from([(0, 5)])
+    );
+    assert_eq!(after.view_frontier, manifest["required_frontier"]);
+    assert_eq!(after.weighted_output, manifest["expected_weighted_output"]);
+    assert_eq!(after.relation, manifest["expected_relation"]);
+    assert_eq!(query_frontier, manifest["required_frontier"]);
+    assert_eq!(query_rows, expected_query_rows);
+    assert_eq!(
+        group_offset_after_recovery,
+        manifest["source_offset_after_recovery"]
+    );
+    assert_eq!(
+        sink_records_after_recovery, manifest["expected_sink"],
+        "P1-SINK-CURSOR-GAP: recovered Kafka sink output mismatch"
+    );
+    assert_eq!(
+        after.sink_progress,
+        json!({"view":126,"columns":2,"topic":sink_topic,"snapshot_complete":true,"view_epoch":5,"transaction":5,"pending":null})
+    );
+    assert_eq!(recovered_sink_progress, after.sink_progress);
+    for (name, elapsed) in [
+        ("detection", detection_ms),
+        ("ownership", ownership_ms),
+        ("query", query_ms),
+    ] {
+        assert!(
+            elapsed <= manifest["limits_ms"][name].as_u64().unwrap(),
+            "{name} deadline: {elapsed} ms"
+        );
+    }
+    let revision = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let evidence = json!({
+        "scenario_id":manifest["scenario_id"],
+        "manifest_sha256":format!("{:x}", Sha256::digest(SINK_CURSOR_GAP_MANIFEST)),
+        "revision":String::from_utf8(revision.stdout).unwrap().trim(),
+        "kafka_image":"apache/kafka:3.8.0",
+        "minio_image":"codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+        "source_type":"KafkaSource",
+        "sink_type":"KafkaViewSink with transactional KafkaSink",
+        "source_topic":source_topic,
+        "sink_topic":sink_topic,
+        "source_group":source_group,
+        "bucket":bucket,
+        "run_id":suffix,
+        "replay_seed":manifest["replay_seed"],
+        "fault_at_ms":fault_at_ms,
+        "fault_boundary":fault_boundary,
+        "detection":detection,
+        "lease_event":lease_event,
+        "before":before,
+        "after":after,
+        "worker_kill_ms":worker_kill_ms,
+        "fault_group_offset":fault_group_offset,
+        "group_offset_after_recovery":group_offset_after_recovery,
+        "sink_records_at_fault":sink_records_at_fault,
+        "sink_records_after_recovery":sink_records_after_recovery,
+        "fault_query_frontier":fault_query_frontier,
+        "fault_query_rows":fault_query_rows,
+        "fault_sink_progress":fault_sink_progress,
+        "query_frontier":query_frontier,
+        "query_rows":query_rows,
+        "recovered_sink_progress":recovered_sink_progress,
+        "query_at_ms":query_at_ms,
+        "elapsed_ms":{"detection":detection_ms,"ownership":ownership_ms,"query":query_ms},
+        "oracle":{"history":manifest["history"],"expected_weighted_output":manifest["expected_weighted_output"],"expected_relation":manifest["expected_relation"],"expected_sink":manifest["expected_sink"]},
+        "scope":manifest["scope"]
+    });
+    save(&artifact_dir.join("evidence.json"), &evidence);
+    save(&artifact_dir.join("fault-boundary.json"), &fault_boundary);
+    save(
+        &artifact_dir.join("fault-sink-cursor.json"),
+        &fault_sink_progress,
+    );
+    save(&artifact_dir.join("before-fault.json"), &before);
+    save(&artifact_dir.join("after-recovery.json"), &after);
+    let evidence_sha256 = format!(
+        "{:x}",
+        Sha256::digest(fs::read(artifact_dir.join("evidence.json")).unwrap())
+    );
+    let worker_log_sha256 = [1, 2].map(|id| {
+        let path = artifact_dir.join(format!("worker-{id}.log"));
+        (
+            path.file_name().unwrap().to_string_lossy().to_string(),
+            format!("{:x}", Sha256::digest(fs::read(path).unwrap())),
+        )
+    });
+    let fault_artifact_sha256 = ["fault-boundary.json", "fault-sink-cursor.json"].map(|name| {
+        (
+            name,
+            format!(
+                "{:x}",
+                Sha256::digest(fs::read(artifact_dir.join(name)).unwrap())
+            ),
+        )
+    });
+    save(
+        &artifact_dir.join("artifact-digests.json"),
+        &json!({"evidence_sha256":evidence_sha256,"fault_artifact_sha256":fault_artifact_sha256,"worker_log_sha256":worker_log_sha256}),
+    );
+    fs::write(
+        artifact_dir.join("sink-cursor-gap-summary.md"),
+        format!(
+            "# Sink cursor gap recovery: {}\n\nRevision: `{}`; manifest SHA-256: `{}`; replay seed: {}.\n\nFault: Kafka transaction epoch {} committed before the MinIO cursor cleared its pending state. Replacement ownership and first correct query: {} ms.\n\nSource group offset: {} at fault, {} after recovery. Final frontier: {}; sink records match the independent oracle.\n\nKafka: `apache/kafka:3.8.0`; MinIO: `codemowers/minio:RELEASE.2025-09-07T16-13-09Z`. Scope: {}.\n\nComplete observations: `evidence.json`. Worker logs and fault-boundary records are SHA-256 indexed in `artifact-digests.json`.\n",
+            manifest["scenario_id"],
+            evidence["revision"].as_str().unwrap(),
+            evidence["manifest_sha256"].as_str().unwrap(),
+            manifest["replay_seed"],
+            manifest["fault_sink_transaction_epoch"],
+            query_ms,
+            fault_group_offset,
+            group_offset_after_recovery,
+            query_frontier,
+            manifest["scope"]
+        ),
+    )
+    .unwrap();
+    drop(workers);
+    control.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

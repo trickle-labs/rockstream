@@ -783,7 +783,10 @@ still abstracts epochs, not row contents. The adapter persists the full pending
 envelope and view cursor before Kafka commit, then finalizes progress. Restart
 fences the old producer and resolves the pending transaction through the existing
 CheckBeforeCommit protocol. A snapshot is one atomic envelope before any live
-epoch; all envelopes use partition zero. No new FizzBee invariant is asserted.
+epoch; all envelopes use partition zero. The real-process
+`worker-sink-cursor-gap-kafka-minio-v1` scenario additionally kills a worker
+after Kafka transaction 2 commits but before the MinIO-backed sink cursor is
+finalized. No new FizzBee invariant is asserted.
 `view_snapshot_changes_and_recovery_match_exact_consumer_stream` compiles the
 production view, consumes real Kafka records, and compares independently specified
 rows, signed weights, keys, and transaction boundaries. LFS reopen covers crashes
