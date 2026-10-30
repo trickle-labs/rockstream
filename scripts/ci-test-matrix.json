@@ -106,6 +106,7 @@
     "nightly-docker": [
       "checkpoint_recovery",
       "real_cluster_chaos_soak_tests",
+      "real_postgres_cdc_chaos_tests",
       "recovery_slo_tests",
       "resource_leak_soak_real_binary_tests",
       "shard_migration_tc_tests",
@@ -288,6 +289,15 @@
       ]
     },
     "rockstream-sim/test:real_cluster_chaos_soak_tests": {
+      "features": [
+        "simulation",
+        "docker_tests"
+      ],
+      "services": [
+        "docker"
+      ]
+    },
+    "rockstream-sim/test:real_postgres_cdc_chaos_tests": {
       "features": [
         "simulation",
         "docker_tests"
