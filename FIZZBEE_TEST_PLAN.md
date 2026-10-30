@@ -787,6 +787,13 @@ epoch; all envelopes use partition zero. The real-process
 `worker-sink-cursor-gap-kafka-minio-v1` scenario additionally kills a worker
 after Kafka transaction 2 commits but before the MinIO-backed sink cursor is
 finalized. No new FizzBee invariant is asserted.
+The `worker-state-enospc-kafka-minio-v1` scenario separately fills a bounded
+MinIO data tmpfs to OS ENOSPC before source checkpoint preparation, requires a
+failed worker WAL write, checks that the Kafka group offset and committed state
+stay at the previous epoch, then restores capacity and validates exact replay
+in a replacement worker. The durability future may remain pending while the
+backend is full. It is an external storage-failure test and adds no abstract
+FizzBee transition.
 `view_snapshot_changes_and_recovery_match_exact_consumer_stream` compiles the
 production view, consumes real Kafka records, and compares independently specified
 rows, signed weights, keys, and transaction boundaries. LFS reopen covers crashes

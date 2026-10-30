@@ -65,6 +65,19 @@ rebalance coverage. The test writes a distinct artifact directory with fault,
 before/after observations, worker logs, versions, replay seed, and SHA-256
 digests.
 
+The separately versioned `worker-state-enospc-kafka-minio-v1` scenario fills an
+isolated 64 MiB MinIO `/data` tmpfs until the OS reports ENOSPC while worker 1
+holds a two-record Kafka epoch before `SourceCheckpointStore::prepare`. It
+requires MinIO to reject the worker WAL write and checks that the source group
+offset, committed view, frontier, Kafka sink stream, and durable sink cursor
+remain at the prior epoch. The storage future may remain pending while the
+backend is full; the test kills worker 1, restores capacity, then requires
+worker 2 to replay to the complete independent Kafka and MinIO oracle.
+Artifacts retain the ENOSPC output, `df` state, outcome or pending-write proof,
+both worker logs, MinIO logs, versions, and digests. This qualifies the tested
+MinIO-backed persistence path only; it is not a local filesystem worker test,
+PostgreSQL CDC test, or host power-loss test.
+
 For qualification, run:
 
 ```sh

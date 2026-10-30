@@ -1,5 +1,6 @@
 //! #126: one real worker loss, with independently checked view and Kafka output.
 #![cfg(feature = "docker_tests")]
+#![recursion_limit = "256"]
 
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -30,7 +31,9 @@ use rockstream_sim::qualification::worker_failure::{
     MANIFEST,
 };
 use rockstream_storage::{keys::ShardKeyEncoder, ShardReader, WriteBatch};
-use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS, MINIO_USER};
+use rockstream_test_support::minio::{
+    create_minio_bucket, minio_object_store, start_minio, MINIO_PASS, MINIO_USER,
+};
 use rockstream_types::{
     arrow_batch::split_weight_column,
     connector::PartitionFilter,
@@ -114,6 +117,201 @@ const ACK_GAP_MANIFEST: &str =
     include_str!("../../../docs/testing/worker-source-ack-gap-kafka-minio-v1.json");
 const SINK_CURSOR_GAP_MANIFEST: &str =
     include_str!("../../../docs/testing/worker-sink-cursor-gap-kafka-minio-v1.json");
+const ENOSPC_MANIFEST: &str =
+    include_str!("../../../docs/testing/worker-state-enospc-kafka-minio-v1.json");
+const ENOSPC_MINIO_IMAGE: &str = "codemowers/minio:RELEASE.2025-09-07T16-13-09Z";
+const ENOSPC_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
+
+struct BoundedMinio {
+    id: String,
+    port: u16,
+    log_path: PathBuf,
+}
+
+impl Drop for BoundedMinio {
+    fn drop(&mut self) {
+        if let Ok(logs) = Command::new("docker")
+            .args(["logs", self.id.as_str()])
+            .output()
+        {
+            let _ = fs::write(
+                &self.log_path,
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&logs.stdout),
+                    String::from_utf8_lossy(&logs.stderr)
+                ),
+            );
+        }
+        let _ = Command::new("docker")
+            .args(["rm", "--force", self.id.as_str()])
+            .output();
+    }
+}
+
+async fn start_bounded_minio(bucket: &str, run_id: &str, log_path: &Path) -> BoundedMinio {
+    let name = format!("rockstream-enospc-minio-{run_id}");
+    let tmpfs = format!("/data:rw,size={ENOSPC_TMPFS_BYTES},mode=0777");
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--detach",
+            "--rm",
+            "--name",
+            name.as_str(),
+            "--publish",
+            "127.0.0.1::9000",
+            "--tmpfs",
+            tmpfs.as_str(),
+            "--env",
+            "MINIO_ROOT_USER=minioadmin",
+            "--env",
+            "MINIO_ROOT_PASSWORD=minioadmin",
+            ENOSPC_MINIO_IMAGE,
+            "server",
+            "/data",
+        ])
+        .output()
+        .expect("start bounded MinIO container");
+    assert!(
+        output.status.success(),
+        "start bounded MinIO: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let id = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    let mut container = BoundedMinio {
+        id,
+        port: 0,
+        log_path: log_path.to_path_buf(),
+    };
+    let port_output = Command::new("docker")
+        .args(["port", container.id.as_str(), "9000/tcp"])
+        .output()
+        .expect("read bounded MinIO port");
+    assert!(
+        port_output.status.success(),
+        "read bounded MinIO port: {}",
+        String::from_utf8_lossy(&port_output.stderr)
+    );
+    container.port = String::from_utf8(port_output.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let client = reqwest::Client::new();
+    let ready_url = format!("http://127.0.0.1:{}/minio/health/ready", container.port);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if client
+            .get(&ready_url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bounded MinIO readiness deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    create_minio_bucket(container.port, bucket).await;
+    container
+}
+
+fn docker_exec(container_id: &str, command: &[&str]) -> std::process::Output {
+    let mut args = vec!["exec", container_id];
+    args.extend_from_slice(command);
+    Command::new("docker")
+        .args(args)
+        .output()
+        .expect("run bounded MinIO container command")
+}
+
+fn minio_data_available_kib(df: &str) -> u64 {
+    df.lines()
+        .last()
+        .unwrap()
+        .split_whitespace()
+        .nth(3)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+fn fill_minio_data_tmpfs(container_id: &str) -> Value {
+    let fill = docker_exec(
+        container_id,
+        &[
+            "sh",
+            "-c",
+            "dd if=/dev/zero of=/data/.rockstream-enospc-pressure bs=1M",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&fill.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&fill.stderr).into_owned();
+    assert!(
+        !fill.status.success() && stderr.contains("No space left on device"),
+        "bounded MinIO tmpfs did not produce ENOSPC: status={:?}, stderr={stderr}",
+        fill.status.code()
+    );
+    let df = docker_exec(container_id, &["df", "-Pk", "/data"]);
+    assert!(df.status.success(), "df /data failed");
+    let df = String::from_utf8_lossy(&df.stdout).into_owned();
+    assert_eq!(
+        minio_data_available_kib(&df),
+        0,
+        "MinIO data tmpfs has space"
+    );
+    json!({
+        "path":"/data/.rockstream-enospc-pressure",
+        "tmpfs_bytes":ENOSPC_TMPFS_BYTES,
+        "fill_exit_code":fill.status.code(),
+        "fill_stdout":stdout,
+        "fill_stderr":stderr,
+        "df_full":df
+    })
+}
+
+fn restore_minio_data_tmpfs(container_id: &str) -> Value {
+    let remove = docker_exec(
+        container_id,
+        &["rm", "-f", "/data/.rockstream-enospc-pressure"],
+    );
+    assert!(
+        remove.status.success(),
+        "remove MinIO tmpfs pressure file: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let df = docker_exec(container_id, &["df", "-Pk", "/data"]);
+    assert!(df.status.success(), "df /data after recovery failed");
+    let df = String::from_utf8_lossy(&df.stdout).into_owned();
+    let available_kib = minio_data_available_kib(&df);
+    assert!(
+        available_kib > 8 * 1024,
+        "MinIO capacity was not restored: {df}"
+    );
+    json!({"available_kib":available_kib,"df_after_restore":df})
+}
+
+fn bounded_minio_logs(container_id: &str) -> String {
+    let output = Command::new("docker")
+        .args(["logs", container_id])
+        .output()
+        .expect("read bounded MinIO logs");
+    assert!(output.status.success(), "read MinIO logs failed");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
 
 struct AckBoundarySource {
     inner: KafkaSource,
@@ -282,8 +480,10 @@ async fn worker_process_fixture() {
     let stale_owner_mode = std::env::var_os("ROCKSTREAM_RECOVERY_STALE_OWNER").is_some();
     let ack_gap = std::env::var_os("ROCKSTREAM_RECOVERY_ACK_GAP").is_some();
     let sink_cursor_gap = std::env::var_os("ROCKSTREAM_RECOVERY_SINK_CURSOR_GAP").is_some();
+    let enospc_mode = std::env::var_os("ROCKSTREAM_RECOVERY_ENOSPC").is_some();
     let ack_gap_manifest: Value = serde_json::from_str(ACK_GAP_MANIFEST).unwrap();
     let sink_cursor_gap_manifest: Value = serde_json::from_str(SINK_CURSOR_GAP_MANIFEST).unwrap();
+    let enospc_manifest: Value = serde_json::from_str(ENOSPC_MANIFEST).unwrap();
     let (source_topic, sink_topic, source_group) = if ack_gap {
         (
             std::env::var("ROCKSTREAM_ACK_GAP_SOURCE_TOPIC")
@@ -319,6 +519,8 @@ async fn worker_process_fixture() {
             assert!(Instant::now() < deadline, "recipient request deadline");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        worker.request_shard(ShardId(ID)).await.unwrap();
+    } else if enospc_mode && id == 2 {
         worker.request_shard(ShardId(ID)).await.unwrap();
     }
     let db = loop {
@@ -417,7 +619,7 @@ async fn worker_process_fixture() {
         OperatorId(ID),
         2,
     );
-    if id == 2 && !stale_owner_mode {
+    if id == 2 && !stale_owner_mode && !enospc_mode {
         assert!(
             sink.deliver_next().await.unwrap(),
             "recover durable staged update"
@@ -428,12 +630,23 @@ async fn worker_process_fixture() {
     }
     let final_epoch = if ack_gap {
         ack_gap_manifest["required_frontier"].as_u64().unwrap()
+    } else if enospc_mode {
+        enospc_manifest["required_frontier"].as_u64().unwrap()
     } else {
         5
     };
+    let records_per_epoch = if enospc_mode {
+        enospc_manifest["records_per_epoch"].as_u64().unwrap() as usize
+    } else {
+        1
+    };
+    let enospc_fault_epoch = enospc_manifest["fault_epoch"].as_u64().unwrap();
     while source.committed_epoch() < final_epoch {
         assert!(Instant::now() < deadline, "source progress deadline");
-        let delta = source.poll_delta(64 * 1024, 1).await.unwrap();
+        let delta = source
+            .poll_delta(64 * 1024, records_per_epoch)
+            .await
+            .unwrap();
         if delta.batches.is_empty() {
             continue;
         }
@@ -474,6 +687,24 @@ async fn worker_process_fixture() {
             let deadline = Instant::now() + Duration::from_secs(180);
             while !root.join("release-stale-owner").exists() {
                 assert!(Instant::now() < deadline, "stale owner release deadline");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        if enospc_mode && id == 1 && epoch == enospc_fault_epoch {
+            save(
+                &root.join("enospc-ready.json"),
+                &json!({
+                    "at_ms":now_ms(),
+                    "process_id":std::process::id(),
+                    "worker_id":id,
+                    "epoch":epoch,
+                    "attempted_source_offset":serde_json::from_slice::<Value>(delta.new_offset.as_bytes()).unwrap(),
+                    "before":observe(&db,&worker,&source).await
+                }),
+            );
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while !root.join("release-enospc").exists() {
+                assert!(Instant::now() < deadline, "ENOSPC release deadline");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
@@ -521,10 +752,30 @@ async fn worker_process_fixture() {
             return;
         }
         assert!(fence_valid, "current owner must pass the write fence");
-        source
+        let commit_result = source
             .commit_epoch(&owner, epoch, delta.new_offset, writes)
-            .await
-            .unwrap();
+            .await;
+        if enospc_mode && id == 1 && epoch == enospc_fault_epoch {
+            let (outcome, error) = match commit_result {
+                Ok(()) => ("unexpected_success", None),
+                Err(error) => ("error", Some(error.to_string())),
+            };
+            save(
+                &root.join("enospc-failure.json"),
+                &json!({
+                    "at_ms":now_ms(),
+                    "process_id":std::process::id(),
+                    "worker_id":id,
+                    "epoch":epoch,
+                    "outcome":outcome,
+                    "error":error,
+                    "after":observe(&db,&worker,&source).await
+                }),
+            );
+            std::future::pending::<()>().await;
+            return;
+        }
+        commit_result.unwrap();
         if stale_owner_mode {
             assert_eq!(
                 worker
@@ -1016,7 +1267,11 @@ async fn sink_transaction_cursor_gap_recovers_exactly_once() {
         .arg("info")
         .output()
         .expect("Docker required");
-    assert!(info.status.success(), "Docker required");
+    assert!(
+        info.status.success(),
+        "Docker required: {}",
+        String::from_utf8_lossy(&info.stderr)
+    );
     let artifact_root = std::env::var_os("ROCKSTREAM_CHAOS_ARTIFACT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -1325,7 +1580,7 @@ async fn sink_transaction_cursor_gap_recovers_exactly_once() {
         artifact_dir.join("sink-cursor-gap-summary.md"),
         format!(
             "# Sink cursor gap recovery: {}\n\nRevision: `{}`; manifest SHA-256: `{}`; replay seed: {}.\n\nFault: Kafka transaction epoch {} committed before the MinIO cursor cleared its pending state. Replacement ownership and first correct query: {} ms.\n\nSource group offset: {} at fault, {} after recovery. Final frontier: {}; sink records match the independent oracle.\n\nKafka: `apache/kafka:3.8.0`; MinIO: `codemowers/minio:RELEASE.2025-09-07T16-13-09Z`. Scope: {}.\n\nComplete observations: `evidence.json`. Worker logs and fault-boundary records are SHA-256 indexed in `artifact-digests.json`.\n",
-            manifest["scenario_id"],
+            manifest["scenario_id"].as_str().unwrap(),
             evidence["revision"].as_str().unwrap(),
             evidence["manifest_sha256"].as_str().unwrap(),
             manifest["replay_seed"],
@@ -1334,6 +1589,440 @@ async fn sink_transaction_cursor_gap_recovers_exactly_once() {
             fault_group_offset,
             group_offset_after_recovery,
             query_frontier,
+            manifest["scope"].as_str().unwrap()
+        ),
+    )
+    .unwrap();
+    drop(workers);
+    control.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_state_enospc_withholds_source_ack_and_recovers_exactly() {
+    let info = Command::new("docker")
+        .arg("info")
+        .output()
+        .expect("Docker required");
+    assert!(
+        info.status.success(),
+        "Docker required: {}",
+        String::from_utf8_lossy(&info.stderr)
+    );
+    let artifact_root = std::env::var_os("ROCKSTREAM_CHAOS_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/real-cluster-chaos")
+        });
+    fs::create_dir_all(&artifact_root).unwrap();
+    let manifest: Value = serde_json::from_str(ENOSPC_MANIFEST).unwrap();
+    let suffix = now_ms().to_string();
+    let artifact_dir = artifact_root.join(format!("worker-state-enospc-{suffix}"));
+    fs::create_dir_all(&artifact_dir).unwrap();
+    let source_topic = format!("{}-{suffix}", manifest["source_topic"].as_str().unwrap());
+    let sink_topic = format!("{}-{suffix}", manifest["sink_topic"].as_str().unwrap());
+    let source_group = format!("{}-{suffix}", manifest["source_group"].as_str().unwrap());
+    let bucket = format!("worker-state-enospc-{suffix}");
+    let broker = apache::Kafka::default()
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .start()
+        .await
+        .unwrap();
+    let bootstrap = format!(
+        "127.0.0.1:{}",
+        broker.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
+    );
+    let minio = start_bounded_minio(&bucket, &suffix, &artifact_dir.join("minio.log")).await;
+    let admin: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    for topic in [&source_topic, &sink_topic] {
+        assert_eq!(
+            admin
+                .create_topics(
+                    &[NewTopic::new(topic.as_str(), 1, TopicReplication::Fixed(1))],
+                    &AdminOptions::new()
+                )
+                .await
+                .unwrap(),
+            vec![Ok(topic.to_string())]
+        );
+    }
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    for row in manifest["history"].as_array().unwrap() {
+        producer
+            .send(
+                FutureRecord::to(&source_topic)
+                    .key("")
+                    .payload(&row.to_string()),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+    }
+    let root = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(root.path().join("audit.jsonl")).unwrap());
+    let control = ControlService::new(TopologyCatalog::new())
+        .with_shard_manager(ShardManager::new())
+        .with_audit(audit.clone())
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
+    let spawn_worker = |id: u64, log_path: &Path| {
+        let log = fs::File::create(log_path).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["worker_process_fixture", "--exact", "--nocapture"])
+            .env("ROCKSTREAM_RECOVERY_WORKER_ROOT", root.path())
+            .env("ROCKSTREAM_RECOVERY_WORKER_ID", id.to_string())
+            .env("ROCKSTREAM_RECOVERY_CONTROL", control.addr.to_string())
+            .env("ROCKSTREAM_RECOVERY_KAFKA", &bootstrap)
+            .env("ROCKSTREAM_RECOVERY_SOURCE_TOPIC", &source_topic)
+            .env("ROCKSTREAM_RECOVERY_SINK_TOPIC", &sink_topic)
+            .env("ROCKSTREAM_RECOVERY_SOURCE_GROUP", &source_group)
+            .env("ROCKSTREAM_RECOVERY_ENOSPC", "1")
+            .env(
+                "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
+                format!("http://127.0.0.1:{}", minio.port),
+            )
+            .env("ROCKSTREAM_OBJECT_STORE_BUCKET", &bucket)
+            .env("ROCKSTREAM_OBJECT_STORE_REGION", "us-east-1")
+            .env("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY", MINIO_USER)
+            .env("ROCKSTREAM_OBJECT_STORE_SECRET_KEY", MINIO_PASS)
+            .env_remove("ROCKSTREAM_RECOVERY_STALE_OWNER")
+            .env_remove("ROCKSTREAM_RECOVERY_ACK_GAP")
+            .env_remove("ROCKSTREAM_RECOVERY_SINK_CURSOR_GAP")
+            .env_remove("ROCKSTREAM_ACK_GAP_SKIP_OFFSET")
+            .env_remove("ROCKSTREAM_TEST_SINK_CURSOR_GAP_ROOT")
+            .env_remove("ROCKSTREAM_TEST_SINK_CURSOR_GAP_EPOCH")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
+        if id == 1 {
+            command.env("ROCKSTREAM_TEST_ENOSPC_ROOT", root.path());
+        }
+        command.spawn().unwrap()
+    };
+    let mut workers = Workers(vec![spawn_worker(1, &artifact_dir.join("worker-1.log"))]);
+    let ready = wait_for_json(&root.path().join("enospc-ready.json"), &mut workers.0[0]).await;
+    let ready_group_offset = kafka_committed_offset(&bootstrap, &source_group, &source_topic);
+    assert_eq!(ready["epoch"], manifest["fault_epoch"]);
+    assert_eq!(
+        ready["attempted_source_offset"],
+        manifest["attempted_source_offset"]
+    );
+    assert_eq!(
+        ready["before"]["source_epoch"],
+        manifest["fault_epoch"].as_u64().unwrap() - 1
+    );
+    assert_eq!(ready_group_offset, manifest["source_offset_at_fault"]);
+
+    let enospc_trigger = fill_minio_data_tmpfs(&minio.id);
+    let enospc_at_ms = now_ms();
+    save(&artifact_dir.join("enospc-trigger.json"), &enospc_trigger);
+    fs::write(root.path().join("release-enospc"), b"ENOSPC confirmed").unwrap();
+    let failure_path = root.path().join("enospc-failure.json");
+    let failure_deadline = Instant::now() + Duration::from_secs(60);
+    let failure: Value = loop {
+        if let Ok(bytes) = fs::read(&failure_path) {
+            if let Ok(failure) = serde_json::from_slice(&bytes) {
+                break failure;
+            }
+        }
+        if let Some(status) = workers.0[0].try_wait().unwrap() {
+            panic!("worker exited before reporting ENOSPC: {status}");
+        }
+        assert!(
+            Instant::now() < failure_deadline,
+            "MinIO WAL write did not report ENOSPC before deadline"
+        );
+        let minio_log = bounded_minio_logs(&minio.id);
+        if minio_log.contains(&format!(
+            "API: PutObject(bucket={bucket}, object=shards/{ID}/db/wal/"
+        )) && minio_log.contains(&format!("dstPath: shards/{ID}/db/wal/"))
+            && minio_log.contains("drive path full")
+        {
+            break json!({
+                "at_ms":now_ms(),
+                "worker_process_id":workers.0[0].id(),
+                "outcome":"pending_enospc",
+                "error":"MinIO rejected the worker WAL PutObject with drive path full",
+                "worker_pending":true
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let fault_at_ms = failure["at_ms"].as_u64().unwrap();
+    let fault_group_offset = kafka_committed_offset(&bootstrap, &source_group, &source_topic);
+    let sink_records_at_fault = consume_topic(&bootstrap, &sink_topic);
+    let fault_after: Option<WorkerObservation> = failure
+        .get("after")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .unwrap();
+    let before: WorkerObservation = serde_json::from_value(ready["before"].clone()).unwrap();
+    let expected_fault_rows: Vec<String> = manifest["query_rows_before_fault"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row.as_str().unwrap().to_owned())
+        .collect();
+    let expected_fault_sink_progress = json!({
+        "view":ID,
+        "columns":2,
+        "topic":sink_topic,
+        "snapshot_complete":true,
+        "view_epoch":manifest["sink_cursor_at_fault"]["view_epoch"],
+        "transaction":manifest["sink_cursor_at_fault"]["transaction"],
+        "pending":null
+    });
+    save(&artifact_dir.join("before-fault.json"), &ready);
+
+    match failure["outcome"].as_str().unwrap() {
+        "error" => {
+            let storage_error = failure["error"].as_str().unwrap_or_default();
+            assert!(
+                storage_error.contains("No space left on device")
+                    || storage_error.contains("Insufficient Storage")
+                    || storage_error.contains("507")
+                    || storage_error.contains("drive path full"),
+                "source checkpoint failure did not expose ENOSPC: {storage_error}"
+            );
+        }
+        "pending_enospc" => assert_eq!(failure["worker_pending"], true),
+        outcome => panic!("unexpected ENOSPC outcome: {outcome}"),
+    }
+    assert_eq!(ready_group_offset, fault_group_offset);
+    assert_eq!(fault_group_offset, manifest["source_offset_at_fault"]);
+    assert_eq!(
+        before.source_epoch,
+        manifest["fault_epoch"].as_u64().unwrap() - 1
+    );
+    assert_eq!(
+        before.source_offsets,
+        std::collections::BTreeMap::from([(
+            0,
+            manifest["source_offset_at_fault"].as_u64().unwrap()
+        )])
+    );
+    assert_eq!(before.view_frontier, manifest["frontier_before_fault"]);
+    assert_eq!(
+        before.weighted_output,
+        manifest["weighted_output_before_fault"]
+    );
+    assert_eq!(before.relation, manifest["relation_before_fault"]);
+    assert_eq!(sink_records_at_fault, manifest["sink_records_at_fault"]);
+    if let Some(fault_after) = &fault_after {
+        assert_eq!(fault_after.source_epoch, before.source_epoch);
+        assert_eq!(fault_after.source_offsets, before.source_offsets);
+        assert_eq!(fault_after.view_frontier, before.view_frontier);
+        assert_eq!(fault_after.weighted_output, before.weighted_output);
+        assert_eq!(fault_after.relation, before.relation);
+        assert_eq!(fault_after.sink_progress, expected_fault_sink_progress);
+    }
+
+    let kill_started = Instant::now();
+    workers.0[0].kill().unwrap();
+    workers.0[0].wait().unwrap();
+    let worker_kill_ms = kill_started.elapsed().as_millis() as u64;
+    let capacity_restored = restore_minio_data_tmpfs(&minio.id);
+    save(
+        &artifact_dir.join("capacity-restored.json"),
+        &capacity_restored,
+    );
+    let (fault_frontier, fault_rows, fault_sink_progress) =
+        read_minio_view(minio.port, &bucket).await;
+    assert_eq!(fault_frontier, manifest["frontier_before_fault"]);
+    assert_eq!(fault_rows, expected_fault_rows);
+    assert_eq!(fault_sink_progress, expected_fault_sink_progress);
+    save(
+        &artifact_dir.join("fault-state.json"),
+        &json!({
+            "failure":failure,
+            "ready_group_offset":ready_group_offset,
+            "fault_group_offset":fault_group_offset,
+            "sink_records":sink_records_at_fault,
+            "frontier":fault_frontier,
+            "rows":fault_rows,
+            "sink_progress":fault_sink_progress
+        }),
+    );
+    workers
+        .0
+        .push(spawn_worker(2, &artifact_dir.join("worker-2.log")));
+    let after: WorkerObservation = serde_json::from_value(
+        wait_for_json(&root.path().join("recovered.json"), &mut workers.0[1]).await,
+    )
+    .unwrap();
+    let group_offset_after_recovery =
+        kafka_committed_offset(&bootstrap, &source_group, &source_topic);
+    let sink_records_after_recovery = consume_topic(&bootstrap, &sink_topic);
+    let (query_frontier, query_rows, recovered_sink_progress) =
+        read_minio_view(minio.port, &bucket).await;
+    let expected_query_rows: Vec<String> = manifest["query_rows_after_recovery"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row.as_str().unwrap().to_owned())
+        .collect();
+    let lease_event: Value =
+        serde_json::from_slice(&fs::read(root.path().join("worker-2-lease.json")).unwrap())
+            .unwrap();
+    let detection = audit
+        .read_all()
+        .unwrap()
+        .into_iter()
+        .find(|event| event.action == "worker.disconnected")
+        .expect("control must detect worker killed after ENOSPC");
+    let detection_ms = detection.timestamp_ms.saturating_sub(fault_at_ms);
+    let ownership_ms = lease_event["at_ms"]
+        .as_u64()
+        .unwrap()
+        .saturating_sub(fault_at_ms);
+    let query_at_ms = now_ms();
+    let query_ms = query_at_ms.saturating_sub(fault_at_ms);
+    let minio_log = bounded_minio_logs(&minio.id);
+    fs::write(artifact_dir.join("minio.log"), &minio_log).unwrap();
+    let revision = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let expected_final_sink_progress = json!({
+        "view":ID,
+        "columns":2,
+        "topic":sink_topic,
+        "snapshot_complete":true,
+        "view_epoch":manifest["required_frontier"],
+        "transaction":manifest["required_frontier"],
+        "pending":null
+    });
+    let evidence = json!({
+        "scenario_id":manifest["scenario_id"],
+        "manifest_sha256":format!("{:x}",Sha256::digest(ENOSPC_MANIFEST)),
+        "revision":String::from_utf8(revision.stdout).unwrap().trim(),
+        "kafka_image":"apache/kafka:3.8.0",
+        "minio_image":ENOSPC_MINIO_IMAGE,
+        "minio_container_id":minio.id,
+        "minio_data_tmpfs_bytes":ENOSPC_TMPFS_BYTES,
+        "source_type":"KafkaSource",
+        "sink_type":"KafkaViewSink with transactional KafkaSink",
+        "state_store":"MinIO-backed ShardDb",
+        "source_topic":source_topic,
+        "sink_topic":sink_topic,
+        "source_group":source_group,
+        "bucket":bucket,
+        "run_id":suffix,
+        "replay_seed":manifest["replay_seed"],
+        "ready_at_ms":ready["at_ms"],
+        "enospc_at_ms":enospc_at_ms,
+        "fault_at_ms":fault_at_ms,
+        "before":before,
+        "failure":failure,
+        "fault_group_offset":fault_group_offset,
+        "sink_records_at_fault":sink_records_at_fault,
+        "fault_frontier":fault_frontier,
+        "fault_rows":fault_rows,
+        "fault_sink_progress":fault_sink_progress,
+        "enospc_trigger":enospc_trigger,
+        "capacity_restored":capacity_restored,
+        "detection":detection,
+        "lease_event":lease_event,
+        "after":after,
+        "worker_kill_ms":worker_kill_ms,
+        "group_offset_after_recovery":group_offset_after_recovery,
+        "sink_records_after_recovery":sink_records_after_recovery,
+        "query_frontier":query_frontier,
+        "query_rows":query_rows,
+        "recovered_sink_progress":recovered_sink_progress,
+        "query_at_ms":query_at_ms,
+        "elapsed_ms":{"detection":detection_ms,"ownership":ownership_ms,"query":query_ms},
+        "oracle":{
+            "history":manifest["history"],
+            "weighted_output_before_fault":manifest["weighted_output_before_fault"],
+            "relation_before_fault":manifest["relation_before_fault"],
+            "expected_weighted_output":manifest["expected_weighted_output"],
+            "expected_relation":manifest["expected_relation"],
+            "expected_sink":manifest["expected_sink"]
+        },
+        "minio_log_sha256":format!("{:x}",Sha256::digest(minio_log.as_bytes())),
+        "scope":manifest["scope"]
+    });
+    save(&artifact_dir.join("evidence.json"), &evidence);
+
+    assert_eq!(after.lease.worker_id.0, 2);
+    assert!(after.lease.lease_token.0 > before.lease.lease_token.0);
+    assert_ne!(after.process_id, before.process_id);
+    assert_eq!(after.source_epoch, manifest["required_frontier"]);
+    assert_eq!(
+        after.source_offsets,
+        std::collections::BTreeMap::from([(0, 5)])
+    );
+    assert_eq!(after.view_frontier, manifest["required_frontier"]);
+    assert_eq!(after.weighted_output, manifest["expected_weighted_output"]);
+    assert_eq!(after.relation, manifest["expected_relation"]);
+    assert_eq!(query_frontier, manifest["required_frontier"]);
+    assert_eq!(query_rows, expected_query_rows);
+    assert_eq!(
+        group_offset_after_recovery,
+        manifest["source_offset_after_recovery"]
+    );
+    assert_eq!(sink_records_after_recovery, manifest["expected_sink"]);
+    assert_eq!(after.sink_progress, expected_final_sink_progress);
+    assert_eq!(recovered_sink_progress, after.sink_progress);
+    for (name, elapsed) in [("ownership", ownership_ms), ("query", query_ms)] {
+        assert!(
+            elapsed <= manifest["limits_ms"][name].as_u64().unwrap(),
+            "{name} deadline: {elapsed} ms"
+        );
+    }
+    workers.0[1].kill().unwrap();
+    workers.0[1].wait().unwrap();
+    let evidence_sha256 = format!(
+        "{:x}",
+        Sha256::digest(fs::read(artifact_dir.join("evidence.json")).unwrap())
+    );
+    let artifact_names = [
+        "evidence.json",
+        "before-fault.json",
+        "fault-state.json",
+        "enospc-trigger.json",
+        "capacity-restored.json",
+        "worker-1.log",
+        "worker-2.log",
+        "minio.log",
+    ];
+    let artifact_sha256 = artifact_names.map(|name| {
+        (
+            name,
+            format!(
+                "{:x}",
+                Sha256::digest(fs::read(artifact_dir.join(name)).unwrap())
+            ),
+        )
+    });
+    save(
+        &artifact_dir.join("artifact-digests.json"),
+        &json!({"evidence_sha256":evidence_sha256,"artifact_sha256":artifact_sha256}),
+    );
+    fs::write(
+        artifact_dir.join("worker-state-enospc-summary.md"),
+        format!(
+            "# Worker state ENOSPC recovery: {}\n\nRevision: `{}`; manifest SHA-256: `{}`; replay seed: {}.\n\nThe bounded MinIO `/data` tmpfs reached OS ENOSPC before source epoch {} checkpoint prepare. MinIO rejected the worker WAL write, and the worker did not advance Kafka offset {} or committed frontier {} before it was killed. After restoring capacity, worker 2 recovered frontier {} and the exact Kafka sink, MinIO view, and cursor matched the independent oracle.\n\nKafka: `apache/kafka:3.8.0`; MinIO: `{}`; tmpfs: {} bytes. Scope: {}.\n\nComplete observations and logs are indexed in `artifact-digests.json`.\n",
+            manifest["scenario_id"],
+            evidence["revision"].as_str().unwrap(),
+            evidence["manifest_sha256"].as_str().unwrap(),
+            manifest["replay_seed"],
+            manifest["fault_epoch"],
+            fault_group_offset,
+            fault_frontier,
+            query_frontier,
+            ENOSPC_MINIO_IMAGE,
+            ENOSPC_TMPFS_BYTES,
             manifest["scope"]
         ),
     )
