@@ -1,9 +1,22 @@
-use std::sync::Arc;
+use std::{
+    fmt::{Display, Formatter},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt};
+use futures::{stream::BoxStream, StreamExt};
+use object_store::{
+    local::LocalFileSystem, path::Path, CopyOptions, GetOptions, GetResult, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult,
+};
 use rockstream_control::{CheckpointExportService, CheckpointManifestStore};
 use rockstream_runtime::RecoveryDriver;
-use rockstream_storage::ShardDb;
+#[cfg(feature = "simulation")]
+use rockstream_sim::buggify::{buggify_disable, buggify_focus, buggify_init};
+use rockstream_storage::{keys::ShardKeyEncoder, ShardDb};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{
     create_minio_bucket, minio_object_store, start_minio, MinIO2024,
@@ -13,12 +26,140 @@ use rockstream_types::{
     ids::{LeaseToken, ShardId},
 };
 
+#[derive(Debug)]
+struct FaultInjectingStore {
+    inner: Arc<dyn ObjectStore>,
+    fail_put_at: Option<usize>,
+    fail_get_path: Option<Path>,
+    put_attempts: AtomicUsize,
+}
+
+impl FaultInjectingStore {
+    fn fail_nth_put(inner: Arc<dyn ObjectStore>, fail_at: usize) -> Self {
+        Self {
+            inner,
+            fail_put_at: Some(fail_at),
+            fail_get_path: None,
+            put_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn fail_get_path(inner: Arc<dyn ObjectStore>, path: Path) -> Self {
+        Self {
+            inner,
+            fail_put_at: None,
+            fail_get_path: Some(path),
+            put_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn put_error() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "FaultInjectingStore",
+            source: std::io::Error::other("injected remote PUT failure").into(),
+        }
+    }
+
+    fn get_error() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "FaultInjectingStore",
+            source: std::io::Error::other("injected remote GET failure").into(),
+        }
+    }
+}
+
+impl Display for FaultInjectingStore {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "FaultInjectingStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FaultInjectingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        let attempt = self.put_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if Some(attempt) == self.fail_put_at {
+            return Err(Self::put_error());
+        }
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if self.fail_get_path.as_ref() == Some(location) {
+            return Err(Self::get_error());
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 async fn seed_checkpoint(store: Arc<dyn ObjectStore>, checkpoint_id: u64) -> ClusterCheckpoint {
     let db = ShardDb::builder("shards/0", store.clone())
         .build()
         .await
         .unwrap();
     db.put(b"view/rows", b"committed").await.unwrap();
+    db.put(b"view/rows/1", b"before-overwrite").await.unwrap();
+    db.put(b"view/rows/2", b"deleted").await.unwrap();
+    db.put(b"view/rows/1", b"committed").await.unwrap();
+    db.delete(b"view/rows/2").await.unwrap();
+    db.put(b"view/rows/3", b"committed-second-row")
+        .await
+        .unwrap();
+    db.put(
+        &ShardKeyEncoder::frontier_key(),
+        &checkpoint_id.to_be_bytes(),
+    )
+    .await
+    .unwrap();
     db.flush().await.unwrap();
     let handle = db.create_checkpoint().await.unwrap();
     let id = CheckpointId(checkpoint_id);
@@ -68,6 +209,20 @@ async fn export_restore_and_assert(
         )
         .await
         .unwrap();
+    restore_and_assert(export, target, generation, checkpoint).await;
+}
+
+async fn restore_and_assert(
+    export: Arc<dyn ObjectStore>,
+    target: Arc<dyn ObjectStore>,
+    generation: &str,
+    checkpoint: ClusterCheckpoint,
+) -> serde_json::Value {
+    let service = CheckpointExportService::new();
+    let validated_export = service
+        .validate_generation(export.clone(), generation)
+        .await
+        .unwrap();
     let restored = service
         .restore_generation(export, target.clone(), generation)
         .await
@@ -75,51 +230,102 @@ async fn export_restore_and_assert(
     assert_eq!(
         restored,
         rockstream_control::CheckpointRestoreOutcome {
-            checkpoint_id: 7,
+            checkpoint_id: checkpoint.checkpoint_id.0,
             generation: generation.to_string(),
-            object_count: restored.object_count,
-            byte_count: restored.byte_count,
-            restored_shards: 1,
+            object_count: validated_export.object_count,
+            byte_count: validated_export.byte_count,
+            restored_shards: checkpoint.shards.len(),
             status: "SUCCESS".to_string(),
         }
     );
-    assert!(target
-        .head(&Path::from("control/bootstrap/active-generation"))
+    let active_generation = target
+        .get(&Path::from("control/bootstrap/active-generation"))
         .await
-        .is_ok());
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let active_generation: serde_json::Value = serde_json::from_slice(&active_generation).unwrap();
     assert_eq!(
-        CheckpointManifestStore::new(target.clone())
-            .load_manifest(CheckpointId(7))
-            .await,
-        Some(checkpoint.clone())
+        active_generation,
+        serde_json::json!({
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "generation": generation,
+        })
     );
-    assert_eq!(
-        target
-            .get(&Path::from("control/catalog/views"))
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap()
-            .as_ref(),
-        b"view=v committed_epoch=7"
-    );
+    let restored_manifest = CheckpointManifestStore::new(target.clone())
+        .load_manifest(checkpoint.checkpoint_id)
+        .await;
+    assert_eq!(restored_manifest, Some(checkpoint.clone()));
+    let catalog = target
+        .get(&Path::from("control/catalog/views"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(catalog.as_ref(), b"view=v committed_epoch=7");
+    let source_resume = target
+        .get(&Path::from("control/connectors/source-resume"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(source_resume.as_ref(), b"offset=42");
     let recovery = RecoveryDriver::new();
-    recovery.load_checkpoint(checkpoint);
+    recovery.load_checkpoint(checkpoint.clone());
     let shard = recovery
         .recover_shard(ShardId(0), "shards/0", target, LeaseToken(1), LeaseToken(1))
         .await
         .unwrap();
-    assert_eq!(
-        shard
-            .reader
-            .get(b"view/rows")
-            .await
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        b"committed"
-    );
+    let row = shard.reader.get(b"view/rows").await.unwrap().unwrap();
+    assert_eq!(row.as_ref(), b"committed");
+    let overwritten_row = shard.reader.get(b"view/rows/1").await.unwrap().unwrap();
+    assert_eq!(overwritten_row.as_ref(), b"committed");
+    let deleted_row = shard.reader.get(b"view/rows/2").await.unwrap();
+    assert!(deleted_row.is_none());
+    let second_row = shard.reader.get(b"view/rows/3").await.unwrap().unwrap();
+    assert_eq!(second_row.as_ref(), b"committed-second-row");
+    let frontier_key = ShardKeyEncoder::frontier_key();
+    let frontier = shard.reader.get(&frontier_key).await.unwrap().unwrap();
+    let frontier = u64::from_be_bytes(frontier.as_ref().try_into().unwrap());
+    let observed_state = serde_json::json!({
+        "checkpoint_manifest": restored_manifest,
+        "active_generation": active_generation,
+        "frontier": frontier,
+        "catalog": String::from_utf8(catalog.to_vec()).unwrap(),
+        "source_resume": String::from_utf8(source_resume.to_vec()).unwrap(),
+        "rows": {
+            "view/rows": String::from_utf8(row.to_vec()).unwrap(),
+            "view/rows/1": String::from_utf8(overwritten_row.to_vec()).unwrap(),
+            "view/rows/2": deleted_row.map(|bytes| String::from_utf8(bytes.to_vec()).unwrap()),
+            "view/rows/3": String::from_utf8(second_row.to_vec()).unwrap(),
+        },
+    });
+    let expected_state = serde_json::json!({
+        "checkpoint_manifest": checkpoint.clone(),
+        "active_generation": {
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "generation": generation,
+        },
+        "frontier": checkpoint.checkpoint_id.0,
+        "catalog": "view=v committed_epoch=7",
+        "source_resume": "offset=42",
+        "rows": {
+            "view/rows": "committed",
+            "view/rows/1": "committed",
+            "view/rows/2": null,
+            "view/rows/3": "committed-second-row",
+        },
+    });
+    assert_eq!(observed_state, expected_state);
+    serde_json::json!({
+        "restore_outcome": restored,
+        "active_generation": active_generation,
+        "expected_state": expected_state,
+        "observed_state": observed_state,
+    })
 }
 
 #[tokio::test]
@@ -243,10 +449,9 @@ async fn minio_stores(
         return None;
     }
     let source_bucket = format!("rs-dr-source-{suffix}");
-    let (container, port) = match start_minio(&source_bucket).await {
-        Some(res) => res,
-        None => return None,
-    };
+    let (container, port) = start_minio(&source_bucket)
+        .await
+        .expect("MinIO must start when Docker is available");
     let export_bucket = format!("rs-dr-export-{suffix}");
     let target_bucket = format!("rs-dr-target-{suffix}");
     create_minio_bucket(port, &export_bucket).await;
@@ -257,6 +462,265 @@ async fn minio_stores(
         minio_object_store(port, &export_bucket),
         minio_object_store(port, &target_bucket),
     ))
+}
+
+async fn object_inventory(store: &Arc<dyn ObjectStore>) -> Vec<serde_json::Value> {
+    let mut listing = store.list(None);
+    let mut inventory = Vec::new();
+    while let Some(entry) = listing.next().await {
+        let entry = entry.expect("MinIO inventory listing must succeed");
+        inventory.push(serde_json::json!({
+            "path": entry.location.to_string(),
+            "size": entry.size,
+            "etag": entry.e_tag,
+        }));
+    }
+    inventory.sort_by_key(|entry| entry["path"].as_str().unwrap().to_string());
+    inventory
+}
+
+async fn export_inventory_records(
+    store: &Arc<dyn ObjectStore>,
+    generation: &str,
+) -> Vec<serde_json::Value> {
+    let prefix = Path::from(format!("checkpoint-exports/{generation}/inventory"));
+    let mut listing = store.list(Some(&prefix));
+    let mut records = Vec::new();
+    while let Some(entry) = listing.next().await {
+        let entry = entry.expect("MinIO export inventory listing must succeed");
+        let bytes = store
+            .get(&entry.location)
+            .await
+            .expect("MinIO export inventory record must be readable")
+            .bytes()
+            .await
+            .expect("MinIO export inventory record bytes must be readable");
+        records.push(serde_json::json!({
+            "record_path": entry.location.to_string(),
+            "record": serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        }));
+    }
+    records.sort_by_key(|record| record["record_path"].as_str().unwrap().to_string());
+    records
+}
+
+fn source_revision() -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn write_export_evidence(name: &str, evidence: serde_json::Value) {
+    let artifact_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ci-test-results");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    std::fs::write(
+        artifact_dir.join(name),
+        serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn minio_restore_process_fixture() {
+    let Ok(port) = std::env::var("ROCKSTREAM_MINIO_RESTORE_PORT") else {
+        return;
+    };
+    let port = port.parse().unwrap();
+    let export_bucket = std::env::var("ROCKSTREAM_MINIO_RESTORE_EXPORT_BUCKET").unwrap();
+    let target_bucket = std::env::var("ROCKSTREAM_MINIO_RESTORE_TARGET_BUCKET").unwrap();
+    let generation = std::env::var("ROCKSTREAM_MINIO_RESTORE_GENERATION").unwrap();
+    let result_path = std::env::var("ROCKSTREAM_MINIO_RESTORE_RESULT").unwrap();
+    let export = minio_object_store(port, &export_bucket);
+    let target = minio_object_store(port, &target_bucket);
+    let service = CheckpointExportService::new();
+    let validated_export = service
+        .validate_generation(export.clone(), &generation)
+        .await
+        .unwrap();
+    let restore = service
+        .restore_generation(export, target.clone(), &generation)
+        .await
+        .unwrap();
+    let checkpoint = CheckpointManifestStore::new(target.clone())
+        .load_manifest(CheckpointId(12))
+        .await
+        .unwrap();
+    let recovery = RecoveryDriver::new();
+    recovery.load_checkpoint(checkpoint.clone());
+    let shard = recovery
+        .recover_shard(
+            ShardId(0),
+            "shards/0",
+            target.clone(),
+            LeaseToken(1),
+            LeaseToken(1),
+        )
+        .await
+        .unwrap();
+    let row = shard.reader.get(b"view/rows").await.unwrap().unwrap();
+    let row_1 = shard.reader.get(b"view/rows/1").await.unwrap().unwrap();
+    let row_2 = shard.reader.get(b"view/rows/2").await.unwrap();
+    let row_3 = shard.reader.get(b"view/rows/3").await.unwrap().unwrap();
+    let frontier = shard
+        .reader
+        .get(&ShardKeyEncoder::frontier_key())
+        .await
+        .unwrap()
+        .unwrap();
+    let catalog = target
+        .get(&Path::from("control/catalog/views"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let source_resume = target
+        .get(&Path::from("control/connectors/source-resume"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let result = serde_json::json!({
+        "pid": std::process::id(),
+        "export": validated_export,
+        "restore": restore,
+        "checkpoint": checkpoint,
+        "row": String::from_utf8(row.to_vec()).unwrap(),
+        "rows": {
+            "1": String::from_utf8(row_1.to_vec()).unwrap(),
+            "2": row_2.map(|value| String::from_utf8(value.to_vec()).unwrap()),
+            "3": String::from_utf8(row_3.to_vec()).unwrap(),
+        },
+        "frontier": u64::from_be_bytes(frontier.as_ref().try_into().unwrap()),
+        "catalog": String::from_utf8(catalog.to_vec()).unwrap(),
+        "source_resume": String::from_utf8(source_resume.to_vec()).unwrap(),
+    });
+    std::fs::write(result_path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn minio_tc_restore_in_fresh_process_preserves_exact_state() {
+    if !docker_available() {
+        eprintln!("SKIP MinIO fresh-process restore test: Docker not available");
+        return;
+    }
+    let source_bucket = "rs-dr-source-fresh-process";
+    let export_bucket = "rs-dr-export-fresh-process";
+    let target_bucket = "rs-dr-target-fresh-process";
+    let (_container, port) = start_minio(source_bucket)
+        .await
+        .expect("MinIO must start when Docker is available");
+    create_minio_bucket(port, export_bucket).await;
+    create_minio_bucket(port, target_bucket).await;
+
+    let source = minio_object_store(port, source_bucket);
+    let export = minio_object_store(port, export_bucket);
+    let target = minio_object_store(port, target_bucket);
+    assert!(target.list(None).next().await.is_none());
+    let checkpoint = seed_checkpoint(source.clone(), 12).await;
+    let source_inventory = object_inventory(&source).await;
+    let generation = "minio-fresh-process";
+    let service = CheckpointExportService::new();
+    let export_outcome = service
+        .export_latest_prefix(
+            source.clone(),
+            export.clone(),
+            &CheckpointManifestStore::new(source.clone()),
+            generation,
+            &Path::from(""),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .validate_generation(export.clone(), generation)
+            .await
+            .unwrap(),
+        export_outcome
+    );
+
+    let export_records = export_inventory_records(&export, generation).await;
+    let result_dir = tempfile::tempdir().unwrap();
+    let result_path = result_dir.path().join("restore.json");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["minio_restore_process_fixture", "--exact", "--nocapture"])
+        .env("ROCKSTREAM_MINIO_RESTORE_PORT", port.to_string())
+        .env("ROCKSTREAM_MINIO_RESTORE_EXPORT_BUCKET", export_bucket)
+        .env("ROCKSTREAM_MINIO_RESTORE_TARGET_BUCKET", target_bucket)
+        .env("ROCKSTREAM_MINIO_RESTORE_GENERATION", generation)
+        .env("ROCKSTREAM_MINIO_RESTORE_RESULT", &result_path)
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "fresh-process restore failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let mut observed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&result_path).unwrap()).unwrap();
+    let child_pid = observed["pid"].as_u64().unwrap();
+    assert_ne!(child_pid, std::process::id() as u64);
+    observed.as_object_mut().unwrap().remove("pid");
+    assert_eq!(
+        observed,
+        serde_json::json!({
+            "export": export_outcome,
+            "restore": rockstream_control::CheckpointRestoreOutcome {
+                checkpoint_id: 12,
+                generation: generation.to_string(),
+                object_count: export_outcome.object_count,
+                byte_count: export_outcome.byte_count,
+                restored_shards: 1,
+                status: "SUCCESS".to_string(),
+            },
+            "checkpoint": checkpoint,
+            "row": "committed",
+            "rows": {
+                "1": "committed",
+                "2": null,
+                "3": "committed-second-row",
+            },
+            "frontier": 12,
+            "catalog": "view=v committed_epoch=7",
+            "source_resume": "offset=42",
+        })
+    );
+
+    let revision = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let artifact_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ci-test-results");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    std::fs::write(
+        artifact_dir.join("checkpoint-export-minio-fresh-process.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "source_sha": String::from_utf8(revision.stdout).unwrap().trim(),
+            "minio_image": "codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+            "endpoint": format!("http://127.0.0.1:{port}"),
+            "source_bucket": source_bucket,
+            "export_bucket": export_bucket,
+            "target_bucket": target_bucket,
+            "checkpoint": checkpoint,
+            "generation": generation,
+            "export": export_outcome,
+            "source_inventory": source_inventory,
+            "export_inventory_records": export_records,
+            "export_object_inventory": object_inventory(&export).await,
+            "restored_by_pid": child_pid,
+            "observed_state": observed,
+            "target_inventory": object_inventory(&target).await,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -313,13 +777,292 @@ async fn minio_tc_export_under_writes_restores_one_committed_epoch() {
 }
 
 #[tokio::test]
+async fn minio_tc_failed_export_put_has_no_success_and_retry_restores_exact_state() {
+    let Some((_container, source, export, target)) = minio_stores("put-failure").await else {
+        return;
+    };
+    let checkpoint = seed_checkpoint(source.clone(), 14).await;
+    let manifests = CheckpointManifestStore::new(source.clone());
+    let source_before = object_inventory(&source).await;
+    let target_before = object_inventory(&target).await;
+    let generation = "minio-put-failure";
+    let injected = Arc::new(FaultInjectingStore::fail_nth_put(export.clone(), 2));
+    let faulting_destination: Arc<dyn ObjectStore> = injected.clone();
+    let service = CheckpointExportService::new();
+    let error = service
+        .export_latest_prefix(
+            source.clone(),
+            faulting_destination,
+            &manifests,
+            generation,
+            &Path::from(""),
+        )
+        .await
+        .unwrap_err();
+    let expected = format!(
+        "RS-3614: checkpoint export object-store operation failed: {}; next_steps: verify source and destination access, then retry the same generation",
+        FaultInjectingStore::put_error()
+    );
+    assert_eq!(error.to_string(), expected);
+    assert_eq!(injected.put_attempts.load(Ordering::SeqCst), 2);
+
+    let source_after_failure = object_inventory(&source).await;
+    let export_after_failure = object_inventory(&export).await;
+    let target_after_failure = object_inventory(&target).await;
+    assert_eq!(source_after_failure, source_before);
+    assert_eq!(
+        export_after_failure
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["checkpoint-exports/minio-put-failure/generation"]
+    );
+    assert_eq!(target_after_failure, target_before);
+    assert!(matches!(
+        export
+            .head(&Path::from("checkpoint-exports/minio-put-failure/commit"))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    let retry = service
+        .export_latest_prefix(
+            source.clone(),
+            export.clone(),
+            &manifests,
+            generation,
+            &Path::from(""),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.checkpoint_id, 14);
+    assert_eq!(retry.generation, generation);
+    assert_eq!(retry.status, "SUCCESS");
+    let restored_state = restore_and_assert(
+        export.clone(),
+        target.clone(),
+        generation,
+        checkpoint.clone(),
+    )
+    .await;
+
+    write_export_evidence(
+        "checkpoint-export-minio-put-failure.json",
+        serde_json::json!({
+            "source_sha": source_revision(),
+            "minio_image": "codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+            "source_bucket": "rs-dr-source-put-failure",
+            "export_bucket": "rs-dr-export-put-failure",
+            "target_bucket": "rs-dr-target-put-failure",
+            "checkpoint": checkpoint,
+            "generation": generation,
+            "fault": {
+                "operation": "destination ObjectStore PUT during object copy",
+                "attempt": 2,
+                "error": error.to_string(),
+            },
+            "source_inventory_before": source_before,
+            "source_inventory_after_failure": source_after_failure,
+            "export_inventory_after_failure": export_after_failure,
+            "target_inventory_before": target_before,
+            "target_inventory_after_failure": target_after_failure,
+            "terminal_success_marker_present_after_failure": false,
+            "retry_outcome": retry,
+            "retry_inventory_records": export_inventory_records(&export, generation).await,
+            "export_inventory_after_retry": object_inventory(&export).await,
+            "source_inventory_after_retry": object_inventory(&source).await,
+            "restored_state": restored_state,
+            "target_inventory_after_retry": object_inventory(&target).await,
+            "terminal_success_marker_present_after_retry": true,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn minio_tc_failed_restore_get_leaves_target_unchanged_and_retry_restores_exact_state() {
+    let Some((_container, source, export, target)) = minio_stores("get-failure").await else {
+        return;
+    };
+    let checkpoint = seed_checkpoint(source.clone(), 16).await;
+    let source_inventory = object_inventory(&source).await;
+    let generation = "minio-get-failure";
+    let service = CheckpointExportService::new();
+    let export_outcome = service
+        .export_latest_prefix(
+            source.clone(),
+            export.clone(),
+            &CheckpointManifestStore::new(source.clone()),
+            generation,
+            &Path::from(""),
+        )
+        .await
+        .unwrap();
+    let export_records = export_inventory_records(&export, generation).await;
+    let failed_path = Path::from(
+        export_records
+            .first()
+            .expect("checkpoint export must contain an object")["record"]["destination"]
+            .as_str()
+            .unwrap(),
+    );
+    let target_before_failure = object_inventory(&target).await;
+    let faulting_export: Arc<dyn ObjectStore> = Arc::new(FaultInjectingStore::fail_get_path(
+        export.clone(),
+        failed_path.clone(),
+    ));
+    let error = service
+        .restore_generation(faulting_export, target.clone(), generation)
+        .await
+        .unwrap_err();
+    let expected = format!(
+        "RS-3614: checkpoint export object-store operation failed: {}; next_steps: verify source and destination access, then retry the same generation",
+        FaultInjectingStore::get_error()
+    );
+    assert_eq!(error.to_string(), expected);
+    let target_after_failure = object_inventory(&target).await;
+    assert_eq!(target_after_failure, target_before_failure);
+
+    let restored_state = restore_and_assert(
+        export.clone(),
+        target.clone(),
+        generation,
+        checkpoint.clone(),
+    )
+    .await;
+    write_export_evidence(
+        "checkpoint-export-minio-get-failure.json",
+        serde_json::json!({
+            "source_sha": source_revision(),
+            "minio_image": "codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+            "source_bucket": "rs-dr-source-get-failure",
+            "export_bucket": "rs-dr-export-get-failure",
+            "target_bucket": "rs-dr-target-get-failure",
+            "checkpoint": checkpoint,
+            "generation": generation,
+            "export_outcome": export_outcome,
+            "source_inventory": source_inventory,
+            "export_inventory_records": export_records,
+            "fault": {
+                "operation": "destination ObjectStore GET during object validation",
+                "path": failed_path.to_string(),
+                "error": error.to_string(),
+            },
+            "target_inventory_before_failure": target_before_failure,
+            "target_inventory_after_failure": target_after_failure,
+            "target_unchanged_after_failure": true,
+            "restored_state_after_retry": restored_state,
+            "export_inventory_after_retry": object_inventory(&export).await,
+            "target_inventory_after_retry": object_inventory(&target).await,
+        }),
+    );
+}
+
+#[cfg(feature = "simulation")]
+#[tokio::test]
+async fn minio_tc_interrupted_export_has_no_success_and_retry_restores_exact_state() {
+    let Some((_container, source, export, target)) = minio_stores("interrupted").await else {
+        return;
+    };
+    let checkpoint = seed_checkpoint(source.clone(), 15).await;
+    let manifests = CheckpointManifestStore::new(source.clone());
+    let source_before = object_inventory(&source).await;
+    let target_before = object_inventory(&target).await;
+    let generation = "minio-interrupted";
+    let service = CheckpointExportService::new();
+
+    buggify_init(0x5601_0015);
+    buggify_focus("dr.export.before_terminal_marker");
+    let error = service
+        .export_latest_prefix(
+            source.clone(),
+            export.clone(),
+            &manifests,
+            generation,
+            &Path::from(""),
+        )
+        .await
+        .unwrap_err();
+    buggify_disable();
+    assert_eq!(
+        error.to_string(),
+        "RS-3614: checkpoint export was interrupted at dr.export.before_terminal_marker; next_steps: retry the same generation so validated objects can be resumed"
+    );
+
+    let source_after_failure = object_inventory(&source).await;
+    let export_after_failure = object_inventory(&export).await;
+    let target_after_failure = object_inventory(&target).await;
+    assert_eq!(source_after_failure, source_before);
+    assert!(!export_after_failure
+        .iter()
+        .any(|entry| entry["path"] == "checkpoint-exports/minio-interrupted/commit"));
+    assert!(!export_after_failure.is_empty());
+    assert_eq!(target_after_failure, target_before);
+    assert!(matches!(
+        export
+            .head(&Path::from("checkpoint-exports/minio-interrupted/commit"))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    let retry = service
+        .export_latest_prefix(
+            source.clone(),
+            export.clone(),
+            &manifests,
+            generation,
+            &Path::from(""),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.checkpoint_id, 15);
+    assert_eq!(retry.generation, generation);
+    assert_eq!(retry.status, "SUCCESS");
+    let restored_state = restore_and_assert(
+        export.clone(),
+        target.clone(),
+        generation,
+        checkpoint.clone(),
+    )
+    .await;
+
+    write_export_evidence(
+        "checkpoint-export-minio-interrupted.json",
+        serde_json::json!({
+            "source_sha": source_revision(),
+            "minio_image": "codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+            "source_bucket": "rs-dr-source-interrupted",
+            "export_bucket": "rs-dr-export-interrupted",
+            "target_bucket": "rs-dr-target-interrupted",
+            "checkpoint": checkpoint,
+            "generation": generation,
+            "fault": "dr.export.before_terminal_marker",
+            "error": error.to_string(),
+            "source_inventory_before": source_before,
+            "source_inventory_after_failure": source_after_failure,
+            "export_inventory_after_failure": export_after_failure,
+            "target_inventory_before": target_before,
+            "target_inventory_after_failure": target_after_failure,
+            "terminal_success_marker_present_after_failure": false,
+            "retry_outcome": retry,
+            "retry_inventory_records": export_inventory_records(&export, generation).await,
+            "export_inventory_after_retry": object_inventory(&export).await,
+            "source_inventory_after_retry": object_inventory(&source).await,
+            "restored_state": restored_state,
+            "target_inventory_after_retry": object_inventory(&target).await,
+            "terminal_success_marker_present_after_retry": true,
+        }),
+    );
+}
+
+#[tokio::test]
 async fn minio_tc_truncated_export_fails_closed_rs3614() {
     let Some((_container, source, export, target)) = minio_stores("truncated").await else {
         return;
     };
-    seed_checkpoint(source.clone(), 11).await;
+    let checkpoint = seed_checkpoint(source.clone(), 11).await;
+    let source_inventory = object_inventory(&source).await;
     let service = CheckpointExportService::new();
-    service
+    let export_outcome = service
         .export_latest_prefix(
             source.clone(),
             export.clone(),
@@ -329,22 +1072,144 @@ async fn minio_tc_truncated_export_fails_closed_rs3614() {
         )
         .await
         .unwrap();
+    let expected_record = export_inventory_records(&export, "minio-truncated")
+        .await
+        .into_iter()
+        .map(|record| record["record"].clone())
+        .find(|record| {
+            record["destination"]
+                == "checkpoint-exports/minio-truncated/objects/00000000000000000000"
+        })
+        .unwrap();
+    let corrupted_path = Path::from(expected_record["destination"].as_str().unwrap());
     export
         .put(
-            &Path::from("checkpoint-exports/minio-truncated/objects/00000000000000000000"),
+            &corrupted_path,
             bytes::Bytes::from_static(b"truncated").into(),
         )
         .await
         .unwrap();
     let error = service
-        .restore_generation(export, target.clone(), "minio-truncated")
+        .restore_generation(export.clone(), target.clone(), "minio-truncated")
         .await
         .unwrap_err();
-    assert!(error.to_string().starts_with("RS-3614:"));
-    assert!(target
-        .head(&Path::from("control/bootstrap/active-generation"))
+    assert_eq!(
+        error.to_string(),
+        "RS-3614: checkpoint export integrity validation failed: destination object checkpoint-exports/minio-truncated/objects/00000000000000000000 failed validation; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
+    );
+    assert!(target.list(None).next().await.is_none());
+    write_export_evidence(
+        "checkpoint-export-minio-truncated.json",
+        serde_json::json!({
+            "source_sha": source_revision(),
+            "minio_image": "codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+            "source_bucket": "rs-dr-source-truncated",
+            "export_bucket": "rs-dr-export-truncated",
+            "target_bucket": "rs-dr-target-truncated",
+            "checkpoint": checkpoint,
+            "generation": "minio-truncated",
+            "export_outcome": export_outcome,
+            "source_inventory": source_inventory,
+            "export_inventory_records": export_inventory_records(&export, "minio-truncated").await,
+            "corruption": {
+                "path": corrupted_path.to_string(),
+                "expected_record": expected_record,
+                "written_bytes": "truncated",
+            },
+            "export_inventory_after_corruption": object_inventory(&export).await,
+            "target_inventory_after_failure": object_inventory(&target).await,
+            "failure": error.to_string(),
+            "target_unchanged": true,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn minio_tc_export_rejects_missing_committed_shard_objects_before_success() {
+    let Some((_container, source, export, target)) = minio_stores("missing-shard").await else {
+        return;
+    };
+    let checkpoint = seed_checkpoint(source.clone(), 13).await;
+    let manifests = CheckpointManifestStore::new(source.clone());
+    let shard_prefix = Path::from("shards/0");
+    let mut listing = source.list(Some(&shard_prefix));
+    let mut paths = Vec::new();
+    let mut inventory_before = Vec::new();
+    while let Some(entry) = listing.next().await {
+        let entry = entry.expect("MinIO shard inventory must list successfully");
+        paths.push(entry.location.clone());
+        inventory_before.push(serde_json::json!({
+            "path": entry.location.to_string(),
+            "size": entry.size,
+            "etag": entry.e_tag,
+        }));
+    }
+    drop(listing);
+    assert!(
+        !paths.is_empty(),
+        "checkpoint must reference MinIO shard objects"
+    );
+    for path in paths {
+        source.delete(&path).await.unwrap();
+    }
+    assert_eq!(
+        manifests.load_latest_manifest().await.unwrap(),
+        Some(checkpoint.clone())
+    );
+    assert!(source.list(Some(&shard_prefix)).next().await.is_none());
+
+    let generation = "minio-missing-shard";
+    let error = CheckpointExportService::new()
+        .export_latest_prefix(
+            source,
+            export.clone(),
+            &manifests,
+            generation,
+            &Path::from(""),
+        )
         .await
-        .is_err());
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "RS-3614: checkpoint export integrity validation failed: SlateDB database for shard `shards/0` is missing; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
+    );
+    let marker = Path::from("checkpoint-exports/minio-missing-shard/commit");
+    assert!(matches!(
+        export.head(&marker).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    assert!(export.list(None).next().await.is_none());
+    assert!(target.list(None).next().await.is_none());
+
+    let revision = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let artifact_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ci-test-results");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    std::fs::write(
+        artifact_dir.join("checkpoint-export-minio-missing-object.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "source_sha": String::from_utf8(revision.stdout).unwrap().trim(),
+            "minio_image": "codemowers/minio:RELEASE.2025-09-07T16-13-09Z",
+            "source_bucket": "rs-dr-source-missing-shard",
+            "export_bucket": "rs-dr-export-missing-shard",
+            "target_bucket": "rs-dr-target-missing-shard",
+            "checkpoint": checkpoint,
+            "generation": generation,
+            "fault": "deleted all committed shard objects before export",
+            "source_inventory_before": inventory_before,
+            "source_inventory_after": [],
+            "export_inventory_after": [],
+            "target_inventory_after": [],
+            "failure": error.to_string(),
+            "terminal_success_marker_present": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]

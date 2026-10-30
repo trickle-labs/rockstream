@@ -12,10 +12,12 @@ from pathlib import Path
 import re
 import resource
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 
@@ -25,6 +27,10 @@ TEST_OK = re.compile(r"^test (.+) \.\.\. ok$", re.MULTILINE)
 TEST_FAILED = re.compile(r"^test (.+) \.\.\. FAILED$", re.MULTILINE)
 OK_SUMMARY = "test result: ok. 1 passed; 0 failed;"
 FAILED_SUMMARY = "test result: FAILED. 0 passed; 1 failed;"
+MIN_AVAILABLE_BYTES = 10 * 1024**3
+STOP_AVAILABLE_BYTES = 2 * 1024**3
+RESOURCE_SAMPLE_SECONDS = 5
+CAPACITY_FAILURE_MARKERS = ("no space left on device", "disk quota exceeded", "enospc")
 
 
 def digest(data: bytes) -> str:
@@ -41,6 +47,94 @@ def source_fingerprint_matches(path: Path, expected: str) -> bool:
 
 def command(argv: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, check=False)
+
+
+def directory_bytes(path: Path) -> int:
+    total = 0
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        if not current.exists():
+            continue
+        with os.scandir(current) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+    return total
+
+
+def filesystem_usage(paths: dict[str, Path]) -> list[dict]:
+    filesystems = {}
+    for role, path in paths.items():
+        path.mkdir(parents=True, exist_ok=True)
+        stat = path.stat()
+        usage = os.statvfs(path)
+        filesystem = filesystems.setdefault(stat.st_dev, {
+            "device": str(stat.st_dev),
+            "total_bytes": usage.f_blocks * usage.f_frsize,
+            "free_bytes": usage.f_bfree * usage.f_frsize,
+            "available_bytes": usage.f_bavail * usage.f_frsize,
+            "paths": [],
+        })
+        filesystem["paths"].append(role)
+    return sorted(filesystems.values(), key=lambda item: item["device"])
+
+
+def disk_snapshot(paths: dict[str, Path]) -> dict:
+    return {
+        "filesystems": filesystem_usage(paths),
+        "directory_bytes": {role: directory_bytes(path) for role, path in paths.items()},
+    }
+
+
+def minimum_available_bytes(filesystems: list[dict]) -> int:
+    return min((filesystem["available_bytes"] for filesystem in filesystems), default=0)
+
+
+def preflight_disk_space(target: Path, paths: dict[str, Path], minimum_bytes: int) -> dict:
+    before = disk_snapshot(paths)
+    pruned_bytes = 0
+    if minimum_available_bytes(before["filesystems"]) < minimum_bytes:
+        pruned_bytes = directory_bytes(target)
+        if target.exists():
+            shutil.rmtree(target)
+        target.mkdir(parents=True, exist_ok=True)
+    after = disk_snapshot(paths)
+    return {
+        "minimum_available_bytes": minimum_bytes,
+        "before": before,
+        "target_pruned_bytes": pruned_bytes,
+        "after": after,
+        "qualified": minimum_available_bytes(after["filesystems"]) >= minimum_bytes,
+    }
+
+
+def sample_disk(paths: dict[str, Path], report: dict) -> None:
+    for filesystem in filesystem_usage(paths):
+        device = filesystem["device"]
+        report["minimum_available_bytes_by_device"][device] = min(
+            filesystem["available_bytes"],
+            report["minimum_available_bytes_by_device"].get(device, filesystem["available_bytes"]),
+        )
+        used = filesystem["total_bytes"] - filesystem["free_bytes"]
+        report["peak_used_bytes_by_device"][device] = max(
+            used, report["peak_used_bytes_by_device"].get(device, used)
+        )
+        if filesystem["available_bytes"] < STOP_AVAILABLE_BYTES:
+            report["low_space_stop"].set()
+    report["samples"] += 1
+
+
+def monitor_disk(paths: dict[str, Path], stop: threading.Event, low_space: threading.Event, report: dict) -> None:
+    while not stop.wait(RESOURCE_SAMPLE_SECONDS):
+        try:
+            sample_disk(paths, report)
+        except OSError as error:
+            report["telemetry_error"] = str(error)
+            low_space.set()
+            return
 
 
 def require_clean_checkout() -> None:
@@ -97,6 +191,8 @@ def apply_mutation(text: str, case: dict) -> str:
 
 
 def classify_mutant(status: int | None, output: str, case: dict) -> str:
+    if any(marker in output.lower() for marker in CAPACITY_FAILURE_MARKERS):
+        return "disk_full_not_qualified"
     if status is None:
         return "timeout"
     if status == 0:
@@ -110,31 +206,76 @@ def classify_mutant(status: int | None, output: str, case: dict) -> str:
     return "caught_by_intended_assertion"
 
 
-def run_test(case: dict, cwd: Path, env: dict[str, str], log: Path, timeout_seconds: int) -> tuple[dict, str]:
+def terminate_process(process: subprocess.Popen) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
+        process.wait()
+
+
+def run_test(
+    case: dict,
+    cwd: Path,
+    env: dict[str, str],
+    log: Path,
+    timeout_seconds: int,
+    low_space: threading.Event | None = None,
+) -> tuple[dict, str]:
     started = time.monotonic()
     usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    timed_out = False
+    resource_stop = False
+    status = None
     test_env = env.copy()
     test_env["ROCKSTREAM_CHAOS_ARTIFACT_DIR"] = str(
         log.with_name(f"{log.stem}-artifacts").resolve()
     )
     with log.open("wb") as output:
-        try:
-            result = subprocess.run(
-                case["test_command"],
-                cwd=cwd,
-                env=test_env,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                check=False,
-                timeout=timeout_seconds,
-            )
-            status = result.returncode
-        except subprocess.TimeoutExpired:
-            status = None
+        process = subprocess.Popen(
+            case["test_command"],
+            cwd=cwd,
+            env=test_env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=(os.name == "posix"),
+        )
+        deadline = started + timeout_seconds
+        while process.poll() is None:
+            if low_space is not None and low_space.is_set():
+                resource_stop = True
+                terminate_process(process)
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                terminate_process(process)
+                break
+            try:
+                status = process.wait(timeout=min(0.5, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+        if status is None and not timed_out and not resource_stop:
+            status = process.returncode
     text = log.read_text(errors="replace")
     usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
     return ({
         "exit_code": status,
+        "timed_out": timed_out,
+        "resource_stop": resource_stop,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "child_cpu_user_seconds": round(usage_after.ru_utime - usage_before.ru_utime, 3),
         "child_cpu_system_seconds": round(usage_after.ru_stime - usage_before.ru_stime, 3),
@@ -144,7 +285,14 @@ def run_test(case: dict, cwd: Path, env: dict[str, str], log: Path, timeout_seco
     }, text)
 
 
-def run_case(case: dict, candidate: Path, env: dict[str, str], logs: Path, timeout_seconds: int) -> dict:
+def run_case(
+    case: dict,
+    candidate: Path,
+    env: dict[str, str],
+    logs: Path,
+    timeout_seconds: int,
+    low_space: threading.Event | None = None,
+) -> dict:
     source = candidate / case["source_path"]
     original = source.read_bytes()
     text = original.decode()
@@ -159,9 +307,15 @@ def run_case(case: dict, candidate: Path, env: dict[str, str], logs: Path, timeo
         "source_sha256": digest(original),
     }
     baseline, output = run_test(
-        case, candidate, env, logs / f"{case['id']}-baseline-before.log", timeout_seconds
+        case, candidate, env, logs / f"{case['id']}-baseline-before.log", timeout_seconds, low_space
     )
     record["baseline_before"] = baseline
+    if baseline["resource_stop"]:
+        record["classification"] = "resource_limit_not_qualified"
+        return record
+    if any(marker in output.lower() for marker in CAPACITY_FAILURE_MARKERS):
+        record["classification"] = "disk_full_not_qualified"
+        return record
     if not baseline_passed(baseline["exit_code"], output, case["test_id"]):
         record["classification"] = "baseline_failed_or_test_not_run"
         return record
@@ -182,20 +336,31 @@ def run_case(case: dict, candidate: Path, env: dict[str, str], logs: Path, timeo
     record["mutant_source_sha256"] = digest(mutant_bytes)
     try:
         mutant, output = run_test(
-            case, candidate, env, logs / f"{case['id']}-mutant.log", timeout_seconds
+            case, candidate, env, logs / f"{case['id']}-mutant.log", timeout_seconds, low_space
         )
     finally:
         source.write_bytes(original)
-    record["mutant"] = mutant
-    record["classification"] = classify_mutant(mutant["exit_code"], output, case)
-    baseline, output = run_test(
-        case, candidate, env, logs / f"{case['id']}-baseline-after.log", timeout_seconds
-    )
-    record["baseline_after"] = baseline
-    if not baseline_passed(baseline["exit_code"], output, case["test_id"]):
-        record["classification"] = "restored_baseline_failed_or_test_not_run"
     if digest(source.read_bytes()) != record["source_sha256"]:
         raise RuntimeError(f"{case['id']}: source was not restored exactly")
+    record["mutant"] = mutant
+    record["classification"] = classify_mutant(mutant["exit_code"], output, case)
+    if mutant["resource_stop"]:
+        record["classification"] = "resource_limit_not_qualified"
+        return record
+    if record["classification"] == "disk_full_not_qualified":
+        return record
+    baseline, output = run_test(
+        case, candidate, env, logs / f"{case['id']}-baseline-after.log", timeout_seconds, low_space
+    )
+    record["baseline_after"] = baseline
+    if baseline["resource_stop"]:
+        record["classification"] = "resource_limit_not_qualified"
+        return record
+    if any(marker in output.lower() for marker in CAPACITY_FAILURE_MARKERS):
+        record["classification"] = "disk_full_not_qualified"
+        return record
+    if not baseline_passed(baseline["exit_code"], output, case["test_id"]):
+        record["classification"] = "restored_baseline_failed_or_test_not_run"
     return record
 
 
@@ -212,6 +377,13 @@ def render_summary(report: dict) -> str:
         f"Mutant total/median seconds: {report.get('mutant_wall_total_seconds', 0)} / {report.get('mutant_wall_median_seconds', 'n/a')}",
         f"Child CPU seconds: {report.get('child_cpu_seconds', 0)}",
         f"Peak child RSS bytes: {report.get('peak_child_rss_bytes', 0)}",
+        f"Minimum available bytes by filesystem: {report.get('disk_samples', {}).get('minimum_available_bytes_by_device', {})}",
+        f"Peak sampled filesystem use bytes: {report.get('disk_samples', {}).get('peak_used_bytes_by_device', {})}",
+        f"Preflight filesystem bytes: {json.dumps(report.get('disk_preflight', {}).get('before', {}).get('filesystems', []), sort_keys=True)}",
+        f"End filesystem bytes: {json.dumps(report.get('resource_end', {}).get('filesystems', []), sort_keys=True)}",
+        f"Preflight path bytes: {json.dumps(report.get('disk_preflight', {}).get('before', {}).get('directory_bytes', {}), sort_keys=True)}",
+        f"End path bytes: {json.dumps(report.get('resource_end', {}).get('directory_bytes', {}), sort_keys=True)}",
+        f"Candidate copy bytes: {report.get('candidate_copy_bytes', 0)}",
         "Candidate inventory: [candidate-inventory.json](candidate-inventory.json)",
         "",
         "| Mutation | Invariant | Severity | Test | Result | Mutant seconds | Diff | Log |",
@@ -246,6 +418,7 @@ def run_lane(output: Path) -> int:
         "source_clean_before": None,
         "source_clean_after": None,
         "resource_method": "resource.getrusage(RUSAGE_CHILDREN); peak RSS is a high-water mark.",
+        "disk_resource_method": "5-second filesystem sampling; free-byte high-water is runner-wide per involved device.",
         "runner_os": os.environ.get("RUNNER_OS", "local"),
         "workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
         "workflow_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
@@ -266,6 +439,20 @@ def run_lane(output: Path) -> int:
         return 1
     logs = output / "logs"
     logs.mkdir()
+    target = ROOT / "target/safety-mutation-lane"
+    scratch = Path(os.environ.get("ROCKSTREAM_MUTATION_TMP", Path(tempfile.gettempdir()) / "safety-mutation-work"))
+    paths = {"cargo_target": target, "candidate_scratch": scratch, "output": output.resolve()}
+    disk_samples = {
+        "sample_interval_seconds": RESOURCE_SAMPLE_SECONDS,
+        "samples": 0,
+        "minimum_available_bytes_by_device": {},
+        "peak_used_bytes_by_device": {},
+        "low_space_stop": threading.Event(),
+        "telemetry_error": None,
+    }
+    low_space = threading.Event()
+    monitor_stop = threading.Event()
+    monitor_thread = None
     try:
         require_clean_checkout()
         report["source_clean_before"] = True
@@ -299,23 +486,46 @@ def run_lane(output: Path) -> int:
             "CARGO_BUILD_JOBS": "2",
             "ROCKSTREAM_QUALIFICATION_REVISION": report["source_sha"],
         })
-        target = Path(env.get("CARGO_TARGET_DIR", ROOT / "target/safety-mutation-lane"))
+        configured_target = Path(env.get("CARGO_TARGET_DIR", target)).absolute()
+        if target.is_symlink() or configured_target != target.absolute():
+            raise RuntimeError("CARGO_TARGET_DIR must be the lane-owned target/safety-mutation-lane directory")
         target.mkdir(parents=True, exist_ok=True)
         env["CARGO_TARGET_DIR"] = str(target)
-        with tempfile.TemporaryDirectory(prefix="rockstream-safety-mutation-") as temp:
+        scratch.mkdir(parents=True, exist_ok=True)
+        sample_disk(paths, disk_samples)
+        report["disk_preflight"] = preflight_disk_space(target, paths, MIN_AVAILABLE_BYTES)
+        if not report["disk_preflight"]["qualified"]:
+            available = minimum_available_bytes(report["disk_preflight"]["after"]["filesystems"])
+            raise RuntimeError(
+                f"disk_full_not_qualified: {available} available bytes after pruning the owned target; "
+                f"{MIN_AVAILABLE_BYTES} required"
+            )
+        with tempfile.TemporaryDirectory(prefix="rockstream-safety-mutation-", dir=scratch) as temp:
             candidate = Path(temp) / "candidate"
             shutil.copytree(
                 ROOT,
                 candidate,
                 ignore=shutil.ignore_patterns(".git", "target", ".cache", "openwiki", ".openwiki"),
             )
+            report["candidate_copy_bytes"] = directory_bytes(candidate)
+            sample_disk(paths, disk_samples)
+            monitor_thread = threading.Thread(
+                target=monitor_disk, args=(paths, monitor_stop, low_space, disk_samples), daemon=True
+            )
+            monitor_thread.start()
             for case in inventory["cases"]:
                 record = run_case(
-                    case, candidate, env, logs, inventory["command_timeout_seconds"]
+                    case, candidate, env, logs, inventory["command_timeout_seconds"], low_space
                 )
                 report["cases"].append(record)
                 if record["classification"] != "caught_by_intended_assertion":
                     report["errors"].append(f"{case['id']}: {record['classification']}")
+                if low_space.is_set():
+                    if record["classification"] == "caught_by_intended_assertion":
+                        record["classification"] = "resource_limit_not_qualified"
+                    reason = disk_samples["telemetry_error"] or "available space reached the 2 GiB reserve"
+                    report["errors"].append(f"resource_limit_not_qualified: {reason}")
+                    break
         require_clean_checkout()
         report["source_clean_after"] = True
         if (
@@ -325,7 +535,33 @@ def run_lane(output: Path) -> int:
         ):
             report["status"] = "partial_evidence_not_qualification"
     except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
-        report["errors"].append(str(error))
+        message = str(error)
+        if any(marker in message.lower() for marker in CAPACITY_FAILURE_MARKERS):
+            message = f"disk_full_not_qualified: {message}"
+        report["errors"].append(message)
+    finally:
+        if monitor_thread is not None:
+            monitor_stop.set()
+            monitor_thread.join()
+            try:
+                sample_disk(paths, disk_samples)
+            except OSError as error:
+                report["errors"].append(f"disk telemetry failed: {error}")
+        disk_samples["low_space_stop"] = disk_samples["low_space_stop"].is_set()
+        report["disk_samples"] = disk_samples
+        if paths["cargo_target"].exists() and paths["candidate_scratch"].exists():
+            try:
+                report["resource_end"] = disk_snapshot(paths)
+            except OSError as error:
+                report["errors"].append(f"disk telemetry failed: {error}")
+        if disk_samples.get("telemetry_error"):
+            report["errors"].append(f"disk telemetry failed: {report['disk_samples']['telemetry_error']}")
+        if disk_samples["low_space_stop"] and not any(
+            error.startswith("resource_limit_not_qualified:") for error in report["errors"]
+        ):
+            report["errors"].append("resource_limit_not_qualified: available space reached the 2 GiB reserve")
+    if report["errors"]:
+        report["status"] = "not_qualified"
     report["run_seconds"] = round(time.monotonic() - started, 3)
     usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
     report["child_cpu_seconds"] = round(
