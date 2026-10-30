@@ -1018,11 +1018,18 @@ impl WorkerBudgetLedger {
     ///
     /// A duplicate release cannot permanently make the queue appear full.
     pub fn decrement_waiters(&self) {
-        let _ = self
-            .waiter_count
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            });
+        let mut current = self.waiter_count.load(Ordering::SeqCst);
+        while current != 0 {
+            match self.waiter_count.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub fn category_bytes(&self, category: MemoryCategory) -> u64 {
