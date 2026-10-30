@@ -55,6 +55,8 @@ impl WorkerDeployment {
 }
 
 pub type WorkerDeployments = Arc<RwLock<HashMap<(WorkloadId, ShardId), Arc<WorkerDeployment>>>>;
+type FrontierReportWaiter =
+    Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<Result<u64, String>>>>>;
 
 fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<String, SchemaRef>> {
     descriptor
@@ -814,8 +816,7 @@ pub struct WorkerClientHandle {
     msg_tx: mpsc::Sender<WorkerMessage>,
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
-    frontier_report_waiter:
-        Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<Result<u64, String>>>>>,
+    frontier_report_waiter: FrontierReportWaiter,
     secret_manager: Arc<WorkerSecretManager>,
     storage_context: Arc<rockstream_storage::storage_context::WorkerStorageContext>,
     compaction_config: Arc<RwLock<EpochCompactionConfig>>,
@@ -982,12 +983,13 @@ impl WorkerClientHandle {
     ) -> Result<u64, String> {
         // shortcut: the wire protocol has no request ID, so one report may be pending per client; add correlation IDs before supporting concurrent reports.
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut waiter = self.frontier_report_waiter.lock();
-        if waiter.is_some() {
-            return Err("a frontier report is already pending".to_owned());
+        {
+            let mut waiter = self.frontier_report_waiter.lock();
+            if waiter.is_some() {
+                return Err("a frontier report is already pending".to_owned());
+            }
+            *waiter = Some(tx);
         }
-        *waiter = Some(tx);
-        drop(waiter);
         self.msg_tx
             .send(WorkerMessage::ReportShardFrontier { shard_id, epoch })
             .await
