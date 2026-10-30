@@ -1020,7 +1020,7 @@ impl WorkerBudgetLedger {
     pub fn decrement_waiters(&self) {
         let _ = self
             .waiter_count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 count.checked_sub(1)
             });
     }
