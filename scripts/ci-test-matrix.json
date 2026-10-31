@@ -106,6 +106,7 @@
     "nightly-docker": [
       "checkpoint_recovery",
       "real_cluster_chaos_soak_tests",
+      "real_postgres_cdc_chaos_tests",
       "recovery_slo_tests",
       "resource_leak_soak_real_binary_tests",
       "shard_migration_tc_tests",
@@ -296,6 +297,15 @@
         "docker"
       ]
     },
+    "rockstream-sim/test:real_postgres_cdc_chaos_tests": {
+      "features": [
+        "simulation",
+        "docker_tests"
+      ],
+      "services": [
+        "docker"
+      ]
+    },
     "rockstream-sim/test:resource_leak_soak_real_binary_tests": {
       "features": [
         "simulation",
@@ -353,6 +363,7 @@
     "rockstream-cli::test/r1_real_worker_data_plane_tests::real_workers_execute_aggregate_join_and_fenced_failover": "Unimplemented direct gateway-to-worker source transport; #110 audit A1. This ignored case is not executed and does not count as a mandatory pass.",
     "rockstream-sql::test/lfs_catalog::register_workload_survives_restart_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
     "rockstream-sql::test/lfs_catalog::index_point_lookup_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
-    "rockstream-sql::test/lfs_catalog::index_backfill_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory."
+    "rockstream-sql::test/lfs_catalog::index_backfill_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
+    "rockstream-storage::test/enospc_recovery_tests::dm_log_writes_replays_the_exact_post_ack_epoch": "Requires Linux root and dm-log-writes device-mapper support; the dedicated post-ack-block-crash workflow runs this ignored case and captures source-bound recovery evidence, so the ordinary package shard does not execute it."
   }
 }

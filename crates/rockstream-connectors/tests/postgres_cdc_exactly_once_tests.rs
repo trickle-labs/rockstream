@@ -170,7 +170,7 @@ async fn pgoutput_testcontainer_fence_snapshot_live_update_and_commit_are_exact(
         publication: "orders_pub".to_string(),
         table: "orders".to_string(),
     };
-    let mut source = PostgresCdcSource::connect_pgoutput(ConnectorId(5_201), schema, config)
+    let mut source = PostgresCdcSource::connect_pgoutput(ConnectorId(5_201), schema, config, false)
         .await
         .unwrap();
     let fence = source.capture_snapshot_delta_fence(None).await.unwrap();

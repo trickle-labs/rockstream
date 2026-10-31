@@ -447,13 +447,15 @@ impl PostgresCdcSource {
     /// This intentionally supports only PostgreSQL's text tuple representation.
     /// Refusing another physical schema is safer than
     /// coercing a change before it reaches the M3 fence.
+    /// `has_checkpoint` makes a missing slot fail closed after recovery.
     pub async fn connect_pgoutput(
         connector_id: ConnectorId,
         schema: SchemaRef,
         config: PgOutputConfig,
+        has_checkpoint: bool,
     ) -> Result<Self, SourceError> {
         let mut source = Self::configured_pgoutput(connector_id, schema, config)?;
-        source.open_pgoutput(false).await?;
+        source.open_pgoutput(has_checkpoint).await?;
         Ok(source)
     }
 

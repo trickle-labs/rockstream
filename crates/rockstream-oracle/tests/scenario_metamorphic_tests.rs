@@ -334,6 +334,7 @@ async fn postgres_cdc_replay_idempotent() {
                 publication: "orders_pub".to_string(),
                 table: "orders".to_string(),
             },
+            false,
         )
         .await
         .expect("connect pgoutput");

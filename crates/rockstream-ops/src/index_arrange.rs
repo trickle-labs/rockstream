@@ -133,6 +133,8 @@ impl IndexArrangeOp {
     /// - Weight == 0: no-op.
     ///
     /// NEVER performs range deletion.
+    // The pinned fuzz toolchain predates AtomicU64::try_update stabilization.
+    #[allow(deprecated)]
     pub async fn apply_delta(&self, delta: &ArrowZSet) -> Result<(), OpError> {
         let mut batch = WriteBatch::new();
         let num_rows = delta.data.num_rows();

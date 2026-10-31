@@ -33,6 +33,8 @@ on:
       - "docs/testing/worker-source-ack-gap-recovery.md"
       - "docs/testing/worker-sink-cursor-gap-kafka-minio-v1.json"
       - "docs/testing/worker-state-enospc-kafka-minio-v1.json"
+      - "docs/testing/postgres-cdc-kafka-minio-v1.json"
+      - "docs/testing/postgres-cdc-kafka-minio-v1.md"
       - "docs/testing/worker-failure-recovery.md"
       - "scripts/release-qualification*"
       - "scripts/run-release-qualification.sh"
@@ -76,6 +78,10 @@ jobs:
         env:
           ROCKSTREAM_CHAOS_ARTIFACT_DIR: ${{ github.workspace }}/target/real-cluster-chaos
         run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests worker_state_enospc_withholds_source_ack_and_recovers_exactly -- --exact --test-threads=1
+      - name: Prove real PostgreSQL CDC slot ACK recovery into Kafka
+        env:
+          ROCKSTREAM_CHAOS_ARTIFACT_DIR: ${{ github.workspace }}/target/real-cluster-chaos/postgres-cdc
+        run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_postgres_cdc_chaos_tests postgres_cdc_real_process_ack_gap_recovers_to_kafka -- --exact --test-threads=1
       - name: Upload real-cluster chaos artifacts
         if: always()
         uses: actions/upload-artifact@v4

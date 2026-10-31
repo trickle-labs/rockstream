@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 
 struct EnospcStore {
-    inner: Arc<LocalFileSystem>,
+    inner: Arc<dyn ObjectStore>,
     fail_puts: AtomicBool,
     failures: AtomicUsize,
     fault_path: Mutex<Option<String>>,
@@ -141,6 +141,14 @@ struct EpochState {
 async fn open_shard(store: Arc<EnospcStore>) -> ShardDb {
     ShardDb::builder("shard", store)
         .with_flush_interval(Duration::from_millis(10))
+        .build()
+        .await
+        .unwrap()
+}
+
+async fn open_shard_for_crash_test(store: Arc<EnospcStore>) -> ShardDb {
+    ShardDb::builder("shard", store)
+        .with_flush_interval(Duration::from_secs(60))
         .build()
         .await
         .unwrap()
@@ -322,11 +330,91 @@ async fn enospc_withholds_ack_and_recovers_a_complete_epoch() {
     );
     let fresh_process_state = std::fs::read_to_string(&result_path).unwrap();
     assert_eq!(fresh_process_state, format!("{expected_epoch_2:?}"));
-    let revision = std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_owned());
+    let revision = std::env::var("ROCKSTREAM_SOURCE_SHA")
+        .or_else(|_| std::env::var("GITHUB_SHA"))
+        .unwrap_or_else(|_| "local".to_owned());
     eprintln!(
         "post_ack_enospc_v1 source_sha={revision} backend=LocalFileSystem fault=object-store-put path={:?} errno={} failures={} ack_at_fault=withheld fault_response={fault_response} ack_after_recovery={ack_after_recovery} before={expected_epoch_1:?} recovered={actual:?} fresh_process_pid={child_pid} fresh_process={fresh_process_state:?}",
         store.fault_path.lock().unwrap(),
         libc::ENOSPC,
         store.failures.load(Ordering::SeqCst)
     );
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated Linux dm-log-writes device"]
+async fn dm_log_writes_replays_the_exact_post_ack_epoch() {
+    let root = std::env::var("ROCKSTREAM_POST_ACK_ROOT").unwrap();
+    let mode = std::env::var("ROCKSTREAM_POST_ACK_MODE").unwrap();
+    let store = Arc::new(EnospcStore {
+        inner: rockstream_storage::build_runtime_object_store(std::path::Path::new(&root), "shard")
+            .unwrap(),
+        fail_puts: AtomicBool::new(false),
+        failures: AtomicUsize::new(0),
+        fault_path: Mutex::new(None),
+        fault_reached: Notify::new(),
+    });
+    let expected_epoch_1 = EpochState {
+        row_1: Some(b"10:100".to_vec()),
+        row_2: Some(b"20:50".to_vec()),
+        row_3: None,
+        source_offset: Some(b"12".to_vec()),
+        frontier: Some(1u64.to_be_bytes().to_vec()),
+        operation_id: Some(b"epoch-1".to_vec()),
+    };
+    let expected_epoch_2 = EpochState {
+        row_1: Some(b"10:200".to_vec()),
+        row_2: None,
+        row_3: Some(b"30:75".to_vec()),
+        source_offset: Some(b"15".to_vec()),
+        frontier: Some(2u64.to_be_bytes().to_vec()),
+        operation_id: Some(b"epoch-2".to_vec()),
+    };
+    let revision = std::env::var("ROCKSTREAM_SOURCE_SHA")
+        .or_else(|_| std::env::var("GITHUB_SHA"))
+        .unwrap_or_else(|_| "local".to_owned());
+
+    if mode == "recover" {
+        let recovered = open_shard_for_crash_test(store).await;
+        let actual = state(&recovered).await;
+        assert_eq!(actual, expected_epoch_2, "replayed post-ACK state");
+        eprintln!(
+            "post_ack_dm_log_writes_v1 source_sha={revision} backend=LocalFileSystem mode=recovered state={actual:?}"
+        );
+        return;
+    }
+
+    assert_eq!(mode, "write", "mode must be write or recover");
+    let db = open_shard_for_crash_test(store).await;
+    let mut epoch_1 = WriteBatch::new();
+    epoch_1.put(b"row/1", b"10:100");
+    epoch_1.put(b"row/2", b"20:50");
+    epoch_1.put(b"source/orders/offset", b"12");
+    epoch_1.put(&ShardKeyEncoder::frontier_key(), &1u64.to_be_bytes());
+    epoch_1.put(b"operation/last", b"epoch-1");
+    db.write_batch(epoch_1).await.unwrap();
+    db.flush().await.unwrap();
+    assert_eq!(state(&db).await, expected_epoch_1);
+
+    let mut epoch_2 = WriteBatch::new();
+    epoch_2.put(b"row/1", b"10:200");
+    epoch_2.delete(b"row/2");
+    epoch_2.put(b"row/3", b"30:75");
+    epoch_2.put(b"source/orders/offset", b"15");
+    epoch_2.put(&ShardKeyEncoder::frontier_key(), &2u64.to_be_bytes());
+    epoch_2.put(b"operation/last", b"epoch-2");
+    db.write_batch(epoch_2).await.unwrap();
+    let before_ack = state(&db).await;
+    assert_eq!(before_ack, expected_epoch_2, "state before durable flush");
+    db.flush().await.unwrap();
+
+    let pid = std::process::id();
+    std::fs::write(
+        std::env::var("ROCKSTREAM_POST_ACK_SIGNAL").unwrap(),
+        format!(
+            "post_ack_dm_log_writes_v1 source_sha={revision} backend=LocalFileSystem ack=ShardDb::flush-returned pid={pid} state={before_ack:?}"
+        ),
+    )
+    .unwrap();
+    std::future::pending::<()>().await;
 }

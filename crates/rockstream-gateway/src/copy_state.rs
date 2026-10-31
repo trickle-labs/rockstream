@@ -54,6 +54,8 @@ impl CopyState {
 // drops the COPY state. Reconcile buffered-row accounting here, not only on
 // CopyDone/CopyFail, so an abruptly disconnected client cannot leak the gauge.
 impl Drop for CopyState {
+    // The pinned fuzz toolchain predates AtomicUsize::try_update stabilization.
+    #[allow(deprecated)]
     fn drop(&mut self) {
         let unflushed = self.buf_rows.len() as u64;
         if unflushed != 0 {

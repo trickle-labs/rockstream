@@ -747,6 +747,21 @@ after retained-key recovery. The suite also covers concurrent operations,
 successful rotation, legacy mixed generations, and catalog/audit redaction.
 These tests do not claim live KMS or abrupt process-termination qualification.
 
+Issue #276 qualifies the local filesystem object-store durability boundary below
+the M1–M7 coordination state machines. Runtime, migration, and validated-file
+store builders enable `LocalFileSystem::with_fsync(true)`, so successful local
+object writes sync file data and affected parent directories. The bounded
+`dm-log-writes` workflow marks after a successful `ShardDb::flush`, kills the
+writer, and requires fresh-process recovery to match the complete epoch-2 state.
+Its initial no-fsync run recovered epoch 1 after acknowledging epoch 2; the
+fsync-enabled run passed on source `23f102add4f431c6a73d88b44a0cb073984b301b`
+([run](https://github.com/trickle-labs/rockstream/actions/runs/41130677912)).
+This is backend evidence, not a new formal transition. It qualifies only the
+hosted Linux ext4/loop/`dm-log-writes` path; physical power loss, device caches,
+and remote object-store guarantees remain unqualified. Full ACK and recovery
+evidence is in the [versioned fault matrix](docs/testing/post-ack-durability-fault-matrix.md)
+and the workflow artifact.
+
 Issue #126 observes the existing M4 worker-disconnect and lease-reassignment
 path together with M3 Kafka transaction recovery. `ControlService` emits the
 `worker.disconnected` audit event when the worker session ends, before removing
@@ -775,8 +790,18 @@ offset 3 is acknowledged, then requires worker 2 to restore and acknowledge offs
 cursor, broker offsets, frontier, and worker identities; an offset-4 control must
 fail before another poll. M1–M7 do not model Kafka group assignment or source
 offsets, so this documents the external source boundary without adding an abstract
-invariant or qualifying PostgreSQL CDC (see
-`docs/testing/worker-source-ack-gap-recovery.md`).
+invariant (see `docs/testing/worker-source-ack-gap-recovery.md`).
+
+Issue #289 qualifies the corresponding PostgreSQL logical-slot ACK gap. After
+recovery and owner acquisition, the first coordinator-driven source operation
+connects through `PostgresCdcSource::connect_pgoutput`; the real-process test
+kills worker 1 after epoch 3 is durable but before the slot advances, then
+checks worker 2's recovery against the exact weighted-view and read-committed
+Kafka oracles. A future-slot-ACK mutation must be rejected. PostgreSQL slot/WAL
+state remains an external source boundary outside M1–M7, so this adds real
+cluster evidence without a new abstract invariant or a general CDC guarantee
+(`docs/testing/postgres-cdc-kafka-minio-v1.md`). The adjacent spill-governor
+atomic compatibility annotation changes no coordination transition.
 
 Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
 still abstracts epochs, not row contents. The adapter persists the full pending
