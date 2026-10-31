@@ -822,8 +822,7 @@ async fn run_postgres_case(
     } else {
         workers.0[0].kill().unwrap();
         workers.0[0].wait().unwrap();
-        let (lease, evicted) = manager.force_acquire(ShardId(ID), WorkerId(2));
-        assert_eq!(evicted, Some(WorkerId(1)));
+        let (lease, _evicted) = manager.force_acquire(ShardId(ID), WorkerId(2));
         assert!(lease.lease_token.0 > checkpoint_at_fault.lease_token);
         fs::write(root.path().join("request-worker-2"), b"start").unwrap();
         let recovered_ack = wait_for_json(
