@@ -326,8 +326,17 @@ async fn postgres_cdc_worker_process_fixture() {
     if id == 1 {
         worker.request_shard(ShardId(ID)).await.unwrap();
     } else {
-        wait_for_child_file(&root.join("request-worker-2")).await;
+        let handoff = wait_for_child_json(&root.join("request-worker-2")).await;
         worker.request_shard(ShardId(ID)).await.unwrap();
+        let minimum_lease_token = handoff["minimum_lease_token"].as_u64().unwrap();
+        while !worker
+            .leases()
+            .iter()
+            .any(|lease| lease.shard_id == ShardId(ID) && lease.lease_token.0 > minimum_lease_token)
+        {
+            assert!(Instant::now() < deadline, "handoff lease deadline");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     let db = loop {
         if let Some(db) = worker.get_shard_db(ShardId(ID)) {
@@ -828,7 +837,10 @@ async fn run_postgres_case(
             None | Some(WorkerId(1)) | Some(WorkerId(2))
         ));
         assert!(lease.lease_token.0 > checkpoint_at_fault.lease_token);
-        fs::write(root.path().join("request-worker-2"), b"start").unwrap();
+        save(
+            &root.path().join("request-worker-2"),
+            &json!({"minimum_lease_token":lease.lease_token.0}),
+        );
         let recovered_ack = wait_for_json(
             &root.path().join("postgres-recovered-ack.json"),
             &mut workers.0[1],
