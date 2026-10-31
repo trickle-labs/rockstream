@@ -209,6 +209,11 @@ impl SourceConnector for PgAckBoundarySource {
             .await?;
         let checkpoint_lsn = PgLsn::from_offset_token(&offset)?.to_string();
         if self.worker_id == 1 && epoch == FAULT_EPOCH {
+            log_worker_event(
+                self.worker_id,
+                "source_ack_withheld",
+                json!({"epoch":epoch,"checkpoint_lsn":checkpoint_lsn}),
+            );
             save(
                 &self.root.join("postgres-ack-pending.json"),
                 &json!({
@@ -225,6 +230,11 @@ impl SourceConnector for PgAckBoundarySource {
                 let target_offset = PgLsn::parse(target_lsn)?.to_offset_token();
                 self.inner.commit_offset(epoch, target_offset).await?;
                 let confirmed_flush_lsn = self.inner.confirmed_flush_lsn().await?;
+                log_worker_event(
+                    self.worker_id,
+                    "source_ack_unsafe",
+                    json!({"epoch":epoch,"checkpoint_lsn":checkpoint_lsn,"requested_lsn":target_lsn,"confirmed_flush_lsn":confirmed_flush_lsn}),
+                );
                 save(
                     &self.root.join("postgres-unsafe-ack.json"),
                     &json!({
@@ -254,6 +264,11 @@ impl SourceConnector for PgAckBoundarySource {
                     "checkpoint_lsn": checkpoint_lsn,
                     "confirmed_flush_lsn": confirmed_flush_lsn.map(|lsn| lsn.to_string()),
                 }),
+            );
+            log_worker_event(
+                self.worker_id,
+                "source_ack_recovered",
+                json!({"epoch":epoch,"checkpoint_lsn":checkpoint_lsn,"confirmed_flush_lsn":confirmed_flush_lsn.map(|lsn| lsn.to_string())}),
             );
             wait_for_child_file(&self.root.join("continue-recovered-ack")).await;
             return Ok(());
@@ -294,6 +309,11 @@ async fn postgres_cdc_worker_process_fixture() {
     let bootstrap = std::env::var("ROCKSTREAM_PG_CDC_KAFKA").unwrap();
     let pg_config = pg_config_from_env();
     let unsafe_future_ack = std::env::var_os("ROCKSTREAM_PG_CDC_UNSAFE_FUTURE_ACK").is_some();
+    log_worker_event(
+        id,
+        "worker_started",
+        json!({"unsafe_future_ack":unsafe_future_ack}),
+    );
     let (worker, _task) =
         start_worker_client(id, &control_addr, &root.join(format!("worker-{id}")))
             .await
@@ -320,6 +340,7 @@ async fn postgres_cdc_worker_process_fixture() {
         &root.join(format!("worker-{id}-lease.json")),
         &json!({"at_ms":recovery::now_ms(),"lease":worker.leases()}),
     );
+    log_worker_event(id, "lease_acquired", json!({"leases":worker.leases()}));
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Utf8, false),
@@ -351,6 +372,11 @@ async fn postgres_cdc_worker_process_fixture() {
         checkpoint_store,
     );
     source.recover().await.unwrap();
+    log_worker_event(
+        id,
+        "source_recovered",
+        json!({"epoch":source.committed_epoch(),"checkpoint_lsn":PgLsn::from_offset_token(source.committed_offset()).unwrap().to_string()}),
+    );
     let owner = source.acquire_owner(format!("worker-{id}")).unwrap();
     if id == 1 {
         let observed_db = db.clone();
@@ -412,6 +438,11 @@ async fn postgres_cdc_worker_process_fixture() {
     if id == 2 {
         source.acknowledge_recovered(&owner).await.unwrap();
         assert!(sink.deliver_next().await.unwrap());
+        log_worker_event(
+            id,
+            "sink_epoch_delivered",
+            json!({"epoch":source.committed_epoch(),"checkpoint_lsn":PgLsn::from_offset_token(source.committed_offset()).unwrap().to_string()}),
+        );
         save(
             &root.join("postgres-checkpoint-after-recovered-ack.json"),
             &observe_postgres(&db, &worker, &source).await,
@@ -431,6 +462,11 @@ async fn postgres_cdc_worker_process_fixture() {
                 save(
                     &root.join("postgres-source-ready.json"),
                     &json!({"at_ms":recovery::now_ms(),"worker_id":id,"process_id":std::process::id()}),
+                );
+                log_worker_event(
+                    id,
+                    "source_ready",
+                    json!({"epoch":source.committed_epoch()}),
                 );
                 source_ready = true;
             }
@@ -466,12 +502,30 @@ async fn postgres_cdc_worker_process_fixture() {
             .commit_epoch(&owner, epoch, delta.new_offset, writes)
             .await
             .unwrap();
+        let checkpoint_lsn = PgLsn::from_offset_token(source.committed_offset())
+            .unwrap()
+            .to_string();
+        log_worker_event(
+            id,
+            "source_epoch_committed",
+            json!({"epoch":epoch,"checkpoint_lsn":checkpoint_lsn,"lease_token":lease.lease_token.0}),
+        );
         assert!(sink.deliver_next().await.unwrap());
+        log_worker_event(
+            id,
+            "sink_epoch_delivered",
+            json!({"epoch":epoch,"checkpoint_lsn":checkpoint_lsn}),
+        );
         save(
             &root.join(format!("postgres-progress-{epoch}.json")),
             &observe_postgres(&db, &worker, &source).await,
         );
     }
+    log_worker_event(
+        id,
+        "worker_complete",
+        json!({"epoch":source.committed_epoch(),"checkpoint_lsn":PgLsn::from_offset_token(source.committed_offset()).unwrap().to_string()}),
+    );
     save(
         &root.join("postgres-worker-complete.json"),
         &observe_postgres(&db, &worker, &source).await,
@@ -737,6 +791,22 @@ async fn run_postgres_case(
         let slot_lsn = pg_slot_lsn(postgres, &slot).await;
         workers.0[0].kill().unwrap();
         workers.0[0].wait().unwrap();
+        assert_worker_events(
+            &artifact_dir,
+            1,
+            &[
+                "worker_started",
+                "lease_acquired",
+                "source_recovered",
+                "source_ready",
+                "source_epoch_committed",
+                "sink_epoch_delivered",
+                "source_epoch_committed",
+                "sink_epoch_delivered",
+                "source_ack_withheld",
+                "source_ack_unsafe",
+            ],
+        );
         (
             None,
             None,
@@ -797,6 +867,35 @@ async fn run_postgres_case(
         let sink_records = recovery::consume_topic(bootstrap, &sink_topic);
         workers.0[1].kill().unwrap();
         workers.0[1].wait().unwrap();
+        assert_worker_events(
+            &artifact_dir,
+            1,
+            &[
+                "worker_started",
+                "lease_acquired",
+                "source_recovered",
+                "source_ready",
+                "source_epoch_committed",
+                "sink_epoch_delivered",
+                "source_epoch_committed",
+                "sink_epoch_delivered",
+                "source_ack_withheld",
+            ],
+        );
+        assert_worker_events(
+            &artifact_dir,
+            2,
+            &[
+                "worker_started",
+                "lease_acquired",
+                "source_recovered",
+                "source_ack_recovered",
+                "sink_epoch_delivered",
+                "source_epoch_committed",
+                "sink_epoch_delivered",
+                "worker_complete",
+            ],
+        );
         (
             Some(checkpoint_after_recovered_ack),
             slot_lsn_after_recovered_ack,
@@ -909,6 +1008,34 @@ fn spawn_worker(
         command.env("ROCKSTREAM_PG_CDC_UNSAFE_FUTURE_ACK", "1");
     }
     command.spawn().unwrap()
+}
+
+fn log_worker_event(worker_id: u64, event: &str, details: Value) {
+    eprintln!(
+        "worker_event {}",
+        json!({"at_ms":recovery::now_ms(),"process_id":std::process::id(),"worker_id":worker_id,"event":event,"details":details})
+    );
+}
+
+fn assert_worker_events(artifact_dir: &Path, worker_id: u64, expected: &[&str]) {
+    let path = artifact_dir.join(format!("worker-{worker_id}.log"));
+    let actual = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("worker_event "))
+        .map(|event| {
+            serde_json::from_str::<Value>(event).unwrap()["event"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        expected,
+        "worker event transcript in {}",
+        path.display()
+    );
 }
 
 async fn observe_postgres<S: SourceConnector>(
