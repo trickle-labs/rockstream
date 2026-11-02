@@ -60,9 +60,7 @@ use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Parse, ParseComplete, PortalSuspended,
     TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
 };
-use pgwire::messages::response::{
-    CommandComplete, EmptyQueryResponse, NoticeResponse,
-};
+use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, NoticeResponse};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::startup::{BackendKeyData, ParameterStatus};
 use pgwire::messages::PgWireBackendMessage;
