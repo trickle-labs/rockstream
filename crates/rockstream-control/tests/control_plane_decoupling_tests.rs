@@ -3,9 +3,9 @@
 //! Asserts that the control plane never buffers or stores row payloads or query
 //! output history; it forwards routed frames without retaining their contents.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use rockstream_control::service::ControlService;
@@ -15,10 +15,23 @@ use rockstream_types::config::JoinStrategy;
 use rockstream_types::data_plane::{
     DeploymentRequest, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow, SourceDeltaRequest,
 };
+use rockstream_types::explain::{IdentifiedOperatorStats, OperatorStats};
 use rockstream_types::ids::{OperatorId, WorkerId, WorkloadId};
 use rockstream_types::topology::{
     CapacityHeadroom, ControlMessage, NodeRole, WorkerMessage, WorkerRegistration,
 };
+
+async fn read_control_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> ControlMessage {
+    let mut line = String::new();
+    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+    serde_json::from_str(&line).unwrap()
+}
+
+async fn write_worker_message<W: AsyncWrite + Unpin>(writer: &mut W, message: &WorkerMessage) {
+    let mut line = serde_json::to_string(message).unwrap();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await.unwrap();
+}
 
 #[tokio::test]
 async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
@@ -270,6 +283,180 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
             assert_eq!(epoch, 2);
         }
         other => panic!("Expected SourceDeltaCommitted, got {other:?}"),
+    }
+
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn operator_stats_round_trip_is_scoped_to_workload_and_operator_ids() {
+    let catalog = TopologyCatalog::new();
+    let registration = WorkerRegistration::new(
+        WorkerId(1),
+        NodeRole::Worker,
+        "127.0.0.1:9001",
+        CapacityHeadroom::FULL,
+    );
+    catalog.register(&registration);
+    let handle = ControlService::new(catalog)
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
+
+    let worker = TcpStream::connect(handle.addr).await.unwrap();
+    let (worker_read, mut worker_write) = worker.into_split();
+    let mut worker_reader = BufReader::new(worker_read);
+    write_worker_message(&mut worker_write, &WorkerMessage::Register(registration)).await;
+    assert!(matches!(
+        read_control_message(&mut worker_reader).await,
+        ControlMessage::Registered {
+            worker_id: WorkerId(1)
+        }
+    ));
+    assert!(matches!(
+        read_control_message(&mut worker_reader).await,
+        ControlMessage::TopologyChanged { .. }
+    ));
+
+    let gateway_addr = handle.addr.to_string();
+    for (workload_id, sink_operator_id) in [
+        (WorkloadId(42), OperatorId(400)),
+        (WorkloadId(43), OperatorId(500)),
+    ] {
+        let deployment = DeploymentRequest {
+            version: 1,
+            workload_id,
+            plan_json: "{}".to_string(),
+            join_strategy: JoinStrategy::Auto,
+            schemas: vec![],
+            frontier: 0,
+            storage_root: "/tmp/operator-stats".to_string(),
+            sink_operator_id,
+            output_columns: vec!["value".to_string()],
+            primary_key: vec![0],
+            merge_key_columns: vec![0],
+            routing_columns: BTreeMap::from([("source".to_string(), 0)]),
+        };
+        let deploy_task = tokio::spawn({
+            let gateway_addr = gateway_addr.clone();
+            async move {
+                rockstream_runtime::data_plane::DataPlaneClient::new(gateway_addr)
+                    .deploy(deployment)
+                    .await
+            }
+        });
+        let descriptor = loop {
+            match read_control_message(&mut worker_reader).await {
+                ControlMessage::Deploy { descriptor } => break descriptor,
+                ControlMessage::ShardAssigned { .. } => {}
+                other => panic!("unexpected worker command during deployment: {other:?}"),
+            }
+        };
+        write_worker_message(
+            &mut worker_write,
+            &WorkerMessage::DeploymentReady {
+                version: descriptor.version,
+                workload_id,
+                shard_id: descriptor.shard.shard_id,
+                worker_id: WorkerId(1),
+                process_id: 1,
+                operator_ids: vec![descriptor.sink_operator_id],
+                frontier: descriptor.frontier,
+            },
+        )
+        .await;
+        deploy_task.await.unwrap().unwrap();
+    }
+
+    for (workload_id, requested_ids, own_rows, other_view_id) in [
+        (
+            WorkloadId(42),
+            [OperatorId(101), OperatorId(102)],
+            [1.0, 2.0],
+            OperatorId(201),
+        ),
+        (
+            WorkloadId(43),
+            [OperatorId(201), OperatorId(202)],
+            [3.0, 4.0],
+            OperatorId(101),
+        ),
+    ] {
+        let stats_task = tokio::spawn({
+            let gateway_addr = gateway_addr.clone();
+            async move {
+                rockstream_runtime::data_plane::DataPlaneClient::new(gateway_addr)
+                    .read_operator_stats(workload_id, requested_ids.to_vec())
+                    .await
+            }
+        });
+        let (request_id, requested) = match read_control_message(&mut worker_reader).await {
+            ControlMessage::ReadOperatorStats {
+                request_id,
+                workload_id: actual_workload_id,
+                operator_ids,
+            } => {
+                assert_eq!(actual_workload_id, workload_id);
+                (request_id, operator_ids.into_iter().collect::<HashSet<_>>())
+            }
+            other => panic!("expected operator stats request, got {other:?}"),
+        };
+        assert_eq!(requested, HashSet::from(requested_ids));
+
+        let mut stats: Vec<IdentifiedOperatorStats> = requested_ids
+            .into_iter()
+            .zip(own_rows)
+            .map(|(operator_id, rows_per_s)| IdentifiedOperatorStats {
+                operator_id,
+                stats: OperatorStats {
+                    rows_per_s,
+                    state_reads: rows_per_s as u64,
+                    rmw_ratio: 0.0,
+                    p99_latency_ms: 1.0,
+                    dlq_entries: 0,
+                },
+                rmw_avoided: 0,
+                rmw_required: 0,
+            })
+            .collect();
+        stats.reverse();
+        stats.push(IdentifiedOperatorStats {
+            operator_id: other_view_id,
+            stats: OperatorStats {
+                rows_per_s: 99.0,
+                state_reads: 99,
+                rmw_ratio: 0.0,
+                p99_latency_ms: 99.0,
+                dlq_entries: 99,
+            },
+            rmw_avoided: 0,
+            rmw_required: 0,
+        });
+        write_worker_message(
+            &mut worker_write,
+            &WorkerMessage::OperatorStatsReport {
+                request_id,
+                workload_id,
+                worker_id: WorkerId(1),
+                stats,
+            },
+        )
+        .await;
+
+        let stats = stats_task.await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            stats
+                .iter()
+                .map(|stat| stat.operator_id)
+                .collect::<HashSet<_>>(),
+            HashSet::from(requested_ids)
+        );
+        for ((operator_id, expected_rows), stat) in
+            requested_ids.into_iter().zip(own_rows).zip(stats.iter())
+        {
+            assert_eq!(stat.operator_id, operator_id);
+            assert_eq!(stat.stats.rows_per_s, expected_rows);
+        }
     }
 
     handle.shutdown();

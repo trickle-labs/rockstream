@@ -519,6 +519,49 @@ mod tests {
     use rockstream_plan::{AggregateExpr, AggregateFunc, ExchangeKind, Expr, PlanNode};
 
     #[test]
+    fn analyze_matches_reordered_stats_by_operator_id() {
+        let text = explain_incremental_analyze_for_operators(
+            "orders_view",
+            &[
+                (Some(OperatorId(11)), "Join", "INNER JOIN"),
+                (Some(OperatorId(22)), "Aggregate", "SUM(amount)"),
+            ],
+            &[
+                IdentifiedOperatorStats {
+                    operator_id: OperatorId(22),
+                    stats: OperatorStats {
+                        rows_per_s: 22.4,
+                        state_reads: 220,
+                        rmw_ratio: 0.22,
+                        p99_latency_ms: 2.2,
+                        dlq_entries: 2,
+                    },
+                    rmw_avoided: 78,
+                    rmw_required: 22,
+                },
+                IdentifiedOperatorStats {
+                    operator_id: OperatorId(11),
+                    stats: OperatorStats {
+                        rows_per_s: 11.4,
+                        state_reads: 110,
+                        rmw_ratio: 0.11,
+                        p99_latency_ms: 1.1,
+                        dlq_entries: 1,
+                    },
+                    rmw_avoided: 89,
+                    rmw_required: 11,
+                },
+            ],
+            true,
+        );
+
+        assert_eq!(
+            text,
+            "EXPLAIN INCREMENTAL ANALYZE\n──────────────────────────────────────────────────────\nView[orders_view]\n  Join[op=11] INNER JOIN  [rows/s=11 state_reads=110 rmw_ratio=0.11 p99=1.1ms dlq_entries=1]\n  Aggregate[op=22] SUM(amount)  [rows/s=22 state_reads=220 rmw_ratio=0.22 p99=2.2ms dlq_entries=2]\n"
+        );
+    }
+
+    #[test]
     fn explain_source_shows_stateless() {
         let plan = PlanNode::Source {
             name: "t".to_string(),

@@ -3554,6 +3554,43 @@ mod tests {
     /// sequences.
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    #[test]
+    fn operator_runtime_stats_filter_ids_and_expire_after_sixty_seconds() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        let recent_id = OperatorId(101);
+        let stale_id = OperatorId(202);
+        let now = SystemTime::now();
+        record_operator_runtime_sample_at(recent_id, 60, 12, Duration::from_millis(9), 2, now);
+        record_operator_runtime_sample_at(
+            stale_id,
+            120,
+            18,
+            Duration::from_millis(8),
+            3,
+            now - Duration::from_secs(61),
+        );
+
+        assert_eq!(
+            operator_runtime_stats_for_ids(&[recent_id, OperatorId(303)]),
+            vec![crate::explain::IdentifiedOperatorStats {
+                operator_id: recent_id,
+                stats: crate::explain::OperatorStats {
+                    rows_per_s: 1.0,
+                    state_reads: 12,
+                    rmw_ratio: 0.0,
+                    p99_latency_ms: 9.0,
+                    dlq_entries: 2,
+                },
+                rmw_avoided: 0,
+                rmw_required: 0,
+            }]
+        );
+
+        reset_all();
+    }
+
     fn key() -> LawMetricKey {
         LawMetricKey {
             law_id: MergeLawId(0x0001),
