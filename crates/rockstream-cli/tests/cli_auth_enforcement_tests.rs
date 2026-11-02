@@ -4,6 +4,16 @@ use rockstream_cli::{run_start, start_gateway, StartOptions};
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 use std::path::PathBuf;
+use std::process::Command;
+
+fn normalize_correlation_id(stderr: Vec<u8>) -> String {
+    let stderr = String::from_utf8(stderr).unwrap();
+    let marker = "(correlation_id=";
+    let start = stderr.find(marker).unwrap() + marker.len();
+    let end = start + stderr[start..].find(' ').unwrap();
+    uuid::Uuid::parse_str(&stderr[start..end]).unwrap();
+    stderr.replacen(&stderr[start..end], "<correlation_id>", 1)
+}
 
 fn test_options(storage: PathBuf, auth_mode: &str, listen: Option<String>) -> StartOptions {
     StartOptions {
@@ -80,6 +90,37 @@ async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_
         );
         assert!(!storage.exists(), "{mode} created gateway storage");
     }
+}
+
+#[test]
+fn unavailable_auth_mode_fails_closed_in_cli_process_before_storage_or_listener_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = tmp.path().join("gateway-storage");
+    let output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .args([
+            "start",
+            "--role",
+            "gateway",
+            "--storage",
+            storage.to_str().unwrap(),
+            "--listen",
+            "not-an-address",
+            "--auth",
+            "oidc",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        normalize_correlation_id(output.stderr),
+        "[RS-0002] config.invalid: Configuration error (detail=authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured) (correlation_id=<correlation_id> context=detail=authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured) next_steps: Check configuration file and CLI flags.\n  next steps: This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.\n"
+    );
+    assert!(
+        !storage.exists(),
+        "Unavailable auth created gateway storage"
+    );
 }
 
 #[test]
