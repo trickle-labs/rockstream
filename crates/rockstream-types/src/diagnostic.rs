@@ -224,7 +224,8 @@ pub fn redact_secrets(input: &str) -> String {
     for key in ["password", "passwd", "secret", "token", "api_key", "apikey"] {
         output = redact_assignment(&output, key);
     }
-    output = redact_bearer(&output);
+    output = redact_auth_scheme(&output, "bearer");
+    output = redact_auth_scheme(&output, "basic");
     output = redact_url_credentials(&output);
     if output.contains("-----BEGIN") {
         "[REDACTED_PRIVATE_KEY_MATERIAL]".to_string()
@@ -345,18 +346,24 @@ fn redact_assignment(input: &str, key: &str) -> String {
     output
 }
 
-fn redact_bearer(input: &str) -> String {
-    let lower = input.to_ascii_lowercase();
-    let Some(start) = lower.find("bearer ") else {
-        return input.to_string();
-    };
-    let value_start = start + "bearer ".len();
-    let value_end = input[value_start..]
-        .find(char::is_whitespace)
-        .map(|end| value_start + end)
-        .unwrap_or(input.len());
+fn redact_auth_scheme(input: &str, scheme: &str) -> String {
+    let marker = format!("{scheme} ");
     let mut output = input.to_string();
-    output.replace_range(value_start..value_end, "[REDACTED]");
+    let mut offset = 0;
+    loop {
+        let lower = output.to_ascii_lowercase();
+        let Some(relative) = lower[offset..].find(&marker) else {
+            break;
+        };
+        let start = offset + relative;
+        let value_start = start + marker.len();
+        let value_end = output[value_start..]
+            .find(char::is_whitespace)
+            .map(|end| value_start + end)
+            .unwrap_or(output.len());
+        output.replace_range(value_start..value_end, "[REDACTED]");
+        offset = value_start + "[REDACTED]".len();
+    }
     output
 }
 
@@ -468,6 +475,10 @@ mod tests {
         assert_eq!(
             redact_secrets(r#"token = "fixture secret value" and api_key : 'fixture key'"#),
             "token = [REDACTED] and api_key : [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets("Authorization: Basic dXNlcjpwYXNz"),
+            "Authorization: Basic [REDACTED]"
         );
         let value = "x".repeat(MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES + 10);
         assert_eq!(

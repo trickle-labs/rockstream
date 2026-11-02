@@ -97,7 +97,7 @@ fn support_bundle_redacts_view_metadata_in_exact_output_artifact_and_audit() {
     let temp = tempfile::tempdir().unwrap();
     let output_path = temp.path().join("support.json");
     let storage = StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS);
-    let safe_view = "token = [REDACTED]";
+    let safe_view = "Authorization: Basic [REDACTED]";
     let expected_bundle = json!({
         "generated_at_ms": BUNDLE_TIME_MS,
         "candidate_identity": CandidateIdentity::current(),
@@ -121,7 +121,7 @@ fn support_bundle_redacts_view_metadata_in_exact_output_artifact_and_audit() {
             OutputFormat::Json,
             &storage,
             temp.path(),
-            Some("token = \"fixture secret value\""),
+            Some("Authorization: Basic dXNlcjpwYXNz"),
             None,
             Some(&output_path),
         )
