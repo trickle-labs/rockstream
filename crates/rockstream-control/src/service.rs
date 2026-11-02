@@ -3043,10 +3043,7 @@ async fn handle_connection_stream<R, W>(
         match msg {
             WorkerMessage::Register(reg) => {
                 if let Some(id) = &peer_identity {
-                    if id.role != NodeRole::Worker
-                        || (!id.matches_worker_id(reg.worker_id.0)
-                            && !id.matches_worker_str(&reg.address))
-                    {
+                    if id.role != NodeRole::Worker || !id.matches_worker_id(reg.worker_id.0) {
                         tracing::warn!(
                             %peer,
                             cert_identity = %id.to_cn(),
