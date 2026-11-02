@@ -32,7 +32,7 @@ impl FileAuditLog {
         })
     }
 
-    /// Append an audit event.
+    /// Append an audit event and sync it before returning success.
     pub fn append(&self, event: &AuditEvent) -> io::Result<()> {
         let _guard = self
             .write_lock
@@ -45,6 +45,7 @@ impl FileAuditLog {
         let line = serde_json::to_string(event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         writeln!(file, "{line}")?;
+        file.sync_all()?;
         tracing::debug!(action = %event.action, resource = %event.resource, "audit event written");
         Ok(())
     }
@@ -106,15 +107,14 @@ mod tests {
         let log_path = dir.path().join("audit.jsonl");
         let log = FileAuditLog::open(&log_path).unwrap();
 
-        let e1 = AuditEvent::now("system", "pipeline.created", "p1");
-        let e2 = AuditEvent::now("system", "pipeline.started", "p1");
+        let e1 = AuditEvent::now("system", "pipeline.created", "p1").with_detail("source=ddl");
+        let e2 = AuditEvent::now("system", "pipeline.started", "p1").with_error_code("RS-0003");
         log.append(&e1).unwrap();
         log.append(&e2).unwrap();
+        drop(log);
 
-        let events = log.read_all().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].action, "pipeline.created");
-        assert_eq!(events[1].action, "pipeline.started");
+        let reopened = FileAuditLog::open(&log_path).unwrap();
+        assert_eq!(reopened.read_all().unwrap(), vec![e1, e2]);
     }
 
     #[test]
