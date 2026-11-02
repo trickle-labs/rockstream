@@ -121,7 +121,7 @@ fn support_bundle_redacts_view_metadata_in_exact_output_artifact_and_audit() {
             OutputFormat::Json,
             &storage,
             temp.path(),
-            Some("token = fixture-secret-value"),
+            Some("token = \"fixture secret value\""),
             None,
             Some(&output_path),
         )

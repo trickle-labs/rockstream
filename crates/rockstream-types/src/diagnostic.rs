@@ -315,12 +315,30 @@ fn redact_assignment(input: &str, key: &str) -> String {
             }
             value_start += character.len_utf8();
         }
-        let value_end = output[value_start..]
-            .find(|character: char| {
-                character.is_whitespace() || matches!(character, ',' | ';' | '&')
-            })
-            .map(|end| value_start + end)
-            .unwrap_or(output.len());
+        let value_end = if let Some(quote @ ('"' | '\'')) = output[value_start..].chars().next() {
+            let content_start = value_start + quote.len_utf8();
+            let mut escaped = false;
+            output[content_start..]
+                .char_indices()
+                .find_map(|(relative, character)| {
+                    if escaped {
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == quote {
+                        return Some(content_start + relative + character.len_utf8());
+                    }
+                    None
+                })
+                .unwrap_or(output.len())
+        } else {
+            output[value_start..]
+                .find(|character: char| {
+                    character.is_whitespace() || matches!(character, ',' | ';' | '&')
+                })
+                .map(|end| value_start + end)
+                .unwrap_or(output.len())
+        };
         output.replace_range(value_start..value_end, "[REDACTED]");
         offset = value_start + "[REDACTED]".len();
     }
@@ -448,7 +466,7 @@ mod tests {
             "password=[REDACTED] bearer [REDACTED] https://user:[REDACTED]@example.test/api"
         );
         assert_eq!(
-            redact_secrets("token = fixture-secret-value and api_key : fixture-secret-key"),
+            redact_secrets(r#"token = "fixture secret value" and api_key : 'fixture key'"#),
             "token = [REDACTED] and api_key : [REDACTED]"
         );
         let value = "x".repeat(MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES + 10);
