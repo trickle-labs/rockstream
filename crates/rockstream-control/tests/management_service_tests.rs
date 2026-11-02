@@ -464,7 +464,11 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
             operations,
             NodeConfig::default(),
         );
-    let control = service.start("127.0.0.1:0").await.unwrap();
+    let control = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     let mut donor = register_worker(control.addr, 1).await;
     let mut recipient = register_worker(control.addr, 2).await;
     shard_manager.acquire(ShardId(77), WorkerId(1)).unwrap();
@@ -621,7 +625,11 @@ async fn management_migrate_moves_a_real_shard_once() {
             operations,
             NodeConfig::default(),
         );
-    let control = service.start("127.0.0.1:0").await.unwrap();
+    let control = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     let mut donor = register_worker(control.addr, 11).await;
     let mut recipient = register_worker(control.addr, 12).await;
     let old_lease = shard_manager.acquire(ShardId(77), WorkerId(11)).unwrap();

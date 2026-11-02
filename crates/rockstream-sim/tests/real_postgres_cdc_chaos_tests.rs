@@ -674,6 +674,7 @@ async fn run_postgres_case(
     let control = ControlService::new(TopologyCatalog::new())
         .with_shard_manager(manager.clone())
         .with_audit(audit)
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();

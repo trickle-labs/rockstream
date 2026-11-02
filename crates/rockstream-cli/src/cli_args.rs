@@ -124,6 +124,10 @@ pub struct Cli {
     #[arg(long = "internal-tls-ca-cert-path", global = true)]
     pub internal_tls_ca_cert_path: Option<PathBuf>,
 
+    /// Allow plaintext internal control traffic for loopback-only development.
+    #[arg(long, global = true)]
+    pub allow_insecure_internal_dev: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

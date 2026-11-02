@@ -1659,6 +1659,13 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 Start a RockStream node
 
+For `--role all`, `control`, or `worker`, internal control traffic requires
+mutual TLS. Configure `--internal-tls-cert-path`, `--internal-tls-key-path`,
+and `--internal-tls-ca-cert-path`. Startup rejects missing or incomplete
+material. For loopback development only, `--allow-insecure-internal-dev`
+explicitly enables plaintext control traffic; the flag rejects remote
+addresses and is excluded from production qualification.
+
 Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
