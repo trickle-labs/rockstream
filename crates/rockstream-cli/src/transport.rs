@@ -18,7 +18,8 @@ use rockstream_control::{
 use rockstream_types::acl::Role;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::diagnostic::{
-    DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES, MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
+    redact_secrets, DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES,
+    MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
 };
 use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_0005, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014,
@@ -2913,11 +2914,12 @@ impl StorageClient {
         out: Option<&Path>,
         occurrences: &[DiagnosticOccurrence],
     ) -> Result<SupportBundleInfo, CliError> {
+        let view = view.map(redact_secrets);
         if self.identity.role < required_role("support bundle") {
             let event = AuditEvent::now(
                 self.identity.user.clone(),
                 "support.bundle",
-                view.unwrap_or("all"),
+                view.as_deref().unwrap_or("all"),
             )
             .with_detail("unauthorized role")
             .with_error_code("RS-2401");
@@ -2946,7 +2948,7 @@ impl StorageClient {
         let event = AuditEvent::now(
             self.identity.user.clone(),
             "support.bundle",
-            view.unwrap_or("all"),
+            view.as_deref().unwrap_or("all"),
         )
         .with_detail(format!("bundle written to {}", out_path.display()));
         append_audit_file(storage_path, &event);
@@ -2962,7 +2964,7 @@ impl StorageClient {
         let mut bundle = serde_json::json!({
             "generated_at_ms": now_ms,
             "candidate_identity": rockstream_types::candidate_identity::CandidateIdentity::current(),
-            "view": view,
+            "view": view.as_deref(),
             "audit_events": [],
             "diagnostic_occurrences": diagnostic_occurrences,
             "redaction": "secret values are never included; only metadata and audit events are exported"
@@ -3037,7 +3039,7 @@ impl StorageClient {
 
         Ok(SupportBundleInfo {
             bundle_path: out_path.to_string_lossy().into_owned(),
-            view: view.map(Into::into),
+            view,
             size_bytes: bytes.len() as u64,
             redacted_secrets_count: 1,
             generated_at_ms: now_ms,
