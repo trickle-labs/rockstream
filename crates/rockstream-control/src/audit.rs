@@ -10,13 +10,27 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 // Re-export the canonical AuditEvent type.
 pub use rockstream_types::audit::AuditEvent;
 
 /// A file-backed audit log that writes JSONL.
 pub struct FileAuditLog {
     path: PathBuf,
-    write_lock: Mutex<()>,
+    directory_synced: Mutex<bool>,
 }
 
 impl FileAuditLog {
@@ -28,14 +42,14 @@ impl FileAuditLog {
         }
         Ok(Self {
             path,
-            write_lock: Mutex::new(()),
+            directory_synced: Mutex::new(false),
         })
     }
 
     /// Append an audit event and sync it before returning success.
     pub fn append(&self, event: &AuditEvent) -> io::Result<()> {
-        let _guard = self
-            .write_lock
+        let mut directory_synced = self
+            .directory_synced
             .lock()
             .map_err(|_| io::Error::other("audit log lock poisoned"))?;
         let mut file = OpenOptions::new()
@@ -46,6 +60,11 @@ impl FileAuditLog {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         writeln!(file, "{line}")?;
         file.sync_all()?;
+        if !*directory_synced {
+            // Persist the filename as well as the event data on Unix.
+            sync_parent_directory(&self.path)?;
+            *directory_synced = true;
+        }
         tracing::debug!(action = %event.action, resource = %event.resource, "audit event written");
         Ok(())
     }
