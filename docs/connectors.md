@@ -128,6 +128,7 @@ CREATE SOURCE events_source TYPE kafka (
 ### Partition Offset Management and Epoch Assembly
 
 - **Durable Epoch Coupling**: Offsets advance upstream only when the corresponding RockStream epoch is durable in SlateDB. Replays caused by downstream worker crashes seek directly to the committed checkpoint offset token.
+- **Per-view delivery**: Each maintained view derives its own Kafka consumer group from the configured `group_id`, because views keep independent offset checkpoints. Consumers for one view may share partitions; separate views each receive every partition.
 - **Idle Partition Isolation**: Multi-partition consumers do not block epoch assembly indefinitely waiting for idle partitions; partitions exceeding `idle_partition_timeout_ms` (default 5,000ms) yield their progress frontier.
 - **Cluster/Topic Incarnation**: Stable cluster ID, topic UUID, and partition count are tracked in `KafkaSourceIdentityV1`. Mismatched incarnations fail closed with `RS-4015`.
 
