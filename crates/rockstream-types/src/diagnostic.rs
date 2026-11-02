@@ -293,12 +293,28 @@ fn redact_assignment(input: &str, key: &str) -> String {
         };
         let start = offset + relative;
         let after_key = start + key.len();
-        let separator = output[after_key..].chars().next();
-        if !matches!(separator, Some('=') | Some(':')) {
+        let mut separator_start = after_key;
+        while let Some(character) = output[separator_start..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            separator_start += character.len_utf8();
+        }
+        let Some(separator) = output[separator_start..].chars().next() else {
+            offset = after_key;
+            continue;
+        };
+        if !matches!(separator, '=' | ':') {
             offset = after_key;
             continue;
         }
-        let value_start = after_key + 1;
+        let mut value_start = separator_start + separator.len_utf8();
+        while let Some(character) = output[value_start..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            value_start += character.len_utf8();
+        }
         let value_end = output[value_start..]
             .find(|character: char| {
                 character.is_whitespace() || matches!(character, ',' | ';' | '&')
@@ -430,6 +446,10 @@ mod tests {
         assert_eq!(
             redact_secrets(input),
             "password=[REDACTED] bearer [REDACTED] https://user:[REDACTED]@example.test/api"
+        );
+        assert_eq!(
+            redact_secrets("token = fixture-secret-value and api_key : fixture-secret-key"),
+            "token = [REDACTED] and api_key : [REDACTED]"
         );
         let value = "x".repeat(MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES + 10);
         assert_eq!(
