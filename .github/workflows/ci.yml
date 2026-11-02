@@ -102,13 +102,11 @@ jobs:
         if: needs.ci-policy.outputs.scope == 'full'
         run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::uninlined_format_args
       - name: install cargo-deny
-        if: needs.ci-policy.outputs.scope == 'full'
         uses: taiki-e/install-action@cargo-deny
       - name: cargo deny
         if: needs.ci-policy.outputs.scope == 'full'
         run: cargo deny --all-features check
       - name: install cargo-audit
-        if: needs.ci-policy.outputs.scope == 'full'
         uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
         if: needs.ci-policy.outputs.scope == 'full'
