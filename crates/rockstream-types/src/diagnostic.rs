@@ -221,7 +221,9 @@ pub fn diagnostic_metrics() -> DiagnosticMetrics {
 
 pub fn redact_secrets(input: &str) -> String {
     let mut output = input.to_string();
-    for key in ["password", "passwd", "secret", "token", "api_key", "apikey"] {
+    for key in [
+        "password", "passwd", "secret", "token", "api_key", "api-key", "apikey",
+    ] {
         output = redact_assignment(&output, key);
     }
     output = redact_auth_scheme(&output, "bearer");
@@ -479,6 +481,10 @@ mod tests {
         assert_eq!(
             redact_secrets("Authorization: Basic dXNlcjpwYXNz"),
             "Authorization: Basic [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets("X-API-Key: fixture-api-key"),
+            "X-API-Key: [REDACTED]"
         );
         let value = "x".repeat(MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES + 10);
         assert_eq!(
