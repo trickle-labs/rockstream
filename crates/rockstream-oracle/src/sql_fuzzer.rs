@@ -1013,7 +1013,7 @@ pub struct OracleCaseReport {
 }
 
 const EXPECTED_UNSUPPORTED_SCALAR_HAVING_ERROR: &str =
-    "[RS-1013] Unsupported plan node in incremental lowering: join_filter_non_eq";
+    "[RS-1013] Unsupported plan node in incremental lowering: expr:ScalarSubquery";
 const SCALAR_HAVING_QUERIES: [&str; 4] = [
     "SELECT category, COUNT(id) FROM t1 GROUP BY category HAVING COUNT(id) > (SELECT CAST(AVG(val) AS BIGINT) FROM t2)",
     "SELECT category, COUNT(id) FROM t1 GROUP BY category HAVING COUNT(id) > (SELECT COUNT(id) FROM t2)",

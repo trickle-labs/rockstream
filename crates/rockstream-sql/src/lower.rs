@@ -666,13 +666,17 @@ pub fn lower_expr(expr: &DfExpr, schema: &DFSchema) -> Result<Expr, SqlError> {
         // would expose a different type than the SQL batch result. Other
         // casts retain the historical pass-through lowering because their
         // existing operator paths already expose the expected wire value.
-        DfExpr::Cast(cast) if matches!(&cast.data_type, arrow::datatypes::DataType::Int64) => {
+        DfExpr::Cast(cast)
+            if matches!(cast.field.data_type(), arrow::datatypes::DataType::Int64) =>
+        {
             Ok(Expr::ScalarUdf {
                 name: "cast_int64".to_string(),
                 args: vec![lower_expr(&cast.expr, schema)?],
             })
         }
-        DfExpr::TryCast(cast) if matches!(&cast.data_type, arrow::datatypes::DataType::Int64) => {
+        DfExpr::TryCast(cast)
+            if matches!(cast.field.data_type(), arrow::datatypes::DataType::Int64) =>
+        {
             Ok(Expr::ScalarUdf {
                 name: "cast_int64".to_string(),
                 args: vec![lower_expr(&cast.expr, schema)?],
@@ -1855,7 +1859,7 @@ fn extract_interval_ms(expr: &DfExpr) -> Option<i64> {
 ///    that resolution, not the original seconds value.
 fn timestamp_display_scale(expr: &DfExpr) -> i64 {
     match expr {
-        DfExpr::Cast(cast) => match &cast.data_type {
+        DfExpr::Cast(cast) => match cast.field.data_type() {
             arrow::datatypes::DataType::Timestamp(unit, _) => match unit {
                 arrow::datatypes::TimeUnit::Second => 1,
                 arrow::datatypes::TimeUnit::Millisecond => 1_000,
@@ -2621,6 +2625,7 @@ mod tests {
             static_term: recursive.static_term,
             recursive_term: Arc::new(one_col_plan),
             is_distinct: recursive.is_distinct,
+            schema: recursive.schema,
         });
         let err = lower(&mismatched).expect_err("column-count mismatch must be rejected");
         assert_eq!(err.error_code().to_string(), "RS-1013");
