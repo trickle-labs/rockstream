@@ -172,6 +172,7 @@ verifying coordination logic.
 |---|---|
 | Z-set algebra / `incremental == batch` equivalence | `rockstream-oracle` + DataFusion ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 1–3) |
 | Operator semantics (MIN/MAX, joins, windows, Top-K) | Oracle property tests |
+| Read-only `EXPLAIN INCREMENTAL ANALYZE` worker-statistics request/response | Control-worker TCP and gateway pgwire integration tests; it does not mutate lease, frontier, checkpoint, or workload state |
 | Arrangement byte encodings, key schemes | `SimRuntime` paired assertions ([DESIGN.md §17.3](DESIGN.md)) |
 | SlateDB internal LSM/compaction behavior, including arrangement Bloom filtering and NVMe tiered caching | SlateDB determinism gate ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 0) and arrangement lookup benchmarks |
 | pgwire protocol, SQL compilation, planner | Integration tests (Phase 7) |
@@ -184,6 +185,14 @@ faults* over a small abstract state machine. Data-plane correctness is a
 function of single-threaded algebra, which exhaustive interleaving exploration
 does not illuminate. Keeping the data plane out of the FizzBee models is what
 keeps the state space tractable (Section 2.3).
+
+Issue #295 adds a read-only worker-statistics round trip. The control service
+routes it to ready workers for one workload, matches replies by connected worker
+identity and stable operator ID, and returns unavailable on incomplete samples
+or timeout. The TCP and pgwire integration tests cover that behavior. This path
+does not change any M1–M7 lease, frontier, commit, checkpoint, or durable
+workload transition, so it is recorded here as an implementation-level
+diagnostic boundary rather than a new FizzBee state machine.
 
 ### 1.3 Strategy Principles
 
