@@ -522,6 +522,7 @@ pub struct CatalogStubs {
     workload_catalog: Option<Arc<WorkloadCatalog>>,
     /// Serializes producer-side async workload mutations, including durable writes.
     workload_edit_lock: tokio::sync::Mutex<()>,
+    table_edit_lock: tokio::sync::Mutex<()>,
     // Naturally bounded by the number of catalog-defined workloads.
     workload_budgets: RwLock<HashMap<String, Arc<WorkloadBudget>>>,
     view_budgets: RwLock<HashMap<String, Arc<StateBudget>>>,
@@ -601,6 +602,7 @@ impl CatalogStubs {
             inner: RwLock::new(CatalogStubsInner::default()),
             workload_catalog: None,
             workload_edit_lock: tokio::sync::Mutex::new(()),
+            table_edit_lock: tokio::sync::Mutex::new(()),
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
@@ -621,6 +623,7 @@ impl CatalogStubs {
             inner: RwLock::new(CatalogStubsInner::default()),
             workload_catalog: Some(Arc::clone(&workload_catalog)),
             workload_edit_lock: tokio::sync::Mutex::new(()),
+            table_edit_lock: tokio::sync::Mutex::new(()),
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
@@ -1481,11 +1484,12 @@ impl CatalogStubs {
         inner.view_workloads.get(view_name).cloned()
     }
 
-    /// Register a table in the catalog.
+    /// Register a table in the catalog synchronously.
     ///
     /// If the table already exists, the call is idempotent only when the caller
     /// handles `IF NOT EXISTS` logic. Returns `true` if a new table was inserted,
-    /// `false` if a table with the same name already existed.
+    /// `false` if a table with the same name already existed. Durable pgwire
+    /// writes use `add_table_durably`.
     pub fn add_table(&self, table: CatalogTable) -> bool {
         let mut inner = self.inner.write().unwrap();
         if inner.tables.contains_key(&table.name) {
@@ -1495,32 +1499,72 @@ impl CatalogStubs {
         drop(inner);
         self.invalidate_projection_caches();
 
-        let cols = table
+        self.persist_mutations(vec![Self::table_mutation(&table)]);
+        true
+    }
+
+    /// Persist a table definition before publishing it to pgwire-visible state.
+    pub async fn add_table_durably(&self, table: CatalogTable) -> Result<bool, String> {
+        let _edit = self.table_edit_lock.lock().await;
+        if self.inner.read().unwrap().tables.contains_key(&table.name) {
+            return Ok(false);
+        }
+        let Some(store) = self.get_durable_store() else {
+            return Ok(self.add_table(table));
+        };
+
+        use rockstream_storage::catalog::CatalogStore;
+        let revision = store
+            .get_revision()
+            .await
+            .checked_add(1)
+            .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+        let txn = rockstream_storage::catalog::CatalogTxn::new(
+            revision,
+            revision,
+            vec![Self::table_mutation(&table)],
+        )
+        .map_err(|error| error.to_string())?;
+        let committed_revision = store
+            .commit_txn(txn)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        self.inner
+            .write()
+            .unwrap()
+            .tables
+            .insert(table.name.clone(), table);
+        self.set_revision(committed_revision);
+        Ok(true)
+    }
+
+    fn table_mutation(table: &CatalogTable) -> rockstream_storage::catalog::CatalogMutation {
+        let columns = table
             .columns
             .iter()
             .enumerate()
-            .map(|(i, c)| rockstream_storage::catalog::CatalogColumn {
-                name: c.name.clone(),
-                data_type: c.data_type.clone(),
-                nullable: true,
-                ordinal: (i + 1) as u32,
-            })
+            .map(
+                |(index, column)| rockstream_storage::catalog::CatalogColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: true,
+                    ordinal: (index + 1) as u32,
+                },
+            )
             .collect();
-        let tid = rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
-            "table",
-            &table.name,
-        ));
-        let cat_table = rockstream_storage::catalog::CatalogTable {
-            id: tid,
-            name: table.name.clone(),
-            namespace_id: rockstream_types::ids::NamespaceId(1),
-            columns: cols,
-            pk_cols: table.pk_cols.clone(),
-        };
-        self.persist_mutations(vec![
-            rockstream_storage::catalog::CatalogMutation::PutTable(cat_table),
-        ]);
-        true
+        rockstream_storage::catalog::CatalogMutation::PutTable(
+            rockstream_storage::catalog::CatalogTable {
+                id: rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
+                    "table",
+                    &table.name,
+                )),
+                name: table.name.clone(),
+                namespace_id: rockstream_types::ids::NamespaceId(1),
+                columns,
+                pk_cols: table.pk_cols.clone(),
+            },
+        )
     }
 
     /// Update the column list for an existing view (called after materialisation).

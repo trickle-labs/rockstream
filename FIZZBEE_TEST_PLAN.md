@@ -801,6 +801,17 @@ fail before another poll. M1–M7 do not model Kafka group assignment or source
 offsets, so this documents the external source boundary without adding an abstract
 invariant (see `docs/testing/worker-source-ack-gap-recovery.md`).
 
+Issue #298 covers the Kafka source poll-error boundary. If `poll_delta` consumes
+records and then fails decoding a record, refreshing assignment, encoding the
+next offset token, or building batches, it seeks assigned partitions back to the
+input `after` token before returning the error. A retry with that token therefore
+replays the same records instead of advancing past records from an unsuccessful
+poll. `kafka_source_exactly_once_tests::real_broker_poison_retry_keeps_the_committed_offset`
+sends valid/poison/valid records, requires two polls with the same token to
+return the same `RS-1003` error, and verifies the broker offset stays at 1.
+Kafka assignment and broker cursor state remain outside M1–M7, so this records
+the concrete source-boundary obligation without adding an abstract transition.
+
 Issue #289 qualifies the corresponding PostgreSQL logical-slot ACK gap. After
 recovery and owner acquisition, the first coordinator-driven source operation
 connects through `PostgresCdcSource::connect_pgoutput`; the real-process test

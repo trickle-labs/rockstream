@@ -506,16 +506,20 @@ impl KafkaSource {
         after: &OffsetToken,
         assigned: &BTreeSet<i32>,
     ) -> Result<(), SourceError> {
-        if after.as_bytes().is_empty() || self.last_polled.as_ref() == Some(after) {
+        if self.last_polled.as_ref() == Some(after) {
             return Ok(());
         }
-        let offsets: BTreeMap<u64, u64> = serde_json::from_slice(after.as_bytes()).map_err(|e| {
-            SourceError::PollDeltaFailed {
-                reason: format!(
-                    "[RS-4015] invalid Kafka offset token: {e}. Next steps: recover the token from the committed source epoch"
-                ),
-            }
-        })?;
+        let offsets: BTreeMap<u64, u64> = if after.as_bytes().is_empty() {
+            BTreeMap::new()
+        } else {
+            serde_json::from_slice(after.as_bytes()).map_err(|e| {
+                SourceError::PollDeltaFailed {
+                    reason: format!(
+                        "[RS-4015] invalid Kafka offset token: {e}. Next steps: recover the token from the committed source epoch"
+                    ),
+                }
+            })?
+        };
         if assigned.is_empty() {
             return Ok(());
         }
@@ -542,6 +546,18 @@ impl KafkaSource {
                     "Kafka recovery seek failed: {error}. Next steps: retry after consumer-group rebalance"
                 ),
             })?;
+        Ok(())
+    }
+
+    fn restore_poll_position(
+        &mut self,
+        after: &OffsetToken,
+        assigned: &BTreeSet<i32>,
+    ) -> Result<(), SourceError> {
+        // A failed decode may consume records before a new durable token exists.
+        self.last_polled = None;
+        self.seek_recovery_offset(after, assigned)?;
+        self.last_polled = Some(after.clone());
         Ok(())
     }
 
@@ -725,8 +741,14 @@ impl SourceConnector for KafkaSource {
         let _poll_generation = self.assignment_generation;
 
         while records.len() < effective_record_limit {
-            let Some(record) = self.next_record().await? else {
-                break;
+            let record = match self.next_record().await {
+                Ok(Some(record)) => record,
+                Ok(None) => break,
+                Err(error) => {
+                    let assigned = self.assigned_partitions.clone();
+                    self.restore_poll_position(&after, &assigned)?;
+                    return Err(error);
+                }
             };
             if !self.assigned_partitions.contains(&record.partition) {
                 let _ = self.refresh_assignment();
@@ -761,15 +783,33 @@ impl SourceConnector for KafkaSource {
             records.push(record);
         }
         self.last_poll_fill_level = usize::from(self.pending_record.is_some());
-        self.refresh_assignment()?;
-        let new_offset = OffsetToken::new(serde_json::to_vec(&offsets).map_err(|error| {
-            SourceError::PollDeltaFailed {
-                reason: format!("failed to serialize Kafka offset token: {error}"),
+        if let Err(error) = self.refresh_assignment() {
+            let assigned = self.assigned_partitions.clone();
+            self.restore_poll_position(&after, &assigned)?;
+            return Err(error);
+        }
+        let encoded_offset = match serde_json::to_vec(&offsets) {
+            Ok(offset) => offset,
+            Err(error) => {
+                let assigned = self.assigned_partitions.clone();
+                self.restore_poll_position(&after, &assigned)?;
+                return Err(SourceError::PollDeltaFailed {
+                    reason: format!("failed to serialize Kafka offset token: {error}"),
+                });
             }
-        })?);
+        };
+        let new_offset = OffsetToken::new(encoded_offset);
+        let batches = match self.build_batch(&records) {
+            Ok(batches) => batches,
+            Err(error) => {
+                let assigned = self.assigned_partitions.clone();
+                self.restore_poll_position(&after, &assigned)?;
+                return Err(error);
+            }
+        };
         self.last_polled = Some(new_offset.clone());
         Ok(PollDeltaResult {
-            batches: self.build_batch(&records)?,
+            batches,
             new_offset,
             watermark: self.current_global_watermark(),
         })

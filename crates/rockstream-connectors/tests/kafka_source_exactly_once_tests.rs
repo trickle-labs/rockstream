@@ -156,6 +156,123 @@ async fn real_broker_source_assignment_poll_and_commit() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn real_broker_poison_retry_keeps_the_committed_offset() {
+    let broker = apache::Kafka::default().start().await.unwrap();
+    let bootstrap = format!(
+        "127.0.0.1:{}",
+        broker.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
+    );
+    let topic = "source-poison-retry";
+    let admin: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    assert_eq!(
+        admin
+            .create_topics(
+                &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
+                &AdminOptions::new(),
+            )
+            .await
+            .unwrap(),
+        vec![Ok(topic.to_string())]
+    );
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    let publish = |payload: String| {
+        let producer = producer.clone();
+        async move {
+            producer
+                .send(
+                    FutureRecord::<(), _>::to(topic)
+                        .partition(0)
+                        .payload(&payload),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let mut source = KafkaSource::connect(
+        ConnectorId(102),
+        schema,
+        &bootstrap,
+        topic,
+        "source-poison-retry",
+    )
+    .unwrap();
+    let initial_payload =
+        serde_json::json!({"timestamp": 0, "values": [0], "weight": 1}).to_string();
+    publish(initial_payload).await;
+    let committed = poll_until(&mut source, OffsetToken::new(vec![]), 1)
+        .await
+        .new_offset;
+    assert_eq!(source.get_partition_offset(&committed, 0), Some(1));
+    source.commit_offset(1, committed.clone()).await.unwrap();
+
+    let valid_before = serde_json::json!({"timestamp": 1, "values": [1], "weight": 1}).to_string();
+    let valid_after = serde_json::json!({"timestamp": 3, "values": [3], "weight": 1}).to_string();
+    publish(valid_before).await;
+    publish("not-valid-json".to_string()).await;
+    publish(valid_after).await;
+
+    let first = source
+        .poll_delta(committed.clone(), 4096, 3, None)
+        .await
+        .expect_err("strict mode must reject the malformed record");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let retry = loop {
+        match source.poll_delta(committed.clone(), 4096, 3, None).await {
+            Err(error) => break error,
+            Ok(result) => {
+                assert!(
+                    result.batches.is_empty(),
+                    "retry returned records before the poison record"
+                );
+                assert_eq!(
+                    result.new_offset, committed,
+                    "empty retry poll advanced the durable token"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "retry did not reach the malformed record"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    };
+    assert_eq!(first.to_string(), retry.to_string());
+    assert!(first.to_string().contains("RS-1003"));
+    assert_eq!(source.last_committed(), Some((1, committed.clone())));
+
+    let verifier: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .set("group.id", "source-poison-retry")
+        .create()
+        .unwrap();
+    let mut partitions = TopicPartitionList::new();
+    partitions.add_partition(topic, 0);
+    let committed_offsets = verifier
+        .committed_offsets(partitions, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        committed_offsets
+            .elements()
+            .into_iter()
+            .map(|partition| (partition.partition(), partition.offset()))
+            .collect::<Vec<_>>(),
+        vec![(0, Offset::Offset(1))]
+    );
+}
+
 // =========================================================================
 // Slice 3: Commit Semantics & Crash Recovery Matrix (Table 4.3)
 // =========================================================================

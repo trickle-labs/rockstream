@@ -493,7 +493,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
         match MemTable::try_new(schema, vec![vec![]]) {
             Ok(mem_table) => {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(view.name.as_str()),
+                    datafusion::common::TableReference::from(view.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -515,7 +515,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
         match MemTable::try_new(schema, vec![vec![]]) {
             Ok(mem_table) => {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(table.name.as_str()),
+                    datafusion::common::TableReference::from(table.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -3296,11 +3296,13 @@ impl GatewayHandler {
                     detail: format!("Kafka source '{}' requires topic", source.name),
                 })?;
         let connector_id = source_view_connector_id(&source.name, view_name);
+        // Each view has its own durable offset token, so it must not share a
+        // Kafka consumer group that divides partitions between the views.
         let group_id = source
             .options
             .get("group.id")
             .or_else(|| source.options.get("group_id"))
-            .cloned()
+            .map(|configured| format!("{configured}-{connector_id}"))
             .unwrap_or_else(|| format!("rockstream-{connector_id}"));
         let mut runtime = KafkaSource::connect(
             connector_id,
@@ -5454,7 +5456,7 @@ impl GatewayHandler {
 
         // CREATE TABLE [IF NOT EXISTS] — register in catalog
         if ql.starts_with("create table ") || ql.starts_with("create table if not exists ") {
-            return Some(self.handle_create_table(q));
+            return Some(self.handle_create_table(q).await);
         }
 
         // DROP TABLE [IF EXISTS]
@@ -7330,7 +7332,7 @@ impl GatewayHandler {
             let schema = Arc::new(Schema::new(fields));
             if let Ok(mem_table) = MemTable::try_new(schema, vec![vec![]]) {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(view.name.as_str()),
+                    datafusion::common::TableReference::from(view.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -7347,7 +7349,7 @@ impl GatewayHandler {
             let schema = Arc::new(Schema::new(fields));
             if let Ok(mem_table) = MemTable::try_new(schema, vec![vec![]]) {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(table.name.as_str()),
+                    datafusion::common::TableReference::from(table.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -8696,7 +8698,7 @@ impl GatewayHandler {
         ))]
     }
 
-    fn handle_create_table<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_table<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let if_not_exists = ql.contains("if not exists");
 
@@ -8773,11 +8775,36 @@ impl GatewayHandler {
             }
         }
 
-        self.catalog.add_table(CatalogTable {
-            name: table_name.clone(),
-            columns: parsed.columns,
-            pk_cols: parsed.pk_cols,
-        });
+        match self
+            .catalog
+            .add_table_durably(CatalogTable {
+                name: table_name.clone(),
+                columns: parsed.columns,
+                pk_cols: parsed.pk_cols,
+            })
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) if if_not_exists => {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE TABLE").with_rows(0),
+                )]);
+            }
+            Ok(false) => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42P07".to_owned(),
+                    format!("relation \"{table_name}\" already exists"),
+                )))]);
+            }
+            Err(error) => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "58030".to_owned(),
+                    format!("[RS-0003] catalog write failed: {error}"),
+                )))]);
+            }
+        }
         if !parsed.generated_columns.is_empty() {
             let identity_sequences = parsed
                 .generated_columns
@@ -11104,17 +11131,29 @@ impl GatewayHandler {
             cols.clone()
         };
         if self.catalog.get_table(&table).is_none() && !insert_cols.is_empty() {
-            self.catalog.add_table(CatalogTable {
-                name: table.clone(),
-                columns: insert_cols
-                    .iter()
-                    .map(|c| CatalogColumn {
-                        name: c.clone(),
-                        data_type: "Utf8".to_string(),
-                    })
-                    .collect(),
-                pk_cols: vec![],
-            });
+            if let Err(error) = self
+                .catalog
+                .add_table_durably(CatalogTable {
+                    name: table.clone(),
+                    columns: insert_cols
+                        .iter()
+                        .map(|c| CatalogColumn {
+                            name: c.clone(),
+                            data_type: "Utf8".to_string(),
+                        })
+                        .collect(),
+                    pk_cols: vec![],
+                })
+                .await
+            {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "58030".to_owned(),
+                        format!("[RS-0003] catalog write failed: {error}"),
+                    ),
+                )))]);
+            }
         }
         let metadata = self
             .table_insert_metadata
@@ -15135,7 +15174,9 @@ fn collect_query_relations(
         SetExpr::Select(select) => {
             for projection in &select.projection {
                 match projection {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    SelectItem::UnnamedExpr(expr)
+                    | SelectItem::ExprWithAlias { expr, .. }
+                    | SelectItem::ExprWithAliases { expr, .. } => {
                         visit_expr(expr, relations, top_level_relation, top_level_relation_full);
                     }
                     SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {}
