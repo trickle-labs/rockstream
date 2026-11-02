@@ -13,6 +13,7 @@ ignore = [
     "RUSTSEC-2026-0391", # zstd 0.13 remains in Arrow/DataFusion 53/58; inspected paths use bulk APIs, while RockStream's direct zstd dependency is patched 0.14.3
     "RUSTSEC-2026-0398", # zstd-safe 7 remains in Arrow/DataFusion 53/58 without the seekable feature that exposes the affected API
     "RUSTSEC-2026-0403", # zstd-safe 7 remains in Arrow/DataFusion bulk paths, which RustSec marks unaffected; async codecs and direct use are on patched zstd-safe 8.2.0
+    "RUSTSEC-2026-0435", # thrift 0.17 is confined to Parquet 58's legacy format API and parquet-layout tool, unused by RockStream/DataFusion 54
     "RUSTSEC-2024-0449", # unsafe-libyaml - pre-existing serde_yaml dependency; unmaintained, no reported vulnerability
 ]
 
