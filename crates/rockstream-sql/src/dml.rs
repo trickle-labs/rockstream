@@ -732,15 +732,21 @@ fn extract_object_name(name: &ObjectName) -> String {
 
 fn extract_returning(returning: &Option<Vec<SelectItem>>) -> Option<Vec<String>> {
     returning.as_ref().map(|items| {
-        items
-            .iter()
-            .map(|item| match item {
-                SelectItem::Wildcard(_) => "*".to_string(),
-                SelectItem::UnnamedExpr(expr) => expr.to_string(),
-                SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-                SelectItem::QualifiedWildcard(prefix, _) => format!("{prefix}.*"),
-            })
-            .collect()
+        let mut columns = Vec::new();
+        for item in items {
+            match item {
+                SelectItem::Wildcard(_) => columns.push("*".to_string()),
+                SelectItem::UnnamedExpr(expr) => columns.push(expr.to_string()),
+                SelectItem::ExprWithAlias { alias, .. } => columns.push(alias.value.clone()),
+                SelectItem::ExprWithAliases { aliases, .. } => {
+                    columns.extend(aliases.iter().map(|alias| alias.value.clone()));
+                }
+                SelectItem::QualifiedWildcard(prefix, _) => {
+                    columns.push(format!("{prefix}.*"));
+                }
+            }
+        }
+        columns
     })
 }
 
@@ -846,16 +852,26 @@ pub fn parse_dml_statement(sql: &str) -> Result<DmlStatement, SqlError> {
                 .next_back()
                 .unwrap_or("")
                 .to_string();
-            let col_names = columns.into_iter().map(|c| c.value).collect();
+            let col_names = columns
+                .into_iter()
+                .map(|column| {
+                    column
+                        .0
+                        .last()
+                        .and_then(|part| part.as_ident())
+                        .map(|ident| ident.value.clone())
+                        .unwrap_or_else(|| column.to_string())
+                })
+                .collect();
 
             let mut values = Vec::new();
             if let Some(query) = source {
                 if let SetExpr::Values(v) = *query.body {
                     for row in v.rows {
-                        for expr in &row {
+                        for expr in &row.content {
                             check_expr_depth(expr, 1, MAX_EXPR_DEPTH)?;
                         }
-                        values.push(row);
+                        values.push(row.content);
                     }
                 } else {
                     return Err(SqlError::UnsupportedPlanNode {

@@ -493,7 +493,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
         match MemTable::try_new(schema, vec![vec![]]) {
             Ok(mem_table) => {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(view.name.as_str()),
+                    datafusion::common::TableReference::from(view.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -515,7 +515,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
         match MemTable::try_new(schema, vec![vec![]]) {
             Ok(mem_table) => {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(table.name.as_str()),
+                    datafusion::common::TableReference::from(table.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -7332,7 +7332,7 @@ impl GatewayHandler {
             let schema = Arc::new(Schema::new(fields));
             if let Ok(mem_table) = MemTable::try_new(schema, vec![vec![]]) {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(view.name.as_str()),
+                    datafusion::common::TableReference::from(view.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -7349,7 +7349,7 @@ impl GatewayHandler {
             let schema = Arc::new(Schema::new(fields));
             if let Ok(mem_table) = MemTable::try_new(schema, vec![vec![]]) {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(table.name.as_str()),
+                    datafusion::common::TableReference::from(table.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -15174,7 +15174,9 @@ fn collect_query_relations(
         SetExpr::Select(select) => {
             for projection in &select.projection {
                 match projection {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    SelectItem::UnnamedExpr(expr)
+                    | SelectItem::ExprWithAlias { expr, .. }
+                    | SelectItem::ExprWithAliases { expr, .. } => {
                         visit_expr(expr, relations, top_level_relation, top_level_relation_full);
                     }
                     SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {}
