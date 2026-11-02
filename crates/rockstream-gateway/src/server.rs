@@ -55,13 +55,13 @@ use pgwire::messages::copy::{
     CopyData, CopyData as MsgCopyData, CopyDone, CopyDone as MsgCopyDone, CopyFail,
     CopyOutResponse as MsgCopyOutResponse,
 };
-use pgwire::messages::data::{DataRow, RowDescription};
+use pgwire::messages::data::RowDescription;
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Parse, ParseComplete, PortalSuspended,
     TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
 };
 use pgwire::messages::response::{
-    CommandComplete, EmptyQueryResponse, ErrorResponse, NoticeResponse,
+    CommandComplete, EmptyQueryResponse, NoticeResponse,
 };
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::startup::{BackendKeyData, ParameterStatus};
