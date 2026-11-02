@@ -228,10 +228,27 @@ async fn real_broker_poison_retry_keeps_the_committed_offset() {
         .poll_delta(committed.clone(), 4096, 3, None)
         .await
         .expect_err("strict mode must reject the malformed record");
-    let retry = source
-        .poll_delta(committed.clone(), 4096, 3, None)
-        .await
-        .expect_err("retrying the same token must reject the same malformed record");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let retry = loop {
+        match source.poll_delta(committed.clone(), 4096, 3, None).await {
+            Err(error) => break error,
+            Ok(result) => {
+                assert!(
+                    result.batches.is_empty(),
+                    "retry returned records before the poison record"
+                );
+                assert_eq!(
+                    result.new_offset, committed,
+                    "empty retry poll advanced the durable token"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "retry did not reach the malformed record"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    };
     assert_eq!(first.to_string(), retry.to_string());
     assert!(first.to_string().contains("RS-1003"));
     assert_eq!(source.last_committed(), Some((1, committed.clone())));

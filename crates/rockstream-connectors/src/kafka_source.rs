@@ -557,6 +557,7 @@ impl KafkaSource {
         // A failed decode may consume records before a new durable token exists.
         self.last_polled = None;
         self.seek_recovery_offset(after, assigned)?;
+        self.last_polled = Some(after.clone());
         Ok(())
     }
 
