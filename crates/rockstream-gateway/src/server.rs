@@ -37,24 +37,33 @@ use pgwire::api::copy::{
     send_copy_both_response, send_copy_in_response, send_copy_out_response, CopyHandler,
 };
 use pgwire::api::portal::Portal;
-use pgwire::api::query::{send_execution_response, ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::query::{
+    send_execution_response, send_ready_for_query, ExtendedQueryHandler, SimpleQueryHandler,
+};
 use pgwire::api::results::{
     CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
     FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireServerHandlers, Type};
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers,
+    Type,
+};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{
     CopyData, CopyData as MsgCopyData, CopyDone, CopyDone as MsgCopyDone, CopyFail,
     CopyOutResponse as MsgCopyOutResponse,
 };
+use pgwire::messages::data::{DataRow, RowDescription};
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Parse, ParseComplete, PortalSuspended,
     TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
 };
-use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, NoticeResponse};
+use pgwire::messages::response::{
+    CommandComplete, EmptyQueryResponse, ErrorResponse, NoticeResponse,
+};
+use pgwire::messages::simplequery::Query;
 use pgwire::messages::startup::{BackendKeyData, ParameterStatus};
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
@@ -13687,13 +13696,109 @@ impl CopyHandler for GatewayHandler {
 
 // ── Handler factory ───────────────────────────────────────────────────────────
 
+struct DefaultGatewaySimpleQueryHandler(Arc<GatewayHandler>);
+
+#[async_trait]
+impl SimpleQueryHandler for DefaultGatewaySimpleQueryHandler {
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        client: &mut C,
+        query: &'a str,
+    ) -> PgWireResult<Vec<Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        <GatewayHandler as SimpleQueryHandler>::do_query(&self.0, client, query).await
+    }
+}
+
+struct GatewaySimpleQueryHandler(Arc<GatewayHandler>);
+
+#[async_trait]
+impl SimpleQueryHandler for GatewaySimpleQueryHandler {
+    async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let normalized = query.query.trim().to_ascii_lowercase();
+        if normalized != "subscribe" && !normalized.starts_with("subscribe ") {
+            return DefaultGatewaySimpleQueryHandler(self.0.clone())
+                .on_query(client, query)
+                .await;
+        }
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+
+        let mut transaction_status = client.transaction_status();
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        for response in
+            <GatewayHandler as SimpleQueryHandler>::do_query(&self.0, client, &query.query).await?
+        {
+            match response {
+                Response::Query(results) => {
+                    let schema = results.row_schema();
+                    let row_description =
+                        RowDescription::new(schema.iter().map(Into::into).collect());
+                    client
+                        .send(PgWireBackendMessage::RowDescription(row_description))
+                        .await?;
+                    let command_tag = results.command_tag().to_owned();
+                    let mut data_rows = results.data_rows();
+                    let mut row_count = 0;
+                    // SUBSCRIBE stays open, so feed() would buffer its rows until CommandComplete.
+                    while let Some(row) = data_rows.next().await {
+                        client.send(PgWireBackendMessage::DataRow(row?)).await?;
+                        row_count += 1;
+                    }
+                    send_execution_response(client, Tag::new(&command_tag).with_rows(row_count))
+                        .await?;
+                }
+                Response::Error(error) => {
+                    client
+                        .feed(PgWireBackendMessage::ErrorResponse((*error).into()))
+                        .await?;
+                    transaction_status = transaction_status.to_error_state();
+                }
+                _ => {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "XX000".to_owned(),
+                        "unexpected response to SUBSCRIBE".to_owned(),
+                    ))));
+                }
+            }
+        }
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client.set_transaction_status(transaction_status);
+        send_ready_for_query(client, transaction_status).await
+    }
+
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        client: &mut C,
+        query: &'a str,
+    ) -> PgWireResult<Vec<Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        <GatewayHandler as SimpleQueryHandler>::do_query(&self.0, client, query).await
+    }
+}
+
 struct GatewayHandlerFactory {
     handler: Arc<GatewayHandler>,
 }
 
 impl PgWireServerHandlers for GatewayHandlerFactory {
     type StartupHandler = GatewayHandler;
-    type SimpleQueryHandler = GatewayHandler;
+    type SimpleQueryHandler = GatewaySimpleQueryHandler;
     type ExtendedQueryHandler = GatewayHandler;
     type CopyHandler = GatewayHandler;
     type ErrorHandler = NoopErrorHandler;
@@ -13702,7 +13807,7 @@ impl PgWireServerHandlers for GatewayHandlerFactory {
         self.handler.clone()
     }
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
-        self.handler.clone()
+        Arc::new(GatewaySimpleQueryHandler(self.handler.clone()))
     }
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
         self.handler.clone()
