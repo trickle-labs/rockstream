@@ -538,7 +538,11 @@ pub async fn start_gateway_with_shard_and_catalog(
 fn validate_auth_mode(auth_mode: &str) -> Result<(), CliError> {
     let mode = auth_mode.trim().to_lowercase();
     let (message, next_steps) = match mode.as_str() {
-        "" | "off" => return Ok(()),
+        "off" => return Ok(()),
+        "" => (
+            "authentication mode is empty".to_string(),
+            "Set [auth].mode to `off` to explicitly disable client authentication.",
+        ),
         "scram" | "md5" => (
             format!("authentication mode `{mode}` is unavailable: no durable role store is configured"),
             "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
@@ -2753,6 +2757,27 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "RS-0002 authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured\n  next steps: This mode is unavailable; use --auth=off only where unauthenticated access is acceptable."
+        );
+        assert!(!storage.exists());
+    }
+
+    #[test]
+    fn empty_configured_auth_mode_fails_before_startup_side_effects() {
+        let parent = tempfile::tempdir().unwrap();
+        let storage = parent.path().join("empty-auth");
+        let mut node_config =
+            rockstream_types::config::NodeConfig::from(&RockstreamConfig::default());
+        node_config.auth.mode.clear();
+        let opts = StartOptions {
+            storage: storage.clone(),
+            node_config: Some(node_config),
+            ..StartOptions::default()
+        };
+
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RS-0002 authentication mode is empty\n  next steps: Set [auth].mode to `off` to explicitly disable client authentication."
         );
         assert!(!storage.exists());
     }
