@@ -217,9 +217,9 @@ pub enum Command {
         #[arg(long)]
         control: Option<String>,
 
-        /// Authentication mode.
-        #[arg(long, value_enum, default_value_t = AuthMode::Off)]
-        auth: AuthMode,
+        /// Authentication mode. Only `off` is available; other modes fail closed.
+        #[arg(long, value_enum)]
+        auth: Option<AuthMode>,
 
         /// Stable same-host identity advertised during worker registration.
         #[arg(long)]

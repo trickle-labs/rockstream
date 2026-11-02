@@ -1663,7 +1663,7 @@ Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| auth | — | --auth | AUTH | no | off | off, scram, md5, oidc, mtls | Authentication mode |
+| auth | — | --auth | AUTH | no | config (`off`) | off (available), scram/md5/oidc/mtls (unavailable) | Omitted uses `[auth].mode`; only `off` is configured, and other modes fail closed with RS-0002 before gateway startup. |
 | availability_zone | — | --availability-zone | AVAILABILITY_ZONE | no | — | — | Availability zone advertised during worker registration |
 | checkpoint_retention_count | — | --checkpoint-retention-count | CHECKPOINT_RETENTION_COUNT | no | — | — |  |
 | control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker and frontier roles) |

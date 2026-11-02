@@ -21,3 +21,11 @@
 | storage.base_dir | String | ./data | ROCKSTREAM_STORAGE_DIR | false | rockstream-storage | Local filesystem storage directory root |
 | storage.object_store_url | Option<String> | None | ROCKSTREAM_OBJECT_STORE_URL | false | rockstream-storage | Object store bucket URL (e.g. s3://bucket or minio://bucket) |
 
+## Gateway authentication
+
+The node configuration `[auth].mode` defaults to `off`. An explicit
+`rockstream start --auth` value overrides the configured mode; when the flag is
+omitted, the configured value is used. Only `off` is currently available for
+gateway client authentication. Selecting `scram`, `md5`, `oidc`, or `mtls` in
+the configuration or CLI returns `RS-0002` before gateway startup.
+
