@@ -217,7 +217,7 @@ pub enum Command {
         #[arg(long)]
         control: Option<String>,
 
-        /// Authentication mode. Only `off` is available; other modes fail closed.
+        /// Authentication mode. Only `off` is available; others fail closed. Omitted uses `[auth].mode`.
         #[arg(long, value_enum)]
         auth: Option<AuthMode>,
 

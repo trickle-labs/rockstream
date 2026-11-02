@@ -2,6 +2,7 @@
 
 | Key | Type | Default | Environment | Deprecated | Source | Description |
 | --- | --- | --- | --- | --- | --- | --- |
+| auth.mode | String | off | ROCKSTREAM_AUTH_MODE | false | rockstream-types::config::AuthSection | Explicit --auth overrides this mode; omitted uses it. Only off is currently available; other modes return RS-0002 before gateway startup. |
 | autotuner.compression_disable_hysteresis_windows | usize | 2 | ROCKSTREAM_AUTOTUNER_COMPRESSION_DISABLE_HYSTERESIS_WINDOWS | false | rockstream-types::config::AutotunerConfig | Windows of high CPU before disabling direct compression |
 | autotuner.compression_reenable_hysteresis_windows | usize | 4 | ROCKSTREAM_AUTOTUNER_COMPRESSION_REENABLE_HYSTERESIS_WINDOWS | false | rockstream-types::config::AutotunerConfig | Windows of low CPU before re-enabling direct compression |
 | autotuner.default_parallelism | usize | 4 | ROCKSTREAM_AUTOTUNER_DEFAULT_PARALLELISM | false | rockstream-types::config::AutotunerConfig | Default operator execution parallelism |
@@ -20,12 +21,4 @@
 | skew_split.max_skew_buckets | u16 | 16 | ROCKSTREAM_SKEW_SPLIT_MAX_SKEW_BUCKETS | false | rockstream-types::config::SkewSplitConfig | Maximum number of sub-buckets per skewed key |
 | storage.base_dir | String | ./data | ROCKSTREAM_STORAGE_DIR | false | rockstream-storage | Local filesystem storage directory root |
 | storage.object_store_url | Option<String> | None | ROCKSTREAM_OBJECT_STORE_URL | false | rockstream-storage | Object store bucket URL (e.g. s3://bucket or minio://bucket) |
-
-## Gateway authentication
-
-The node configuration `[auth].mode` defaults to `off`. An explicit
-`rockstream start --auth` value overrides the configured mode; when the flag is
-omitted, the configured value is used. Only `off` is currently available for
-gateway client authentication. Selecting `scram`, `md5`, `oidc`, or `mtls` in
-the configuration or CLI returns `RS-0002` before gateway startup.
 
