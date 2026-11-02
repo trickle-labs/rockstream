@@ -562,6 +562,21 @@ mod tests {
     }
 
     #[test]
+    fn analyze_marks_missing_worker_stats_unavailable() {
+        let text = explain_incremental_analyze_for_operators(
+            "orders_view",
+            &[(Some(OperatorId(11)), "Aggregate", "SUM(amount)")],
+            &[],
+            false,
+        );
+
+        assert_eq!(
+            text,
+            "EXPLAIN INCREMENTAL ANALYZE\n──────────────────────────────────────────────────────\nView[orders_view]\nLive worker statistics unavailable\n  Aggregate[op=11] SUM(amount)  [statistics unavailable]\n"
+        );
+    }
+
+    #[test]
     fn explain_source_shows_stateless() {
         let plan = PlanNode::Source {
             name: "t".to_string(),

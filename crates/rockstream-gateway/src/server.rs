@@ -6162,10 +6162,17 @@ impl GatewayHandler {
                             &sink_plan,
                             &table_schemas,
                         ) {
+                            let parse_operator_id =
+                                |value: &str| -> Option<rockstream_types::ids::OperatorId> {
+                                    value
+                                        .strip_prefix("op-")?
+                                        .parse::<u64>()
+                                        .ok()
+                                        .map(rockstream_types::ids::OperatorId)
+                                };
                             let operator_ids: Vec<_> = operators
                                 .iter()
-                                .filter_map(|operator| operator.op_id.parse::<u64>().ok())
-                                .map(rockstream_types::ids::OperatorId)
+                                .filter_map(|operator| parse_operator_id(&operator.op_id))
                                 .collect();
                             let stats = if let Some(data_plane) = &self.distributed_data_plane {
                                 data_plane
@@ -6189,11 +6196,7 @@ impl GatewayHandler {
                                 .iter()
                                 .map(|operator| {
                                     (
-                                        operator
-                                            .op_id
-                                            .parse::<u64>()
-                                            .ok()
-                                            .map(rockstream_types::ids::OperatorId),
+                                        parse_operator_id(&operator.op_id),
                                         operator.kind.as_str(),
                                         operator.details.as_str(),
                                     )

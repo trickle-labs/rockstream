@@ -2,13 +2,18 @@
 
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio_postgres::NoTls;
 
 use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable, CatalogView};
 use rockstream_gateway::server::GatewayServer;
 use rockstream_gateway::view_reader::ViewReadStrategy;
 use rockstream_gateway::GatewayError;
+use rockstream_runtime::data_plane::DataPlaneClient;
+use rockstream_types::explain::{IdentifiedOperatorStats, OperatorStats};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::topology::{ControlMessage, WorkerMessage};
 
 static OPSTATS_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -129,6 +134,155 @@ async fn test_explain_analyze_opstats_aggregate() {
         "output: {plan_output}"
     );
     assert!(!plan_output.contains("rows/s="), "output: {plan_output}");
+}
+
+#[tokio::test]
+async fn test_explain_analyze_uses_distributed_stats_for_each_view_and_operator() {
+    let _guard = OPSTATS_TEST_LOCK.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = listener.local_addr().unwrap().to_string();
+    let worker_responder = tokio::spawn(async move {
+        let mut responses = Vec::new();
+        for base_rows in [10_u64, 20] {
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("gateway did not request worker statistics")
+                .unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).await.unwrap() > 0);
+            let WorkerMessage::ReadOperatorStats {
+                request_id,
+                workload_id,
+                operator_ids,
+            } = serde_json::from_str(&line).unwrap()
+            else {
+                panic!("gateway did not request operator statistics");
+            };
+            assert!(
+                !operator_ids.is_empty(),
+                "expected a stateful plan operator"
+            );
+            let mut sorted_ids = operator_ids.clone();
+            sorted_ids.sort();
+            let expected: Vec<_> = sorted_ids
+                .iter()
+                .enumerate()
+                .map(|(idx, operator_id)| (*operator_id, base_rows + idx as u64))
+                .collect();
+            let mut stats: Vec<_> = expected
+                .iter()
+                .map(|(operator_id, rows_per_s)| IdentifiedOperatorStats {
+                    operator_id: *operator_id,
+                    stats: OperatorStats {
+                        rows_per_s: *rows_per_s as f64,
+                        state_reads: *rows_per_s,
+                        rmw_ratio: 0.5,
+                        p99_latency_ms: *rows_per_s as f64,
+                        dlq_entries: *rows_per_s,
+                    },
+                    rmw_avoided: 1,
+                    rmw_required: 1,
+                })
+                .collect();
+            stats.reverse();
+            let response = ControlMessage::OperatorStatsSnapshot {
+                request_id,
+                available: true,
+                stats,
+            };
+            let mut response_line = serde_json::to_string(&response).unwrap();
+            response_line.push('\n');
+            write.write_all(response_line.as_bytes()).await.unwrap();
+            responses.push((workload_id, expected));
+        }
+        responses
+    });
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "base".to_string(),
+        columns: vec![
+            CatalogColumn {
+                name: "k".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            CatalogColumn {
+                name: "v".to_string(),
+                data_type: "Int64".to_string(),
+            },
+        ],
+        pk_cols: vec![],
+    });
+    for name in ["view_a", "view_b"] {
+        catalog.add_view(CatalogView {
+            name: name.to_string(),
+            sql: "SELECT k, SUM(v) FROM base GROUP BY k".to_string(),
+            columns: vec![
+                CatalogColumn {
+                    name: "k".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                CatalogColumn {
+                    name: "sum".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+            ],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+    }
+
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(DummyViewReader),
+    )
+    .with_distributed_data_plane(DataPlaneClient::new(control_addr), "/tmp/operator-stats");
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+    let mut outputs = Vec::new();
+    for view_name in ["view_a", "view_b"] {
+        let messages = client
+            .simple_query(&format!("EXPLAIN INCREMENTAL ANALYZE {view_name}"))
+            .await
+            .unwrap();
+        outputs.push(
+            data_rows_from(&messages)
+                .iter()
+                .filter_map(|row| row.first().and_then(|value| value.clone()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    let responses = worker_responder.await.unwrap();
+    assert_ne!(responses[0].0, responses[1].0);
+    assert!(responses[0].1.iter().all(|(operator_id, _)| !responses[1]
+        .1
+        .iter()
+        .any(|(other_id, _)| operator_id == other_id)));
+    for ((view_name, output), (_, expected)) in
+        ["view_a", "view_b"].into_iter().zip(outputs).zip(responses)
+    {
+        assert!(output.contains(&format!("View[{view_name}]")), "{output}");
+        assert!(
+            !output.contains("Live worker statistics unavailable"),
+            "{output}"
+        );
+        for (operator_id, rows_per_s) in expected {
+            let line = output
+                .lines()
+                .find(|line| line.contains(&format!("op={}]", operator_id.0)))
+                .unwrap_or_else(|| panic!("missing operator {} in {output}", operator_id.0));
+            assert!(
+                line.contains(&format!("rows/s={rows_per_s}")),
+                "wrong statistic for operator {}: {line}",
+                operator_id.0
+            );
+        }
+    }
 }
 
 #[tokio::test]
