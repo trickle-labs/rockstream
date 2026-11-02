@@ -167,6 +167,7 @@ struct DrainState {
 struct DataPlaneState {
     deployments: HashMap<WorkloadId, DeploymentState>,
     source_waiters: HashMap<String, SourceWaiter>,
+    operator_stats_waiters: HashMap<String, OperatorStatsWaiter>,
 }
 
 struct DeploymentState {
@@ -182,6 +183,17 @@ struct SourceWaiter {
     expected: usize,
     received: usize,
     epoch: u64,
+}
+
+struct OperatorStatsWaiter {
+    workload_id: WorkloadId,
+    expected_workers: HashSet<WorkerId>,
+    received_workers: HashSet<WorkerId>,
+    operator_ids: HashSet<rockstream_types::ids::OperatorId>,
+    sender: mpsc::Sender<(
+        WorkerId,
+        Vec<rockstream_types::explain::IdentifiedOperatorStats>,
+    )>,
 }
 
 /// Convert the internal [`RaftRole`] to its wire-serializable mirror.
@@ -675,28 +687,9 @@ impl ControlService {
     /// Collect live operator statistics for a pipeline.
     pub fn collect_operator_stats(
         &self,
-        _pipeline_id: u64,
-    ) -> Vec<rockstream_types::explain::OperatorStats> {
-        rockstream_types::metrics::operator_runtime_report()
-            .into_iter()
-            .map(|snapshot| {
-                let (rmw_avoided, rmw_required) =
-                    rockstream_types::metrics::operator_rmw_totals(snapshot.operator_id);
-                let rmw_total = rmw_avoided + rmw_required;
-                let rmw_ratio = if rmw_total == 0 {
-                    0.0
-                } else {
-                    rmw_required as f64 / rmw_total as f64
-                };
-                rockstream_types::explain::OperatorStats {
-                    rows_per_s: snapshot.rows_per_s,
-                    state_reads: snapshot.state_reads,
-                    rmw_ratio,
-                    p99_latency_ms: snapshot.p99_latency_ms,
-                    dlq_entries: snapshot.dlq_entries,
-                }
-            })
-            .collect()
+        operator_ids: &[rockstream_types::ids::OperatorId],
+    ) -> Vec<rockstream_types::explain::IdentifiedOperatorStats> {
+        rockstream_types::metrics::operator_runtime_stats_for_ids(operator_ids)
     }
 }
 
@@ -2819,6 +2812,177 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
     accept_and_handle(stream, peer, ctx, None).await;
 }
 
+async fn request_operator_stats(
+    request_id: String,
+    workload_id: WorkloadId,
+    operator_ids: Vec<rockstream_types::ids::OperatorId>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+) -> ControlMessage {
+    let unavailable = || ControlMessage::OperatorStatsSnapshot {
+        request_id: request_id.clone(),
+        available: false,
+        stats: Vec::new(),
+    };
+    if operator_ids.is_empty() {
+        return unavailable();
+    }
+
+    let expected_workers = {
+        let state = data_plane.lock().await;
+        let Some(deployment) = state.deployments.get(&workload_id) else {
+            return unavailable();
+        };
+        if deployment.descriptors.is_empty()
+            || deployment.ready_shards.len() != deployment.descriptors.len()
+        {
+            return unavailable();
+        }
+        let workers: HashSet<_> = deployment
+            .descriptors
+            .values()
+            .map(|descriptor| descriptor.shard.worker_id)
+            .collect();
+        if workers.iter().any(|worker_id| {
+            !deployment
+                .workers
+                .get(worker_id)
+                .is_some_and(|status| status.ready)
+        }) {
+            return unavailable();
+        }
+        workers
+    };
+    if expected_workers.is_empty() {
+        return unavailable();
+    }
+
+    let mut worker_targets = {
+        let senders = worker_senders.lock().await;
+        expected_workers
+            .iter()
+            .filter_map(|worker_id| {
+                senders
+                    .get(worker_id)
+                    .cloned()
+                    .map(|sender| (*worker_id, sender))
+            })
+            .collect::<Vec<_>>()
+    };
+    if worker_targets.len() != expected_workers.len() {
+        return unavailable();
+    }
+    worker_targets.sort_by_key(|(worker_id, _)| *worker_id);
+
+    let (report_tx, mut report_rx) = mpsc::channel(expected_workers.len());
+    let operator_ids = operator_ids.into_iter().collect::<HashSet<_>>();
+    {
+        let mut state = data_plane.lock().await;
+        if state.operator_stats_waiters.contains_key(&request_id) {
+            return unavailable();
+        }
+        state.operator_stats_waiters.insert(
+            request_id.clone(),
+            OperatorStatsWaiter {
+                workload_id,
+                expected_workers: expected_workers.clone(),
+                received_workers: HashSet::new(),
+                operator_ids: operator_ids.clone(),
+                sender: report_tx,
+            },
+        );
+    }
+
+    let command = ControlMessage::ReadOperatorStats {
+        request_id: request_id.clone(),
+        workload_id,
+        operator_ids: operator_ids.iter().copied().collect(),
+    };
+    for (_, worker_sender) in worker_targets {
+        if worker_sender.send(command.clone()).await.is_err() {
+            data_plane
+                .lock()
+                .await
+                .operator_stats_waiters
+                .remove(&request_id);
+            return unavailable();
+        }
+    }
+
+    let reports = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut received_workers = HashSet::new();
+        let mut combined = HashMap::<
+            rockstream_types::ids::OperatorId,
+            rockstream_types::explain::IdentifiedOperatorStats,
+        >::new();
+        let mut stats_workers =
+            HashMap::<rockstream_types::ids::OperatorId, HashSet<WorkerId>>::new();
+        while received_workers.len() < expected_workers.len() {
+            let Some((worker_id, stats)) = report_rx.recv().await else {
+                break;
+            };
+            if !expected_workers.contains(&worker_id) || !received_workers.insert(worker_id) {
+                continue;
+            }
+            for stat in stats {
+                if !operator_ids.contains(&stat.operator_id) {
+                    continue;
+                }
+                stats_workers
+                    .entry(stat.operator_id)
+                    .or_default()
+                    .insert(worker_id);
+                if let Some(total) = combined.get_mut(&stat.operator_id) {
+                    total.stats.rows_per_s += stat.stats.rows_per_s;
+                    total.stats.state_reads += stat.stats.state_reads;
+                    total.stats.p99_latency_ms =
+                        total.stats.p99_latency_ms.max(stat.stats.p99_latency_ms);
+                    total.stats.dlq_entries += stat.stats.dlq_entries;
+                    total.rmw_avoided += stat.rmw_avoided;
+                    total.rmw_required += stat.rmw_required;
+                    let rmw_total = total.rmw_avoided + total.rmw_required;
+                    total.stats.rmw_ratio = if rmw_total == 0 {
+                        0.0
+                    } else {
+                        total.rmw_required as f64 / rmw_total as f64
+                    };
+                } else {
+                    combined.insert(stat.operator_id, stat);
+                }
+            }
+        }
+        (received_workers, combined, stats_workers)
+    })
+    .await;
+    data_plane
+        .lock()
+        .await
+        .operator_stats_waiters
+        .remove(&request_id);
+
+    let Ok((received_workers, mut combined, stats_workers)) = reports else {
+        return unavailable();
+    };
+    if received_workers != expected_workers || combined.is_empty() {
+        return unavailable();
+    }
+    combined.retain(|operator_id, _| {
+        stats_workers
+            .get(operator_id)
+            .is_some_and(|workers| workers.len() == expected_workers.len())
+    });
+    if combined.is_empty() {
+        return unavailable();
+    }
+    let mut stats: Vec<_> = combined.into_values().collect();
+    stats.sort_by_key(|stat| stat.operator_id);
+    ControlMessage::OperatorStatsSnapshot {
+        request_id: request_id.clone(),
+        available: true,
+        stats,
+    }
+}
+
 /// Handle a single worker connection over an arbitrary stream.
 async fn handle_connection_stream<R, W>(
     reader: R,
@@ -3118,6 +3282,58 @@ async fn handle_connection_stream<R, W>(
                     )
                     .await;
                 }
+            }
+            WorkerMessage::OperatorStatsReport {
+                request_id,
+                workload_id,
+                worker_id,
+                mut stats,
+            } => {
+                if connected_worker_id == Some(worker_id) {
+                    let report_target = {
+                        let mut state = data_plane.lock().await;
+                        state
+                            .operator_stats_waiters
+                            .get_mut(&request_id)
+                            .and_then(|waiter| {
+                                if waiter.workload_id == workload_id
+                                    && waiter.expected_workers.contains(&worker_id)
+                                    && waiter.received_workers.insert(worker_id)
+                                {
+                                    Some((waiter.sender.clone(), waiter.operator_ids.clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                    };
+                    if let Some((report_sender, operator_ids)) = report_target {
+                        stats.retain(|stat| operator_ids.contains(&stat.operator_id));
+                        let _ = report_sender.send((worker_id, stats)).await;
+                    }
+                }
+            }
+            WorkerMessage::ReadOperatorStats {
+                request_id,
+                workload_id,
+                operator_ids,
+            } => {
+                let reply = if connected_worker_id.is_none() {
+                    request_operator_stats(
+                        request_id,
+                        workload_id,
+                        operator_ids,
+                        &data_plane,
+                        &worker_senders,
+                    )
+                    .await
+                } else {
+                    ControlMessage::OperatorStatsSnapshot {
+                        request_id,
+                        available: false,
+                        stats: Vec::new(),
+                    }
+                };
+                send_message(&sender, &reply).await;
             }
             WorkerMessage::ReadWorkload { workload_id } => {
                 let snapshot = {
@@ -4351,24 +4567,25 @@ mod tests {
         metrics::inc_rmw_required(&metric_key);
 
         let svc = ControlService::new(TopologyCatalog::new());
-        let stats = svc.collect_operator_stats(0);
+        let stats = svc.collect_operator_stats(&[op_id]);
         let stat = stats
             .iter()
-            .find(|s| (s.rows_per_s - 10.0).abs() < 1e-9)
+            .find(|s| (s.stats.rows_per_s - 10.0).abs() < 1e-9)
             .expect("expected driven operator stats");
 
-        assert_ne!(stat.rows_per_s, 12500.0);
-        assert_ne!(stat.state_reads, 120);
-        assert_ne!(stat.p99_latency_ms, 12.0);
-        assert_eq!(stat.rows_per_s, 10.0);
-        assert_eq!(stat.state_reads, 30);
+        assert_eq!(stat.operator_id, op_id);
+        assert_ne!(stat.stats.rows_per_s, 12500.0);
+        assert_ne!(stat.stats.state_reads, 120);
+        assert_ne!(stat.stats.p99_latency_ms, 12.0);
+        assert_eq!(stat.stats.rows_per_s, 10.0);
+        assert_eq!(stat.stats.state_reads, 30);
         assert!(
-            (stat.rmw_ratio - 0.25).abs() < 1e-9,
+            (stat.stats.rmw_ratio - 0.25).abs() < 1e-9,
             "rmw_ratio={}",
-            stat.rmw_ratio
+            stat.stats.rmw_ratio
         );
-        assert_eq!(stat.p99_latency_ms, 15.0);
-        assert_eq!(stat.dlq_entries, 2);
+        assert_eq!(stat.stats.p99_latency_ms, 15.0);
+        assert_eq!(stat.stats.dlq_entries, 2);
 
         metrics::reset_all();
     }

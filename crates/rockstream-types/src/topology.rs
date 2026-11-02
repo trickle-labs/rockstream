@@ -298,6 +298,16 @@ pub enum ControlMessage {
     WorkloadSnapshot {
         snapshot: crate::data_plane::WorkloadSnapshot,
     },
+    ReadOperatorStats {
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        operator_ids: Vec<crate::ids::OperatorId>,
+    },
+    OperatorStatsSnapshot {
+        request_id: String,
+        available: bool,
+        stats: Vec<crate::explain::IdentifiedOperatorStats>,
+    },
     /// The topology has changed; the worker should update its view.
     TopologyChanged {
         /// Current list of healthy workers.
@@ -809,6 +819,17 @@ pub enum WorkerMessage {
     },
     ReadWorkload {
         workload_id: crate::ids::WorkloadId,
+    },
+    ReadOperatorStats {
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        operator_ids: Vec<crate::ids::OperatorId>,
+    },
+    OperatorStatsReport {
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        worker_id: WorkerId,
+        stats: Vec<crate::explain::IdentifiedOperatorStats>,
     },
     /// Periodic heartbeat with updated capacity.
     Heartbeat {

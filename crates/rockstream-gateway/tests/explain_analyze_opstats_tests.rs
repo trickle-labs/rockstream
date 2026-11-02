@@ -124,16 +124,11 @@ async fn test_explain_analyze_opstats_aggregate() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(plan_output.contains("rows/s="), "output: {plan_output}");
     assert!(
-        plan_output.contains("state_reads="),
+        plan_output.contains("Live worker statistics unavailable"),
         "output: {plan_output}"
     );
-    assert!(plan_output.contains("p99="), "output: {plan_output}");
-    assert!(
-        plan_output.contains("dlq_entries="),
-        "output: {plan_output}"
-    );
+    assert!(!plan_output.contains("rows/s="), "output: {plan_output}");
 }
 
 #[tokio::test]
@@ -207,11 +202,11 @@ async fn test_explain_analyze_opstats_join() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(plan_output.contains("rows/s="), "output: {plan_output}");
     assert!(
-        plan_output.contains("state_reads="),
+        plan_output.contains("Live worker statistics unavailable"),
         "output: {plan_output}"
     );
+    assert!(!plan_output.contains("rows/s="), "output: {plan_output}");
 }
 
 #[tokio::test]
@@ -265,7 +260,11 @@ async fn test_explain_analyze_opstats_distinct_minmax() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(plan_output.contains("rows/s="), "output: {plan_output}");
+    assert!(
+        plan_output.contains("Live worker statistics unavailable"),
+        "output: {plan_output}"
+    );
+    assert!(!plan_output.contains("rows/s="), "output: {plan_output}");
 }
 
 #[tokio::test]

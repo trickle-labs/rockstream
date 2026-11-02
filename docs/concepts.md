@@ -1268,7 +1268,9 @@ EXPLAIN INCREMENTAL VERBOSE revenue_by_region;
 **Level 3 — ANALYZE.** Adds live per-operator runtime statistics
 collected over the last 60 seconds: rows processed, state reads,
 RMW-avoidance ratio, hot groups, p99 latency, decode errors, and DLQ
-entries. Requires a live round-trip to workers.
+entries. Requires a live round-trip to the workers executing that view;
+statistics are matched by operator ID and marked unavailable when no complete
+set of recent worker samples is available.
 
 ```sql
 EXPLAIN INCREMENTAL ANALYZE revenue_by_region;

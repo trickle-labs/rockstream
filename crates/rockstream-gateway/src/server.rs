@@ -6096,15 +6096,16 @@ impl GatewayHandler {
                 (ExplainLevel::Default, false, explain_args)
             };
 
-            let normalized_sql = if target_sql.to_ascii_lowercase().starts_with("select ")
-                || target_sql.to_ascii_lowercase().starts_with("with ")
-            {
-                target_sql.to_string()
-            } else if let Some(view) = self.catalog.get_view(target_sql.trim()) {
-                view.sql
-            } else {
-                format!("SELECT * FROM {}", target_sql.trim())
-            };
+            let (normalized_sql, requested_view) =
+                if target_sql.to_ascii_lowercase().starts_with("select ")
+                    || target_sql.to_ascii_lowercase().starts_with("with ")
+                {
+                    (target_sql.to_string(), None)
+                } else if let Some(view) = self.catalog.get_view(target_sql.trim()) {
+                    (view.sql.clone(), Some(view))
+                } else {
+                    (format!("SELECT * FROM {}", target_sql.trim()), None)
+                };
 
             let frontend = self.build_explain_frontend()?;
             let explain_text = if is_estimate {
@@ -6134,18 +6135,93 @@ impl GatewayHandler {
                     .await
                     .map_err(|e| PgWireError::ApiError(Box::new(e)))?
             } else {
-                let stats = if level == ExplainLevel::Analyze {
-                    rockstream_control::ControlService::new(
-                        rockstream_control::TopologyCatalog::new(),
-                    )
-                    .collect_operator_stats(0)
+                let analyzed_view = if level == ExplainLevel::Analyze {
+                    if let Some(view) = requested_view.as_ref() {
+                        let plan = frontend
+                            .sql_to_plan_node(&normalized_sql)
+                            .await
+                            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                        let sink_plan = rockstream_plan::PlanNode::ViewSink {
+                            view_name: view.name.clone(),
+                            pk: full_row_pk(view.columns.len()),
+                            child: Box::new(plan),
+                        };
+                        let table_schemas: std::collections::HashMap<_, _> = self
+                            .catalog
+                            .list_tables()
+                            .into_iter()
+                            .map(|table| (table.name, catalog_columns_to_schema(&table.columns)))
+                            .chain(
+                                self.catalog.list_views().into_iter().map(|view| {
+                                    (view.name, catalog_columns_to_schema(&view.columns))
+                                }),
+                            )
+                            .collect();
+                        if let Ok(operators) = rockstream_ops::explain_view_op_ids(
+                            &view.name,
+                            &sink_plan,
+                            &table_schemas,
+                        ) {
+                            let operator_ids: Vec<_> = operators
+                                .iter()
+                                .filter_map(|operator| operator.op_id.parse::<u64>().ok())
+                                .map(rockstream_types::ids::OperatorId)
+                                .collect();
+                            let stats = if let Some(data_plane) = &self.distributed_data_plane {
+                                data_plane
+                                    .read_operator_stats(
+                                        WorkloadId(stable_name_id("workload", &view.name)),
+                                        operator_ids.clone(),
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            } else if self.compiled_views.contains_key(&view.name) {
+                                let local =
+                                    rockstream_types::metrics::operator_runtime_stats_for_ids(
+                                        &operator_ids,
+                                    );
+                                (!local.is_empty()).then_some(local)
+                            } else {
+                                None
+                            };
+                            let operator_lines: Vec<_> = operators
+                                .iter()
+                                .map(|operator| {
+                                    (
+                                        operator
+                                            .op_id
+                                            .parse::<u64>()
+                                            .ok()
+                                            .map(rockstream_types::ids::OperatorId),
+                                        operator.kind.as_str(),
+                                        operator.details.as_str(),
+                                    )
+                                })
+                                .collect();
+                            Some(rockstream_sql::explain_incremental_analyze_for_operators(
+                                &view.name,
+                                &operator_lines,
+                                stats.as_deref().unwrap_or_default(),
+                                stats.is_some(),
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 } else {
-                    Vec::new()
+                    None
                 };
-                frontend
-                    .explain_incremental_for_sql(&normalized_sql, level, &stats)
-                    .await
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+                if let Some(explain) = analyzed_view {
+                    explain
+                } else {
+                    frontend
+                        .explain_incremental_for_sql(&normalized_sql, level, &[])
+                        .await
+                        .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+                }
             };
 
             let schema = Arc::new(vec![FieldInfo::new(
