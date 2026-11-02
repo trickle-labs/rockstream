@@ -9,9 +9,11 @@
 //! actual shard frontiers, throughput, and arrangement sizes) is deferred to
 //! v0.9 when the runtime has a running pipeline to query.
 
+use std::collections::HashMap;
+
 use rockstream_plan::{AggregateFunc, PlanNode};
 use rockstream_types::explain::{
-    ArrangementSharingInfo, OperatorStats, ShardInfo, ViewEngineFacts,
+    ArrangementSharingInfo, IdentifiedOperatorStats, OperatorStats, ShardInfo, ViewEngineFacts,
 };
 use rockstream_types::ids::OperatorId;
 use rockstream_types::laws::weight_add::WEIGHT_ADD_ID;
@@ -83,28 +85,47 @@ pub fn explain_incremental_verbose(
     format_explain_block(&rendered)
 }
 
-pub fn explain_incremental_analyze(plan: &PlanNode, stats: &[OperatorStats]) -> String {
+pub fn explain_incremental_analyze(plan: &PlanNode, _stats: &[OperatorStats]) -> String {
     let lines = collect_plan_lines(plan);
-    let rendered = lines
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            if let Some(stat) = stats.get(idx) {
-                format!(
-                    "{}  [rows/s={:.0} state_reads={} rmw_ratio={:.2} p99={:.1}ms dlq_entries={}]",
-                    line.base_line,
-                    stat.rows_per_s,
-                    stat.state_reads,
-                    stat.rmw_ratio,
-                    stat.p99_latency_ms,
-                    stat.dlq_entries
-                )
-            } else {
-                line.base_line.clone()
-            }
-        })
-        .collect::<Vec<_>>();
-    format_explain_block(&rendered)
+    let mut rendered = vec![
+        "Live worker statistics unavailable (operator identities were not supplied)".to_string(),
+    ];
+    rendered.extend(lines.iter().map(|line| line.base_line.clone()));
+    format_explain_analyze_block(&rendered)
+}
+
+pub fn explain_incremental_analyze_for_operators(
+    view_name: &str,
+    operators: &[(Option<OperatorId>, &str, &str)],
+    stats: &[IdentifiedOperatorStats],
+    available: bool,
+) -> String {
+    let stats_by_id: HashMap<_, _> = stats.iter().map(|stat| (stat.operator_id, stat)).collect();
+    let mut rendered = vec![format!("View[{view_name}]")];
+    if !available {
+        rendered.push("Live worker statistics unavailable".to_string());
+    }
+    for (operator_id, kind, details) in operators {
+        let identity = operator_id
+            .as_ref()
+            .map(|id| format!("{kind}[op={}]", id.0))
+            .unwrap_or_else(|| (*kind).to_string());
+        let line = format!("  {identity} {details}");
+        let Some(stat) = operator_id.as_ref().and_then(|id| stats_by_id.get(id)) else {
+            rendered.push(format!("{line}  [statistics unavailable]"));
+            continue;
+        };
+        let stat = &stat.stats;
+        rendered.push(format!(
+            "{line}  [rows/s={:.0} state_reads={} rmw_ratio={:.2} p99={:.1}ms dlq_entries={}]",
+            stat.rows_per_s,
+            stat.state_reads,
+            stat.rmw_ratio,
+            stat.p99_latency_ms,
+            stat.dlq_entries
+        ));
+    }
+    format_explain_analyze_block(&rendered)
 }
 
 pub fn explain_incremental_with_arrangements(
@@ -203,7 +224,15 @@ fn collect_plan_lines(plan: &PlanNode) -> Vec<PlanExplainLine> {
 }
 
 fn format_explain_block(lines: &[String]) -> String {
-    let mut out = String::from("EXPLAIN INCREMENTAL\n");
+    format_explain_block_with_header("EXPLAIN INCREMENTAL", lines)
+}
+
+fn format_explain_analyze_block(lines: &[String]) -> String {
+    format_explain_block_with_header("EXPLAIN INCREMENTAL ANALYZE", lines)
+}
+
+fn format_explain_block_with_header(header: &str, lines: &[String]) -> String {
+    let mut out = format!("{header}\n");
     out.push_str("──────────────────────────────────────────────────────\n");
     for line in lines {
         out.push_str(line);
@@ -488,6 +517,64 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<PlanExplainLine>) 
 mod tests {
     use super::*;
     use rockstream_plan::{AggregateExpr, AggregateFunc, ExchangeKind, Expr, PlanNode};
+
+    #[test]
+    fn analyze_matches_reordered_stats_by_operator_id() {
+        let text = explain_incremental_analyze_for_operators(
+            "orders_view",
+            &[
+                (Some(OperatorId(11)), "Join", "INNER JOIN"),
+                (Some(OperatorId(22)), "Aggregate", "SUM(amount)"),
+            ],
+            &[
+                IdentifiedOperatorStats {
+                    operator_id: OperatorId(22),
+                    stats: OperatorStats {
+                        rows_per_s: 22.4,
+                        state_reads: 220,
+                        rmw_ratio: 0.22,
+                        p99_latency_ms: 2.2,
+                        dlq_entries: 2,
+                    },
+                    rmw_avoided: 78,
+                    rmw_required: 22,
+                },
+                IdentifiedOperatorStats {
+                    operator_id: OperatorId(11),
+                    stats: OperatorStats {
+                        rows_per_s: 11.4,
+                        state_reads: 110,
+                        rmw_ratio: 0.11,
+                        p99_latency_ms: 1.1,
+                        dlq_entries: 1,
+                    },
+                    rmw_avoided: 89,
+                    rmw_required: 11,
+                },
+            ],
+            true,
+        );
+
+        assert_eq!(
+            text,
+            "EXPLAIN INCREMENTAL ANALYZE\n──────────────────────────────────────────────────────\nView[orders_view]\n  Join[op=11] INNER JOIN  [rows/s=11 state_reads=110 rmw_ratio=0.11 p99=1.1ms dlq_entries=1]\n  Aggregate[op=22] SUM(amount)  [rows/s=22 state_reads=220 rmw_ratio=0.22 p99=2.2ms dlq_entries=2]\n"
+        );
+    }
+
+    #[test]
+    fn analyze_marks_missing_worker_stats_unavailable() {
+        let text = explain_incremental_analyze_for_operators(
+            "orders_view",
+            &[(Some(OperatorId(11)), "Aggregate", "SUM(amount)")],
+            &[],
+            false,
+        );
+
+        assert_eq!(
+            text,
+            "EXPLAIN INCREMENTAL ANALYZE\n──────────────────────────────────────────────────────\nView[orders_view]\nLive worker statistics unavailable\n  Aggregate[op=11] SUM(amount)  [statistics unavailable]\n"
+        );
+    }
 
     #[test]
     fn explain_source_shows_stateless() {

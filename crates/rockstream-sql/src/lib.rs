@@ -39,8 +39,9 @@ pub use estimate::{
     CapacityEstimateContext, EstimateRow,
 };
 pub use explain_incremental::{
-    explain_incremental, explain_incremental_analyze, explain_incremental_verbose,
-    explain_incremental_with_arrangements, explain_incremental_with_engine_facts,
+    explain_incremental, explain_incremental_analyze, explain_incremental_analyze_for_operators,
+    explain_incremental_verbose, explain_incremental_with_arrangements,
+    explain_incremental_with_engine_facts,
 };
 pub use extension::{IncAggregate, IncDistinct, IncJoin};
 pub use frontend::SqlFrontend;

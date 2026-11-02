@@ -1571,6 +1571,36 @@ where
                         );
                     }
                 }
+                ControlMessage::ReadOperatorStats {
+                    request_id,
+                    workload_id,
+                    operator_ids,
+                } => {
+                    let active = deployments_clone
+                        .read()
+                        .keys()
+                        .any(|(active_workload_id, _)| *active_workload_id == workload_id);
+                    let worker_id = *worker_id_clone.read();
+                    if let Some(worker_id) = worker_id {
+                        let stats = if active {
+                            rockstream_types::metrics::operator_runtime_stats_for_ids(&operator_ids)
+                        } else {
+                            Vec::new()
+                        };
+                        if msg_tx
+                            .send(WorkerMessage::OperatorStatsReport {
+                                request_id,
+                                workload_id,
+                                worker_id,
+                                stats,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(%worker_id, "operator statistics report could not be queued");
+                        }
+                    }
+                }
                 ControlMessage::ShardAssigned {
                     lease,
                     operation_id,

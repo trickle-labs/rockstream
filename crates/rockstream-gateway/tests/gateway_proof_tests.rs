@@ -3075,7 +3075,7 @@ async fn explain_incremental_matches_frontend_byte_for_byte() {
 }
 
 #[tokio::test]
-async fn explain_incremental_analyze_reflects_live_view_traffic() {
+async fn explain_incremental_analyze_does_not_report_gateway_metrics_for_inactive_view() {
     use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogView};
     use rockstream_gateway::view_reader::ViewReadStrategy;
     use rockstream_types::ids::OperatorId;
@@ -3150,20 +3150,11 @@ async fn explain_incremental_analyze_reflects_live_view_traffic() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(plan_output.contains("rows/s=2"), "output: {plan_output}");
     assert!(
-        plan_output.contains("state_reads=18"),
+        plan_output.contains("Live worker statistics unavailable"),
         "output: {plan_output}"
     );
-    assert!(plan_output.contains("p99=9.0ms"), "output: {plan_output}");
-    assert!(
-        plan_output.contains("dlq_entries=2"),
-        "output: {plan_output}"
-    );
-    assert!(
-        !plan_output.contains("rows/s=12500"),
-        "output: {plan_output}"
-    );
+    assert!(!plan_output.contains("rows/s="), "output: {plan_output}");
 
     rockstream_types::metrics::reset_all();
 }

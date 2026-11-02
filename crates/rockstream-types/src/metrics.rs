@@ -182,6 +182,8 @@ struct OperatorStatsBucket {
     rows_processed: u64,
     state_reads: u64,
     dlq_entries: u64,
+    rmw_avoided: u64,
+    rmw_required: u64,
     latency_samples_ms: Vec<u32>,
 }
 
@@ -191,6 +193,8 @@ impl OperatorStatsBucket {
         self.rows_processed = 0;
         self.state_reads = 0;
         self.dlq_entries = 0;
+        self.rmw_avoided = 0;
+        self.rmw_required = 0;
         self.latency_samples_ms.clear();
     }
 }
@@ -227,10 +231,25 @@ impl OperatorRuntimeWindow {
         }
     }
 
+    fn record_rmw(&mut self, second: u64, avoided: bool) {
+        let idx = (second % OPERATOR_STATS_WINDOW_SECS) as usize;
+        let bucket = &mut self.buckets[idx];
+        if bucket.second != second {
+            bucket.reset(second);
+        }
+        if avoided {
+            bucket.rmw_avoided += 1;
+        } else {
+            bucket.rmw_required += 1;
+        }
+    }
+
     fn snapshot(&self, operator_id: OperatorId, now_second: u64) -> OperatorRuntimeSnapshot {
         let mut rows_processed = 0_u64;
         let mut state_reads = 0_u64;
         let mut dlq_entries = 0_u64;
+        let mut rmw_avoided = 0_u64;
+        let mut rmw_required = 0_u64;
         let mut latency_samples_ms = Vec::new();
 
         for bucket in &self.buckets {
@@ -242,6 +261,8 @@ impl OperatorRuntimeWindow {
             rows_processed += bucket.rows_processed;
             state_reads += bucket.state_reads;
             dlq_entries += bucket.dlq_entries;
+            rmw_avoided += bucket.rmw_avoided;
+            rmw_required += bucket.rmw_required;
             latency_samples_ms.extend(bucket.latency_samples_ms.iter().copied());
         }
 
@@ -254,6 +275,8 @@ impl OperatorRuntimeWindow {
             state_reads,
             p99_latency_ms,
             dlq_entries,
+            rmw_avoided,
+            rmw_required,
             latency_sample_fill_level,
         }
     }
@@ -266,6 +289,8 @@ pub struct OperatorRuntimeSnapshot {
     pub state_reads: u64,
     pub p99_latency_ms: f64,
     pub dlq_entries: u64,
+    pub rmw_avoided: u64,
+    pub rmw_required: u64,
     /// Fill-level metric for the bounded latency reservoir:
     /// `<= OPERATOR_STATS_WINDOW_SECS * OPERATOR_LATENCY_SAMPLES_PER_BUCKET`.
     pub latency_sample_fill_level: usize,
@@ -856,11 +881,21 @@ pub fn read_fallback(key: &LawMetricKey) -> u64 {
 /// reading the existing stored value first (abelian group laws: WeightAdd/v1,
 /// SumCount/v1).
 pub fn inc_rmw_avoided(key: &LawMetricKey) {
+    let second = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     with_registry(|reg| {
         reg.rmw_avoided
             .entry(key.clone())
             .or_insert_with(Counter::new)
             .inc();
+        if let Some(operator_id) = key.operator_id {
+            reg.operator_runtime
+                .entry(operator_id)
+                .or_insert_with(OperatorRuntimeWindow::new)
+                .record_rmw(second, true);
+        }
     });
 }
 
@@ -870,11 +905,21 @@ pub fn inc_rmw_avoided(key: &LawMetricKey) {
 /// writing (semilattice laws: MaxRegister/v1, MinRegister/v1, HyperLogLog/v1,
 /// BloomUnion/v1 — all of which carry `not_merge_safe_reason=ExtremumRequiresRmw`).
 pub fn inc_rmw_required(key: &LawMetricKey) {
+    let second = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     with_registry(|reg| {
         reg.rmw_required
             .entry(key.clone())
             .or_insert_with(Counter::new)
             .inc();
+        if let Some(operator_id) = key.operator_id {
+            reg.operator_runtime
+                .entry(operator_id)
+                .or_insert_with(OperatorRuntimeWindow::new)
+                .record_rmw(second, false);
+        }
     });
 }
 
@@ -1021,6 +1066,40 @@ pub fn operator_runtime_report() -> Vec<OperatorRuntimeSnapshot> {
         out.sort_by_key(|row| row.operator_id.0);
         out
     })
+}
+
+/// Return only recent samples for the requested stable operator IDs.
+pub fn operator_runtime_stats_for_ids(
+    operator_ids: &[OperatorId],
+) -> Vec<crate::explain::IdentifiedOperatorStats> {
+    operator_runtime_report()
+        .into_iter()
+        .filter(|snapshot| {
+            operator_ids.contains(&snapshot.operator_id)
+                && (snapshot.latency_sample_fill_level > 0
+                    || snapshot.rmw_avoided > 0
+                    || snapshot.rmw_required > 0)
+        })
+        .map(|snapshot| {
+            let total = snapshot.rmw_avoided + snapshot.rmw_required;
+            crate::explain::IdentifiedOperatorStats {
+                operator_id: snapshot.operator_id,
+                stats: crate::explain::OperatorStats {
+                    rows_per_s: snapshot.rows_per_s,
+                    state_reads: snapshot.state_reads,
+                    rmw_ratio: if total == 0 {
+                        0.0
+                    } else {
+                        snapshot.rmw_required as f64 / total as f64
+                    },
+                    p99_latency_ms: snapshot.p99_latency_ms,
+                    dlq_entries: snapshot.dlq_entries,
+                },
+                rmw_avoided: snapshot.rmw_avoided,
+                rmw_required: snapshot.rmw_required,
+            }
+        })
+        .collect()
 }
 
 pub fn operator_rmw_totals(operator_id: OperatorId) -> (u64, u64) {
@@ -3474,6 +3553,43 @@ mod tests {
     /// concurrent test threads don't corrupt each other's `reset_all` / `inc`
     /// sequences.
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn operator_runtime_stats_filter_ids_and_expire_after_sixty_seconds() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        let recent_id = OperatorId(101);
+        let stale_id = OperatorId(202);
+        let now = SystemTime::now();
+        record_operator_runtime_sample_at(recent_id, 60, 12, Duration::from_millis(9), 2, now);
+        record_operator_runtime_sample_at(
+            stale_id,
+            120,
+            18,
+            Duration::from_millis(8),
+            3,
+            now - Duration::from_secs(61),
+        );
+
+        assert_eq!(
+            operator_runtime_stats_for_ids(&[recent_id, OperatorId(303)]),
+            vec![crate::explain::IdentifiedOperatorStats {
+                operator_id: recent_id,
+                stats: crate::explain::OperatorStats {
+                    rows_per_s: 1.0,
+                    state_reads: 12,
+                    rmw_ratio: 0.0,
+                    p99_latency_ms: 9.0,
+                    dlq_entries: 2,
+                },
+                rmw_avoided: 0,
+                rmw_required: 0,
+            }]
+        );
+
+        reset_all();
+    }
 
     fn key() -> LawMetricKey {
         LawMetricKey {

@@ -265,6 +265,15 @@ pub struct OperatorStats {
     pub dlq_entries: u64,
 }
 
+/// Windowed statistics tied to the stable runtime identity of one operator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdentifiedOperatorStats {
+    pub operator_id: crate::ids::OperatorId,
+    pub stats: OperatorStats,
+    pub rmw_avoided: u64,
+    pub rmw_required: u64,
+}
+
 // ─── ShardInfo ──────────────────────────────────────────────────────────────
 
 /// Shard-level information for `EXPLAIN INCREMENTAL VERBOSE`.

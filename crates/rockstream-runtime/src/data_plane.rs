@@ -1,12 +1,16 @@
 //! Short-lived public data-plane client.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use rockstream_types::data_plane::{DeploymentRequest, SourceDeltaRequest, WorkloadSnapshot};
 use rockstream_types::ids::WorkloadId;
 use rockstream_types::topology::{ControlMessage, WorkerMessage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+static NEXT_OPERATOR_STATS_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct DataPlaneClient {
     control_addr: String,
@@ -90,6 +94,42 @@ impl DataPlaneClient {
             {
                 Ok(snapshot)
             }
+            response => Err(Self::unexpected(response)),
+        }
+    }
+
+    pub async fn read_operator_stats(
+        &self,
+        workload_id: WorkloadId,
+        operator_ids: Vec<rockstream_types::ids::OperatorId>,
+    ) -> io::Result<Option<Vec<rockstream_types::explain::IdentifiedOperatorStats>>> {
+        let request_id = format!(
+            "{}-{}-operator-stats-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            NEXT_OPERATOR_STATS_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(7),
+            self.request(WorkerMessage::ReadOperatorStats {
+                request_id: request_id.clone(),
+                workload_id,
+                operator_ids,
+            }),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "operator stats request timed out")
+        })??;
+        match response {
+            ControlMessage::OperatorStatsSnapshot {
+                request_id: actual,
+                available,
+                stats,
+            } if actual == request_id => Ok(available.then_some(stats)),
             response => Err(Self::unexpected(response)),
         }
     }
