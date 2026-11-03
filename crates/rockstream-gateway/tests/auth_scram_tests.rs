@@ -1,4 +1,4 @@
-//! S10: Auth integration tests (SCRAM + MD5) against in-process gateway.
+//! S10: Auth integration tests against the in-process gateway.
 //! All tests require the "testcontainers" feature gate.
 
 #![cfg(feature = "testcontainers")]
@@ -154,21 +154,6 @@ async fn test_scram_startup_rejects_missing_or_empty_durable_credentials() {
     assert_scram_startup_rejects(empty_catalog).await;
 }
 
-async fn spawn_md5_gateway(roles: Vec<(&str, &str)>) -> (u16, tokio::task::JoinHandle<()>) {
-    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
-    let role_catalog = Arc::new(RoleCatalog::new());
-    for (user, pass) in roles {
-        role_catalog
-            .insert(create_role_entry(user, pass))
-            .expect("insert role");
-    }
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server =
-        GatewayServer::with_md5_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
-    let (local_addr, handle) = server.serve_background().await.unwrap();
-    (local_addr.port(), handle)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -285,19 +270,19 @@ async fn test_scram_wrong_password() {
 }
 
 #[tokio::test]
-async fn test_md5_tokio_postgres_connects() {
-    let (port, _handle) = spawn_md5_gateway(vec![("bob", "secret")]).await;
-    let (client, conn) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={port} user=bob password=secret dbname=test sslmode=disable"),
-        NoTls,
-    )
-    .await
-    .expect("MD5 connect should succeed");
-    tokio::spawn(async move {
-        conn.await.ok();
-    });
-    let rows = client.simple_query("SELECT 1").await.expect("SELECT 1");
-    assert!(!rows.is_empty());
+async fn test_md5_mode_fails_before_listener() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_md5_auth(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+        Arc::new(RoleCatalog::new()),
+    );
+    let error = server.serve_background().await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "gateway MD5 authentication is unavailable; configure SCRAM-SHA-256"
+    );
 }
 
 #[tokio::test]

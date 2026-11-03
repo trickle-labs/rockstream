@@ -55,25 +55,18 @@ fn test_cli_invalid_auth_fails_startup() {
     let err = res.unwrap_err();
     assert_eq!(
         err.to_string(),
-        "RS-0002 unknown auth mode `invalid_super_auth`\n  next steps: Pass a supported authentication mode: off, oidc, or mtls."
+        "RS-0002 unknown auth mode `invalid_super_auth`\n  next steps: Pass a supported authentication mode: off, scram, oidc, or mtls."
     );
 }
 
 #[tokio::test]
-async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_start() {
+async fn test_cli_md5_mode_fails_closed_before_storage_or_listener_start() {
     let tmp = tempfile::tempdir().unwrap();
-    for (mode, detail, next_steps) in [
-        (
-            "scram",
-            "durable principal integration is incomplete",
-            "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
-        ),
-        (
-            "md5",
-            "MD5 is not a release authentication mode",
-            "Use a release-supported authentication mode.",
-        ),
-    ] {
+    for (mode, detail, next_steps) in [(
+        "md5",
+        "MD5 is not a release authentication mode",
+        "Use a release-supported authentication mode.",
+    )] {
         let storage = tmp.path().join(mode);
         let opts = test_options(storage.clone(), mode, Some("127.0.0.1:0".to_string()));
         let err = start_gateway(&opts).await.unwrap_err();
@@ -85,6 +78,23 @@ async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_
         );
         assert!(!storage.exists(), "{mode} created gateway storage");
     }
+}
+
+#[tokio::test]
+async fn scram_mode_fails_closed_without_enabled_login() {
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = test_options(
+        tmp.path().join("scram"),
+        "scram",
+        Some("127.0.0.1:0".to_string()),
+    );
+    let error = start_gateway(&opts).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("SCRAM requires an available durable catalog with an enabled SCRAM login"),
+        "unexpected startup error: {error}"
+    );
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@
 
 | Key | Type | Default | Environment | Deprecated | Source | Description |
 | --- | --- | --- | --- | --- | --- | --- |
-| auth.mode | String | off | ROCKSTREAM_AUTH_MODE | false | rockstream-types::config::AuthSection | Explicit --auth selects a mode; OIDC and gateway mTLS require their settings. SCRAM remains unavailable until durable principal grants are enforced. |
+| auth.mode | String | off | ROCKSTREAM_AUTH_MODE | false | rockstream-types::config::AuthSection | Explicit --auth selects off, SCRAM, OIDC, or gateway mTLS. SCRAM requires an enabled durable login; OIDC and gateway mTLS require their settings. MD5 is rejected. |
 | auth.oidc_audience | Option<String> | None | ROCKSTREAM_AUTH_OIDC_AUDIENCE | false | rockstream-types::config::AuthSection | Expected audience for RS256 OIDC bearer tokens; required when auth.mode is oidc |
 | auth.oidc_issuer | Option<String> | None | ROCKSTREAM_AUTH_OIDC_ISSUER | false | rockstream-types::config::AuthSection | Expected issuer for RS256 OIDC bearer tokens; required when auth.mode is oidc |
 | auth.oidc_jwks_url | Option<String> | None | ROCKSTREAM_AUTH_OIDC_JWKS_URL | false | rockstream-types::config::AuthSection | HTTPS or loopback HTTP JWKS endpoint used to verify RS256 tokens; required when auth.mode is oidc |

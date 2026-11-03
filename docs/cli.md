@@ -55,7 +55,7 @@ Starts a RockStream node.
 | `--storage <dir>` | yes | — | Local storage directory for node state and artifacts. Created if missing. |
 | `--role <role>` | no | `all` | Node role. One of `all`, `control`, `worker`, `gateway`, `frontier`. An unrecognised role, or a role requiring `--control` when it is omitted, is rejected with `RS-0002`. |
 | `--control <url>` | no (required for `worker`/`frontier`) | — | Control service URL. Required for the `worker` and `frontier` roles; omitting it is rejected with `RS-0002`. |
-| `--auth <mode>` | no | `off` | Authentication mode. One of `off`, `oidc`, `mtls`. |
+| `--auth <mode>` | no | `off` | Authentication mode. One of `off`, `scram`, `oidc`, `mtls`; MD5 is rejected. SCRAM requires an enabled durable login. |
 | `--host-id <id>` | no | — | Stable same-host identity advertised during worker registration. |
 | `--availability-zone <az>` | no | — | Availability zone advertised during worker registration. |
 | `--metrics-addr <addr>` | no | — | Metrics HTTP server listen address. |

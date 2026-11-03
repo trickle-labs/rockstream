@@ -27,7 +27,7 @@ pub enum AuthMode {
     Oidc,  // --auth=oidc: bearer JWT validated against an RS256 JWKS
     Mtls,  // --auth=mtls: TLS client cert CN extracted
     Scram, // --auth=scram: SCRAM-SHA-256 with RoleCatalog
-    Md5,   // --auth=md5: MD5 password with RoleCatalog
+    Md5,   // Legacy mode retained for explicit startup rejection.
 }
 
 impl std::str::FromStr for AuthMode {

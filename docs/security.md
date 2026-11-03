@@ -107,9 +107,10 @@ and `ca_cert_path`; a CA-verified client certificate must map by SHA-256
 fingerprint to an enabled durable principal. Its common name alone grants no
 authority, and an unmapped certificate is rejected before application session
 creation. Internal node mTLS described below remains a separate transport
-boundary. SCRAM-SHA-256 requires an available durable principal and grant store;
-MD5 is not a release authentication mode. Implementing these startup paths does
-not satisfy the v0.73 ten-case release qualification gate by itself.
+boundary. SCRAM-SHA-256 requires a recovered durable principal store with an
+enabled SCRAM login; startup rejects an unavailable or empty store. MD5 is not
+a release authentication mode. Enabling these startup paths does not satisfy
+the v0.73 ten-case release qualification gate by itself.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 

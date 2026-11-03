@@ -216,7 +216,7 @@ pub struct StartOptions {
     pub role: String,
     /// Control service URL.
     pub control: Option<String>,
-    /// Authentication mode; `oidc` and `mtls` require configured gateway credentials.
+    /// Authentication mode; SCRAM requires a durable login, and OIDC/mTLS require configured gateway credentials.
     pub auth_mode: String,
     /// Worker locality metadata.
     pub worker_location: WorkerLocation,
@@ -644,6 +644,13 @@ pub async fn start_gateway_with_shard_and_catalog(
                 )
             })?
         }
+        "scram" => rockstream_gateway::GatewayServer::with_shard_db_and_scram_auth(
+            addr,
+            catalog,
+            view_reader,
+            shard_db,
+            Arc::new(rockstream_gateway::RoleCatalog::new()),
+        ),
         _ => {
             return Err(CliError::new(
                 RS_0002,
@@ -700,22 +707,19 @@ pub async fn start_gateway_with_shard_and_catalog(
 fn validate_auth_mode(auth_mode: &str) -> Result<(), CliError> {
     let mode = auth_mode.trim().to_lowercase();
     let (message, next_steps) = match mode.as_str() {
-        "off" | "oidc" | "mtls" => return Ok(()),
+        "off" | "scram" | "oidc" | "mtls" => return Ok(()),
         "" => (
             "authentication mode is empty".to_string(),
             "Set [auth].mode to `off` to explicitly disable client authentication.",
         ),
-        "scram" => (
-            "authentication mode `scram` is unavailable: durable principal integration is incomplete".to_string(),
-            "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
-        ),
         "md5" => (
-            "authentication mode `md5` is unavailable: MD5 is not a release authentication mode".to_string(),
+            "authentication mode `md5` is unavailable: MD5 is not a release authentication mode"
+                .to_string(),
             "Use a release-supported authentication mode.",
         ),
         _ => (
             format!("unknown auth mode `{auth_mode}`"),
-            "Pass a supported authentication mode: off, oidc, or mtls.",
+            "Pass a supported authentication mode: off, scram, oidc, or mtls.",
         ),
     };
     Err(CliError::new(RS_0002, message, next_steps))
@@ -2964,25 +2968,23 @@ mod tests {
         let err = run_start(&opts).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "RS-0002 unknown auth mode `invalid`\n  next steps: Pass a supported authentication mode: off, oidc, or mtls."
+            "RS-0002 unknown auth mode `invalid`\n  next steps: Pass a supported authentication mode: off, scram, oidc, or mtls."
         );
+    }
+
+    #[test]
+    fn scram_is_a_supported_startup_mode() {
+        assert!(validate_start_auth_modes("scram", None).is_ok());
     }
 
     #[test]
     fn unavailable_auth_modes_fail_before_startup_side_effects() {
         let parent = tempfile::tempdir().unwrap();
-        for (mode, detail, next_steps) in [
-            (
-                "scram",
-                "durable principal integration is incomplete",
-                "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
-            ),
-            (
-                "md5",
-                "MD5 is not a release authentication mode",
-                "Use a release-supported authentication mode.",
-            ),
-        ] {
+        for (mode, detail, next_steps) in [(
+            "md5",
+            "MD5 is not a release authentication mode",
+            "Use a release-supported authentication mode.",
+        )] {
             let storage = parent.path().join(mode);
             let opts = StartOptions {
                 storage: storage.clone(),

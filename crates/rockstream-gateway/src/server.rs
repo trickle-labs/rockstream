@@ -15422,6 +15422,12 @@ impl GatewayServer {
     }
 
     fn require_tls_for_auth(&self) -> std::io::Result<()> {
+        if self.handler.auth_mode == AuthMode::Md5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "gateway MD5 authentication is unavailable; configure SCRAM-SHA-256",
+            ));
+        }
         if matches!(self.handler.auth_mode, AuthMode::Oidc | AuthMode::Mtls)
             && self.tls_acceptor.is_none()
         {
@@ -15566,7 +15572,7 @@ impl GatewayServer {
         GatewayServer::from_handler(addr, handler)
     }
 
-    /// Create a gateway with MD5 auth and a pre-populated RoleCatalog.
+    /// Legacy MD5 constructor; startup rejects the selected mode.
     pub fn with_md5_auth(
         addr: std::net::SocketAddr,
         catalog: Arc<CatalogStubs>,
@@ -15594,7 +15600,7 @@ impl GatewayServer {
         GatewayServer::from_handler(addr, handler)
     }
 
-    /// Create a gateway with MD5 auth, ShardDb, and RoleCatalog.
+    /// Legacy MD5 constructor; startup rejects the selected mode.
     pub fn with_shard_db_and_md5_auth(
         addr: std::net::SocketAddr,
         catalog: Arc<CatalogStubs>,

@@ -221,7 +221,7 @@ pub enum Command {
         #[arg(long)]
         control: Option<String>,
 
-        /// Authentication mode. Only `off` is available; others fail closed. Omitted uses `[auth].mode`.
+        /// Authentication mode. SCRAM requires an enabled durable login; OIDC and mTLS require their configuration. MD5 is rejected. Omitted uses `[auth].mode`.
         #[arg(long, value_enum)]
         auth: Option<AuthMode>,
 
