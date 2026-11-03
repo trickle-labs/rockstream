@@ -46,6 +46,9 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 tonic = { workspace = true }
 tokio-postgres = { workspace = true }
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 futures = { workspace = true }
 rockstream-cli = { workspace = true }
 rockstream-docgen = { workspace = true }

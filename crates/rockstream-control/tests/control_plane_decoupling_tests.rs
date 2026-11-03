@@ -47,7 +47,11 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
     let shard_manager = ShardManager::new();
     let service = ControlService::new(catalog.clone()).with_shard_manager(shard_manager.clone());
 
-    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let handle = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     let bound_addr = handle.addr;
 
     // 1. Worker connects and registers
@@ -299,6 +303,7 @@ async fn operator_stats_round_trip_is_scoped_to_workload_and_operator_ids() {
     );
     catalog.register(&registration);
     let handle = ControlService::new(catalog)
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();

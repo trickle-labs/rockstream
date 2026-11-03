@@ -71,7 +71,11 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
             source_store.clone(),
             NodeConfig::default(),
         );
-    let control = control.start("127.0.0.1:0").await.unwrap();
+    let control = control
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     let control_url = control.addr.to_string();
     let (worker, worker_task) =
         rockstream_runtime::start_worker_client(17, &control_url, storage.path())
@@ -294,7 +298,11 @@ async fn create_backup_reconciles_persisted_exporting_record_from_manifest() {
             source.clone(),
             NodeConfig::default(),
         );
-    let running = service.start("127.0.0.1:0").await.unwrap();
+    let running = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     let mut client = ManagementServiceClient::connect(format!("http://{management_addr}"))
         .await
         .unwrap();

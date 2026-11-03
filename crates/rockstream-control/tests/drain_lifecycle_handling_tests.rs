@@ -116,7 +116,11 @@ async fn test_drain_ack_completes_drain_and_evicts_worker() {
         .with_shard_manager(manager.clone())
         .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
         .with_migration_store(Arc::new(MigrationPersistentStore::new(store)));
-    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let handle = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
 
     let mut worker_1 = register(handle.addr, 1).await;
     let mut worker_2 = register(handle.addr, 2).await;
@@ -178,7 +182,11 @@ async fn test_lifecycle_state_update_triggers_release_and_eviction() {
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
     let service = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
-    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let handle = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
 
     let mut worker = register(handle.addr, 10).await;
     manager.acquire(ShardId(50), WorkerId(10)).unwrap();
