@@ -298,12 +298,12 @@ name = "Historical and streaming reads"
 tier = "Core"
 reachability = "SUBSCRIBE over pgwire"
 dispatch = ["query_async_entry", "response_encoding"]
-proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_pgwire_dispatch"
+proof = "crates/rockstream-gateway/tests/v072_durable_subscription_publication_tests.rs::pgwire_snapshot_then_committed_deltas_match_exact_transcript"
 proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
 min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
-  { behavior = "incremental", statement = "SUBSCRIBE emits the snapshot followed by each committed delta in order.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_incremental", paired_proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_pgwire_dispatch" },
+  { behavior = "incremental", statement = "SUBSCRIBE emits the snapshot followed by each committed delta in order.", proof = "crates/rockstream-gateway/tests/v072_durable_subscription_publication_tests.rs::pgwire_snapshot_then_committed_deltas_match_exact_transcript" },
   { behavior = "backfill", statement = "A historical subscription starts from the requested committed snapshot before streaming deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_backfill" },
   { behavior = "checkpoint_recovery", statement = "Reconnecting a subscription resumes from durable committed state without duplicate rows.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_checkpoint_recovery" },
   { behavior = "state_growth", statement = "Subscription output uses a bounded delivery window and reports fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_state_growth", bound = "configured subscription delivery window", metric = "subscription_buffer_fill_ratio", on_bound = "delivery applies backpressure or returns its RS-coded resource error" },

@@ -9,6 +9,15 @@ impl ConfigContributor {
     pub fn extract() -> ConfigSurface {
         let mut options = vec![
             ConfigOptionDescriptor {
+                key: "auth.mode".to_string(),
+                data_type: "String".to_string(),
+                default_value: "off".to_string(),
+                description: "Explicit --auth overrides this mode; omitted uses it. Only off is currently available; other modes return RS-0002 before gateway startup.".to_string(),
+                deprecated: false,
+                env_var: Some("ROCKSTREAM_AUTH_MODE".to_string()),
+                source_origin: "rockstream-types::config::AuthSection".to_string(),
+            },
+            ConfigOptionDescriptor {
                 key: "autotuner.compression_disable_hysteresis_windows".to_string(),
                 data_type: "usize".to_string(),
                 default_value: "2".to_string(),

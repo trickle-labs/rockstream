@@ -222,6 +222,7 @@ pub struct SecretStore {
     audit_log: Option<Arc<FileAuditLog>>,
     in_memory: Arc<RwLock<HashMap<(u128, String), EncryptedSecret>>>,
     references: Arc<RwLock<SecretReferences>>,
+    reference_mutation_lock: tokio::sync::Mutex<()>,
     metrics: Arc<SecretStoreMetrics>,
     rotation_tx: watch::Sender<Option<SecretRotation>>,
 }
@@ -237,6 +238,7 @@ impl SecretStore {
             audit_log: None,
             in_memory: Arc::new(RwLock::new(HashMap::new())),
             references: Arc::new(RwLock::new(HashMap::new())),
+            reference_mutation_lock: tokio::sync::Mutex::new(()),
             metrics: Arc::new(SecretStoreMetrics::default()),
             rotation_tx,
         }
@@ -274,63 +276,136 @@ impl SecretStore {
     }
 
     /// Add a reference to a secret (e.g. from a source or sink).
-    pub fn add_reference(
+    pub async fn add_reference(
         &self,
         namespace_id: u128,
         secret_name: &str,
         ref_name: &str,
     ) -> Result<(), SecretStoreError> {
-        let mut refs = self.references.write();
+        let _reference_lock = self.reference_mutation_lock.lock().await;
+        let rotation = self.rotation_lock.clone().read_owned().await;
+        let secret_name = secret_name.trim();
+        let ref_name = ref_name.trim();
+        if ref_name.is_empty() {
+            return Err(SecretStoreError::ddl_invalid(
+                "secret reference name cannot be empty",
+            ));
+        }
         let key = (namespace_id, secret_name.to_string());
-        if refs.get(&key).is_some_and(|set| set.contains(ref_name)) {
-            return Ok(());
+        let mut encrypted = self
+            .get_encrypted_raw(namespace_id, secret_name)
+            .await?
+            .ok_or_else(|| SecretStoreError::not_found(secret_name))?;
+
+        {
+            let mut refs = self.references.write();
+            let known_refs = refs.entry(key.clone()).or_default();
+            known_refs.extend(encrypted.metadata.source_refs.iter().cloned());
+            if encrypted
+                .metadata
+                .source_refs
+                .iter()
+                .any(|entry| entry == ref_name)
+            {
+                let total_references = refs.values().map(HashSet::len).sum();
+                self.metrics
+                    .reference_fill_level
+                    .store(total_references, Ordering::Relaxed);
+                return Ok(());
+            }
+            encrypted.metadata.source_refs.sort();
+            encrypted.metadata.source_refs.dedup();
+            if encrypted.metadata.source_refs.len() >= MAX_SECRET_REFERENCES {
+                return Err(SecretStoreError::capacity_exceeded(
+                    "secret reference limit reached",
+                ));
+            }
+            let total_references: usize = refs.values().map(HashSet::len).sum();
+            if total_references >= MAX_TOTAL_SECRET_REFERENCES {
+                return Err(SecretStoreError::capacity_exceeded(
+                    "in-memory secret reference limit reached",
+                ));
+            }
         }
-        if refs.get(&key).map_or(0, HashSet::len) >= MAX_SECRET_REFERENCES {
-            return Err(SecretStoreError::capacity_exceeded(
-                "secret reference limit reached",
-            ));
-        }
-        let total_references: usize = refs.values().map(HashSet::len).sum();
-        if total_references >= MAX_TOTAL_SECRET_REFERENCES {
-            return Err(SecretStoreError::capacity_exceeded(
-                "in-memory secret reference limit reached",
-            ));
-        }
-        let set = refs.entry(key).or_default();
-        set.insert(ref_name.to_string());
+
+        encrypted.metadata.source_refs.push(ref_name.to_string());
+        encrypted.metadata.source_refs.sort();
+        self.put_encrypted_raw(namespace_id, secret_name, &encrypted, rotation)
+            .await?;
+
+        let mut refs = self.references.write();
+        refs.entry(key).or_default().insert(ref_name.to_string());
+        let total_references = refs.values().map(HashSet::len).sum();
         self.metrics
             .reference_fill_level
-            .store(total_references + 1, Ordering::Relaxed);
+            .store(total_references, Ordering::Relaxed);
         Ok(())
     }
 
     /// Remove a reference to a secret.
-    pub fn remove_reference(&self, namespace_id: u128, secret_name: &str, ref_name: &str) {
-        let mut refs = self.references.write();
+    pub async fn remove_reference(
+        &self,
+        namespace_id: u128,
+        secret_name: &str,
+        ref_name: &str,
+    ) -> Result<(), SecretStoreError> {
+        let _reference_lock = self.reference_mutation_lock.lock().await;
+        let rotation = self.rotation_lock.clone().read_owned().await;
+        let secret_name = secret_name.trim();
+        let ref_name = ref_name.trim();
         let key = (namespace_id, secret_name.to_string());
-        let remove_key = if let Some(set) = refs.get_mut(&key) {
-            set.remove(ref_name);
-            set.is_empty()
-        } else {
-            false
-        };
-        if remove_key {
+        let mut encrypted = self.get_encrypted_raw(namespace_id, secret_name).await?;
+        let mut persisted_refs = Vec::new();
+        if let Some(encrypted) = encrypted.as_mut() {
+            let old_len = encrypted.metadata.source_refs.len();
+            encrypted
+                .metadata
+                .source_refs
+                .retain(|entry| entry != ref_name);
+            encrypted.metadata.source_refs.sort();
+            encrypted.metadata.source_refs.dedup();
+            persisted_refs = encrypted.metadata.source_refs.clone();
+            if old_len != encrypted.metadata.source_refs.len() {
+                self.put_encrypted_raw(namespace_id, secret_name, encrypted, rotation)
+                    .await?;
+            }
+        }
+        let mut refs = self.references.write();
+        if persisted_refs.is_empty() {
             refs.remove(&key);
+        } else {
+            refs.insert(key, persisted_refs.into_iter().collect());
         }
         let total_references: usize = refs.values().map(HashSet::len).sum();
         self.metrics
             .reference_fill_level
             .store(total_references, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Get all references for a secret.
-    pub fn get_references(&self, namespace_id: u128, secret_name: &str) -> Vec<String> {
-        let refs = self.references.read();
-        refs.get(&(namespace_id, secret_name.to_string()))
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect()
+    pub async fn get_references(
+        &self,
+        namespace_id: u128,
+        secret_name: &str,
+    ) -> Result<Vec<String>, SecretStoreError> {
+        let _reference_lock = self.reference_mutation_lock.lock().await;
+        let _rotation = self.rotation_lock.read().await;
+        let secret_name = secret_name.trim();
+        let encrypted = self.get_encrypted_raw(namespace_id, secret_name).await?;
+        let mut references = encrypted
+            .map(|secret| secret.metadata.source_refs)
+            .unwrap_or_default();
+        if let Some(cached) = self
+            .references
+            .read()
+            .get(&(namespace_id, secret_name.to_string()))
+        {
+            references.extend(cached.iter().cloned());
+        }
+        references.sort();
+        references.dedup();
+        Ok(references)
     }
 
     /// Synchronously check if a secret exists in memory.
@@ -475,6 +550,7 @@ impl SecretStore {
         payload: HashMap<String, String>,
         actor: &str,
     ) -> Result<SecretMetadata, SecretStoreError> {
+        let _reference_lock = self.reference_mutation_lock.lock().await;
         let rotation = self.rotation_lock.clone().read_owned().await;
         let trimmed_name = name.trim();
         if trimmed_name.is_empty() {
@@ -534,6 +610,7 @@ impl SecretStore {
         payload: HashMap<String, String>,
         actor: &str,
     ) -> Result<SecretMetadata, SecretStoreError> {
+        let _reference_lock = self.reference_mutation_lock.lock().await;
         let rotation = self.rotation_lock.clone().read_owned().await;
         let trimmed_name = name.trim();
         let existing = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
@@ -582,9 +659,10 @@ impl SecretStore {
         name: &str,
         actor: &str,
     ) -> Result<(), SecretStoreError> {
-        let _rotation = self.rotation_lock.read().await;
+        let _reference_lock = self.reference_mutation_lock.lock().await;
+        let _rotation = self.rotation_lock.clone().read_owned().await;
         let trimmed_name = name.trim();
-        let _ = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
+        let encrypted = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
             Some(e) => e,
             None => {
                 self.record_audit(actor, "secret.drop_failed", trimmed_name, Some(RS_2420));
@@ -592,7 +670,13 @@ impl SecretStore {
             }
         };
 
-        let refs = self.get_references(namespace_id, trimmed_name);
+        let key = (namespace_id, trimmed_name.to_string());
+        let mut refs = encrypted.metadata.source_refs;
+        if let Some(cached) = self.references.read().get(&key) {
+            refs.extend(cached.iter().cloned());
+        }
+        refs.sort();
+        refs.dedup();
         if !refs.is_empty() {
             let ref_str = refs.join(", ");
             self.record_audit(actor, "secret.drop_failed", trimmed_name, Some(RS_2426));
@@ -600,6 +684,11 @@ impl SecretStore {
         }
 
         self.delete_raw(namespace_id, trimmed_name).await?;
+        self.references.write().remove(&key);
+        let total_references = self.references.read().values().map(HashSet::len).sum();
+        self.metrics
+            .reference_fill_level
+            .store(total_references, Ordering::Relaxed);
         self.record_audit(actor, "secret.dropped", trimmed_name, None);
 
         Ok(())
