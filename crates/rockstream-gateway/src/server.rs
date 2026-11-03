@@ -2627,10 +2627,6 @@ impl GatewayHandler {
         conn_id: Option<&str>,
         secret_name: &str,
     ) -> Result<Option<(PrincipalId, String)>, ()> {
-        if self.auth_mode == AuthMode::Off && self.catalog.get_durable_store().is_none() {
-            return Ok(None);
-        }
-
         let session = conn_id.and_then(|id| {
             self.sessions
                 .get(id)
@@ -2692,10 +2688,6 @@ impl GatewayHandler {
     ) -> Result<String, String> {
         let secret_name = rockstream_types::secret::secret_name_from_reference(reference)
             .ok_or_else(|| "source has an unsupported secret reference".to_string())?;
-        if self.auth_mode == AuthMode::Off && self.catalog.get_durable_store().is_none() {
-            return Ok(secret_name.to_string());
-        }
-
         let consumer_id = source.secret_consumer.ok_or_else(|| {
             "source secret reference has no durable consumer identity".to_string()
         })?;

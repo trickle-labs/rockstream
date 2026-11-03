@@ -143,31 +143,24 @@ async fn secret_ddl_negative_paths_return_actionable_codes() {
         .unwrap_err();
     assert_eq!(
         db_error_message(error),
-        "[RS-2420] secret.not_found: secret 'does_not_exist' does not exist. Next steps: verify the secret name or run CREATE SECRET to define it."
+        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
     );
 
     client
         .simple_query("CREATE SECRET in_use (TYPE = 'sasl_plain', username = 'u', password = 'p')")
         .await
         .unwrap();
-    client
+    let error = client
         .simple_query(
             "CREATE SOURCE kafka_src TYPE kafka (bootstrap_servers = 'localhost:9092', secret = 'in_use', topic = 'orders') FORMAT json",
         )
         .await
-        .unwrap();
+        .unwrap_err();
     assert_eq!(
-        catalog
-            .get_source("kafka_src")
-            .unwrap()
-            .options
-            .get("secret")
-            .map(String::as_str),
-        Some("secret://in_use")
+        db_error_message(error),
+        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
     );
-    let error = client.simple_query("DROP SECRET in_use").await.unwrap_err();
-    assert!(db_error_message(error).contains("RS-2426"));
-    client.simple_query("DROP SOURCE kafka_src").await.unwrap();
+    assert!(catalog.get_source("kafka_src").is_none());
     client.simple_query("DROP SECRET in_use").await.unwrap();
 }
 
