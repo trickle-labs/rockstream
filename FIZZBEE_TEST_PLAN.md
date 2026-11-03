@@ -890,8 +890,14 @@ frontier, lease, or durable-commit transitions and cannot prove fairness or
 RSS limits. The fixed-owner capacity/retry behavior in
 `formal/edge_quota_exhaustion.fizz` remains an abstraction, not a model of
 futures or per-channel notifier identity. This documents the formal boundary
-required by DC.2; the v0.72 resource inventory, physical memory bounds,
-producer-side pressure and release-process evidence remain incomplete.
+required by DC.2. Linux workers now report `MemAvailable / MemTotal` from
+`/proc/meminfo` when both values parse, falling back to the existing
+`sysconf` ratio otherwise; `linux_memory_headroom_uses_memavailable` checks
+the ratio. Registration and heartbeat reports feed the advisory placement
+tie-break, without reserving memory or changing shard lease transitions.
+Cgroup limits and absolute memory bounds remain outside this abstraction; the
+v0.72 resource inventory, producer-side pressure and release-process evidence
+remain incomplete.
 
 Issue #236 strengthens exchange reservation identity after channel teardown.
 An acknowledgment carries only the channel key and epoch/sequence, not a unique
