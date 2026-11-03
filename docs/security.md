@@ -157,3 +157,7 @@ Every mTLS rejection and successful CLI session writes a structured JSONL audit 
 - `security.internal_mtls_denied`: Handshake refusal with peer address, error code (`RS-2410`/`RS-2411`), and reason.
 - `cli.authenticated`: Successful administrative connection with operator CN identity.
 - `worker.registered`: Authenticated worker join with verified node identity.
+
+## First administrator preprovisioning
+
+Trusted offline deployment tooling must create the first interactive administrator before application listeners open. Use `DurableCatalogStore::preprovision_first_administrator` against the deployment's durable catalog with a unique operation ID that remains stable across retries. The principal and its grant-change audit event commit together; the audit actor is `unknown` because bootstrap has no authenticated application session. The operation rejects a nonempty security catalog, and a retry verifies the committed principal and audit record. It is not a public network operation. Catalog mutations also reject removal, disablement, or downgrade of the last active administrator.

@@ -53,7 +53,7 @@ fn policy_state(principal: &SecurityPrincipal) -> String {
 fn grant_audit(
     event_id: &str,
     operation_id: u64,
-    actor: &str,
+    actor: AuditIdentity,
     principal: &SecurityPrincipal,
     before_state: Option<String>,
     after_state: Option<String>,
@@ -62,7 +62,7 @@ fn grant_audit(
         format_version: SECURITY_AUDIT_FORMAT_VERSION,
         event_id: event_id.to_string(),
         timestamp_ms: 1,
-        actor: AuditIdentity::Verified(actor.to_string()),
+        actor,
         target: AuditField::Known(format!("principal:{}", principal.id.0)),
         scope: AuditField::Known("cluster".to_string()),
         action: SecurityAuditClass::GrantChange,
@@ -75,19 +75,30 @@ fn grant_audit(
     }
 }
 
+fn bootstrap_audit(
+    event_id: &str,
+    operation_id: u64,
+    principal: &SecurityPrincipal,
+) -> SecurityAuditRecord {
+    let mut audit = grant_audit(
+        event_id,
+        operation_id,
+        AuditIdentity::Unknown,
+        principal,
+        None,
+        Some(policy_state(principal)),
+    );
+    audit.actor = AuditIdentity::Unknown;
+    audit.correlation = AuditCorrelation::NotApplicable;
+    audit
+}
+
 #[tokio::test]
 async fn security_principal_and_correlated_audit_survive_log_snapshot_and_restart() {
     let object_store = Arc::new(InMemory::new());
     let catalog = DurableCatalogStore::new(object_store.clone(), "security");
     let administrator = admin(1, 1);
-    let audit = grant_audit(
-        "event-1",
-        101,
-        "offline-operator",
-        &administrator,
-        None,
-        Some(policy_state(&administrator)),
-    );
+    let audit = bootstrap_audit("event-1", 101, &administrator);
     let txn = CatalogTxn::new(
         1,
         101,
@@ -145,18 +156,138 @@ async fn security_principal_and_correlated_audit_survive_log_snapshot_and_restar
 }
 
 #[tokio::test]
-async fn stale_policy_change_and_last_admin_lockout_have_no_durable_effect() {
+async fn first_administrator_preprovision_is_atomic_audited_and_one_time() {
     let object_store = Arc::new(InMemory::new());
-    let catalog = DurableCatalogStore::new(object_store, "security");
-    let administrator = admin(1, 1);
-    let initial_audit = grant_audit(
-        "event-1",
-        101,
-        "offline-operator",
+    let catalog = DurableCatalogStore::new(object_store.clone(), "bootstrap");
+    let administrator = admin(77, 1);
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let before_ms = now_ms();
+
+    assert_eq!(
+        catalog
+            .preprovision_first_administrator(administrator.clone(), 901)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        catalog
+            .preprovision_first_administrator(administrator.clone(), 901)
+            .await
+            .unwrap(),
+        1
+    );
+    let committed_audits = catalog.list_security_audit_records().await.unwrap();
+    let [stored_audit] = committed_audits.as_slice() else {
+        panic!("bootstrap must commit exactly one audit record");
+    };
+    let expected_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "first-admin-bootstrap:901".into(),
+        timestamp_ms: stored_audit.timestamp_ms,
+        actor: AuditIdentity::Unknown,
+        target: AuditField::Known("principal:77".into()),
+        scope: AuditField::Known("cluster".into()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known("901".into()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(policy_state(&administrator)),
+    };
+    assert!(stored_audit.timestamp_ms >= before_ms && stored_audit.timestamp_ms <= now_ms());
+    assert_eq!(committed_audits, vec![expected_audit.clone()]);
+    assert_eq!(
+        catalog.list_security_principals().await.unwrap(),
+        vec![administrator.clone()]
+    );
+
+    assert!(matches!(
+        catalog
+            .preprovision_first_administrator(admin(78, 1), 902)
+            .await,
+        Err(CatalogError::InvalidSecurityPolicy(message))
+            if message == "principal changes require an authorized grantor"
+    ));
+    assert_eq!(
+        catalog.list_security_principals().await.unwrap(),
+        vec![administrator.clone()]
+    );
+    assert_eq!(
+        catalog.list_security_audit_records().await.unwrap(),
+        vec![expected_audit.clone()]
+    );
+
+    let recovered = DurableCatalogStore::recover(object_store, "bootstrap")
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.list_security_principals().await.unwrap(),
+        vec![administrator]
+    );
+    assert_eq!(
+        recovered.list_security_audit_records().await.unwrap(),
+        vec![expected_audit]
+    );
+}
+
+#[tokio::test]
+async fn first_administrator_bootstrap_rejects_a_fabricated_verified_actor() {
+    let catalog = DurableCatalogStore::new(Arc::new(InMemory::new()), "bootstrap-actor");
+    let administrator = admin(88, 1);
+    let audit = grant_audit(
+        "fabricated-bootstrap-actor",
+        903,
+        AuditIdentity::Verified("operator".into()),
         &administrator,
         None,
         Some(policy_state(&administrator)),
     );
+    let error = catalog
+        .commit_txn(
+            CatalogTxn::new(
+                1,
+                903,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: administrator,
+                    expected_revision: None,
+                    grantor_revision: None,
+                    audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CatalogError::InvalidSecurityPolicy(message)
+            if message == "grant audit must record the permitted actor identity, target, operation, policy revision, and exact before/after state"
+    ));
+    assert_eq!(catalog.get_revision().await, 0);
+    assert_eq!(
+        catalog.list_security_principals().await.unwrap(),
+        Vec::new()
+    );
+    assert_eq!(
+        catalog.list_security_audit_records().await.unwrap(),
+        Vec::new()
+    );
+}
+
+#[tokio::test]
+async fn stale_policy_change_and_last_admin_lockout_have_no_durable_effect() {
+    let object_store = Arc::new(InMemory::new());
+    let catalog = DurableCatalogStore::new(object_store, "security");
+    let administrator = admin(1, 1);
+    let initial_audit = bootstrap_audit("event-1", 101, &administrator);
     catalog
         .commit_txn(
             CatalogTxn::new(
@@ -178,7 +309,7 @@ async fn stale_policy_change_and_last_admin_lockout_have_no_durable_effect() {
     let stale_audit = grant_audit(
         "event-stale",
         102,
-        "principal:1",
+        AuditIdentity::Verified("principal:1".into()),
         &stale,
         Some(policy_state(&administrator)),
         Some(policy_state(&stale)),
@@ -219,7 +350,7 @@ async fn stale_policy_change_and_last_admin_lockout_have_no_durable_effect() {
     let lockout_audit = grant_audit(
         "event-lockout",
         103,
-        "principal:1",
+        AuditIdentity::Verified("principal:1".into()),
         &disabled_admin,
         Some(policy_state(&administrator)),
         Some(policy_state(&disabled_admin)),
@@ -263,14 +394,7 @@ async fn ordinary_principal_cannot_self_grant_administrator_authority() {
     let object_store = Arc::new(InMemory::new());
     let catalog = DurableCatalogStore::new(object_store, "security");
     let administrator = admin(1, 1);
-    let admin_audit = grant_audit(
-        "event-1",
-        101,
-        "offline-operator",
-        &administrator,
-        None,
-        Some(policy_state(&administrator)),
-    );
+    let admin_audit = bootstrap_audit("event-1", 101, &administrator);
     catalog
         .commit_txn(
             CatalogTxn::new(
@@ -292,7 +416,7 @@ async fn ordinary_principal_cannot_self_grant_administrator_authority() {
     let ordinary_audit = grant_audit(
         "event-2",
         102,
-        "principal:1",
+        AuditIdentity::Verified("principal:1".into()),
         &ordinary,
         None,
         Some(policy_state(&ordinary)),
@@ -318,7 +442,7 @@ async fn ordinary_principal_cannot_self_grant_administrator_authority() {
     let self_grant_audit = grant_audit(
         "event-3",
         103,
-        "principal:2",
+        AuditIdentity::Verified("principal:2".into()),
         &elevated,
         Some(policy_state(&ordinary)),
         Some(policy_state(&elevated)),
@@ -359,14 +483,7 @@ async fn recovery_rejects_a_security_transaction_without_a_reachable_login() {
     let object_store = Arc::new(InMemory::new());
     let mut unreachable_admin = admin(1, 1);
     unreachable_admin.login_methods.clear();
-    let audit = grant_audit(
-        "event-invalid",
-        501,
-        "offline-operator",
-        &unreachable_admin,
-        None,
-        Some(policy_state(&unreachable_admin)),
-    );
+    let audit = bootstrap_audit("event-invalid", 501, &unreachable_admin);
     let txn = CatalogTxn::new(
         1,
         501,

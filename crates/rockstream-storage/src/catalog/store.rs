@@ -27,8 +27,8 @@ use super::{
     CatalogWorkloadEntry, CompiledPlanRecord, DependencyKind, ViewDependency,
 };
 use rockstream_types::authorization::{
-    AuditField, AuditIdentity, PermissionPreset, PolicyScope, SecurityAuditClass,
-    SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
+    AuditCorrelation, AuditField, AuditIdentity, PermissionPreset, PolicyScope, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::ids::{
     CompiledPlanId, DatabaseId, IndexId, NamespaceId, PrincipalId, SinkId, SourceId, TableId,
@@ -525,6 +525,70 @@ impl DurableCatalogStore {
         *catalog.state.write().await = recovered_state;
         Ok(catalog)
     }
+
+    /// Preprovision the first administrator from trusted offline deployment tooling.
+    ///
+    /// Call this before opening application listeners. The operation ID must be
+    /// unique for the catalog and stable across retries.
+    pub async fn preprovision_first_administrator(
+        &self,
+        principal: SecurityPrincipal,
+        operation_id: u64,
+    ) -> Result<u64, CatalogError> {
+        let revision = self.get_revision().await.checked_add(1).ok_or_else(|| {
+            invalid_security_policy("catalog revision is exhausted during administrator bootstrap")
+        })?;
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| CatalogError::Internal(format!("system clock error: {error}")))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| {
+                CatalogError::Internal("system clock exceeds audit timestamp range".into())
+            })?;
+        let audit = SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("first-admin-bootstrap:{operation_id}"),
+            timestamp_ms,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Known(format!("principal:{}", principal.id.0)),
+            scope: AuditField::Known("cluster".into()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::Known(operation_id.to_string()),
+            policy_revision: AuditField::Known(principal.revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(principal_audit_state(&principal)),
+        };
+        let txn = CatalogTxn::new(
+            revision,
+            operation_id,
+            vec![CatalogMutation::PutSecurityPrincipal {
+                principal: principal.clone(),
+                expected_revision: None,
+                grantor_revision: None,
+                audit: audit.clone(),
+            }],
+        )?;
+        self.commit_txn(txn).await?;
+
+        let persisted_principal = self.get_security_principal(principal.id).await?;
+        let audit_committed =
+            self.list_security_audit_records()
+                .await?
+                .into_iter()
+                .any(|mut record| {
+                    record.timestamp_ms = audit.timestamp_ms;
+                    record == audit
+                });
+        if persisted_principal.as_ref() != Some(&principal) || !audit_committed {
+            return Err(invalid_security_policy(
+                "bootstrap operation ID is already committed to a different catalog change",
+            ));
+        }
+        Ok(self.get_revision().await)
+    }
 }
 
 fn validate_security_mutations(
@@ -550,6 +614,8 @@ fn validate_security_mutations(
                 audit,
             } => {
                 has_principal_change = true;
+                let is_first_administrator =
+                    state.security_principals.is_empty() && expected_revision.is_none();
                 principal.validate().map_err(|error| {
                     CatalogError::InvalidSecurityPolicy(format!(
                         "invalid security principal: {error}"
@@ -615,6 +681,7 @@ fn validate_security_mutations(
                     principal.revision,
                     old.map(principal_audit_state),
                     Some(principal_audit_state(principal)),
+                    is_first_administrator,
                 )?;
                 if !audit_ids.insert(audit.event_id.as_str()) {
                     return Err(invalid_security_policy(
@@ -653,6 +720,7 @@ fn validate_security_mutations(
                     expected_revision.saturating_add(1),
                     Some(principal_audit_state(old)),
                     None,
+                    false,
                 )?;
                 if !audit_ids.insert(audit.event_id.as_str()) {
                     return Err(invalid_security_policy(
@@ -758,11 +826,17 @@ fn validate_grant_audit(
     policy_revision: u64,
     before_state: Option<String>,
     after_state: Option<String>,
+    allow_unknown_actor: bool,
 ) -> Result<(), CatalogError> {
     audit.validate().map_err(|error| {
         CatalogError::InvalidSecurityPolicy(format!("invalid grant audit record: {error}"))
     })?;
     let target = format!("principal:{}", principal_id.0);
+    let actor_is_valid = if allow_unknown_actor {
+        matches!(&audit.actor, AuditIdentity::Unknown)
+    } else {
+        matches!(&audit.actor, AuditIdentity::Verified(_))
+    };
     if audit.action != SecurityAuditClass::GrantChange
         || audit.outcome != SecurityAuditOutcome::Success
         || !matches!(&audit.target, AuditField::Known(value) if value == &target)
@@ -771,10 +845,10 @@ fn validate_grant_audit(
         || audit.policy_revision != AuditField::Known(policy_revision)
         || audit.before_state != before_state.map_or(AuditField::NotApplicable, AuditField::Known)
         || audit.after_state != after_state.map_or(AuditField::NotApplicable, AuditField::Known)
-        || !matches!(audit.actor, AuditIdentity::Verified(_))
+        || !actor_is_valid
     {
         return Err(invalid_security_policy(
-            "grant audit must record the verified actor, target, operation, policy revision, and exact before/after state",
+            "grant audit must record the permitted actor identity, target, operation, policy revision, and exact before/after state",
         ));
     }
     Ok(())
