@@ -21939,8 +21939,8 @@ mod s4_tests {
         let server = GatewayServer::with_oidc_auth(
             "127.0.0.1:0".parse().unwrap(),
             catalog,
-            reader,
-            verifier,
+            reader.clone(),
+            verifier.clone(),
         )
         .with_tls(&cert_path, &key_path, None)
         .unwrap();
@@ -22063,8 +22063,122 @@ mod s4_tests {
         assert_ne!(audit[1].event_id, audit[2].event_id);
         assert!(!audit[2].event_id.contains("bad-token"));
 
+        let unmapped_catalog = Arc::new(CatalogStubs::new());
+        let unmapped_durable = Arc::new(DurableCatalogStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            "gateway-oidc-unmapped-auth-test",
+        ));
+        unmapped_durable
+            .preprovision_first_administrator(
+                SecurityPrincipal {
+                    format_version:
+                        rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+                    id: rockstream_types::ids::PrincipalId(1),
+                    display_name: "Unrelated OIDC administrator".to_string(),
+                    enabled: true,
+                    revision: 1,
+                    login_methods: vec![LoginMethod::Oidc {
+                        issuer: "https://issuer.example".to_string(),
+                        subject: "bob".to_string(),
+                    }],
+                    preset_grants: vec![rockstream_types::authorization::ScopedPresetGrant {
+                        preset: rockstream_types::authorization::PermissionPreset::Administrator,
+                        scope: PolicyScope::Cluster,
+                    }],
+                    scoped_grants: vec![],
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        unmapped_catalog.set_durable_store(unmapped_durable.clone());
+        let unmapped_server = GatewayServer::with_oidc_auth(
+            "127.0.0.1:0".parse().unwrap(),
+            unmapped_catalog,
+            reader,
+            verifier,
+        )
+        .with_tls(&cert_path, &key_path, None)
+        .unwrap();
+        let unmapped_handler = unmapped_server.handler().clone();
+        let (unmapped_address, unmapped_server_task) =
+            unmapped_server.serve_background().await.unwrap();
+
+        let mut tcp = tokio::net::TcpStream::connect(unmapped_address)
+            .await
+            .unwrap();
+        tcp.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).await.unwrap();
+        let mut ssl_response = [0u8; 1];
+        tcp.read_exact(&mut ssl_response).await.unwrap();
+        assert_eq!(ssl_response[0], b'S');
+        let mut unmapped = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        unmapped
+            .write_all(&startup_packet(crate::auth::VALID_TOKEN))
+            .await
+            .unwrap();
+        let mut error_header = [0u8; 5];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            unmapped.read_exact(&mut error_header),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(error_header[0], b'E');
+        let response_len = i32::from_be_bytes(error_header[1..5].try_into().unwrap()) as usize;
+        let mut error_body = vec![0u8; response_len - 4];
+        tokio::time::timeout(Duration::from_secs(2), unmapped.read_exact(&mut error_body))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut fields = std::collections::HashMap::new();
+        let mut remaining = error_body.as_slice();
+        while !remaining.is_empty() && remaining[0] != 0 {
+            let field = remaining[0];
+            remaining = &remaining[1..];
+            let end = remaining.iter().position(|byte| *byte == 0).unwrap();
+            fields.insert(field, String::from_utf8(remaining[..end].to_vec()).unwrap());
+            remaining = &remaining[end + 1..];
+        }
+        assert_eq!(fields.get(&b'S'), Some(&"FATAL".to_string()));
+        assert_eq!(fields.get(&b'C'), Some(&"28000".to_string()));
+        assert_eq!(
+            fields.get(&b'M'),
+            Some(&"[RS-2400] auth.unauthenticated: verified OIDC identity has no enabled principal mapping. next_steps: Configure the issuer and subject in the durable security catalog".to_string())
+        );
+        assert_eq!(unmapped_handler.sessions.len(), 0);
+        let unmapped_audit = unmapped_durable
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        assert_eq!(unmapped_audit.len(), 2);
+        assert_authentication_event(
+            unmapped_audit
+                .iter()
+                .find(|record| record.action == SecurityAuditClass::AuthenticationFailure)
+                .unwrap(),
+            AuditIdentity::Verified(
+                Principal::Oidc {
+                    issuer: "https://issuer.example".to_string(),
+                    sub: "alice".to_string(),
+                }
+                .actor(),
+            ),
+            AuditField::Unknown,
+            SecurityAuditClass::AuthenticationFailure,
+            SecurityAuditOutcome::Failure,
+            AuditField::Unknown,
+        );
+
         drop(accepted);
         server_task.abort();
+        unmapped_server_task.abort();
     }
 
     #[tokio::test]
