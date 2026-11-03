@@ -1,4 +1,9 @@
-//! Auth types and JWT verification for v0.26.
+//! Gateway authentication types and protocol verifiers.
+
+mod oidc;
+#[cfg(test)]
+pub(crate) use oidc::{verifier_with_local_jwks, VALID_TOKEN};
+pub use oidc::{OidcConfig, OidcVerifier};
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +24,7 @@ pub const MAX_JWKS_ENTRIES: usize = 100;
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthMode {
     Off,   // --auth=off: all connections get Principal::System, zero network calls
-    Oidc,  // --auth=oidc: bearer JWT validated against JWKS
+    Oidc,  // --auth=oidc: bearer JWT validated against an RS256 JWKS
     Mtls,  // --auth=mtls: TLS client cert CN extracted
     Scram, // --auth=scram: SCRAM-SHA-256 with RoleCatalog
     Md5,   // --auth=md5: MD5 password with RoleCatalog
@@ -48,7 +53,7 @@ pub enum Principal {
     System, // --auth=off or internal paths
     Jwt {
         sub: String,
-    }, // OIDC bearer token, verified against JWKS; sub = JWT subject
+    }, // Legacy HS256 test verifier identity
     Oidc {
         issuer: String,
         sub: String,
@@ -74,6 +79,21 @@ impl Principal {
             Principal::CertCn { cn } => cn,
             Principal::Mtls { cn, .. } => cn,
             Principal::ScramUser { username } => username,
+        }
+    }
+
+    /// Stable ACL key for the authenticated identity.
+    ///
+    /// OIDC subjects are only unique within an issuer, so their ACL key carries
+    /// both values with byte lengths to avoid delimiter collisions. Durable
+    /// principal IDs will replace this compatibility key when catalog mapping
+    /// is available.
+    pub fn authorization_identity(&self) -> String {
+        match self {
+            Principal::Oidc { issuer, sub } => {
+                format!("oidc:{}:{}:{}:{}", issuer.len(), issuer, sub.len(), sub)
+            }
+            _ => self.identity().to_string(),
         }
     }
 
@@ -130,6 +150,7 @@ pub(crate) fn parse_certificate_sha256_hex(encoded: &str) -> Option<[u8; 32]> {
 /// JWT claims parsed from payload.
 #[derive(Debug, Clone)]
 pub struct JwtClaims {
+    pub issuer: Option<String>,
     pub sub: String,
     pub exp: Option<u64>,
 }
@@ -289,7 +310,7 @@ pub fn compute_md5_stored_hash(username: &str, password: &str) -> String {
     format!("md5{:x}", ctx.compute())
 }
 
-/// JWKS in-memory key cache with LRU eviction.
+/// Legacy verifier key cache with LRU eviction.
 struct JwksCache {
     entries: HashMap<String, Vec<u8>>,
     order: VecDeque<String>,
@@ -325,7 +346,10 @@ impl JwksCache {
     }
 }
 
-/// JWT verifier with JWKS key cache.
+/// Legacy HS256 verifier retained for regression tests.
+///
+/// Production gateway OIDC authentication uses OidcVerifier and RS256 only.
+#[doc(hidden)]
 pub struct JwtVerifier {
     // Audit: cache operations are synchronous, never await, and tolerate retaining
     // an inserted key if a holder panics before it returns.
@@ -347,6 +371,7 @@ impl JwtVerifier {
         }
     }
 
+    #[doc(hidden)]
     pub fn with_hs256_key(key: Vec<u8>) -> Self {
         Self {
             cache: Mutex::new(JwksCache::new()),
@@ -431,22 +456,21 @@ impl JwtVerifier {
             .to_string();
 
         Ok(JwtClaims {
+            issuer: None,
             sub,
             exp: payload["exp"].as_u64(),
         })
     }
 }
 
-/// Verify a bearer token only when an OIDC verifier is configured.
-///
-/// A missing verifier is an authentication failure; the presented token must
-/// never become an identity string or otherwise establish a session.
+#[cfg(test)]
 pub(crate) fn verify_oidc_token(
     verifier: Option<&JwtVerifier>,
     token: &str,
 ) -> Result<JwtClaims, AuthError> {
-    let verifier = verifier
-        .ok_or_else(|| AuthError::Unauthenticated("OIDC verifier is unavailable".to_string()))?;
+    let verifier = verifier.ok_or_else(|| {
+        AuthError::Unauthenticated("OIDC verification is unavailable".to_string())
+    })?;
     verifier.verify(token)
 }
 
@@ -500,8 +524,30 @@ mod tests {
         let presented = "fixture-raw-bearer-token";
         let error = verify_oidc_token(None, presented).unwrap_err();
 
-        assert!(error.to_string().contains("OIDC verifier is unavailable"));
+        assert!(error.to_string().contains("OIDC verification is unavailable"));
         assert!(!error.to_string().contains(presented));
+    }
+
+    #[test]
+    fn oidc_authorization_identity_includes_issuer_and_subject_without_collisions() {
+        let first = Principal::Oidc {
+            issuer: "https://issuer.example".to_string(),
+            sub: "user:one".to_string(),
+        };
+        let second = Principal::Oidc {
+            issuer: "https://issuer.example:user".to_string(),
+            sub: "one".to_string(),
+        };
+
+        assert_eq!(
+            format!("oidc:{}:{}", "https://issuer.example", "user:one"),
+            format!("oidc:{}:{}", "https://issuer.example:user", "one")
+        );
+        assert_ne!(
+            first.authorization_identity(),
+            second.authorization_identity()
+        );
+        assert_eq!(first.actor(), first.authorization_identity());
     }
 
     /// S2 green gate: jwt_bearer_token_validates_sub
@@ -691,5 +737,14 @@ mod tests {
             TEST_SECRET,
         );
         assert_eq!(verifier.verify(&token).unwrap().sub, "alice");
+    }
+
+    #[test]
+    fn oidc_token_without_verifier_is_rejected() {
+        let error = verify_oidc_token(None, "unverified-token").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "[RS-2400] auth.unauthenticated: OIDC verification is unavailable"
+        );
     }
 }

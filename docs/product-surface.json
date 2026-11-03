@@ -4747,9 +4747,36 @@
         "key": "auth.mode",
         "data_type": "String",
         "default_value": "off",
-        "description": "Explicit --auth overrides this mode; omitted uses it. Only off is currently available; other modes return RS-0002 before gateway startup.",
+        "description": "Explicit --auth selects a mode; OIDC and gateway mTLS require their settings. SCRAM remains unavailable until durable principal grants are enforced.",
         "deprecated": false,
         "env_var": "ROCKSTREAM_AUTH_MODE",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.oidc_audience",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Expected audience for RS256 OIDC bearer tokens; required when auth.mode is oidc",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_OIDC_AUDIENCE",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.oidc_issuer",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Expected issuer for RS256 OIDC bearer tokens; required when auth.mode is oidc",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_OIDC_ISSUER",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.oidc_jwks_url",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "HTTPS or loopback HTTP JWKS endpoint used to verify RS256 tokens; required when auth.mode is oidc",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_OIDC_JWKS_URL",
         "source_origin": "rockstream-types::config::AuthSection"
       },
       {

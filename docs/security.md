@@ -96,13 +96,17 @@ For full assessor findings, verification records, and machine-readable audit met
 
 ### Gateway client authentication status
 
-The CLI currently supports only `rockstream start --auth=off`, which disables
-client authentication. Selecting `scram`, `md5`, `oidc`, or `mtls` through
-`--auth` or `[auth].mode` fails with `RS-0002` before gateway storage or a
-listener is started: password modes do
-not have a durable role store, OIDC has no configured issuer/audience/JWKS
-verifier, and the CLI does not configure a gateway TLS listener. Internal
-node mTLS described below is a separate transport boundary.
+The gateway supports unauthenticated `off`, RS256 OIDC bearer authentication,
+and client-certificate mTLS. OIDC requires `[auth].oidc_issuer`,
+`[auth].oidc_audience`, `[auth].oidc_jwks_url`, and gateway TLS certificate
+and key paths; it fetches and validates JWKS before opening the listener and
+rejects requests when token verification fails. Gateway mTLS requires
+`gateway.tls.cert_path`, `key_path`, and
+`ca_cert_path`. Internal node mTLS described below remains a separate
+transport boundary. SCRAM stays fail-closed until durable principal grants
+are enforced on the public gateway path; MD5 is not a release authentication
+mode. Implementing these startup paths does not satisfy the v0.73 ten-case
+release qualification gate by itself.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 

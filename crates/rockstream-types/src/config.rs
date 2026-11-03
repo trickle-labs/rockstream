@@ -764,6 +764,12 @@ pub struct AuthSection {
     pub secret_path: Option<std::path::PathBuf>,
     #[serde(default)]
     pub admin_user: Option<String>,
+    #[serde(default)]
+    pub oidc_issuer: Option<String>,
+    #[serde(default)]
+    pub oidc_audience: Option<String>,
+    #[serde(default)]
+    pub oidc_jwks_url: Option<String>,
 }
 
 fn default_auth_mode() -> String {
@@ -776,6 +782,9 @@ impl Default for AuthSection {
             mode: default_auth_mode(),
             secret_path: None,
             admin_user: None,
+            oidc_issuer: None,
+            oidc_audience: None,
+            oidc_jwks_url: None,
         }
     }
 }
