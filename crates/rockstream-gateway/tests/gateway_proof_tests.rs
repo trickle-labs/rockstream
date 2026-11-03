@@ -3497,6 +3497,7 @@ async fn copy_in_auth_enforced_lfs() {
 
     let responses = handler
         .copy_from_stdin_response("COPY auth_t FROM STDIN", viewer_conn)
+        .await
         .expect("copy_from_stdin_response should return Ok (error inside response)");
 
     let viewer_err = responses
@@ -3528,6 +3529,7 @@ async fn copy_in_auth_enforced_lfs() {
 
     let responses = handler
         .copy_from_stdin_response("COPY auth_t FROM STDIN", owner_conn)
+        .await
         .expect("owner should get a response");
 
     let has_copy_in = responses

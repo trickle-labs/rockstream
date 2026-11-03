@@ -1,8 +1,6 @@
 //! Shared evaluator for the fixed v0.73 action and scope model.
 
-use rockstream_types::authorization::{
-    PermissionPreset, PolicyScope, ScopedActionGrant, SecurityAction, SecurityPrincipal,
-};
+use rockstream_types::authorization::{PolicyScope, SecurityAction, SecurityPrincipal};
 
 /// Evaluate a principal's current fixed presets and independently granted actions.
 ///

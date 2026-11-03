@@ -77,6 +77,11 @@ use rockstream_ops::sink::{column_values_to_tsv_bytes, materialize_view_state};
 use rockstream_ops::ArrowZSet;
 use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_sql::SqlFrontend;
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PolicyScope, ResourceKind,
+    SecurityAction, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
+    SecurityPrincipal,
+};
 use rockstream_types::config::{JoinStrategy, ScatterPruningConfig};
 use rockstream_types::data_plane::{
     DeploymentColumn, DeploymentRequest, DeploymentSchema, RuntimeRow, SourceDeltaRequest,
@@ -2253,13 +2258,309 @@ impl GatewayHandler {
         .unwrap_or_else(|| "<unknown>".to_string())
     }
 
-    fn authorize_mutation(
+    fn mutation_security_action(operation: &str) -> Option<SecurityAction> {
+        Some(match operation {
+            "CREATE VIEW" | "REFRESH MATERIALIZED VIEW" => SecurityAction::ViewAuthor,
+            "CREATE TABLE" => SecurityAction::TableCreate,
+            "CREATE SINK"
+            | "CREATE SOURCE"
+            | "ALTER SOURCE"
+            | "DROP SOURCE"
+            | "ALTER SOURCE PAUSE"
+            | "ALTER SOURCE RESUME" => SecurityAction::SourceLifecycle,
+            "CREATE SECRET" | "ALTER SECRET" | "DROP SECRET" => SecurityAction::SecretManage,
+            "CREATE INDEX" | "DROP INDEX" | "REBUILD INDEX" | "MARK INDEX" => {
+                SecurityAction::IndexManage
+            }
+            "CREATE WORKLOAD" | "ALTER WORKLOAD" | "DROP WORKLOAD" => {
+                SecurityAction::WorkloadChange
+            }
+            "INSERT" | "UPDATE" | "DELETE" | "COPY FROM STDIN" => SecurityAction::DataWrite,
+            "CREATE NAMESPACE" => SecurityAction::NamespaceCreate,
+            _ => return None,
+        })
+    }
+
+    fn mutation_policy_scope(
+        query: &str,
+        operation: &str,
+        current_namespace: &str,
+    ) -> Option<(SecurityAction, PolicyScope, String)> {
+        let action = Self::mutation_security_action(operation)?;
+        let resource = Self::mutation_resource(query, operation);
+        if resource == "<unknown>" {
+            return None;
+        }
+        if action == SecurityAction::NamespaceCreate {
+            return Some((action, PolicyScope::Cluster, resource));
+        }
+
+        let parts: Vec<&str> = resource.split('.').collect();
+        if parts.is_empty() || parts.len() > 2 || (parts.len() == 2 && query.contains('"')) {
+            return None;
+        }
+        let (namespace, name) = match parts.as_slice() {
+            [name] => (current_namespace.trim_matches('"'), name.trim_matches('"')),
+            [namespace, name] => (namespace.trim_matches('"'), name.trim_matches('"')),
+            _ => return None,
+        };
+        if namespace.is_empty() || name.is_empty() {
+            return None;
+        }
+
+        let scope = match action {
+            SecurityAction::SecretManage => PolicyScope::Secret {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                consumer: None,
+            },
+            _ => {
+                let kind = match operation {
+                    "CREATE VIEW" | "REFRESH MATERIALIZED VIEW" => ResourceKind::View,
+                    "CREATE TABLE" | "INSERT" | "UPDATE" | "DELETE" | "COPY FROM STDIN" => {
+                        ResourceKind::Table
+                    }
+                    "CREATE SINK" => ResourceKind::Sink,
+                    "CREATE SOURCE"
+                    | "ALTER SOURCE"
+                    | "DROP SOURCE"
+                    | "ALTER SOURCE PAUSE"
+                    | "ALTER SOURCE RESUME" => ResourceKind::Source,
+                    "CREATE INDEX" | "DROP INDEX" | "REBUILD INDEX" | "MARK INDEX" => {
+                        ResourceKind::Index
+                    }
+                    "CREATE WORKLOAD" | "ALTER WORKLOAD" | "DROP WORKLOAD" => {
+                        ResourceKind::Workload
+                    }
+                    _ => return None,
+                };
+                PolicyScope::Resource {
+                    namespace: namespace.to_string(),
+                    kind,
+                    name: name.to_string(),
+                }
+            }
+        };
+        if scope.validate().is_err() {
+            return None;
+        }
+        Some((action, scope, format!("{namespace}.{name}")))
+    }
+
+    async fn security_principal_for_login(
+        &self,
+        authenticated: &Principal,
+    ) -> Result<Option<SecurityPrincipal>, String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable security catalog is unavailable".to_string())?;
+        let principals = store
+            .list_security_principals()
+            .await
+            .map_err(|error| error.to_string())?;
+        let matches_login = |method: &LoginMethod| match (authenticated, method) {
+            (
+                Principal::ScramUser { username },
+                LoginMethod::ScramSha256 {
+                    username: stored_username,
+                    salt,
+                    iterations,
+                    stored_key,
+                    server_key,
+                },
+            ) if self.auth_mode != AuthMode::Md5 && username == stored_username => {
+                self.role_catalog.get(username).is_some_and(|role| {
+                    if role.scram_salt != *salt || role.scram_iterations != *iterations {
+                        return false;
+                    }
+                    let actual_stored_key = scram_stored_key(&role.scram_salted_password);
+                    let actual_server_key = scram_server_key(&role.scram_salted_password);
+                    actual_stored_key.as_slice() == stored_key.as_slice()
+                        && actual_server_key.as_slice() == server_key.as_slice()
+                })
+            }
+            _ => false,
+        };
+        let mut matches = principals
+            .into_iter()
+            .filter(|principal| principal.login_methods.iter().any(&matches_login));
+        let found = matches.next();
+        if matches.next().is_some() {
+            return Err("authenticated login is bound to multiple durable principals".to_string());
+        }
+        Ok(found)
+    }
+
+    async fn append_authorization_denial(
+        &self,
+        principal: Option<&Principal>,
+        conn_id: Option<&str>,
+        scope: Option<&PolicyScope>,
+        target: Option<&str>,
+        policy_revision: Option<u64>,
+    ) -> Result<(), String> {
+        use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable security audit store is unavailable".to_string())?;
+        let actor = match principal {
+            Some(actor @ Principal::ScramUser { .. }) => AuditIdentity::Verified(actor.actor()),
+            Some(actor @ (Principal::Jwt { .. } | Principal::CertCn { .. })) => {
+                AuditIdentity::Unverified(actor.actor())
+            }
+            Some(Principal::System) | None => AuditIdentity::Unknown,
+        };
+        let scope_field = match scope {
+            Some(scope) => {
+                AuditField::Known(serde_json::to_string(scope).map_err(|error| error.to_string())?)
+            }
+            None => AuditField::Unknown,
+        };
+        let record = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("gateway-authz-{:032x}", rand::random::<u128>()),
+            timestamp_ms: current_time_ms().max(1),
+            actor,
+            target: target
+                .filter(|target| !target.trim().is_empty())
+                .map_or(AuditField::Unknown, |target| {
+                    AuditField::Known(target.to_string())
+                }),
+            scope: scope_field,
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: conn_id.map_or(AuditCorrelation::Unknown, |id| {
+                AuditCorrelation::Observed(id.to_string())
+            }),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: policy_revision.map_or(AuditField::Unknown, AuditField::Known),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        };
+        let operation_id = rand::random::<u64>().max(1);
+        for attempt in 0..2 {
+            let revision = store
+                .get_revision()
+                .await
+                .checked_add(1)
+                .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+            let transaction = CatalogTxn::new(
+                revision,
+                operation_id,
+                vec![CatalogMutation::AppendSecurityAudit(record.clone())],
+            )
+            .map_err(|error| error.to_string())?;
+            match store.commit_txn(transaction).await {
+                Ok(_) => return Ok(()),
+                Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
+                    if attempt == 0 =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("durable security audit retry was exhausted".to_string())
+    }
+
+    async fn authorize_mutation(
         &self,
         query: &str,
         conn_id: Option<&str>,
     ) -> Option<Vec<Response<'static>>> {
         let spec = pgwire_mutation_policy(query)?;
-        let id = conn_id?;
+        let durable_policy_required =
+            self.auth_mode != AuthMode::Off || self.catalog.get_durable_store().is_some();
+
+        if durable_policy_required {
+            let session = conn_id.and_then(|id| {
+                self.sessions
+                    .get(id)
+                    .map(|s| (s.principal.clone(), s.current_namespace.clone()))
+            });
+            let principal = session.as_ref().map(|(principal, _)| principal);
+            let namespace = session
+                .as_ref()
+                .map(|(_, namespace)| namespace.as_str())
+                .unwrap_or("public");
+            let action = Self::mutation_security_action(spec.operation);
+            let policy_scope = Self::mutation_policy_scope(query, spec.operation, namespace);
+            let (scope, target) = policy_scope
+                .as_ref()
+                .map(|(_, scope, target)| (Some(scope), Some(target.as_str())))
+                .unwrap_or((None, None));
+
+            let matching_principal = match principal {
+                Some(authenticated) if !authenticated.is_system() => self
+                    .security_principal_for_login(authenticated)
+                    .await
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+            let policy_revision = matching_principal
+                .as_ref()
+                .map(|security_principal| security_principal.revision);
+            // The unauthenticated development mode may still dispatch its
+            // explicit system principal. Authenticated modes never inherit
+            // system authority from a missing connection or session.
+            let authorized = if principal.is_some_and(Principal::is_system) {
+                self.auth_mode == AuthMode::Off
+            } else {
+                match (action, policy_scope.as_ref(), matching_principal.as_ref()) {
+                    (Some(action), Some((_, scope, _)), Some(security_principal)) => {
+                        rockstream_control::authorization::allows(security_principal, action, scope)
+                    }
+                    _ => false,
+                }
+            };
+            if authorized {
+                return None;
+            }
+
+            let audit_recorded = if action.is_some() {
+                self.append_authorization_denial(principal, conn_id, scope, target, policy_revision)
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            if !audit_recorded {
+                if let Some(id) = conn_id {
+                    self.sessions.remove(id);
+                }
+            }
+
+            let identity = principal.map_or("unknown", Principal::identity);
+            let resource = target.unwrap_or("<unknown>");
+            let action_label = action.map_or("unknown".to_string(), |action| format!("{action:?}"));
+            let audit_status = if audit_recorded {
+                ""
+            } else {
+                " The required security audit could not be persisted; this session's authorization state was invalidated."
+            };
+            return Some(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42501".to_string(),
+                    format!(
+                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{action_label}' on {resource}. next_steps: Request an authorized scoped grant, then retry.{audit_status}"
+                    ),
+                ),
+            )))]);
+        }
+
+        // Compatibility path for auth-off fixtures that exercise the legacy
+        // ACL store. Release authentication modes always use durable policy.
+        let id = match conn_id {
+            Some(id) => id,
+            None => return None,
+        };
         let (principal, namespace) = self
             .sessions
             .get(id)
@@ -5156,7 +5457,7 @@ impl GatewayHandler {
         // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
         let ql = query.trim().to_lowercase();
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
-            if let Some(response) = self.authorize_mutation(query, Some(conn_id)) {
+            if let Some(response) = self.authorize_mutation(query, Some(conn_id)).await {
                 return Ok(response);
             }
             return self.handle_copy_from_stdin(query, conn_id);
@@ -5765,7 +6066,7 @@ impl GatewayHandler {
         let q = query.trim();
         let ql = q.to_lowercase();
 
-        if let Some(response) = self.authorize_mutation(q, conn_id) {
+        if let Some(response) = self.authorize_mutation(q, conn_id).await {
             return Ok(response);
         }
 
@@ -12268,12 +12569,12 @@ impl GatewayHandler {
     /// Public wrapper for `handle_copy_from_stdin` — for integration tests that
     /// need to exercise auth/error paths without going through the full pgwire stack.
     #[doc(hidden)]
-    pub fn copy_from_stdin_response(
+    pub async fn copy_from_stdin_response(
         &self,
         query: &str,
         conn_id: &str,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        if let Some(response) = self.authorize_mutation(query, Some(conn_id)) {
+        if let Some(response) = self.authorize_mutation(query, Some(conn_id)).await {
             return Ok(response);
         }
         self.handle_copy_from_stdin(query, conn_id)
@@ -13474,7 +13775,7 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // COPY IN via extended query protocol (e.g. tokio_postgres.copy_in()).
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
-            if let Some(response) = self.authorize_mutation(query, Some(&conn_id)) {
+            if let Some(response) = self.authorize_mutation(query, Some(&conn_id)).await {
                 return Ok(response
                     .into_iter()
                     .next()
