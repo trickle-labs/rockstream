@@ -26,16 +26,19 @@ pub enum AuthMode {
 }
 
 impl std::str::FromStr for AuthMode {
-    type Err = std::convert::Infallible;
+    type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "oidc" => AuthMode::Oidc,
-            "mtls" => AuthMode::Mtls,
-            "scram" => AuthMode::Scram,
-            "md5" => AuthMode::Md5,
-            _ => AuthMode::Off,
-        })
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(AuthMode::Off),
+            "oidc" => Ok(AuthMode::Oidc),
+            "mtls" => Ok(AuthMode::Mtls),
+            "scram" => Ok(AuthMode::Scram),
+            "md5" => Ok(AuthMode::Md5),
+            _ => Err(format!(
+                "[RS-0002] configuration error: unknown auth mode `{s}`"
+            )),
+        }
     }
 }
 
@@ -422,6 +425,15 @@ mod tests {
 
         let verifier = JwtVerifier::new();
         assert_eq!(verifier.cache_size(), 0);
+    }
+
+    #[test]
+    fn auth_mode_rejects_unknown_value_instead_of_disabling_auth() {
+        let err = "oidc_typo".parse::<AuthMode>().unwrap_err();
+        assert_eq!(
+            err,
+            "[RS-0002] configuration error: unknown auth mode `oidc_typo`"
+        );
     }
 
     /// S2 green gate: jwt_bearer_token_validates_sub
