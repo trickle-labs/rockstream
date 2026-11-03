@@ -3023,7 +3023,7 @@ impl StorageClient {
         if bytes.len() > MAX_DIAGNOSTIC_BUNDLE_BYTES {
             return Err(CliError::new(
                 RS_0003,
-                "support bundle exceeds the 1 MiB diagnostic bundle bound",
+                "support bundle exceeds the 10 MiB diagnostic bundle bound",
                 "Reduce diagnostic history and retry the support bundle command.",
             ));
         }

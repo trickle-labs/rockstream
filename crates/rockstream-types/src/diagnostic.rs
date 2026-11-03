@@ -16,7 +16,7 @@ pub const MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES: usize = 1_024;
 pub const MAX_DIAGNOSTIC_CONTEXT_BYTES: usize = 8 * 1_024;
 pub const MAX_DIAGNOSTIC_OCCURRENCES: usize = 256;
 pub const MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES: usize = 256;
-pub const MAX_DIAGNOSTIC_BUNDLE_BYTES: usize = 1_024 * 1_024;
+pub const MAX_DIAGNOSTIC_BUNDLE_BYTES: usize = 10 * 1_024 * 1_024;
 
 static CONTEXT_REJECTED: AtomicU64 = AtomicU64::new(0);
 static OCCURRENCES_EVICTED: AtomicU64 = AtomicU64::new(0);
