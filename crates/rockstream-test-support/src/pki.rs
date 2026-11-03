@@ -36,6 +36,11 @@ pub struct TestPki {
 impl TestPki {
     /// Generate a fresh test PKI fixture with all certificates configured.
     pub fn generate() -> Self {
+        Self::generate_with_worker_ids(1..=5)
+    }
+
+    /// Generate a test PKI fixture with certificates for the supplied worker IDs.
+    pub fn generate_with_worker_ids(worker_ids: impl IntoIterator<Item = u64>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (ca_cert, ca_key) = make_ca("RockStream Test Cluster CA");
         let ca_cert_pem = ca_cert.pem();
@@ -58,7 +63,7 @@ impl TestPki {
 
         // Worker certs (workers 1..=5)
         let mut worker_certs = HashMap::new();
-        for id in 1..=5 {
+        for id in worker_ids {
             let (w_cert_pem, w_key_pem) = make_leaf(
                 &ca_cert,
                 &ca_key,
