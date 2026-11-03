@@ -9936,20 +9936,52 @@ impl GatewayHandler {
             state: "OK".to_string(),
         };
 
-        if !self.catalog.add_sink(entry) {
-            return Ok(vec![create_sink_error_response(format!(
-                "[RS-4010] sink.already_exists: sink '{}' already exists for a different view. Next steps: choose a distinct sink name.",
-                parsed.name
-            ))]);
-        }
-        if let Some(secret_name) = secret_name {
-            if let Err(error) = self
+        let secret_reference_added = if let Some(secret_name) = secret_name {
+            match self
                 .secret_store
-                .add_reference(0u128, secret_name, &parsed.name)
+                .add_reference_if_absent(0u128, secret_name, &parsed.name)
                 .await
             {
-                self.catalog.remove_sink(&parsed.name);
-                return Ok(vec![create_sink_error_response(error.to_string())]);
+                Ok(added) => added,
+                Err(error) => {
+                    return Ok(vec![create_sink_error_response(error.to_string())]);
+                }
+            }
+        } else {
+            false
+        };
+
+        let add_result = if self.catalog.get_durable_store().is_some() {
+            self.catalog.add_sink_durable(entry).await
+        } else {
+            Ok(self.catalog.add_sink(entry))
+        };
+        match add_result {
+            Ok(true) => {}
+            Ok(false) => {
+                if secret_reference_added {
+                    if let Some(secret_name) = secret_name {
+                        let _ = self
+                            .secret_store
+                            .remove_reference(0u128, secret_name, &parsed.name)
+                            .await;
+                    }
+                }
+                return Ok(vec![create_sink_error_response(format!(
+                    "[RS-4010] sink.already_exists: sink '{}' already exists for a different view. Next steps: choose a distinct sink name.",
+                    parsed.name
+                ))]);
+            }
+            Err(error) => {
+                if secret_reference_added {
+                    if let Some(secret_name) = secret_name {
+                        let _ = self
+                            .secret_store
+                            .remove_reference(0u128, secret_name, &parsed.name)
+                            .await;
+                    }
+                }
+                return Ok(vec![create_sink_error_response(error)]);
             }
         }
 
@@ -10012,6 +10044,23 @@ impl GatewayHandler {
             )))]);
         };
 
+        let remove_result = if self.catalog.get_durable_store().is_some() {
+            self.catalog.remove_sink_durable(&name).await
+        } else {
+            Ok({
+                self.catalog.remove_sink(&name);
+                true
+            })
+        };
+        match remove_result {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SINK").with_rows(0),
+                )])
+            }
+            Err(error) => return Ok(vec![create_sink_error_response(error)]),
+        }
         if let Some(secret_reference) = sink.secret_name.as_deref() {
             let Some(secret_name) =
                 rockstream_types::secret::secret_name_from_reference(secret_reference)
@@ -10028,8 +10077,6 @@ impl GatewayHandler {
                 return Ok(vec![create_sink_error_response(error.to_string())]);
             }
         }
-
-        self.catalog.remove_sink(&name);
         if let Some(log) = &self.audit_log {
             let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                 "system",
@@ -10173,25 +10220,57 @@ impl GatewayHandler {
             }
         }
 
-        if !self.catalog.add_source(entry.clone()) {
-            if parsed.if_not_exists {
-                return Ok(vec![Response::Execution(
-                    Tag::new("CREATE SOURCE").with_rows(0),
-                )]);
-            }
-            return Ok(vec![create_source_error_response(format!(
-                "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
-                parsed.name
-            ))]);
-        }
-        if let Some(secret_name) = secret_name {
-            if let Err(error) = self
+        let secret_reference_added = if let Some(secret_name) = secret_name {
+            match self
                 .secret_store
-                .add_reference(0u128, secret_name, &parsed.name)
+                .add_reference_if_absent(0u128, secret_name, &parsed.name)
                 .await
             {
-                self.catalog.remove_source(&parsed.name);
-                return Ok(vec![create_source_error_response(error.to_string())]);
+                Ok(added) => added,
+                Err(error) => {
+                    return Ok(vec![create_source_error_response(error.to_string())]);
+                }
+            }
+        } else {
+            false
+        };
+
+        let add_result = if self.catalog.get_durable_store().is_some() {
+            self.catalog.add_source_durable(entry.clone()).await
+        } else {
+            Ok(self.catalog.add_source(entry.clone()))
+        };
+        match add_result {
+            Ok(true) => {}
+            Ok(false) => {
+                if secret_reference_added {
+                    if let Some(secret_name) = secret_name {
+                        let _ = self
+                            .secret_store
+                            .remove_reference(0u128, secret_name, &parsed.name)
+                            .await;
+                    }
+                }
+                if parsed.if_not_exists {
+                    return Ok(vec![Response::Execution(
+                        Tag::new("CREATE SOURCE").with_rows(0),
+                    )]);
+                }
+                return Ok(vec![create_source_error_response(format!(
+                    "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                    parsed.name
+                ))]);
+            }
+            Err(error) => {
+                if secret_reference_added {
+                    if let Some(secret_name) = secret_name {
+                        let _ = self
+                            .secret_store
+                            .remove_reference(0u128, secret_name, &parsed.name)
+                            .await;
+                    }
+                }
+                return Ok(vec![create_source_error_response(error)]);
             }
         }
         if let Some(log) = &self.audit_log {
@@ -10443,9 +10522,22 @@ impl GatewayHandler {
                         .flatten()
                         .map(|identity| identity.connector_id())
                 });
+                let remove_result = if self.catalog.get_durable_store().is_some() {
+                    self.catalog.remove_source_durable(&parsed.name).await
+                } else {
+                    Ok(self.catalog.remove_source(&parsed.name))
+                };
+                match remove_result {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(vec![Response::Execution(
+                            Tag::new("DROP SOURCE").with_rows(0),
+                        )]);
+                    }
+                    Err(error) => return Ok(vec![create_source_error_response(error)]),
+                }
                 if let Some(source_entry) = source.as_ref() {
-                    let secret_reference = source_entry.options.get("secret");
-                    if let Some(secret_reference) = secret_reference {
+                    if let Some(secret_reference) = source_entry.options.get("secret") {
                         let Some(secret_name) =
                             rockstream_types::secret::secret_name_from_reference(secret_reference)
                         else {
@@ -10462,7 +10554,6 @@ impl GatewayHandler {
                         }
                     }
                 }
-                self.catalog.remove_source(&parsed.name);
                 if let (Some(connector_id), Some(shard_db), Ok(runtime)) = (
                     pgoutput_id.filter(|connector_id| {
                         self.pgoutput_registered_aliases(*connector_id).is_empty()

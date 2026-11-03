@@ -6,12 +6,13 @@ Kafka sources/sinks and PostgreSQL CDC sources can bind to `secret = '<name>'`.
 An altered secret queues one encrypted replacement token and applies it at the
 next epoch boundary, preserving the connector process and committed batches.
 New source and sink catalog entries store the binding as `secret://<name>`;
-resolved credential values are not copied into connector metadata. With durable
-authorization enabled, attaching a secret requires an explicit `SecretUse`
-grant scoped to the secret and consumer principal. The gateway rechecks that
-consumer's current grant before it resolves a source credential. Older entries
-without persisted consumer scope fail closed; an authorized migration route
-remains to be qualified.
+resolved credential values are not copied into connector metadata. Attaching a
+secret requires an explicit `SecretUse` grant scoped to the secret and consumer
+principal; missing identity or durable policy fails closed. Source and sink
+metadata is committed before CREATE or DROP is acknowledged. The gateway
+rechecks a source consumer's current grant before resolving its credential.
+Older entries without persisted consumer scope fail closed; an authorized
+migration route remains to be qualified.
 
 RockStream supports exactly three external connector boundaries: PostgreSQL
 CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,

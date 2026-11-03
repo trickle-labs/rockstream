@@ -538,6 +538,44 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
     );
     assert_eq!(source.secret_consumer, Some(PrincipalId(2)));
     assert_eq!(source.secret_namespace.as_deref(), Some("public"));
+    let persisted_source = durable
+        .list_sources()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|source| source.name == "kafka_src")
+        .expect("authorized source must be durable before the request is acknowledged");
+    assert_eq!(
+        persisted_source.options.get("secret").map(String::as_str),
+        Some("secret://kafka_auth")
+    );
+    assert_eq!(persisted_source.secret_consumer, Some(PrincipalId(2)));
+    assert_eq!(persisted_source.secret_namespace.as_deref(), Some("public"));
+
+    let allowed_sink = handler
+        .dispatch_async_with_conn(
+            "CREATE SINK kafka_sink FOR VIEW allowed_view TO ICEBERG 's3://bucket/path' WITH (catalog='filesystem', secret='kafka_auth')",
+            Some(reader_connection),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed_sink.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    let persisted_sink = durable
+        .list_sinks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|sink| sink.name == "kafka_sink")
+        .expect("authorized sink must be durable before the request is acknowledged");
+    assert_eq!(
+        persisted_sink.secret_reference.as_deref(),
+        Some("secret://kafka_auth")
+    );
+    assert_eq!(persisted_sink.secret_consumer, Some(PrincipalId(2)));
+    assert_eq!(persisted_sink.secret_namespace.as_deref(), Some("public"));
 
     let denied_source = handler
         .dispatch_async_with_conn(
@@ -593,6 +631,22 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
         AuditCorrelation::Observed(reader_connection.to_string())
     );
     assert_eq!(denied_secret_use.policy_revision, AuditField::Known(1));
+
+    for query in ["DROP SINK kafka_sink", "DROP SOURCE kafka_src"] {
+        let response = handler
+            .dispatch_async_with_conn(query, Some(reader_connection))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response.as_slice(),
+                [pgwire::api::results::Response::Execution(_)]
+            ),
+            "{query} must be acknowledged after durable deletion"
+        );
+    }
+    assert!(durable.list_sinks().await.unwrap().is_empty());
+    assert!(durable.list_sources().await.unwrap().is_empty());
 }
 
 #[cfg(feature = "testcontainers")]
