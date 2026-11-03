@@ -3696,10 +3696,9 @@
           {
             "name": "auth",
             "long": "auth",
-            "help": "Authentication mode",
+            "help": "Authentication mode. Only `off` is available; others fail closed. Omitted uses `[auth].mode`",
             "required": false,
             "value_name": "AUTH",
-            "default_value": "off",
             "possible_values": [
               "off",
               "scram",
@@ -4744,6 +4743,15 @@
   },
   "config_surface": {
     "options": [
+      {
+        "key": "auth.mode",
+        "data_type": "String",
+        "default_value": "off",
+        "description": "Explicit --auth overrides this mode; omitted uses it. Only off is currently available; other modes return RS-0002 before gateway startup.",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_MODE",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
       {
         "key": "autotuner.compression_disable_hysteresis_windows",
         "data_type": "usize",

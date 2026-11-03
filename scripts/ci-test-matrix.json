@@ -23,6 +23,7 @@
   "sim_lib_job": "pr-sim-unit",
   "target_jobs": {
     "rockstream-gateway/test:pg18_differential_conformance_tests": "pr-postgres-differential",
+    "rockstream-gateway/test:v072_durable_subscription_publication_tests": "pr-gateway",
     "rockstream-gateway/test:auth_scram_tests": "pr-gateway",
     "rockstream-gateway/test:gateway_dml_tests": "pr-gateway",
     "rockstream-gateway/test:gateway_extended_query_tests": "pr-gateway",
@@ -158,7 +159,8 @@
         "rockstream-gateway/test:gateway_proof_tests",
         "rockstream-gateway/test:golden_wire_tests",
         "rockstream-gateway/test:listen_notify_tests",
-        "rockstream-gateway/test:transaction_savepoint_tests"
+        "rockstream-gateway/test:transaction_savepoint_tests",
+        "rockstream-gateway/test:v072_durable_subscription_publication_tests"
       ]
     },
     "pr-postgres-differential": {

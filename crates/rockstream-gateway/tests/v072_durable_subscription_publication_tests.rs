@@ -2,14 +2,19 @@
 //! These exercise the actual PgWire COMMIT path and its bounded replay log;
 //! full durability under process destruction still needs release qualification.
 
-use std::sync::Arc;
+use std::{
+    pin::Pin,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
+use futures::StreamExt;
 use object_store::memory::InMemory;
 use rockstream_gateway::catalog_stubs::CatalogStubs;
 use rockstream_gateway::view_reader::{ViewReadStrategy, ViewReader};
 use rockstream_gateway::{GatewayError, GatewayServer};
 use rockstream_storage::ShardDb;
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 struct EmptyViewReader;
 
@@ -29,6 +34,24 @@ impl ViewReader for EmptyViewReader {
     }
 }
 
+struct TranscriptViewReader;
+
+#[async_trait::async_trait]
+impl ViewReader for TranscriptViewReader {
+    async fn read_view(
+        &self,
+        _view_name: &str,
+        _limit: Option<usize>,
+        _strategy: ViewReadStrategy,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        Ok(vec![b"1\t10".to_vec(), b"2\t20".to_vec()])
+    }
+
+    fn published_frontier(&self) -> Option<u64> {
+        None
+    }
+}
+
 async fn open_client(port: u16) -> tokio_postgres::Client {
     let (client, connection) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={port} user=test dbname=test"),
@@ -40,6 +63,127 @@ async fn open_client(port: u16) -> tokio_postgres::Client {
         let _ = connection.await;
     });
     client
+}
+
+async fn next_subscribe_row(
+    stream: &mut Pin<Box<tokio_postgres::SimpleQueryStream>>,
+) -> (String, String, u64, i8) {
+    let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("SUBSCRIBE row should arrive within five seconds")
+        .expect("SUBSCRIBE stream ended before the expected row")
+        .unwrap();
+    let SimpleQueryMessage::Row(row) = message else {
+        panic!("expected a SUBSCRIBE data row, received {message:?}");
+    };
+    (
+        row.get("id").unwrap().to_owned(),
+        row.get("amount").unwrap().to_owned(),
+        row.get("mz_timestamp").unwrap().parse().unwrap(),
+        row.get("mz_diff").unwrap().parse().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn pgwire_snapshot_then_committed_deltas_match_exact_transcript() {
+    let storage = Arc::new(InMemory::new());
+    let shard = Arc::new(
+        ShardDb::builder("v072-subscribe-wire-transcript", storage)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(TranscriptViewReader),
+        Arc::clone(&shard),
+    );
+    let (address, task) = server.serve_background().await.unwrap();
+    let subscriber = open_client(address.port()).await;
+    let writer = open_client(address.port()).await;
+    writer
+        .simple_query("CREATE TABLE v072_subscribe_wire (id BIGINT, amount BIGINT)")
+        .await
+        .unwrap();
+    writer.simple_query("BEGIN").await.unwrap();
+    writer
+        .simple_query("INSERT INTO v072_subscribe_wire VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap();
+    writer.simple_query("COMMIT").await.unwrap();
+    let snapshot_epoch = shard.last_epoch().load(Ordering::SeqCst);
+
+    let mut stream = Box::pin(
+        subscriber
+            .simple_query_raw("SUBSCRIBE v072_subscribe_wire AS OF NOW WITH SNAPSHOT")
+            .await
+            .unwrap(),
+    );
+    let description = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("SUBSCRIBE schema should arrive within five seconds")
+        .expect("SUBSCRIBE stream ended before its schema")
+        .unwrap();
+    let SimpleQueryMessage::RowDescription(columns) = description else {
+        panic!("expected the SUBSCRIBE row schema, received {description:?}");
+    };
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column.name())
+            .collect::<Vec<_>>(),
+        vec!["id", "amount", "mz_timestamp", "mz_diff"]
+    );
+    let mut snapshot = vec![
+        next_subscribe_row(&mut stream).await,
+        next_subscribe_row(&mut stream).await,
+    ];
+    snapshot.sort_unstable();
+    assert_eq!(
+        snapshot,
+        vec![
+            ("1".to_owned(), "10".to_owned(), snapshot_epoch, 1),
+            ("2".to_owned(), "20".to_owned(), snapshot_epoch, 1),
+        ]
+    );
+
+    writer.simple_query("BEGIN").await.unwrap();
+    writer
+        .simple_query("UPDATE v072_subscribe_wire SET amount = 15 WHERE id = 1")
+        .await
+        .unwrap();
+    writer.simple_query("COMMIT").await.unwrap();
+    let update_epoch = shard.last_epoch().load(Ordering::SeqCst);
+    writer.simple_query("BEGIN").await.unwrap();
+    writer
+        .simple_query("DELETE FROM v072_subscribe_wire WHERE id = 2")
+        .await
+        .unwrap();
+    writer.simple_query("COMMIT").await.unwrap();
+    let delete_epoch = shard.last_epoch().load(Ordering::SeqCst);
+    assert!(snapshot_epoch < update_epoch && update_epoch < delete_epoch);
+
+    let deltas = vec![
+        next_subscribe_row(&mut stream).await,
+        next_subscribe_row(&mut stream).await,
+        next_subscribe_row(&mut stream).await,
+    ];
+    assert_eq!(
+        deltas.iter().map(|row| row.2).collect::<Vec<_>>(),
+        vec![update_epoch, update_epoch, delete_epoch]
+    );
+    let mut sorted_deltas = deltas;
+    sorted_deltas.sort_unstable();
+    assert_eq!(
+        sorted_deltas,
+        vec![
+            ("1".to_owned(), "10".to_owned(), update_epoch, -1),
+            ("1".to_owned(), "15".to_owned(), update_epoch, 1),
+            ("2".to_owned(), "20".to_owned(), delete_epoch, -1),
+        ]
+    );
+    task.abort();
 }
 
 #[tokio::test]

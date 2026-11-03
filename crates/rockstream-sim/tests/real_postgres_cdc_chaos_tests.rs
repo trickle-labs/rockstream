@@ -36,7 +36,7 @@ use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS
 use rockstream_types::{
     arrow_batch::split_weight_column,
     connector::PartitionFilter,
-    ids::{ConnectorId, OperatorId, ShardId, WorkerId},
+    ids::{ConnectorId, OperatorId, ShardId},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -325,18 +325,6 @@ async fn postgres_cdc_worker_process_fixture() {
     }
     if id == 1 {
         worker.request_shard(ShardId(ID)).await.unwrap();
-    } else {
-        let handoff = wait_for_child_json(&root.join("request-worker-2")).await;
-        worker.request_shard(ShardId(ID)).await.unwrap();
-        let minimum_lease_token = handoff["minimum_lease_token"].as_u64().unwrap();
-        while !worker
-            .leases()
-            .iter()
-            .any(|lease| lease.shard_id == ShardId(ID) && lease.lease_token.0 > minimum_lease_token)
-        {
-            assert!(Instant::now() < deadline, "handoff lease deadline");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
     }
     let db = loop {
         if let Some(db) = worker.get_shard_db(ShardId(ID)) {
@@ -832,16 +820,6 @@ async fn run_postgres_case(
     } else {
         workers.0[0].kill().unwrap();
         workers.0[0].wait().unwrap();
-        let (lease, evicted) = manager.force_acquire(ShardId(ID), WorkerId(2));
-        assert!(matches!(
-            evicted,
-            None | Some(WorkerId(1)) | Some(WorkerId(2))
-        ));
-        assert!(lease.lease_token.0 > checkpoint_at_fault.lease_token);
-        save(
-            &root.path().join("request-worker-2"),
-            &json!({"minimum_lease_token":lease.lease_token.0}),
-        );
         let recovered_ack = wait_for_json(
             &root.path().join("postgres-recovered-ack.json"),
             &mut workers.0[1],

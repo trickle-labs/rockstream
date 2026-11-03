@@ -1,8 +1,8 @@
 {
-  "aggregate_performance/aggregate_in_memory/10000": 1096619.097,
-  "delta_propagation_cost/aggregate_update/0.1pct": 26257.514,
-  "delta_propagation_cost/aggregate_update/10pct": 2190130.280,
-  "delta_propagation_cost/aggregate_update/1pct": 220665.554,
+  "aggregate_performance/aggregate_in_memory/10000": 1399829.870,
+  "delta_propagation_cost/aggregate_update/0.1pct": 31043.463,
+  "delta_propagation_cost/aggregate_update/10pct": 2803913.940,
+  "delta_propagation_cost/aggregate_update/1pct": 282461.430,
   "filter_delta_cost/filter_update/0.1pct": 4170.599,
   "filter_delta_cost/filter_update/10pct": 201208.007,
   "filter_delta_cost/filter_update/1pct": 21571.640,

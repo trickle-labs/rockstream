@@ -292,6 +292,8 @@ pub struct CatalogSinkEntry {
     pub format_version: Option<u64>,
     pub partition_by: Vec<String>,
     pub catalog: String,
+    #[serde(default)]
+    pub secret_name: Option<String>,
     /// Last epoch whose snapshot was committed through this sink (v0.44
     /// slice 10, `EXPLAIN` annotation). `None` until the first snapshot
     /// commits.
@@ -846,6 +848,7 @@ impl CatalogStubs {
                     format_version: None,
                     partition_by: vec![],
                     catalog: "memory".to_string(),
+                    secret_name: None,
                     last_snapshot_epoch: None,
                     state: "OK".to_string(),
                 },

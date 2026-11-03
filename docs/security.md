@@ -74,6 +74,18 @@ For full assessor findings, verification records, and machine-readable audit met
 
 ## Overview
 
+### Gateway client authentication status
+
+The CLI currently supports only `rockstream start --auth=off`, which disables
+client authentication. Selecting `scram`, `md5`, `oidc`, or `mtls` through
+`--auth` or `[auth].mode` fails with `RS-0002` before gateway storage or a
+listener is started: password modes do
+not have a durable role store, OIDC has no configured issuer/audience/JWKS
+verifier, and the CLI does not configure a gateway TLS listener. Internal
+node mTLS described below is a separate transport boundary.
+
+Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
+
 The control-worker TCP listener used for registration, heartbeats, and shard leases requires internal mTLS. Control, worker, and embedded `all` roles need a certificate, matching private key, trusted CA roots, and `client_auth_required = true`; invalid or incomplete material fails startup before the listener opens.
 
 For local development only, `--allow-insecure-internal-dev` explicitly permits plaintext control traffic when the control listener or worker target uses a literal loopback socket address. The option rejects non-loopback addresses and must not be used for production or release qualification.
