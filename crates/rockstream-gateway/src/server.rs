@@ -87,7 +87,7 @@ use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, Workloa
 
 use crate::auth::{
     scram_server_key, scram_server_signature, scram_stored_key, verify_client_proof, AuthMode,
-    JwtVerifier, Principal,
+    Principal,
 };
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
@@ -2124,8 +2124,6 @@ pub struct GatewayHandler {
     query_time_shard_topology_provider: Option<Arc<QueryTimeShardTopologyProvider>>,
     /// Authentication mode for this gateway instance.
     auth_mode: AuthMode,
-    /// Optional JWT verifier (populated when auth_mode == Oidc).
-    jwt_verifier: Option<Arc<JwtVerifier>>,
     /// Role catalog for SCRAM/MD5 auth (always present; empty for Off/Oidc/Mtls).
     pub role_catalog: Arc<RoleCatalog>,
     /// ACL store for RBAC enforcement.
@@ -2266,7 +2264,7 @@ impl GatewayHandler {
         if self
             .acl_store
             .check(
-                principal.identity(),
+                &principal.authorization_identity(),
                 &namespace,
                 Some(&resource),
                 spec.minimum_role.clone(),
@@ -2340,7 +2338,6 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
-            jwt_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
@@ -2391,7 +2388,6 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
-            jwt_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
@@ -5410,7 +5406,8 @@ impl GatewayHandler {
                     let session = entry.value();
                     let pid = session.backend_pid;
                     let usename = match &session.principal {
-                        crate::auth::Principal::Jwt { sub } => sub.clone(),
+                        crate::auth::Principal::Jwt { sub }
+                        | crate::auth::Principal::Oidc { sub, .. } => sub.clone(),
                         _ => "postgres".to_string(),
                     };
                     let app_name = session.application_name.clone();
@@ -7743,7 +7740,7 @@ impl GatewayHandler {
         use rockstream_types::acl::Role;
         if !principal.is_system() {
             if let Err(e) = self.acl_store.check(
-                principal.identity(),
+                &principal.authorization_identity(),
                 &session_namespace,
                 Some(relation_name),
                 Role::Viewer,
@@ -7759,7 +7756,12 @@ impl GatewayHandler {
             if view_ns != &session_namespace && !principal.is_system() {
                 let is_admin = self
                     .acl_store
-                    .check(principal.identity(), &session_namespace, None, Role::Admin)
+                    .check(
+                        &principal.authorization_identity(),
+                        &session_namespace,
+                        None,
+                        Role::Admin,
+                    )
                     .is_ok();
                 if !is_admin {
                     return Some(vec![promote_response(Response::Error(Box::new(
@@ -12216,7 +12218,7 @@ impl GatewayHandler {
                 .map(|s| s.current_namespace.clone())
                 .unwrap_or_else(|| "public".to_string());
             if let Err(e) = self.acl_store.check(
-                principal.identity(),
+                &principal.authorization_identity(),
                 &session_namespace,
                 Some(&table),
                 Role::PipelineOwner,
@@ -12393,15 +12395,18 @@ impl StartupHandler for GatewayHandler {
                                     ),
                                 )));
                             }
-                            match crate::auth::verify_oidc_token(
-                                self.jwt_verifier.as_deref(),
-                                token,
-                            ) {
+                            let verified = crate::auth::oidc_verification_unavailable();
+                            match verified {
                                 Ok(claims) => {
                                     client.metadata_mut().insert(
                                         "_rs_principal".to_string(),
                                         format!("jwt:{}", claims.sub),
                                     );
+                                    if let Some(issuer) = claims.issuer {
+                                        client
+                                            .metadata_mut()
+                                            .insert("_rs_oidc_issuer".to_string(), issuer);
+                                    }
                                 }
                                 Err(e) => {
                                     return Err(pgwire::error::PgWireError::UserError(
@@ -12884,11 +12889,19 @@ impl SimpleQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let oidc_issuer = client.metadata().get("_rs_oidc_issuer").cloned();
             let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
-                    Principal::Jwt {
-                        sub: sub.to_string(),
+                    if let Some(issuer) = oidc_issuer {
+                        Principal::Oidc {
+                            issuer,
+                            sub: sub.to_string(),
+                        }
+                    } else {
+                        Principal::Jwt {
+                            sub: sub.to_string(),
+                        }
                     }
                 } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
                     Principal::CertCn { cn: cn.to_string() }
@@ -13445,11 +13458,19 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let oidc_issuer = client.metadata().get("_rs_oidc_issuer").cloned();
             let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
-                    Principal::Jwt {
-                        sub: sub.to_string(),
+                    if let Some(issuer) = oidc_issuer {
+                        Principal::Oidc {
+                            issuer,
+                            sub: sub.to_string(),
+                        }
+                    } else {
+                        Principal::Jwt {
+                            sub: sub.to_string(),
+                        }
                     }
                 } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
                     Principal::CertCn { cn: cn.to_string() }
@@ -14005,20 +14026,6 @@ impl GatewayServer {
         let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
         handler.auth_mode = AuthMode::Md5;
         handler.role_catalog = role_catalog;
-        GatewayServer::from_handler(addr, handler)
-    }
-
-    /// Create a gateway with OIDC auth enabled (for auth integration tests).
-    pub fn with_shard_db_and_auth(
-        addr: std::net::SocketAddr,
-        catalog: Arc<CatalogStubs>,
-        view_reader: Arc<dyn ViewReader>,
-        shard_db: Arc<rockstream_storage::ShardDb>,
-        jwt_secret: &[u8],
-    ) -> Self {
-        let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
-        handler.auth_mode = AuthMode::Oidc;
-        handler.jwt_verifier = Some(Arc::new(JwtVerifier::with_hs256_key(jwt_secret.to_vec())));
         GatewayServer::from_handler(addr, handler)
     }
 
