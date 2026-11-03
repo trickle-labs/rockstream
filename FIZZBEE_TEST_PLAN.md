@@ -756,6 +756,18 @@ after retained-key recovery. The suite also covers concurrent operations,
 successful rotation, legacy mixed generations, and catalog/audit redaction.
 These tests do not claim live KMS or abrupt process-termination qualification.
 
+Issue #304 persists source/sink secret bindings in `SecretMetadata.source_refs`
+and retains sink bindings in `CatalogSinkEntry.secret_name`. Source/sink DDL
+adds and removes those references; `DROP SECRET` combines persisted and cached
+references and rejects deletion with `RS-2426` while a binding remains. This is
+catalog metadata lifecycle coverage, not a new M1–M7 coordination transition.
+The `test_secret_references_survive_store_reopen` regression in
+`crates/rockstream-control/tests/secrets_lifecycle_tests.rs` verifies that a
+reopened store retains the reference and continues to reject secret deletion.
+The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
+`crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
+deletion until `DROP SINK` removes it.
+
 Issue #276 qualifies the local filesystem object-store durability boundary below
 the M1–M7 coordination state machines. Runtime, migration, and validated-file
 store builders enable `LocalFileSystem::with_fsync(true)`, so successful local
@@ -800,6 +812,17 @@ cursor, broker offsets, frontier, and worker identities; an offset-4 control mus
 fail before another poll. M1–M7 do not model Kafka group assignment or source
 offsets, so this documents the external source boundary without adding an abstract
 invariant (see `docs/testing/worker-source-ack-gap-recovery.md`).
+
+Issue #298 covers the Kafka source poll-error boundary. If `poll_delta` consumes
+records and then fails decoding a record, refreshing assignment, encoding the
+next offset token, or building batches, it seeks assigned partitions back to the
+input `after` token before returning the error. A retry with that token therefore
+replays the same records instead of advancing past records from an unsuccessful
+poll. `kafka_source_exactly_once_tests::real_broker_poison_retry_keeps_the_committed_offset`
+sends valid/poison/valid records, requires two polls with the same token to
+return the same `RS-1003` error, and verifies the broker offset stays at 1.
+Kafka assignment and broker cursor state remain outside M1–M7, so this records
+the concrete source-boundary obligation without adding an abstract transition.
 
 Issue #289 qualifies the corresponding PostgreSQL logical-slot ACK gap. After
 recovery and owner acquisition, the first coordinator-driven source operation

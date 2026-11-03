@@ -37,24 +37,31 @@ use pgwire::api::copy::{
     send_copy_both_response, send_copy_in_response, send_copy_out_response, CopyHandler,
 };
 use pgwire::api::portal::Portal;
-use pgwire::api::query::{send_execution_response, ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::query::{
+    send_execution_response, send_ready_for_query, ExtendedQueryHandler, SimpleQueryHandler,
+};
 use pgwire::api::results::{
     CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
     FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireServerHandlers, Type};
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers,
+    Type,
+};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{
     CopyData, CopyData as MsgCopyData, CopyDone, CopyDone as MsgCopyDone, CopyFail,
     CopyOutResponse as MsgCopyOutResponse,
 };
+use pgwire::messages::data::RowDescription;
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Parse, ParseComplete, PortalSuspended,
     TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
 };
 use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, NoticeResponse};
+use pgwire::messages::simplequery::Query;
 use pgwire::messages::startup::{BackendKeyData, ParameterStatus};
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
@@ -493,7 +500,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
         match MemTable::try_new(schema, vec![vec![]]) {
             Ok(mem_table) => {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(view.name.as_str()),
+                    datafusion::common::TableReference::from(view.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -515,7 +522,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
         match MemTable::try_new(schema, vec![vec![]]) {
             Ok(mem_table) => {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(table.name.as_str()),
+                    datafusion::common::TableReference::from(table.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -3296,11 +3303,13 @@ impl GatewayHandler {
                     detail: format!("Kafka source '{}' requires topic", source.name),
                 })?;
         let connector_id = source_view_connector_id(&source.name, view_name);
+        // Each view has its own durable offset token, so it must not share a
+        // Kafka consumer group that divides partitions between the views.
         let group_id = source
             .options
             .get("group.id")
             .or_else(|| source.options.get("group_id"))
-            .cloned()
+            .map(|configured| format!("{configured}-{connector_id}"))
             .unwrap_or_else(|| format!("rockstream-{connector_id}"));
         let mut runtime = KafkaSource::connect(
             connector_id,
@@ -5454,7 +5463,7 @@ impl GatewayHandler {
 
         // CREATE TABLE [IF NOT EXISTS] — register in catalog
         if ql.starts_with("create table ") || ql.starts_with("create table if not exists ") {
-            return Some(self.handle_create_table(q));
+            return Some(self.handle_create_table(q).await);
         }
 
         // DROP TABLE [IF EXISTS]
@@ -5477,10 +5486,10 @@ impl GatewayHandler {
 
         // CREATE SINK / DROP SINK — v0.44 pgwire DDL wiring
         if ql.starts_with("create sink ") {
-            return Some(self.handle_create_sink(q));
+            return Some(self.handle_create_sink(q).await);
         }
         if ql.starts_with("drop sink ") {
-            return Some(self.handle_drop_sink(q));
+            return Some(self.handle_drop_sink(q).await);
         }
 
         // CREATE SOURCE / ALTER SOURCE / DROP SOURCE — v0.51.9 pgwire DDL wiring
@@ -5488,7 +5497,7 @@ impl GatewayHandler {
             return Some(self.handle_create_source(q).await);
         }
         if ql.starts_with("alter source ") || ql.starts_with("drop source ") {
-            return Some(self.handle_alter_source(q));
+            return Some(self.handle_alter_source(q).await);
         }
 
         // CREATE SECRET / ALTER SECRET / DROP SECRET — v0.55.1 pgwire DDL wiring
@@ -7330,7 +7339,7 @@ impl GatewayHandler {
             let schema = Arc::new(Schema::new(fields));
             if let Ok(mem_table) = MemTable::try_new(schema, vec![vec![]]) {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(view.name.as_str()),
+                    datafusion::common::TableReference::from(view.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -7347,7 +7356,7 @@ impl GatewayHandler {
             let schema = Arc::new(Schema::new(fields));
             if let Ok(mem_table) = MemTable::try_new(schema, vec![vec![]]) {
                 let _ = ctx.register_table(
-                    datafusion::sql::TableReference::from(table.name.as_str()),
+                    datafusion::common::TableReference::from(table.name.as_str()),
                     Arc::new(mem_table),
                 );
             }
@@ -8696,7 +8705,7 @@ impl GatewayHandler {
         ))]
     }
 
-    fn handle_create_table<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_table<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let if_not_exists = ql.contains("if not exists");
 
@@ -8773,11 +8782,36 @@ impl GatewayHandler {
             }
         }
 
-        self.catalog.add_table(CatalogTable {
-            name: table_name.clone(),
-            columns: parsed.columns,
-            pk_cols: parsed.pk_cols,
-        });
+        match self
+            .catalog
+            .add_table_durably(CatalogTable {
+                name: table_name.clone(),
+                columns: parsed.columns,
+                pk_cols: parsed.pk_cols,
+            })
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) if if_not_exists => {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE TABLE").with_rows(0),
+                )]);
+            }
+            Ok(false) => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42P07".to_owned(),
+                    format!("relation \"{table_name}\" already exists"),
+                )))]);
+            }
+            Err(error) => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "58030".to_owned(),
+                    format!("[RS-0003] catalog write failed: {error}"),
+                )))]);
+            }
+        }
         if !parsed.generated_columns.is_empty() {
             let identity_sequences = parsed
                 .generated_columns
@@ -8998,7 +9032,7 @@ impl GatewayHandler {
     }
 
     /// Handle `CREATE SINK <name> FOR VIEW <view> TO ICEBERG|DELTA '<path>' WITH (...)` — v0.44.
-    fn handle_create_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let if_not_exists = ql.contains("if not exists");
         let parsed = match parse_create_sink_ddl(q) {
@@ -9039,7 +9073,16 @@ impl GatewayHandler {
         if let Some(secret_name) = secret_name.as_deref() {
             if !secret_name.is_empty() {
                 let ns = 0u128;
-                if !self.secret_store.has_secret(ns, secret_name) {
+                let secret_exists = match self.secret_store.contains_secret(ns, secret_name).await {
+                    Ok(exists) => exists,
+                    Err(_) => {
+                        return Ok(vec![create_sink_error_response(
+                            "[RS-0003] secret.storage_unavailable: unable to check the secret catalog. Next steps: verify catalog storage health and retry."
+                                .to_string(),
+                        )])
+                    }
+                };
+                if !secret_exists {
                     return Ok(vec![create_sink_error_response(
                         "[RS-2420] secret.not_found: referenced secret does not exist. Next steps: verify the secret name or run CREATE SECRET to define it."
                             .to_string(),
@@ -9059,6 +9102,7 @@ impl GatewayHandler {
             format_version: parsed.format_version,
             partition_by: parsed.partition_by,
             catalog: parsed.catalog,
+            secret_name: secret_name.clone(),
             last_snapshot_epoch: None,
             state: "OK".to_string(),
         };
@@ -9073,6 +9117,7 @@ impl GatewayHandler {
             if let Err(error) = self
                 .secret_store
                 .add_reference(0u128, secret_name, &parsed.name)
+                .await
             {
                 self.catalog.remove_sink(&parsed.name);
                 return Ok(vec![create_sink_error_response(error.to_string())]);
@@ -9092,7 +9137,7 @@ impl GatewayHandler {
         )])
     }
 
-    fn handle_drop_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_drop_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let if_exists = ql.contains("if exists");
         let after = if if_exists {
@@ -9125,7 +9170,7 @@ impl GatewayHandler {
             )))]);
         }
 
-        if self.catalog.get_sink(&name).is_none() {
+        let Some(sink) = self.catalog.get_sink(&name) else {
             if if_exists {
                 return Ok(vec![Response::Execution(
                     Tag::new("DROP SINK").with_rows(0),
@@ -9136,6 +9181,16 @@ impl GatewayHandler {
                 "42704".to_owned(),
                 format!("[RS-4004] sink.not_found: sink '{name}' does not exist"),
             )))]);
+        };
+
+        if let Some(secret_name) = sink.secret_name.as_deref() {
+            if let Err(error) = self
+                .secret_store
+                .remove_reference(0u128, secret_name, &name)
+                .await
+            {
+                return Ok(vec![create_sink_error_response(error.to_string())]);
+            }
         }
 
         self.catalog.remove_sink(&name);
@@ -9247,6 +9302,7 @@ impl GatewayHandler {
             if let Err(error) = self
                 .secret_store
                 .add_reference(0u128, secret_name, &parsed.name)
+                .await
             {
                 self.catalog.remove_source(&parsed.name);
                 return Ok(vec![create_source_error_response(error.to_string())]);
@@ -9410,7 +9466,7 @@ impl GatewayHandler {
         })
     }
 
-    fn handle_alter_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_alter_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_alter_source_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![create_source_error_response(message)]),
@@ -9504,8 +9560,13 @@ impl GatewayHandler {
                 if let Some(source_entry) = source.as_ref() {
                     let secret_name_opt = source_entry.options.get("secret");
                     if let Some(secret_name) = secret_name_opt {
-                        self.secret_store
-                            .remove_reference(0u128, secret_name, &parsed.name);
+                        if let Err(error) = self
+                            .secret_store
+                            .remove_reference(0u128, secret_name, &parsed.name)
+                            .await
+                        {
+                            return Ok(vec![create_source_error_response(error.to_string())]);
+                        }
                     }
                 }
                 self.catalog.remove_source(&parsed.name);
@@ -11104,17 +11165,29 @@ impl GatewayHandler {
             cols.clone()
         };
         if self.catalog.get_table(&table).is_none() && !insert_cols.is_empty() {
-            self.catalog.add_table(CatalogTable {
-                name: table.clone(),
-                columns: insert_cols
-                    .iter()
-                    .map(|c| CatalogColumn {
-                        name: c.clone(),
-                        data_type: "Utf8".to_string(),
-                    })
-                    .collect(),
-                pk_cols: vec![],
-            });
+            if let Err(error) = self
+                .catalog
+                .add_table_durably(CatalogTable {
+                    name: table.clone(),
+                    columns: insert_cols
+                        .iter()
+                        .map(|c| CatalogColumn {
+                            name: c.clone(),
+                            data_type: "Utf8".to_string(),
+                        })
+                        .collect(),
+                    pk_cols: vec![],
+                })
+                .await
+            {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "58030".to_owned(),
+                        format!("[RS-0003] catalog write failed: {error}"),
+                    ),
+                )))]);
+            }
         }
         let metadata = self
             .table_insert_metadata
@@ -13687,13 +13760,109 @@ impl CopyHandler for GatewayHandler {
 
 // ── Handler factory ───────────────────────────────────────────────────────────
 
+struct DefaultGatewaySimpleQueryHandler(Arc<GatewayHandler>);
+
+#[async_trait]
+impl SimpleQueryHandler for DefaultGatewaySimpleQueryHandler {
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        client: &mut C,
+        query: &'a str,
+    ) -> PgWireResult<Vec<Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        <GatewayHandler as SimpleQueryHandler>::do_query(&self.0, client, query).await
+    }
+}
+
+struct GatewaySimpleQueryHandler(Arc<GatewayHandler>);
+
+#[async_trait]
+impl SimpleQueryHandler for GatewaySimpleQueryHandler {
+    async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let normalized = query.query.trim().to_ascii_lowercase();
+        if normalized != "subscribe" && !normalized.starts_with("subscribe ") {
+            return DefaultGatewaySimpleQueryHandler(self.0.clone())
+                .on_query(client, query)
+                .await;
+        }
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+
+        let mut transaction_status = client.transaction_status();
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        for response in
+            <GatewayHandler as SimpleQueryHandler>::do_query(&self.0, client, &query.query).await?
+        {
+            match response {
+                Response::Query(results) => {
+                    let schema = results.row_schema();
+                    let row_description =
+                        RowDescription::new(schema.iter().map(Into::into).collect());
+                    client
+                        .send(PgWireBackendMessage::RowDescription(row_description))
+                        .await?;
+                    let command_tag = results.command_tag().to_owned();
+                    let mut data_rows = results.data_rows();
+                    let mut row_count = 0;
+                    // SUBSCRIBE stays open, so feed() would buffer its rows until CommandComplete.
+                    while let Some(row) = data_rows.next().await {
+                        client.send(PgWireBackendMessage::DataRow(row?)).await?;
+                        row_count += 1;
+                    }
+                    send_execution_response(client, Tag::new(&command_tag).with_rows(row_count))
+                        .await?;
+                }
+                Response::Error(error) => {
+                    client
+                        .feed(PgWireBackendMessage::ErrorResponse((*error).into()))
+                        .await?;
+                    transaction_status = transaction_status.to_error_state();
+                }
+                _ => {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "XX000".to_owned(),
+                        "unexpected response to SUBSCRIBE".to_owned(),
+                    ))));
+                }
+            }
+        }
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client.set_transaction_status(transaction_status);
+        send_ready_for_query(client, transaction_status).await
+    }
+
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        client: &mut C,
+        query: &'a str,
+    ) -> PgWireResult<Vec<Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        <GatewayHandler as SimpleQueryHandler>::do_query(&self.0, client, query).await
+    }
+}
+
 struct GatewayHandlerFactory {
     handler: Arc<GatewayHandler>,
 }
 
 impl PgWireServerHandlers for GatewayHandlerFactory {
     type StartupHandler = GatewayHandler;
-    type SimpleQueryHandler = GatewayHandler;
+    type SimpleQueryHandler = GatewaySimpleQueryHandler;
     type ExtendedQueryHandler = GatewayHandler;
     type CopyHandler = GatewayHandler;
     type ErrorHandler = NoopErrorHandler;
@@ -13702,7 +13871,7 @@ impl PgWireServerHandlers for GatewayHandlerFactory {
         self.handler.clone()
     }
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
-        self.handler.clone()
+        Arc::new(GatewaySimpleQueryHandler(self.handler.clone()))
     }
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
         self.handler.clone()
@@ -15135,7 +15304,9 @@ fn collect_query_relations(
         SetExpr::Select(select) => {
             for projection in &select.projection {
                 match projection {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    SelectItem::UnnamedExpr(expr)
+                    | SelectItem::ExprWithAlias { expr, .. }
+                    | SelectItem::ExprWithAliases { expr, .. } => {
                         visit_expr(expr, relations, top_level_relation, top_level_relation_full);
                     }
                     SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {}
@@ -19993,8 +20164,8 @@ mod s4_tests {
             .unwrap_or_default()
     }
 
-    #[test]
-    fn create_sink_registers_catalog_entry() {
+    #[tokio::test]
+    async fn create_sink_registers_catalog_entry() {
         let handler = make_handler();
         handler.catalog.add_view_in_namespace(CatalogView {
             name: "orders_view".to_string(),
@@ -20009,6 +20180,7 @@ mod s4_tests {
 
         let responses = handler
             .handle_create_sink("CREATE SINK daily_sink FOR VIEW orders_view TO ICEBERG 'file:///warehouse/orders' WITH (snapshot_interval_epochs=3, snapshot_interval_ms=500, parquet_row_group_bytes=1024, format_version=2, partition_by=ARRAY['region','day'], catalog=filesystem)")
+            .await
             .unwrap();
 
         assert!(matches!(responses.as_slice(), [Response::Execution(_)]));
@@ -20031,12 +20203,67 @@ mod s4_tests {
         assert_eq!(sink.catalog, "filesystem");
     }
 
-    #[test]
-    fn create_sink_unknown_view_returns_rs4007() {
+    #[tokio::test]
+    async fn sink_secret_reference_blocks_secret_drop_until_sink_drop() {
+        let handler = make_handler();
+        handler.catalog.add_view_in_namespace(CatalogView {
+            name: "orders_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+        handler
+            .dispatch_async_with_conn(
+                "CREATE SECRET sink_secret (TYPE = 'sasl_plain', username = 'u', password = 'p')",
+                None,
+            )
+            .await
+            .unwrap();
+        handler
+            .dispatch_async_with_conn(
+                "CREATE SINK credentialed_sink FOR VIEW orders_view TO ICEBERG 'file:///warehouse/orders' WITH (snapshot_interval_epochs=3, catalog=filesystem, secret='sink_secret')",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handler
+                .catalog
+                .get_sink("credentialed_sink")
+                .unwrap()
+                .secret_name
+                .as_deref(),
+            Some("sink_secret")
+        );
+        assert_eq!(
+            create_sink_error_message(
+                handler
+                    .dispatch_async_with_conn("DROP SECRET sink_secret", None)
+                    .await
+                    .unwrap()
+            ),
+            "[RS-2426] secret.in_use_by_source_or_sink: secret 'sink_secret' is in use by sources/sinks [credentialed_sink]. Next steps: drop or alter referencing sources and sinks before dropping the secret."
+        );
+        handler
+            .dispatch_async_with_conn("DROP SINK credentialed_sink", None)
+            .await
+            .unwrap();
+        let drop_secret = handler
+            .dispatch_async_with_conn("DROP SECRET sink_secret", None)
+            .await
+            .unwrap();
+        assert!(matches!(drop_secret.as_slice(), [Response::Execution(_)]));
+    }
+
+    #[tokio::test]
+    async fn create_sink_unknown_view_returns_rs4007() {
         let handler = make_handler();
         let message = create_sink_error_message(
             handler
                 .handle_create_sink("CREATE SINK missing_view_sink FOR VIEW missing_view TO ICEBERG 'file:///warehouse/orders' WITH (snapshot_interval_epochs=3, catalog=filesystem)")
+                .await
                 .unwrap(),
         );
         assert!(
@@ -20049,8 +20276,8 @@ mod s4_tests {
         );
     }
 
-    #[test]
-    fn create_sink_bad_catalog_returns_rs4007() {
+    #[tokio::test]
+    async fn create_sink_bad_catalog_returns_rs4007() {
         let handler = make_handler();
         handler.catalog.add_view_in_namespace(CatalogView {
             name: "orders_view".to_string(),
@@ -20063,6 +20290,7 @@ mod s4_tests {
         let message = create_sink_error_message(
             handler
                 .handle_create_sink("CREATE SINK bad_catalog_sink FOR VIEW orders_view TO DELTA 'file:///warehouse/orders' WITH (snapshot_interval_epochs=3, catalog=bogus)")
+                .await
                 .unwrap(),
         );
         assert!(
@@ -20075,8 +20303,8 @@ mod s4_tests {
         );
     }
 
-    #[test]
-    fn create_sink_malformed_with_clause_returns_rs4007() {
+    #[tokio::test]
+    async fn create_sink_malformed_with_clause_returns_rs4007() {
         let handler = make_handler();
         handler.catalog.add_view_in_namespace(CatalogView {
             name: "orders_view".to_string(),
@@ -20089,6 +20317,7 @@ mod s4_tests {
         let message = create_sink_error_message(
             handler
                 .handle_create_sink("CREATE SINK malformed_sink FOR VIEW orders_view TO ICEBERG 'file:///warehouse/orders' WITH (snapshot_interval_epochs='three', catalog=filesystem)")
+                .await
                 .unwrap(),
         );
         assert!(

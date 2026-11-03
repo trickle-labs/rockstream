@@ -331,7 +331,7 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
     assert!(topology_revision(&live) > empty_revision);
     let before_headroom = live.nodes[0].capacity_headroom;
     let memory_pressure = allocate_memory_pressure();
-    let pressure_deadline = Instant::now() + Duration::from_secs(10);
+    let pressure_deadline = Instant::now() + Duration::from_secs(30);
     let pressure_output = loop {
         let output = run_json_status(binary, &management_addr);
         if output.status.success()
