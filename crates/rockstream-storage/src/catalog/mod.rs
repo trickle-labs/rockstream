@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
+use rockstream_types::authorization::{SecurityAuditRecord, SecurityPrincipal};
 use rockstream_types::ids::{
     CompiledPlanId, DatabaseId, IndexId, NamespaceId, PrincipalId, SinkId, SourceId, TableId,
     ViewId, WorkloadId,
@@ -57,6 +58,12 @@ pub enum CatalogError {
 
     #[error("{0}")]
     TransactionTooLarge(String),
+
+    #[error("{0}")]
+    OptimisticConflict(String),
+
+    #[error("{0}")]
+    InvalidSecurityPolicy(String),
 
     #[error("{0}")]
     DependencyCycle(String),

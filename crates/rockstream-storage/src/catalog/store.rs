@@ -26,6 +26,10 @@ use super::{
     CatalogRoleEntry, CatalogSinkEntry, CatalogSourceEntry, CatalogTable, CatalogView,
     CatalogWorkloadEntry, CompiledPlanRecord, DependencyKind, ViewDependency,
 };
+use rockstream_types::authorization::{
+    AuditField, AuditIdentity, PermissionPreset, PolicyScope, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
+};
 use rockstream_types::ids::{
     CompiledPlanId, DatabaseId, IndexId, NamespaceId, PrincipalId, SinkId, SourceId, TableId,
     ViewId, WorkloadId,
@@ -72,6 +76,13 @@ pub trait CatalogStore: Send + Sync {
     async fn get_role(&self, id: PrincipalId) -> Result<Option<CatalogRoleEntry>, CatalogError>;
     async fn list_roles(&self) -> Result<Vec<CatalogRoleEntry>, CatalogError>;
 
+    async fn get_security_principal(
+        &self,
+        id: PrincipalId,
+    ) -> Result<Option<SecurityPrincipal>, CatalogError>;
+    async fn list_security_principals(&self) -> Result<Vec<SecurityPrincipal>, CatalogError>;
+    async fn list_security_audit_records(&self) -> Result<Vec<SecurityAuditRecord>, CatalogError>;
+
     async fn get_compiled_plan(
         &self,
         id: CompiledPlanId,
@@ -97,6 +108,8 @@ struct CatalogInnerState {
     sources: HashMap<SourceId, CatalogSourceEntry>,
     sinks: HashMap<SinkId, CatalogSinkEntry>,
     roles: HashMap<PrincipalId, CatalogRoleEntry>,
+    security_principals: HashMap<PrincipalId, SecurityPrincipal>,
+    security_audit_records: Vec<SecurityAuditRecord>,
     compiled_plans: HashMap<CompiledPlanId, CompiledPlanRecord>,
 }
 
@@ -178,6 +191,10 @@ impl DurableCatalogStore {
             state.roles.values().cloned().collect(),
             state.compiled_plans.values().cloned().collect(),
             state.committed_operations.iter().copied().collect(),
+        )?
+        .with_security_records(
+            state.security_principals.values().cloned().collect(),
+            state.security_audit_records.clone(),
         )?;
         drop(state);
 
@@ -395,6 +412,13 @@ impl DurableCatalogStore {
                 catalog.id_allocator.observe(role.id.0);
                 recovered_state.roles.insert(role.id, role);
             }
+            for principal in snap.security_principals {
+                catalog.id_allocator.observe(principal.id.0);
+                recovered_state
+                    .security_principals
+                    .insert(principal.id, principal);
+            }
+            recovered_state.security_audit_records = snap.security_audit_records;
             for plan in snap.compiled_plans {
                 catalog.id_allocator.observe(plan.id.0);
                 recovered_state.compiled_plans.insert(plan.id, plan);
@@ -476,6 +500,8 @@ impl DurableCatalogStore {
                 continue;
             }
 
+            validate_security_mutations(&recovered_state, &txn)?;
+
             for mutation in &txn.mutations {
                 apply_mutation_to_state(&mut recovered_state, &catalog.id_allocator, mutation);
             }
@@ -498,6 +524,259 @@ impl DurableCatalogStore {
         *catalog.state.write().await = recovered_state;
         Ok(catalog)
     }
+}
+
+fn validate_security_mutations(
+    state: &CatalogInnerState,
+    txn: &CatalogTxn,
+) -> Result<(), CatalogError> {
+    let mut principals = state.security_principals.clone();
+    let mut changed_principals = HashSet::new();
+    let mut audit_ids: HashSet<&str> = state
+        .security_audit_records
+        .iter()
+        .map(|record| record.event_id.as_str())
+        .collect();
+    let mut has_principal_change = false;
+    let mut has_bootstrap = false;
+
+    for mutation in &txn.mutations {
+        match mutation {
+            CatalogMutation::PutSecurityPrincipal {
+                principal,
+                expected_revision,
+                grantor_revision,
+                audit,
+            } => {
+                has_principal_change = true;
+                principal.validate().map_err(|error| {
+                    CatalogError::InvalidSecurityPolicy(format!(
+                        "invalid security principal: {error}"
+                    ))
+                })?;
+                if !changed_principals.insert(principal.id) {
+                    return Err(invalid_security_policy(
+                        "transaction changes the same principal more than once",
+                    ));
+                }
+
+                let old = state.security_principals.get(&principal.id);
+                match (old, expected_revision) {
+                    (None, None) => {
+                        if state.security_principals.is_empty() {
+                            if has_bootstrap
+                                || !is_active_administrator(principal)
+                                || !principal.has_interactive_login()
+                                || grantor_revision.is_some()
+                                || principal.revision != 1
+                            {
+                                return Err(invalid_security_policy(
+                                    "first-administrator preprovisioning requires an empty security catalog and one enabled interactive administrator at revision 1",
+                                ));
+                            }
+                            has_bootstrap = true;
+                        } else {
+                            if principal.revision != 1 {
+                                return Err(invalid_security_policy(
+                                    "new principal revision must start at one",
+                                ));
+                            }
+                            validate_grantor(state, *grantor_revision, audit)?;
+                        }
+                    }
+                    (Some(old), Some(expected)) => {
+                        if old.revision != *expected {
+                            return Err(security_revision_conflict(
+                                principal.id,
+                                *expected,
+                                old.revision,
+                            ));
+                        }
+                        if principal.revision != expected.saturating_add(1) {
+                            return Err(invalid_security_policy(
+                                "updated principal revision must increment by exactly one",
+                            ));
+                        }
+                        validate_grantor(state, *grantor_revision, audit)?;
+                    }
+                    (Some(old), None) => {
+                        return Err(security_revision_conflict(principal.id, 0, old.revision));
+                    }
+                    (None, Some(expected)) => {
+                        return Err(security_revision_conflict(principal.id, *expected, 0));
+                    }
+                }
+
+                validate_grant_audit(
+                    audit,
+                    txn.operation_id,
+                    principal.id,
+                    principal.revision,
+                    old.map(principal_audit_state),
+                    Some(principal_audit_state(principal)),
+                )?;
+                if !audit_ids.insert(audit.event_id.as_str()) {
+                    return Err(invalid_security_policy(
+                        "audit event identity is already present",
+                    ));
+                }
+                principals.insert(principal.id, principal.clone());
+            }
+            CatalogMutation::DeleteSecurityPrincipal {
+                principal_id,
+                expected_revision,
+                grantor_revision,
+                audit,
+            } => {
+                has_principal_change = true;
+                if !changed_principals.insert(*principal_id) {
+                    return Err(invalid_security_policy(
+                        "transaction changes the same principal more than once",
+                    ));
+                }
+                let old = state.security_principals.get(principal_id).ok_or_else(|| {
+                    security_revision_conflict(*principal_id, *expected_revision, 0)
+                })?;
+                if old.revision != *expected_revision {
+                    return Err(security_revision_conflict(
+                        *principal_id,
+                        *expected_revision,
+                        old.revision,
+                    ));
+                }
+                validate_grantor(state, *grantor_revision, audit)?;
+                validate_grant_audit(
+                    audit,
+                    txn.operation_id,
+                    *principal_id,
+                    expected_revision.saturating_add(1),
+                    Some(principal_audit_state(old)),
+                    None,
+                )?;
+                if !audit_ids.insert(audit.event_id.as_str()) {
+                    return Err(invalid_security_policy(
+                        "audit event identity is already present",
+                    ));
+                }
+                principals.remove(principal_id);
+            }
+            CatalogMutation::AppendSecurityAudit(record) => {
+                record.validate().map_err(|error| {
+                    CatalogError::InvalidSecurityPolicy(format!(
+                        "invalid security audit record: {error}"
+                    ))
+                })?;
+                if !audit_ids.insert(record.event_id.as_str()) {
+                    return Err(invalid_security_policy(
+                        "audit event identity is already present",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if has_principal_change && !principals.values().any(is_active_administrator) {
+        return Err(invalid_security_policy(
+            "principal mutation would remove or disable the last active administrator",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_security_policy(message: &str) -> CatalogError {
+    CatalogError::InvalidSecurityPolicy(message.to_string())
+}
+
+fn security_revision_conflict(
+    principal_id: PrincipalId,
+    expected: u64,
+    actual: u64,
+) -> CatalogError {
+    CatalogError::OptimisticConflict(format!(
+        "[RS-2008] transaction.optimistic_conflict: principal {} revision was {}, expected {}; retry the transaction against current policy",
+        principal_id.0, actual, expected
+    ))
+}
+
+fn validate_grantor(
+    state: &CatalogInnerState,
+    grantor_revision: Option<(PrincipalId, u64)>,
+    audit: &SecurityAuditRecord,
+) -> Result<(), CatalogError> {
+    let (grantor_id, expected_revision) = grantor_revision.ok_or_else(|| {
+        invalid_security_policy("principal changes require an authorized grantor")
+    })?;
+    let grantor = state
+        .security_principals
+        .get(&grantor_id)
+        .ok_or_else(|| invalid_security_policy("grantor principal does not exist"))?;
+    if grantor.revision != expected_revision {
+        return Err(security_revision_conflict(
+            grantor_id,
+            expected_revision,
+            grantor.revision,
+        ));
+    }
+    if !is_active_administrator(grantor) {
+        return Err(invalid_security_policy(
+            "grantor lacks current principal and grant management authority",
+        ));
+    }
+    if audit.actor != AuditIdentity::Verified(format!("principal:{}", grantor_id.0)) {
+        return Err(invalid_security_policy(
+            "grant audit actor does not match the current grantor",
+        ));
+    }
+    Ok(())
+}
+
+fn is_active_administrator(principal: &SecurityPrincipal) -> bool {
+    principal.enabled
+        && principal.validate().is_ok()
+        && principal.has_interactive_login()
+        && principal.preset_grants.iter().any(|grant| {
+            grant.preset == PermissionPreset::Administrator && grant.scope == PolicyScope::Cluster
+        })
+}
+
+fn principal_audit_state(principal: &SecurityPrincipal) -> String {
+    let policy = serde_json::to_string(&(
+        principal.enabled,
+        &principal.preset_grants,
+        &principal.scoped_grants,
+    ))
+    .expect("serializing policy fields cannot fail");
+    format!("revision={};policy={policy}", principal.revision)
+}
+
+fn validate_grant_audit(
+    audit: &SecurityAuditRecord,
+    operation_id: u64,
+    principal_id: PrincipalId,
+    policy_revision: u64,
+    before_state: Option<String>,
+    after_state: Option<String>,
+) -> Result<(), CatalogError> {
+    audit.validate().map_err(|error| {
+        CatalogError::InvalidSecurityPolicy(format!("invalid grant audit record: {error}"))
+    })?;
+    let target = format!("principal:{}", principal_id.0);
+    if audit.action != SecurityAuditClass::GrantChange
+        || audit.outcome != SecurityAuditOutcome::Success
+        || !matches!(&audit.target, AuditField::Known(value) if value == &target)
+        || audit.scope != AuditField::Known("cluster".to_string())
+        || audit.operation_id != AuditField::Known(operation_id.to_string())
+        || audit.policy_revision != AuditField::Known(policy_revision)
+        || audit.before_state != before_state.map_or(AuditField::NotApplicable, AuditField::Known)
+        || audit.after_state != after_state.map_or(AuditField::NotApplicable, AuditField::Known)
+        || !matches!(audit.actor, AuditIdentity::Verified(_))
+    {
+        return Err(invalid_security_policy(
+            "grant audit must record the verified actor, target, operation, policy revision, and exact before/after state",
+        ));
+    }
+    Ok(())
 }
 
 fn apply_mutation_to_state(
@@ -599,6 +878,26 @@ fn apply_mutation_to_state(
         CatalogMutation::DeleteRole(id) => {
             state.roles.remove(id);
         }
+        CatalogMutation::PutSecurityPrincipal {
+            principal, audit, ..
+        } => {
+            allocator.observe(principal.id.0);
+            state
+                .security_principals
+                .insert(principal.id, principal.clone());
+            state.security_audit_records.push(audit.clone());
+        }
+        CatalogMutation::DeleteSecurityPrincipal {
+            principal_id,
+            audit,
+            ..
+        } => {
+            state.security_principals.remove(principal_id);
+            state.security_audit_records.push(audit.clone());
+        }
+        CatalogMutation::AppendSecurityAudit(record) => {
+            state.security_audit_records.push(record.clone());
+        }
         CatalogMutation::PutCompiledPlan(p) => {
             allocator.observe(p.id.0);
             state.compiled_plans.insert(p.id, p.clone());
@@ -618,6 +917,8 @@ impl CatalogStore for DurableCatalogStore {
         if state.committed_operations.contains(&txn.operation_id) {
             return Ok(state.revision);
         }
+
+        validate_security_mutations(&state, &txn)?;
 
         // 2. Pre-commit validation
         // 2a. Cycle detection in view dependencies
@@ -860,6 +1161,34 @@ impl CatalogStore for DurableCatalogStore {
 
     async fn list_roles(&self) -> Result<Vec<CatalogRoleEntry>, CatalogError> {
         Ok(self.state.read().await.roles.values().cloned().collect())
+    }
+
+    async fn get_security_principal(
+        &self,
+        id: PrincipalId,
+    ) -> Result<Option<SecurityPrincipal>, CatalogError> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .security_principals
+            .get(&id)
+            .cloned())
+    }
+
+    async fn list_security_principals(&self) -> Result<Vec<SecurityPrincipal>, CatalogError> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .security_principals
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn list_security_audit_records(&self) -> Result<Vec<SecurityAuditRecord>, CatalogError> {
+        Ok(self.state.read().await.security_audit_records.clone())
     }
 
     async fn get_compiled_plan(
