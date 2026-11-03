@@ -2347,6 +2347,50 @@ impl GatewayHandler {
         Some((action, scope, format!("{namespace}.{name}")))
     }
 
+    fn read_policy_scope(
+        &self,
+        relation_name: &str,
+        current_namespace: &str,
+    ) -> Option<(PolicyScope, String, String)> {
+        if relation_name.contains('"') {
+            return None;
+        }
+        let parts: Vec<&str> = relation_name.split('.').collect();
+        let (namespace, name) = match parts.as_slice() {
+            [name] => {
+                let namespace = self
+                    .catalog
+                    .get_view(name)
+                    .map(|view| view.namespace)
+                    .unwrap_or_else(|| current_namespace.to_string());
+                (namespace, *name)
+            }
+            [namespace, name] => (namespace.to_string(), *name),
+            _ => return None,
+        };
+        if namespace.trim().is_empty() || name.trim().is_empty() {
+            return None;
+        }
+        let kind = if self.catalog.get_view(relation_name).is_some() {
+            ResourceKind::View
+        } else {
+            ResourceKind::Table
+        };
+        let scope = PolicyScope::Resource {
+            // The authorization scope is anchored to the authenticated
+            // session's namespace, matching the legacy ACL boundary. A
+            // cross-namespace target additionally requires its own explicit
+            // namespace.cross_access decision below.
+            namespace: current_namespace.to_string(),
+            kind,
+            name: name.to_string(),
+        };
+        if scope.validate().is_err() {
+            return None;
+        }
+        Some((scope, format!("{namespace}.{name}"), namespace))
+    }
+
     async fn security_principal_for_login(
         &self,
         authenticated: &Principal,
@@ -5468,7 +5512,10 @@ impl GatewayHandler {
             if let Some(view_name) = parse_copy_to_stdout_view(query) {
                 // COPY OUT must use the same ACL and namespace checks as SELECT.
                 // Do not read rows or emit a COPY frame before checking access.
-                if let Some(denied) = self.select_access_error_response(&view_name, Some(conn_id)) {
+                if let Some(denied) = self
+                    .select_access_error_response(&view_name, Some(conn_id))
+                    .await
+                {
                     return Ok(denied);
                 }
                 if self.catalog.get_view(&view_name).is_some()
@@ -5853,7 +5900,10 @@ impl GatewayHandler {
 
         // Authorize reads before exposing retention metadata, scanning
         // a snapshot or reserving a stream slot.
-        if let Some(denied) = self.select_access_error_response(&request.view_name, conn_id) {
+        if let Some(denied) = self
+            .select_access_error_response(&request.view_name, conn_id)
+            .await
+        {
             return Ok(denied);
         }
 
@@ -7443,6 +7493,13 @@ impl GatewayHandler {
                             .cloned()
                             .unwrap_or_else(|| top_level_relation.clone());
 
+                        if let Some(denied) = self
+                            .select_access_error_response(&target_rel, conn_id)
+                            .await
+                        {
+                            return Ok(denied);
+                        }
+
                         let has_view = self.catalog.get_view(&target_rel).is_some();
                         let has_table = self.catalog.get_table(&target_rel).is_some();
                         if !has_view && !has_table {
@@ -7975,7 +8032,9 @@ impl GatewayHandler {
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
         for relation_name in referenced_tables {
-            if let Some(error_responses) = self.select_access_error_response(relation_name, conn_id)
+            if let Some(error_responses) = self
+                .select_access_error_response(relation_name, conn_id)
+                .await
             {
                 return Ok(error_responses);
             }
@@ -8036,35 +8095,141 @@ impl GatewayHandler {
         ))
     }
 
-    fn select_access_error_response(
+    async fn select_access_error_response(
         &self,
         relation_name: &str,
         conn_id: Option<&str>,
     ) -> Option<Vec<Response<'static>>> {
-        let (principal, session_namespace) = if let Some(id) = conn_id {
-            let session = self.sessions.entry(id.to_string()).or_default();
-            (session.principal.clone(), session.current_namespace.clone())
-        } else {
-            (Principal::System, "public".to_string())
-        };
+        let session = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+        });
+        let principal = session.as_ref().map(|(principal, _)| principal);
+        let session_namespace = session.as_ref().map(|(_, namespace)| namespace.as_str());
+        let durable_policy_required =
+            self.auth_mode != AuthMode::Off || self.catalog.get_durable_store().is_some();
 
+        if durable_policy_required {
+            if principal.is_some_and(Principal::is_system) && self.auth_mode == AuthMode::Off {
+                return None;
+            }
+
+            let policy_scope = session_namespace
+                .and_then(|namespace| self.read_policy_scope(relation_name, namespace));
+            let matching_principal = match principal {
+                Some(authenticated) if !authenticated.is_system() => self
+                    .security_principal_for_login(authenticated)
+                    .await
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+            let policy_revision = matching_principal
+                .as_ref()
+                .map(|security_principal| security_principal.revision);
+            let data_read_allowed = match (policy_scope.as_ref(), matching_principal.as_ref()) {
+                (Some((scope, _, _)), Some(security_principal)) => {
+                    rockstream_control::authorization::allows(
+                        security_principal,
+                        SecurityAction::DataRead,
+                        scope,
+                    )
+                }
+                _ => false,
+            };
+            let cross_namespace = match (policy_scope.as_ref(), session_namespace) {
+                (Some((_, _, target_namespace)), Some(session_namespace)) => {
+                    target_namespace != session_namespace
+                }
+                _ => false,
+            };
+            let cross_scope = session_namespace.map(|namespace| PolicyScope::Namespace {
+                namespace: namespace.to_string(),
+            });
+            let cross_namespace_allowed = !cross_namespace
+                || matching_principal
+                    .as_ref()
+                    .is_some_and(|security_principal| {
+                        cross_scope.as_ref().is_some_and(|scope| {
+                            rockstream_control::authorization::allows(
+                                security_principal,
+                                SecurityAction::NamespaceCrossAccess,
+                                scope,
+                            )
+                        })
+                    });
+            if data_read_allowed && cross_namespace_allowed {
+                return None;
+            }
+
+            let (audit_scope, target, denied_action) = if data_read_allowed {
+                (
+                    cross_scope.as_ref(),
+                    policy_scope.as_ref().map(|(_, target, _)| target.as_str()),
+                    SecurityAction::NamespaceCrossAccess,
+                )
+            } else {
+                (
+                    policy_scope.as_ref().map(|(scope, _, _)| scope),
+                    policy_scope.as_ref().map(|(_, target, _)| target.as_str()),
+                    SecurityAction::DataRead,
+                )
+            };
+            let audit_recorded = self
+                .append_authorization_denial(
+                    principal,
+                    conn_id,
+                    audit_scope,
+                    target,
+                    policy_revision,
+                )
+                .await
+                .is_ok();
+            if !audit_recorded {
+                if let Some(id) = conn_id {
+                    self.sessions.remove(id);
+                }
+            }
+            let identity = principal.map_or("unknown", Principal::identity);
+            let resource = target.unwrap_or("<unknown>");
+            let audit_status = if audit_recorded {
+                ""
+            } else {
+                " The required security audit could not be persisted; this session's authorization state was invalidated."
+            };
+            return Some(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42501".to_owned(),
+                    format!(
+                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{denied_action:?}' on {resource}. next_steps: Request an authorized scoped grant, then retry.{audit_status}"
+                    ),
+                ),
+            )))]);
+        }
+
+        // Compatibility path for auth-off fixtures that exercise the legacy
+        // ACL store. Release authentication modes always use durable policy.
+        let (principal, session_namespace) =
+            session.unwrap_or((Principal::System, "public".to_string()));
         use rockstream_types::acl::Role;
         if !principal.is_system() {
-            if let Err(e) = self.acl_store.check(
+            if let Err(error) = self.acl_store.check(
                 principal.identity(),
                 &session_namespace,
                 Some(relation_name),
                 Role::Viewer,
             ) {
                 return Some(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_owned(), "42501".to_owned(), e.to_string()),
+                    ErrorInfo::new("ERROR".to_owned(), "42501".to_owned(), error.to_string()),
                 )))]);
             }
         }
 
-        if let Some(cv) = self.catalog.get_view(relation_name) {
-            let view_ns = &cv.namespace;
-            if view_ns != &session_namespace && !principal.is_system() {
+        if let Some(view) = self.catalog.get_view(relation_name) {
+            let view_namespace = &view.namespace;
+            if view_namespace != &session_namespace && !principal.is_system() {
                 let is_admin = self
                     .acl_store
                     .check(principal.identity(), &session_namespace, None, Role::Admin)
@@ -8076,7 +8241,7 @@ impl GatewayHandler {
                             "42501".to_owned(),
                             format!(
                                 "[RS-2402] auth.namespace_access_denied: principal '{}' cannot access namespace '{}' from session namespace '{}'",
-                                principal.identity(), view_ns, session_namespace
+                                principal.identity(), view_namespace, session_namespace
                             ),
                         ),
                     )))]);
@@ -8096,7 +8261,7 @@ impl GatewayHandler {
         order_by: Vec<(String, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        if let Some(error_responses) = self.select_access_error_response(view_name, conn_id) {
+        if let Some(error_responses) = self.select_access_error_response(view_name, conn_id).await {
             return Ok(error_responses);
         }
         if self.catalog.get_view(view_name).is_some()
@@ -11040,7 +11205,7 @@ impl GatewayHandler {
         // Retain that compatibility path; only relation reads need view ACL.
         let view_name = extract_view_name_from_select(inner_sql);
         if let Some(name) = view_name.as_deref() {
-            if let Some(denied) = self.select_access_error_response(name, conn_id) {
+            if let Some(denied) = self.select_access_error_response(name, conn_id).await {
                 return Ok(denied);
             }
             if self.catalog.get_view(name).is_some() && !self.catalog.is_backfill_published(name) {

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rockstream_control::audit::FileAuditLog;
 use rockstream_gateway::auth::Principal;
-use rockstream_gateway::catalog_stubs::CatalogStubs;
+use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable, CatalogView};
 use rockstream_gateway::role_catalog::{gen_scram_verifiers, RoleEntry};
 use rockstream_gateway::server::GatewayHandler;
 use rockstream_gateway::view_reader::{ViewReadStrategy, ViewReader};
@@ -247,6 +247,14 @@ async fn gateway_mutation_authorization_lfs() {
 async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() {
     let catalog = Arc::new(CatalogStubs::new());
     let handler = GatewayHandler::new(catalog.clone(), Arc::new(NoopViewReader));
+    let protected_table = CatalogTable::new(
+        "blocked",
+        vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    );
+    assert!(catalog.add_table(protected_table.clone()));
     let salt = vec![1; 16];
     let iterations = 4096;
     let (salted_password, stored_key, server_key) =
@@ -311,17 +319,94 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
         )
         .await
         .unwrap();
+
+    let reader = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Durable reader".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "reader-login".to_string(),
+            salt: salt.clone(),
+            iterations,
+            stored_key: stored_key.to_vec(),
+            server_key: server_key.to_vec(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::DataReader,
+            scope: PolicyScope::Namespace {
+                namespace: "public".to_string(),
+            },
+        }],
+        scoped_grants: vec![],
+    };
+    let reader_policy =
+        serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
+            .unwrap();
+    let reader_grant_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "reader-grant".to_string(),
+        timestamp_ms: 2,
+        actor: AuditIdentity::Verified("principal:1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("2".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={reader_policy}")),
+    };
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: reader.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: reader_grant_audit.clone(),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
     catalog.set_durable_store(durable.clone());
     handler
         .role_catalog
         .insert(RoleEntry {
             username: "admin-login".to_string(),
             scram_salted_password: salted_password.to_vec(),
+            scram_salt: salt.clone(),
+            scram_iterations: iterations,
+            md5_hash: None,
+        })
+        .unwrap();
+    handler
+        .role_catalog
+        .insert(RoleEntry {
+            username: "reader-login".to_string(),
+            scram_salted_password: salted_password.to_vec(),
             scram_salt: salt,
             scram_iterations: iterations,
             md5_hash: None,
         })
         .unwrap();
+
+    catalog.add_view_in_namespace(CatalogView {
+        name: "allowed_view".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
 
     let connection_id = "durable-policy-denial";
     handler
@@ -345,8 +430,42 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
         error.message,
         "[RS-2401] auth.permission_denied: principal 'admin-login' is not authorized for action 'TableCreate' on public.blocked. next_steps: Request an authorized scoped grant, then retry."
     );
-    assert!(catalog.get_table("blocked").is_none());
+    assert_eq!(catalog.get_table("blocked"), Some(protected_table.clone()));
     assert!(handler.sessions.contains_key(connection_id));
+
+    let read_responses = handler
+        .dispatch_async_with_conn("SELECT * FROM blocked", Some(connection_id))
+        .await
+        .unwrap();
+    let read_error = match read_responses.as_slice() {
+        [pgwire::api::results::Response::Error(error)] => error,
+        _ => panic!("expected exactly one read authorization error response"),
+    };
+    assert_eq!(read_error.severity, "ERROR");
+    assert_eq!(read_error.code, "42501");
+    assert_eq!(
+        read_error.message,
+        "[RS-2401] auth.permission_denied: principal 'admin-login' is not authorized for action 'DataRead' on public.blocked. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert_eq!(catalog.get_table("blocked"), Some(protected_table));
+    assert!(handler.sessions.contains_key(connection_id));
+
+    let reader_connection = "durable-policy-reader";
+    handler
+        .sessions
+        .entry(reader_connection.to_string())
+        .or_default()
+        .principal = Principal::ScramUser {
+        username: "reader-login".to_string(),
+    };
+    let allowed_read = handler
+        .dispatch_async_with_conn("SELECT * FROM allowed_view", Some(reader_connection))
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed_read.as_slice(),
+        [pgwire::api::results::Response::Query(_)]
+    ));
 
     let denial = SecurityAuditRecord {
         format_version: SECURITY_AUDIT_FORMAT_VERSION,
@@ -371,19 +490,21 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
         after_state: AuditField::NotApplicable,
     };
     let records = durable.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 4);
     assert_eq!(records[0], bootstrap_audit);
-    let actual_denial = &records[1];
-    assert!(actual_denial.event_id.starts_with("gateway-authz-"));
-    assert!(actual_denial.timestamp_ms > 0);
-    assert_eq!(
-        &SecurityAuditRecord {
-            event_id: String::new(),
-            timestamp_ms: 0,
-            ..actual_denial.clone()
-        },
-        &denial
-    );
+    assert_eq!(records[1], reader_grant_audit);
+    for actual_denial in &records[2..] {
+        assert!(actual_denial.event_id.starts_with("gateway-authz-"));
+        assert!(actual_denial.timestamp_ms > 0);
+        assert_eq!(
+            &SecurityAuditRecord {
+                event_id: String::new(),
+                timestamp_ms: 0,
+                ..actual_denial.clone()
+            },
+            &denial
+        );
+    }
 }
 
 #[cfg(feature = "testcontainers")]
