@@ -156,7 +156,7 @@ async fn gateway_start_fails_closed_when_durable_catalog_recovery_fails() {
     assert_eq!(
         error.to_string(),
         format!(
-            "RS-0003 gateway catalog recovery failed: {catalog_error}\n  next steps: Restore or repair durable catalog storage before starting the gateway."
+            "RS-0003 gateway durable catalog recovery failed: {catalog_error}\n  next steps: Check that the durable catalog is intact and storage is accessible."
         )
     );
 }
