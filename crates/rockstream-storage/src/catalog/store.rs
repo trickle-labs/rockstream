@@ -37,6 +37,7 @@ use rockstream_types::ids::{
 use rockstream_types::workload::WorkloadDef;
 
 /// Abstract interface for catalog operations.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CatalogStore: Send + Sync {
     async fn commit_txn(&self, txn: CatalogTxn) -> Result<u64, CatalogError>;

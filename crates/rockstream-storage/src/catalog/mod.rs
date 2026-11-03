@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
-use rockstream_types::authorization::{SecurityAuditRecord, SecurityPrincipal};
 use rockstream_types::ids::{
     CompiledPlanId, DatabaseId, IndexId, NamespaceId, PrincipalId, SinkId, SourceId, TableId,
     ViewId, WorkloadId,
