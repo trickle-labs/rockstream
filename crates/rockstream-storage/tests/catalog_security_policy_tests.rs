@@ -8,6 +8,7 @@ use rockstream_types::authorization::{
     SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
 use rockstream_types::ids::PrincipalId;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 fn principal(id: u64, revision: u64, presets: Vec<ScopedPresetGrant>) -> SecurityPrincipal {
@@ -507,4 +508,83 @@ async fn recovery_rejects_a_security_transaction_without_a_reachable_login() {
         .await
         .unwrap_err();
     assert!(matches!(error, CatalogError::InvalidSecurityPolicy(_)));
+}
+
+#[tokio::test]
+async fn duplicate_login_identity_is_rejected_for_mutations_and_snapshots() {
+    let object_store = Arc::new(InMemory::new());
+    let catalog = DurableCatalogStore::new(object_store, "duplicate-login");
+    let administrator = admin(1, 1);
+    catalog
+        .preprovision_first_administrator(administrator.clone(), 601)
+        .await
+        .unwrap();
+
+    let mut duplicate = admin(2, 1);
+    duplicate.login_methods = administrator.login_methods.clone();
+    let snapshot = CatalogSnapshot::new(
+        1,
+        2,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        BTreeSet::new(),
+    )
+    .unwrap();
+    let snapshot_error = snapshot
+        .with_security_records(vec![administrator.clone(), duplicate.clone()], vec![])
+        .unwrap_err();
+    assert!(matches!(
+        snapshot_error,
+        CatalogError::DecodeError(message)
+            if message == "[RS-1003] invalid security login mapping in snapshot: login identity is mapped more than once in the security catalog"
+    ));
+
+    let audits_before = catalog.list_security_audit_records().await.unwrap();
+    let error = catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                602,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: duplicate.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit(
+                        "event-duplicate-login",
+                        602,
+                        AuditIdentity::Verified("principal:1".to_string()),
+                        &duplicate,
+                        None,
+                        Some(policy_state(&duplicate)),
+                    ),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CatalogError::InvalidSecurityPolicy(message)
+            if message == "invalid security login mapping: login identity is mapped more than once in the security catalog"
+    ));
+    assert_eq!(catalog.get_revision().await, 1);
+    assert_eq!(
+        catalog.list_security_principals().await.unwrap(),
+        vec![administrator]
+    );
+    assert_eq!(
+        catalog.list_security_audit_records().await.unwrap(),
+        audits_before
+    );
 }

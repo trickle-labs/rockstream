@@ -745,6 +745,10 @@ fn validate_security_mutations(
         }
     }
 
+    SecurityPrincipal::validate_unique_login_identities(principals.values()).map_err(|error| {
+        invalid_security_policy(&format!("invalid security login mapping: {error}"))
+    })?;
+
     if has_principal_change && !principals.values().any(is_active_administrator) {
         return Err(invalid_security_policy(
             "principal mutation would remove or disable the last active administrator",

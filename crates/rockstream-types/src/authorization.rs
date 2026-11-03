@@ -421,6 +421,22 @@ impl SecurityPrincipal {
         Ok(())
     }
 
+    /// Reject login methods that would map one credential identity to multiple
+    /// principals in the same durable catalog.
+    pub fn validate_unique_login_identities<'a>(
+        principals: impl IntoIterator<Item = &'a SecurityPrincipal>,
+    ) -> Result<(), AuthorizationModelError> {
+        let mut identities = std::collections::HashSet::new();
+        for principal in principals {
+            for method in &principal.login_methods {
+                if !identities.insert(method.identity_key()) {
+                    return Err(AuthorizationModelError::DuplicateLoginIdentity);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn has_interactive_login(&self) -> bool {
         self.login_methods.iter().any(LoginMethod::is_interactive)
     }
@@ -534,7 +550,7 @@ impl std::fmt::Display for AuthorizationModelError {
                 "security principal is invalid or uses an unsupported record version"
             }
             Self::DuplicateLoginIdentity => {
-                "login identity is already mapped within this principal"
+                "login identity is mapped more than once in the security catalog"
             }
             Self::InvalidLoginMethod => "login method is malformed",
             Self::ServicePrincipalPresetDenied => {

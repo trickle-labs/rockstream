@@ -120,6 +120,13 @@ impl CatalogSnapshot {
                 ));
             }
         }
+        SecurityPrincipal::validate_unique_login_identities(principals.iter()).map_err(
+            |error| {
+                CatalogError::DecodeError(format!(
+                    "[RS-1003] invalid security login mapping in snapshot: {error}"
+                ))
+            },
+        )?;
         let mut audit_ids = HashSet::new();
         for event in &audit_records {
             event.validate().map_err(|error| {
@@ -188,6 +195,12 @@ impl CatalogSnapshot {
                 ));
             }
         }
+        SecurityPrincipal::validate_unique_login_identities(snap.security_principals.iter())
+            .map_err(|error| {
+                CatalogError::DecodeError(format!(
+                    "[RS-1003] invalid security login mapping in snapshot: {error}"
+                ))
+            })?;
         let mut audit_ids = HashSet::new();
         for event in &snap.security_audit_records {
             event.validate().map_err(|error| {
@@ -224,4 +237,68 @@ fn validate_last_administrator(principals: &[SecurityPrincipal]) -> Result<(), C
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rockstream_types::{
+        authorization::{LoginMethod, ScopedPresetGrant, SECURITY_PRINCIPAL_FORMAT_VERSION},
+        ids::PrincipalId,
+    };
+
+    fn administrator(id: u64) -> SecurityPrincipal {
+        SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(id),
+            display_name: format!("administrator-{id}"),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::ScramSha256 {
+                username: "shared-login".to_string(),
+                salt: vec![1; 16],
+                iterations: 4096,
+                stored_key: vec![2; 32],
+                server_key: vec![3; 32],
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![],
+        }
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_login_identities_across_principals() {
+        let mut snapshot = CatalogSnapshot::new(
+            1,
+            2,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            BTreeSet::new(),
+        )
+        .unwrap();
+        snapshot.security_principals = vec![administrator(1), administrator(2)];
+        snapshot.checksum = 0;
+        let checksum_input = serde_json::to_vec(&snapshot).unwrap();
+        snapshot.checksum = compute_checksum(&checksum_input);
+
+        let error = CatalogSnapshot::decode(&snapshot.encode().unwrap()).unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogError::DecodeError(message)
+                if message == "[RS-1003] invalid security login mapping in snapshot: login identity is mapped more than once in the security catalog"
+        ));
+    }
 }
