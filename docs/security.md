@@ -181,10 +181,17 @@ RockStream features **zero-downtime in-flight certificate rotation** via `TlsCer
 
 ## Audit Trail
 
-Every mTLS rejection and successful CLI session writes a structured JSONL audit entry:
+When configured, the control service writes mTLS and CLI identity events to a structured JSONL audit log:
 - `security.internal_mtls_denied`: Handshake refusal with peer address, error code (`RS-2410`/`RS-2411`), and reason.
 - `cli.authenticated`: Successful administrative connection with operator CN identity.
 - `worker.registered`: Authenticated worker join with verified node identity.
+
+Pre-authentication handshake and certificate-extraction failures record actor
+`unknown`; the listener records only the observed peer address. A registration
+whose requested worker ID conflicts with a CA-verified certificate records the
+certificate identity as the actor and rejects the connection before topology
+registration. If the required audit log is unavailable or an append fails, the
+connection is rejected and the server reports the audit failure.
 
 ## First administrator preprovisioning
 

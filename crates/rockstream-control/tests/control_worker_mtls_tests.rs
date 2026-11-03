@@ -82,6 +82,10 @@ async fn test_control_worker_mtls_missing_cert_rejected() {
             && (e.detail.as_deref().unwrap_or("").contains("RS-2410")
                 || e.detail.as_deref().unwrap_or("").contains("RS-2411"))
     }));
+    assert!(events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .all(|event| event.actor == "unknown"));
 
     worker_handle.abort();
     handle.shutdown();
@@ -117,6 +121,10 @@ async fn test_control_worker_mtls_expired_cert_rejected() {
         e.action == "security.internal_mtls_denied"
             && e.detail.as_deref().unwrap_or("").contains("RS-2411")
     }));
+    assert!(events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .all(|event| event.actor == "unknown"));
 
     handle.shutdown();
 }
@@ -151,6 +159,10 @@ async fn test_control_worker_mtls_untrusted_ca_rejected() {
         e.action == "security.internal_mtls_denied"
             && e.detail.as_deref().unwrap_or("").contains("RS-2411")
     }));
+    assert!(events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .all(|event| event.actor == "unknown"));
 
     handle.shutdown();
 }
@@ -231,6 +243,14 @@ async fn test_control_worker_mtls_role_only_certificate_cannot_register() {
         }),
         "unexpected audit events: {events:?}"
     );
+    let denial = events
+        .iter()
+        .find(|event| {
+            event.action == "security.internal_mtls_denied"
+                && event.detail.as_deref() == Some(expected_detail)
+        })
+        .expect("node identity rejection audit event");
+    assert_eq!(denial.actor, "worker:worker");
 
     worker_handle.abort();
     handle.shutdown();

@@ -2775,6 +2775,24 @@ async fn cleanup_decommissioned_workers(
     }
 }
 
+fn append_required_security_audit(
+    audit: Option<&Arc<FileAuditLog>>,
+    event: &AuditEvent,
+    context: &'static str,
+) -> bool {
+    let Some(audit) = audit else {
+        tracing::error!(context, "required security audit log is unavailable");
+        return false;
+    };
+    match audit.append(event) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, context, "required security audit append failed");
+            false
+        }
+    }
+}
+
 /// Accept a connection and perform TLS handshake if configured.
 async fn accept_and_handle(
     stream: TcpStream,
@@ -2789,29 +2807,35 @@ async fn accept_and_handle(
                     Ok(id) => Some(id),
                     Err(e) => {
                         tracing::warn!(%peer, error = %e, "control: mTLS identity extraction failed");
-                        if let Some(aud) = &ctx.audit {
-                            let event = AuditEvent::now(
-                                "control",
-                                "security.internal_mtls_denied",
-                                format!("peer={peer}"),
-                            )
-                            .with_detail(format!(
-                                "identity extraction failed: {e}, error_code=RS-2411"
-                            ));
-                            let _ = aud.append(&event);
-                        }
+                        let event = AuditEvent::now(
+                            "unknown",
+                            "security.internal_mtls_denied",
+                            format!("peer={peer}"),
+                        )
+                        .with_detail(format!(
+                            "identity extraction failed: {e}, error_code=RS-2411"
+                        ));
+                        append_required_security_audit(
+                            ctx.audit.as_ref(),
+                            &event,
+                            "internal mTLS identity extraction failure",
+                        );
                         return;
                     }
                 };
                 if let Some(ref id) = identity {
                     if id.role == NodeRole::Cli {
-                        if let Some(aud) = &ctx.audit {
-                            let event = AuditEvent::now(
-                                id.to_cn(),
-                                "cli.authenticated",
-                                format!("peer={peer}"),
-                            );
-                            let _ = aud.append(&event);
+                        let event = AuditEvent::now(
+                            id.to_cn(),
+                            "cli.authenticated",
+                            format!("peer={peer}"),
+                        );
+                        if !append_required_security_audit(
+                            ctx.audit.as_ref(),
+                            &event,
+                            "internal CLI authentication",
+                        ) {
+                            return;
                         }
                     }
                 }
@@ -2826,15 +2850,17 @@ async fn accept_and_handle(
                     RS_2411
                 };
                 tracing::warn!(%peer, error = %e, %code, "control: mTLS handshake rejected");
-                if let Some(aud) = &ctx.audit {
-                    let event = AuditEvent::now(
-                        "control",
-                        "security.internal_mtls_denied",
-                        format!("peer={peer}"),
-                    )
-                    .with_detail(format!("TLS handshake failed: {e}, error_code={code}"));
-                    let _ = aud.append(&event);
-                }
+                let event = AuditEvent::now(
+                    "unknown",
+                    "security.internal_mtls_denied",
+                    format!("peer={peer}"),
+                )
+                .with_detail(format!("TLS handshake failed: {e}, error_code={code}"));
+                append_required_security_audit(
+                    ctx.audit.as_ref(),
+                    &event,
+                    "internal mTLS handshake rejection",
+                );
             }
         }
     } else {
@@ -3087,19 +3113,21 @@ async fn handle_connection_stream<R, W>(
                             registered_id = %reg.worker_id,
                             "control: worker mTLS identity mismatch rejected"
                         );
-                        if let Some(aud) = &audit {
-                            let event = AuditEvent::now(
-                                "control",
-                                "security.internal_mtls_denied",
-                                format!("worker_id={}, peer={peer}", reg.worker_id),
-                            )
-                            .with_detail(format!(
-                                "node identity mismatch: cert={}, requested_worker_id={}, error_code=RS-2412",
-                                id.to_cn(),
-                                reg.worker_id
-                            ));
-                            let _ = aud.append(&event);
-                        }
+                        let event = AuditEvent::now(
+                            id.to_cn(),
+                            "security.internal_mtls_denied",
+                            format!("worker_id={}, peer={peer}", reg.worker_id),
+                        )
+                        .with_detail(format!(
+                            "node identity mismatch: cert={}, requested_worker_id={}, error_code=RS-2412",
+                            id.to_cn(),
+                            reg.worker_id
+                        ));
+                        append_required_security_audit(
+                            audit.as_ref(),
+                            &event,
+                            "worker node identity rejection",
+                        );
                         let reply = ControlMessage::OperationFailed {
                             code: RS_2412.to_string(),
                             message: format!(

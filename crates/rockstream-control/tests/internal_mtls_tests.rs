@@ -90,6 +90,10 @@ async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_dat
         !denial_events.is_empty(),
         "Audited denial events must be recorded for failed mTLS handshakes"
     );
+    assert!(
+        denial_events.iter().all(|event| event.actor == "unknown"),
+        "pre-authentication TLS failures must not claim an authenticated actor: {denial_events:?}"
+    );
 
     h1.abort();
     h2.abort();
