@@ -32,6 +32,7 @@ class GateSelfTests(unittest.TestCase):
                 "auth_scram_tests", "gateway_dml_tests", "gateway_extended_query_tests",
                 "gateway_integration_tests", "gateway_proof_tests", "golden_wire_tests",
                 "listen_notify_tests", "transaction_savepoint_tests",
+                "v072_durable_subscription_publication_tests",
             )
         ])
 
