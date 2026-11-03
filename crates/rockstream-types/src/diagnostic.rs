@@ -307,9 +307,23 @@ fn is_sensitive_json_key(key: &str) -> bool {
 }
 
 fn redact_secrets_text(input: &str) -> String {
+    if input.contains("-----BEGIN") {
+        return "[REDACTED_PRIVATE_KEY_MATERIAL]".to_string();
+    }
     let mut output = input.to_string();
     for key in [
-        "password", "passwd", "secret", "token", "api_key", "api-key", "apikey",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "authorization",
+        "private_key",
+        "private-key",
+        "privatekey",
+        "private key",
     ] {
         output = redact_assignment(&output, key);
     }
@@ -317,11 +331,7 @@ fn redact_secrets_text(input: &str) -> String {
     output = redact_auth_scheme(&output, "basic");
     output = redact_auth_scheme(&output, "token");
     output = redact_url_credentials(&output);
-    if output.contains("-----BEGIN") {
-        "[REDACTED_PRIVATE_KEY_MATERIAL]".to_string()
-    } else {
-        output
-    }
+    output
 }
 
 fn count_redaction_markers(input: &str, redacted: &str) -> usize {
@@ -455,6 +465,16 @@ fn redact_assignment(input: &str, key: &str) -> String {
                 .map(|end| value_start + end)
                 .unwrap_or(output.len())
         };
+        if key == "authorization" {
+            let value = output[value_start..].to_ascii_lowercase();
+            if ["bearer ", "basic ", "token "]
+                .iter()
+                .any(|scheme| value.starts_with(scheme))
+            {
+                offset = value_end;
+                continue;
+            }
+        }
         if quoted_key {
             if let Some(value_quote @ ('"' | '\'')) = output[value_start..].chars().next() {
                 let quote_len = value_quote.len_utf8();
@@ -611,6 +631,22 @@ mod tests {
         assert_eq!(
             redact_secrets(r#"token = "fixture secret value" and api_key : 'fixture key'"#),
             "token = [REDACTED] and api_key : [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets(
+                "private_key=fixture-key private-key=hyphen-key privatekey=camel-key private key=spaced-key authorization=fixture-auth"
+            ),
+            "private_key=[REDACTED] private-key=[REDACTED] privatekey=[REDACTED] private key=[REDACTED] authorization=[REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets(r#"'private-key':'fixture-key'"#),
+            r#"'private-key':'[REDACTED]'"#
+        );
+        assert_eq!(
+            redact_secrets(
+                "private_key=-----BEGIN PRIVATE KEY-----\nfixture key material\n-----END PRIVATE KEY-----"
+            ),
+            "[REDACTED_PRIVATE_KEY_MATERIAL]"
         );
         assert_eq!(
             redact_secrets_with_count(
