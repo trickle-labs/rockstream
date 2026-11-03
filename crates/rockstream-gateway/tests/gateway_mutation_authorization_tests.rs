@@ -220,6 +220,117 @@ fn set_viewer(handler: &GatewayHandler, conn_id: &str) {
 }
 
 #[tokio::test]
+async fn oidc_login_uses_exact_issuer_and_subject_for_durable_policy() {
+    let issuer = "https://issuer.example";
+    let subject = "reader";
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "OIDC administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: issuer.to_string(),
+            subject: subject.to_string(),
+        }],
+        preset_grants: vec![
+            ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            },
+            ScopedPresetGrant {
+                preset: PermissionPreset::DataReader,
+                scope: PolicyScope::Namespace {
+                    namespace: "public".to_string(),
+                },
+            },
+        ],
+        scoped_grants: vec![],
+    };
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "oidc-policy-test",
+    ));
+    seed_public_namespace(&durable).await;
+    durable
+        .preprovision_first_administrator(principal, 801)
+        .await
+        .unwrap();
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.set_durable_store(durable.clone());
+    catalog.add_view_in_namespace(CatalogView {
+        name: "allowed_view".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader));
+
+    let allowed_connection = "oidc-allowed";
+    handler
+        .sessions
+        .entry(allowed_connection.to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: issuer.to_string(),
+        sub: subject.to_string(),
+    };
+    let allowed = handler
+        .dispatch_async_with_conn("SELECT * FROM allowed_view", Some(allowed_connection))
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed.as_slice(),
+        [pgwire::api::results::Response::Query(_)]
+    ));
+
+    let wrong_issuer = "https://wrong.example";
+    let wrong_issuer_connection = "oidc-wrong-issuer";
+    handler
+        .sessions
+        .entry(wrong_issuer_connection.to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: wrong_issuer.to_string(),
+        sub: subject.to_string(),
+    };
+    let denied = handler
+        .dispatch_async_with_conn("SELECT * FROM allowed_view", Some(wrong_issuer_connection))
+        .await
+        .unwrap();
+    let error = match denied.as_slice() {
+        [pgwire::api::results::Response::Error(error)] => error,
+        _ => panic!("expected one authorization denial for the wrong issuer"),
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "42501");
+    assert_eq!(
+        error.message,
+        "[RS-2401] auth.permission_denied: principal 'reader' is not authorized for action 'DataRead' on public.allowed_view. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert!(handler.sessions.contains_key(wrong_issuer_connection));
+
+    let records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[1].actor,
+        AuditIdentity::Verified(format!(
+            "oidc:{}:{}:{}:{}",
+            wrong_issuer.len(),
+            wrong_issuer,
+            subject.len(),
+            subject
+        ))
+    );
+    assert_eq!(records[1].outcome, SecurityAuditOutcome::Denied);
+}
+
+#[tokio::test]
 async fn pgwire_mutation_policy_simple_and_extended() {
     assert_eq!(PGWIRE_MUTATION_POLICY.len(), mutation_cases().len());
     let temp = tempfile::tempdir().unwrap();

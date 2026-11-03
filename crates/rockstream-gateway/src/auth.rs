@@ -49,6 +49,10 @@ pub enum Principal {
     Jwt {
         sub: String,
     }, // OIDC bearer token, verified against JWKS; sub = JWT subject
+    Oidc {
+        issuer: String,
+        sub: String,
+    }, // Verified OIDC identity pair
     CertCn {
         cn: String,
     }, // mTLS client cert CN
@@ -66,6 +70,7 @@ impl Principal {
         match self {
             Principal::System => "system",
             Principal::Jwt { sub } => sub,
+            Principal::Oidc { sub, .. } => sub,
             Principal::CertCn { cn } => cn,
             Principal::Mtls { cn, .. } => cn,
             Principal::ScramUser { username } => username,
@@ -81,6 +86,9 @@ impl Principal {
         match self {
             Principal::System => "system".to_string(),
             Principal::Jwt { sub } => format!("jwt:{sub}"),
+            Principal::Oidc { issuer, sub } => {
+                format!("oidc:{}:{}:{}:{}", issuer.len(), issuer, sub.len(), sub)
+            }
             Principal::CertCn { cn } => format!("cert:{cn}"),
             Principal::Mtls {
                 certificate_sha256, ..

@@ -2606,6 +2606,13 @@ impl GatewayHandler {
                 },
             ) if self.auth_mode != AuthMode::Md5 && username == stored_username => true,
             (
+                Principal::Oidc { issuer, sub },
+                LoginMethod::Oidc {
+                    issuer: stored_issuer,
+                    subject,
+                },
+            ) => issuer == stored_issuer && sub == subject,
+            (
                 Principal::Mtls {
                     certificate_sha256, ..
                 },
@@ -2846,6 +2853,7 @@ impl GatewayHandler {
         let actor = match principal {
             Some(actor @ Principal::ScramUser { .. }) => AuditIdentity::Verified(actor.actor()),
             Some(actor @ Principal::Mtls { .. }) => AuditIdentity::Verified(actor.actor()),
+            Some(actor @ Principal::Oidc { .. }) => AuditIdentity::Verified(actor.actor()),
             Some(actor @ (Principal::Jwt { .. } | Principal::CertCn { .. })) => {
                 AuditIdentity::Unverified(actor.actor())
             }
@@ -6167,6 +6175,7 @@ impl GatewayHandler {
                     let pid = session.backend_pid;
                     let usename = match &session.principal {
                         crate::auth::Principal::Jwt { sub } => sub.clone(),
+                        crate::auth::Principal::Oidc { sub, .. } => sub.clone(),
                         _ => "postgres".to_string(),
                     };
                     let app_name = session.application_name.clone();
