@@ -300,7 +300,8 @@ fn test_cli_support_bundle_redaction_and_size_cap() {
 
     assert!(res.size_bytes > 0);
     assert!(res.size_bytes < 10 * 1024 * 1024); // < 10MB default size cap
-    assert!(res.redacted_secrets_count > 0); // Secret redaction confirmed
+    assert_eq!(res.view.as_deref(), Some("active_users"));
+    assert_eq!(res.redacted_secrets_count, 0);
 }
 
 #[test]

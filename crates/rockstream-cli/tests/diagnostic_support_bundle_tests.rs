@@ -1,6 +1,7 @@
 use rockstream_cli::output::{DiagnosticSupportInfo, OutputFormat, SupportBundleInfo};
-use rockstream_cli::run_support_diagnose;
 use rockstream_cli::transport::StorageClient;
+use rockstream_cli::{run_support_bundle, run_support_diagnose};
+use rockstream_types::audit::AuditEvent;
 use rockstream_types::candidate_identity::CandidateIdentity;
 use rockstream_types::diagnostic::{
     global_diagnostic_journal, record_diagnostic, DiagnosticOccurrence,
@@ -52,7 +53,7 @@ fn support_diagnose_exact_bundle() {
             bundle_path: output_path.to_string_lossy().into_owned(),
             view: None,
             size_bytes: expected_bytes.len() as u64,
-            redacted_secrets_count: 1,
+            redacted_secrets_count: 0,
             generated_at_ms: BUNDLE_TIME_MS,
         },
     })
@@ -88,4 +89,107 @@ fn support_diagnose_exact_bundle() {
             output_path.display()
         )
     );
+}
+
+#[test]
+fn support_bundle_redacts_view_metadata_in_exact_output_artifact_and_audit() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("support.json");
+    let storage = StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS);
+    let safe_view = "Authorization: Basic [REDACTED]";
+    let expected_bundle = json!({
+        "generated_at_ms": BUNDLE_TIME_MS,
+        "candidate_identity": CandidateIdentity::current(),
+        "view": safe_view,
+        "audit_events": [],
+        "diagnostic_occurrences": [],
+        "redaction": "secret values are never included; only metadata and audit events are exported"
+    });
+    let expected_bytes = serde_json::to_vec_pretty(&expected_bundle).unwrap();
+    let expected_output = serde_json::to_string_pretty(&SupportBundleInfo {
+        bundle_path: output_path.to_string_lossy().into_owned(),
+        view: Some(safe_view.to_string()),
+        size_bytes: expected_bytes.len() as u64,
+        redacted_secrets_count: 1,
+        generated_at_ms: BUNDLE_TIME_MS,
+    })
+    .unwrap();
+
+    assert_eq!(
+        run_support_bundle(
+            OutputFormat::Json,
+            &storage,
+            temp.path(),
+            Some("Authorization: Basic dXNlcjpwYXNz"),
+            None,
+            Some(&output_path),
+        )
+        .unwrap(),
+        expected_output
+    );
+    assert_eq!(std::fs::read(&output_path).unwrap(), expected_bytes);
+
+    let events = storage.audit_tail(temp.path(), 10).unwrap();
+    let expected_event = AuditEvent {
+        timestamp_ms: events[0].timestamp_ms,
+        actor: "admin".to_string(),
+        action: "support.bundle".to_string(),
+        resource: safe_view.to_string(),
+        error_code: None,
+        detail: Some(format!("bundle written to {}", output_path.display())),
+    };
+    assert_eq!(events, vec![expected_event]);
+}
+
+#[test]
+fn support_bundle_redacts_nested_json_secrets_in_exact_output_artifact_and_audit() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("support.json");
+    let storage = StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS);
+    let raw_view = r#"{"token":{"value":"fixture-secret-value","backup":"another-secret"}}"#;
+    let safe_view = r#"{"token":"[REDACTED]"}"#;
+    let expected_bundle = json!({
+        "generated_at_ms": BUNDLE_TIME_MS,
+        "candidate_identity": CandidateIdentity::current(),
+        "view": safe_view,
+        "audit_events": [],
+        "diagnostic_occurrences": [],
+        "redaction": "secret values are never included; only metadata and audit events are exported"
+    });
+    let expected_bytes = serde_json::to_vec_pretty(&expected_bundle).unwrap();
+    let expected_output = serde_json::to_string_pretty(&SupportBundleInfo {
+        bundle_path: output_path.to_string_lossy().into_owned(),
+        view: Some(safe_view.to_string()),
+        size_bytes: expected_bytes.len() as u64,
+        redacted_secrets_count: 1,
+        generated_at_ms: BUNDLE_TIME_MS,
+    })
+    .unwrap();
+
+    assert_eq!(
+        run_support_bundle(
+            OutputFormat::Json,
+            &storage,
+            temp.path(),
+            Some(raw_view),
+            None,
+            Some(&output_path),
+        )
+        .unwrap(),
+        expected_output
+    );
+    assert_eq!(std::fs::read(&output_path).unwrap(), expected_bytes);
+
+    let events = storage.audit_tail(temp.path(), 10).unwrap();
+    let expected_event = AuditEvent {
+        timestamp_ms: events[0].timestamp_ms,
+        actor: "admin".to_string(),
+        action: "support.bundle".to_string(),
+        resource: safe_view.to_string(),
+        error_code: None,
+        detail: Some(format!("bundle written to {}", output_path.display())),
+    };
+    assert_eq!(events, vec![expected_event]);
 }

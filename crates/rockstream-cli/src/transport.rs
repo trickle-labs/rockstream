@@ -18,7 +18,8 @@ use rockstream_control::{
 use rockstream_types::acl::Role;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::diagnostic::{
-    DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES, MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
+    redact_secrets_with_count, DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES,
+    MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
 };
 use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_0005, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014,
@@ -2913,11 +2914,18 @@ impl StorageClient {
         out: Option<&Path>,
         occurrences: &[DiagnosticOccurrence],
     ) -> Result<SupportBundleInfo, CliError> {
+        let (view, mut redacted_secrets_count) = match view {
+            Some(view) => {
+                let (view, count) = redact_secrets_with_count(view);
+                (Some(view), count)
+            }
+            None => (None, 0),
+        };
         if self.identity.role < required_role("support bundle") {
             let event = AuditEvent::now(
                 self.identity.user.clone(),
                 "support.bundle",
-                view.unwrap_or("all"),
+                view.as_deref().unwrap_or("all"),
             )
             .with_detail("unauthorized role")
             .with_error_code("RS-2401");
@@ -2946,23 +2954,26 @@ impl StorageClient {
         let event = AuditEvent::now(
             self.identity.user.clone(),
             "support.bundle",
-            view.unwrap_or("all"),
+            view.as_deref().unwrap_or("all"),
         )
         .with_detail(format!("bundle written to {}", out_path.display()));
         append_audit_file(storage_path, &event);
 
-        let mut diagnostic_occurrences = occurrences
-            .iter()
-            .take(MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES)
-            .map(DiagnosticOccurrence::redacted)
-            .collect::<Vec<_>>();
+        let mut diagnostic_occurrences = Vec::new();
+        let mut diagnostic_redaction_counts = Vec::new();
+        for occurrence in occurrences.iter().take(MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES) {
+            let (occurrence, count) = occurrence.redacted_with_count();
+            redacted_secrets_count += count;
+            diagnostic_occurrences.push(occurrence);
+            diagnostic_redaction_counts.push(count);
+        }
         let mut omitted_occurrences = occurrences
             .len()
             .saturating_sub(diagnostic_occurrences.len());
         let mut bundle = serde_json::json!({
             "generated_at_ms": now_ms,
             "candidate_identity": rockstream_types::candidate_identity::CandidateIdentity::current(),
-            "view": view,
+            "view": view.as_deref(),
             "audit_events": [],
             "diagnostic_occurrences": diagnostic_occurrences,
             "redaction": "secret values are never included; only metadata and audit events are exported"
@@ -2980,6 +2991,7 @@ impl StorageClient {
                 .is_some_and(|items| !items.is_empty())
         {
             diagnostic_occurrences.pop();
+            redacted_secrets_count -= diagnostic_redaction_counts.pop().unwrap_or_default();
             omitted_occurrences += 1;
             bundle["diagnostic_occurrences"] = serde_json::to_value(&diagnostic_occurrences)
                 .expect("diagnostic occurrences are serializable");
@@ -3037,9 +3049,9 @@ impl StorageClient {
 
         Ok(SupportBundleInfo {
             bundle_path: out_path.to_string_lossy().into_owned(),
-            view: view.map(Into::into),
+            view,
             size_bytes: bytes.len() as u64,
-            redacted_secrets_count: 1,
+            redacted_secrets_count,
             generated_at_ms: now_ms,
         })
     }
