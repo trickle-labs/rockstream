@@ -479,7 +479,7 @@ fn redact_assignment(input: &str, key: &str) -> String {
             if let Some(value_quote @ ('"' | '\'')) = output[value_start..].chars().next() {
                 let quote_len = value_quote.len_utf8();
                 if value_end >= value_start + 2 * quote_len
-                    && output[value_end - quote_len..value_end].chars().next() == Some(value_quote)
+                    && output[value_end - quote_len..value_end].starts_with(value_quote)
                 {
                     value_start += quote_len;
                     value_end -= quote_len;
