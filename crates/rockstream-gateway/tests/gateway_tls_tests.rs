@@ -111,6 +111,16 @@ fn make_leaf(
     (cert.pem(), key_pair.serialize_pem())
 }
 
+fn make_expired_leaf(ca_cert: &rcgen::Certificate, ca_key: &KeyPair, cn: &str) -> (String, String) {
+    let mut params = CertificateParams::new(vec![]).unwrap();
+    params.distinguished_name.push(DnType::CommonName, cn);
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2020, 1, 2);
+    let key_pair = KeyPair::generate().unwrap();
+    let cert = params.signed_by(&key_pair, ca_cert, ca_key).unwrap();
+    (cert.pem(), key_pair.serialize_pem())
+}
+
 /// Build a CA + server cert (for `127.0.0.1`/`localhost`) rooted in a fresh
 /// temp dir, returning paths suitable for `GatewayServer::with_tls`.
 fn build_server_pki() -> TestPki {
@@ -602,6 +612,53 @@ async fn mtls_rejects_connection_with_no_client_cert() {
     assert!(
         result.is_err(),
         "connection without a client cert must be rejected by mTLS"
+    );
+    assert!(handler.sessions.is_empty());
+    assert_single_unknown_tls_failure(&durable).await;
+}
+
+// ── mtls_rejects_connection_with_expired_client_cert ─────────────────────────
+
+#[tokio::test]
+async fn mtls_rejects_connection_with_expired_client_cert() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let (ca_cert, ca_key) = make_ca();
+    let ca_cert_pem = ca_cert.pem();
+    let ca_cert_path = write_file(dir.path(), "ca.pem", &ca_cert_pem);
+    let (server_cert_pem, server_key_pem) = make_leaf(
+        &ca_cert,
+        &ca_key,
+        "localhost",
+        vec!["localhost".to_string(), "127.0.0.1".to_string()],
+    );
+    let server_cert_path = write_file(dir.path(), "server.pem", &server_cert_pem);
+    let server_key_path = write_file(dir.path(), "server-key.pem", &server_key_pem);
+    let (client_cert_pem, client_key_pem) = make_expired_leaf(&ca_cert, &ca_key, "expired-client");
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let shard_db = new_shard_db("mtls-expired-cert-shard").await;
+    let (catalog, durable) = new_audit_catalog("mtls-expired-cert-audit");
+    let server = GatewayServer::with_shard_db_and_mtls_auth(
+        addr,
+        catalog,
+        Arc::new(NoopViewReader),
+        shard_db,
+    )
+    .with_tls(&server_cert_path, &server_key_path, Some(&ca_cert_path))
+    .unwrap();
+    let handler = server.handler().clone();
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+
+    let client_cert = ClientCert {
+        cert_pem: client_cert_pem,
+        key_pem: client_key_pem,
+    };
+    let config = rustls_client_config_with_cert(&ca_cert_pem, &client_cert);
+    let result = connect_tls(&local_addr.to_string(), config).await;
+    assert!(
+        result.is_err(),
+        "expired client certificate must be rejected"
     );
     assert!(handler.sessions.is_empty());
     assert_single_unknown_tls_failure(&durable).await;
