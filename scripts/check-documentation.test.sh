@@ -25,6 +25,7 @@ setup_tree() {
   cp "$ROOT/crates/rockstream-gateway/tests/gateway_dml_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/gateway_proof_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
+  cp "$ROOT/crates/rockstream-gateway/tests/v072_durable_subscription_publication_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/live_exec_tumble_window_durability_lfs_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/serving_path_aggregate_matrix_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
   cp "$ROOT/crates/rockstream-sql/tests/lfs_catalog.rs" "$TMP_ROOT/crates/rockstream-sql/tests/"
