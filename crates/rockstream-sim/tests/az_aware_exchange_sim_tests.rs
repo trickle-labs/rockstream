@@ -496,6 +496,7 @@ async fn az_domain_rebuild_during_drain_preserves_delivery_sim() {
         .with_shard_manager(manager.clone())
         .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
         .with_migration_store(Arc::new(MigrationPersistentStore::new(store)))
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();
@@ -594,6 +595,7 @@ async fn exchange_domain_rebuild_releases_row_credits_during_drain_sim() {
         .with_shard_manager(manager.clone())
         .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
         .with_migration_store(Arc::new(MigrationPersistentStore::new(store)))
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();

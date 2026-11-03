@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use rockstream_cli::{run_start, StartOptions};
+use rockstream_cli::{run_start_with_dev_transport, StartOptions};
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::ids::WorkerId;
@@ -20,7 +20,11 @@ async fn test_worker_service_lifecycle_and_explicit_worker_id() {
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
     let control_service = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
-    let control_handle = control_service.start("127.0.0.1:0").await.unwrap();
+    let control_handle = control_service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     let control_addr = control_handle.addr.to_string();
 
     // 2. Configure worker with explicit worker_id = 42
@@ -53,7 +57,7 @@ async fn test_worker_service_lifecycle_and_explicit_worker_id() {
     std::env::set_var("ROCKSTREAM_E2E_SLEEP_MS", "400");
 
     let opts_clone = opts.clone();
-    let worker_task = std::thread::spawn(move || run_start(&opts_clone));
+    let worker_task = std::thread::spawn(move || run_start_with_dev_transport(&opts_clone, true));
 
     // 3. Verify worker registration in topology catalog
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

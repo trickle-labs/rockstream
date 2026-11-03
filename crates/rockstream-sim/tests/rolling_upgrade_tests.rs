@@ -403,6 +403,7 @@ async fn three_worker_n_to_n_plus_1_zero_loss_tc() {
     let catalog = TopologyCatalog::new();
     let control = ControlService::new(catalog.clone())
         .with_shard_manager(manager.clone())
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();

@@ -5385,6 +5385,8 @@ dependencies = [
  "rockstream-storage",
  "rockstream-test-support",
  "rockstream-types",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5393,6 +5395,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "tonic 0.12.3",
 ]
 

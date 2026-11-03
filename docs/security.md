@@ -90,11 +90,11 @@ release qualification gate by itself.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 
-1. **Worker ↔ Control-Plane**: TCP control channel for worker registration, heartbeats, and shard lease acquisition.
-2. **Worker ↔ Worker Shuffle Exchange**: gRPC Flight data transport for high-throughput shuffle exchanges.
-3. **CLI ↔ Control-Plane**: Administrative inspection and cluster control commands.
+The control-worker TCP listener used for registration, heartbeats, and shard leases requires internal mTLS. Control, worker, and embedded `all` roles need a certificate, matching private key, trusted CA roots, and `client_auth_required = true`; invalid or incomplete material fails startup before the listener opens.
 
-All internal TLS handshakes require mutual authentication (`client_auth_required = true`) using X.509 certificates issued by a trusted cluster Certificate Authority (CA).
+For local development only, `--allow-insecure-internal-dev` explicitly permits plaintext control traffic when the control listener or worker target uses a literal loopback socket address. The option rejects non-loopback addresses and must not be used for production or release qualification.
+
+Worker shuffle and native management APIs are separate transport boundaries. Configuring TLS support for those components does not establish that authentication is required there; qualify them under their owning security work before relying on them in production.
 
 ---
 
@@ -111,7 +111,7 @@ Every certificate in the cluster embeds a verified `NodeIdentity` encoded in the
 ### Verification Invariants
 - **Identity Enforcement**: During handshake, the receiver extracts the leaf certificate's CN/SAN. If a connecting node presents a valid certificate whose embedded role or ID does not match its advertised wire identity, the handshake is rejected immediately with error `RS-2412` (`IdentityMismatch`).
 - **CA Chain Validation**: Every peer must chain to a configured CA root. Untrusted, malformed, or expired certificates are rejected with `RS-2411` (`UntrustedCa` / `ExpiredCert`).
-- **Mandatory Authentication**: Unauthenticated/plaintext connections to an mTLS-enabled node are refused with `RS-2410` (`InternalMtlsRequired`).
+- **Mandatory Authentication**: Unauthenticated/plaintext connections are refused with `RS-2410` (`InternalMtlsRequired`), except when the explicit loopback-only development option is enabled.
 - **Role Permissions**: Only authenticated nodes with `NodeRole::Worker` can receive shard leases; only `NodeRole::Cli` or `NodeRole::Control` can execute administrative operations.
 
 ---

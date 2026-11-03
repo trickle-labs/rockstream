@@ -320,6 +320,8 @@ pub struct ControlService {
     drain_state: Arc<AsyncMutex<DrainState>>,
     /// Optional internal TLS configuration for control plane mTLS.
     internal_tls: Option<InternalTlsConfig>,
+    /// Explicit loopback-only plaintext transport for local development.
+    insecure_dev_mode: bool,
     secret_store: Arc<SecretStore>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     data_plane: Arc<AsyncMutex<DataPlaneState>>,
@@ -346,6 +348,7 @@ impl ControlService {
             migration_recovery_donors: BTreeMap::new(),
             drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
             internal_tls: None,
+            insecure_dev_mode: false,
             secret_store: Arc::new(SecretStore::new(
                 None,
                 Arc::new(crate::kek::EnvKekProvider::from_env_or_default(
@@ -418,6 +421,15 @@ impl ControlService {
         self
     }
 
+    /// Allow plaintext control traffic only when the listener binds to loopback.
+    ///
+    /// This is intended for local development and tests. Production callers
+    /// must configure internal mTLS instead.
+    pub fn with_insecure_dev_mode(mut self) -> Self {
+        self.insecure_dev_mode = true;
+        self
+    }
+
     /// Attach the catalog secret store used by worker token requests.
     pub fn with_secret_store(mut self, secret_store: Arc<SecretStore>) -> Self {
         self.secret_store = secret_store;
@@ -460,6 +472,48 @@ impl ControlService {
     /// Returns a [`ControlServiceHandle`] which can be used to query the
     /// bound address and send a shutdown signal.
     pub async fn start(self, bind_addr: &str) -> io::Result<ControlServiceHandle> {
+        let reloader = match self.internal_tls.as_ref() {
+            Some(tls_cfg) if tls_cfg.is_enabled() => {
+                if !tls_cfg.client_auth_required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RS-2405: control service requires client certificate authentication",
+                    ));
+                }
+                Some(Arc::new(
+                    crate::tls::TlsCertificateReloader::new(tls_cfg.clone()).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("RS-2405: failed to initialize internal mTLS: {error}"),
+                        )
+                    })?,
+                ))
+            }
+            tls_cfg => {
+                let tls_material_configured = tls_cfg.is_some_and(|cfg| {
+                    cfg.cert_path.is_some() || cfg.key_path.is_some() || cfg.ca_cert_path.is_some()
+                });
+                if tls_material_configured {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RS-2405: internal mTLS requires a certificate, private key, and trust roots",
+                    ));
+                }
+                let addr = bind_addr.parse::<SocketAddr>().ok();
+                if !self.insecure_dev_mode || !addr.is_some_and(|addr| addr.ip().is_loopback()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RS-2405: control service requires internal mTLS; plaintext development mode must be explicitly enabled on a loopback address",
+                    ));
+                }
+                tracing::warn!(
+                    bind_addr,
+                    "control service is using explicitly enabled loopback-only plaintext development transport"
+                );
+                None
+            }
+        };
+
         if self.raft.is_none() && self.shard_manager.is_empty() {
             if let Some(store) = &self.shard_store {
                 self.shard_manager.restore(store.load().await);
@@ -608,23 +662,6 @@ impl ControlService {
             data_plane: self.data_plane.clone(),
         };
 
-        let reloader = if let Some(tls_cfg) = &self.internal_tls {
-            if tls_cfg.is_enabled() {
-                match crate::tls::TlsCertificateReloader::new(tls_cfg.clone()) {
-                    Ok(r) => Some(Arc::new(r)),
-                    Err(e) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("RS-2405: failed to initialize internal TLS: {e}"),
-                        ));
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let reloader_for_handle = reloader.clone();
 
         tokio::spawn(async move {
@@ -3043,10 +3080,7 @@ async fn handle_connection_stream<R, W>(
         match msg {
             WorkerMessage::Register(reg) => {
                 if let Some(id) = &peer_identity {
-                    if id.role != NodeRole::Worker
-                        || (!id.matches_worker_id(reg.worker_id.0)
-                            && !id.matches_worker_str(&reg.address))
-                    {
+                    if id.role != NodeRole::Worker || !id.matches_worker_id(reg.worker_id.0) {
                         tracing::warn!(
                             %peer,
                             cert_identity = %id.to_cn(),
@@ -4302,9 +4336,35 @@ mod tests {
         assert_eq!(drain_state.lock().await.queue.len(), MAX_DRAIN_QUEUE);
     }
 
+    #[tokio::test]
+    async fn control_listener_requires_mtls_or_loopback_dev_opt_in() {
+        let error = ControlService::new(TopologyCatalog::new())
+            .start("127.0.0.1:0")
+            .await
+            .err()
+            .expect("plaintext listener must fail closed by default");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "RS-2405: control service requires internal mTLS; plaintext development mode must be explicitly enabled on a loopback address"
+        );
+
+        let error = ControlService::new(TopologyCatalog::new())
+            .with_insecure_dev_mode()
+            .start("0.0.0.0:0")
+            .await
+            .err()
+            .expect("plaintext development mode must reject non-loopback listeners");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "RS-2405: control service requires internal mTLS; plaintext development mode must be explicitly enabled on a loopback address"
+        );
+    }
+
     async fn start_test_service() -> (ControlServiceHandle, TopologyCatalog) {
         let catalog = TopologyCatalog::new();
-        let svc = ControlService::new(catalog.clone());
+        let svc = ControlService::new(catalog.clone()).with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
         (handle, catalog)
     }
@@ -4405,7 +4465,7 @@ mod tests {
         // Tier 2: --role=all means control + worker start in the same process.
         // Verify the control service starts and a worker can self-register.
         let catalog = TopologyCatalog::new();
-        let svc = ControlService::new(catalog.clone());
+        let svc = ControlService::new(catalog.clone()).with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
         let addr = handle.addr.to_string();
 
@@ -4438,7 +4498,9 @@ mod tests {
     ) -> (ControlServiceHandle, TopologyCatalog, ShardManager) {
         let catalog = TopologyCatalog::new();
         let manager = ShardManager::new();
-        let svc = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
+        let svc = ControlService::new(catalog.clone())
+            .with_shard_manager(manager.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
         (handle, catalog, manager)
     }
@@ -4504,7 +4566,8 @@ mod tests {
         let manager = ShardManager::new();
         let svc = ControlService::new(catalog.clone())
             .with_shard_manager(manager.clone())
-            .with_raft(node.handle.clone());
+            .with_raft(node.handle.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4725,7 +4788,9 @@ mod tests {
         assert!(node.handle.is_leader());
 
         let catalog = TopologyCatalog::new();
-        let svc = ControlService::new(catalog).with_raft(node.handle.clone());
+        let svc = ControlService::new(catalog)
+            .with_raft(node.handle.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4789,7 +4854,8 @@ mod tests {
         let frontier = Arc::new(FrontierAggregator::new());
         let svc = ControlService::new(catalog)
             .with_shard_manager(manager)
-            .with_frontier(frontier.clone());
+            .with_frontier(frontier.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4834,7 +4900,8 @@ mod tests {
         let frontier = Arc::new(FrontierAggregator::new());
         let svc = ControlService::new(TopologyCatalog::new())
             .with_shard_manager(manager)
-            .with_frontier(frontier.clone());
+            .with_frontier(frontier.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4878,7 +4945,8 @@ mod tests {
         let frontier = Arc::new(FrontierAggregator::with_membership(membership));
         let svc = ControlService::new(TopologyCatalog::new())
             .with_shard_manager(manager.clone())
-            .with_frontier(frontier.clone());
+            .with_frontier(frontier.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4990,7 +5058,8 @@ mod tests {
         let svc = ControlService::new(catalog)
             .with_shard_manager(manager)
             .with_raft(node.handle.clone())
-            .with_frontier(frontier.clone());
+            .with_frontier(frontier.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -5051,7 +5120,8 @@ mod tests {
         let svc_a = ControlService::new(catalog_a)
             .with_shard_manager(manager_a.clone())
             .with_raft(node_a.handle.clone())
-            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store.clone())));
+            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store.clone())))
+            .with_insecure_dev_mode();
         let handle_a = svc_a.start("127.0.0.1:0").await.unwrap();
 
         let mut stream_a = TcpStream::connect(handle_a.addr).await.unwrap();
@@ -5096,7 +5166,8 @@ mod tests {
         let svc_b = ControlService::new(catalog_b)
             .with_shard_manager(manager_b.clone())
             .with_raft(node_b.handle.clone())
-            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store)));
+            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store)))
+            .with_insecure_dev_mode();
         let handle_b = svc_b.start("127.0.0.1:0").await.unwrap();
 
         // A different worker (worker 20) tries to grab the SAME shard that
@@ -5216,7 +5287,8 @@ mod tests {
         let svc = ControlService::new(catalog)
             .with_shard_manager(manager.clone())
             .with_raft(node_leader.handle.clone())
-            .with_shard_store(store.clone());
+            .with_shard_store(store.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();

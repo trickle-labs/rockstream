@@ -156,6 +156,6 @@ OIDs, valid element widths, and exact declared lengths.
 | `LISTEN` | `listen_notify_tests.rs::test_listen_notify_roundtrip` |
 | `NOTIFY` | `listen_notify_tests.rs::test_listen_notify_roundtrip` |
 | `UNLISTEN` | `listen_notify_tests.rs::test_unlisten_stops_delivery` |
-| `SUBSCRIBE` | `gateway_proof_tests.rs::proof_subscribe_snapshot_then_deltas_lfs` |
+| `SUBSCRIBE` | `v072_durable_subscription_publication_tests.rs::pgwire_snapshot_then_committed_deltas_match_exact_transcript` |
 | `SET` | `auth_scram_tests.rs::test_set_show_search_path` |
 | `SHOW` | `auth_scram_tests.rs::test_set_show_search_path` |
