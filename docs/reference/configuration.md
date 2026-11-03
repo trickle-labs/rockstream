@@ -2,6 +2,7 @@
 
 | Key | Type | Default | Environment | Deprecated | Source | Description |
 | --- | --- | --- | --- | --- | --- | --- |
+| auth.mode | String | off | ROCKSTREAM_AUTH_MODE | false | rockstream-types::config::AuthSection | Explicit --auth overrides this mode; omitted uses it. Only off is currently available; other modes return RS-0002 before gateway startup. |
 | autotuner.compression_disable_hysteresis_windows | usize | 2 | ROCKSTREAM_AUTOTUNER_COMPRESSION_DISABLE_HYSTERESIS_WINDOWS | false | rockstream-types::config::AutotunerConfig | Windows of high CPU before disabling direct compression |
 | autotuner.compression_reenable_hysteresis_windows | usize | 4 | ROCKSTREAM_AUTOTUNER_COMPRESSION_REENABLE_HYSTERESIS_WINDOWS | false | rockstream-types::config::AutotunerConfig | Windows of low CPU before re-enabling direct compression |
 | autotuner.default_parallelism | usize | 4 | ROCKSTREAM_AUTOTUNER_DEFAULT_PARALLELISM | false | rockstream-types::config::AutotunerConfig | Default operator execution parallelism |
