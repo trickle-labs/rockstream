@@ -32,6 +32,12 @@ use rockstream_types::acl::Role as AclRole;
 use rockstream_types::config_resolver::CliConfigOverrides;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 
+fn selected_auth_mode(cli_mode: Option<AuthMode>, configured_mode: &str) -> String {
+    cli_mode
+        .map(|mode| mode.to_string())
+        .unwrap_or_else(|| configured_mode.to_string())
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -325,7 +331,7 @@ fn main() -> ExitCode {
                 worker_id,
                 storage_url: Some(storage.to_string_lossy().to_string()),
                 metrics_addr: metrics_addr.clone(),
-                auth_mode: Some(auth.to_string()),
+                auth_mode: auth.map(|mode| mode.to_string()),
                 min_epoch_ms,
                 checkpoint_retention_count,
                 state_budget_gb,
@@ -368,7 +374,7 @@ fn main() -> ExitCode {
                 storage,
                 role: role.to_string(),
                 control,
-                auth_mode: auth.to_string(),
+                auth_mode: selected_auth_mode(auth, &node_config.auth.mode),
                 worker_location: WorkerLocation::new(
                     host_id
                         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -905,5 +911,22 @@ fn handle_result(res: Result<String, rockstream_cli::CliError>, format: OutputFo
             eprintln!("{}", rockstream_cli::output::render_error(&err, format));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_flag_overrides_config_only_when_explicit() {
+        let cli = Cli::try_parse_from(["rockstream", "start", "--storage", "unused"])
+            .expect("start should parse without an explicit auth flag");
+        let Command::Start { auth, .. } = cli.command else {
+            panic!("expected the start command");
+        };
+        assert_eq!(auth, None);
+        assert_eq!(selected_auth_mode(None, "scram"), "scram");
+        assert_eq!(selected_auth_mode(Some(AuthMode::Off), "scram"), "off");
     }
 }
