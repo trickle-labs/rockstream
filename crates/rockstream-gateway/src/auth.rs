@@ -429,6 +429,19 @@ impl JwtVerifier {
     }
 }
 
+/// Verify a bearer token only when an OIDC verifier is configured.
+///
+/// A missing verifier is an authentication failure; the presented token must
+/// never become an identity string or otherwise establish a session.
+pub(crate) fn verify_oidc_token(
+    verifier: Option<&JwtVerifier>,
+    token: &str,
+) -> Result<JwtClaims, AuthError> {
+    let verifier = verifier
+        .ok_or_else(|| AuthError::Unauthenticated("OIDC verifier is unavailable".to_string()))?;
+    verifier.verify(token)
+}
+
 /// Create a signed HS256 JWT for tests.
 pub fn create_test_jwt(sub: &str, exp: u64, secret: &[u8]) -> String {
     let header = r#"{"alg":"HS256","typ":"JWT"}"#;
@@ -472,6 +485,15 @@ mod tests {
             err,
             "[RS-0002] configuration error: unknown auth mode `oidc_typo`"
         );
+    }
+
+    #[test]
+    fn oidc_without_verifier_rejects_token_without_echoing_it() {
+        let presented = "fixture-raw-bearer-token";
+        let error = verify_oidc_token(None, presented).unwrap_err();
+
+        assert!(error.to_string().contains("OIDC verifier is unavailable"));
+        assert!(!error.to_string().contains(presented));
     }
 
     /// S2 green gate: jwt_bearer_token_validates_sub

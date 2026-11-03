@@ -97,7 +97,10 @@ use rockstream_types::ids::{ConnectorId, OperatorId, PrincipalId, ShardId, ViewI
 use rockstream_types::mutation_policy::pgwire_mutation_policy;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
-use crate::auth::{scram_server_signature, verify_client_proof, AuthMode, JwtVerifier, Principal};
+use crate::auth::{
+    scram_server_signature, verify_client_proof, verify_oidc_token, AuthMode, JwtVerifier,
+    Principal,
+};
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
     CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail, WorkloadRevisionOutcome,
@@ -13624,28 +13627,22 @@ impl StartupHandler for GatewayHandler {
                                     ),
                                 )));
                             }
-                            if let Some(verifier) = &self.jwt_verifier {
-                                match verifier.verify(token) {
-                                    Ok(claims) => {
-                                        client.metadata_mut().insert(
-                                            "_rs_principal".to_string(),
-                                            format!("jwt:{}", claims.sub),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        return Err(pgwire::error::PgWireError::UserError(
-                                            Box::new(pgwire::error::ErrorInfo::new(
-                                                "FATAL".to_string(),
-                                                "28000".to_string(),
-                                                format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
-                                            )),
-                                        ));
-                                    }
+                            match verify_oidc_token(self.jwt_verifier.as_deref(), token) {
+                                Ok(claims) => {
+                                    client.metadata_mut().insert(
+                                        "_rs_principal".to_string(),
+                                        format!("jwt:{}", claims.sub),
+                                    );
                                 }
-                            } else {
-                                client
-                                    .metadata_mut()
-                                    .insert("_rs_principal".to_string(), format!("jwt:{token}"));
+                                Err(e) => {
+                                    return Err(pgwire::error::PgWireError::UserError(
+                                        Box::new(pgwire::error::ErrorInfo::new(
+                                            "FATAL".to_string(),
+                                            "28000".to_string(),
+                                            format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
+                                        )),
+                                    ));
+                                }
                             }
                         }
                     }
