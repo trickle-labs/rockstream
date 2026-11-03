@@ -359,6 +359,9 @@ jobs:
     if: needs.ci-policy.outputs.scope == 'full'
     name: Check tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     strategy:
       fail-fast: false
       matrix:

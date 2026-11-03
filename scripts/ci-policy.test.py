@@ -79,6 +79,8 @@ class PolicyTests(unittest.TestCase):
             "workspace", "crates", "sim-unit", "sim-integration", "oracle", "ops",
             "storage-sql", "gateway-components",
         ])
+        self.assertIn('CARGO_INCREMENTAL: "0"', blocks["check-tests"])
+        self.assertIn('CARGO_PROFILE_TEST_DEBUG: "0"', blocks["check-tests"])
         self.assertIn("run: python3 scripts/ci-test-inventory.py run --job pr-${{ matrix.shard }}", blocks["check-tests"])
         self.assertIn("suite: [ops, storage, runtime, control]", blocks["benchmark-suites"])
         self.assertIn("fail-fast: false", blocks["benchmark-suites"])
