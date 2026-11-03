@@ -228,6 +228,7 @@ pub fn redact_secrets(input: &str) -> String {
     }
     output = redact_auth_scheme(&output, "bearer");
     output = redact_auth_scheme(&output, "basic");
+    output = redact_auth_scheme(&output, "token");
     output = redact_url_credentials(&output);
     if output.contains("-----BEGIN") {
         "[REDACTED_PRIVATE_KEY_MATERIAL]".to_string()
@@ -358,7 +359,17 @@ fn redact_auth_scheme(input: &str, scheme: &str) -> String {
             break;
         };
         let start = offset + relative;
-        let value_start = start + marker.len();
+        let mut value_start = start + marker.len();
+        while let Some(character) = output[value_start..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            value_start += character.len_utf8();
+        }
+        if matches!(output[value_start..].chars().next(), Some('=') | Some(':')) {
+            offset = value_start;
+            continue;
+        }
         let value_end = output[value_start..]
             .find(char::is_whitespace)
             .map(|end| value_start + end)
@@ -485,6 +496,10 @@ mod tests {
         assert_eq!(
             redact_secrets("X-API-Key: fixture-api-key"),
             "X-API-Key: [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets("Authorization: token fixture-token"),
+            "Authorization: token [REDACTED]"
         );
         let value = "x".repeat(MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES + 10);
         assert_eq!(
