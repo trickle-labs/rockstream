@@ -1,10 +1,14 @@
 //! v0.51.7 Slice 3 — CLI Auth Mode Routing & Fail-Closed Enforcement Tests.
 
+use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt};
 use rockstream_cli::{run_start, start_gateway, StartOptions};
+use rockstream_gateway::catalog_stubs::CatalogStubs;
+use rockstream_storage::ShardDb;
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 
 fn normalize_correlation_id(stderr: Vec<u8>) -> String {
     let stderr = String::from_utf8(stderr).unwrap();
@@ -90,6 +94,49 @@ async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_
         );
         assert!(!storage.exists(), "{mode} created gateway storage");
     }
+}
+
+#[tokio::test]
+async fn gateway_start_fails_closed_when_durable_catalog_recovery_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shard_path = "gateway";
+    let store = Arc::new(InMemory::new());
+    let snapshot_path = ObjectPath::from("gateway/catalog/snapshots/00000000000000000000.snap");
+    store
+        .put(&snapshot_path, b"{".to_vec().into())
+        .await
+        .unwrap();
+
+    let shard_db = Arc::new(
+        ShardDb::builder(shard_path, store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let options = test_options(
+        tmp.path().to_path_buf(),
+        "off",
+        Some("127.0.0.1:0".to_string()),
+    );
+    let error = rockstream_cli::start_gateway_with_shard_and_catalog(
+        &options,
+        shard_db,
+        store.clone(),
+        shard_path,
+        Arc::new(CatalogStubs::new()),
+    )
+    .await
+    .unwrap_err();
+
+    let catalog_error = rockstream_storage::catalog::CatalogSnapshot::decode(b"{")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "RS-0003 gateway catalog recovery failed: {catalog_error}\n  next steps: Restore or repair durable catalog storage before starting the gateway."
+        )
+    );
 }
 
 #[test]

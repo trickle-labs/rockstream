@@ -411,21 +411,26 @@ pub async fn start_gateway_with_shard_and_catalog(
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     validate_start_auth_modes(&opts.auth_mode, opts.node_config.as_ref())?;
     if catalog.get_durable_store().is_none() {
-        let durable_catalog = match rockstream_storage::catalog::DurableCatalogStore::recover(
-            store.clone(),
-            shard_path,
-        )
-        .await
-        {
-            Ok(recovered) => Arc::new(recovered),
-            Err(_) => Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
-                store.clone(),
-                shard_path,
-            )),
-        };
+        let durable_catalog =
+            rockstream_storage::catalog::DurableCatalogStore::recover(store.clone(), shard_path)
+                .await
+                .map(Arc::new)
+                .map_err(|error| {
+                    CliError::new(
+                        RS_0003,
+                        format!("gateway catalog recovery failed: {error}"),
+                        "Restore or repair durable catalog storage before starting the gateway.",
+                    )
+                })?;
         catalog.set_durable_store(durable_catalog);
-        let _ = catalog.sync_from_durable_store().await;
     }
+    catalog.sync_from_durable_store().await.map_err(|error| {
+        CliError::new(
+            RS_0003,
+            format!("gateway catalog state could not be loaded: {error}"),
+            "Restore or repair durable catalog storage before starting the gateway.",
+        )
+    })?;
 
     // Flush to create the initial manifest so ShardReader can open on a fresh node.
     shard_db.flush().await.map_err(|e| {
