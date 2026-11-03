@@ -50,6 +50,26 @@ fn scope_covers(action: SecurityAction, grant: &PolicyScope, requested: &PolicyS
             },
         ) => grant_ns == requested_ns,
         (
+            SecurityAction::SecretMetadataRead
+            | SecurityAction::SecretManage
+            | SecurityAction::SecretRotate,
+            PolicyScope::Cluster,
+            PolicyScope::Namespace { .. } | PolicyScope::Secret { .. },
+        ) => true,
+        (
+            SecurityAction::SecretMetadataRead
+            | SecurityAction::SecretManage
+            | SecurityAction::SecretRotate,
+            PolicyScope::Namespace {
+                namespace: grant_ns,
+            },
+            PolicyScope::Secret {
+                namespace: requested_ns,
+                ..
+            },
+        ) => grant_ns == requested_ns,
+        (SecurityAction::SecretRotate, PolicyScope::Cluster, PolicyScope::ClusterKey) => true,
+        (
             SecurityAction::ClusterObserve,
             PolicyScope::Cluster,
             PolicyScope::Node { .. } | PolicyScope::Shard { .. },
@@ -120,10 +140,14 @@ fn scope_is_applicable(action: SecurityAction, scope: &PolicyScope) -> bool {
             matches!(scope, Scope::Cluster)
         }
         Action::GrantManage => matches!(scope, Scope::Cluster | Scope::Grant { .. }),
-        Action::SecretMetadataRead | Action::SecretManage => {
-            matches!(scope, Scope::Secret { .. })
-        }
-        Action::SecretRotate => matches!(scope, Scope::Secret { .. } | Scope::ClusterKey),
+        Action::SecretMetadataRead | Action::SecretManage => matches!(
+            scope,
+            Scope::Cluster | Scope::Namespace { .. } | Scope::Secret { .. }
+        ),
+        Action::SecretRotate => matches!(
+            scope,
+            Scope::Cluster | Scope::Namespace { .. } | Scope::Secret { .. } | Scope::ClusterKey
+        ),
         Action::SecretUse => matches!(
             scope,
             Scope::Secret {
@@ -249,6 +273,22 @@ mod tests {
         ));
         assert!(!allows(
             &policy,
+            SecurityAction::SecretMetadataRead,
+            &PolicyScope::Namespace {
+                namespace: "sales".to_string(),
+            }
+        ));
+        assert!(!allows(
+            &policy,
+            SecurityAction::SecretManage,
+            &PolicyScope::Secret {
+                namespace: "sales".to_string(),
+                name: "warehouse_password".to_string(),
+                consumer: None,
+            }
+        ));
+        assert!(!allows(
+            &policy,
             SecurityAction::GrantManage,
             &PolicyScope::Grant {
                 principal_id: PrincipalId(15),
@@ -300,6 +340,15 @@ mod tests {
                 consumer: Some(PrincipalId(12)),
             }
         ));
+        assert!(!allows(
+            &policy,
+            SecurityAction::SecretManage,
+            &PolicyScope::Secret {
+                namespace: "sales".to_string(),
+                name: "warehouse_password".to_string(),
+                consumer: None,
+            }
+        ));
     }
 
     #[test]
@@ -346,6 +395,82 @@ mod tests {
             &PolicyScope::Node {
                 node_id: "worker-1".to_string(),
             }
+        ));
+    }
+
+    #[test]
+    fn administrator_secret_actions_cover_secret_scopes_without_secret_use() {
+        let policy = principal(
+            vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            vec![],
+        );
+        let secret = PolicyScope::Secret {
+            namespace: "sales".to_string(),
+            name: "warehouse_password".to_string(),
+            consumer: None,
+        };
+
+        assert!(allows(
+            &policy,
+            SecurityAction::SecretMetadataRead,
+            &PolicyScope::Namespace {
+                namespace: "sales".to_string(),
+            }
+        ));
+        assert!(allows(&policy, SecurityAction::SecretManage, &secret));
+        assert!(allows(&policy, SecurityAction::SecretRotate, &secret));
+        assert!(allows(
+            &policy,
+            SecurityAction::SecretRotate,
+            &PolicyScope::ClusterKey
+        ));
+        assert!(!allows(
+            &policy,
+            SecurityAction::SecretUse,
+            &PolicyScope::Secret {
+                namespace: "sales".to_string(),
+                name: "warehouse_password".to_string(),
+                consumer: Some(PrincipalId(12)),
+            }
+        ));
+    }
+
+    #[test]
+    fn namespace_secret_admin_grant_cannot_cross_namespaces() {
+        let policy = principal(
+            vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Namespace {
+                    namespace: "sales".to_string(),
+                },
+            }],
+            vec![],
+        );
+        assert!(allows(
+            &policy,
+            SecurityAction::SecretManage,
+            &PolicyScope::Secret {
+                namespace: "sales".to_string(),
+                name: "warehouse_password".to_string(),
+                consumer: None,
+            }
+        ));
+        assert!(!allows(
+            &policy,
+            SecurityAction::SecretManage,
+            &PolicyScope::Secret {
+                namespace: "finance".to_string(),
+                name: "ledger_password".to_string(),
+                consumer: None,
+            }
+        ));
+        assert!(!allows(
+            &policy,
+            SecurityAction::SecretMetadataRead,
+            &PolicyScope::Cluster
         ));
     }
 

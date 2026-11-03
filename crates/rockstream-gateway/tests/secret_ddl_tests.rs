@@ -32,7 +32,9 @@ impl ViewReader for NoopViewReader {
     }
 }
 
-async fn start_gateway(catalog: Arc<CatalogStubs>) -> (u16, tokio::task::JoinHandle<()>) {
+async fn start_gateway(
+    catalog: Arc<CatalogStubs>,
+) -> (u16, tokio::task::JoinHandle<()>, Arc<SecretStore>) {
     let store = Arc::new(SecretStore::new(
         None,
         Arc::new(EnvKekProvider::from_passphrase("secret-ddl-test-kek")),
@@ -42,9 +44,9 @@ async fn start_gateway(catalog: Arc<CatalogStubs>) -> (u16, tokio::task::JoinHan
         catalog,
         Arc::new(NoopViewReader),
     )
-    .with_secret_store(store);
+    .with_secret_store(store.clone());
     let (addr, handle) = server.serve_background().await.unwrap();
-    (addr.port(), handle)
+    (addr.port(), handle, store)
 }
 
 async fn connect(port: u16) -> tokio_postgres::Client {
@@ -68,61 +70,45 @@ fn db_error_message(error: tokio_postgres::Error) -> String {
 }
 
 #[tokio::test]
-async fn secret_ddl_is_reachable_over_pgwire_and_returns_metadata_only() {
+async fn unauthenticated_pgwire_cannot_manage_or_list_secrets() {
     let catalog = Arc::new(CatalogStubs::new());
-    let (port, _server) = start_gateway(Arc::clone(&catalog)).await;
-    let client = connect(port).await;
+    let (port, _server, secret_store) = start_gateway(Arc::clone(&catalog)).await;
 
-    let create_count = client
-        .execute(
+    for (query, action, target) in [
+        (
             "CREATE SECRET kafka_auth (TYPE = 'sasl_plain', username = 'alice', password = 'literal-secret')",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(create_count, 0);
-
-    let rows = client.simple_query("SHOW SECRETS").await.unwrap();
-    let rows: Vec<Vec<String>> = rows
-        .iter()
-        .filter_map(|message| match message {
-            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
-                (0..row.len())
-                    .map(|index| row.get(index).unwrap_or_default().to_owned())
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].len(), 4);
-    assert_eq!(rows[0][..2], ["kafka_auth", "sasl_plain"]);
-    assert!(!rows[0].iter().any(|value| value.contains("literal-secret")));
-
-    client
-        .simple_query("ALTER SECRET kafka_auth SET (username = 'bob', password = 'rotated-secret')")
-        .await
-        .unwrap();
-    client.simple_query("DROP SECRET kafka_auth").await.unwrap();
-    assert!(client
-        .simple_query("SHOW SECRETS")
-        .await
-        .unwrap()
-        .iter()
-        .all(|message| !matches!(message, tokio_postgres::SimpleQueryMessage::Row(_))));
+            "SecretManage",
+            "public.kafka_auth",
+        ),
+        ("SHOW SECRETS", "SecretMetadataRead", "public"),
+        (
+            "ALTER SECRET kafka_auth SET (username = 'bob', password = 'rotated-secret')",
+            "SecretManage",
+            "public.kafka_auth",
+        ),
+        ("DROP SECRET kafka_auth", "SecretManage", "public.kafka_auth"),
+    ] {
+        let client = connect(port).await;
+        let error = client.simple_query(query).await.unwrap_err();
+        assert_eq!(
+            db_error_message(error),
+            format!("[RS-2401] auth.permission_denied: principal 'system' is not authorized for action '{action}' on {target}. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated.")
+        );
+    }
+    assert!(!secret_store.contains_secret(0, "kafka_auth").await.unwrap());
 }
 
 #[tokio::test]
 async fn secret_ddl_negative_paths_return_actionable_codes() {
     let catalog = Arc::new(CatalogStubs::new());
-    let (port, _server) = start_gateway(Arc::clone(&catalog)).await;
+    let (port, _server, _secret_store) = start_gateway(Arc::clone(&catalog)).await;
     let client = connect(port).await;
 
     let error = client
         .simple_query("CREATE SECRET malformed")
         .await
         .unwrap_err();
-    assert!(db_error_message(error).contains("RS-2424"));
+    assert!(db_error_message(error).contains("RS-2401"));
 
     let error = client
         .simple_query(
@@ -146,10 +132,11 @@ async fn secret_ddl_negative_paths_return_actionable_codes() {
         "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
     );
 
-    client
+    let error = client
         .simple_query("CREATE SECRET in_use (TYPE = 'sasl_plain', username = 'u', password = 'p')")
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(db_error_message(error).contains("RS-2401"));
     let error = client
         .simple_query(
             "CREATE SOURCE kafka_src TYPE kafka (bootstrap_servers = 'localhost:9092', secret = 'in_use', topic = 'orders') FORMAT json",
@@ -161,7 +148,8 @@ async fn secret_ddl_negative_paths_return_actionable_codes() {
         "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
     );
     assert!(catalog.get_source("kafka_src").is_none());
-    client.simple_query("DROP SECRET in_use").await.unwrap();
+    let error = client.simple_query("DROP SECRET in_use").await.unwrap_err();
+    assert!(db_error_message(error).contains("RS-2401"));
 }
 
 #[tokio::test]

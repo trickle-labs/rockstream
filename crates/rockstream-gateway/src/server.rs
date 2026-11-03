@@ -2681,6 +2681,95 @@ impl GatewayHandler {
         Err(())
     }
 
+    async fn secret_namespace_id(&self, namespace: &str) -> Result<u128, String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable namespace catalog is unavailable".to_string())?;
+        store
+            .get_namespace_by_name(namespace)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|namespace| u128::from(namespace.id.0))
+            .ok_or_else(|| "secret namespace is absent from the durable catalog".to_string())
+    }
+
+    async fn authorize_secret_metadata_read_for_connection(
+        &self,
+        conn_id: Option<&str>,
+    ) -> Option<Vec<Response<'static>>> {
+        let session = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+        });
+        let principal = session.as_ref().map(|(principal, _)| principal);
+        let namespace = session
+            .as_ref()
+            .map(|(_, namespace)| namespace.clone())
+            .unwrap_or_else(|| "public".to_string());
+        let scope = PolicyScope::Namespace {
+            namespace: namespace.clone(),
+        };
+        let matching_principal = match principal {
+            Some(authenticated) if !authenticated.is_system() => self
+                .security_principal_for_login(authenticated)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        let policy_revision = matching_principal
+            .as_ref()
+            .map(|security_principal| security_principal.revision);
+        let authorized = matching_principal
+            .as_ref()
+            .is_some_and(|security_principal| {
+                rockstream_control::authorization::allows(
+                    security_principal,
+                    SecurityAction::SecretMetadataRead,
+                    &scope,
+                )
+            });
+        if authorized {
+            return None;
+        }
+
+        let audit_recorded = self
+            .append_authorization_denial(
+                principal,
+                conn_id,
+                Some(&scope),
+                Some(&namespace),
+                policy_revision,
+            )
+            .await
+            .is_ok();
+        if !audit_recorded {
+            if let Some(id) = conn_id {
+                self.sessions.remove(id);
+            }
+        }
+
+        let identity = principal.map_or("unknown", Principal::identity);
+        let audit_status = if audit_recorded {
+            ""
+        } else {
+            " The required security audit could not be persisted; this session's authorization state was invalidated."
+        };
+        Some(vec![promote_response(Response::Error(Box::new(
+            ErrorInfo::new(
+                "ERROR".to_string(),
+                "42501".to_string(),
+                format!(
+                    "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action 'SecretMetadataRead' on {namespace}. next_steps: Request an authorized scoped grant, then retry.{audit_status}"
+                ),
+            ),
+        )))])
+    }
+
     async fn authorize_source_secret_use(
         &self,
         source: &CatalogSourceEntry,
@@ -2726,8 +2815,13 @@ impl GatewayHandler {
         reference: &str,
     ) -> Result<rockstream_types::secret::Secret, String> {
         let secret_name = self.authorize_source_secret_use(source, reference).await?;
+        let namespace = source
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "source secret reference has no durable namespace".to_string())?;
+        let namespace_id = self.secret_namespace_id(namespace).await?;
         self.secret_store
-            .get_secret(0, &secret_name)
+            .get_secret(namespace_id, &secret_name)
             .await
             .map_err(|error| error.to_string())
     }
@@ -2813,8 +2907,11 @@ impl GatewayHandler {
         conn_id: Option<&str>,
     ) -> Option<Vec<Response<'static>>> {
         let spec = pgwire_mutation_policy(query)?;
-        let durable_policy_required =
-            self.auth_mode != AuthMode::Off || self.catalog.get_durable_store().is_some();
+        let action = Self::mutation_security_action(spec.operation);
+        let secret_management = action == Some(SecurityAction::SecretManage);
+        let durable_policy_required = self.auth_mode != AuthMode::Off
+            || self.catalog.get_durable_store().is_some()
+            || secret_management;
 
         if durable_policy_required {
             let session = conn_id.and_then(|id| {
@@ -2827,7 +2924,6 @@ impl GatewayHandler {
                 .as_ref()
                 .map(|(_, namespace)| namespace.as_str())
                 .unwrap_or("public");
-            let action = Self::mutation_security_action(spec.operation);
             let policy_scope = Self::mutation_policy_scope(query, spec.operation, namespace);
             let (scope, target) = policy_scope
                 .as_ref()
@@ -2849,7 +2945,7 @@ impl GatewayHandler {
             // explicit system principal. Authenticated modes never inherit
             // system authority from a missing connection or session.
             let authorized = if principal.is_some_and(Principal::is_system) {
-                self.auth_mode == AuthMode::Off
+                self.auth_mode == AuthMode::Off && !secret_management
             } else {
                 match (action, policy_scope.as_ref(), matching_principal.as_ref()) {
                     (Some(action), Some((_, scope, _)), Some(security_principal)) => {
@@ -6152,13 +6248,13 @@ impl GatewayHandler {
 
         // CREATE SECRET / ALTER SECRET / DROP SECRET — v0.55.1 pgwire DDL wiring
         if ql.starts_with("create secret ") {
-            return Some(self.handle_create_secret(q).await);
+            return Some(self.handle_create_secret(q, "public").await);
         }
         if ql.starts_with("alter secret ") {
-            return Some(self.handle_alter_secret(q).await);
+            return Some(self.handle_alter_secret(q, "public").await);
         }
         if ql.starts_with("drop secret ") {
-            return Some(self.handle_drop_secret(q).await);
+            return Some(self.handle_drop_secret(q, "public").await);
         }
 
         // CREATE INDEX / DROP INDEX / REBUILD INDEX / MARK INDEX READY — v0.32 pgwire DDL wiring
@@ -6420,6 +6516,44 @@ impl GatewayHandler {
 
         if let Some(response) = self.authorize_mutation(q, conn_id).await {
             return Ok(response);
+        }
+
+        let namespace = conn_id
+            .and_then(|id| {
+                self.sessions
+                    .get(id)
+                    .map(|session| session.current_namespace.clone())
+            })
+            .unwrap_or_else(|| "public".to_string());
+        if ql.starts_with("create secret ") {
+            return self
+                .handle_create_secret(q, &namespace)
+                .await
+                .map(|responses| responses.into_iter().map(promote_response).collect());
+        }
+        if ql.starts_with("alter secret ") {
+            return self
+                .handle_alter_secret(q, &namespace)
+                .await
+                .map(|responses| responses.into_iter().map(promote_response).collect());
+        }
+        if ql.starts_with("drop secret ") {
+            return self
+                .handle_drop_secret(q, &namespace)
+                .await
+                .map(|responses| responses.into_iter().map(promote_response).collect());
+        }
+
+        if ql.trim_end_matches(';') == "show secrets" || ql.trim_end_matches(';') == "show secret" {
+            if let Some(response) = self
+                .authorize_secret_metadata_read_for_connection(conn_id)
+                .await
+            {
+                return Ok(response);
+            }
+            return Ok(vec![promote_response(
+                self.handle_show_secrets(&namespace).await,
+            )]);
         }
 
         // ── Aborted-transaction guard ────────────────────────────────────────────
@@ -7304,7 +7438,9 @@ impl GatewayHandler {
             ))]);
         }
         if ql.trim_end_matches(';') == "show secrets" || ql.trim_end_matches(';') == "show secret" {
-            return Ok(vec![promote_response(self.handle_show_secrets().await)]);
+            return Ok(vec![promote_response(
+                self.handle_show_secrets("public").await,
+            )]);
         }
         if ql.trim_end_matches(';') == "show source status" {
             return Ok(vec![promote_response(catalog_resp_to_response(
@@ -9895,9 +10031,20 @@ impl GatewayHandler {
         } else {
             None
         };
+        let secret_namespace_id = match secret_scope.as_ref() {
+            Some((_, namespace)) => match self.secret_namespace_id(namespace).await {
+                Ok(namespace_id) => namespace_id,
+                Err(_) => {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                    )]);
+                }
+            },
+            None => 0,
+        };
         if let Some(secret_name) = secret_name {
             if !secret_name.is_empty() {
-                let ns = 0u128;
+                let ns = secret_namespace_id;
                 let secret_exists = match self.secret_store.contains_secret(ns, secret_name).await {
                     Ok(exists) => exists,
                     Err(_) => {
@@ -9939,7 +10086,7 @@ impl GatewayHandler {
         let secret_reference_added = if let Some(secret_name) = secret_name {
             match self
                 .secret_store
-                .add_reference_if_absent(0u128, secret_name, &parsed.name)
+                .add_reference_if_absent(secret_namespace_id, secret_name, &parsed.name)
                 .await
             {
                 Ok(added) => added,
@@ -9963,7 +10110,7 @@ impl GatewayHandler {
                     if let Some(secret_name) = secret_name {
                         let _ = self
                             .secret_store
-                            .remove_reference(0u128, secret_name, &parsed.name)
+                            .remove_reference(secret_namespace_id, secret_name, &parsed.name)
                             .await;
                     }
                 }
@@ -9977,7 +10124,7 @@ impl GatewayHandler {
                     if let Some(secret_name) = secret_name {
                         let _ = self
                             .secret_store
-                            .remove_reference(0u128, secret_name, &parsed.name)
+                            .remove_reference(secret_namespace_id, secret_name, &parsed.name)
                             .await;
                     }
                 }
@@ -10044,6 +10191,33 @@ impl GatewayHandler {
             )))]);
         };
 
+        let secret_reference = match sink.secret_name.as_deref() {
+            Some(reference) => {
+                let Some(secret_name) =
+                    rockstream_types::secret::secret_name_from_reference(reference)
+                else {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-4007] sink has an unsupported secret reference".to_string(),
+                    )]);
+                };
+                let Some(namespace) = sink.secret_namespace.as_deref() else {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-0003] secret.storage_unavailable: sink secret namespace is missing from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                    )]);
+                };
+                let namespace_id = match self.secret_namespace_id(namespace).await {
+                    Ok(namespace_id) => namespace_id,
+                    Err(_) => {
+                        return Ok(vec![create_sink_error_response(
+                            "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                        )]);
+                    }
+                };
+                Some((secret_name.to_string(), namespace_id))
+            }
+            None => None,
+        };
+
         let remove_result = if self.catalog.get_durable_store().is_some() {
             self.catalog.remove_sink_durable(&name).await
         } else {
@@ -10061,17 +10235,10 @@ impl GatewayHandler {
             }
             Err(error) => return Ok(vec![create_sink_error_response(error)]),
         }
-        if let Some(secret_reference) = sink.secret_name.as_deref() {
-            let Some(secret_name) =
-                rockstream_types::secret::secret_name_from_reference(secret_reference)
-            else {
-                return Ok(vec![create_sink_error_response(
-                    "[RS-4007] sink has an unsupported secret reference".to_string(),
-                )]);
-            };
+        if let Some((secret_name, namespace_id)) = secret_reference {
             if let Err(error) = self
                 .secret_store
-                .remove_reference(0u128, secret_name, &name)
+                .remove_reference(namespace_id, &secret_name, &name)
                 .await
             {
                 return Ok(vec![create_sink_error_response(error.to_string())]);
@@ -10151,9 +10318,20 @@ impl GatewayHandler {
         } else {
             None
         };
+        let secret_namespace_id = match secret_scope.as_ref() {
+            Some((_, namespace)) => match self.secret_namespace_id(namespace).await {
+                Ok(namespace_id) => namespace_id,
+                Err(_) => {
+                    return Ok(vec![create_source_error_response(
+                        "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                    )]);
+                }
+            },
+            None => 0,
+        };
         if let Some(secret_name) = secret_name {
             if !secret_name.is_empty() {
-                let ns = 0u128;
+                let ns = secret_namespace_id;
                 let secret_exists = match self.secret_store.contains_secret(ns, secret_name).await {
                     Ok(exists) => exists,
                     Err(_) => {
@@ -10223,7 +10401,7 @@ impl GatewayHandler {
         let secret_reference_added = if let Some(secret_name) = secret_name {
             match self
                 .secret_store
-                .add_reference_if_absent(0u128, secret_name, &parsed.name)
+                .add_reference_if_absent(secret_namespace_id, secret_name, &parsed.name)
                 .await
             {
                 Ok(added) => added,
@@ -10247,7 +10425,7 @@ impl GatewayHandler {
                     if let Some(secret_name) = secret_name {
                         let _ = self
                             .secret_store
-                            .remove_reference(0u128, secret_name, &parsed.name)
+                            .remove_reference(secret_namespace_id, secret_name, &parsed.name)
                             .await;
                     }
                 }
@@ -10266,7 +10444,7 @@ impl GatewayHandler {
                     if let Some(secret_name) = secret_name {
                         let _ = self
                             .secret_store
-                            .remove_reference(0u128, secret_name, &parsed.name)
+                            .remove_reference(secret_namespace_id, secret_name, &parsed.name)
                             .await;
                     }
                 }
@@ -10304,13 +10482,24 @@ impl GatewayHandler {
         )])
     }
 
-    async fn handle_create_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_secret<'a>(
+        &'a self,
+        q: &str,
+        namespace: &str,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_create_secret_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
 
-        let ns = 0u128;
+        let ns = match self.secret_namespace_id(namespace).await {
+            Ok(namespace_id) => namespace_id,
+            Err(_) => {
+                return Ok(vec![secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                )]);
+            }
+        };
         if parsed.if_not_exists {
             if let Ok(exists) = self.secret_store.contains_secret(ns, &parsed.name).await {
                 if exists {
@@ -10350,13 +10539,24 @@ impl GatewayHandler {
         )])
     }
 
-    async fn handle_alter_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_alter_secret<'a>(
+        &'a self,
+        q: &str,
+        namespace: &str,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_alter_secret_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
 
-        let ns = 0u128;
+        let ns = match self.secret_namespace_id(namespace).await {
+            Ok(namespace_id) => namespace_id,
+            Err(_) => {
+                return Ok(vec![secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                )]);
+            }
+        };
         if let Err(err) = self
             .secret_store
             .alter_secret(ns, &parsed.name, parsed.payload, "pgwire")
@@ -10370,13 +10570,24 @@ impl GatewayHandler {
         )])
     }
 
-    async fn handle_drop_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_drop_secret<'a>(
+        &'a self,
+        q: &str,
+        namespace: &str,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_drop_secret_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
 
-        let ns = 0u128;
+        let ns = match self.secret_namespace_id(namespace).await {
+            Ok(namespace_id) => namespace_id,
+            Err(_) => {
+                return Ok(vec![secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                )]);
+            }
+        };
         if let Err(err) = self
             .secret_store
             .drop_secret(ns, &parsed.name, "pgwire")
@@ -10397,8 +10608,15 @@ impl GatewayHandler {
         )])
     }
 
-    async fn handle_show_secrets<'a>(&'a self) -> Response<'a> {
-        let ns = 0u128;
+    async fn handle_show_secrets<'a>(&'a self, namespace: &str) -> Response<'a> {
+        let ns = match self.secret_namespace_id(namespace).await {
+            Ok(namespace_id) => namespace_id,
+            Err(_) => {
+                return secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                )
+            }
+        };
         let listings = match self.secret_store.list_secrets(ns).await {
             Ok(listings) => listings,
             Err(_) => {
@@ -10522,6 +10740,37 @@ impl GatewayHandler {
                         .flatten()
                         .map(|identity| identity.connector_id())
                 });
+                let secret_reference = match source.as_ref().and_then(|source| {
+                    source
+                        .options
+                        .get("secret")
+                        .map(|reference| (source, reference.as_str()))
+                }) {
+                    Some((source_entry, reference)) => {
+                        let Some(secret_name) =
+                            rockstream_types::secret::secret_name_from_reference(reference)
+                        else {
+                            return Ok(vec![create_source_error_response(
+                                "[RS-4008] source has an unsupported secret reference".to_string(),
+                            )]);
+                        };
+                        let Some(namespace) = source_entry.secret_namespace.as_deref() else {
+                            return Ok(vec![create_source_error_response(
+                                "[RS-0003] secret.storage_unavailable: source secret namespace is missing from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                            )]);
+                        };
+                        let namespace_id = match self.secret_namespace_id(namespace).await {
+                            Ok(namespace_id) => namespace_id,
+                            Err(_) => {
+                                return Ok(vec![create_source_error_response(
+                                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                                )]);
+                            }
+                        };
+                        Some((secret_name.to_string(), namespace_id))
+                    }
+                    None => None,
+                };
                 let remove_result = if self.catalog.get_durable_store().is_some() {
                     self.catalog.remove_source_durable(&parsed.name).await
                 } else {
@@ -10536,22 +10785,13 @@ impl GatewayHandler {
                     }
                     Err(error) => return Ok(vec![create_source_error_response(error)]),
                 }
-                if let Some(source_entry) = source.as_ref() {
-                    if let Some(secret_reference) = source_entry.options.get("secret") {
-                        let Some(secret_name) =
-                            rockstream_types::secret::secret_name_from_reference(secret_reference)
-                        else {
-                            return Ok(vec![create_source_error_response(
-                                "[RS-4008] source has an unsupported secret reference".to_string(),
-                            )]);
-                        };
-                        if let Err(error) = self
-                            .secret_store
-                            .remove_reference(0u128, secret_name, &parsed.name)
-                            .await
-                        {
-                            return Ok(vec![create_source_error_response(error.to_string())]);
-                        }
+                if let Some((secret_name, namespace_id)) = secret_reference {
+                    if let Err(error) = self
+                        .secret_store
+                        .remove_reference(namespace_id, &secret_name, &parsed.name)
+                        .await
+                    {
+                        return Ok(vec![create_source_error_response(error.to_string())]);
                     }
                 }
                 if let (Some(connector_id), Some(shard_db), Ok(runtime)) = (

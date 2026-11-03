@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures::StreamExt;
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::SecretStore;
@@ -11,14 +12,16 @@ use rockstream_gateway::role_catalog::{gen_scram_verifiers, RoleEntry};
 use rockstream_gateway::server::GatewayHandler;
 use rockstream_gateway::view_reader::{ViewReadStrategy, ViewReader};
 use rockstream_gateway::GatewayError;
-use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
+use rockstream_storage::catalog::{
+    CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn, DurableCatalogStore,
+};
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
     ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
     SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
     SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
-use rockstream_types::ids::PrincipalId;
+use rockstream_types::ids::{DatabaseId, NamespaceId, PrincipalId};
 use rockstream_types::mutation_policy::{pgwire_mutation_policy, PGWIRE_MUTATION_POLICY};
 use rockstream_types::secret::SecretType;
 
@@ -27,6 +30,58 @@ fn current_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after Unix epoch")
         .as_millis() as u64
+}
+
+async fn seed_public_namespace(durable: &DurableCatalogStore) {
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                1,
+                100,
+                vec![
+                    CatalogMutation::PutNamespace(CatalogNamespace {
+                        id: NamespaceId(1),
+                        name: "public".to_string(),
+                        database_id: DatabaseId(1),
+                        created_at: 1,
+                    }),
+                    CatalogMutation::PutNamespace(CatalogNamespace {
+                        id: NamespaceId(2),
+                        name: "sales".to_string(),
+                        database_id: DatabaseId(1),
+                        created_at: 2,
+                    }),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+fn decode_pgwire_row(row: &pgwire::messages::data::DataRow) -> Vec<Option<String>> {
+    let mut data = row.data.as_ref();
+    let mut fields = Vec::with_capacity(row.field_count as usize);
+    for _ in 0..row.field_count {
+        let length = i32::from_be_bytes(
+            data[..4]
+                .try_into()
+                .expect("data row field length is present"),
+        );
+        data = &data[4..];
+        if length == -1 {
+            fields.push(None);
+            continue;
+        }
+        let length = usize::try_from(length).expect("data row field length is nonnegative");
+        let value = std::str::from_utf8(&data[..length])
+            .expect("metadata field is utf-8")
+            .to_string();
+        fields.push(Some(value));
+        data = &data[length..];
+    }
+    assert!(data.is_empty(), "data row contains no trailing fields");
+    fields
 }
 
 struct NoopViewReader;
@@ -110,11 +165,13 @@ fn mutation_cases() -> Vec<(&'static str, &'static str, &'static str)> {
 
 async fn denied_matrix(handler: &GatewayHandler, conn_id: &str) -> Vec<(String, String, String)> {
     let mut results = Vec::new();
-    for (operation, query, resource) in mutation_cases() {
+    for (index, (operation, query, resource)) in mutation_cases().into_iter().enumerate() {
+        let case_conn_id = format!("{conn_id}-{index}");
+        set_viewer(handler, &case_conn_id);
         let spec = pgwire_mutation_policy(query).expect("matrix query must be policy-covered");
         assert_eq!(spec.operation, operation);
         let responses = handler
-            .dispatch_async_with_conn(query, Some(conn_id))
+            .dispatch_async_with_conn(query, Some(&case_conn_id))
             .await
             .expect("authorization denial must be a pgwire response");
         assert_eq!(responses.len(), 1, "exact denial response for {query}");
@@ -124,12 +181,21 @@ async fn denied_matrix(handler: &GatewayHandler, conn_id: &str) -> Vec<(String, 
         };
         assert_eq!(error.severity, "ERROR");
         assert_eq!(error.code, "42501");
-        assert_eq!(
-            error.message,
+        let expected_message = if matches!(
+            operation,
+            "CREATE SECRET" | "ALTER SECRET" | "DROP SECRET"
+        ) {
+            format!(
+                "[RS-2401] auth.permission_denied: principal 'viewer' is not authorized for action 'SecretManage' on public.{resource}. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated."
+            )
+        } else {
             format!(
                 "[RS-2401] auth.permission_denied: principal 'viewer' lacks required role '{:?}' on {resource}. next_steps: Request an ACL grant for the required role, then retry.",
                 spec.minimum_role
-            ),
+            )
+        };
+        assert_eq!(
+            error.message, expected_message,
             "operation={operation} query={query}"
         );
         results.push((
@@ -228,6 +294,202 @@ async fn viewer_cannot_bypass_mutation_policy_with_multi_statement_sql() {
 }
 
 #[tokio::test]
+async fn administrator_can_manage_secret_and_read_only_its_metadata() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "secret-administration-policy-test",
+    ));
+    seed_public_namespace(&durable).await;
+    let salt = vec![3; 16];
+    let iterations = 4096;
+    let (_, stored_key, server_key) = gen_scram_verifiers("test-password", &salt, iterations);
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(31),
+        display_name: "Secret administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "secret-admin".to_string(),
+            salt,
+            iterations,
+            stored_key: stored_key.to_vec(),
+            server_key: server_key.to_vec(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    durable
+        .preprovision_first_administrator(principal, 1)
+        .await
+        .unwrap();
+    catalog.set_durable_store(durable);
+
+    let secret_store = Arc::new(SecretStore::new(
+        None,
+        Arc::new(EnvKekProvider::from_passphrase(
+            "secret-admin-policy-test-kek",
+        )),
+    ));
+    let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader))
+        .with_secret_store(secret_store.clone());
+    handler
+        .sessions
+        .entry("secret-admin-connection".to_string())
+        .or_default()
+        .principal = Principal::ScramUser {
+        username: "secret-admin".to_string(),
+    };
+
+    let created = handler
+        .dispatch_async_with_conn(
+            "CREATE SECRET kafka_auth (TYPE = 'sasl_plain', username = 'alice', password = 'literal-secret')",
+            Some("secret-admin-connection"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        created.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+
+    let shown = handler
+        .dispatch_async_with_conn("SHOW SECRETS", Some("secret-admin-connection"))
+        .await
+        .unwrap();
+    assert_eq!(shown.len(), 1);
+    let pgwire::api::results::Response::Query(query) = shown.into_iter().next().unwrap() else {
+        panic!("authorized SHOW SECRETS returns one metadata query");
+    };
+    let schema = query.row_schema();
+    assert_eq!(
+        schema.iter().map(|field| field.name()).collect::<Vec<_>>(),
+        vec!["name", "type", "created_at", "updated_at"]
+    );
+    let metadata = secret_store
+        .get_secret_metadata(1, "kafka_auth")
+        .await
+        .unwrap();
+    let mut rows = query.data_rows();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        decode_pgwire_row(&row),
+        vec![
+            Some("kafka_auth".to_string()),
+            Some("sasl_plain".to_string()),
+            Some(metadata.created_at.to_string()),
+            Some(metadata.updated_at.to_string()),
+        ]
+    );
+    assert!(rows.next().await.is_none());
+    assert!(!format!("{row:?}").contains("literal-secret"));
+
+    assert!(secret_store.contains_secret(1, "kafka_auth").await.unwrap());
+    handler
+        .sessions
+        .get_mut("secret-admin-connection")
+        .unwrap()
+        .current_namespace = "sales".to_string();
+    let created_sales = handler
+        .dispatch_async_with_conn(
+            "CREATE SECRET kafka_auth (TYPE = 'sasl_plain', username = 'bob', password = 'sales-secret')",
+            Some("secret-admin-connection"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        created_sales.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    assert!(secret_store.contains_secret(1, "kafka_auth").await.unwrap());
+    assert!(secret_store.contains_secret(2, "kafka_auth").await.unwrap());
+
+    let shown_sales = handler
+        .dispatch_async_with_conn("SHOW SECRETS", Some("secret-admin-connection"))
+        .await
+        .unwrap();
+    assert_eq!(shown_sales.len(), 1);
+    let pgwire::api::results::Response::Query(query) = shown_sales.into_iter().next().unwrap()
+    else {
+        panic!("authorized sales SHOW SECRETS returns one metadata query");
+    };
+    let sales_metadata = secret_store
+        .get_secret_metadata(2, "kafka_auth")
+        .await
+        .unwrap();
+    let mut sales_rows = query.data_rows();
+    let sales_row = sales_rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        decode_pgwire_row(&sales_row),
+        vec![
+            Some("kafka_auth".to_string()),
+            Some("sasl_plain".to_string()),
+            Some(sales_metadata.created_at.to_string()),
+            Some(sales_metadata.updated_at.to_string()),
+        ]
+    );
+    assert!(sales_rows.next().await.is_none());
+    assert!(!format!("{sales_row:?}").contains("sales-secret"));
+
+    let altered_sales = handler
+        .dispatch_async_with_conn(
+            "ALTER SECRET kafka_auth SET (password = 'replacement')",
+            Some("secret-admin-connection"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        altered_sales.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    assert_eq!(
+        secret_store
+            .get_secret(1, "kafka_auth")
+            .await
+            .unwrap()
+            .payload["password"],
+        "literal-secret"
+    );
+    assert_eq!(
+        secret_store
+            .get_secret(2, "kafka_auth")
+            .await
+            .unwrap()
+            .payload["password"],
+        "replacement"
+    );
+
+    let dropped_sales = handler
+        .dispatch_async_with_conn("DROP SECRET kafka_auth", Some("secret-admin-connection"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        dropped_sales.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    assert!(secret_store.contains_secret(1, "kafka_auth").await.unwrap());
+    assert!(!secret_store.contains_secret(2, "kafka_auth").await.unwrap());
+    handler
+        .sessions
+        .get_mut("secret-admin-connection")
+        .unwrap()
+        .current_namespace = "public".to_string();
+    let dropped_public = handler
+        .dispatch_async_with_conn("DROP SECRET kafka_auth", Some("secret-admin-connection"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        dropped_public.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    assert!(!secret_store.contains_secret(1, "kafka_auth").await.unwrap());
+}
+
+#[tokio::test]
 async fn gateway_mutation_authorization_lfs() {
     let temp = tempfile::tempdir().unwrap();
     let audit_path = temp.path().join("audit.jsonl");
@@ -265,7 +527,7 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
     ));
     secret_store
         .create_secret(
-            0,
+            1,
             "kafka_auth",
             SecretType::SaslPlain,
             HashMap::from([
@@ -313,6 +575,7 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
         Arc::new(object_store::memory::InMemory::new()),
         "security-policy-test",
     ));
+    seed_public_namespace(&durable).await;
     durable
         .preprovision_first_administrator(principal.clone(), 1)
         .await
@@ -376,7 +639,7 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
     durable
         .commit_txn(
             CatalogTxn::new(
-                2,
+                3,
                 2,
                 vec![CatalogMutation::PutSecurityPrincipal {
                     principal: reader.clone(),
@@ -520,6 +783,52 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
         );
     }
 
+    let secret_metadata_denial = handler
+        .dispatch_async_with_conn("SHOW SECRETS", Some(reader_connection))
+        .await
+        .unwrap();
+    let metadata_error = match secret_metadata_denial.as_slice() {
+        [pgwire::api::results::Response::Error(error)] => error,
+        _ => panic!("expected exactly one secret metadata denial response"),
+    };
+    assert_eq!(metadata_error.severity, "ERROR");
+    assert_eq!(metadata_error.code, "42501");
+    assert_eq!(
+        metadata_error.message,
+        "[RS-2401] auth.permission_denied: principal 'reader-login' is not authorized for action 'SecretMetadataRead' on public. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert!(handler.sessions.contains_key(reader_connection));
+    let records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 5);
+    let metadata_denial = records.last().unwrap();
+    assert_eq!(
+        metadata_denial.actor,
+        AuditIdentity::Verified("scram:reader-login".to_string())
+    );
+    assert_eq!(
+        metadata_denial.target,
+        AuditField::Known("public".to_string())
+    );
+    assert_eq!(
+        metadata_denial.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::Namespace {
+                namespace: "public".to_string(),
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(
+        metadata_denial.action,
+        SecurityAuditClass::AuthorizationDenial
+    );
+    assert_eq!(metadata_denial.outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(
+        metadata_denial.correlation,
+        AuditCorrelation::Observed(reader_connection.to_string())
+    );
+    assert_eq!(metadata_denial.policy_revision, AuditField::Known(1));
+
     let allowed_source = handler
         .dispatch_async_with_conn(
             "CREATE SOURCE kafka_src TYPE kafka (bootstrap.servers='localhost:9092', topic='orders', secret='kafka_auth') FORMAT json",
@@ -598,7 +907,7 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
     assert!(handler.sessions.contains_key(reader_connection));
 
     let records = durable.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), 5);
+    assert_eq!(records.len(), 6);
     let denied_secret_use = records.last().unwrap();
     assert!(denied_secret_use.event_id.starts_with("gateway-authz-"));
     assert!(denied_secret_use.timestamp_ms > 0);

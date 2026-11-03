@@ -6,6 +6,15 @@
 AES-256-GCM envelopes under `catalog/secrets/`. The control plane uses
 `RS_SECRET_KEK` by default. `SHOW SECRETS` returns metadata only.
 
+Secret SQL is authorized through the durable principal policy. `CREATE SECRET`,
+`ALTER SECRET`, and `DROP SECRET` require `secret.manage` for the selected
+namespace and secret; `SHOW SECRETS` requires `secret.metadata.read` for the
+namespace. The Administrator preset grants those secret administration actions
+within its scope. The Operator preset grants none of them, and neither preset
+grants `secret.use`. A gateway running without a durable authenticated policy
+denies secret administration. Secret input remains write-only, and no SQL GET
+returns an existing secret value.
+
 Applications can inject an `AwsKmsKekProvider::new(key_arn, region)` into a
 `SecretStore` and supply that store through `ControlService::with_secret_store`.
 Supplying an ARN alone does not select this provider in the default services.

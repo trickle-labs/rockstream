@@ -53,6 +53,10 @@ pub trait CatalogStore: Send + Sync {
         &self,
         id: NamespaceId,
     ) -> Result<Option<CatalogNamespace>, CatalogError>;
+    async fn get_namespace_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<CatalogNamespace>, CatalogError>;
     async fn get_table(&self, id: TableId) -> Result<Option<CatalogTable>, CatalogError>;
     async fn get_table_by_name(&self, name: &str) -> Result<Option<CatalogTable>, CatalogError>;
     async fn list_tables(&self) -> Result<Vec<CatalogTable>, CatalogError>;
@@ -1356,6 +1360,20 @@ impl CatalogStore for DurableCatalogStore {
         id: NamespaceId,
     ) -> Result<Option<CatalogNamespace>, CatalogError> {
         Ok(self.state.read().await.namespaces.get(&id).cloned())
+    }
+
+    async fn get_namespace_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<CatalogNamespace>, CatalogError> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .namespaces
+            .values()
+            .find(|namespace| namespace.name.eq_ignore_ascii_case(name))
+            .cloned())
     }
 
     async fn get_table(&self, id: TableId) -> Result<Option<CatalogTable>, CatalogError> {
