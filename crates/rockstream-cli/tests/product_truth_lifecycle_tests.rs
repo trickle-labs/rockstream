@@ -119,9 +119,20 @@ fn wait_for_status(binary: &Path, management_addr: &str, expected_nodes: usize) 
 }
 
 fn allocate_memory_pressure() -> Vec<u8> {
+    const PAGE_SIZE: usize = 4096;
+    let mut pattern = vec![0_u8; PAGE_SIZE];
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for word in pattern.chunks_exact_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        word.copy_from_slice(&state.to_ne_bytes());
+    }
+
     let mut memory = vec![0_u8; 512 * 1024 * 1024];
-    for page in memory.chunks_mut(4096) {
-        page[0] = 1;
+    for (page_index, page) in memory.chunks_mut(PAGE_SIZE).enumerate() {
+        page.copy_from_slice(&pattern);
+        page[..std::mem::size_of::<usize>()].copy_from_slice(&page_index.to_ne_bytes());
     }
     memory
 }
