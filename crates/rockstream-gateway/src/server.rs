@@ -2426,6 +2426,14 @@ impl GatewayHandler {
                         && actual_server_key.as_slice() == server_key.as_slice()
                 })
             }
+            (
+                Principal::Mtls {
+                    certificate_sha256, ..
+                },
+                LoginMethod::Mtls {
+                    certificate_sha256: stored_fingerprint,
+                },
+            ) => certificate_sha256 == stored_fingerprint,
             _ => false,
         };
         let mut matches = principals
@@ -2454,6 +2462,7 @@ impl GatewayHandler {
             .ok_or_else(|| "durable security audit store is unavailable".to_string())?;
         let actor = match principal {
             Some(actor @ Principal::ScramUser { .. }) => AuditIdentity::Verified(actor.actor()),
+            Some(actor @ Principal::Mtls { .. }) => AuditIdentity::Verified(actor.actor()),
             Some(actor @ (Principal::Jwt { .. } | Principal::CertCn { .. })) => {
                 AuditIdentity::Unverified(actor.actor())
             }
@@ -12898,11 +12907,16 @@ impl StartupHandler for GatewayHandler {
                     // CN of a real, CA-validated TLS client certificate,
                     // recorded by `MtlsCnExtractingVerifier` during the TLS
                     // handshake and looked up here by peer socket address.
-                    match crate::tls::lookup_mtls_cn(&client.socket_addr()) {
-                        Some(cn) => {
-                            client
-                                .metadata_mut()
-                                .insert("_rs_principal".to_string(), format!("cert:{cn}"));
+                    match crate::tls::lookup_mtls_identity(&client.socket_addr()) {
+                        Some(identity) => {
+                            client.metadata_mut().insert(
+                                "_rs_principal".to_string(),
+                                format!("cert:{}", identity.common_name),
+                            );
+                            client.metadata_mut().insert(
+                                "_rs_mtls_certificate_sha256".to_string(),
+                                crate::auth::certificate_sha256_hex(&identity.certificate_sha256),
+                            );
                         }
                         None => {
                             return Err(pgwire::error::PgWireError::UserError(Box::new(
@@ -13360,6 +13374,10 @@ impl SimpleQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let mtls_fingerprint = client
+                .metadata()
+                .get("_rs_mtls_certificate_sha256")
+                .and_then(|value| crate::auth::parse_certificate_sha256_hex(value));
             let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
@@ -13367,7 +13385,13 @@ impl SimpleQueryHandler for GatewayHandler {
                         sub: sub.to_string(),
                     }
                 } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
-                    Principal::CertCn { cn: cn.to_string() }
+                    match mtls_fingerprint {
+                        Some(certificate_sha256) => Principal::Mtls {
+                            cn: cn.to_string(),
+                            certificate_sha256,
+                        },
+                        None => Principal::CertCn { cn: cn.to_string() },
+                    }
                 } else {
                     Principal::System
                 };
@@ -13921,6 +13945,10 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let mtls_fingerprint = client
+                .metadata()
+                .get("_rs_mtls_certificate_sha256")
+                .and_then(|value| crate::auth::parse_certificate_sha256_hex(value));
             let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
@@ -13928,7 +13956,13 @@ impl ExtendedQueryHandler for GatewayHandler {
                         sub: sub.to_string(),
                     }
                 } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
-                    Principal::CertCn { cn: cn.to_string() }
+                    match mtls_fingerprint {
+                        Some(certificate_sha256) => Principal::Mtls {
+                            cn: cn.to_string(),
+                            certificate_sha256,
+                        },
+                        None => Principal::CertCn { cn: cn.to_string() },
+                    }
                 } else {
                     Principal::System
                 };

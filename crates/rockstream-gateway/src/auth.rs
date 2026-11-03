@@ -45,10 +45,20 @@ impl std::str::FromStr for AuthMode {
 /// Authenticated principal for a gateway connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Principal {
-    System,                         // --auth=off or internal paths
-    Jwt { sub: String },            // OIDC bearer token, verified against JWKS; sub = JWT subject
-    CertCn { cn: String },          // mTLS client cert CN
-    ScramUser { username: String }, // SCRAM-SHA-256 or MD5 authenticated user
+    System, // --auth=off or internal paths
+    Jwt {
+        sub: String,
+    }, // OIDC bearer token, verified against JWKS; sub = JWT subject
+    CertCn {
+        cn: String,
+    }, // mTLS client cert CN
+    Mtls {
+        cn: String,
+        certificate_sha256: [u8; 32],
+    },
+    ScramUser {
+        username: String,
+    }, // SCRAM-SHA-256 or MD5 authenticated user
 }
 
 impl Principal {
@@ -57,6 +67,7 @@ impl Principal {
             Principal::System => "system",
             Principal::Jwt { sub } => sub,
             Principal::CertCn { cn } => cn,
+            Principal::Mtls { cn, .. } => cn,
             Principal::ScramUser { username } => username,
         }
     }
@@ -71,6 +82,9 @@ impl Principal {
             Principal::System => "system".to_string(),
             Principal::Jwt { sub } => format!("jwt:{sub}"),
             Principal::CertCn { cn } => format!("cert:{cn}"),
+            Principal::Mtls {
+                certificate_sha256, ..
+            } => format!("mtls:{}", certificate_sha256_hex(certificate_sha256)),
             Principal::ScramUser { username } => format!("scram:{username}"),
         }
     }
@@ -79,6 +93,30 @@ impl Principal {
     pub fn is_system(&self) -> bool {
         matches!(self, Principal::System)
     }
+}
+
+pub(crate) fn certificate_sha256_hex(fingerprint: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in fingerprint {
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+pub(crate) fn parse_certificate_sha256_hex(encoded: &str) -> Option<[u8; 32]> {
+    if encoded.len() != 64 || !encoded.is_ascii() {
+        return None;
+    }
+
+    let mut fingerprint = [0; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)? as u8;
+        let low = (pair[1] as char).to_digit(16)? as u8;
+        fingerprint[index] = (high << 4) | low;
+    }
+    Some(fingerprint)
 }
 
 /// JWT claims parsed from payload.
