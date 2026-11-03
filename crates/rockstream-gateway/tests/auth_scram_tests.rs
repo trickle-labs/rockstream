@@ -7,10 +7,19 @@ use std::sync::Arc;
 use tokio_postgres::NoTls;
 
 use rockstream_gateway::{
-    catalog_stubs::{CatalogColumn, CatalogView},
-    role_catalog::{create_role_entry, RoleCatalog},
+    catalog_stubs::CatalogStubs,
+    role_catalog::{create_role_entry, gen_scram_verifiers, RoleCatalog},
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
+};
+use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
+use rockstream_types::{
+    authorization::{
+        AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
+        ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityPrincipal,
+        SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
+    },
+    ids::PrincipalId,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -44,18 +53,105 @@ fn data_rows_from(
 }
 
 async fn spawn_scram_gateway(roles: Vec<(&str, &str)>) -> (u16, tokio::task::JoinHandle<()>) {
-    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    let (port, handle, _) = spawn_scram_gateway_with_catalog(roles).await;
+    (port, handle)
+}
+
+async fn spawn_scram_gateway_with_catalog(
+    roles: Vec<(&str, &str)>,
+) -> (u16, tokio::task::JoinHandle<()>, Arc<CatalogStubs>) {
+    let catalog = Arc::new(CatalogStubs::new());
     let role_catalog = Arc::new(RoleCatalog::new());
-    for (user, pass) in roles {
-        role_catalog
-            .insert(create_role_entry(user, pass))
-            .expect("insert role");
+    let mut login_methods = Vec::new();
+    for (username, password) in roles {
+        let role = create_role_entry(username, password);
+        let (_, stored_key, server_key) =
+            gen_scram_verifiers(password, &role.scram_salt, role.scram_iterations);
+        login_methods.push(LoginMethod::ScramSha256 {
+            username: username.to_string(),
+            salt: role.scram_salt.clone(),
+            iterations: role.scram_iterations,
+            stored_key: stored_key.to_vec(),
+            server_key: server_key.to_vec(),
+        });
     }
+
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "Test SCRAM administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods,
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "auth-scram-tests",
+    ));
+    durable
+        .preprovision_first_administrator(principal, 1)
+        .await
+        .expect("persist test administrator and bootstrap audit");
+    catalog.set_durable_store(durable);
+
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server =
-        GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
+    let server = GatewayServer::with_scram_auth(
+        addr,
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+        role_catalog,
+    );
     let (local_addr, handle) = server.serve_background().await.unwrap();
-    (local_addr.port(), handle)
+    (local_addr.port(), handle, catalog)
+}
+
+async fn assert_scram_startup_rejects(catalog: Arc<CatalogStubs>) {
+    let held_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve startup address");
+    let addr = held_listener.local_addr().expect("read reserved address");
+    let server = GatewayServer::with_scram_auth(
+        addr,
+        catalog,
+        Arc::new(NoopViewReader),
+        Arc::new(RoleCatalog::new()),
+    );
+    let error = match server.serve_background().await {
+        Ok((_, handle)) => {
+            handle.abort();
+            panic!("SCRAM startup without credentials unexpectedly opened a listener");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("SCRAM requires an available durable catalog with an enabled SCRAM login"),
+        "unexpected startup error: {error}"
+    );
+    assert_eq!(
+        held_listener
+            .local_addr()
+            .expect("reserved listener remains open"),
+        addr
+    );
+}
+
+#[tokio::test]
+async fn test_scram_startup_rejects_missing_or_empty_durable_credentials() {
+    assert_scram_startup_rejects(Arc::new(CatalogStubs::new())).await;
+
+    let empty_catalog = Arc::new(CatalogStubs::new());
+    empty_catalog.set_durable_store(Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "empty-auth-scram-tests",
+    )));
+    assert_scram_startup_rejects(empty_catalog).await;
 }
 
 async fn spawn_md5_gateway(roles: Vec<(&str, &str)>) -> (u16, tokio::task::JoinHandle<()>) {
@@ -77,7 +173,9 @@ async fn spawn_md5_gateway(roles: Vec<(&str, &str)>) -> (u16, tokio::task::JoinH
 
 #[tokio::test]
 async fn test_scram_tokio_postgres_connects() {
-    let (port, _handle) = spawn_scram_gateway(vec![("alice", "pencil")]).await;
+    let (port, _handle, catalog) =
+        spawn_scram_gateway_with_catalog(vec![("alice", "pencil")]).await;
+    let store = catalog.get_durable_store().expect("durable SCRAM store");
     let (client, conn) = tokio_postgres::connect(
         &format!(
             "host=127.0.0.1 port={port} user=alice password=pencil dbname=test sslmode=disable"
@@ -90,12 +188,47 @@ async fn test_scram_tokio_postgres_connects() {
         conn.await.ok();
     });
     let rows = client.simple_query("SELECT 1").await.expect("SELECT 1");
-    assert!(!rows.is_empty());
+    let data = data_rows_from(&rows);
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].get(0), Some("1"));
+
+    let records = store
+        .list_security_audit_records()
+        .await
+        .expect("read authentication audit");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].event_id, "first-admin-bootstrap:1");
+    let success = &records[1];
+    assert!(success.event_id.starts_with("gateway-authn-"));
+    assert!(success.timestamp_ms > 0);
+    assert_eq!(success.format_version, SECURITY_AUDIT_FORMAT_VERSION);
+    assert_eq!(
+        success.actor,
+        AuditIdentity::Verified("scram:alice".to_string())
+    );
+    assert_eq!(success.target, AuditField::Known("principal:1".to_string()));
+    assert_eq!(success.scope, AuditField::NotApplicable);
+    assert_eq!(success.action, SecurityAuditClass::AuthenticationSuccess);
+    assert_eq!(success.outcome, SecurityAuditOutcome::Success);
+    assert!(
+        matches!(&success.correlation, AuditCorrelation::Observed(id) if !id.is_empty()),
+        "correlation must come from the accepted listener connection"
+    );
+    assert_eq!(success.operation_id, AuditField::NotApplicable);
+    assert_eq!(success.policy_revision, AuditField::Known(1));
+    assert_eq!(success.before_state, AuditField::NotApplicable);
+    assert_eq!(success.after_state, AuditField::NotApplicable);
 }
 
 #[tokio::test]
 async fn test_scram_wrong_password() {
-    let (port, _handle) = spawn_scram_gateway(vec![("alice", "pencil")]).await;
+    let (port, _handle, catalog) =
+        spawn_scram_gateway_with_catalog(vec![("alice", "pencil")]).await;
+    let store = catalog.get_durable_store().expect("durable SCRAM store");
+    let principals_before = store
+        .list_security_principals()
+        .await
+        .expect("read initial principal");
     let result = tokio_postgres::connect(
         &format!(
             "host=127.0.0.1 port={port} user=alice password=wrong dbname=test sslmode=disable"
@@ -103,7 +236,52 @@ async fn test_scram_wrong_password() {
         NoTls,
     )
     .await;
-    assert!(result.is_err(), "wrong password must be rejected");
+    let error = result
+        .err()
+        .expect("wrong password must not establish a client session");
+    let database_error = error
+        .as_db_error()
+        .expect("authentication error from gateway");
+    assert_eq!(database_error.code().code(), "28P01");
+    assert!(database_error
+        .message()
+        .starts_with("[RS-2401] auth.invalid_password:"));
+    let records = store
+        .list_security_audit_records()
+        .await
+        .expect("read authentication audit");
+    assert_eq!(
+        records.len(),
+        2,
+        "bootstrap and failed login are both audited"
+    );
+    assert_eq!(records[0].event_id, "first-admin-bootstrap:1");
+    let failure = &records[1];
+    assert!(failure.event_id.starts_with("gateway-authn-"));
+    assert!(failure.timestamp_ms > 0);
+    assert_eq!(failure.format_version, SECURITY_AUDIT_FORMAT_VERSION);
+    assert_eq!(
+        failure.actor,
+        AuditIdentity::Unverified("scram:alice".to_string())
+    );
+    assert_eq!(failure.target, AuditField::Known("principal:1".to_string()));
+    assert_eq!(failure.scope, AuditField::NotApplicable);
+    assert_eq!(failure.action, SecurityAuditClass::AuthenticationFailure);
+    assert_eq!(failure.outcome, SecurityAuditOutcome::Failure);
+    assert!(
+        matches!(&failure.correlation, AuditCorrelation::Observed(id) if !id.is_empty()),
+        "correlation must come from the accepted listener connection"
+    );
+    assert_eq!(failure.operation_id, AuditField::NotApplicable);
+    assert_eq!(failure.policy_revision, AuditField::Known(1));
+    assert_eq!(failure.before_state, AuditField::NotApplicable);
+    assert_eq!(failure.after_state, AuditField::NotApplicable);
+
+    let principals = store
+        .list_security_principals()
+        .await
+        .expect("read persisted principal");
+    assert_eq!(principals, principals_before);
 }
 
 #[tokio::test]
@@ -238,30 +416,7 @@ async fn test_bootstrap_function_shapes() {
 
 #[tokio::test]
 async fn test_search_path_unqualified_view() {
-    use rockstream_gateway::catalog_stubs::CatalogStubs;
-
-    let catalog = Arc::new(CatalogStubs::new());
-    catalog.add_view_in_namespace(CatalogView {
-        name: "vtest".to_string(),
-        namespace: "public".to_string(),
-        sql: "SELECT 1 AS id".to_string(),
-        columns: vec![CatalogColumn {
-            name: "id".to_string(),
-            data_type: "Int32".to_string(),
-        }],
-        op_id: None,
-    });
-
-    let role_catalog = Arc::new(RoleCatalog::new());
-    role_catalog
-        .insert(create_role_entry("alice", "pencil"))
-        .expect("insert alice");
-
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server =
-        GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
-    let (local_addr, _handle) = server.serve_background().await.unwrap();
-    let port = local_addr.port();
+    let (port, _handle) = spawn_scram_gateway(vec![("alice", "pencil")]).await;
 
     let (_client, conn) = tokio_postgres::connect(
         &format!(

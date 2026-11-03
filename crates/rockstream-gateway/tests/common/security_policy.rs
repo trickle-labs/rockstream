@@ -54,31 +54,6 @@ pub async fn role_catalog_with_authorized_builder(
         }],
         scoped_grants: vec![],
     };
-    let policy = serde_json::to_string(&(
-        principal.enabled,
-        &principal.preset_grants,
-        &principal.scoped_grants,
-    ))
-    .expect("serialize test principal policy");
-    let timestamp_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("system clock is after Unix epoch")
-        .as_millis() as u64;
-    let audit = SecurityAuditRecord {
-        format_version: SECURITY_AUDIT_FORMAT_VERSION,
-        event_id: "test-bootstrap-admin".to_string(),
-        timestamp_ms: timestamp_ms.max(1),
-        actor: AuditIdentity::Verified("offline-operator".to_string()),
-        target: AuditField::Known("principal:1".to_string()),
-        scope: AuditField::Known("cluster".to_string()),
-        action: SecurityAuditClass::GrantChange,
-        outcome: SecurityAuditOutcome::Success,
-        correlation: AuditCorrelation::Unknown,
-        operation_id: AuditField::Known("1".to_string()),
-        policy_revision: AuditField::Known(1),
-        before_state: AuditField::NotApplicable,
-        after_state: AuditField::Known(format!("revision=1;policy={policy}")),
-    };
     let builder = SecurityPrincipal {
         format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
         id: PrincipalId(2),
@@ -130,19 +105,7 @@ pub async fn role_catalog_with_authorized_builder(
         format!("test-security-policy-{username}"),
     ));
     durable
-        .commit_txn(
-            CatalogTxn::new(
-                1,
-                1,
-                vec![CatalogMutation::PutSecurityPrincipal {
-                    principal,
-                    expected_revision: None,
-                    grantor_revision: None,
-                    audit,
-                }],
-            )
-            .expect("valid test bootstrap transaction"),
-        )
+        .preprovision_first_administrator(principal, 1)
         .await
         .expect("persist test administrator and bootstrap audit");
     durable

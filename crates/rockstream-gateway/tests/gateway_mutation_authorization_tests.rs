@@ -278,47 +278,23 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
         }],
         scoped_grants: vec![],
     };
-    let principal_policy = serde_json::to_string(&(
-        principal.enabled,
-        &principal.preset_grants,
-        &principal.scoped_grants,
-    ))
-    .unwrap();
-    let bootstrap_audit = SecurityAuditRecord {
-        format_version: SECURITY_AUDIT_FORMAT_VERSION,
-        event_id: "bootstrap-admin".to_string(),
-        timestamp_ms: 1,
-        actor: AuditIdentity::Verified("offline-operator".to_string()),
-        target: AuditField::Known("principal:1".to_string()),
-        scope: AuditField::Known("cluster".to_string()),
-        action: SecurityAuditClass::GrantChange,
-        outcome: SecurityAuditOutcome::Success,
-        correlation: AuditCorrelation::Unknown,
-        operation_id: AuditField::Known("1".to_string()),
-        policy_revision: AuditField::Known(1),
-        before_state: AuditField::NotApplicable,
-        after_state: AuditField::Known(format!("revision=1;policy={principal_policy}")),
-    };
     let durable = Arc::new(DurableCatalogStore::new(
         Arc::new(object_store::memory::InMemory::new()),
         "security-policy-test",
     ));
     durable
-        .commit_txn(
-            CatalogTxn::new(
-                1,
-                1,
-                vec![CatalogMutation::PutSecurityPrincipal {
-                    principal: principal.clone(),
-                    expected_revision: None,
-                    grantor_revision: None,
-                    audit: bootstrap_audit.clone(),
-                }],
-            )
-            .unwrap(),
-        )
+        .preprovision_first_administrator(principal.clone(), 1)
         .await
         .unwrap();
+    let bootstrap_audit = durable
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("first administrator bootstrap audit");
+    assert_eq!(bootstrap_audit.actor, AuditIdentity::Unknown);
+    assert_eq!(bootstrap_audit.event_id, "first-admin-bootstrap:1");
 
     let reader = SecurityPrincipal {
         format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,

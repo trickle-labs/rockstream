@@ -97,10 +97,7 @@ use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId, WorkloadId
 use rockstream_types::mutation_policy::pgwire_mutation_policy;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
-use crate::auth::{
-    scram_server_key, scram_server_signature, scram_stored_key, verify_client_proof, AuthMode,
-    JwtVerifier, Principal,
-};
+use crate::auth::{scram_server_signature, verify_client_proof, AuthMode, JwtVerifier, Principal};
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
     CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail, WorkloadRevisionOutcome,
@@ -2138,7 +2135,7 @@ pub struct GatewayHandler {
     auth_mode: AuthMode,
     /// Optional JWT verifier (populated when auth_mode == Oidc).
     jwt_verifier: Option<Arc<JwtVerifier>>,
-    /// Role catalog for SCRAM/MD5 auth (always present; empty for Off/Oidc/Mtls).
+    /// Legacy RoleCatalog for MD5 compatibility; SCRAM credentials come from durable principals.
     pub role_catalog: Arc<RoleCatalog>,
     /// ACL store for RBAC enforcement.
     pub acl_store: Arc<rockstream_control::AclStore>,
@@ -2391,6 +2388,198 @@ impl GatewayHandler {
         Some((scope, format!("{namespace}.{name}"), namespace))
     }
 
+    async fn durable_scram_credentials_for_login(
+        &self,
+        username: &str,
+    ) -> Result<
+        Option<(
+            rockstream_types::ids::PrincipalId,
+            u64,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            Vec<u8>,
+        )>,
+        String,
+    > {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "SCRAM requires a recovered durable principal store".to_string())?;
+        let principals = store
+            .list_security_principals()
+            .await
+            .map_err(|_| "SCRAM durable principal store is unavailable".to_string())?;
+        let mut found = None;
+        for principal in principals.into_iter().filter(|principal| principal.enabled) {
+            for method in &principal.login_methods {
+                let LoginMethod::ScramSha256 {
+                    username: stored_username,
+                    salt,
+                    iterations,
+                    stored_key,
+                    server_key,
+                } = method
+                else {
+                    continue;
+                };
+                if stored_username != username {
+                    continue;
+                }
+                if found.is_some() {
+                    return Err(
+                        "SCRAM login identity maps to multiple enabled principals".to_string()
+                    );
+                }
+                found = Some((
+                    principal.id,
+                    principal.revision,
+                    salt.clone(),
+                    *iterations,
+                    stored_key.clone(),
+                    server_key.clone(),
+                ));
+            }
+        }
+        Ok(found)
+    }
+
+    async fn append_authentication_audit(
+        &self,
+        actor: AuditIdentity,
+        target: AuditField<String>,
+        policy_revision: AuditField<u64>,
+        success: bool,
+    ) -> Result<(), String> {
+        use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable security audit store is unavailable".to_string())?;
+        let record = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("gateway-authn-{:032x}", rand::random::<u128>()),
+            timestamp_ms: current_time_ms().max(1),
+            actor,
+            target,
+            scope: AuditField::NotApplicable,
+            action: if success {
+                SecurityAuditClass::AuthenticationSuccess
+            } else {
+                SecurityAuditClass::AuthenticationFailure
+            },
+            outcome: if success {
+                SecurityAuditOutcome::Success
+            } else {
+                SecurityAuditOutcome::Failure
+            },
+            correlation: CONN_ID
+                .try_with(|id| id.clone())
+                .map_or(AuditCorrelation::Unknown, AuditCorrelation::Observed),
+            operation_id: AuditField::NotApplicable,
+            policy_revision,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        };
+        let operation_id = rand::random::<u64>().max(1);
+        for attempt in 0..2 {
+            let revision = store
+                .get_revision()
+                .await
+                .checked_add(1)
+                .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+            let transaction = CatalogTxn::new(
+                revision,
+                operation_id,
+                vec![CatalogMutation::AppendSecurityAudit(record.clone())],
+            )
+            .map_err(|error| error.to_string())?;
+            match store.commit_txn(transaction).await {
+                Ok(_) => return Ok(()),
+                Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
+                    if attempt == 0 =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("durable authentication audit retry was exhausted".to_string())
+    }
+
+    async fn record_authentication_or_fail(
+        &self,
+        actor: AuditIdentity,
+        principal_id: Option<rockstream_types::ids::PrincipalId>,
+        policy_revision: Option<u64>,
+        success: bool,
+    ) -> Result<(), pgwire::error::PgWireError> {
+        self.append_authentication_audit(
+            actor,
+            principal_id.map_or(AuditField::Unknown, |id| {
+                AuditField::Known(format!("principal:{}", id.0))
+            }),
+            policy_revision.map_or(AuditField::Unknown, AuditField::Known),
+            success,
+        )
+        .await
+        .map_err(|_| {
+            pgwire::error::PgWireError::UserError(Box::new(
+                pgwire::error::ErrorInfo::new(
+                    "FATAL".to_string(),
+                    "28000".to_string(),
+                    "[RS-2400] auth.unauthenticated: security authentication audit is unavailable; authentication was denied".to_string(),
+                ),
+            ))
+        })
+    }
+
+    async fn record_scram_failure_or_fail(
+        &self,
+        username: &str,
+        principal_id: Option<rockstream_types::ids::PrincipalId>,
+        policy_revision: Option<u64>,
+    ) -> Result<(), pgwire::error::PgWireError> {
+        let actor = if username.is_empty() {
+            AuditIdentity::Unknown
+        } else {
+            AuditIdentity::Unverified(format!("scram:{username}"))
+        };
+        self.record_authentication_or_fail(actor, principal_id, policy_revision, false)
+            .await
+    }
+
+    async fn validate_scram_startup(&self) -> Result<(), String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        if self.auth_mode != AuthMode::Scram {
+            return Ok(());
+        }
+        let store = self.catalog.get_durable_store().ok_or_else(|| {
+            "SCRAM requires an available durable catalog with an enabled SCRAM login".to_string()
+        })?;
+        let principals = store.list_security_principals().await.map_err(|_| {
+            "SCRAM requires an available durable catalog with an enabled SCRAM login".to_string()
+        })?;
+        if principals.iter().any(|principal| {
+            principal.enabled
+                && principal
+                    .login_methods
+                    .iter()
+                    .any(|method| matches!(method, LoginMethod::ScramSha256 { .. }))
+        }) {
+            Ok(())
+        } else {
+            Err(
+                "SCRAM requires an available durable catalog with an enabled SCRAM login"
+                    .to_string(),
+            )
+        }
+    }
+
     async fn security_principal_for_login(
         &self,
         authenticated: &Principal,
@@ -2410,22 +2599,9 @@ impl GatewayHandler {
                 Principal::ScramUser { username },
                 LoginMethod::ScramSha256 {
                     username: stored_username,
-                    salt,
-                    iterations,
-                    stored_key,
-                    server_key,
+                    ..
                 },
-            ) if self.auth_mode != AuthMode::Md5 && username == stored_username => {
-                self.role_catalog.get(username).is_some_and(|role| {
-                    if role.scram_salt != *salt || role.scram_iterations != *iterations {
-                        return false;
-                    }
-                    let actual_stored_key = scram_stored_key(&role.scram_salted_password);
-                    let actual_server_key = scram_server_key(&role.scram_salted_password);
-                    actual_stored_key.as_slice() == stored_key.as_slice()
-                        && actual_server_key.as_slice() == server_key.as_slice()
-                })
-            }
+            ) if self.auth_mode != AuthMode::Md5 && username == stored_username => true,
             (
                 Principal::Mtls {
                     certificate_sha256, ..
@@ -2436,9 +2612,9 @@ impl GatewayHandler {
             ) => certificate_sha256 == stored_fingerprint,
             _ => false,
         };
-        let mut matches = principals
-            .into_iter()
-            .filter(|principal| principal.login_methods.iter().any(&matches_login));
+        let mut matches = principals.into_iter().filter(|principal| {
+            principal.enabled && principal.login_methods.iter().any(&matches_login)
+        });
         let found = matches.next();
         if matches.next().is_some() {
             return Err("authenticated login is bound to multiple durable principals".to_string());
@@ -13116,8 +13292,7 @@ impl StartupHandler for GatewayHandler {
                                 .unwrap_or("")
                                 .to_string();
 
-                            // Look up user in role catalog
-                            let role = self.role_catalog.get(&username).ok_or_else(|| {
+                            let invalid_password = || {
                                 pgwire::error::PgWireError::UserError(Box::new(
                                     pgwire::error::ErrorInfo::new(
                                         "FATAL".to_string(),
@@ -13125,17 +13300,32 @@ impl StartupHandler for GatewayHandler {
                                         format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
                                     ),
                                 ))
-                            })?;
+                            };
+                            let credentials =
+                                self.durable_scram_credentials_for_login(&username).await;
+                            let (
+                                principal_id,
+                                policy_revision,
+                                salt,
+                                iterations,
+                                stored_key,
+                                server_key,
+                            ) = match credentials {
+                                Ok(Some(credentials)) => credentials,
+                                Ok(None) | Err(_) => {
+                                    self.record_scram_failure_or_fail(&username, None, None)
+                                        .await?;
+                                    return Err(invalid_password());
+                                }
+                            };
 
                             // Build server-first-message
                             let server_nonce_suffix: String =
                                 B64_STANDARD.encode(rand::random::<[u8; 18]>());
                             let server_nonce = format!("{client_nonce}{server_nonce_suffix}");
-                            let salt_b64 = B64_STANDARD.encode(&role.scram_salt);
-                            let server_first = format!(
-                                "r={server_nonce},s={salt_b64},i={}",
-                                role.scram_iterations
-                            );
+                            let salt_b64 = B64_STANDARD.encode(&salt);
+                            let server_first =
+                                format!("r={server_nonce},s={salt_b64},i={iterations}");
 
                             // auth_message prefix: client_first_bare + "," + server_first
                             let auth_message_prefix = format!("{client_first_bare},{server_first}");
@@ -13143,7 +13333,10 @@ impl StartupHandler for GatewayHandler {
                             // Store state in session
                             if let Some(mut session) = self.sessions.get_mut(&conn_id) {
                                 session.scram_auth_state = ScramAuthState::ServerFirstSent {
-                                    salted_password: role.scram_salted_password.clone(),
+                                    stored_key,
+                                    server_key,
+                                    principal_id,
+                                    policy_revision,
                                     server_nonce: server_nonce.clone(),
                                     auth_message: auth_message_prefix,
                                     username,
@@ -13158,11 +13351,23 @@ impl StartupHandler for GatewayHandler {
                         }
 
                         ScramAuthState::ServerFirstSent {
-                            salted_password,
+                            stored_key,
+                            server_key,
+                            principal_id,
+                            policy_revision,
                             server_nonce,
                             auth_message: auth_msg_prefix,
                             username,
                         } => {
+                            let invalid_password = || {
+                                pgwire::error::PgWireError::UserError(Box::new(
+                                    pgwire::error::ErrorInfo::new(
+                                        "FATAL".to_string(),
+                                        "28P01".to_string(),
+                                        format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
+                                    ),
+                                ))
+                            };
                             // SASLResponse — client-final-message
                             let sasl_resp = msg.into_sasl_response()?;
                             let client_final =
@@ -13175,13 +13380,13 @@ impl StartupHandler for GatewayHandler {
                                 .and_then(|p| p.strip_prefix("r="))
                                 .unwrap_or("");
                             if r_val != server_nonce {
-                                return Err(pgwire::error::PgWireError::UserError(Box::new(
-                                    pgwire::error::ErrorInfo::new(
-                                        "FATAL".to_string(),
-                                        "28P01".to_string(),
-                                        format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
-                                    ),
-                                )));
+                                self.record_scram_failure_or_fail(
+                                    &username,
+                                    Some(principal_id),
+                                    Some(policy_revision),
+                                )
+                                .await?;
+                                return Err(invalid_password());
                             }
 
                             let proof_b64 = client_final
@@ -13201,23 +13406,46 @@ impl StartupHandler for GatewayHandler {
                                 format!("{auth_msg_prefix},{client_final_without_proof}");
 
                             // Verify
-                            let stored_key = scram_stored_key(&salted_password);
                             if !verify_client_proof(&stored_key, proof_b64, &auth_message) {
-                                // Reset state
-                                if let Some(mut session) = self.sessions.get_mut(&conn_id) {
-                                    session.scram_auth_state = ScramAuthState::Idle;
-                                }
-                                return Err(pgwire::error::PgWireError::UserError(Box::new(
-                                    pgwire::error::ErrorInfo::new(
-                                        "FATAL".to_string(),
-                                        "28P01".to_string(),
-                                        format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
-                                    ),
-                                )));
+                                self.record_scram_failure_or_fail(
+                                    &username,
+                                    Some(principal_id),
+                                    Some(policy_revision),
+                                )
+                                .await?;
+                                return Err(invalid_password());
                             }
 
-                            // Compute and send server signature
-                            let server_key = scram_server_key(&salted_password);
+                            let identity = Principal::ScramUser {
+                                username: username.clone(),
+                            };
+                            let current_principal =
+                                match self.security_principal_for_login(&identity).await {
+                                    Ok(Some(principal))
+                                        if principal.id == principal_id
+                                            && principal.revision == policy_revision =>
+                                    {
+                                        principal
+                                    }
+                                    _ => {
+                                        self.record_scram_failure_or_fail(
+                                            &username,
+                                            Some(principal_id),
+                                            Some(policy_revision),
+                                        )
+                                        .await?;
+                                        return Err(invalid_password());
+                                    }
+                                };
+                            self.record_authentication_or_fail(
+                                AuditIdentity::Verified(identity.actor()),
+                                Some(current_principal.id),
+                                Some(current_principal.revision),
+                                true,
+                            )
+                            .await?;
+
+                            // Compute and send server signature from the persisted verifier.
                             let server_sig = scram_server_signature(&server_key, &auth_message);
                             let server_sig_b64 = B64_STANDARD.encode(server_sig);
                             client
@@ -14560,7 +14788,8 @@ impl GatewayServer {
             .with_query_time_shard_topology(topology)
     }
 
-    /// Create a gateway with SCRAM-SHA-256 auth and a pre-populated RoleCatalog.
+    /// Create a gateway with SCRAM-SHA-256 auth backed by the recovered durable principal store.
+    /// The RoleCatalog argument remains for compatibility and does not authorize SCRAM logins.
     pub fn with_scram_auth(
         addr: std::net::SocketAddr,
         catalog: Arc<CatalogStubs>,
@@ -14586,7 +14815,8 @@ impl GatewayServer {
         GatewayServer::from_handler(addr, handler)
     }
 
-    /// Create a gateway with SCRAM-SHA-256 auth, ShardDb, and RoleCatalog.
+    /// Create a gateway with durable SCRAM auth and a ShardDb.
+    /// The RoleCatalog argument remains for compatibility and does not authorize SCRAM logins.
     pub fn with_shard_db_and_scram_auth(
         addr: std::net::SocketAddr,
         catalog: Arc<CatalogStubs>,
@@ -14705,6 +14935,10 @@ impl GatewayServer {
         &self,
         addr: std::net::SocketAddr,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        self.handler
+            .validate_scram_startup()
+            .await
+            .map_err(std::io::Error::other)?;
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let handler = self.handler.clone();
@@ -14734,12 +14968,23 @@ impl GatewayServer {
         tokio::task::JoinHandle<()>,
     )> {
         let (webhook_addr, webhook_handle) = self.serve_webhook_background(webhook_addr).await?;
-        let (pgwire_addr, pgwire_handle) = self.serve_background().await?;
+        let (pgwire_addr, pgwire_handle) = match self.serve_background().await {
+            Ok(listener) => listener,
+            Err(error) => {
+                webhook_handle.abort();
+                let _ = webhook_handle.await;
+                return Err(error);
+            }
+        };
         Ok((pgwire_addr, webhook_addr, pgwire_handle, webhook_handle))
     }
 
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
+        self.handler
+            .validate_scram_startup()
+            .await
+            .map_err(std::io::Error::other)?;
         if let Some(shard_db) = &self.handler.shard_db {
             self.handler
                 .catalog
@@ -14928,6 +15173,10 @@ impl GatewayServer {
     pub async fn serve_background(
         self,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        self.handler
+            .validate_scram_startup()
+            .await
+            .map_err(std::io::Error::other)?;
         if let Some(shard_db) = &self.handler.shard_db {
             self.handler
                 .catalog
