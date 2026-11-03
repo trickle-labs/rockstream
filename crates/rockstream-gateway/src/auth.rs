@@ -1,6 +1,8 @@
 //! Gateway authentication types and protocol verifiers.
 
 mod oidc;
+#[cfg(test)]
+pub(crate) use oidc::{verifier_with_local_jwks, VALID_TOKEN};
 pub use oidc::{OidcConfig, OidcVerifier};
 
 use std::collections::{HashMap, VecDeque};
@@ -429,12 +431,6 @@ pub(crate) fn verify_oidc_token(
         AuthError::Unauthenticated("OIDC verification is unavailable".to_string())
     })?;
     verifier.verify(token)
-}
-
-pub(crate) fn oidc_verification_unavailable() -> Result<JwtClaims, AuthError> {
-    Err(AuthError::Unauthenticated(
-        "OIDC verification is unavailable".to_string(),
-    ))
 }
 
 /// Create a signed HS256 JWT for tests.

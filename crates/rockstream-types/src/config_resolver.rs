@@ -423,6 +423,9 @@ fn init_default_origins(origins: &mut BTreeMap<String, ConfigOrigin>) {
     origins.insert("metrics.listen_addr".to_string(), ConfigOrigin::Default);
     origins.insert("metrics.enabled".to_string(), ConfigOrigin::Default);
     origins.insert("auth.mode".to_string(), ConfigOrigin::Default);
+    origins.insert("auth.oidc_issuer".to_string(), ConfigOrigin::Default);
+    origins.insert("auth.oidc_audience".to_string(), ConfigOrigin::Default);
+    origins.insert("auth.oidc_jwks_url".to_string(), ConfigOrigin::Default);
     origins.insert("logging.level".to_string(), ConfigOrigin::Default);
     origins.insert("logging.format".to_string(), ConfigOrigin::Default);
     origins.insert(
@@ -493,6 +496,34 @@ fn apply_env_vars(
     node_config: &mut NodeConfig,
     origins: &mut BTreeMap<String, ConfigOrigin>,
 ) {
+    if let Ok(value) = std::env::var("ROCKSTREAM_AUTH_MODE") {
+        node_config.auth.mode = value;
+        origins.insert(
+            "auth.mode".to_string(),
+            ConfigOrigin::Environment("ROCKSTREAM_AUTH_MODE".to_string()),
+        );
+    }
+    if let Ok(value) = std::env::var("ROCKSTREAM_AUTH_OIDC_ISSUER") {
+        node_config.auth.oidc_issuer = Some(value);
+        origins.insert(
+            "auth.oidc_issuer".to_string(),
+            ConfigOrigin::Environment("ROCKSTREAM_AUTH_OIDC_ISSUER".to_string()),
+        );
+    }
+    if let Ok(value) = std::env::var("ROCKSTREAM_AUTH_OIDC_AUDIENCE") {
+        node_config.auth.oidc_audience = Some(value);
+        origins.insert(
+            "auth.oidc_audience".to_string(),
+            ConfigOrigin::Environment("ROCKSTREAM_AUTH_OIDC_AUDIENCE".to_string()),
+        );
+    }
+    if let Ok(value) = std::env::var("ROCKSTREAM_AUTH_OIDC_JWKS_URL") {
+        node_config.auth.oidc_jwks_url = Some(value);
+        origins.insert(
+            "auth.oidc_jwks_url".to_string(),
+            ConfigOrigin::Environment("ROCKSTREAM_AUTH_OIDC_JWKS_URL".to_string()),
+        );
+    }
     if let Ok(value) = std::env::var("ROCKSTREAM_WORKER_EXECUTION_THREADS") {
         if let Ok(value) = value.parse::<usize>() {
             config.worker.execution_threads = value;
@@ -627,6 +658,24 @@ fn apply_env_vars(
             ["AUTH", "MODE"] => {
                 node_config.auth.mode = v.clone();
                 origins.insert("auth.mode".to_string(), ConfigOrigin::Environment(k));
+            }
+            ["AUTH", "OIDC_ISSUER"] => {
+                node_config.auth.oidc_issuer = Some(v.clone());
+                origins.insert("auth.oidc_issuer".to_string(), ConfigOrigin::Environment(k));
+            }
+            ["AUTH", "OIDC_AUDIENCE"] => {
+                node_config.auth.oidc_audience = Some(v.clone());
+                origins.insert(
+                    "auth.oidc_audience".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
+            }
+            ["AUTH", "OIDC_JWKS_URL"] => {
+                node_config.auth.oidc_jwks_url = Some(v.clone());
+                origins.insert(
+                    "auth.oidc_jwks_url".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
             }
             ["LOGGING", "LEVEL"] => {
                 node_config.logging.level = v.clone();
