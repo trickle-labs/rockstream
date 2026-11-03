@@ -498,13 +498,7 @@ pub async fn start_gateway_with_shard_and_catalog(
         )
     })?;
 
-    let selected_mode = opts.auth_mode.trim().to_lowercase();
-    let configured_mode = node_config.auth.mode.trim().to_lowercase();
-    let auth_mode_str = if selected_mode == "off" && configured_mode != "off" {
-        configured_mode
-    } else {
-        selected_mode
-    };
+    let auth_mode_str = opts.auth_mode.trim().to_lowercase();
     tracing::info!("Gateway server starting with auth mode: {}", auth_mode_str);
 
     let server = match auth_mode_str.as_str() {
@@ -665,57 +659,53 @@ fn validate_start_auth_modes(
 ) -> Result<(), CliError> {
     validate_auth_mode(auth_mode)?;
     if let Some(node_config) = node_config {
-        validate_auth_mode(&node_config.auth.mode)?;
         let selected = auth_mode.trim().to_ascii_lowercase();
-        let configured = node_config.auth.mode.trim().to_ascii_lowercase();
-        for mode in [selected.as_str(), configured.as_str()] {
-            match mode {
-                "oidc"
-                    if node_config
+        match selected.as_str() {
+            "oidc"
+                if node_config
+                    .auth
+                    .oidc_issuer
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                    || node_config
                         .auth
-                        .oidc_issuer
+                        .oidc_audience
                         .as_deref()
                         .is_none_or(str::is_empty)
-                        || node_config
-                            .auth
-                            .oidc_audience
-                            .as_deref()
-                            .is_none_or(str::is_empty)
-                        || node_config
-                            .auth
-                            .oidc_jwks_url
-                            .as_deref()
-                            .is_none_or(str::is_empty) =>
-                {
-                    return Err(CliError::new(
+                    || node_config
+                        .auth
+                        .oidc_jwks_url
+                        .as_deref()
+                        .is_none_or(str::is_empty) =>
+            {
+                return Err(CliError::new(
                         RS_0002,
                         "OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url",
                         "Configure the issuer, audience, and JWKS endpoint before starting the gateway.",
                     ));
-                }
-                "oidc"
-                    if node_config.gateway.tls.cert_path.is_none()
-                        || node_config.gateway.tls.key_path.is_none() =>
-                {
-                    return Err(CliError::new(
+            }
+            "oidc"
+                if node_config.gateway.tls.cert_path.is_none()
+                    || node_config.gateway.tls.key_path.is_none() =>
+            {
+                return Err(CliError::new(
                         RS_0002,
                         "OIDC requires gateway TLS certificate and key paths",
                         "Configure gateway.tls.cert_path and gateway.tls.key_path before starting the gateway.",
                     ));
-                }
-                "mtls"
-                    if node_config.gateway.tls.cert_path.is_none()
-                        || node_config.gateway.tls.key_path.is_none()
-                        || node_config.gateway.tls.ca_cert_path.is_none() =>
-                {
-                    return Err(CliError::new(
-                        RS_0002,
-                        "mTLS requires gateway TLS certificate, key, and client CA paths",
-                        "Configure gateway.tls.cert_path, key_path, and ca_cert_path.",
-                    ));
-                }
-                _ => {}
             }
+            "mtls"
+                if node_config.gateway.tls.cert_path.is_none()
+                    || node_config.gateway.tls.key_path.is_none()
+                    || node_config.gateway.tls.ca_cert_path.is_none() =>
+            {
+                return Err(CliError::new(
+                    RS_0002,
+                    "mTLS requires gateway TLS certificate, key, and client CA paths",
+                    "Configure gateway.tls.cert_path, key_path, and ca_cert_path.",
+                ));
+            }
+            _ => {}
         }
     } else if matches!(
         auth_mode.trim().to_ascii_lowercase().as_str(),

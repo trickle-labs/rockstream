@@ -4,11 +4,12 @@ use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt};
 use rockstream_cli::{run_start, start_gateway, StartOptions};
 use rockstream_gateway::catalog_stubs::CatalogStubs;
 use rockstream_storage::ShardDb;
-use rockstream_types::config::RockstreamConfig;
+use rockstream_types::config::{NodeConfig, RockstreamConfig};
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use tokio_postgres::NoTls;
 
 fn normalize_correlation_id(stderr: Vec<u8>) -> String {
     let stderr = String::from_utf8(stderr).unwrap();
@@ -84,6 +85,37 @@ async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_
         );
         assert!(!storage.exists(), "{mode} created gateway storage");
     }
+}
+
+#[tokio::test]
+async fn explicit_off_auth_mode_overrides_configured_oidc_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut node_config = NodeConfig::default();
+    node_config.auth.mode = "oidc".to_string();
+    let mut opts = test_options(
+        tmp.path().join("gateway-storage"),
+        "off",
+        Some("127.0.0.1:0".to_string()),
+    );
+    opts.node_config = Some(node_config);
+
+    let (address, handle) = start_gateway(&opts).await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=unused dbname=test sslmode=disable",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .expect("explicit auth mode should control the listener");
+    let connection_handle = tokio::spawn(async move { connection.await });
+    let rows = client.query("SELECT 1 AS value", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    drop(client);
+    connection_handle.abort();
+    handle.abort();
 }
 
 #[tokio::test]
