@@ -21878,6 +21878,48 @@ mod s4_tests {
             packet
         }
 
+        async fn startup_error(
+            connector: &tokio_rustls::TlsConnector,
+            address: std::net::SocketAddr,
+            token: &str,
+        ) -> std::collections::HashMap<u8, String> {
+            let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+            tcp.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).await.unwrap();
+            let mut ssl_response = [0u8; 1];
+            tcp.read_exact(&mut ssl_response).await.unwrap();
+            assert_eq!(ssl_response[0], b'S');
+            let mut client = connector
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap(),
+                    tcp,
+                )
+                .await
+                .unwrap();
+            client.write_all(&startup_packet(token)).await.unwrap();
+            let mut error_header = [0u8; 5];
+            tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut error_header))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(error_header[0], b'E');
+            let response_len = i32::from_be_bytes(error_header[1..5].try_into().unwrap()) as usize;
+            let mut error_body = vec![0u8; response_len - 4];
+            tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut error_body))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut fields = std::collections::HashMap::new();
+            let mut remaining = error_body.as_slice();
+            while !remaining.is_empty() && remaining[0] != 0 {
+                let field = remaining[0];
+                remaining = &remaining[1..];
+                let end = remaining.iter().position(|byte| *byte == 0).unwrap();
+                fields.insert(field, String::from_utf8(remaining[..end].to_vec()).unwrap());
+                remaining = &remaining[end + 1..];
+            }
+            fields
+        }
+
         let catalog = Arc::new(CatalogStubs::new());
         let durable = Arc::new(DurableCatalogStore::new(
             Arc::new(object_store::memory::InMemory::new()),
@@ -22095,7 +22137,7 @@ mod s4_tests {
         let unmapped_server = GatewayServer::with_oidc_auth(
             "127.0.0.1:0".parse().unwrap(),
             unmapped_catalog,
-            reader,
+            reader.clone(),
             verifier,
         )
         .with_tls(&cert_path, &key_path, None)
@@ -22175,6 +22217,66 @@ mod s4_tests {
             SecurityAuditOutcome::Failure,
             AuditField::Unknown,
         );
+
+        for (issuer, audience, expected_message) in [
+            (
+                "https://wrong-issuer.example",
+                "rockstream",
+                "[RS-2400] auth.unauthenticated: OIDC issuer claim does not match configuration. next_steps: Provide valid credentials (Bearer token or mTLS certificate)",
+            ),
+            (
+                "https://issuer.example",
+                "wrong-audience",
+                "[RS-2400] auth.unauthenticated: OIDC audience claim does not match configuration. next_steps: Provide valid credentials (Bearer token or mTLS certificate)",
+            ),
+        ] {
+            let verifier = Arc::new(
+                crate::auth::verifier_with_local_jwks_for(issuer, audience).await,
+            );
+            let catalog = Arc::new(CatalogStubs::new());
+            catalog.set_durable_store(unmapped_durable.clone());
+            let server = GatewayServer::with_oidc_auth(
+                "127.0.0.1:0".parse().unwrap(),
+                catalog,
+                reader.clone(),
+                verifier,
+            )
+            .with_tls(&cert_path, &key_path, None)
+            .unwrap();
+            let handler = server.handler().clone();
+            let (address, server_task) = server.serve_background().await.unwrap();
+            let audit_before = unmapped_durable
+                .list_security_audit_records()
+                .await
+                .unwrap();
+            let prior_ids = audit_before
+                .iter()
+                .map(|record| record.event_id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let fields = startup_error(&connector, address, crate::auth::VALID_TOKEN).await;
+            assert_eq!(fields.get(&b'S'), Some(&"FATAL".to_string()));
+            assert_eq!(fields.get(&b'C'), Some(&"28000".to_string()));
+            assert_eq!(fields.get(&b'M'), Some(&expected_message.to_string()));
+            assert_eq!(handler.sessions.len(), 0);
+            let audit_after = unmapped_durable
+                .list_security_audit_records()
+                .await
+                .unwrap();
+            assert_eq!(audit_after.len(), audit_before.len() + 1);
+            let event = audit_after
+                .iter()
+                .find(|record| !prior_ids.contains(&record.event_id))
+                .unwrap();
+            assert_authentication_event(
+                event,
+                AuditIdentity::Unknown,
+                AuditField::Unknown,
+                SecurityAuditClass::AuthenticationFailure,
+                SecurityAuditOutcome::Failure,
+                AuditField::Unknown,
+            );
+            server_task.abort();
+        }
 
         drop(accepted);
         server_task.abort();

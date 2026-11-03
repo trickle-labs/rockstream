@@ -2,7 +2,7 @@
 
 mod oidc;
 #[cfg(test)]
-pub(crate) use oidc::{verifier_with_local_jwks, VALID_TOKEN};
+pub(crate) use oidc::{verifier_with_local_jwks, verifier_with_local_jwks_for, VALID_TOKEN};
 pub use oidc::{OidcConfig, OidcVerifier};
 
 use std::collections::{HashMap, VecDeque};
