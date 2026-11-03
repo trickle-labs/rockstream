@@ -14,6 +14,7 @@ use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -35,6 +36,9 @@ use rockstream_types::ids::{
     ViewId, WorkloadId,
 };
 use rockstream_types::workload::WorkloadDef;
+
+const SECURITY_AUDIT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+const MAX_SECURITY_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Abstract interface for catalog operations.
 #[allow(clippy::double_must_use)]
@@ -111,6 +115,8 @@ struct CatalogInnerState {
     roles: HashMap<PrincipalId, CatalogRoleEntry>,
     security_principals: HashMap<PrincipalId, SecurityPrincipal>,
     security_audit_records: Vec<SecurityAuditRecord>,
+    security_audit_bytes: u64,
+    security_audit_oldest_timestamp_ms: Option<u64>,
     compiled_plans: HashMap<CompiledPlanId, CompiledPlanRecord>,
 }
 
@@ -169,6 +175,13 @@ impl DurableCatalogStore {
     /// Persist a snapshot of the current state at the given revision.
     pub async fn create_snapshot(&self) -> Result<CatalogSnapshot, CatalogError> {
         let state = self.state.read().await;
+        let audit_cutoff_ms = security_audit_cutoff_ms(current_time_ms()?);
+        let retained_audit_records = state
+            .security_audit_records
+            .iter()
+            .filter(|record| record.timestamp_ms >= audit_cutoff_ms)
+            .cloned()
+            .collect();
         let snapshot = CatalogSnapshot::new(
             state.revision,
             self.id_allocator.high_water_mark(),
@@ -195,7 +208,7 @@ impl DurableCatalogStore {
         )?
         .with_security_records(
             state.security_principals.values().cloned().collect(),
-            state.security_audit_records.clone(),
+            retained_audit_records,
         )?;
         drop(state);
 
@@ -288,6 +301,7 @@ impl DurableCatalogStore {
     ) -> Result<Self, CatalogError> {
         let prefix = prefix.into();
         let catalog = Self::new(Arc::clone(&store), prefix.clone());
+        let audit_cutoff_ms = security_audit_cutoff_ms(current_time_ms()?);
 
         // Find all finalized snapshots before selecting a recovery base.
         let snap_prefix = format!("{}/catalog/snapshots/", prefix);
@@ -427,6 +441,11 @@ impl DurableCatalogStore {
             break;
         }
 
+        recovered_state
+            .security_audit_records
+            .retain(|record| record.timestamp_ms >= audit_cutoff_ms);
+        rebuild_security_audit_index(&mut recovered_state)?;
+
         // The log listing must finish successfully before replay can publish
         // anything. A failed page is not proof that no later files exist.
         let log_prefix = format!("{}/catalog/log/", prefix);
@@ -504,8 +523,9 @@ impl DurableCatalogStore {
             validate_security_mutations(&recovered_state, &txn)?;
 
             for mutation in &txn.mutations {
-                apply_mutation_to_state(&mut recovered_state, &catalog.id_allocator, mutation);
+                apply_mutation_to_state(&mut recovered_state, &catalog.id_allocator, mutation)?;
             }
+            prune_expired_security_audit_records(&mut recovered_state, audit_cutoff_ms)?;
             recovered_state
                 .committed_operations
                 .insert(txn.operation_id);
@@ -523,6 +543,14 @@ impl DurableCatalogStore {
         }
 
         *catalog.state.write().await = recovered_state;
+        {
+            let mut state = catalog.state.write().await;
+            prune_expired_security_audit_records(&mut state, audit_cutoff_ms)?;
+            ensure_security_audit_budget_bytes(
+                state.security_audit_bytes,
+                MAX_SECURITY_AUDIT_BYTES,
+            )?;
+        }
         Ok(catalog)
     }
 
@@ -589,6 +617,179 @@ impl DurableCatalogStore {
         }
         Ok(self.get_revision().await)
     }
+}
+
+fn current_time_ms() -> Result<u64, CatalogError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| CatalogError::Internal(format!("system clock error: {error}")))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| CatalogError::Internal("system clock exceeds audit timestamp range".into()))
+}
+
+fn security_audit_cutoff_ms(now_ms: u64) -> u64 {
+    now_ms.saturating_sub(SECURITY_AUDIT_RETENTION_MS)
+}
+
+#[derive(Default)]
+struct JsonByteCounter(u64);
+
+impl Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_security_audit_bytes<'a>(
+    records: impl IntoIterator<Item = &'a SecurityAuditRecord>,
+) -> Result<u64, CatalogError> {
+    let mut total = 2u64; // JSON array delimiters.
+    let mut has_record = false;
+    for record in records {
+        if has_record {
+            total = total.saturating_add(1); // JSON array separator.
+        }
+        total = total.saturating_add(encoded_security_audit_record_bytes(record)?);
+        has_record = true;
+    }
+    Ok(total)
+}
+
+fn encoded_security_audit_record_bytes(record: &SecurityAuditRecord) -> Result<u64, CatalogError> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, record).map_err(|error| {
+        CatalogError::Internal(format!("failed to size security audit record: {error}"))
+    })?;
+    Ok(counter.0)
+}
+
+fn ensure_security_audit_budget_bytes(bytes: u64, max_bytes: u64) -> Result<(), CatalogError> {
+    if bytes > max_bytes {
+        return Err(CatalogError::Storage(
+            "security audit retention budget is full (1 GiB); required security operation was not committed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn rebuild_security_audit_index(state: &mut CatalogInnerState) -> Result<(), CatalogError> {
+    state.security_audit_bytes = encoded_security_audit_bytes(&state.security_audit_records)?;
+    state.security_audit_oldest_timestamp_ms = state
+        .security_audit_records
+        .iter()
+        .map(|record| record.timestamp_ms)
+        .min();
+    Ok(())
+}
+
+fn prune_expired_security_audit_records(
+    state: &mut CatalogInnerState,
+    cutoff_ms: u64,
+) -> Result<(), CatalogError> {
+    if state
+        .security_audit_oldest_timestamp_ms
+        .is_some_and(|timestamp_ms| timestamp_ms < cutoff_ms)
+    {
+        state
+            .security_audit_records
+            .retain(|record| record.timestamp_ms >= cutoff_ms);
+        rebuild_security_audit_index(state)?;
+    }
+    Ok(())
+}
+
+fn append_security_audit_record_to_state(
+    state: &mut CatalogInnerState,
+    record: &SecurityAuditRecord,
+) -> Result<(), CatalogError> {
+    let separator_bytes = if state.security_audit_records.is_empty() {
+        2
+    } else {
+        1
+    };
+    state.security_audit_bytes = state
+        .security_audit_bytes
+        .saturating_add(separator_bytes)
+        .saturating_add(encoded_security_audit_record_bytes(record)?);
+    state.security_audit_oldest_timestamp_ms = Some(
+        state
+            .security_audit_oldest_timestamp_ms
+            .map_or(record.timestamp_ms, |oldest| {
+                oldest.min(record.timestamp_ms)
+            }),
+    );
+    state.security_audit_records.push(record.clone());
+    Ok(())
+}
+
+fn security_audit_record(mutation: &CatalogMutation) -> Option<&SecurityAuditRecord> {
+    match mutation {
+        CatalogMutation::PutSecurityPrincipal { audit, .. }
+        | CatalogMutation::DeleteSecurityPrincipal { audit, .. } => Some(audit),
+        CatalogMutation::AppendSecurityAudit(record) => Some(record),
+        _ => None,
+    }
+}
+
+fn ensure_txn_security_audit_budget(
+    state: &CatalogInnerState,
+    txn: &CatalogTxn,
+    cutoff_ms: u64,
+    max_bytes: u64,
+) -> Result<(), CatalogError> {
+    let new_records = txn
+        .mutations
+        .iter()
+        .filter_map(security_audit_record)
+        .collect::<Vec<_>>();
+    if new_records
+        .iter()
+        .any(|record| record.timestamp_ms < cutoff_ms)
+    {
+        return Err(invalid_security_policy(
+            "new security audit record is outside the 90-day retention window",
+        ));
+    }
+
+    let has_expired_records = state
+        .security_audit_oldest_timestamp_ms
+        .is_some_and(|timestamp_ms| timestamp_ms < cutoff_ms);
+    let (mut bytes, mut count) = if has_expired_records {
+        let records = state
+            .security_audit_records
+            .iter()
+            .filter(|record| record.timestamp_ms >= cutoff_ms);
+        (
+            encoded_security_audit_bytes(records.clone())?.saturating_sub(2),
+            records.count() as u64,
+        )
+    } else {
+        let count = state.security_audit_records.len() as u64;
+        (
+            if count == 0 {
+                0
+            } else {
+                state.security_audit_bytes.saturating_sub(2)
+            },
+            count,
+        )
+    };
+    for record in new_records {
+        if count == 0 {
+            bytes = bytes.saturating_add(2);
+        } else {
+            bytes = bytes.saturating_add(1);
+        }
+        bytes = bytes.saturating_add(encoded_security_audit_record_bytes(record)?);
+        count = count.saturating_add(1);
+    }
+    ensure_security_audit_budget_bytes(bytes, max_bytes)
 }
 
 fn validate_security_mutations(
@@ -862,7 +1063,7 @@ fn apply_mutation_to_state(
     state: &mut CatalogInnerState,
     allocator: &IdAllocator,
     mutation: &CatalogMutation,
-) {
+) -> Result<(), CatalogError> {
     match mutation {
         CatalogMutation::PutDatabase(db) => {
             allocator.observe(db.id.0);
@@ -964,7 +1165,7 @@ fn apply_mutation_to_state(
             state
                 .security_principals
                 .insert(principal.id, principal.clone());
-            state.security_audit_records.push(audit.clone());
+            append_security_audit_record_to_state(state, audit)?;
         }
         CatalogMutation::DeleteSecurityPrincipal {
             principal_id,
@@ -972,10 +1173,10 @@ fn apply_mutation_to_state(
             ..
         } => {
             state.security_principals.remove(principal_id);
-            state.security_audit_records.push(audit.clone());
+            append_security_audit_record_to_state(state, audit)?;
         }
         CatalogMutation::AppendSecurityAudit(record) => {
-            state.security_audit_records.push(record.clone());
+            append_security_audit_record_to_state(state, record)?;
         }
         CatalogMutation::PutCompiledPlan(p) => {
             allocator.observe(p.id.0);
@@ -985,6 +1186,7 @@ fn apply_mutation_to_state(
             state.compiled_plans.remove(id);
         }
     }
+    Ok(())
 }
 
 #[async_trait]
@@ -998,6 +1200,17 @@ impl CatalogStore for DurableCatalogStore {
         }
 
         validate_security_mutations(&state, &txn)?;
+        let audit_cutoff_ms = if txn
+            .mutations
+            .iter()
+            .any(|mutation| security_audit_record(mutation).is_some())
+        {
+            let cutoff_ms = security_audit_cutoff_ms(current_time_ms()?);
+            ensure_txn_security_audit_budget(&state, &txn, cutoff_ms, MAX_SECURITY_AUDIT_BYTES)?;
+            cutoff_ms
+        } else {
+            0
+        };
 
         // 2. Pre-commit validation
         // 2a. Cycle detection in view dependencies
@@ -1113,8 +1326,11 @@ impl CatalogStore for DurableCatalogStore {
         })?;
 
         // 4. Apply all mutations to in-memory state
+        if audit_cutoff_ms > 0 {
+            prune_expired_security_audit_records(&mut state, audit_cutoff_ms)?;
+        }
         for m in &txn.mutations {
-            apply_mutation_to_state(&mut state, &self.id_allocator, m);
+            apply_mutation_to_state(&mut state, &self.id_allocator, m)?;
         }
 
         state.committed_operations.insert(txn.operation_id);
@@ -1267,7 +1483,16 @@ impl CatalogStore for DurableCatalogStore {
     }
 
     async fn list_security_audit_records(&self) -> Result<Vec<SecurityAuditRecord>, CatalogError> {
-        Ok(self.state.read().await.security_audit_records.clone())
+        let cutoff_ms = security_audit_cutoff_ms(current_time_ms()?);
+        Ok(self
+            .state
+            .read()
+            .await
+            .security_audit_records
+            .iter()
+            .filter(|record| record.timestamp_ms >= cutoff_ms)
+            .cloned()
+            .collect())
     }
 
     async fn get_compiled_plan(
@@ -1333,4 +1558,117 @@ fn check_dependency_cycle(deps: &[ViewDependency]) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod security_audit_budget_tests {
+    use super::*;
+
+    fn audit_record(event_id: &str, timestamp_ms: u64) -> SecurityAuditRecord {
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: event_id.to_string(),
+            timestamp_ms,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Unknown,
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    }
+
+    #[test]
+    fn retained_audit_budget_uses_exact_json_array_size_and_rejects_overflow() {
+        let event = audit_record("event-1", 1);
+        let encoded = encoded_security_audit_bytes([&event]).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::to_vec(&[event.clone()]).unwrap().len() as u64
+        );
+        assert!(matches!(
+            ensure_security_audit_budget_bytes(encoded, encoded),
+            Ok(())
+        ));
+        assert!(matches!(
+            ensure_security_audit_budget_bytes(encoded, encoded - 1),
+            Err(CatalogError::Storage(message))
+                if message == "security audit retention budget is full (1 GiB); required security operation was not committed"
+        ));
+    }
+
+    #[test]
+    fn audit_retention_excludes_expired_records_but_rejects_expired_new_events() {
+        let now_ms = SECURITY_AUDIT_RETENTION_MS + 1_000;
+        let cutoff_ms = security_audit_cutoff_ms(now_ms);
+        let expired = audit_record("expired", cutoff_ms - 1);
+        let current = audit_record("current", now_ms);
+        let txn = CatalogTxn::new(
+            1,
+            1,
+            vec![CatalogMutation::AppendSecurityAudit(current.clone())],
+        )
+        .unwrap();
+        let current_size = encoded_security_audit_bytes([&current]).unwrap();
+        let mut state = CatalogInnerState {
+            security_audit_records: vec![expired.clone()],
+            ..CatalogInnerState::default()
+        };
+        rebuild_security_audit_index(&mut state).unwrap();
+
+        assert!(matches!(
+            ensure_txn_security_audit_budget(&state, &txn, cutoff_ms, current_size),
+            Ok(())
+        ));
+
+        let expired_txn = CatalogTxn::new(
+            2,
+            2,
+            vec![CatalogMutation::AppendSecurityAudit(expired.clone())],
+        )
+        .unwrap();
+        assert!(matches!(
+            ensure_txn_security_audit_budget(
+                &CatalogInnerState::default(),
+                &expired_txn,
+                cutoff_ms,
+                MAX_SECURITY_AUDIT_BYTES
+            ),
+            Err(CatalogError::InvalidSecurityPolicy(message))
+                if message == "new security audit record is outside the 90-day retention window"
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_audit_records_are_hidden_and_omitted_from_snapshots() {
+        let now_ms = current_time_ms().unwrap();
+        let cutoff_ms = security_audit_cutoff_ms(now_ms);
+        let expired = audit_record("expired", cutoff_ms.saturating_sub(1).max(1));
+        let current = audit_record("current", now_ms);
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let catalog = DurableCatalogStore::new(object_store.clone(), "audit-retention");
+        {
+            let mut state = catalog.state.write().await;
+            state.security_audit_records = vec![expired, current.clone()];
+            rebuild_security_audit_index(&mut state).unwrap();
+        }
+
+        assert_eq!(
+            catalog.list_security_audit_records().await.unwrap(),
+            vec![current.clone()]
+        );
+        let snapshot = catalog.create_snapshot().await.unwrap();
+        assert_eq!(snapshot.security_audit_records, vec![current.clone()]);
+        let recovered = DurableCatalogStore::recover(object_store, "audit-retention")
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.list_security_audit_records().await.unwrap(),
+            vec![current]
+        );
+    }
 }

@@ -9,6 +9,7 @@
 
 use std::io::Write;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::memory::InMemory;
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair};
@@ -29,6 +30,13 @@ use rockstream_types::ids::PrincipalId;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_millis() as u64
+}
 
 /// rustls 0.23 requires a process-level `CryptoProvider` to be installed
 /// before any `ClientConfig`/`ServerConfig` is built. `tokio-rustls`'s default
@@ -383,7 +391,7 @@ async fn mtls_end_to_end_authenticates_real_client_cert() {
     let bootstrap_audit = SecurityAuditRecord {
         format_version: SECURITY_AUDIT_FORMAT_VERSION,
         event_id: "mtls-bootstrap".to_string(),
-        timestamp_ms: 1,
+        timestamp_ms: current_timestamp_ms(),
         actor: AuditIdentity::Unknown,
         target: AuditField::Known("principal:1".to_string()),
         scope: AuditField::Known("cluster".to_string()),

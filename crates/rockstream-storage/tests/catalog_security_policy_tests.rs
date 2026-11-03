@@ -1,6 +1,7 @@
+use futures::StreamExt;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStoreExt;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_storage::catalog::*;
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
@@ -62,7 +63,10 @@ fn grant_audit(
     SecurityAuditRecord {
         format_version: SECURITY_AUDIT_FORMAT_VERSION,
         event_id: event_id.to_string(),
-        timestamp_ms: 1,
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
         actor,
         target: AuditField::Known(format!("principal:{}", principal.id.0)),
         scope: AuditField::Known("cluster".to_string()),
@@ -154,6 +158,43 @@ async fn security_principal_and_correlated_audit_survive_log_snapshot_and_restar
         after_snapshot.list_security_audit_records().await.unwrap(),
         vec![audit]
     );
+}
+
+#[tokio::test]
+async fn expired_security_audit_append_is_rejected_without_a_catalog_effect() {
+    let object_store = Arc::new(InMemory::new());
+    let catalog = DurableCatalogStore::new(object_store.clone(), "expired-audit");
+    let principal = principal(8, 1, vec![]);
+    let mut expired = grant_audit(
+        "expired-event",
+        808,
+        AuditIdentity::Unknown,
+        &principal,
+        None,
+        Some(policy_state(&principal)),
+    );
+    expired.timestamp_ms = 1;
+
+    let error = catalog
+        .commit_txn(
+            CatalogTxn::new(1, 808, vec![CatalogMutation::AppendSecurityAudit(expired)]).unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CatalogError::InvalidSecurityPolicy(message)
+            if message == "new security audit record is outside the 90-day retention window"
+    ));
+    assert_eq!(catalog.get_revision().await, 0);
+    assert!(catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .is_empty());
+    let mut log_files = object_store.list(Some(&ObjectPath::from("expired-audit/catalog/log")));
+    assert!(log_files.next().await.is_none());
 }
 
 #[tokio::test]

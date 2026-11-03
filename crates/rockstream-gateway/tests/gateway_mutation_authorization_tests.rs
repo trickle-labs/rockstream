@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rockstream_control::audit::FileAuditLog;
 use rockstream_gateway::auth::Principal;
@@ -15,6 +16,13 @@ use rockstream_types::authorization::{
 };
 use rockstream_types::ids::PrincipalId;
 use rockstream_types::mutation_policy::{pgwire_mutation_policy, PGWIRE_MUTATION_POLICY};
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_millis() as u64
+}
 
 struct NoopViewReader;
 
@@ -323,7 +331,7 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
     let reader_grant_audit = SecurityAuditRecord {
         format_version: SECURITY_AUDIT_FORMAT_VERSION,
         event_id: "reader-grant".to_string(),
-        timestamp_ms: 2,
+        timestamp_ms: current_timestamp_ms(),
         actor: AuditIdentity::Verified("principal:1".to_string()),
         target: AuditField::Known("principal:2".to_string()),
         scope: AuditField::Known("cluster".to_string()),
