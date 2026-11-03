@@ -126,6 +126,8 @@ async fn test_catalog_sources_query() {
         status: "RUNNING".to_string(),
         live_offset: "1048576".to_string(),
         live_lag: 42,
+        secret_consumer: None,
+        secret_namespace: None,
     });
 
     let (addr, _handle) = start_gateway(catalog).await;

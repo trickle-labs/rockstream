@@ -77,6 +77,11 @@ use rockstream_ops::sink::{column_values_to_tsv_bytes, materialize_view_state};
 use rockstream_ops::ArrowZSet;
 use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_sql::SqlFrontend;
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PolicyScope, ResourceKind,
+    SecurityAction, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
+    SecurityPrincipal,
+};
 use rockstream_types::config::{JoinStrategy, ScatterPruningConfig};
 use rockstream_types::data_plane::{
     DeploymentColumn, DeploymentRequest, DeploymentSchema, RuntimeRow, SourceDeltaRequest,
@@ -88,13 +93,13 @@ use rockstream_types::diagnostic::{
 use rockstream_types::error_code::{ErrorCode, ErrorDescriptor, RS_1012};
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
-use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId, WorkloadId};
+use rockstream_types::ids::{ConnectorId, OperatorId, PrincipalId, ShardId, ViewId, WorkloadId};
 use rockstream_types::mutation_policy::pgwire_mutation_policy;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
 use crate::auth::{
-    scram_server_key, scram_server_signature, scram_stored_key, verify_client_proof, AuthMode,
-    JwtVerifier, Principal,
+    scram_server_signature, verify_client_proof, verify_oidc_token, AuthMode, JwtVerifier,
+    Principal,
 };
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
@@ -2133,7 +2138,7 @@ pub struct GatewayHandler {
     auth_mode: AuthMode,
     /// Optional JWT verifier (populated when auth_mode == Oidc).
     jwt_verifier: Option<Arc<JwtVerifier>>,
-    /// Role catalog for SCRAM/MD5 auth (always present; empty for Off/Oidc/Mtls).
+    /// Legacy RoleCatalog for MD5 compatibility; SCRAM credentials come from durable principals.
     pub role_catalog: Arc<RoleCatalog>,
     /// ACL store for RBAC enforcement.
     pub acl_store: Arc<rockstream_control::AclStore>,
@@ -2253,13 +2258,755 @@ impl GatewayHandler {
         .unwrap_or_else(|| "<unknown>".to_string())
     }
 
-    fn authorize_mutation(
+    fn mutation_security_action(operation: &str) -> Option<SecurityAction> {
+        Some(match operation {
+            "CREATE VIEW" | "REFRESH MATERIALIZED VIEW" => SecurityAction::ViewAuthor,
+            "CREATE TABLE" => SecurityAction::TableCreate,
+            "CREATE SINK"
+            | "CREATE SOURCE"
+            | "ALTER SOURCE"
+            | "DROP SOURCE"
+            | "ALTER SOURCE PAUSE"
+            | "ALTER SOURCE RESUME" => SecurityAction::SourceLifecycle,
+            "CREATE SECRET" | "ALTER SECRET" | "DROP SECRET" => SecurityAction::SecretManage,
+            "CREATE INDEX" | "DROP INDEX" | "REBUILD INDEX" | "MARK INDEX" => {
+                SecurityAction::IndexManage
+            }
+            "CREATE WORKLOAD" | "ALTER WORKLOAD" | "DROP WORKLOAD" => {
+                SecurityAction::WorkloadChange
+            }
+            "INSERT" | "UPDATE" | "DELETE" | "COPY FROM STDIN" => SecurityAction::DataWrite,
+            "CREATE NAMESPACE" => SecurityAction::NamespaceCreate,
+            _ => return None,
+        })
+    }
+
+    fn mutation_policy_scope(
+        query: &str,
+        operation: &str,
+        current_namespace: &str,
+    ) -> Option<(SecurityAction, PolicyScope, String)> {
+        let action = Self::mutation_security_action(operation)?;
+        let resource = Self::mutation_resource(query, operation);
+        if resource == "<unknown>" {
+            return None;
+        }
+        if action == SecurityAction::NamespaceCreate {
+            return Some((action, PolicyScope::Cluster, resource));
+        }
+
+        let parts: Vec<&str> = resource.split('.').collect();
+        if parts.is_empty() || parts.len() > 2 || (parts.len() == 2 && query.contains('"')) {
+            return None;
+        }
+        let (namespace, name) = match parts.as_slice() {
+            [name] => (current_namespace.trim_matches('"'), name.trim_matches('"')),
+            [namespace, name] => (namespace.trim_matches('"'), name.trim_matches('"')),
+            _ => return None,
+        };
+        if namespace.is_empty() || name.is_empty() {
+            return None;
+        }
+
+        let scope = match action {
+            SecurityAction::SecretManage => PolicyScope::Secret {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                consumer: None,
+            },
+            _ => {
+                let kind = match operation {
+                    "CREATE VIEW" | "REFRESH MATERIALIZED VIEW" => ResourceKind::View,
+                    "CREATE TABLE" | "INSERT" | "UPDATE" | "DELETE" | "COPY FROM STDIN" => {
+                        ResourceKind::Table
+                    }
+                    "CREATE SINK" => ResourceKind::Sink,
+                    "CREATE SOURCE"
+                    | "ALTER SOURCE"
+                    | "DROP SOURCE"
+                    | "ALTER SOURCE PAUSE"
+                    | "ALTER SOURCE RESUME" => ResourceKind::Source,
+                    "CREATE INDEX" | "DROP INDEX" | "REBUILD INDEX" | "MARK INDEX" => {
+                        ResourceKind::Index
+                    }
+                    "CREATE WORKLOAD" | "ALTER WORKLOAD" | "DROP WORKLOAD" => {
+                        ResourceKind::Workload
+                    }
+                    _ => return None,
+                };
+                PolicyScope::Resource {
+                    namespace: namespace.to_string(),
+                    kind,
+                    name: name.to_string(),
+                }
+            }
+        };
+        if scope.validate().is_err() {
+            return None;
+        }
+        Some((action, scope, format!("{namespace}.{name}")))
+    }
+
+    fn read_policy_scope(
+        &self,
+        relation_name: &str,
+        current_namespace: &str,
+    ) -> Option<(PolicyScope, String, String)> {
+        if relation_name.contains('"') {
+            return None;
+        }
+        let parts: Vec<&str> = relation_name.split('.').collect();
+        let (namespace, name) = match parts.as_slice() {
+            [name] => {
+                let namespace = self
+                    .catalog
+                    .get_view(name)
+                    .map(|view| view.namespace)
+                    .unwrap_or_else(|| current_namespace.to_string());
+                (namespace, *name)
+            }
+            [namespace, name] => (namespace.to_string(), *name),
+            _ => return None,
+        };
+        if namespace.trim().is_empty() || name.trim().is_empty() {
+            return None;
+        }
+        let kind = if self.catalog.get_view(relation_name).is_some() {
+            ResourceKind::View
+        } else {
+            ResourceKind::Table
+        };
+        let scope = PolicyScope::Resource {
+            // The authorization scope is anchored to the authenticated
+            // session's namespace, matching the legacy ACL boundary. A
+            // cross-namespace target additionally requires its own explicit
+            // namespace.cross_access decision below.
+            namespace: current_namespace.to_string(),
+            kind,
+            name: name.to_string(),
+        };
+        if scope.validate().is_err() {
+            return None;
+        }
+        Some((scope, format!("{namespace}.{name}"), namespace))
+    }
+
+    async fn durable_scram_credentials_for_login(
+        &self,
+        username: &str,
+    ) -> Result<
+        Option<(
+            rockstream_types::ids::PrincipalId,
+            u64,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            Vec<u8>,
+        )>,
+        String,
+    > {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "SCRAM requires a recovered durable principal store".to_string())?;
+        let principals = store
+            .list_security_principals()
+            .await
+            .map_err(|_| "SCRAM durable principal store is unavailable".to_string())?;
+        let mut found = None;
+        for principal in principals.into_iter().filter(|principal| principal.enabled) {
+            for method in &principal.login_methods {
+                let LoginMethod::ScramSha256 {
+                    username: stored_username,
+                    salt,
+                    iterations,
+                    stored_key,
+                    server_key,
+                } = method
+                else {
+                    continue;
+                };
+                if stored_username != username {
+                    continue;
+                }
+                if found.is_some() {
+                    return Err(
+                        "SCRAM login identity maps to multiple enabled principals".to_string()
+                    );
+                }
+                found = Some((
+                    principal.id,
+                    principal.revision,
+                    salt.clone(),
+                    *iterations,
+                    stored_key.clone(),
+                    server_key.clone(),
+                ));
+            }
+        }
+        Ok(found)
+    }
+
+    async fn append_authentication_audit(
+        &self,
+        actor: AuditIdentity,
+        target: AuditField<String>,
+        policy_revision: AuditField<u64>,
+        success: bool,
+    ) -> Result<(), String> {
+        use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable security audit store is unavailable".to_string())?;
+        let record = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("gateway-authn-{:032x}", rand::random::<u128>()),
+            timestamp_ms: current_time_ms().max(1),
+            actor,
+            target,
+            scope: AuditField::NotApplicable,
+            action: if success {
+                SecurityAuditClass::AuthenticationSuccess
+            } else {
+                SecurityAuditClass::AuthenticationFailure
+            },
+            outcome: if success {
+                SecurityAuditOutcome::Success
+            } else {
+                SecurityAuditOutcome::Failure
+            },
+            correlation: CONN_ID
+                .try_with(|id| id.clone())
+                .map_or(AuditCorrelation::Unknown, AuditCorrelation::Observed),
+            operation_id: AuditField::NotApplicable,
+            policy_revision,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        };
+        let operation_id = rand::random::<u64>().max(1);
+        for attempt in 0..2 {
+            let revision = store
+                .get_revision()
+                .await
+                .checked_add(1)
+                .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+            let transaction = CatalogTxn::new(
+                revision,
+                operation_id,
+                vec![CatalogMutation::AppendSecurityAudit(record.clone())],
+            )
+            .map_err(|error| error.to_string())?;
+            match store.commit_txn(transaction).await {
+                Ok(_) => return Ok(()),
+                Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
+                    if attempt == 0 =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("durable authentication audit retry was exhausted".to_string())
+    }
+
+    async fn record_authentication_or_fail(
+        &self,
+        actor: AuditIdentity,
+        principal_id: Option<rockstream_types::ids::PrincipalId>,
+        policy_revision: Option<u64>,
+        success: bool,
+    ) -> Result<(), pgwire::error::PgWireError> {
+        self.append_authentication_audit(
+            actor,
+            principal_id.map_or(AuditField::Unknown, |id| {
+                AuditField::Known(format!("principal:{}", id.0))
+            }),
+            policy_revision.map_or(AuditField::Unknown, AuditField::Known),
+            success,
+        )
+        .await
+        .map_err(|_| {
+            pgwire::error::PgWireError::UserError(Box::new(
+                pgwire::error::ErrorInfo::new(
+                    "FATAL".to_string(),
+                    "28000".to_string(),
+                    "[RS-2400] auth.unauthenticated: security authentication audit is unavailable; authentication was denied".to_string(),
+                ),
+            ))
+        })
+    }
+
+    async fn record_scram_failure_or_fail(
+        &self,
+        username: &str,
+        principal_id: Option<rockstream_types::ids::PrincipalId>,
+        policy_revision: Option<u64>,
+    ) -> Result<(), pgwire::error::PgWireError> {
+        let actor = if username.is_empty() {
+            AuditIdentity::Unknown
+        } else {
+            AuditIdentity::Unverified(format!("scram:{username}"))
+        };
+        self.record_authentication_or_fail(actor, principal_id, policy_revision, false)
+            .await
+    }
+
+    async fn validate_scram_startup(&self) -> Result<(), String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        if self.auth_mode != AuthMode::Scram {
+            return Ok(());
+        }
+        let store = self.catalog.get_durable_store().ok_or_else(|| {
+            "SCRAM requires an available durable catalog with an enabled SCRAM login".to_string()
+        })?;
+        let principals = store.list_security_principals().await.map_err(|_| {
+            "SCRAM requires an available durable catalog with an enabled SCRAM login".to_string()
+        })?;
+        if principals.iter().any(|principal| {
+            principal.enabled
+                && principal
+                    .login_methods
+                    .iter()
+                    .any(|method| matches!(method, LoginMethod::ScramSha256 { .. }))
+        }) {
+            Ok(())
+        } else {
+            Err(
+                "SCRAM requires an available durable catalog with an enabled SCRAM login"
+                    .to_string(),
+            )
+        }
+    }
+
+    async fn security_principal_for_login(
+        &self,
+        authenticated: &Principal,
+    ) -> Result<Option<SecurityPrincipal>, String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable security catalog is unavailable".to_string())?;
+        let principals = store
+            .list_security_principals()
+            .await
+            .map_err(|error| error.to_string())?;
+        let matches_login = |method: &LoginMethod| match (authenticated, method) {
+            (
+                Principal::ScramUser { username },
+                LoginMethod::ScramSha256 {
+                    username: stored_username,
+                    ..
+                },
+            ) if self.auth_mode != AuthMode::Md5 && username == stored_username => true,
+            (
+                Principal::Oidc { issuer, sub },
+                LoginMethod::Oidc {
+                    issuer: stored_issuer,
+                    subject,
+                },
+            ) => issuer == stored_issuer && sub == subject,
+            (
+                Principal::Mtls {
+                    certificate_sha256, ..
+                },
+                LoginMethod::Mtls {
+                    certificate_sha256: stored_fingerprint,
+                },
+            ) => certificate_sha256 == stored_fingerprint,
+            _ => false,
+        };
+        let mut matches = principals.into_iter().filter(|principal| {
+            principal.enabled && principal.login_methods.iter().any(&matches_login)
+        });
+        let found = matches.next();
+        if matches.next().is_some() {
+            return Err("authenticated login is bound to multiple durable principals".to_string());
+        }
+        Ok(found)
+    }
+
+    async fn authorize_secret_use_for_connection(
+        &self,
+        conn_id: Option<&str>,
+        secret_name: &str,
+    ) -> Result<Option<(PrincipalId, String)>, ()> {
+        let session = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+        });
+        let principal = session.as_ref().map(|(principal, _)| principal);
+        let namespace = session
+            .as_ref()
+            .map(|(_, namespace)| namespace.clone())
+            .unwrap_or_else(|| "public".to_string());
+        let consumer = match principal {
+            Some(authenticated) if !authenticated.is_system() => self
+                .security_principal_for_login(authenticated)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        let scope = consumer.as_ref().map(|consumer| PolicyScope::Secret {
+            namespace: namespace.clone(),
+            name: secret_name.to_string(),
+            consumer: Some(consumer.id),
+        });
+        let authorized = consumer.as_ref().is_some_and(|consumer| {
+            scope.as_ref().is_some_and(|scope| {
+                rockstream_control::authorization::allows(
+                    consumer,
+                    SecurityAction::SecretUse,
+                    scope,
+                )
+            })
+        });
+        if authorized {
+            return Ok(consumer.map(|consumer| (consumer.id, namespace)));
+        }
+
+        let audit_recorded = self
+            .append_authorization_denial(
+                principal,
+                conn_id,
+                scope.as_ref(),
+                Some(secret_name),
+                consumer.as_ref().map(|principal| principal.revision),
+            )
+            .await
+            .is_ok();
+        if !audit_recorded {
+            if let Some(id) = conn_id {
+                self.sessions.remove(id);
+            }
+        }
+        Err(())
+    }
+
+    async fn secret_namespace_id(&self, namespace: &str) -> Result<u128, String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable namespace catalog is unavailable".to_string())?;
+        store
+            .get_namespace_by_name(namespace)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|namespace| u128::from(namespace.id.0))
+            .ok_or_else(|| "secret namespace is absent from the durable catalog".to_string())
+    }
+
+    async fn authorize_secret_metadata_read_for_connection(
+        &self,
+        conn_id: Option<&str>,
+    ) -> Option<Vec<Response<'static>>> {
+        let session = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+        });
+        let principal = session.as_ref().map(|(principal, _)| principal);
+        let namespace = session
+            .as_ref()
+            .map(|(_, namespace)| namespace.clone())
+            .unwrap_or_else(|| "public".to_string());
+        let scope = PolicyScope::Namespace {
+            namespace: namespace.clone(),
+        };
+        let matching_principal = match principal {
+            Some(authenticated) if !authenticated.is_system() => self
+                .security_principal_for_login(authenticated)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        let policy_revision = matching_principal
+            .as_ref()
+            .map(|security_principal| security_principal.revision);
+        let authorized = matching_principal
+            .as_ref()
+            .is_some_and(|security_principal| {
+                rockstream_control::authorization::allows(
+                    security_principal,
+                    SecurityAction::SecretMetadataRead,
+                    &scope,
+                )
+            });
+        if authorized {
+            return None;
+        }
+
+        let audit_recorded = self
+            .append_authorization_denial(
+                principal,
+                conn_id,
+                Some(&scope),
+                Some(&namespace),
+                policy_revision,
+            )
+            .await
+            .is_ok();
+        if !audit_recorded {
+            if let Some(id) = conn_id {
+                self.sessions.remove(id);
+            }
+        }
+
+        let identity = principal.map_or("unknown", Principal::identity);
+        let audit_status = if audit_recorded {
+            ""
+        } else {
+            " The required security audit could not be persisted; this session's authorization state was invalidated."
+        };
+        Some(vec![promote_response(Response::Error(Box::new(
+            ErrorInfo::new(
+                "ERROR".to_string(),
+                "42501".to_string(),
+                format!(
+                    "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action 'SecretMetadataRead' on {namespace}. next_steps: Request an authorized scoped grant, then retry.{audit_status}"
+                ),
+            ),
+        )))])
+    }
+
+    async fn authorize_source_secret_use(
+        &self,
+        source: &CatalogSourceEntry,
+        reference: &str,
+    ) -> Result<String, String> {
+        let secret_name = rockstream_types::secret::secret_name_from_reference(reference)
+            .ok_or_else(|| "source has an unsupported secret reference".to_string())?;
+        let consumer_id = source.secret_consumer.ok_or_else(|| {
+            "source secret reference has no durable consumer identity".to_string()
+        })?;
+        let namespace = source
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "source secret reference has no durable namespace".to_string())?;
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable secret authorization state is unavailable".to_string())?;
+        use rockstream_storage::catalog::CatalogStore;
+        let consumers = store
+            .list_security_principals()
+            .await
+            .map_err(|_| "durable secret authorization state is unavailable".to_string())?;
+        let consumer = consumers
+            .into_iter()
+            .find(|principal| principal.id == consumer_id && principal.enabled)
+            .ok_or_else(|| "source secret consumer is no longer enabled".to_string())?;
+        let scope = PolicyScope::Secret {
+            namespace: namespace.to_string(),
+            name: secret_name.to_string(),
+            consumer: Some(consumer_id),
+        };
+        if !rockstream_control::authorization::allows(&consumer, SecurityAction::SecretUse, &scope)
+        {
+            return Err("source secret consumer is no longer authorized".to_string());
+        }
+        Ok(secret_name.to_string())
+    }
+
+    async fn resolve_source_secret(
+        &self,
+        source: &CatalogSourceEntry,
+        reference: &str,
+    ) -> Result<rockstream_types::secret::Secret, String> {
+        let secret_name = self.authorize_source_secret_use(source, reference).await?;
+        let namespace = source
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "source secret reference has no durable namespace".to_string())?;
+        let namespace_id = self.secret_namespace_id(namespace).await?;
+        self.secret_store
+            .get_secret(namespace_id, &secret_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn append_authorization_denial(
+        &self,
+        principal: Option<&Principal>,
+        conn_id: Option<&str>,
+        scope: Option<&PolicyScope>,
+        target: Option<&str>,
+        policy_revision: Option<u64>,
+    ) -> Result<(), String> {
+        use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
+
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable security audit store is unavailable".to_string())?;
+        let actor = match principal {
+            Some(actor @ Principal::ScramUser { .. }) => AuditIdentity::Verified(actor.actor()),
+            Some(actor @ Principal::Mtls { .. }) => AuditIdentity::Verified(actor.actor()),
+            Some(actor @ Principal::Oidc { .. }) => AuditIdentity::Verified(actor.actor()),
+            Some(actor @ (Principal::Jwt { .. } | Principal::CertCn { .. })) => {
+                AuditIdentity::Unverified(actor.actor())
+            }
+            Some(Principal::System) | None => AuditIdentity::Unknown,
+        };
+        let scope_field = match scope {
+            Some(scope) => {
+                AuditField::Known(serde_json::to_string(scope).map_err(|error| error.to_string())?)
+            }
+            None => AuditField::Unknown,
+        };
+        let record = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("gateway-authz-{:032x}", rand::random::<u128>()),
+            timestamp_ms: current_time_ms().max(1),
+            actor,
+            target: target
+                .filter(|target| !target.trim().is_empty())
+                .map_or(AuditField::Unknown, |target| {
+                    AuditField::Known(target.to_string())
+                }),
+            scope: scope_field,
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: conn_id.map_or(AuditCorrelation::Unknown, |id| {
+                AuditCorrelation::Observed(id.to_string())
+            }),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: policy_revision.map_or(AuditField::Unknown, AuditField::Known),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        };
+        let operation_id = rand::random::<u64>().max(1);
+        for attempt in 0..2 {
+            let revision = store
+                .get_revision()
+                .await
+                .checked_add(1)
+                .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+            let transaction = CatalogTxn::new(
+                revision,
+                operation_id,
+                vec![CatalogMutation::AppendSecurityAudit(record.clone())],
+            )
+            .map_err(|error| error.to_string())?;
+            match store.commit_txn(transaction).await {
+                Ok(_) => return Ok(()),
+                Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
+                    if attempt == 0 =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("durable security audit retry was exhausted".to_string())
+    }
+
+    async fn authorize_mutation(
         &self,
         query: &str,
         conn_id: Option<&str>,
     ) -> Option<Vec<Response<'static>>> {
         let spec = pgwire_mutation_policy(query)?;
-        let id = conn_id?;
+        let action = Self::mutation_security_action(spec.operation);
+        let secret_management = action == Some(SecurityAction::SecretManage);
+        let durable_policy_required = self.auth_mode != AuthMode::Off
+            || self.catalog.get_durable_store().is_some()
+            || secret_management;
+
+        if durable_policy_required {
+            let session = conn_id.and_then(|id| {
+                self.sessions
+                    .get(id)
+                    .map(|s| (s.principal.clone(), s.current_namespace.clone()))
+            });
+            let principal = session.as_ref().map(|(principal, _)| principal);
+            let namespace = session
+                .as_ref()
+                .map(|(_, namespace)| namespace.as_str())
+                .unwrap_or("public");
+            let policy_scope = Self::mutation_policy_scope(query, spec.operation, namespace);
+            let (scope, target) = policy_scope
+                .as_ref()
+                .map(|(_, scope, target)| (Some(scope), Some(target.as_str())))
+                .unwrap_or((None, None));
+
+            let matching_principal = match principal {
+                Some(authenticated) if !authenticated.is_system() => self
+                    .security_principal_for_login(authenticated)
+                    .await
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+            let policy_revision = matching_principal
+                .as_ref()
+                .map(|security_principal| security_principal.revision);
+            // The unauthenticated development mode may still dispatch its
+            // explicit system principal. Authenticated modes never inherit
+            // system authority from a missing connection or session.
+            let authorized = if principal.is_some_and(Principal::is_system) {
+                self.auth_mode == AuthMode::Off && !secret_management
+            } else {
+                match (action, policy_scope.as_ref(), matching_principal.as_ref()) {
+                    (Some(action), Some((_, scope, _)), Some(security_principal)) => {
+                        rockstream_control::authorization::allows(security_principal, action, scope)
+                    }
+                    _ => false,
+                }
+            };
+            if authorized {
+                return None;
+            }
+
+            let audit_recorded = if action.is_some() {
+                self.append_authorization_denial(principal, conn_id, scope, target, policy_revision)
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            if !audit_recorded {
+                if let Some(id) = conn_id {
+                    self.sessions.remove(id);
+                }
+            }
+
+            let identity = principal.map_or("unknown", Principal::identity);
+            let resource = target.unwrap_or("<unknown>");
+            let action_label = action.map_or("unknown".to_string(), |action| format!("{action:?}"));
+            let audit_status = if audit_recorded {
+                ""
+            } else {
+                " The required security audit could not be persisted; this session's authorization state was invalidated."
+            };
+            return Some(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42501".to_string(),
+                    format!(
+                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{action_label}' on {resource}. next_steps: Request an authorized scoped grant, then retry.{audit_status}"
+                    ),
+                ),
+            )))]);
+        }
+
+        // Compatibility path for auth-off fixtures that exercise the legacy
+        // ACL store. Release authentication modes always use durable policy.
+        let id = match conn_id {
+            Some(id) => id,
+            None => return None,
+        };
         let (principal, namespace) = self
             .sessions
             .get(id)
@@ -3278,7 +4025,7 @@ impl GatewayHandler {
         Ok(())
     }
 
-    fn build_kafka_source(
+    async fn build_kafka_source(
         &self,
         source: &CatalogSourceEntry,
         view_name: &str,
@@ -3319,8 +4066,12 @@ impl GatewayHandler {
             &group_id,
         )
         .map_err(source_backfill_error)?;
-        if let Some(secret_name) = source.options.get("secret") {
-            runtime.bind_secret(secret_name.clone());
+        if let Some(secret_reference) = source.options.get("secret") {
+            let secret_name = self
+                .authorize_source_secret_use(source, secret_reference)
+                .await
+                .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+            runtime.bind_secret(secret_name);
         }
         Ok((table, connector_id, runtime))
     }
@@ -3350,15 +4101,18 @@ impl GatewayHandler {
                 }
             })
         };
-        let secret_name = source.options.get("secret").cloned();
-        let (password, secret_name) = if let Some(secret_name) = secret_name {
+        let secret_reference = source.options.get("secret").cloned();
+        let (password, secret_name) = if let Some(secret_reference) = secret_reference {
             let secret = self
-                .secret_store
-                .get_secret(0, &secret_name)
+                .resolve_source_secret(source, &secret_reference)
                 .await
-                .map_err(|error| GatewayError::QueryTimeExecutionFailed {
-                    detail: error.to_string(),
-                })?;
+                .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+            let secret_name =
+                rockstream_types::secret::secret_name_from_reference(&secret_reference)
+                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                        detail: "source has an unsupported secret reference".to_string(),
+                    })?
+                    .to_string();
             let password = secret.payload.get("password").cloned();
             (password, Some(secret_name))
         } else {
@@ -3432,7 +4186,7 @@ impl GatewayHandler {
             controller: Arc::clone(&self.backfill_admission),
             bytes: BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
         };
-        let (_, connector_id, source_runtime) = self.build_kafka_source(source, view_name)?;
+        let (_, connector_id, source_runtime) = self.build_kafka_source(source, view_name).await?;
         let checkpoint_store =
             SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
         self.backfill_bound_source(
@@ -3952,7 +4706,7 @@ impl GatewayHandler {
             return;
         };
         let Ok((table, connector_id, source_runtime)) =
-            handler.build_kafka_source(&source, &view_name)
+            handler.build_kafka_source(&source, &view_name).await
         else {
             return;
         };
@@ -5156,7 +5910,7 @@ impl GatewayHandler {
         // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
         let ql = query.trim().to_lowercase();
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
-            if let Some(response) = self.authorize_mutation(query, Some(conn_id)) {
+            if let Some(response) = self.authorize_mutation(query, Some(conn_id)).await {
                 return Ok(response);
             }
             return self.handle_copy_from_stdin(query, conn_id);
@@ -5167,7 +5921,10 @@ impl GatewayHandler {
             if let Some(view_name) = parse_copy_to_stdout_view(query) {
                 // COPY OUT must use the same ACL and namespace checks as SELECT.
                 // Do not read rows or emit a COPY frame before checking access.
-                if let Some(denied) = self.select_access_error_response(&view_name, Some(conn_id)) {
+                if let Some(denied) = self
+                    .select_access_error_response(&view_name, Some(conn_id))
+                    .await
+                {
                     return Ok(denied);
                 }
                 if self.catalog.get_view(&view_name).is_some()
@@ -5418,6 +6175,7 @@ impl GatewayHandler {
                     let pid = session.backend_pid;
                     let usename = match &session.principal {
                         crate::auth::Principal::Jwt { sub } => sub.clone(),
+                        crate::auth::Principal::Oidc { sub, .. } => sub.clone(),
                         _ => "postgres".to_string(),
                     };
                     let app_name = session.application_name.clone();
@@ -5502,13 +6260,13 @@ impl GatewayHandler {
 
         // CREATE SECRET / ALTER SECRET / DROP SECRET — v0.55.1 pgwire DDL wiring
         if ql.starts_with("create secret ") {
-            return Some(self.handle_create_secret(q).await);
+            return Some(self.handle_create_secret(q, "public").await);
         }
         if ql.starts_with("alter secret ") {
-            return Some(self.handle_alter_secret(q).await);
+            return Some(self.handle_alter_secret(q, "public").await);
         }
         if ql.starts_with("drop secret ") {
-            return Some(self.handle_drop_secret(q).await);
+            return Some(self.handle_drop_secret(q, "public").await);
         }
 
         // CREATE INDEX / DROP INDEX / REBUILD INDEX / MARK INDEX READY — v0.32 pgwire DDL wiring
@@ -5552,7 +6310,10 @@ impl GatewayHandler {
 
         // Authorize reads before exposing retention metadata, scanning
         // a snapshot or reserving a stream slot.
-        if let Some(denied) = self.select_access_error_response(&request.view_name, conn_id) {
+        if let Some(denied) = self
+            .select_access_error_response(&request.view_name, conn_id)
+            .await
+        {
             return Ok(denied);
         }
 
@@ -5765,8 +6526,46 @@ impl GatewayHandler {
         let q = query.trim();
         let ql = q.to_lowercase();
 
-        if let Some(response) = self.authorize_mutation(q, conn_id) {
+        if let Some(response) = self.authorize_mutation(q, conn_id).await {
             return Ok(response);
+        }
+
+        let namespace = conn_id
+            .and_then(|id| {
+                self.sessions
+                    .get(id)
+                    .map(|session| session.current_namespace.clone())
+            })
+            .unwrap_or_else(|| "public".to_string());
+        if ql.starts_with("create secret ") {
+            return self
+                .handle_create_secret(q, &namespace)
+                .await
+                .map(|responses| responses.into_iter().map(promote_response).collect());
+        }
+        if ql.starts_with("alter secret ") {
+            return self
+                .handle_alter_secret(q, &namespace)
+                .await
+                .map(|responses| responses.into_iter().map(promote_response).collect());
+        }
+        if ql.starts_with("drop secret ") {
+            return self
+                .handle_drop_secret(q, &namespace)
+                .await
+                .map(|responses| responses.into_iter().map(promote_response).collect());
+        }
+
+        if ql.trim_end_matches(';') == "show secrets" || ql.trim_end_matches(';') == "show secret" {
+            if let Some(response) = self
+                .authorize_secret_metadata_read_for_connection(conn_id)
+                .await
+            {
+                return Ok(response);
+            }
+            return Ok(vec![promote_response(
+                self.handle_show_secrets(&namespace).await,
+            )]);
         }
 
         // ── Aborted-transaction guard ────────────────────────────────────────────
@@ -6651,7 +7450,9 @@ impl GatewayHandler {
             ))]);
         }
         if ql.trim_end_matches(';') == "show secrets" || ql.trim_end_matches(';') == "show secret" {
-            return Ok(vec![promote_response(self.handle_show_secrets().await)]);
+            return Ok(vec![promote_response(
+                self.handle_show_secrets("public").await,
+            )]);
         }
         if ql.trim_end_matches(';') == "show source status" {
             return Ok(vec![promote_response(catalog_resp_to_response(
@@ -6972,6 +7773,23 @@ impl GatewayHandler {
             return self.handle_drop_workload(query).await;
         }
 
+        if ql.starts_with("create sink ") {
+            return Ok(self
+                .handle_create_sink_with_connection(query, conn_id)
+                .await?
+                .into_iter()
+                .map(promote_response)
+                .collect());
+        }
+        if ql.starts_with("create source ") {
+            return Ok(self
+                .handle_create_source_with_connection(query, conn_id)
+                .await?
+                .into_iter()
+                .map(promote_response)
+                .collect());
+        }
+
         if let Some(result) = self.dispatch_sync(query, &session_info).await {
             // Promote lifetime — responses from dispatch_sync hold no borrows
             // from `query`, only owned data.
@@ -7141,6 +7959,13 @@ impl GatewayHandler {
                             .first()
                             .cloned()
                             .unwrap_or_else(|| top_level_relation.clone());
+
+                        if let Some(denied) = self
+                            .select_access_error_response(&target_rel, conn_id)
+                            .await
+                        {
+                            return Ok(denied);
+                        }
 
                         let has_view = self.catalog.get_view(&target_rel).is_some();
                         let has_table = self.catalog.get_table(&target_rel).is_some();
@@ -7674,7 +8499,9 @@ impl GatewayHandler {
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
         for relation_name in referenced_tables {
-            if let Some(error_responses) = self.select_access_error_response(relation_name, conn_id)
+            if let Some(error_responses) = self
+                .select_access_error_response(relation_name, conn_id)
+                .await
             {
                 return Ok(error_responses);
             }
@@ -7735,35 +8562,141 @@ impl GatewayHandler {
         ))
     }
 
-    fn select_access_error_response(
+    async fn select_access_error_response(
         &self,
         relation_name: &str,
         conn_id: Option<&str>,
     ) -> Option<Vec<Response<'static>>> {
-        let (principal, session_namespace) = if let Some(id) = conn_id {
-            let session = self.sessions.entry(id.to_string()).or_default();
-            (session.principal.clone(), session.current_namespace.clone())
-        } else {
-            (Principal::System, "public".to_string())
-        };
+        let session = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+        });
+        let principal = session.as_ref().map(|(principal, _)| principal);
+        let session_namespace = session.as_ref().map(|(_, namespace)| namespace.as_str());
+        let durable_policy_required =
+            self.auth_mode != AuthMode::Off || self.catalog.get_durable_store().is_some();
 
+        if durable_policy_required {
+            if principal.is_some_and(Principal::is_system) && self.auth_mode == AuthMode::Off {
+                return None;
+            }
+
+            let policy_scope = session_namespace
+                .and_then(|namespace| self.read_policy_scope(relation_name, namespace));
+            let matching_principal = match principal {
+                Some(authenticated) if !authenticated.is_system() => self
+                    .security_principal_for_login(authenticated)
+                    .await
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+            let policy_revision = matching_principal
+                .as_ref()
+                .map(|security_principal| security_principal.revision);
+            let data_read_allowed = match (policy_scope.as_ref(), matching_principal.as_ref()) {
+                (Some((scope, _, _)), Some(security_principal)) => {
+                    rockstream_control::authorization::allows(
+                        security_principal,
+                        SecurityAction::DataRead,
+                        scope,
+                    )
+                }
+                _ => false,
+            };
+            let cross_namespace = match (policy_scope.as_ref(), session_namespace) {
+                (Some((_, _, target_namespace)), Some(session_namespace)) => {
+                    target_namespace != session_namespace
+                }
+                _ => false,
+            };
+            let cross_scope = session_namespace.map(|namespace| PolicyScope::Namespace {
+                namespace: namespace.to_string(),
+            });
+            let cross_namespace_allowed = !cross_namespace
+                || matching_principal
+                    .as_ref()
+                    .is_some_and(|security_principal| {
+                        cross_scope.as_ref().is_some_and(|scope| {
+                            rockstream_control::authorization::allows(
+                                security_principal,
+                                SecurityAction::NamespaceCrossAccess,
+                                scope,
+                            )
+                        })
+                    });
+            if data_read_allowed && cross_namespace_allowed {
+                return None;
+            }
+
+            let (audit_scope, target, denied_action) = if data_read_allowed {
+                (
+                    cross_scope.as_ref(),
+                    policy_scope.as_ref().map(|(_, target, _)| target.as_str()),
+                    SecurityAction::NamespaceCrossAccess,
+                )
+            } else {
+                (
+                    policy_scope.as_ref().map(|(scope, _, _)| scope),
+                    policy_scope.as_ref().map(|(_, target, _)| target.as_str()),
+                    SecurityAction::DataRead,
+                )
+            };
+            let audit_recorded = self
+                .append_authorization_denial(
+                    principal,
+                    conn_id,
+                    audit_scope,
+                    target,
+                    policy_revision,
+                )
+                .await
+                .is_ok();
+            if !audit_recorded {
+                if let Some(id) = conn_id {
+                    self.sessions.remove(id);
+                }
+            }
+            let identity = principal.map_or("unknown", Principal::identity);
+            let resource = target.unwrap_or("<unknown>");
+            let audit_status = if audit_recorded {
+                ""
+            } else {
+                " The required security audit could not be persisted; this session's authorization state was invalidated."
+            };
+            return Some(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42501".to_owned(),
+                    format!(
+                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{denied_action:?}' on {resource}. next_steps: Request an authorized scoped grant, then retry.{audit_status}"
+                    ),
+                ),
+            )))]);
+        }
+
+        // Compatibility path for auth-off fixtures that exercise the legacy
+        // ACL store. Release authentication modes always use durable policy.
+        let (principal, session_namespace) =
+            session.unwrap_or((Principal::System, "public".to_string()));
         use rockstream_types::acl::Role;
         if !principal.is_system() {
-            if let Err(e) = self.acl_store.check(
+            if let Err(error) = self.acl_store.check(
                 principal.identity(),
                 &session_namespace,
                 Some(relation_name),
                 Role::Viewer,
             ) {
                 return Some(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_owned(), "42501".to_owned(), e.to_string()),
+                    ErrorInfo::new("ERROR".to_owned(), "42501".to_owned(), error.to_string()),
                 )))]);
             }
         }
 
-        if let Some(cv) = self.catalog.get_view(relation_name) {
-            let view_ns = &cv.namespace;
-            if view_ns != &session_namespace && !principal.is_system() {
+        if let Some(view) = self.catalog.get_view(relation_name) {
+            let view_namespace = &view.namespace;
+            if view_namespace != &session_namespace && !principal.is_system() {
                 let is_admin = self
                     .acl_store
                     .check(principal.identity(), &session_namespace, None, Role::Admin)
@@ -7775,7 +8708,7 @@ impl GatewayHandler {
                             "42501".to_owned(),
                             format!(
                                 "[RS-2402] auth.namespace_access_denied: principal '{}' cannot access namespace '{}' from session namespace '{}'",
-                                principal.identity(), view_ns, session_namespace
+                                principal.identity(), view_namespace, session_namespace
                             ),
                         ),
                     )))]);
@@ -7795,7 +8728,7 @@ impl GatewayHandler {
         order_by: Vec<(String, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        if let Some(error_responses) = self.select_access_error_response(view_name, conn_id) {
+        if let Some(error_responses) = self.select_access_error_response(view_name, conn_id).await {
             return Ok(error_responses);
         }
         if self.catalog.get_view(view_name).is_some()
@@ -9033,6 +9966,14 @@ impl GatewayHandler {
 
     /// Handle `CREATE SINK <name> FOR VIEW <view> TO ICEBERG|DELTA '<path>' WITH (...)` — v0.44.
     async fn handle_create_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        self.handle_create_sink_with_connection(q, None).await
+    }
+
+    async fn handle_create_sink_with_connection<'a>(
+        &'a self,
+        q: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let if_not_exists = ql.contains("if not exists");
         let parsed = match parse_create_sink_ddl(q) {
@@ -9069,10 +10010,53 @@ impl GatewayHandler {
             ))]);
         }
 
-        let secret_name = parsed.secret.clone();
-        if let Some(secret_name) = secret_name.as_deref() {
+        let secret_reference = match parsed.secret.as_deref() {
+            Some(reference) => {
+                let Some(reference) =
+                    rockstream_types::secret::canonical_secret_reference(reference)
+                else {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-4007] CREATE SINK secret must be a name or secret:// reference. Next steps: use the documented secret = '<name>' option."
+                            .to_string(),
+                    )]);
+                };
+                Some(reference)
+            }
+            None => None,
+        };
+        let secret_name = secret_reference
+            .as_deref()
+            .and_then(rockstream_types::secret::secret_name_from_reference);
+        let secret_scope = if let Some(secret_name) = secret_name {
+            match self
+                .authorize_secret_use_for_connection(conn_id, secret_name)
+                .await
+            {
+                Ok(scope) => scope,
+                Err(()) => {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
+                            .to_string(),
+                    )]);
+                }
+            }
+        } else {
+            None
+        };
+        let secret_namespace_id = match secret_scope.as_ref() {
+            Some((_, namespace)) => match self.secret_namespace_id(namespace).await {
+                Ok(namespace_id) => namespace_id,
+                Err(_) => {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                    )]);
+                }
+            },
+            None => 0,
+        };
+        if let Some(secret_name) = secret_name {
             if !secret_name.is_empty() {
-                let ns = 0u128;
+                let ns = secret_namespace_id;
                 let secret_exists = match self.secret_store.contains_secret(ns, secret_name).await {
                     Ok(exists) => exists,
                     Err(_) => {
@@ -9102,25 +10086,61 @@ impl GatewayHandler {
             format_version: parsed.format_version,
             partition_by: parsed.partition_by,
             catalog: parsed.catalog,
-            secret_name: secret_name.clone(),
+            secret_name: secret_reference.clone(),
+            secret_consumer: secret_scope.as_ref().map(|(consumer, _)| *consumer),
+            secret_namespace: secret_scope
+                .as_ref()
+                .map(|(_, namespace)| namespace.clone()),
             last_snapshot_epoch: None,
             state: "OK".to_string(),
         };
 
-        if !self.catalog.add_sink(entry) {
-            return Ok(vec![create_sink_error_response(format!(
-                "[RS-4010] sink.already_exists: sink '{}' already exists for a different view. Next steps: choose a distinct sink name.",
-                parsed.name
-            ))]);
-        }
-        if let Some(secret_name) = secret_name.as_deref() {
-            if let Err(error) = self
+        let secret_reference_added = if let Some(secret_name) = secret_name {
+            match self
                 .secret_store
-                .add_reference(0u128, secret_name, &parsed.name)
+                .add_reference_if_absent(secret_namespace_id, secret_name, &parsed.name)
                 .await
             {
-                self.catalog.remove_sink(&parsed.name);
-                return Ok(vec![create_sink_error_response(error.to_string())]);
+                Ok(added) => added,
+                Err(error) => {
+                    return Ok(vec![create_sink_error_response(error.to_string())]);
+                }
+            }
+        } else {
+            false
+        };
+
+        let add_result = if self.catalog.get_durable_store().is_some() {
+            self.catalog.add_sink_durable(entry).await
+        } else {
+            Ok(self.catalog.add_sink(entry))
+        };
+        match add_result {
+            Ok(true) => {}
+            Ok(false) => {
+                if secret_reference_added {
+                    if let Some(secret_name) = secret_name {
+                        let _ = self
+                            .secret_store
+                            .remove_reference(secret_namespace_id, secret_name, &parsed.name)
+                            .await;
+                    }
+                }
+                return Ok(vec![create_sink_error_response(format!(
+                    "[RS-4010] sink.already_exists: sink '{}' already exists for a different view. Next steps: choose a distinct sink name.",
+                    parsed.name
+                ))]);
+            }
+            Err(error) => {
+                if secret_reference_added {
+                    if let Some(secret_name) = secret_name {
+                        let _ = self
+                            .secret_store
+                            .remove_reference(secret_namespace_id, secret_name, &parsed.name)
+                            .await;
+                    }
+                }
+                return Ok(vec![create_sink_error_response(error)]);
             }
         }
 
@@ -9183,17 +10203,59 @@ impl GatewayHandler {
             )))]);
         };
 
-        if let Some(secret_name) = sink.secret_name.as_deref() {
+        let secret_reference = match sink.secret_name.as_deref() {
+            Some(reference) => {
+                let Some(secret_name) =
+                    rockstream_types::secret::secret_name_from_reference(reference)
+                else {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-4007] sink has an unsupported secret reference".to_string(),
+                    )]);
+                };
+                let Some(namespace) = sink.secret_namespace.as_deref() else {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-0003] secret.storage_unavailable: sink secret namespace is missing from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                    )]);
+                };
+                let namespace_id = match self.secret_namespace_id(namespace).await {
+                    Ok(namespace_id) => namespace_id,
+                    Err(_) => {
+                        return Ok(vec![create_sink_error_response(
+                            "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                        )]);
+                    }
+                };
+                Some((secret_name.to_string(), namespace_id))
+            }
+            None => None,
+        };
+
+        let remove_result = if self.catalog.get_durable_store().is_some() {
+            self.catalog.remove_sink_durable(&name).await
+        } else {
+            Ok({
+                self.catalog.remove_sink(&name);
+                true
+            })
+        };
+        match remove_result {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SINK").with_rows(0),
+                )])
+            }
+            Err(error) => return Ok(vec![create_sink_error_response(error)]),
+        }
+        if let Some((secret_name, namespace_id)) = secret_reference {
             if let Err(error) = self
                 .secret_store
-                .remove_reference(0u128, secret_name, &name)
+                .remove_reference(namespace_id, &secret_name, &name)
                 .await
             {
                 return Ok(vec![create_sink_error_response(error.to_string())]);
             }
         }
-
-        self.catalog.remove_sink(&name);
         if let Some(log) = &self.audit_log {
             let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                 "system",
@@ -9208,6 +10270,14 @@ impl GatewayHandler {
     }
 
     async fn handle_create_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        self.handle_create_source_with_connection(q, None).await
+    }
+
+    async fn handle_create_source_with_connection<'a>(
+        &'a self,
+        q: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_create_source_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![create_source_error_response(message)]),
@@ -9225,10 +10295,55 @@ impl GatewayHandler {
             ))]);
         }
 
-        let secret_ref = parsed.options.get("secret").cloned();
-        if let Some(secret_name) = secret_ref.as_deref() {
+        let secret_ref = parsed
+            .options
+            .get("secret")
+            .map(|reference| {
+                rockstream_types::secret::canonical_secret_reference(reference).ok_or(())
+            })
+            .transpose();
+        let secret_ref = match secret_ref {
+            Ok(reference) => reference,
+            Err(()) => {
+                return Ok(vec![create_source_error_response(
+                    "[RS-4008] CREATE SOURCE secret must be a name or secret:// reference. Next steps: use the documented secret = '<name>' option."
+                        .to_string(),
+                )]);
+            }
+        };
+        let secret_name = secret_ref
+            .as_deref()
+            .and_then(rockstream_types::secret::secret_name_from_reference);
+        let secret_scope = if let Some(secret_name) = secret_name {
+            match self
+                .authorize_secret_use_for_connection(conn_id, secret_name)
+                .await
+            {
+                Ok(scope) => scope,
+                Err(()) => {
+                    return Ok(vec![create_source_error_response(
+                        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
+                            .to_string(),
+                    )]);
+                }
+            }
+        } else {
+            None
+        };
+        let secret_namespace_id = match secret_scope.as_ref() {
+            Some((_, namespace)) => match self.secret_namespace_id(namespace).await {
+                Ok(namespace_id) => namespace_id,
+                Err(_) => {
+                    return Ok(vec![create_source_error_response(
+                        "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                    )]);
+                }
+            },
+            None => 0,
+        };
+        if let Some(secret_name) = secret_name {
             if !secret_name.is_empty() {
-                let ns = 0u128;
+                let ns = secret_namespace_id;
                 let secret_exists = match self.secret_store.contains_secret(ns, secret_name).await {
                     Ok(exists) => exists,
                     Err(_) => {
@@ -9246,6 +10361,10 @@ impl GatewayHandler {
             }
         }
 
+        let mut options = parsed.options.clone();
+        if let Some(reference) = secret_ref.as_ref() {
+            options.insert("secret".to_string(), reference.clone());
+        }
         let entry = CatalogSourceEntry {
             name: parsed.name.clone(),
             table_name: self
@@ -9253,11 +10372,15 @@ impl GatewayHandler {
                 .get_table(&parsed.name)
                 .map(|_| parsed.name.clone()),
             source_type: parsed.source_type.clone(),
-            options: parsed.options.clone(),
+            options,
             format: parsed.format.clone(),
             status: "OK".to_string(),
             live_offset: "0".to_string(),
             live_lag: 0,
+            secret_consumer: secret_scope.as_ref().map(|(consumer, _)| *consumer),
+            secret_namespace: secret_scope
+                .as_ref()
+                .map(|(_, namespace)| namespace.clone()),
         };
 
         if entry.source_type == "postgres_cdc" && entry.format == "pgoutput" {
@@ -9287,25 +10410,57 @@ impl GatewayHandler {
             }
         }
 
-        if !self.catalog.add_source(entry.clone()) {
-            if parsed.if_not_exists {
-                return Ok(vec![Response::Execution(
-                    Tag::new("CREATE SOURCE").with_rows(0),
-                )]);
-            }
-            return Ok(vec![create_source_error_response(format!(
-                "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
-                parsed.name
-            ))]);
-        }
-        if let Some(secret_name) = secret_ref.as_deref() {
-            if let Err(error) = self
+        let secret_reference_added = if let Some(secret_name) = secret_name {
+            match self
                 .secret_store
-                .add_reference(0u128, secret_name, &parsed.name)
+                .add_reference_if_absent(secret_namespace_id, secret_name, &parsed.name)
                 .await
             {
-                self.catalog.remove_source(&parsed.name);
-                return Ok(vec![create_source_error_response(error.to_string())]);
+                Ok(added) => added,
+                Err(error) => {
+                    return Ok(vec![create_source_error_response(error.to_string())]);
+                }
+            }
+        } else {
+            false
+        };
+
+        let add_result = if self.catalog.get_durable_store().is_some() {
+            self.catalog.add_source_durable(entry.clone()).await
+        } else {
+            Ok(self.catalog.add_source(entry.clone()))
+        };
+        match add_result {
+            Ok(true) => {}
+            Ok(false) => {
+                if secret_reference_added {
+                    if let Some(secret_name) = secret_name {
+                        let _ = self
+                            .secret_store
+                            .remove_reference(secret_namespace_id, secret_name, &parsed.name)
+                            .await;
+                    }
+                }
+                if parsed.if_not_exists {
+                    return Ok(vec![Response::Execution(
+                        Tag::new("CREATE SOURCE").with_rows(0),
+                    )]);
+                }
+                return Ok(vec![create_source_error_response(format!(
+                    "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                    parsed.name
+                ))]);
+            }
+            Err(error) => {
+                if secret_reference_added {
+                    if let Some(secret_name) = secret_name {
+                        let _ = self
+                            .secret_store
+                            .remove_reference(secret_namespace_id, secret_name, &parsed.name)
+                            .await;
+                    }
+                }
+                return Ok(vec![create_source_error_response(error)]);
             }
         }
         if let Some(log) = &self.audit_log {
@@ -9339,13 +10494,24 @@ impl GatewayHandler {
         )])
     }
 
-    async fn handle_create_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_secret<'a>(
+        &'a self,
+        q: &str,
+        namespace: &str,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_create_secret_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
 
-        let ns = 0u128;
+        let ns = match self.secret_namespace_id(namespace).await {
+            Ok(namespace_id) => namespace_id,
+            Err(_) => {
+                return Ok(vec![secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                )]);
+            }
+        };
         if parsed.if_not_exists {
             if let Ok(exists) = self.secret_store.contains_secret(ns, &parsed.name).await {
                 if exists {
@@ -9385,13 +10551,24 @@ impl GatewayHandler {
         )])
     }
 
-    async fn handle_alter_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_alter_secret<'a>(
+        &'a self,
+        q: &str,
+        namespace: &str,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_alter_secret_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
 
-        let ns = 0u128;
+        let ns = match self.secret_namespace_id(namespace).await {
+            Ok(namespace_id) => namespace_id,
+            Err(_) => {
+                return Ok(vec![secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                )]);
+            }
+        };
         if let Err(err) = self
             .secret_store
             .alter_secret(ns, &parsed.name, parsed.payload, "pgwire")
@@ -9405,13 +10582,24 @@ impl GatewayHandler {
         )])
     }
 
-    async fn handle_drop_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_drop_secret<'a>(
+        &'a self,
+        q: &str,
+        namespace: &str,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_drop_secret_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
 
-        let ns = 0u128;
+        let ns = match self.secret_namespace_id(namespace).await {
+            Ok(namespace_id) => namespace_id,
+            Err(_) => {
+                return Ok(vec![secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                )]);
+            }
+        };
         if let Err(err) = self
             .secret_store
             .drop_secret(ns, &parsed.name, "pgwire")
@@ -9432,8 +10620,15 @@ impl GatewayHandler {
         )])
     }
 
-    async fn handle_show_secrets<'a>(&'a self) -> Response<'a> {
-        let ns = 0u128;
+    async fn handle_show_secrets<'a>(&'a self, namespace: &str) -> Response<'a> {
+        let ns = match self.secret_namespace_id(namespace).await {
+            Ok(namespace_id) => namespace_id,
+            Err(_) => {
+                return secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                )
+            }
+        };
         let listings = match self.secret_store.list_secrets(ns).await {
             Ok(listings) => listings,
             Err(_) => {
@@ -9557,19 +10752,60 @@ impl GatewayHandler {
                         .flatten()
                         .map(|identity| identity.connector_id())
                 });
-                if let Some(source_entry) = source.as_ref() {
-                    let secret_name_opt = source_entry.options.get("secret");
-                    if let Some(secret_name) = secret_name_opt {
-                        if let Err(error) = self
-                            .secret_store
-                            .remove_reference(0u128, secret_name, &parsed.name)
-                            .await
-                        {
-                            return Ok(vec![create_source_error_response(error.to_string())]);
-                        }
+                let secret_reference = match source.as_ref().and_then(|source| {
+                    source
+                        .options
+                        .get("secret")
+                        .map(|reference| (source, reference.as_str()))
+                }) {
+                    Some((source_entry, reference)) => {
+                        let Some(secret_name) =
+                            rockstream_types::secret::secret_name_from_reference(reference)
+                        else {
+                            return Ok(vec![create_source_error_response(
+                                "[RS-4008] source has an unsupported secret reference".to_string(),
+                            )]);
+                        };
+                        let Some(namespace) = source_entry.secret_namespace.as_deref() else {
+                            return Ok(vec![create_source_error_response(
+                                "[RS-0003] secret.storage_unavailable: source secret namespace is missing from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                            )]);
+                        };
+                        let namespace_id = match self.secret_namespace_id(namespace).await {
+                            Ok(namespace_id) => namespace_id,
+                            Err(_) => {
+                                return Ok(vec![create_source_error_response(
+                                    "[RS-0003] secret.storage_unavailable: unable to resolve the secret namespace from the durable catalog. Next steps: verify catalog storage health and retry.".to_string(),
+                                )]);
+                            }
+                        };
+                        Some((secret_name.to_string(), namespace_id))
+                    }
+                    None => None,
+                };
+                let remove_result = if self.catalog.get_durable_store().is_some() {
+                    self.catalog.remove_source_durable(&parsed.name).await
+                } else {
+                    Ok(self.catalog.remove_source(&parsed.name))
+                };
+                match remove_result {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(vec![Response::Execution(
+                            Tag::new("DROP SOURCE").with_rows(0),
+                        )]);
+                    }
+                    Err(error) => return Ok(vec![create_source_error_response(error)]),
+                }
+                if let Some((secret_name, namespace_id)) = secret_reference {
+                    if let Err(error) = self
+                        .secret_store
+                        .remove_reference(namespace_id, &secret_name, &parsed.name)
+                        .await
+                    {
+                        return Ok(vec![create_source_error_response(error.to_string())]);
                     }
                 }
-                self.catalog.remove_source(&parsed.name);
                 if let (Some(connector_id), Some(shard_db), Ok(runtime)) = (
                     pgoutput_id.filter(|connector_id| {
                         self.pgoutput_registered_aliases(*connector_id).is_empty()
@@ -10739,7 +11975,7 @@ impl GatewayHandler {
         // Retain that compatibility path; only relation reads need view ACL.
         let view_name = extract_view_name_from_select(inner_sql);
         if let Some(name) = view_name.as_deref() {
-            if let Some(denied) = self.select_access_error_response(name, conn_id) {
+            if let Some(denied) = self.select_access_error_response(name, conn_id).await {
                 return Ok(denied);
             }
             if self.catalog.get_view(name).is_some() && !self.catalog.is_backfill_published(name) {
@@ -12268,12 +13504,12 @@ impl GatewayHandler {
     /// Public wrapper for `handle_copy_from_stdin` — for integration tests that
     /// need to exercise auth/error paths without going through the full pgwire stack.
     #[doc(hidden)]
-    pub fn copy_from_stdin_response(
+    pub async fn copy_from_stdin_response(
         &self,
         query: &str,
         conn_id: &str,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        if let Some(response) = self.authorize_mutation(query, Some(conn_id)) {
+        if let Some(response) = self.authorize_mutation(query, Some(conn_id)).await {
             return Ok(response);
         }
         self.handle_copy_from_stdin(query, conn_id)
@@ -12400,28 +13636,22 @@ impl StartupHandler for GatewayHandler {
                                     ),
                                 )));
                             }
-                            if let Some(verifier) = &self.jwt_verifier {
-                                match verifier.verify(token) {
-                                    Ok(claims) => {
-                                        client.metadata_mut().insert(
-                                            "_rs_principal".to_string(),
-                                            format!("jwt:{}", claims.sub),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        return Err(pgwire::error::PgWireError::UserError(
-                                            Box::new(pgwire::error::ErrorInfo::new(
-                                                "FATAL".to_string(),
-                                                "28000".to_string(),
-                                                format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
-                                            )),
-                                        ));
-                                    }
+                            match verify_oidc_token(self.jwt_verifier.as_deref(), token) {
+                                Ok(claims) => {
+                                    client.metadata_mut().insert(
+                                        "_rs_principal".to_string(),
+                                        format!("jwt:{}", claims.sub),
+                                    );
                                 }
-                            } else {
-                                client
-                                    .metadata_mut()
-                                    .insert("_rs_principal".to_string(), format!("jwt:{token}"));
+                                Err(e) => {
+                                    return Err(pgwire::error::PgWireError::UserError(
+                                        Box::new(pgwire::error::ErrorInfo::new(
+                                            "FATAL".to_string(),
+                                            "28000".to_string(),
+                                            format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
+                                        )),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -12432,11 +13662,16 @@ impl StartupHandler for GatewayHandler {
                     // CN of a real, CA-validated TLS client certificate,
                     // recorded by `MtlsCnExtractingVerifier` during the TLS
                     // handshake and looked up here by peer socket address.
-                    match crate::tls::lookup_mtls_cn(&client.socket_addr()) {
-                        Some(cn) => {
-                            client
-                                .metadata_mut()
-                                .insert("_rs_principal".to_string(), format!("cert:{cn}"));
+                    match crate::tls::lookup_mtls_identity(&client.socket_addr()) {
+                        Some(identity) => {
+                            client.metadata_mut().insert(
+                                "_rs_principal".to_string(),
+                                format!("cert:{}", identity.common_name),
+                            );
+                            client.metadata_mut().insert(
+                                "_rs_mtls_certificate_sha256".to_string(),
+                                crate::auth::certificate_sha256_hex(&identity.certificate_sha256),
+                            );
                         }
                         None => {
                             return Err(pgwire::error::PgWireError::UserError(Box::new(
@@ -12636,8 +13871,7 @@ impl StartupHandler for GatewayHandler {
                                 .unwrap_or("")
                                 .to_string();
 
-                            // Look up user in role catalog
-                            let role = self.role_catalog.get(&username).ok_or_else(|| {
+                            let invalid_password = || {
                                 pgwire::error::PgWireError::UserError(Box::new(
                                     pgwire::error::ErrorInfo::new(
                                         "FATAL".to_string(),
@@ -12645,17 +13879,32 @@ impl StartupHandler for GatewayHandler {
                                         format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
                                     ),
                                 ))
-                            })?;
+                            };
+                            let credentials =
+                                self.durable_scram_credentials_for_login(&username).await;
+                            let (
+                                principal_id,
+                                policy_revision,
+                                salt,
+                                iterations,
+                                stored_key,
+                                server_key,
+                            ) = match credentials {
+                                Ok(Some(credentials)) => credentials,
+                                Ok(None) | Err(_) => {
+                                    self.record_scram_failure_or_fail(&username, None, None)
+                                        .await?;
+                                    return Err(invalid_password());
+                                }
+                            };
 
                             // Build server-first-message
                             let server_nonce_suffix: String =
                                 B64_STANDARD.encode(rand::random::<[u8; 18]>());
                             let server_nonce = format!("{client_nonce}{server_nonce_suffix}");
-                            let salt_b64 = B64_STANDARD.encode(&role.scram_salt);
-                            let server_first = format!(
-                                "r={server_nonce},s={salt_b64},i={}",
-                                role.scram_iterations
-                            );
+                            let salt_b64 = B64_STANDARD.encode(&salt);
+                            let server_first =
+                                format!("r={server_nonce},s={salt_b64},i={iterations}");
 
                             // auth_message prefix: client_first_bare + "," + server_first
                             let auth_message_prefix = format!("{client_first_bare},{server_first}");
@@ -12663,7 +13912,10 @@ impl StartupHandler for GatewayHandler {
                             // Store state in session
                             if let Some(mut session) = self.sessions.get_mut(&conn_id) {
                                 session.scram_auth_state = ScramAuthState::ServerFirstSent {
-                                    salted_password: role.scram_salted_password.clone(),
+                                    stored_key,
+                                    server_key,
+                                    principal_id,
+                                    policy_revision,
                                     server_nonce: server_nonce.clone(),
                                     auth_message: auth_message_prefix,
                                     username,
@@ -12678,11 +13930,23 @@ impl StartupHandler for GatewayHandler {
                         }
 
                         ScramAuthState::ServerFirstSent {
-                            salted_password,
+                            stored_key,
+                            server_key,
+                            principal_id,
+                            policy_revision,
                             server_nonce,
                             auth_message: auth_msg_prefix,
                             username,
                         } => {
+                            let invalid_password = || {
+                                pgwire::error::PgWireError::UserError(Box::new(
+                                    pgwire::error::ErrorInfo::new(
+                                        "FATAL".to_string(),
+                                        "28P01".to_string(),
+                                        format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
+                                    ),
+                                ))
+                            };
                             // SASLResponse — client-final-message
                             let sasl_resp = msg.into_sasl_response()?;
                             let client_final =
@@ -12695,13 +13959,13 @@ impl StartupHandler for GatewayHandler {
                                 .and_then(|p| p.strip_prefix("r="))
                                 .unwrap_or("");
                             if r_val != server_nonce {
-                                return Err(pgwire::error::PgWireError::UserError(Box::new(
-                                    pgwire::error::ErrorInfo::new(
-                                        "FATAL".to_string(),
-                                        "28P01".to_string(),
-                                        format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
-                                    ),
-                                )));
+                                self.record_scram_failure_or_fail(
+                                    &username,
+                                    Some(principal_id),
+                                    Some(policy_revision),
+                                )
+                                .await?;
+                                return Err(invalid_password());
                             }
 
                             let proof_b64 = client_final
@@ -12721,23 +13985,46 @@ impl StartupHandler for GatewayHandler {
                                 format!("{auth_msg_prefix},{client_final_without_proof}");
 
                             // Verify
-                            let stored_key = scram_stored_key(&salted_password);
                             if !verify_client_proof(&stored_key, proof_b64, &auth_message) {
-                                // Reset state
-                                if let Some(mut session) = self.sessions.get_mut(&conn_id) {
-                                    session.scram_auth_state = ScramAuthState::Idle;
-                                }
-                                return Err(pgwire::error::PgWireError::UserError(Box::new(
-                                    pgwire::error::ErrorInfo::new(
-                                        "FATAL".to_string(),
-                                        "28P01".to_string(),
-                                        format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
-                                    ),
-                                )));
+                                self.record_scram_failure_or_fail(
+                                    &username,
+                                    Some(principal_id),
+                                    Some(policy_revision),
+                                )
+                                .await?;
+                                return Err(invalid_password());
                             }
 
-                            // Compute and send server signature
-                            let server_key = scram_server_key(&salted_password);
+                            let identity = Principal::ScramUser {
+                                username: username.clone(),
+                            };
+                            let current_principal =
+                                match self.security_principal_for_login(&identity).await {
+                                    Ok(Some(principal))
+                                        if principal.id == principal_id
+                                            && principal.revision == policy_revision =>
+                                    {
+                                        principal
+                                    }
+                                    _ => {
+                                        self.record_scram_failure_or_fail(
+                                            &username,
+                                            Some(principal_id),
+                                            Some(policy_revision),
+                                        )
+                                        .await?;
+                                        return Err(invalid_password());
+                                    }
+                                };
+                            self.record_authentication_or_fail(
+                                AuditIdentity::Verified(identity.actor()),
+                                Some(current_principal.id),
+                                Some(current_principal.revision),
+                                true,
+                            )
+                            .await?;
+
+                            // Compute and send server signature from the persisted verifier.
                             let server_sig = scram_server_signature(&server_key, &auth_message);
                             let server_sig_b64 = B64_STANDARD.encode(server_sig);
                             client
@@ -12894,6 +14181,10 @@ impl SimpleQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let mtls_fingerprint = client
+                .metadata()
+                .get("_rs_mtls_certificate_sha256")
+                .and_then(|value| crate::auth::parse_certificate_sha256_hex(value));
             let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
@@ -12901,7 +14192,13 @@ impl SimpleQueryHandler for GatewayHandler {
                         sub: sub.to_string(),
                     }
                 } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
-                    Principal::CertCn { cn: cn.to_string() }
+                    match mtls_fingerprint {
+                        Some(certificate_sha256) => Principal::Mtls {
+                            cn: cn.to_string(),
+                            certificate_sha256,
+                        },
+                        None => Principal::CertCn { cn: cn.to_string() },
+                    }
                 } else {
                     Principal::System
                 };
@@ -13455,6 +14752,10 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let mtls_fingerprint = client
+                .metadata()
+                .get("_rs_mtls_certificate_sha256")
+                .and_then(|value| crate::auth::parse_certificate_sha256_hex(value));
             let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
@@ -13462,7 +14763,13 @@ impl ExtendedQueryHandler for GatewayHandler {
                         sub: sub.to_string(),
                     }
                 } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
-                    Principal::CertCn { cn: cn.to_string() }
+                    match mtls_fingerprint {
+                        Some(certificate_sha256) => Principal::Mtls {
+                            cn: cn.to_string(),
+                            certificate_sha256,
+                        },
+                        None => Principal::CertCn { cn: cn.to_string() },
+                    }
                 } else {
                     Principal::System
                 };
@@ -13474,7 +14781,7 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // COPY IN via extended query protocol (e.g. tokio_postgres.copy_in()).
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
-            if let Some(response) = self.authorize_mutation(query, Some(&conn_id)) {
+            if let Some(response) = self.authorize_mutation(query, Some(&conn_id)).await {
                 return Ok(response
                     .into_iter()
                     .next()
@@ -14060,7 +15367,8 @@ impl GatewayServer {
             .with_query_time_shard_topology(topology)
     }
 
-    /// Create a gateway with SCRAM-SHA-256 auth and a pre-populated RoleCatalog.
+    /// Create a gateway with SCRAM-SHA-256 auth backed by the recovered durable principal store.
+    /// The RoleCatalog argument remains for compatibility and does not authorize SCRAM logins.
     pub fn with_scram_auth(
         addr: std::net::SocketAddr,
         catalog: Arc<CatalogStubs>,
@@ -14086,7 +15394,8 @@ impl GatewayServer {
         GatewayServer::from_handler(addr, handler)
     }
 
-    /// Create a gateway with SCRAM-SHA-256 auth, ShardDb, and RoleCatalog.
+    /// Create a gateway with durable SCRAM auth and a ShardDb.
+    /// The RoleCatalog argument remains for compatibility and does not authorize SCRAM logins.
     pub fn with_shard_db_and_scram_auth(
         addr: std::net::SocketAddr,
         catalog: Arc<CatalogStubs>,
@@ -14205,6 +15514,10 @@ impl GatewayServer {
         &self,
         addr: std::net::SocketAddr,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        self.handler
+            .validate_scram_startup()
+            .await
+            .map_err(std::io::Error::other)?;
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let handler = self.handler.clone();
@@ -14234,12 +15547,23 @@ impl GatewayServer {
         tokio::task::JoinHandle<()>,
     )> {
         let (webhook_addr, webhook_handle) = self.serve_webhook_background(webhook_addr).await?;
-        let (pgwire_addr, pgwire_handle) = self.serve_background().await?;
+        let (pgwire_addr, pgwire_handle) = match self.serve_background().await {
+            Ok(listener) => listener,
+            Err(error) => {
+                webhook_handle.abort();
+                let _ = webhook_handle.await;
+                return Err(error);
+            }
+        };
         Ok((pgwire_addr, webhook_addr, pgwire_handle, webhook_handle))
     }
 
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
+        self.handler
+            .validate_scram_startup()
+            .await
+            .map_err(std::io::Error::other)?;
         if let Some(shard_db) = &self.handler.shard_db {
             self.handler
                 .catalog
@@ -14428,6 +15752,10 @@ impl GatewayServer {
     pub async fn serve_background(
         self,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        self.handler
+            .validate_scram_startup()
+            .await
+            .map_err(std::io::Error::other)?;
         if let Some(shard_db) = &self.handler.shard_db {
             self.handler
                 .catalog

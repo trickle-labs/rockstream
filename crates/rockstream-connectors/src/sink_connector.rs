@@ -30,6 +30,7 @@ use rockstream_types::timestamp::Epoch;
 /// The concrete implementations (Kafka, object-store) live in the sub-modules
 /// [`kafka_sink`].
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait SinkConnector: Send + Sync {
     /// Returns the idempotency profile for this connector.
     fn idempotency_profile(&self) -> SinkIdempotencyProfile;

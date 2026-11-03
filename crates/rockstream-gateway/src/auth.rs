@@ -45,10 +45,24 @@ impl std::str::FromStr for AuthMode {
 /// Authenticated principal for a gateway connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Principal {
-    System,                         // --auth=off or internal paths
-    Jwt { sub: String },            // OIDC bearer token, verified against JWKS; sub = JWT subject
-    CertCn { cn: String },          // mTLS client cert CN
-    ScramUser { username: String }, // SCRAM-SHA-256 or MD5 authenticated user
+    System, // --auth=off or internal paths
+    Jwt {
+        sub: String,
+    }, // OIDC bearer token, verified against JWKS; sub = JWT subject
+    Oidc {
+        issuer: String,
+        sub: String,
+    }, // Verified OIDC identity pair
+    CertCn {
+        cn: String,
+    }, // mTLS client cert CN
+    Mtls {
+        cn: String,
+        certificate_sha256: [u8; 32],
+    },
+    ScramUser {
+        username: String,
+    }, // SCRAM-SHA-256 or MD5 authenticated user
 }
 
 impl Principal {
@@ -56,7 +70,9 @@ impl Principal {
         match self {
             Principal::System => "system",
             Principal::Jwt { sub } => sub,
+            Principal::Oidc { sub, .. } => sub,
             Principal::CertCn { cn } => cn,
+            Principal::Mtls { cn, .. } => cn,
             Principal::ScramUser { username } => username,
         }
     }
@@ -70,7 +86,13 @@ impl Principal {
         match self {
             Principal::System => "system".to_string(),
             Principal::Jwt { sub } => format!("jwt:{sub}"),
+            Principal::Oidc { issuer, sub } => {
+                format!("oidc:{}:{}:{}:{}", issuer.len(), issuer, sub.len(), sub)
+            }
             Principal::CertCn { cn } => format!("cert:{cn}"),
+            Principal::Mtls {
+                certificate_sha256, ..
+            } => format!("mtls:{}", certificate_sha256_hex(certificate_sha256)),
             Principal::ScramUser { username } => format!("scram:{username}"),
         }
     }
@@ -79,6 +101,30 @@ impl Principal {
     pub fn is_system(&self) -> bool {
         matches!(self, Principal::System)
     }
+}
+
+pub(crate) fn certificate_sha256_hex(fingerprint: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in fingerprint {
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+pub(crate) fn parse_certificate_sha256_hex(encoded: &str) -> Option<[u8; 32]> {
+    if encoded.len() != 64 || !encoded.is_ascii() {
+        return None;
+    }
+
+    let mut fingerprint = [0; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)? as u8;
+        let low = (pair[1] as char).to_digit(16)? as u8;
+        fingerprint[index] = (high << 4) | low;
+    }
+    Some(fingerprint)
 }
 
 /// JWT claims parsed from payload.
@@ -391,6 +437,19 @@ impl JwtVerifier {
     }
 }
 
+/// Verify a bearer token only when an OIDC verifier is configured.
+///
+/// A missing verifier is an authentication failure; the presented token must
+/// never become an identity string or otherwise establish a session.
+pub(crate) fn verify_oidc_token(
+    verifier: Option<&JwtVerifier>,
+    token: &str,
+) -> Result<JwtClaims, AuthError> {
+    let verifier = verifier
+        .ok_or_else(|| AuthError::Unauthenticated("OIDC verifier is unavailable".to_string()))?;
+    verifier.verify(token)
+}
+
 /// Create a signed HS256 JWT for tests.
 pub fn create_test_jwt(sub: &str, exp: u64, secret: &[u8]) -> String {
     let header = r#"{"alg":"HS256","typ":"JWT"}"#;
@@ -434,6 +493,15 @@ mod tests {
             err,
             "[RS-0002] configuration error: unknown auth mode `oidc_typo`"
         );
+    }
+
+    #[test]
+    fn oidc_without_verifier_rejects_token_without_echoing_it() {
+        let presented = "fixture-raw-bearer-token";
+        let error = verify_oidc_token(None, presented).unwrap_err();
+
+        assert!(error.to_string().contains("OIDC verifier is unavailable"));
+        assert!(!error.to_string().contains(presented));
     }
 
     /// S2 green gate: jwt_bearer_token_validates_sub

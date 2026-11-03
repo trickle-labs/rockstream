@@ -100,14 +100,14 @@ fn output_row_hash(output_vals: &[i64], nulls: &[bool]) -> u128 {
         bytes.extend_from_slice(&value.to_be_bytes());
         bytes.push(u8::from(*is_null));
     }
-    let mut chunks = bytes.chunks_exact(8);
-    let mut words = Vec::new();
-    for chunk in &mut chunks {
-        words.push(i64::from_be_bytes(chunk.try_into().unwrap()));
-    }
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    let mut words: Vec<i64> = chunks
+        .iter()
+        .map(|chunk| i64::from_be_bytes(*chunk))
+        .collect();
+    if !remainder.is_empty() {
         let mut tail = [0; 8];
-        tail[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
+        tail[..remainder.len()].copy_from_slice(remainder);
         words.push(i64::from_be_bytes(tail));
     }
     row_hash(&words)

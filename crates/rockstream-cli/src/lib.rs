@@ -479,21 +479,26 @@ pub async fn start_gateway_with_shard_and_catalog(
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     validate_start_auth_modes(&opts.auth_mode, opts.node_config.as_ref())?;
     if catalog.get_durable_store().is_none() {
-        let durable_catalog = match rockstream_storage::catalog::DurableCatalogStore::recover(
-            store.clone(),
-            shard_path,
-        )
-        .await
-        {
-            Ok(recovered) => Arc::new(recovered),
-            Err(_) => Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
-                store.clone(),
-                shard_path,
-            )),
-        };
+        let durable_catalog = Arc::new(
+            rockstream_storage::catalog::DurableCatalogStore::recover(store.clone(), shard_path)
+                .await
+                .map_err(|error| {
+                    CliError::new(
+                        RS_0003,
+                        format!("gateway durable catalog recovery failed: {error}"),
+                        "Check that the durable catalog is intact and storage is accessible.",
+                    )
+                })?,
+        );
         catalog.set_durable_store(durable_catalog);
-        let _ = catalog.sync_from_durable_store().await;
     }
+    catalog.sync_from_durable_store().await.map_err(|error| {
+        CliError::new(
+            RS_0003,
+            format!("gateway durable catalog projection failed: {error}"),
+            "Check that the durable catalog is intact and storage is accessible.",
+        )
+    })?;
 
     // Flush to create the initial manifest so ShardReader can open on a fresh node.
     shard_db.flush().await.map_err(|e| {
@@ -3345,5 +3350,48 @@ mod tests {
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
         assert!(err.message.contains("raft-bind"));
+    }
+
+    #[tokio::test]
+    async fn gateway_startup_rejects_corrupt_durable_catalog() {
+        use object_store::{path::Path as ObjectPath, ObjectStoreExt as _};
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("gateway/catalog/snapshots/00000000000000000001.snap"),
+                b"not json".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder("gateway", store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let opts = StartOptions {
+            storage: storage.path().to_path_buf(),
+            listen_addr: Some("127.0.0.1:0".to_string()),
+            ..StartOptions::default()
+        };
+        let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+
+        let err = start_gateway_with_shard_and_catalog(
+            &opts,
+            shard_db,
+            store,
+            "gateway",
+            catalog.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "RS-0003 gateway durable catalog recovery failed: [RS-1003] malformed catalog snapshot: expected ident at line 1 column 2; next_steps: inspect snapshot file\n  next steps: Check that the durable catalog is intact and storage is accessible."
+        );
+        assert!(catalog.get_durable_store().is_none());
     }
 }

@@ -60,6 +60,8 @@ async fn test_alter_source_replay_and_dismiss_dlq() {
         status: "OK".to_string(),
         live_offset: "0".to_string(),
         live_lag: 0,
+        secret_consumer: None,
+        secret_namespace: None,
     };
     catalog.add_source(source);
 

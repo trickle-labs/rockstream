@@ -9,6 +9,7 @@
 
 use std::io::Write;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::memory::InMemory;
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair};
@@ -16,9 +17,26 @@ use rockstream_gateway::{
     catalog_stubs::CatalogStubs, server::GatewayServer, view_reader::ViewReadStrategy,
     view_reader::ViewReader, GatewayError,
 };
-use rockstream_storage::ShardDb;
+use rockstream_storage::{
+    catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore},
+    ShardDb,
+};
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
+    ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
+    SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
+};
+use rockstream_types::ids::PrincipalId;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_millis() as u64
+}
 
 /// rustls 0.23 requires a process-level `CryptoProvider` to be installed
 /// before any `ClientConfig`/`ServerConfig` is built. `tokio-rustls`'s default
@@ -331,12 +349,83 @@ async fn mtls_end_to_end_authenticates_real_client_cert() {
     let server_key_path = write_file(dir.path(), "server-key.pem", &server_key_pem);
     let (client_cert_pem, client_key_pem) =
         make_leaf(&ca_cert, &ca_key, "alice@rockstream.test", vec![]);
+    let mut client_cert_reader = std::io::BufReader::new(client_cert_pem.as_bytes());
+    let client_cert_der = rustls_pemfile::certs(&mut client_cert_reader)
+        .next()
+        .unwrap()
+        .unwrap();
+    let certificate_sha256 = Sha256::digest(client_cert_der.as_ref()).into();
+
+    let catalog = Arc::new(CatalogStubs::new());
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(InMemory::new()),
+        "gateway-mtls-authorization-test",
+    ));
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "mTLS administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Mtls { certificate_sha256 }],
+        preset_grants: vec![
+            ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            },
+            ScopedPresetGrant {
+                preset: PermissionPreset::Builder,
+                scope: PolicyScope::Namespace {
+                    namespace: "public".to_string(),
+                },
+            },
+        ],
+        scoped_grants: vec![],
+    };
+    let principal_policy = serde_json::to_string(&(
+        principal.enabled,
+        &principal.preset_grants,
+        &principal.scoped_grants,
+    ))
+    .unwrap();
+    let bootstrap_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "mtls-bootstrap".to_string(),
+        timestamp_ms: current_timestamp_ms(),
+        actor: AuditIdentity::Unknown,
+        target: AuditField::Known("principal:1".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("1".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={principal_policy}")),
+    };
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                1,
+                1,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal,
+                    expected_revision: None,
+                    grantor_revision: None,
+                    audit: bootstrap_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    catalog.set_durable_store(durable.clone());
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let shard_db = new_shard_db("mtls-e2e-shard").await;
     let server = GatewayServer::with_shard_db_and_mtls_auth(
         addr,
-        Arc::new(CatalogStubs::new()),
+        catalog.clone(),
         Arc::new(NoopViewReader),
         shard_db,
     )
@@ -360,6 +449,85 @@ async fn mtls_end_to_end_authenticates_real_client_cert() {
         )
     });
     assert!(found_row, "expected a result row containing \"1\"");
+
+    let created = client
+        .simple_query("CREATE TABLE mtls_authorized (id BIGINT)")
+        .await
+        .unwrap();
+    assert!(matches!(
+        created.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(rows)] if *rows == 0
+    ));
+    assert!(catalog.get_table("mtls_authorized").is_some());
+
+    let (same_cn_cert_pem, same_cn_key_pem) =
+        make_leaf(&ca_cert, &ca_key, "alice@rockstream.test", vec![]);
+    let mut same_cn_cert_reader = std::io::BufReader::new(same_cn_cert_pem.as_bytes());
+    let same_cn_cert_der = rustls_pemfile::certs(&mut same_cn_cert_reader)
+        .next()
+        .unwrap()
+        .unwrap();
+    let same_cn_certificate_sha256 = Sha256::digest(same_cn_cert_der.as_ref()).into();
+    let same_cn_client = ClientCert {
+        cert_pem: same_cn_cert_pem,
+        key_pem: same_cn_key_pem,
+    };
+    let same_cn_config = rustls_client_config_with_cert(&ca_cert_pem, &same_cn_client);
+    let same_cn_client = connect_tls(&local_addr.to_string(), same_cn_config)
+        .await
+        .expect("second CA-valid certificate with the same CN should complete TLS");
+    let error = same_cn_client
+        .simple_query("CREATE TABLE mtls_denied (id BIGINT)")
+        .await
+        .unwrap_err();
+    let db_error = error.as_db_error().expect("authorization denial error");
+    assert_eq!(db_error.code().code(), "42501");
+    assert_eq!(
+        db_error.message(),
+        "[RS-2401] auth.permission_denied: principal 'alice@rockstream.test' is not authorized for action 'TableCreate' on public.mtls_denied. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert!(catalog.get_table("mtls_denied").is_none());
+
+    let after_denial = same_cn_client.simple_query("SELECT 1").await.unwrap();
+    assert_eq!(after_denial.len(), 3);
+    match after_denial.as_slice() {
+        [tokio_postgres::SimpleQueryMessage::RowDescription(columns), tokio_postgres::SimpleQueryMessage::Row(row), tokio_postgres::SimpleQueryMessage::CommandComplete(rows)] =>
+        {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns[0].name(), "Int64(1)");
+            assert_eq!(row.columns().len(), 1);
+            assert_eq!(row.get(0), Some("1"));
+            assert_eq!(*rows, 1);
+        }
+        other => panic!("unexpected post-denial response: {other:?}"),
+    }
+
+    let audit = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(audit.len(), 2);
+    assert_eq!(
+        audit[1].actor,
+        AuditIdentity::Verified(format!(
+            "mtls:{}",
+            hex_fingerprint(&same_cn_certificate_sha256)
+        ))
+    );
+    assert_eq!(
+        audit[1].target,
+        AuditField::Known("public.mtls_denied".to_string())
+    );
+    assert_eq!(audit[1].action, SecurityAuditClass::AuthorizationDenial);
+    assert_eq!(audit[1].outcome, SecurityAuditOutcome::Denied);
+    assert!(matches!(
+        audit[1].correlation,
+        AuditCorrelation::Observed(_)
+    ));
+}
+
+fn hex_fingerprint(fingerprint: &[u8; 32]) -> String {
+    fingerprint
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // ── mtls_rejects_connection_with_no_client_cert ──────────────────────────────

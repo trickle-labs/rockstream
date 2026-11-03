@@ -282,6 +282,18 @@ impl SecretStore {
         secret_name: &str,
         ref_name: &str,
     ) -> Result<(), SecretStoreError> {
+        self.add_reference_if_absent(namespace_id, secret_name, ref_name)
+            .await
+            .map(|_| ())
+    }
+
+    /// Add a secret reference and report whether this call created it.
+    pub async fn add_reference_if_absent(
+        &self,
+        namespace_id: u128,
+        secret_name: &str,
+        ref_name: &str,
+    ) -> Result<bool, SecretStoreError> {
         let _reference_lock = self.reference_mutation_lock.lock().await;
         let rotation = self.rotation_lock.clone().read_owned().await;
         let secret_name = secret_name.trim();
@@ -311,7 +323,7 @@ impl SecretStore {
                 self.metrics
                     .reference_fill_level
                     .store(total_references, Ordering::Relaxed);
-                return Ok(());
+                return Ok(false);
             }
             encrypted.metadata.source_refs.sort();
             encrypted.metadata.source_refs.dedup();
@@ -339,7 +351,7 @@ impl SecretStore {
         self.metrics
             .reference_fill_level
             .store(total_references, Ordering::Relaxed);
-        Ok(())
+        Ok(true)
     }
 
     /// Remove a reference to a secret.

@@ -112,6 +112,8 @@ async fn catalog_queries_remain_consistent_under_faults() {
                     status: "RUNNING".to_string(),
                     live_offset: (i * 1000).to_string(),
                     live_lag: i as u64,
+                    secret_consumer: None,
+                    secret_namespace: None,
                 });
                 tokio::task::yield_now().await;
             }

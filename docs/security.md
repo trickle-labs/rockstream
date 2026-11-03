@@ -6,6 +6,15 @@
 AES-256-GCM envelopes under `catalog/secrets/`. The control plane uses
 `RS_SECRET_KEK` by default. `SHOW SECRETS` returns metadata only.
 
+Secret SQL is authorized through the durable principal policy. `CREATE SECRET`,
+`ALTER SECRET`, and `DROP SECRET` require `secret.manage` for the selected
+namespace and secret; `SHOW SECRETS` requires `secret.metadata.read` for the
+namespace. The Administrator preset grants those secret administration actions
+within its scope. The Operator preset grants none of them, and neither preset
+grants `secret.use`. A gateway running without a durable authenticated policy
+denies secret administration. Secret input remains write-only, and no SQL GET
+returns an existing secret value.
+
 Applications can inject an `AwsKmsKekProvider::new(key_arn, region)` into a
 `SecretStore` and supply that store through `ControlService::with_secret_store`.
 Supplying an ARN alone does not select this provider in the default services.
@@ -61,9 +70,20 @@ Only retire the previous key after successful recovery and durable rotation.
 Use one shared `SecretStore` for a catalog; independent instances must not mutate
 that catalog during rotation. Rotation stages memory proportional to the catalog.
 
-Workers receive short-lived tokens over authenticated mTLS. Decrypted payloads
-remain in the worker process memory and are refreshed at the next epoch after
-an `ALTER SECRET`; they are never written to worker storage.
+Workers receive short-lived tokens over authenticated mTLS. The worker token
+request path still lacks the required signed actor assertion and current actor
+policy check, so delegated worker secret resolution remains unqualified.
+Decrypted payloads remain in worker process memory and are refreshed at the
+next epoch after an `ALTER SECRET`; they are never written to worker storage.
+
+Connector SQL continues to accept `secret = '<name>'`; newly persisted source
+and sink metadata uses the canonical `secret://<name>` reference. A role preset
+does not imply secret use: authorization requires an explicit grant scoped to
+the secret and consumer principal, and missing identity or durable policy
+fails closed. Gateway source resolution reads the consumer's current durable
+policy before decrypting the value. Legacy source records without a persisted
+consumer identity are denied at resolution; an authorized migration route
+remains to be qualified.
 
 This document describes the security model, mutual TLS (mTLS) transport encryption, identity verification, and dynamic certificate rotation in RockStream.
 
@@ -157,3 +177,7 @@ Every mTLS rejection and successful CLI session writes a structured JSONL audit 
 - `security.internal_mtls_denied`: Handshake refusal with peer address, error code (`RS-2410`/`RS-2411`), and reason.
 - `cli.authenticated`: Successful administrative connection with operator CN identity.
 - `worker.registered`: Authenticated worker join with verified node identity.
+
+## First administrator preprovisioning
+
+Trusted offline deployment tooling must create the first interactive administrator before application listeners open. Use `DurableCatalogStore::preprovision_first_administrator` against the deployment's durable catalog with a unique operation ID that remains stable across retries. The principal and its grant-change audit event commit together; the audit actor is `unknown` because bootstrap has no authenticated application session. The operation rejects a nonempty security catalog, and a retry verifies the committed principal and audit record. It is not a public network operation. Catalog mutations also reject removal, disablement, or downgrade of the last active administrator.
