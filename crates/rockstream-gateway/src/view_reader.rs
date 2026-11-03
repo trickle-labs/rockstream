@@ -35,6 +35,7 @@ pub enum ViewReadStrategy {
 /// (one `Vec<u8>` per row, tab-separated field values) at the current published
 /// frontier.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ViewReader: Send + Sync {
     /// Read up to `limit` rows from the named view at the current published frontier.
     ///

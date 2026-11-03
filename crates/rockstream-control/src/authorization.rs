@@ -187,7 +187,7 @@ mod tests {
     use super::*;
     use rockstream_types::{
         authorization::{
-            LoginMethod, PolicyScope, ScopedActionGrant, ScopedPresetGrant,
+            LoginMethod, PermissionPreset, PolicyScope, ScopedActionGrant, ScopedPresetGrant,
             SECURITY_PRINCIPAL_FORMAT_VERSION,
         },
         ids::PrincipalId,

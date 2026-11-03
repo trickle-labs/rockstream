@@ -59,6 +59,7 @@ impl KekError {
 
 /// Key Encryption Key (KEK) provider trait.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait KekProvider: Send + Sync {
     /// Return the name of the KEK provider (e.g. "env", "aws_kms").
     fn provider_name(&self) -> &str;

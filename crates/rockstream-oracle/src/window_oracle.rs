@@ -727,13 +727,10 @@ mod proptest_oracle {
 
             // Track cost metrics.
             total_recomputed_rows += op.fill_level();
-            if let Some(sz) = {
-                // Approximate max partition size from fill level.
-                Some(op.fill_level())
-            } {
-                if sz > max_partition_size {
-                    max_partition_size = sz;
-                }
+            // Approximate max partition size from fill level.
+            let sz = op.fill_level();
+            if sz > max_partition_size {
+                max_partition_size = sz;
             }
 
             accumulate_output(&mut output_state, &out);
