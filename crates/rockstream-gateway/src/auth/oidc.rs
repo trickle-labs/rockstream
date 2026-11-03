@@ -247,12 +247,9 @@ impl OidcVerifier {
             CachedKey::Expired => {}
         }
 
-        // Refuse excess refresh waiters rather than allowing an unbounded queue
-        // behind a slow issuer. Callers can retry authentication after refresh.
-        let _refresh = self
-            .refresh
-            .try_lock()
-            .map_err(|_| unauthenticated("OIDC key refresh is already in progress"))?;
+        // Coalesce cache-expiry races into one issuer request. Recheck after
+        // acquiring the lock so waiters use the refreshed cache entry.
+        let _refresh = self.refresh.lock().await;
         match self.cached_lookup(kid) {
             CachedKey::Fresh(key) => return Ok(key),
             CachedKey::FreshMiss => {
@@ -682,6 +679,62 @@ mod tests {
             verifier.verify(VALID_TOKEN).await.unwrap_err().to_string(),
             "[RS-2400] auth.unauthenticated: OIDC JWKS request failed"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_expired_cache_refreshes_share_one_jwks_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            async fn respond(mut stream: tokio::net::TcpStream, delay: Duration) {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).await.unwrap();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let body = TEST_JWKS.as_bytes();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+
+            let (initial, _) = listener.accept().await.unwrap();
+            respond(initial, Duration::ZERO).await;
+
+            let mut request_count = 1;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(200), listener.accept()).await {
+                    Ok(Ok((stream, _))) => {
+                        request_count += 1;
+                        respond(stream, Duration::from_millis(50)).await;
+                    }
+                    Ok(Err(error)) => panic!("JWKS listener failed: {error}"),
+                    Err(_) => break,
+                }
+            }
+            request_count
+        });
+
+        let config = OidcConfig::new(
+            "https://issuer.example",
+            "rockstream",
+            format!("http://{address}/jwks"),
+        )
+        .unwrap();
+        let verifier = OidcVerifier::new(config).await.unwrap();
+        verifier.cache.write().as_mut().unwrap().expires_at = Instant::now();
+
+        let (first, second) =
+            tokio::join!(verifier.verify(VALID_TOKEN), verifier.verify(VALID_TOKEN));
+        for claims in [first.unwrap(), second.unwrap()] {
+            assert_eq!(claims.issuer.as_deref(), Some("https://issuer.example"));
+            assert_eq!(claims.sub, "alice");
+            assert_eq!(claims.exp, Some(4_102_444_800));
+        }
+        assert_eq!(server.await.unwrap(), 2);
     }
 
     #[tokio::test]
