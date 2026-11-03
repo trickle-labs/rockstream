@@ -388,7 +388,15 @@ pub async fn process_socket<H>(
 where
     H: PgWireServerHandlers,
 {
-    process_socket_with_tls_error_handler(tcp_socket, tls_acceptor, handlers, |_| async {}).await
+    #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
+    {
+        process_socket_with_tls_error_handler(tcp_socket, tls_acceptor, handlers, |_| async {})
+            .await
+    }
+    #[cfg(not(any(feature = "_ring", feature = "_aws-lc-rs")))]
+    {
+        process_socket_with_tls_error_handler(tcp_socket, handlers, |_| async {}).await
+    }
 }
 
 /// Process a socket, calling `on_tls_error` when TLS negotiation fails before
