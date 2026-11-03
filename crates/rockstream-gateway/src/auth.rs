@@ -391,6 +391,16 @@ impl JwtVerifier {
     }
 }
 
+pub(crate) fn verify_oidc_token(
+    verifier: Option<&JwtVerifier>,
+    token: &str,
+) -> Result<JwtClaims, AuthError> {
+    let verifier = verifier.ok_or_else(|| {
+        AuthError::Unauthenticated("OIDC verification is unavailable".to_string())
+    })?;
+    verifier.verify(token)
+}
+
 /// Create a signed HS256 JWT for tests.
 pub fn create_test_jwt(sub: &str, exp: u64, secret: &[u8]) -> String {
     let header = r#"{"alg":"HS256","typ":"JWT"}"#;
@@ -623,5 +633,14 @@ mod tests {
             TEST_SECRET,
         );
         assert_eq!(verifier.verify(&token).unwrap().sub, "alice");
+    }
+
+    #[test]
+    fn oidc_token_without_verifier_is_rejected() {
+        let error = verify_oidc_token(None, "unverified-token").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "[RS-2400] auth.unauthenticated: OIDC verification is unavailable"
+        );
     }
 }

@@ -12393,28 +12393,25 @@ impl StartupHandler for GatewayHandler {
                                     ),
                                 )));
                             }
-                            if let Some(verifier) = &self.jwt_verifier {
-                                match verifier.verify(token) {
-                                    Ok(claims) => {
-                                        client.metadata_mut().insert(
-                                            "_rs_principal".to_string(),
-                                            format!("jwt:{}", claims.sub),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        return Err(pgwire::error::PgWireError::UserError(
-                                            Box::new(pgwire::error::ErrorInfo::new(
-                                                "FATAL".to_string(),
-                                                "28000".to_string(),
-                                                format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
-                                            )),
-                                        ));
-                                    }
+                            match crate::auth::verify_oidc_token(
+                                self.jwt_verifier.as_deref(),
+                                token,
+                            ) {
+                                Ok(claims) => {
+                                    client.metadata_mut().insert(
+                                        "_rs_principal".to_string(),
+                                        format!("jwt:{}", claims.sub),
+                                    );
                                 }
-                            } else {
-                                client
-                                    .metadata_mut()
-                                    .insert("_rs_principal".to_string(), format!("jwt:{token}"));
+                                Err(e) => {
+                                    return Err(pgwire::error::PgWireError::UserError(
+                                        Box::new(pgwire::error::ErrorInfo::new(
+                                            "FATAL".to_string(),
+                                            "28000".to_string(),
+                                            format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
+                                        )),
+                                    ));
+                                }
                             }
                         }
                     }
