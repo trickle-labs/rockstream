@@ -756,6 +756,18 @@ after retained-key recovery. The suite also covers concurrent operations,
 successful rotation, legacy mixed generations, and catalog/audit redaction.
 These tests do not claim live KMS or abrupt process-termination qualification.
 
+Issue #304 persists source/sink secret bindings in `SecretMetadata.source_refs`
+and retains sink bindings in `CatalogSinkEntry.secret_name`. Source/sink DDL
+adds and removes those references; `DROP SECRET` combines persisted and cached
+references and rejects deletion with `RS-2426` while a binding remains. This is
+catalog metadata lifecycle coverage, not a new M1–M7 coordination transition.
+The `test_secret_references_survive_store_reopen` regression in
+`crates/rockstream-control/tests/secrets_lifecycle_tests.rs` verifies that a
+reopened store retains the reference and continues to reject secret deletion.
+The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
+`crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
+deletion until `DROP SINK` removes it.
+
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
 JSONL event and calls `sync_all` on the file before returning success. On Unix,

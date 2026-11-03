@@ -108,6 +108,7 @@ async fn test_secrets_lifecycle_in_memory_and_audit() {
     // 7. Dependency check: Add reference, try to drop -> fails with RS-2426
     store
         .add_reference(ns, "pg_cdc_creds", "source_pg_cdc_1")
+        .await
         .unwrap();
     let in_use_drop = store.drop_secret(ns, "pg_cdc_creds", "admin_user").await;
     assert!(in_use_drop.is_err());
@@ -118,7 +119,10 @@ async fn test_secrets_lifecycle_in_memory_and_audit() {
     );
 
     // Remove reference and drop succeeds
-    store.remove_reference(ns, "pg_cdc_creds", "source_pg_cdc_1");
+    store
+        .remove_reference(ns, "pg_cdc_creds", "source_pg_cdc_1")
+        .await
+        .unwrap();
     store
         .drop_secret(ns, "pg_cdc_creds", "admin_user")
         .await
@@ -225,4 +229,53 @@ async fn test_secrets_lifecycle_slatedb_persistence() {
     let remaining = store.list_secrets(ns).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].name, "kafka_source_secret");
+}
+
+#[tokio::test]
+async fn test_secret_references_survive_store_reopen() {
+    let dir = TempDir::new().unwrap();
+    let db = open_test_slatedb(&dir).await;
+    let kek_provider = Arc::new(EnvKekProvider::from_passphrase("reference-persistence-kek"));
+    let store = SecretStore::new(Some(db.clone()), kek_provider.clone());
+    let ns = 84u128;
+    store
+        .create_secret(
+            ns,
+            "orders_secret",
+            SecretType::BearerToken,
+            HashMap::from([("token".to_string(), "token-value".to_string())]),
+            "root",
+        )
+        .await
+        .unwrap();
+    store
+        .add_reference(ns, "orders_secret", "orders_sink")
+        .await
+        .unwrap();
+
+    drop(store);
+    Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+
+    let reopened_db = open_test_slatedb(&dir).await;
+    let reopened = SecretStore::new(Some(reopened_db), kek_provider);
+    assert_eq!(
+        reopened.get_references(ns, "orders_secret").await.unwrap(),
+        vec!["orders_sink".to_string()]
+    );
+    assert_eq!(
+        reopened
+            .drop_secret(ns, "orders_secret", "root")
+            .await
+            .unwrap_err()
+            .to_string(),
+        "[RS-2426] secret.in_use_by_source_or_sink: secret 'orders_secret' is in use by sources/sinks [orders_sink]. Next steps: drop or alter referencing sources and sinks before dropping the secret."
+    );
+    reopened
+        .remove_reference(ns, "orders_secret", "orders_sink")
+        .await
+        .unwrap();
+    reopened
+        .drop_secret(ns, "orders_secret", "root")
+        .await
+        .unwrap();
 }
