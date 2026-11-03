@@ -35,7 +35,9 @@ impl std::str::FromStr for AuthMode {
             "mtls" => Ok(AuthMode::Mtls),
             "scram" => Ok(AuthMode::Scram),
             "md5" => Ok(AuthMode::Md5),
-            _ => Err(format!("unknown auth mode `{s}`")),
+            _ => Err(format!(
+                "[RS-0002] configuration error: unknown auth mode `{s}`"
+            )),
         }
     }
 }
@@ -428,7 +430,10 @@ mod tests {
     #[test]
     fn auth_mode_rejects_unknown_value_instead_of_disabling_auth() {
         let err = "oidc_typo".parse::<AuthMode>().unwrap_err();
-        assert_eq!(err, "unknown auth mode `oidc_typo`");
+        assert_eq!(
+            err,
+            "[RS-0002] configuration error: unknown auth mode `oidc_typo`"
+        );
     }
 
     /// S2 green gate: jwt_bearer_token_validates_sub
