@@ -182,6 +182,10 @@ pub struct CatalogSourceEntry {
     pub connector_type: String,
     pub table_name: Option<String>,
     pub options: HashMap<String, String>,
+    #[serde(default)]
+    pub secret_consumer: Option<PrincipalId>,
+    #[serde(default)]
+    pub secret_namespace: Option<String>,
 }
 
 /// Persisted source record with explicit version tag (v0.69 Step 1, V069-01).
@@ -260,6 +264,12 @@ pub struct CatalogSinkEntry {
     pub target: String,
     pub options: HashMap<String, String>,
     pub status: String,
+    #[serde(default)]
+    pub secret_reference: Option<String>,
+    #[serde(default)]
+    pub secret_consumer: Option<PrincipalId>,
+    #[serde(default)]
+    pub secret_namespace: Option<String>,
 }
 
 /// A workload and its immutable catalog identity.

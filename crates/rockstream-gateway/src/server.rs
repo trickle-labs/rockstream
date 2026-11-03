@@ -93,7 +93,7 @@ use rockstream_types::diagnostic::{
 use rockstream_types::error_code::{ErrorCode, ErrorDescriptor, RS_1012};
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
-use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId, WorkloadId};
+use rockstream_types::ids::{ConnectorId, OperatorId, PrincipalId, ShardId, ViewId, WorkloadId};
 use rockstream_types::mutation_policy::pgwire_mutation_policy;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
@@ -2622,6 +2622,124 @@ impl GatewayHandler {
         Ok(found)
     }
 
+    async fn authorize_secret_use_for_connection(
+        &self,
+        conn_id: Option<&str>,
+        secret_name: &str,
+    ) -> Result<Option<(PrincipalId, String)>, ()> {
+        if self.auth_mode == AuthMode::Off && self.catalog.get_durable_store().is_none() {
+            return Ok(None);
+        }
+
+        let session = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+        });
+        let principal = session.as_ref().map(|(principal, _)| principal);
+        let namespace = session
+            .as_ref()
+            .map(|(_, namespace)| namespace.clone())
+            .unwrap_or_else(|| "public".to_string());
+        let consumer = match principal {
+            Some(authenticated) if !authenticated.is_system() => self
+                .security_principal_for_login(authenticated)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        let scope = consumer.as_ref().map(|consumer| PolicyScope::Secret {
+            namespace: namespace.clone(),
+            name: secret_name.to_string(),
+            consumer: Some(consumer.id),
+        });
+        let authorized = consumer.as_ref().is_some_and(|consumer| {
+            scope.as_ref().is_some_and(|scope| {
+                rockstream_control::authorization::allows(
+                    consumer,
+                    SecurityAction::SecretUse,
+                    scope,
+                )
+            })
+        });
+        if authorized {
+            return Ok(consumer.map(|consumer| (consumer.id, namespace)));
+        }
+
+        let audit_recorded = self
+            .append_authorization_denial(
+                principal,
+                conn_id,
+                scope.as_ref(),
+                Some(secret_name),
+                consumer.as_ref().map(|principal| principal.revision),
+            )
+            .await
+            .is_ok();
+        if !audit_recorded {
+            if let Some(id) = conn_id {
+                self.sessions.remove(id);
+            }
+        }
+        Err(())
+    }
+
+    async fn authorize_source_secret_use(
+        &self,
+        source: &CatalogSourceEntry,
+        reference: &str,
+    ) -> Result<String, String> {
+        let secret_name = rockstream_types::secret::secret_name_from_reference(reference)
+            .ok_or_else(|| "source has an unsupported secret reference".to_string())?;
+        if self.auth_mode == AuthMode::Off && self.catalog.get_durable_store().is_none() {
+            return Ok(secret_name.to_string());
+        }
+
+        let consumer_id = source.secret_consumer.ok_or_else(|| {
+            "source secret reference has no durable consumer identity".to_string()
+        })?;
+        let namespace = source
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "source secret reference has no durable namespace".to_string())?;
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable secret authorization state is unavailable".to_string())?;
+        use rockstream_storage::catalog::CatalogStore;
+        let consumers = store
+            .list_security_principals()
+            .await
+            .map_err(|_| "durable secret authorization state is unavailable".to_string())?;
+        let consumer = consumers
+            .into_iter()
+            .find(|principal| principal.id == consumer_id && principal.enabled)
+            .ok_or_else(|| "source secret consumer is no longer enabled".to_string())?;
+        let scope = PolicyScope::Secret {
+            namespace: namespace.to_string(),
+            name: secret_name.to_string(),
+            consumer: Some(consumer_id),
+        };
+        if !rockstream_control::authorization::allows(&consumer, SecurityAction::SecretUse, &scope)
+        {
+            return Err("source secret consumer is no longer authorized".to_string());
+        }
+        Ok(secret_name.to_string())
+    }
+
+    async fn resolve_source_secret(
+        &self,
+        source: &CatalogSourceEntry,
+        reference: &str,
+    ) -> Result<rockstream_types::secret::Secret, String> {
+        let secret_name = self.authorize_source_secret_use(source, reference).await?;
+        self.secret_store
+            .get_secret(0, &secret_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn append_authorization_denial(
         &self,
         principal: Option<&Principal>,
@@ -3808,7 +3926,7 @@ impl GatewayHandler {
         Ok(())
     }
 
-    fn build_kafka_source(
+    async fn build_kafka_source(
         &self,
         source: &CatalogSourceEntry,
         view_name: &str,
@@ -3849,8 +3967,12 @@ impl GatewayHandler {
             &group_id,
         )
         .map_err(source_backfill_error)?;
-        if let Some(secret_name) = source.options.get("secret") {
-            runtime.bind_secret(secret_name.clone());
+        if let Some(secret_reference) = source.options.get("secret") {
+            let secret_name = self
+                .authorize_source_secret_use(source, secret_reference)
+                .await
+                .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+            runtime.bind_secret(secret_name);
         }
         Ok((table, connector_id, runtime))
     }
@@ -3880,15 +4002,18 @@ impl GatewayHandler {
                 }
             })
         };
-        let secret_name = source.options.get("secret").cloned();
-        let (password, secret_name) = if let Some(secret_name) = secret_name {
+        let secret_reference = source.options.get("secret").cloned();
+        let (password, secret_name) = if let Some(secret_reference) = secret_reference {
             let secret = self
-                .secret_store
-                .get_secret(0, &secret_name)
+                .resolve_source_secret(source, &secret_reference)
                 .await
-                .map_err(|error| GatewayError::QueryTimeExecutionFailed {
-                    detail: error.to_string(),
-                })?;
+                .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+            let secret_name =
+                rockstream_types::secret::secret_name_from_reference(&secret_reference)
+                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                        detail: "source has an unsupported secret reference".to_string(),
+                    })?
+                    .to_string();
             let password = secret.payload.get("password").cloned();
             (password, Some(secret_name))
         } else {
@@ -3962,7 +4087,7 @@ impl GatewayHandler {
             controller: Arc::clone(&self.backfill_admission),
             bytes: BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
         };
-        let (_, connector_id, source_runtime) = self.build_kafka_source(source, view_name)?;
+        let (_, connector_id, source_runtime) = self.build_kafka_source(source, view_name).await?;
         let checkpoint_store =
             SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
         self.backfill_bound_source(
@@ -4482,7 +4607,7 @@ impl GatewayHandler {
             return;
         };
         let Ok((table, connector_id, source_runtime)) =
-            handler.build_kafka_source(&source, &view_name)
+            handler.build_kafka_source(&source, &view_name).await
         else {
             return;
         };
@@ -7508,6 +7633,23 @@ impl GatewayHandler {
             return self.handle_drop_workload(query).await;
         }
 
+        if ql.starts_with("create sink ") {
+            return Ok(self
+                .handle_create_sink_with_connection(query, conn_id)
+                .await?
+                .into_iter()
+                .map(promote_response)
+                .collect());
+        }
+        if ql.starts_with("create source ") {
+            return Ok(self
+                .handle_create_source_with_connection(query, conn_id)
+                .await?
+                .into_iter()
+                .map(promote_response)
+                .collect());
+        }
+
         if let Some(result) = self.dispatch_sync(query, &session_info).await {
             // Promote lifetime — responses from dispatch_sync hold no borrows
             // from `query`, only owned data.
@@ -9684,6 +9826,14 @@ impl GatewayHandler {
 
     /// Handle `CREATE SINK <name> FOR VIEW <view> TO ICEBERG|DELTA '<path>' WITH (...)` — v0.44.
     async fn handle_create_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        self.handle_create_sink_with_connection(q, None).await
+    }
+
+    async fn handle_create_sink_with_connection<'a>(
+        &'a self,
+        q: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let if_not_exists = ql.contains("if not exists");
         let parsed = match parse_create_sink_ddl(q) {
@@ -9720,8 +9870,40 @@ impl GatewayHandler {
             ))]);
         }
 
-        let secret_name = parsed.secret.clone();
-        if let Some(secret_name) = secret_name.as_deref() {
+        let secret_reference = match parsed.secret.as_deref() {
+            Some(reference) => {
+                let Some(reference) =
+                    rockstream_types::secret::canonical_secret_reference(reference)
+                else {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-4007] CREATE SINK secret must be a name or secret:// reference. Next steps: use the documented secret = '<name>' option."
+                            .to_string(),
+                    )]);
+                };
+                Some(reference)
+            }
+            None => None,
+        };
+        let secret_name = secret_reference
+            .as_deref()
+            .and_then(rockstream_types::secret::secret_name_from_reference);
+        let secret_scope = if let Some(secret_name) = secret_name {
+            match self
+                .authorize_secret_use_for_connection(conn_id, secret_name)
+                .await
+            {
+                Ok(scope) => scope,
+                Err(()) => {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
+                            .to_string(),
+                    )]);
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(secret_name) = secret_name {
             if !secret_name.is_empty() {
                 let ns = 0u128;
                 let secret_exists = match self.secret_store.contains_secret(ns, secret_name).await {
@@ -9753,7 +9935,11 @@ impl GatewayHandler {
             format_version: parsed.format_version,
             partition_by: parsed.partition_by,
             catalog: parsed.catalog,
-            secret_name: secret_name.clone(),
+            secret_name: secret_reference.clone(),
+            secret_consumer: secret_scope.as_ref().map(|(consumer, _)| *consumer),
+            secret_namespace: secret_scope
+                .as_ref()
+                .map(|(_, namespace)| namespace.clone()),
             last_snapshot_epoch: None,
             state: "OK".to_string(),
         };
@@ -9764,7 +9950,7 @@ impl GatewayHandler {
                 parsed.name
             ))]);
         }
-        if let Some(secret_name) = secret_name.as_deref() {
+        if let Some(secret_name) = secret_name {
             if let Err(error) = self
                 .secret_store
                 .add_reference(0u128, secret_name, &parsed.name)
@@ -9834,7 +10020,14 @@ impl GatewayHandler {
             )))]);
         };
 
-        if let Some(secret_name) = sink.secret_name.as_deref() {
+        if let Some(secret_reference) = sink.secret_name.as_deref() {
+            let Some(secret_name) =
+                rockstream_types::secret::secret_name_from_reference(secret_reference)
+            else {
+                return Ok(vec![create_sink_error_response(
+                    "[RS-4007] sink has an unsupported secret reference".to_string(),
+                )]);
+            };
             if let Err(error) = self
                 .secret_store
                 .remove_reference(0u128, secret_name, &name)
@@ -9859,6 +10052,14 @@ impl GatewayHandler {
     }
 
     async fn handle_create_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        self.handle_create_source_with_connection(q, None).await
+    }
+
+    async fn handle_create_source_with_connection<'a>(
+        &'a self,
+        q: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_create_source_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![create_source_error_response(message)]),
@@ -9876,8 +10077,42 @@ impl GatewayHandler {
             ))]);
         }
 
-        let secret_ref = parsed.options.get("secret").cloned();
-        if let Some(secret_name) = secret_ref.as_deref() {
+        let secret_ref = parsed
+            .options
+            .get("secret")
+            .map(|reference| {
+                rockstream_types::secret::canonical_secret_reference(reference).ok_or(())
+            })
+            .transpose();
+        let secret_ref = match secret_ref {
+            Ok(reference) => reference,
+            Err(()) => {
+                return Ok(vec![create_source_error_response(
+                    "[RS-4008] CREATE SOURCE secret must be a name or secret:// reference. Next steps: use the documented secret = '<name>' option."
+                        .to_string(),
+                )]);
+            }
+        };
+        let secret_name = secret_ref
+            .as_deref()
+            .and_then(rockstream_types::secret::secret_name_from_reference);
+        let secret_scope = if let Some(secret_name) = secret_name {
+            match self
+                .authorize_secret_use_for_connection(conn_id, secret_name)
+                .await
+            {
+                Ok(scope) => scope,
+                Err(()) => {
+                    return Ok(vec![create_source_error_response(
+                        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
+                            .to_string(),
+                    )]);
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(secret_name) = secret_name {
             if !secret_name.is_empty() {
                 let ns = 0u128;
                 let secret_exists = match self.secret_store.contains_secret(ns, secret_name).await {
@@ -9897,6 +10132,10 @@ impl GatewayHandler {
             }
         }
 
+        let mut options = parsed.options.clone();
+        if let Some(reference) = secret_ref.as_ref() {
+            options.insert("secret".to_string(), reference.clone());
+        }
         let entry = CatalogSourceEntry {
             name: parsed.name.clone(),
             table_name: self
@@ -9904,11 +10143,15 @@ impl GatewayHandler {
                 .get_table(&parsed.name)
                 .map(|_| parsed.name.clone()),
             source_type: parsed.source_type.clone(),
-            options: parsed.options.clone(),
+            options,
             format: parsed.format.clone(),
             status: "OK".to_string(),
             live_offset: "0".to_string(),
             live_lag: 0,
+            secret_consumer: secret_scope.as_ref().map(|(consumer, _)| *consumer),
+            secret_namespace: secret_scope
+                .as_ref()
+                .map(|(_, namespace)| namespace.clone()),
         };
 
         if entry.source_type == "postgres_cdc" && entry.format == "pgoutput" {
@@ -9949,7 +10192,7 @@ impl GatewayHandler {
                 parsed.name
             ))]);
         }
-        if let Some(secret_name) = secret_ref.as_deref() {
+        if let Some(secret_name) = secret_name {
             if let Err(error) = self
                 .secret_store
                 .add_reference(0u128, secret_name, &parsed.name)
@@ -10209,8 +10452,15 @@ impl GatewayHandler {
                         .map(|identity| identity.connector_id())
                 });
                 if let Some(source_entry) = source.as_ref() {
-                    let secret_name_opt = source_entry.options.get("secret");
-                    if let Some(secret_name) = secret_name_opt {
+                    let secret_reference = source_entry.options.get("secret");
+                    if let Some(secret_reference) = secret_reference {
+                        let Some(secret_name) =
+                            rockstream_types::secret::secret_name_from_reference(secret_reference)
+                        else {
+                            return Ok(vec![create_source_error_response(
+                                "[RS-4008] source has an unsupported secret reference".to_string(),
+                            )]);
+                        };
                         if let Err(error) = self
                             .secret_store
                             .remove_reference(0u128, secret_name, &parsed.name)

@@ -65,6 +65,14 @@ Workers receive short-lived tokens over authenticated mTLS. Decrypted payloads
 remain in the worker process memory and are refreshed at the next epoch after
 an `ALTER SECRET`; they are never written to worker storage.
 
+Connector SQL continues to accept `secret = '<name>'`; newly persisted source
+and sink metadata uses the canonical `secret://<name>` reference. A role preset
+does not imply secret use: authorization requires an explicit grant scoped to
+the secret and consumer principal, and gateway source resolution reads the
+consumer's current durable policy before decrypting the value. Legacy source
+records without a persisted consumer identity are denied at resolution; an
+authorized migration route remains to be qualified.
+
 This document describes the security model, mutual TLS (mTLS) transport encryption, identity verification, and dynamic certificate rotation in RockStream.
 
 For full assessor findings, verification records, and machine-readable audit metadata, see [Security Report](file:///Users/grove/projects/rockstream/docs/security-report.md) and [Security Assessment Metadata](file:///Users/grove/projects/rockstream/docs/security-assessment.json).

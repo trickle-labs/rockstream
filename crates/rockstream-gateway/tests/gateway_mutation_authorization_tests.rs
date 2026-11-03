@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rockstream_control::audit::FileAuditLog;
+use rockstream_control::kek::EnvKekProvider;
+use rockstream_control::SecretStore;
 use rockstream_gateway::auth::Principal;
 use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable, CatalogView};
 use rockstream_gateway::role_catalog::{gen_scram_verifiers, RoleEntry};
@@ -11,11 +14,13 @@ use rockstream_gateway::GatewayError;
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
-    ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
-    SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
+    ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
+    SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
 use rockstream_types::ids::PrincipalId;
 use rockstream_types::mutation_policy::{pgwire_mutation_policy, PGWIRE_MUTATION_POLICY};
+use rockstream_types::secret::SecretType;
 
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
@@ -254,7 +259,25 @@ async fn gateway_mutation_authorization_lfs() {
 #[tokio::test]
 async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() {
     let catalog = Arc::new(CatalogStubs::new());
-    let handler = GatewayHandler::new(catalog.clone(), Arc::new(NoopViewReader));
+    let secret_store = Arc::new(SecretStore::new(
+        None,
+        Arc::new(EnvKekProvider::from_passphrase("secret-use-test-kek")),
+    ));
+    secret_store
+        .create_secret(
+            0,
+            "kafka_auth",
+            SecretType::SaslPlain,
+            HashMap::from([
+                ("username".to_string(), "source-user".to_string()),
+                ("password".to_string(), "source-password".to_string()),
+            ]),
+            "test",
+        )
+        .await
+        .unwrap();
+    let handler = GatewayHandler::new(catalog.clone(), Arc::new(NoopViewReader))
+        .with_secret_store(secret_store);
     let protected_table = CatalogTable::new(
         "blocked",
         vec![CatalogColumn {
@@ -318,12 +341,19 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
             server_key: server_key.to_vec(),
         }],
         preset_grants: vec![ScopedPresetGrant {
-            preset: PermissionPreset::DataReader,
+            preset: PermissionPreset::Builder,
             scope: PolicyScope::Namespace {
                 namespace: "public".to_string(),
             },
         }],
-        scoped_grants: vec![],
+        scoped_grants: vec![ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: PolicyScope::Secret {
+                namespace: "public".to_string(),
+                name: "kafka_auth".to_string(),
+                consumer: Some(PrincipalId(2)),
+            },
+        }],
     };
     let reader_policy =
         serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
@@ -489,6 +519,80 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
             &denial
         );
     }
+
+    let allowed_source = handler
+        .dispatch_async_with_conn(
+            "CREATE SOURCE kafka_src TYPE kafka (bootstrap.servers='localhost:9092', topic='orders', secret='kafka_auth') FORMAT json",
+            Some(reader_connection),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed_source.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    let source = catalog.get_source("kafka_src").unwrap();
+    assert_eq!(
+        source.options.get("secret").map(String::as_str),
+        Some("secret://kafka_auth")
+    );
+    assert_eq!(source.secret_consumer, Some(PrincipalId(2)));
+    assert_eq!(source.secret_namespace.as_deref(), Some("public"));
+
+    let denied_source = handler
+        .dispatch_async_with_conn(
+            "CREATE SOURCE denied_src TYPE kafka (bootstrap.servers='localhost:9092', topic='orders', secret='restricted_secret') FORMAT json",
+            Some(reader_connection),
+        )
+        .await
+        .unwrap();
+    let error = match denied_source.as_slice() {
+        [pgwire::api::results::Response::Error(error)] => error,
+        _ => panic!("expected secret-use denial"),
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "42601");
+    assert_eq!(
+        error.message,
+        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
+    );
+    assert!(catalog.get_source("denied_src").is_none());
+    assert!(handler.sessions.contains_key(reader_connection));
+
+    let records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 5);
+    let denied_secret_use = records.last().unwrap();
+    assert!(denied_secret_use.event_id.starts_with("gateway-authz-"));
+    assert!(denied_secret_use.timestamp_ms > 0);
+    assert_eq!(
+        denied_secret_use.actor,
+        AuditIdentity::Verified("scram:reader-login".to_string())
+    );
+    assert_eq!(
+        denied_secret_use.target,
+        AuditField::Known("restricted_secret".to_string())
+    );
+    assert_eq!(
+        denied_secret_use.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::Secret {
+                namespace: "public".to_string(),
+                name: "restricted_secret".to_string(),
+                consumer: Some(PrincipalId(2)),
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(
+        denied_secret_use.action,
+        SecurityAuditClass::AuthorizationDenial
+    );
+    assert_eq!(denied_secret_use.outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(
+        denied_secret_use.correlation,
+        AuditCorrelation::Observed(reader_connection.to_string())
+    );
+    assert_eq!(denied_secret_use.policy_revision, AuditField::Known(1));
 }
 
 #[cfg(feature = "testcontainers")]

@@ -294,6 +294,10 @@ pub struct CatalogSinkEntry {
     pub catalog: String,
     #[serde(default)]
     pub secret_name: Option<String>,
+    #[serde(default)]
+    pub secret_consumer: Option<rockstream_types::ids::PrincipalId>,
+    #[serde(default)]
+    pub secret_namespace: Option<String>,
     /// Last epoch whose snapshot was committed through this sink (v0.44
     /// slice 10, `EXPLAIN` annotation). `None` until the first snapshot
     /// commits.
@@ -317,6 +321,10 @@ pub struct CatalogSourceEntry {
     pub status: String,
     pub live_offset: String,
     pub live_lag: u64,
+    #[serde(default)]
+    pub secret_consumer: Option<rockstream_types::ids::PrincipalId>,
+    #[serde(default)]
+    pub secret_namespace: Option<String>,
 }
 
 /// Live source registration kept with the catalog under the same lock.  This
@@ -692,6 +700,7 @@ impl CatalogStubs {
         let workloads = store.list_workloads().await.map_err(|e| e.to_string())?;
         let sources = store.list_sources().await.map_err(|e| e.to_string())?;
         let sinks = store.list_sinks().await.map_err(|e| e.to_string())?;
+        let mut reference_migrations = Vec::new();
 
         let view_deps = store
             .list_view_dependencies()
@@ -798,7 +807,20 @@ impl CatalogStubs {
         }
         inner.sources.clear();
         inner.source_runtime.clear();
-        for s in sources {
+        for mut s in sources {
+            if let Some(reference) = s.options.get_mut("secret") {
+                let Some(canonical) =
+                    rockstream_types::secret::canonical_secret_reference(reference)
+                else {
+                    return Err("durable source has an unsupported secret reference".to_string());
+                };
+                if *reference != canonical {
+                    *reference = canonical;
+                    reference_migrations.push(
+                        rockstream_storage::catalog::CatalogMutation::PutSource(s.clone()),
+                    );
+                }
+            }
             inner.sources.insert(
                 s.name.clone(),
                 CatalogSourceEntry {
@@ -810,6 +832,8 @@ impl CatalogStubs {
                     status: "RUNNING".to_string(),
                     live_offset: "0".to_string(),
                     live_lag: 0,
+                    secret_consumer: s.secret_consumer,
+                    secret_namespace: s.secret_namespace,
                 },
             );
             inner.source_runtime.insert(
@@ -834,7 +858,28 @@ impl CatalogStubs {
             );
         }
         inner.sinks.clear();
-        for s in sinks {
+        for mut s in sinks {
+            let secret_reference = s
+                .secret_reference
+                .clone()
+                .or_else(|| s.options.get("secret").cloned())
+                .map(|reference| {
+                    rockstream_types::secret::canonical_secret_reference(&reference).ok_or_else(
+                        || "durable sink has an unsupported secret reference".to_string(),
+                    )
+                })
+                .transpose()?;
+            if let Some(reference) = secret_reference.as_ref() {
+                let reference_is_current = s.secret_reference.as_ref() == Some(reference)
+                    && s.options.get("secret") == Some(reference);
+                if !reference_is_current {
+                    s.secret_reference = Some(reference.clone());
+                    s.options.insert("secret".to_string(), reference.clone());
+                    reference_migrations.push(
+                        rockstream_storage::catalog::CatalogMutation::PutSink(s.clone()),
+                    );
+                }
+            }
             inner.sinks.insert(
                 s.name.clone(),
                 CatalogSinkEntry {
@@ -848,13 +893,34 @@ impl CatalogStubs {
                     format_version: None,
                     partition_by: vec![],
                     catalog: "memory".to_string(),
-                    secret_name: None,
+                    secret_name: secret_reference,
+                    secret_consumer: s.secret_consumer,
+                    secret_namespace: s.secret_namespace,
                     last_snapshot_epoch: None,
                     state: "OK".to_string(),
                 },
             );
         }
         drop(inner);
+        if !reference_migrations.is_empty() {
+            let revision = store
+                .get_revision()
+                .await
+                .checked_add(1)
+                .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+            let transaction = rockstream_storage::catalog::CatalogTxn::new(
+                revision,
+                rand::random::<u64>().max(1),
+                reference_migrations,
+            )
+            .map_err(|error| error.to_string())?;
+            store
+                .commit_txn(transaction)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.catalog_revision
+                .store(revision, std::sync::atomic::Ordering::SeqCst);
+        }
         self.projection_cache.write().unwrap().clear();
         Ok(())
     }
@@ -1838,14 +1904,43 @@ impl CatalogStubs {
 
     /// Register a new sink. Returns `false` if a sink with the same name and a
     /// different view already exists.
-    pub fn add_sink(&self, entry: CatalogSinkEntry) -> bool {
+    pub fn add_sink(&self, mut entry: CatalogSinkEntry) -> bool {
+        if let Some(reference) = entry.secret_name.as_deref() {
+            let Some(canonical) = rockstream_types::secret::canonical_secret_reference(reference)
+            else {
+                return false;
+            };
+            entry.secret_name = Some(canonical);
+        }
         let mut inner = self.inner.write().unwrap();
         if let Some(existing) = inner.sinks.get(&entry.name) {
             if existing.view != entry.view {
                 return false;
             }
         }
+        let storage_entry = rockstream_storage::catalog::CatalogSinkEntry {
+            id: rockstream_types::ids::SinkId(rockstream_storage::catalog::stable_name_id(
+                "sink",
+                &entry.name,
+            )),
+            name: entry.name.clone(),
+            sink_type: entry.format.clone(),
+            target: entry.path.clone(),
+            options: entry
+                .secret_name
+                .as_ref()
+                .map(|reference| [("secret".to_string(), reference.clone())].into())
+                .unwrap_or_default(),
+            status: entry.state.clone(),
+            secret_reference: entry.secret_name.clone(),
+            secret_consumer: entry.secret_consumer,
+            secret_namespace: entry.secret_namespace.clone(),
+        };
         inner.sinks.insert(entry.name.clone(), entry);
+        drop(inner);
+        self.persist_mutations(vec![rockstream_storage::catalog::CatalogMutation::PutSink(
+            storage_entry,
+        )]);
         true
     }
 
@@ -1858,7 +1953,17 @@ impl CatalogStubs {
     /// Remove a sink entry (DROP SINK in a later slice).
     pub fn remove_sink(&self, name: &str) {
         let mut inner = self.inner.write().unwrap();
-        inner.sinks.remove(name);
+        let removed = inner.sinks.remove(name).is_some();
+        drop(inner);
+        if removed {
+            self.persist_mutations(vec![
+                rockstream_storage::catalog::CatalogMutation::DeleteSink(
+                    rockstream_types::ids::SinkId(rockstream_storage::catalog::stable_name_id(
+                        "sink", name,
+                    )),
+                ),
+            ]);
+        }
     }
 
     /// List all registered sinks.
@@ -1872,7 +1977,14 @@ impl CatalogStubs {
     // ── Source catalog (v0.51.9 pgwire DDL wiring) ───────────────────────────
 
     /// Register a new source. Returns `false` if a source with the same name already exists.
-    pub fn add_source(&self, entry: CatalogSourceEntry) -> bool {
+    pub fn add_source(&self, mut entry: CatalogSourceEntry) -> bool {
+        if let Some(reference) = entry.options.get_mut("secret") {
+            let Some(canonical) = rockstream_types::secret::canonical_secret_reference(reference)
+            else {
+                return false;
+            };
+            *reference = canonical;
+        }
         let mut inner = self.inner.write().unwrap();
         if inner.sources.contains_key(&entry.name) {
             return false;
@@ -1911,6 +2023,8 @@ impl CatalogStubs {
             connector_type: entry.source_type.clone(),
             table_name: entry.table_name.clone(),
             options: entry.options.clone(),
+            secret_consumer: entry.secret_consumer,
+            secret_namespace: entry.secret_namespace.clone(),
         };
         self.persist_mutations(vec![
             rockstream_storage::catalog::CatalogMutation::PutSource(cat_source),
@@ -6362,6 +6476,8 @@ mod tests {
             status: "OK".to_string(),
             live_offset: "0".to_string(),
             live_lag: 0,
+            secret_consumer: None,
+            secret_namespace: None,
         };
 
         assert!(catalog.add_source(source.clone()));
