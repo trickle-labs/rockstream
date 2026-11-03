@@ -336,10 +336,10 @@ mod tests {
         assert!(!id.matches_worker_id(2));
 
         let role_only = NodeIdentity::new(NodeRole::Worker, "worker", None::<String>);
-        assert_eq!(role_only.matches_worker_id(1), false);
-        assert_eq!(role_only.matches_worker_str("1"), false);
-        assert_eq!(role_only.matches_worker_str("worker-1"), false);
-        assert_eq!(role_only.matches_worker_str("worker-worker"), false);
+        assert!(!role_only.matches_worker_id(1));
+        assert!(!role_only.matches_worker_str("1"));
+        assert!(!role_only.matches_worker_str("worker-1"));
+        assert!(!role_only.matches_worker_str("worker-worker"));
 
         let control_id = NodeIdentity::new(NodeRole::Control, "control-1", None::<String>);
         assert!(!control_id.matches_worker_id(1));
