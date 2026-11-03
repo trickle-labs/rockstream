@@ -4,11 +4,14 @@
 #![cfg(feature = "testcontainers")]
 
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio_postgres::NoTls;
 
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
     role_catalog::{create_role_entry, gen_scram_verifiers, RoleCatalog},
+    server::GatewayHandler,
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -53,13 +56,18 @@ fn data_rows_from(
 }
 
 async fn spawn_scram_gateway(roles: Vec<(&str, &str)>) -> (u16, tokio::task::JoinHandle<()>) {
-    let (port, handle, _) = spawn_scram_gateway_with_catalog(roles).await;
+    let (port, handle, _, _) = spawn_scram_gateway_with_catalog(roles).await;
     (port, handle)
 }
 
 async fn spawn_scram_gateway_with_catalog(
     roles: Vec<(&str, &str)>,
-) -> (u16, tokio::task::JoinHandle<()>, Arc<CatalogStubs>) {
+) -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    Arc<CatalogStubs>,
+    Arc<GatewayHandler>,
+) {
     let catalog = Arc::new(CatalogStubs::new());
     let role_catalog = Arc::new(RoleCatalog::new());
     let mut login_methods = Vec::new();
@@ -106,8 +114,46 @@ async fn spawn_scram_gateway_with_catalog(
         Arc::new(NoopViewReader),
         role_catalog,
     );
+    let handler = server.handler().clone();
     let (local_addr, handle) = server.serve_background().await.unwrap();
-    (local_addr.port(), handle, catalog)
+    (local_addr.port(), handle, catalog, handler)
+}
+
+async fn write_frontend_message(stream: &mut TcpStream, tag: u8, payload: &[u8]) {
+    let message_len = u32::try_from(payload.len() + 4).unwrap();
+    stream.write_all(&[tag]).await.unwrap();
+    stream.write_all(&message_len.to_be_bytes()).await.unwrap();
+    stream.write_all(payload).await.unwrap();
+    stream.flush().await.unwrap();
+}
+
+async fn read_backend_message(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await.unwrap();
+    let message_len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+    let mut payload = vec![0u8; message_len - 4];
+    stream.read_exact(&mut payload).await.unwrap();
+    (header[0], payload)
+}
+
+fn parse_error_fields(payload: &[u8]) -> std::collections::BTreeMap<u8, String> {
+    let mut fields = std::collections::BTreeMap::new();
+    let mut cursor = 0;
+    while cursor < payload.len() && payload[cursor] != 0 {
+        let kind = payload[cursor];
+        cursor += 1;
+        let end = payload[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| cursor + offset)
+            .unwrap();
+        fields.insert(
+            kind,
+            String::from_utf8(payload[cursor..end].to_vec()).unwrap(),
+        );
+        cursor = end + 1;
+    }
+    fields
 }
 
 async fn assert_scram_startup_rejects(catalog: Arc<CatalogStubs>) {
@@ -158,7 +204,7 @@ async fn test_scram_startup_rejects_missing_or_empty_durable_credentials() {
 
 #[tokio::test]
 async fn test_scram_tokio_postgres_connects() {
-    let (port, _handle, catalog) =
+    let (port, _handle, catalog, _) =
         spawn_scram_gateway_with_catalog(vec![("alice", "pencil")]).await;
     let store = catalog.get_durable_store().expect("durable SCRAM store");
     let (client, conn) = tokio_postgres::connect(
@@ -207,7 +253,7 @@ async fn test_scram_tokio_postgres_connects() {
 
 #[tokio::test]
 async fn test_scram_wrong_password() {
-    let (port, _handle, catalog) =
+    let (port, _handle, catalog, _) =
         spawn_scram_gateway_with_catalog(vec![("alice", "pencil")]).await;
     let store = catalog.get_durable_store().expect("durable SCRAM store");
     let principals_before = store
@@ -228,9 +274,10 @@ async fn test_scram_wrong_password() {
         .as_db_error()
         .expect("authentication error from gateway");
     assert_eq!(database_error.code().code(), "28P01");
-    assert!(database_error
-        .message()
-        .starts_with("[RS-2401] auth.invalid_password:"));
+    assert_eq!(
+        database_error.message(),
+        "[RS-2401] auth.invalid_password: password authentication failed for user 'alice'. next_steps: Check password and retry"
+    );
     let records = store
         .list_security_audit_records()
         .await
@@ -267,6 +314,105 @@ async fn test_scram_wrong_password() {
         .await
         .expect("read persisted principal");
     assert_eq!(principals, principals_before);
+}
+
+#[tokio::test]
+async fn test_scram_invalid_proof_is_rejected_and_audited_without_session() {
+    let (port, _handle, catalog, handler) =
+        spawn_scram_gateway_with_catalog(vec![("alice", "pencil")]).await;
+    let store = catalog.get_durable_store().expect("durable SCRAM store");
+    let principals_before = store
+        .list_security_principals()
+        .await
+        .expect("read initial principal");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+
+    let mut startup = Vec::new();
+    startup.extend_from_slice(&196_608u32.to_be_bytes());
+    startup.extend_from_slice(b"user\0alice\0database\0test\0\0");
+    let startup_len = u32::try_from(startup.len() + 4).unwrap();
+    stream.write_all(&startup_len.to_be_bytes()).await.unwrap();
+    stream.write_all(&startup).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let (tag, auth_sasl) = read_backend_message(&mut stream).await;
+    assert_eq!(tag, b'R');
+    assert_eq!(&auth_sasl[..4], &10i32.to_be_bytes());
+    assert!(auth_sasl[4..].starts_with(b"SCRAM-SHA-256\0"));
+
+    let client_first = b"n,,n=,r=client-nonce";
+    let mut initial_response = b"SCRAM-SHA-256\0".to_vec();
+    initial_response.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+    initial_response.extend_from_slice(client_first);
+    write_frontend_message(&mut stream, b'p', &initial_response).await;
+
+    let (tag, server_continue) = read_backend_message(&mut stream).await;
+    assert_eq!(tag, b'R');
+    assert_eq!(&server_continue[..4], &11i32.to_be_bytes());
+    let server_first = String::from_utf8(server_continue[4..].to_vec()).unwrap();
+    let server_nonce = server_first
+        .split(',')
+        .find_map(|part| part.strip_prefix("r="))
+        .expect("server nonce");
+    let client_final =
+        format!("c=biws,r={server_nonce},p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    write_frontend_message(&mut stream, b'p', client_final.as_bytes()).await;
+
+    let (tag, error_payload) = read_backend_message(&mut stream).await;
+    assert_eq!(tag, b'E');
+    let fields = parse_error_fields(&error_payload);
+    assert_eq!(fields.get(&b'C'), Some(&"28P01".to_string()));
+    assert_eq!(
+        fields.get(&b'M'),
+        Some(&"[RS-2401] auth.invalid_password: password authentication failed for user 'alice'. next_steps: Check password and retry".to_string())
+    );
+    let mut close_probe = [0u8; 1];
+    let bytes_after_fatal = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        stream.read(&mut close_probe),
+    )
+    .await
+    .expect("fatal SCRAM rejection must close the connection")
+    .unwrap();
+    assert_eq!(bytes_after_fatal, 0);
+
+    let records = store
+        .list_security_audit_records()
+        .await
+        .expect("read authentication audit");
+    assert_eq!(records.len(), 2);
+    let failure = &records[1];
+    assert!(failure.event_id.starts_with("gateway-authn-"));
+    assert!(failure.timestamp_ms > 0);
+    assert_eq!(failure.format_version, SECURITY_AUDIT_FORMAT_VERSION);
+    assert_eq!(failure.action, SecurityAuditClass::AuthenticationFailure);
+    assert_eq!(failure.outcome, SecurityAuditOutcome::Failure);
+    assert_eq!(
+        failure.actor,
+        AuditIdentity::Unverified("scram:alice".to_string())
+    );
+    assert_eq!(failure.target, AuditField::Known("principal:1".to_string()));
+    assert_eq!(failure.scope, AuditField::NotApplicable);
+    assert!(matches!(
+        &failure.correlation,
+        AuditCorrelation::Observed(id) if id.len() == 32
+    ));
+    assert_eq!(failure.operation_id, AuditField::NotApplicable);
+    assert_eq!(failure.policy_revision, AuditField::Known(1));
+    assert_eq!(failure.before_state, AuditField::NotApplicable);
+    assert_eq!(failure.after_state, AuditField::NotApplicable);
+    let principals = store
+        .list_security_principals()
+        .await
+        .expect("read persisted principal");
+    assert_eq!(principals, principals_before);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !handler.sessions.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("failed SCRAM must not retain an application session");
 }
 
 #[tokio::test]

@@ -244,9 +244,18 @@ where
 {
     match error {
         PgWireError::UserError(error_info) => {
+            let close_connection = error_info.severity.eq_ignore_ascii_case("FATAL")
+                || error_info.severity.eq_ignore_ascii_case("PANIC");
             socket
-                .feed(PgWireBackendMessage::ErrorResponse((*error_info).into()))
+                .send(PgWireBackendMessage::ErrorResponse((*error_info).into()))
                 .await?;
+            if close_connection {
+                socket.close().await?;
+                return Err(IOError::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "fatal pgwire error closed the connection",
+                ));
+            }
         }
         PgWireError::ApiError(e) => {
             let error_info = ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string());
