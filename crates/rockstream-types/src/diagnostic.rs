@@ -124,6 +124,25 @@ impl DiagnosticOccurrence {
         (redacted, redaction_count)
     }
 
+    /// Keep only catalog metadata for a support artifact.
+    ///
+    /// Diagnostic context can contain SQL literals, business data, or raw
+    /// connector payloads, so support artifacts omit it instead of trying to
+    /// infer whether each arbitrary value is safe to export.
+    pub fn sanitized_for_support(&self) -> (Self, usize) {
+        fn clear_context(occurrence: &mut DiagnosticOccurrence) {
+            occurrence.context.clear();
+            occurrence.message = catalog_message(occurrence.code, &occurrence.context);
+            if let Some(cause) = occurrence.cause.as_deref_mut() {
+                clear_context(cause);
+            }
+        }
+
+        let (mut occurrence, redaction_count) = self.redacted_with_count();
+        clear_context(&mut occurrence);
+        (occurrence, redaction_count)
+    }
+
     pub fn render_text(&self) -> String {
         let occurrence = self.redacted();
         let descriptor = occurrence.descriptor();

@@ -2916,8 +2916,8 @@ impl StorageClient {
     ) -> Result<SupportBundleInfo, CliError> {
         let (view, mut redacted_secrets_count) = match view {
             Some(view) => {
-                let (view, count) = redact_secrets_with_count(view);
-                (Some(view), count)
+                let (_, count) = redact_secrets_with_count(view);
+                (Some("selected".to_string()), count)
             }
             None => (None, 0),
         };
@@ -2956,13 +2956,13 @@ impl StorageClient {
             "support.bundle",
             view.as_deref().unwrap_or("all"),
         )
-        .with_detail(format!("bundle written to {}", out_path.display()));
+        .with_detail("support bundle generated");
         append_audit_file(storage_path, &event);
 
         let mut diagnostic_occurrences = Vec::new();
         let mut diagnostic_redaction_counts = Vec::new();
         for occurrence in occurrences.iter().take(MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES) {
-            let (occurrence, count) = occurrence.redacted_with_count();
+            let (occurrence, count) = occurrence.sanitized_for_support();
             redacted_secrets_count += count;
             diagnostic_occurrences.push(occurrence);
             diagnostic_redaction_counts.push(count);

@@ -1874,7 +1874,7 @@ pub fn run_support_diagnose(
             "Run SHOW DIAGNOSTICS and retry with a retained correlation ID.",
         ));
     };
-    let occurrence = occurrence.redacted();
+    let occurrence = occurrence.sanitized_for_support().0;
     let bundle = storage.generate_support_bundle_with_diagnostics(
         storage_path,
         None,

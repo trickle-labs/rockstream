@@ -18,7 +18,17 @@ fn occurrence() -> DiagnosticOccurrence {
     DiagnosticOccurrence::new(
         RS_2018,
         Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
-        [("view".to_string(), "orders_mv".to_string())],
+        [
+            ("view".to_string(), "orders_mv".to_string()),
+            (
+                "sql".to_string(),
+                "SELECT * FROM accounts WHERE email = 'support-fixture-sql-literal'".to_string(),
+            ),
+            (
+                "connector_payload".to_string(),
+                r#"{"customer":"support-fixture-connector-payload"}"#.to_string(),
+            ),
+        ],
         None,
         None,
     )
@@ -40,8 +50,9 @@ fn expected_bundle(occurrence: &DiagnosticOccurrence) -> serde_json::Value {
 fn support_diagnose_exact_bundle() {
     let _guard = TEST_LOCK.lock().unwrap();
     global_diagnostic_journal().lock().clear();
-    let expected_occurrence = occurrence();
-    record_diagnostic(expected_occurrence.clone());
+    let raw_occurrence = occurrence();
+    let expected_occurrence = raw_occurrence.sanitized_for_support().0;
+    record_diagnostic(raw_occurrence);
 
     let temp = tempfile::tempdir().unwrap();
     let output_path = temp.path().join("diagnostic.json");
@@ -59,19 +70,25 @@ fn support_diagnose_exact_bundle() {
     })
     .unwrap();
 
-    assert_eq!(
-        run_support_diagnose(
-            OutputFormat::Json,
-            &StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS),
-            temp.path(),
-            Some("RS-2018"),
-            None,
-            Some(&output_path),
-        )
-        .unwrap(),
-        expected_output
-    );
-    assert_eq!(std::fs::read(&output_path).unwrap(), expected_bytes);
+    let actual_output = run_support_diagnose(
+        OutputFormat::Json,
+        &StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS),
+        temp.path(),
+        Some("RS-2018"),
+        None,
+        Some(&output_path),
+    )
+    .unwrap();
+    let actual_bytes = std::fs::read(&output_path).unwrap();
+    assert_eq!(actual_output, expected_output);
+    assert_eq!(actual_bytes, expected_bytes);
+    for forbidden in [
+        "support-fixture-sql-literal",
+        "support-fixture-connector-payload",
+    ] {
+        assert!(!actual_output.contains(forbidden));
+        assert!(!String::from_utf8_lossy(&actual_bytes).contains(forbidden));
+    }
 
     assert_eq!(
         run_support_diagnose(
@@ -97,7 +114,7 @@ fn support_bundle_redacts_view_metadata_in_exact_output_artifact_and_audit() {
     let temp = tempfile::tempdir().unwrap();
     let output_path = temp.path().join("support.json");
     let storage = StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS);
-    let safe_view = "Authorization: Basic [REDACTED]";
+    let safe_view = "selected";
     let expected_bundle = json!({
         "generated_at_ms": BUNDLE_TIME_MS,
         "candidate_identity": CandidateIdentity::current(),
@@ -137,7 +154,7 @@ fn support_bundle_redacts_view_metadata_in_exact_output_artifact_and_audit() {
         action: "support.bundle".to_string(),
         resource: safe_view.to_string(),
         error_code: None,
-        detail: Some(format!("bundle written to {}", output_path.display())),
+        detail: Some("support bundle generated".to_string()),
     };
     assert_eq!(events, vec![expected_event]);
 }
@@ -149,7 +166,7 @@ fn support_bundle_redacts_nested_json_secrets_in_exact_output_artifact_and_audit
     let output_path = temp.path().join("support.json");
     let storage = StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS);
     let raw_view = r#"{"token":{"value":"fixture-secret-value","backup":"another-secret"}}"#;
-    let safe_view = r#"{"token":"[REDACTED]"}"#;
+    let safe_view = "selected";
     let expected_bundle = json!({
         "generated_at_ms": BUNDLE_TIME_MS,
         "candidate_identity": CandidateIdentity::current(),
@@ -189,7 +206,7 @@ fn support_bundle_redacts_nested_json_secrets_in_exact_output_artifact_and_audit
         action: "support.bundle".to_string(),
         resource: safe_view.to_string(),
         error_code: None,
-        detail: Some(format!("bundle written to {}", output_path.display())),
+        detail: Some("support bundle generated".to_string()),
     };
     assert_eq!(events, vec![expected_event]);
 }
