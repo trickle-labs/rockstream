@@ -144,4 +144,6 @@ async fn secret_ddl_negative_paths_return_actionable_codes() {
         .unwrap();
     let error = client.simple_query("DROP SECRET in_use").await.unwrap_err();
     assert!(db_error_message(error).contains("RS-2426"));
+    client.simple_query("DROP SOURCE kafka_src").await.unwrap();
+    client.simple_query("DROP SECRET in_use").await.unwrap();
 }

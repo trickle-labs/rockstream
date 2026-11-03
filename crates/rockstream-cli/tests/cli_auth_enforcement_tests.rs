@@ -1,11 +1,19 @@
 //! v0.51.7 Slice 3 — CLI Auth Mode Routing & Fail-Closed Enforcement Tests.
 
-use std::path::PathBuf;
-use tokio_postgres::NoTls;
-
 use rockstream_cli::{run_start, start_gateway, StartOptions};
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
+use std::path::PathBuf;
+use std::process::Command;
+
+fn normalize_correlation_id(stderr: Vec<u8>) -> String {
+    let stderr = String::from_utf8(stderr).unwrap();
+    let marker = "(correlation_id=";
+    let start = stderr.find(marker).unwrap() + marker.len();
+    let end = start + stderr[start..].find(' ').unwrap();
+    uuid::Uuid::parse_str(&stderr[start..end]).unwrap();
+    stderr.replacen(&stderr[start..end], "<correlation_id>", 1)
+}
 
 fn test_options(storage: PathBuf, auth_mode: &str, listen: Option<String>) -> StartOptions {
     StartOptions {
@@ -40,49 +48,87 @@ fn test_cli_invalid_auth_fails_startup() {
     let res = run_start(&opts);
     assert!(res.is_err(), "Invalid --auth mode string must fail startup");
     let err = res.unwrap_err();
-    assert_eq!(err.code.value(), 2); // RS_0002
-    assert!(
-        err.message.contains("unknown auth mode"),
-        "Error message must indicate unknown auth mode, got: {}",
-        err.message
+    assert_eq!(
+        err.to_string(),
+        "RS-0002 unknown auth mode `invalid_super_auth`\n  next steps: Pass --auth=off; other authentication modes are currently unavailable."
     );
 }
 
 #[tokio::test]
-async fn test_cli_auth_scram_enforcement() {
+async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_start() {
     let tmp = tempfile::tempdir().unwrap();
-    let opts = test_options(
-        tmp.path().to_path_buf(),
-        "scram",
-        Some("127.0.0.1:0".to_string()),
-    );
-
-    let (addr, handle) = start_gateway(&opts).await.unwrap();
-
-    // Under --auth scram, connecting with missing / unauthenticated credentials must fail
-    let res = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=unauthed_user dbname=test sslmode=disable",
-            addr.port()
+    for (mode, detail, next_steps) in [
+        (
+            "scram",
+            "no durable role store is configured",
+            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
         ),
-        NoTls,
-    )
-    .await;
+        (
+            "md5",
+            "no durable role store is configured",
+            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+        ),
+        (
+            "oidc",
+            "issuer, audience, and JWKS verification are not configured",
+            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+        ),
+        (
+            "mtls",
+            "the CLI does not configure a gateway TLS listener",
+            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+        ),
+    ] {
+        let storage = tmp.path().join(mode);
+        let opts = test_options(storage.clone(), mode, Some("127.0.0.1:0".to_string()));
+        let err = start_gateway(&opts).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "RS-0002 authentication mode `{mode}` is unavailable: {detail}\n  next steps: {next_steps}"
+            )
+        );
+        assert!(!storage.exists(), "{mode} created gateway storage");
+    }
+}
 
-    assert!(
-        res.is_err(),
-        "Unauthenticated connection to --auth scram gateway must be rejected"
+#[test]
+fn unavailable_auth_mode_fails_closed_in_cli_process_before_storage_or_listener_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = tmp.path().join("gateway-storage");
+    let output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .args([
+            "start",
+            "--role",
+            "gateway",
+            "--storage",
+            storage.to_str().unwrap(),
+            "--listen",
+            "not-an-address",
+            "--auth",
+            "oidc",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        normalize_correlation_id(output.stderr),
+        "[RS-0002] config.invalid: Configuration error (detail=authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured) (correlation_id=<correlation_id> context=detail=authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured) next_steps: Check configuration file and CLI flags.\n  next steps: This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.\n"
     );
-
-    handle.abort();
+    assert!(
+        !storage.exists(),
+        "Unavailable auth created gateway storage"
+    );
 }
 
 #[test]
 fn test_startup_log_contains_auth_mode() {
     let tmp = tempfile::tempdir().unwrap();
-    let opts = test_options(tmp.path().to_path_buf(), "scram", None);
+    let opts = test_options(tmp.path().to_path_buf(), "off", None);
 
-    // Verify valid auth_mode options pass startup validation in no-op mode
+    // Verify the only available auth mode passes startup validation in no-op mode.
     let outcome = run_start(&opts).unwrap();
     assert!(
         outcome.events_written >= 1,

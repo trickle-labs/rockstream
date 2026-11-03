@@ -148,7 +148,7 @@ pub struct StartOptions {
     pub role: String,
     /// Control service URL.
     pub control: Option<String>,
-    /// Authentication mode: "off", "oidc", or "mtls".
+    /// Authentication mode; only "off" is currently available.
     pub auth_mode: String,
     /// Worker locality metadata.
     pub worker_location: WorkerLocation,
@@ -344,6 +344,7 @@ pub async fn start_gateway_with_catalog(
     opts: &StartOptions,
     catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    validate_start_auth_modes(&opts.auth_mode, opts.node_config.as_ref())?;
     let gateway_shard_dir = opts.storage.join("gateway-shard");
     std::fs::create_dir_all(&gateway_shard_dir).map_err(|e| {
         CliError::new(
@@ -408,6 +409,7 @@ pub async fn start_gateway_with_shard_and_catalog(
     shard_path: &str,
     catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    validate_start_auth_modes(&opts.auth_mode, opts.node_config.as_ref())?;
     if catalog.get_durable_store().is_none() {
         let durable_catalog = match rockstream_storage::catalog::DurableCatalogStore::recover(
             store.clone(),
@@ -486,54 +488,8 @@ pub async fn start_gateway_with_shard_and_catalog(
     let auth_mode_str = opts.auth_mode.trim().to_lowercase();
     tracing::info!("Gateway server starting with auth mode: {}", auth_mode_str);
 
-    let server = match auth_mode_str.as_str() {
-        "off" | "" => {
-            rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db)
-        }
-        "scram" => {
-            let role_catalog = Arc::new(rockstream_gateway::RoleCatalog::new());
-            rockstream_gateway::GatewayServer::with_shard_db_and_scram_auth(
-                addr,
-                catalog,
-                view_reader,
-                shard_db,
-                role_catalog,
-            )
-        }
-        "md5" => {
-            let role_catalog = Arc::new(rockstream_gateway::RoleCatalog::new());
-            rockstream_gateway::GatewayServer::with_shard_db_and_md5_auth(
-                addr,
-                catalog,
-                view_reader,
-                shard_db,
-                role_catalog,
-            )
-        }
-        "oidc" => {
-            let secret = b"rockstream-default-jwt-secret";
-            rockstream_gateway::GatewayServer::with_shard_db_and_auth(
-                addr,
-                catalog,
-                view_reader,
-                shard_db,
-                secret,
-            )
-        }
-        "mtls" => rockstream_gateway::GatewayServer::with_shard_db_and_mtls_auth(
-            addr,
-            catalog,
-            view_reader,
-            shard_db,
-        ),
-        _ => {
-            return Err(CliError::new(
-                RS_0002,
-                format!("unknown auth mode `{}`", opts.auth_mode),
-                "Pass --auth with one of: off, scram, md5, oidc, mtls.",
-            ));
-        }
-    };
+    let server =
+        rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db);
 
     let mut server = server
         .with_query_time_shard_topology_provider(topology_provider)
@@ -579,6 +535,45 @@ pub async fn start_gateway_with_shard_and_catalog(
     }
 }
 
+fn validate_auth_mode(auth_mode: &str) -> Result<(), CliError> {
+    let mode = auth_mode.trim().to_lowercase();
+    let (message, next_steps) = match mode.as_str() {
+        "off" => return Ok(()),
+        "" => (
+            "authentication mode is empty".to_string(),
+            "Set [auth].mode to `off` to explicitly disable client authentication.",
+        ),
+        "scram" | "md5" => (
+            format!("authentication mode `{mode}` is unavailable: no durable role store is configured"),
+            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+        ),
+        "oidc" => (
+            "authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured".to_string(),
+            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+        ),
+        "mtls" => (
+            "authentication mode `mtls` is unavailable: the CLI does not configure a gateway TLS listener".to_string(),
+            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+        ),
+        _ => (
+            format!("unknown auth mode `{auth_mode}`"),
+            "Pass --auth=off; other authentication modes are currently unavailable.",
+        ),
+    };
+    Err(CliError::new(RS_0002, message, next_steps))
+}
+
+fn validate_start_auth_modes(
+    auth_mode: &str,
+    node_config: Option<&rockstream_types::config::NodeConfig>,
+) -> Result<(), CliError> {
+    validate_auth_mode(auth_mode)?;
+    if let Some(node_config) = node_config {
+        validate_auth_mode(&node_config.auth.mode)?;
+    }
+    Ok(())
+}
+
 /// Run `rockstream start`.
 ///
 /// For the `gateway` and `all` roles with a configured listen address this
@@ -612,15 +607,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         ));
     }
 
-    let auth_mode_norm = opts.auth_mode.trim().to_lowercase();
-    let valid_auth_modes = ["off", "scram", "md5", "oidc", "mtls", ""];
-    if !valid_auth_modes.contains(&auth_mode_norm.as_str()) {
-        return Err(CliError::new(
-            RS_0002,
-            format!("unknown auth mode `{}`", opts.auth_mode),
-            "Pass --auth with one of: off, scram, md5, oidc, mtls.",
-        ));
-    }
+    validate_start_auth_modes(&opts.auth_mode, Some(&node_config))?;
 
     // Worker requires a control URL to register with the control plane.
     // Gateway can run in standalone mode without a control URL.
@@ -2689,8 +2676,110 @@ mod tests {
         let err = run_start(&opts).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "RS-0002 unknown auth mode `invalid`\n  next steps: Pass --auth with one of: off, scram, md5, oidc, mtls."
+            "RS-0002 unknown auth mode `invalid`\n  next steps: Pass --auth=off; other authentication modes are currently unavailable."
         );
+    }
+
+    #[test]
+    fn unavailable_auth_modes_fail_before_startup_side_effects() {
+        let parent = tempfile::tempdir().unwrap();
+        for (mode, detail, next_steps) in [
+            (
+                "scram",
+                "no durable role store is configured",
+                "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+            ),
+            (
+                "md5",
+                "no durable role store is configured",
+                "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+            ),
+            (
+                "oidc",
+                "issuer, audience, and JWKS verification are not configured",
+                "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+            ),
+            (
+                "mtls",
+                "the CLI does not configure a gateway TLS listener",
+                "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+            ),
+        ] {
+            let storage = parent.path().join(mode);
+            let opts = StartOptions {
+                storage: storage.clone(),
+                role: "all".to_string(),
+                control: None,
+                worker_id: None,
+                auth_mode: mode.to_string(),
+                worker_location: WorkerLocation::default(),
+                worker_capabilities: WorkerCapabilities::default(),
+                config: RockstreamConfig::default(),
+                node_config: None,
+                metrics_addr: None,
+                listen_addr: None,
+                raft_peers: None,
+                raft_node_id: None,
+                raft_bind: None,
+                raft_bootstrap: false,
+                daemon: false,
+                control_bind: None,
+                control_shared_storage: None,
+                query_time_shard_dirs: Vec::new(),
+                shutdown_timeout_secs: None,
+            };
+
+            let err = run_start(&opts).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "RS-0002 authentication mode `{mode}` is unavailable: {detail}\n  next steps: {next_steps}"
+                )
+            );
+            assert!(!storage.exists(), "{mode} created startup storage");
+        }
+    }
+
+    #[test]
+    fn configured_auth_mode_cannot_be_masked_by_off_in_start_options() {
+        let parent = tempfile::tempdir().unwrap();
+        let storage = parent.path().join("configured-auth");
+        let mut node_config =
+            rockstream_types::config::NodeConfig::from(&RockstreamConfig::default());
+        node_config.auth.mode = "oidc".to_string();
+        let opts = StartOptions {
+            storage: storage.clone(),
+            node_config: Some(node_config),
+            ..StartOptions::default()
+        };
+
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RS-0002 authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured\n  next steps: This mode is unavailable; use --auth=off only where unauthenticated access is acceptable."
+        );
+        assert!(!storage.exists());
+    }
+
+    #[test]
+    fn empty_configured_auth_mode_fails_before_startup_side_effects() {
+        let parent = tempfile::tempdir().unwrap();
+        let storage = parent.path().join("empty-auth");
+        let mut node_config =
+            rockstream_types::config::NodeConfig::from(&RockstreamConfig::default());
+        node_config.auth.mode.clear();
+        let opts = StartOptions {
+            storage: storage.clone(),
+            node_config: Some(node_config),
+            ..StartOptions::default()
+        };
+
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RS-0002 authentication mode is empty\n  next steps: Set [auth].mode to `off` to explicitly disable client authentication."
+        );
+        assert!(!storage.exists());
     }
 
     #[test]
