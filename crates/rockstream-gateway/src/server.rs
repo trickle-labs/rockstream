@@ -15337,6 +15337,21 @@ impl PgWireServerHandlers for GatewayHandlerFactory {
     }
 }
 
+async fn audit_tls_handshake_failure(handler: &GatewayHandler, reason: String) {
+    tracing::debug!(reason, "gateway TLS authentication rejected");
+    if let Err(error) = handler
+        .append_authentication_audit(
+            AuditIdentity::Unknown,
+            AuditField::Unknown,
+            AuditField::Unknown,
+            false,
+        )
+        .await
+    {
+        tracing::error!(%error, "failed to durably audit gateway TLS authentication rejection");
+    }
+}
+
 async fn relay_negotiated_3_2_connection(
     mut client_socket: tokio::net::TcpStream,
     full_msg: Vec<u8>,
@@ -15888,10 +15903,14 @@ impl GatewayServer {
                             }
                         }
 
-                        if let Err(e) = pgwire::tokio::process_socket(
+                        let audit_handler = factory_ref.handler.clone();
+                        if let Err(e) = pgwire::tokio::process_socket_with_tls_error_handler(
                             socket,
                             tls_acceptor_ref.clone(),
                             factory_ref.clone(),
+                            move |reason| async move {
+                                audit_tls_handshake_failure(&audit_handler, reason).await;
+                            },
                         )
                         .await
                         {
@@ -15923,7 +15942,16 @@ impl GatewayServer {
         let factory = Arc::new(GatewayHandlerFactory {
             handler: self.handler.clone(),
         });
-        let _ = pgwire::tokio::process_socket(socket, self.tls_acceptor.clone(), factory).await;
+        let audit_handler = self.handler.clone();
+        let _ = pgwire::tokio::process_socket_with_tls_error_handler(
+            socket,
+            self.tls_acceptor.clone(),
+            factory,
+            move |reason| async move {
+                audit_tls_handshake_failure(&audit_handler, reason).await;
+            },
+        )
+        .await;
     }
 
     /// Bind to `addr`, return the actual local address (useful for port 0 tests),
@@ -16087,10 +16115,14 @@ impl GatewayServer {
                                 }
                             }
 
-                            if let Err(e) = pgwire::tokio::process_socket(
+                            let audit_handler = factory_ref.handler.clone();
+                            if let Err(e) = pgwire::tokio::process_socket_with_tls_error_handler(
                                 socket,
                                 tls_acceptor_ref.clone(),
                                 factory_ref.clone(),
+                                move |reason| async move {
+                                    audit_tls_handshake_failure(&audit_handler, reason).await;
+                                },
                             )
                             .await
                             {

@@ -191,6 +191,35 @@ async fn new_shard_db(name: &str) -> Arc<ShardDb> {
     Arc::new(ShardDb::builder(name, store).build().await.unwrap())
 }
 
+fn new_audit_catalog(name: &str) -> (Arc<CatalogStubs>, Arc<DurableCatalogStore>) {
+    let catalog = Arc::new(CatalogStubs::new());
+    let durable = Arc::new(DurableCatalogStore::new(Arc::new(InMemory::new()), name));
+    catalog.set_durable_store(durable.clone());
+    (catalog, durable)
+}
+
+async fn assert_single_unknown_tls_failure(durable: &DurableCatalogStore) {
+    let records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.format_version, SECURITY_AUDIT_FORMAT_VERSION);
+    assert!(record.event_id.starts_with("gateway-authn-"));
+    assert!(record.timestamp_ms > 0);
+    assert_eq!(record.actor, AuditIdentity::Unknown);
+    assert_eq!(record.target, AuditField::Unknown);
+    assert_eq!(record.scope, AuditField::NotApplicable);
+    assert_eq!(record.action, SecurityAuditClass::AuthenticationFailure);
+    assert_eq!(record.outcome, SecurityAuditOutcome::Failure);
+    assert!(matches!(
+        &record.correlation,
+        AuditCorrelation::Observed(connection_id) if connection_id.len() == 32
+    ));
+    assert_eq!(record.operation_id, AuditField::NotApplicable);
+    assert_eq!(record.policy_revision, AuditField::Unknown);
+    assert_eq!(record.before_state, AuditField::NotApplicable);
+    assert_eq!(record.after_state, AuditField::NotApplicable);
+}
+
 // ── gateway_with_tls_starts_and_binds ────────────────────────────────────────
 
 #[tokio::test]
@@ -554,14 +583,16 @@ async fn mtls_rejects_connection_with_no_client_cert() {
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let shard_db = new_shard_db("mtls-no-cert-shard").await;
+    let (catalog, durable) = new_audit_catalog("mtls-no-cert-audit");
     let server = GatewayServer::with_shard_db_and_mtls_auth(
         addr,
-        Arc::new(CatalogStubs::new()),
+        catalog,
         Arc::new(NoopViewReader),
         shard_db,
     )
     .with_tls(&server_cert_path, &server_key_path, Some(&ca_cert_path))
     .unwrap();
+    let handler = server.handler().clone();
     let (local_addr, _handle) = server.serve_background().await.unwrap();
 
     // Client trusts the CA but presents no client certificate at all — the
@@ -572,6 +603,8 @@ async fn mtls_rejects_connection_with_no_client_cert() {
         result.is_err(),
         "connection without a client cert must be rejected by mTLS"
     );
+    assert!(handler.sessions.is_empty());
+    assert_single_unknown_tls_failure(&durable).await;
 }
 
 // ── mtls_rejects_connection_with_untrusted_client_cert ───────────────────────
@@ -599,14 +632,16 @@ async fn mtls_rejects_connection_with_untrusted_client_cert() {
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let shard_db = new_shard_db("mtls-untrusted-cert-shard").await;
+    let (catalog, durable) = new_audit_catalog("mtls-untrusted-cert-audit");
     let server = GatewayServer::with_shard_db_and_mtls_auth(
         addr,
-        Arc::new(CatalogStubs::new()),
+        catalog,
         Arc::new(NoopViewReader),
         shard_db,
     )
     .with_tls(&server_cert_path, &server_key_path, Some(&ca_cert_path))
     .unwrap();
+    let handler = server.handler().clone();
     let (local_addr, _handle) = server.serve_background().await.unwrap();
 
     let client_cert = ClientCert {
@@ -621,4 +656,6 @@ async fn mtls_rejects_connection_with_untrusted_client_cert() {
         result.is_err(),
         "connection with an untrusted client cert must be rejected by mTLS"
     );
+    assert!(handler.sessions.is_empty());
+    assert_single_unknown_tls_failure(&durable).await;
 }
