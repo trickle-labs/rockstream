@@ -54,7 +54,7 @@ fn test_cli_invalid_auth_fails_startup() {
     let err = res.unwrap_err();
     assert_eq!(
         err.to_string(),
-        "RS-0002 unknown auth mode `invalid_super_auth`\n  next steps: Pass --auth=off; other authentication modes are currently unavailable."
+        "RS-0002 unknown auth mode `invalid_super_auth`\n  next steps: Pass a supported authentication mode: off, oidc, or mtls."
     );
 }
 
@@ -64,23 +64,13 @@ async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_
     for (mode, detail, next_steps) in [
         (
             "scram",
-            "no durable role store is configured",
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+            "durable principal integration is incomplete",
+            "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
         ),
         (
             "md5",
-            "no durable role store is configured",
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
-        ),
-        (
-            "oidc",
-            "issuer, audience, and JWKS verification are not configured",
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
-        ),
-        (
-            "mtls",
-            "the CLI does not configure a gateway TLS listener",
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+            "MD5 is not a release authentication mode",
+            "Use a release-supported authentication mode.",
         ),
     ] {
         let storage = tmp.path().join(mode);
@@ -140,7 +130,7 @@ async fn gateway_start_fails_closed_when_durable_catalog_recovery_fails() {
 }
 
 #[test]
-fn unavailable_auth_mode_fails_closed_in_cli_process_before_storage_or_listener_start() {
+fn oidc_missing_configuration_fails_before_storage_or_listener_start() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = tmp.path().join("gateway-storage");
     let output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
@@ -162,7 +152,7 @@ fn unavailable_auth_mode_fails_closed_in_cli_process_before_storage_or_listener_
     assert_eq!(output.stdout, b"");
     assert_eq!(
         normalize_correlation_id(output.stderr),
-        "[RS-0002] config.invalid: Configuration error (detail=authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured) (correlation_id=<correlation_id> context=detail=authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured) next_steps: Check configuration file and CLI flags.\n  next steps: This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.\n"
+        "[RS-0002] config.invalid: Configuration error (detail=OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url) (correlation_id=<correlation_id> context=detail=OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url) next_steps: Check configuration file and CLI flags.\n  next steps: Configure the issuer, audience, and JWKS endpoint before starting the gateway.\n"
     );
     assert!(
         !storage.exists(),
