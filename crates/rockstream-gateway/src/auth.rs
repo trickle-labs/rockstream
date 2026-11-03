@@ -524,7 +524,9 @@ mod tests {
         let presented = "fixture-raw-bearer-token";
         let error = verify_oidc_token(None, presented).unwrap_err();
 
-        assert!(error.to_string().contains("OIDC verification is unavailable"));
+        assert!(error
+            .to_string()
+            .contains("OIDC verification is unavailable"));
         assert!(!error.to_string().contains(presented));
     }
 

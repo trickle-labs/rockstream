@@ -431,6 +431,7 @@ async fn mtls_end_to_end_authenticates_real_client_cert() {
     )
     .with_tls(&server_cert_path, &server_key_path, Some(&ca_cert_path))
     .expect("mTLS gateway with CA cert should start");
+    let handler = server.handler().clone();
     let (local_addr, _handle) = server.serve_background().await.unwrap();
 
     let client_cert = ClientCert {
@@ -473,54 +474,57 @@ async fn mtls_end_to_end_authenticates_real_client_cert() {
         key_pem: same_cn_key_pem,
     };
     let same_cn_config = rustls_client_config_with_cert(&ca_cert_pem, &same_cn_client);
-    let same_cn_client = connect_tls(&local_addr.to_string(), same_cn_config)
+    let error = connect_tls(&local_addr.to_string(), same_cn_config)
         .await
-        .expect("second CA-valid certificate with the same CN should complete TLS");
-    let error = same_cn_client
-        .simple_query("CREATE TABLE mtls_denied (id BIGINT)")
-        .await
-        .unwrap_err();
+        .expect_err("unmapped certificate fingerprint must not establish a session");
     let db_error = error.as_db_error().expect("authorization denial error");
-    assert_eq!(db_error.code().code(), "42501");
+    assert_eq!(db_error.code().code(), "28000");
     assert_eq!(
         db_error.message(),
-        "[RS-2401] auth.permission_denied: principal 'alice@rockstream.test' is not authorized for action 'TableCreate' on public.mtls_denied. next_steps: Request an authorized scoped grant, then retry."
+        "[RS-2400] auth.unauthenticated: verified client certificate has no enabled principal mapping. next_steps: Configure the certificate fingerprint in the durable security catalog"
     );
     assert!(catalog.get_table("mtls_denied").is_none());
-
-    let after_denial = same_cn_client.simple_query("SELECT 1").await.unwrap();
-    assert_eq!(after_denial.len(), 3);
-    match after_denial.as_slice() {
-        [tokio_postgres::SimpleQueryMessage::RowDescription(columns), tokio_postgres::SimpleQueryMessage::Row(row), tokio_postgres::SimpleQueryMessage::CommandComplete(rows)] =>
-        {
-            assert_eq!(columns.len(), 1);
-            assert_eq!(columns[0].name(), "Int64(1)");
-            assert_eq!(row.columns().len(), 1);
-            assert_eq!(row.get(0), Some("1"));
-            assert_eq!(*rows, 1);
-        }
-        other => panic!("unexpected post-denial response: {other:?}"),
-    }
+    assert_eq!(handler.sessions.len(), 1);
 
     let audit = durable.list_security_audit_records().await.unwrap();
-    assert_eq!(audit.len(), 2);
+    assert_eq!(audit.len(), 3);
+    for record in &audit[1..] {
+        assert_eq!(record.format_version, SECURITY_AUDIT_FORMAT_VERSION);
+        assert!(record.event_id.starts_with("gateway-authn-"));
+        assert!(record.timestamp_ms > 0);
+        assert_eq!(record.scope, AuditField::NotApplicable);
+        assert_eq!(record.operation_id, AuditField::NotApplicable);
+        assert_eq!(record.before_state, AuditField::NotApplicable);
+        assert_eq!(record.after_state, AuditField::NotApplicable);
+        assert!(matches!(
+            &record.correlation,
+            AuditCorrelation::Observed(connection_id) if connection_id.len() == 32
+        ));
+    }
+    assert_ne!(audit[1].event_id, audit[2].event_id);
+    assert_ne!(audit[1].correlation, audit[2].correlation);
     assert_eq!(
         audit[1].actor,
+        AuditIdentity::Verified(format!("mtls:{}", hex_fingerprint(&certificate_sha256)))
+    );
+    assert_eq!(
+        audit[1].target,
+        AuditField::Known("principal:1".to_string())
+    );
+    assert_eq!(audit[1].action, SecurityAuditClass::AuthenticationSuccess);
+    assert_eq!(audit[1].outcome, SecurityAuditOutcome::Success);
+    assert_eq!(audit[1].policy_revision, AuditField::Known(1));
+    assert_eq!(
+        audit[2].actor,
         AuditIdentity::Verified(format!(
             "mtls:{}",
             hex_fingerprint(&same_cn_certificate_sha256)
         ))
     );
-    assert_eq!(
-        audit[1].target,
-        AuditField::Known("public.mtls_denied".to_string())
-    );
-    assert_eq!(audit[1].action, SecurityAuditClass::AuthorizationDenial);
-    assert_eq!(audit[1].outcome, SecurityAuditOutcome::Denied);
-    assert!(matches!(
-        audit[1].correlation,
-        AuditCorrelation::Observed(_)
-    ));
+    assert_eq!(audit[2].target, AuditField::Unknown);
+    assert_eq!(audit[2].action, SecurityAuditClass::AuthenticationFailure);
+    assert_eq!(audit[2].outcome, SecurityAuditOutcome::Failure);
+    assert_eq!(audit[2].policy_revision, AuditField::Unknown);
 }
 
 fn hex_fingerprint(fingerprint: &[u8; 32]) -> String {

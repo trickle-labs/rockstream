@@ -97,9 +97,7 @@ use rockstream_types::ids::{ConnectorId, OperatorId, PrincipalId, ShardId, ViewI
 use rockstream_types::mutation_policy::pgwire_mutation_policy;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
-use crate::auth::{
-    scram_server_signature, verify_client_proof, AuthMode, Principal,
-};
+use crate::auth::{scram_server_signature, verify_client_proof, AuthMode, Principal};
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
     CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail, WorkloadRevisionOutcome,
@@ -13621,6 +13619,13 @@ impl StartupHandler for GatewayHandler {
 
                     match auth_param {
                         None => {
+                            self.record_authentication_or_fail(
+                                AuditIdentity::Unknown,
+                                None,
+                                None,
+                                false,
+                            )
+                            .await?;
                             return Err(pgwire::error::PgWireError::UserError(Box::new(
                                 pgwire::error::ErrorInfo::new(
                                     "FATAL".to_string(),
@@ -13632,6 +13637,13 @@ impl StartupHandler for GatewayHandler {
                         Some(auth_val) => {
                             let token = auth_val.strip_prefix("Bearer ").unwrap_or("").trim();
                             if token.is_empty() {
+                                self.record_authentication_or_fail(
+                                    AuditIdentity::Unknown,
+                                    None,
+                                    None,
+                                    false,
+                                )
+                                .await?;
                                 return Err(pgwire::error::PgWireError::UserError(Box::new(
                                     pgwire::error::ErrorInfo::new(
                                         "FATAL".to_string(),
@@ -13641,6 +13653,13 @@ impl StartupHandler for GatewayHandler {
                                 )));
                             }
                             let Some(verifier) = self.oidc_verifier.as_ref() else {
+                                self.record_authentication_or_fail(
+                                    AuditIdentity::Unknown,
+                                    None,
+                                    None,
+                                    false,
+                                )
+                                .await?;
                                 return Err(pgwire::error::PgWireError::UserError(Box::new(
                                     pgwire::error::ErrorInfo::new(
                                         "FATAL".to_string(),
@@ -13652,17 +13671,70 @@ impl StartupHandler for GatewayHandler {
                             let verified = verifier.verify(token).await;
                             match verified {
                                 Ok(claims) => {
+                                    let Some(issuer) = claims.issuer else {
+                                        self.record_authentication_or_fail(
+                                            AuditIdentity::Unknown,
+                                            None,
+                                            None,
+                                            false,
+                                        )
+                                        .await?;
+                                        return Err(pgwire::error::PgWireError::UserError(
+                                            Box::new(pgwire::error::ErrorInfo::new(
+                                                "FATAL".to_string(),
+                                                "28000".to_string(),
+                                                "[RS-2400] auth.unauthenticated: OIDC token has no verified issuer. next_steps: Provide a token with the configured issuer".to_string(),
+                                            )),
+                                        ));
+                                    };
+                                    let principal = Principal::Oidc {
+                                        issuer: issuer.clone(),
+                                        sub: claims.sub.clone(),
+                                    };
+                                    let durable_principal =
+                                        self.security_principal_for_login(&principal).await;
+                                    let durable_principal = match durable_principal {
+                                        Ok(Some(principal)) => principal,
+                                        _ => {
+                                            self.record_authentication_or_fail(
+                                                AuditIdentity::Verified(principal.actor()),
+                                                None,
+                                                None,
+                                                false,
+                                            )
+                                            .await?;
+                                            return Err(pgwire::error::PgWireError::UserError(
+                                                Box::new(pgwire::error::ErrorInfo::new(
+                                                    "FATAL".to_string(),
+                                                    "28000".to_string(),
+                                                    "[RS-2400] auth.unauthenticated: verified OIDC identity has no enabled principal mapping. next_steps: Configure the issuer and subject in the durable security catalog".to_string(),
+                                                )),
+                                            ));
+                                        }
+                                    };
+                                    self.record_authentication_or_fail(
+                                        AuditIdentity::Verified(principal.actor()),
+                                        Some(durable_principal.id),
+                                        Some(durable_principal.revision),
+                                        true,
+                                    )
+                                    .await?;
                                     client.metadata_mut().insert(
                                         "_rs_principal".to_string(),
                                         format!("jwt:{}", claims.sub),
                                     );
-                                    if let Some(issuer) = claims.issuer {
-                                        client
-                                            .metadata_mut()
-                                            .insert("_rs_oidc_issuer".to_string(), issuer);
-                                    }
+                                    client
+                                        .metadata_mut()
+                                        .insert("_rs_oidc_issuer".to_string(), issuer);
                                 }
                                 Err(e) => {
+                                    self.record_authentication_or_fail(
+                                        AuditIdentity::Unknown,
+                                        None,
+                                        None,
+                                        false,
+                                    )
+                                    .await?;
                                     return Err(pgwire::error::PgWireError::UserError(
                                         Box::new(pgwire::error::ErrorInfo::new(
                                             "FATAL".to_string(),
@@ -13683,6 +13755,38 @@ impl StartupHandler for GatewayHandler {
                     // handshake and looked up here by peer socket address.
                     match crate::tls::lookup_mtls_identity(&client.socket_addr()) {
                         Some(identity) => {
+                            let principal = Principal::Mtls {
+                                cn: identity.common_name.clone(),
+                                certificate_sha256: identity.certificate_sha256,
+                            };
+                            let durable_principal =
+                                self.security_principal_for_login(&principal).await;
+                            let durable_principal = match durable_principal {
+                                Ok(Some(principal)) => principal,
+                                _ => {
+                                    self.record_authentication_or_fail(
+                                        AuditIdentity::Verified(principal.actor()),
+                                        None,
+                                        None,
+                                        false,
+                                    )
+                                    .await?;
+                                    return Err(pgwire::error::PgWireError::UserError(
+                                        Box::new(pgwire::error::ErrorInfo::new(
+                                            "FATAL".to_string(),
+                                            "28000".to_string(),
+                                            "[RS-2400] auth.unauthenticated: verified client certificate has no enabled principal mapping. next_steps: Configure the certificate fingerprint in the durable security catalog".to_string(),
+                                        )),
+                                    ));
+                                }
+                            };
+                            self.record_authentication_or_fail(
+                                AuditIdentity::Verified(principal.actor()),
+                                Some(durable_principal.id),
+                                Some(durable_principal.revision),
+                                true,
+                            )
+                            .await?;
                             client.metadata_mut().insert(
                                 "_rs_principal".to_string(),
                                 format!("cert:{}", identity.common_name),
@@ -13693,6 +13797,13 @@ impl StartupHandler for GatewayHandler {
                             );
                         }
                         None => {
+                            self.record_authentication_or_fail(
+                                AuditIdentity::Unknown,
+                                None,
+                                None,
+                                false,
+                            )
+                            .await?;
                             return Err(pgwire::error::PgWireError::UserError(Box::new(
                                 pgwire::error::ErrorInfo::new(
                                     "FATAL".to_string(),
@@ -21284,6 +21395,35 @@ mod s4_tests {
         Arc::new(GatewayHandler::new(catalog, reader))
     }
 
+    fn assert_authentication_event(
+        record: &SecurityAuditRecord,
+        actor: AuditIdentity,
+        target: AuditField<String>,
+        action: SecurityAuditClass,
+        outcome: SecurityAuditOutcome,
+        policy_revision: AuditField<u64>,
+    ) {
+        assert_eq!(
+            record.format_version,
+            rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION
+        );
+        assert!(record.event_id.starts_with("gateway-authn-"));
+        assert!(record.timestamp_ms > 0);
+        assert_eq!(record.actor, actor);
+        assert_eq!(record.target, target);
+        assert_eq!(record.scope, AuditField::NotApplicable);
+        assert_eq!(record.action, action);
+        assert_eq!(record.outcome, outcome);
+        assert!(matches!(
+            &record.correlation,
+            AuditCorrelation::Observed(connection_id) if connection_id.len() == 32
+        ));
+        assert_eq!(record.operation_id, AuditField::NotApplicable);
+        assert_eq!(record.policy_revision, policy_revision);
+        assert_eq!(record.before_state, AuditField::NotApplicable);
+        assert_eq!(record.after_state, AuditField::NotApplicable);
+    }
+
     #[test]
     fn show_diagnostic_returns_the_complete_catalog_row() {
         let Ok(CatalogResponse::Rows { columns, rows }) =
@@ -21723,6 +21863,7 @@ mod s4_tests {
 
     #[tokio::test]
     async fn oidc_public_pgwire_auth_verifies_tokens_before_session_creation() {
+        use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -21738,6 +21879,31 @@ mod s4_tests {
         }
 
         let catalog = Arc::new(CatalogStubs::new());
+        let durable = Arc::new(DurableCatalogStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            "gateway-oidc-auth-test",
+        ));
+        let security_principal = SecurityPrincipal {
+            format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: rockstream_types::ids::PrincipalId(1),
+            display_name: "OIDC administrator".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::Oidc {
+                issuer: "https://issuer.example".to_string(),
+                subject: "alice".to_string(),
+            }],
+            preset_grants: vec![rockstream_types::authorization::ScopedPresetGrant {
+                preset: rockstream_types::authorization::PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![],
+        };
+        durable
+            .preprovision_first_administrator(security_principal, 1)
+            .await
+            .unwrap();
+        catalog.set_durable_store(durable.clone());
         let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
         let verifier = Arc::new(crate::auth::verifier_with_local_jwks().await);
         let pki_dir = tempfile::tempdir().unwrap();
@@ -21815,6 +21981,27 @@ mod s4_tests {
             0
         );
         assert_eq!(handler.sessions.len(), 1);
+        let authentication_record = durable
+            .list_security_audit_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .nth(1)
+            .unwrap();
+        assert_authentication_event(
+            &authentication_record,
+            AuditIdentity::Verified(
+                Principal::Oidc {
+                    issuer: "https://issuer.example".to_string(),
+                    sub: "alice".to_string(),
+                }
+                .actor(),
+            ),
+            AuditField::Known("principal:1".to_string()),
+            SecurityAuditClass::AuthenticationSuccess,
+            SecurityAuditOutcome::Success,
+            AuditField::Known(1),
+        );
 
         let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
         tcp.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).await.unwrap();
@@ -21863,6 +22050,18 @@ mod s4_tests {
             Some(&"[RS-2400] auth.unauthenticated: malformed JWT: expected 3 parts. next_steps: Provide valid credentials (Bearer token or mTLS certificate)".to_string())
         );
         assert_eq!(handler.sessions.len(), 1);
+        let audit = durable.list_security_audit_records().await.unwrap();
+        assert_eq!(audit.len(), 3);
+        assert_authentication_event(
+            &audit[2],
+            AuditIdentity::Unknown,
+            AuditField::Unknown,
+            SecurityAuditClass::AuthenticationFailure,
+            SecurityAuditOutcome::Failure,
+            AuditField::Unknown,
+        );
+        assert_ne!(audit[1].event_id, audit[2].event_id);
+        assert!(!audit[2].event_id.contains("bad-token"));
 
         drop(accepted);
         server_task.abort();

@@ -100,13 +100,16 @@ The gateway supports unauthenticated `off`, RS256 OIDC bearer authentication,
 and client-certificate mTLS. OIDC requires `[auth].oidc_issuer`,
 `[auth].oidc_audience`, `[auth].oidc_jwks_url`, and gateway TLS certificate
 and key paths; it fetches and validates JWKS before opening the listener and
-rejects requests when token verification fails. Gateway mTLS requires
-`gateway.tls.cert_path`, `key_path`, and
-`ca_cert_path`. Internal node mTLS described below remains a separate
-transport boundary. SCRAM stays fail-closed until durable principal grants
-are enforced on the public gateway path; MD5 is not a release authentication
-mode. Implementing these startup paths does not satisfy the v0.73 ten-case
-release qualification gate by itself.
+rejects requests when token verification fails. The verified `(issuer, subject)`
+must map to an enabled durable principal before the gateway creates an
+application session. Gateway mTLS requires `gateway.tls.cert_path`, `key_path`,
+and `ca_cert_path`; a CA-verified client certificate must map by SHA-256
+fingerprint to an enabled durable principal. Its common name alone grants no
+authority, and an unmapped certificate is rejected before application session
+creation. Internal node mTLS described below remains a separate transport
+boundary. SCRAM-SHA-256 requires an available durable principal and grant store;
+MD5 is not a release authentication mode. Implementing these startup paths does
+not satisfy the v0.73 ten-case release qualification gate by itself.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 
