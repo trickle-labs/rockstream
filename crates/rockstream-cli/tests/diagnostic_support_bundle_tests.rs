@@ -53,7 +53,7 @@ fn support_diagnose_exact_bundle() {
             bundle_path: output_path.to_string_lossy().into_owned(),
             view: None,
             size_bytes: expected_bytes.len() as u64,
-            redacted_secrets_count: 1,
+            redacted_secrets_count: 0,
             generated_at_ms: BUNDLE_TIME_MS,
         },
     })

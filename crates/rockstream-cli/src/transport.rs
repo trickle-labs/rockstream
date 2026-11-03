@@ -18,7 +18,7 @@ use rockstream_control::{
 use rockstream_types::acl::Role;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::diagnostic::{
-    redact_secrets, DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES,
+    redact_secrets_with_count, DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES,
     MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
 };
 use rockstream_types::error_code::{
@@ -2914,7 +2914,13 @@ impl StorageClient {
         out: Option<&Path>,
         occurrences: &[DiagnosticOccurrence],
     ) -> Result<SupportBundleInfo, CliError> {
-        let view = view.map(redact_secrets);
+        let (view, mut redacted_secrets_count) = match view {
+            Some(view) => {
+                let (view, count) = redact_secrets_with_count(view);
+                (Some(view), count)
+            }
+            None => (None, 0),
+        };
         if self.identity.role < required_role("support bundle") {
             let event = AuditEvent::now(
                 self.identity.user.clone(),
@@ -2953,11 +2959,14 @@ impl StorageClient {
         .with_detail(format!("bundle written to {}", out_path.display()));
         append_audit_file(storage_path, &event);
 
-        let mut diagnostic_occurrences = occurrences
-            .iter()
-            .take(MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES)
-            .map(DiagnosticOccurrence::redacted)
-            .collect::<Vec<_>>();
+        let mut diagnostic_occurrences = Vec::new();
+        let mut diagnostic_redaction_counts = Vec::new();
+        for occurrence in occurrences.iter().take(MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES) {
+            let (occurrence, count) = occurrence.redacted_with_count();
+            redacted_secrets_count += count;
+            diagnostic_occurrences.push(occurrence);
+            diagnostic_redaction_counts.push(count);
+        }
         let mut omitted_occurrences = occurrences
             .len()
             .saturating_sub(diagnostic_occurrences.len());
@@ -2982,6 +2991,7 @@ impl StorageClient {
                 .is_some_and(|items| !items.is_empty())
         {
             diagnostic_occurrences.pop();
+            redacted_secrets_count -= diagnostic_redaction_counts.pop().unwrap_or_default();
             omitted_occurrences += 1;
             bundle["diagnostic_occurrences"] = serde_json::to_value(&diagnostic_occurrences)
                 .expect("diagnostic occurrences are serializable");
@@ -3041,7 +3051,7 @@ impl StorageClient {
             bundle_path: out_path.to_string_lossy().into_owned(),
             view,
             size_bytes: bytes.len() as u64,
-            redacted_secrets_count: 1,
+            redacted_secrets_count,
             generated_at_ms: now_ms,
         })
     }

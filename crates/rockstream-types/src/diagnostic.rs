@@ -98,12 +98,30 @@ impl DiagnosticOccurrence {
 
     /// Re-sanitize values before a renderer publishes them.
     pub fn redacted(&self) -> Self {
-        let context = sanitize_context(self.context.clone()).unwrap_or_default();
+        self.redacted_with_count().0
+    }
+
+    /// Return the sanitized occurrence and the number of redaction markers added.
+    pub fn redacted_with_count(&self) -> (Self, usize) {
+        let (context, mut redaction_count) = match sanitize_context(self.context.clone()) {
+            Ok(context) => (
+                context,
+                self.context
+                    .values()
+                    .map(|value| redact_secrets_with_count(value).1)
+                    .sum(),
+            ),
+            Err(_) => (BTreeMap::new(), 0),
+        };
         let mut redacted = self.clone();
         redacted.context = context.clone();
         redacted.message = catalog_message(self.code, &context);
-        redacted.cause = self.cause.as_ref().map(|cause| Box::new(cause.redacted()));
-        redacted
+        redacted.cause = self.cause.as_ref().map(|cause| {
+            let (cause, count) = cause.redacted_with_count();
+            redaction_count += count;
+            Box::new(cause)
+        });
+        (redacted, redaction_count)
     }
 
     pub fn render_text(&self) -> String {
@@ -235,6 +253,20 @@ pub fn redact_secrets(input: &str) -> String {
     } else {
         output
     }
+}
+
+/// Return the sanitized value and the number of redaction markers added.
+pub fn redact_secrets_with_count(input: &str) -> (String, usize) {
+    let redacted = redact_secrets(input);
+    let count = if input.contains("-----BEGIN") {
+        1
+    } else {
+        redacted
+            .matches("[REDACTED]")
+            .count()
+            .saturating_sub(input.matches("[REDACTED]").count())
+    };
+    (redacted, count)
 }
 
 fn sanitize_context(
@@ -501,10 +533,31 @@ mod tests {
             redact_secrets("Authorization: token fixture-token"),
             "Authorization: token [REDACTED]"
         );
+        assert_eq!(
+            redact_secrets_with_count("token=fixture-token password=fixture-password"),
+            ("token=[REDACTED] password=[REDACTED]".to_string(), 2)
+        );
         let value = "x".repeat(MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES + 10);
         assert_eq!(
             truncate_bytes(&value, MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES).len(),
             MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES
+        );
+    }
+
+    #[test]
+    fn occurrence_redaction_counts_secret_values_in_context() {
+        let mut occurrence =
+            DiagnosticOccurrence::new(RS_2018, correlation_id(), [], None, None).unwrap();
+        occurrence.context.insert(
+            "detail".to_string(),
+            "password=fixture-password".to_string(),
+        );
+
+        let (redacted, count) = occurrence.redacted_with_count();
+        assert_eq!(count, 1);
+        assert_eq!(
+            redacted.context.get("detail").map(String::as_str),
+            Some("password=[REDACTED]")
         );
     }
 }
