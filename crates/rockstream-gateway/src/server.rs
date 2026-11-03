@@ -2633,7 +2633,7 @@ impl GatewayHandler {
         &self,
         conn_id: Option<&str>,
         secret_name: &str,
-    ) -> Result<Option<(PrincipalId, String)>, ()> {
+    ) -> PgWireResult<Option<(PrincipalId, String)>> {
         let session = conn_id.and_then(|id| {
             self.sessions
                 .get(id)
@@ -2684,8 +2684,13 @@ impl GatewayHandler {
             if let Some(id) = conn_id {
                 self.sessions.remove(id);
             }
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "42501".to_string(),
+                "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant. The required security audit could not be persisted; this session's authorization state was invalidated.".to_string(),
+            ))));
         }
-        Err(())
+        Ok(None)
     }
 
     async fn secret_namespace_id(&self, namespace: &str) -> Result<u128, String> {
@@ -2706,7 +2711,7 @@ impl GatewayHandler {
     async fn authorize_secret_metadata_read_for_connection(
         &self,
         conn_id: Option<&str>,
-    ) -> Option<Vec<Response<'static>>> {
+    ) -> PgWireResult<Option<Vec<Response<'static>>>> {
         let session = conn_id.and_then(|id| {
             self.sessions
                 .get(id)
@@ -2741,7 +2746,7 @@ impl GatewayHandler {
                 )
             });
         if authorized {
-            return None;
+            return Ok(None);
         }
 
         let audit_recorded = self
@@ -2758,23 +2763,26 @@ impl GatewayHandler {
             if let Some(id) = conn_id {
                 self.sessions.remove(id);
             }
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "42501".to_string(),
+                format!(
+                    "[RS-2401] auth.permission_denied: principal '{}' is not authorized for action 'SecretMetadataRead' on {namespace}. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated.",
+                    principal.map_or("unknown", Principal::identity)
+                ),
+            ))));
         }
 
         let identity = principal.map_or("unknown", Principal::identity);
-        let audit_status = if audit_recorded {
-            ""
-        } else {
-            " The required security audit could not be persisted; this session's authorization state was invalidated."
-        };
-        Some(vec![promote_response(Response::Error(Box::new(
+        Ok(Some(vec![promote_response(Response::Error(Box::new(
             ErrorInfo::new(
                 "ERROR".to_string(),
                 "42501".to_string(),
                 format!(
-                    "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action 'SecretMetadataRead' on {namespace}. next_steps: Request an authorized scoped grant, then retry.{audit_status}"
+                    "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action 'SecretMetadataRead' on {namespace}. next_steps: Request an authorized scoped grant, then retry."
                 ),
             ),
-        )))])
+        )))]))
     }
 
     async fn authorize_source_secret_use(
@@ -2913,8 +2921,10 @@ impl GatewayHandler {
         &self,
         query: &str,
         conn_id: Option<&str>,
-    ) -> Option<Vec<Response<'static>>> {
-        let spec = pgwire_mutation_policy(query)?;
+    ) -> PgWireResult<Option<Vec<Response<'static>>>> {
+        let Some(spec) = pgwire_mutation_policy(query) else {
+            return Ok(None);
+        };
         let action = Self::mutation_security_action(spec.operation);
         let secret_management = action == Some(SecurityAction::SecretManage);
         let durable_policy_required = self.auth_mode != AuthMode::Off
@@ -2963,7 +2973,7 @@ impl GatewayHandler {
                 }
             };
             if authorized {
-                return None;
+                return Ok(None);
             }
 
             let audit_recorded = if action.is_some() {
@@ -2977,32 +2987,38 @@ impl GatewayHandler {
                 if let Some(id) = conn_id {
                     self.sessions.remove(id);
                 }
+                let identity = principal.map_or("unknown", Principal::identity);
+                let resource = target.unwrap_or("<unknown>");
+                let action_label =
+                    action.map_or("unknown".to_string(), |action| format!("{action:?}"));
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_string(),
+                    "42501".to_string(),
+                    format!(
+                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{action_label}' on {resource}. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated."
+                    ),
+                ))));
             }
 
             let identity = principal.map_or("unknown", Principal::identity);
             let resource = target.unwrap_or("<unknown>");
             let action_label = action.map_or("unknown".to_string(), |action| format!("{action:?}"));
-            let audit_status = if audit_recorded {
-                ""
-            } else {
-                " The required security audit could not be persisted; this session's authorization state was invalidated."
-            };
-            return Some(vec![promote_response(Response::Error(Box::new(
+            return Ok(Some(vec![promote_response(Response::Error(Box::new(
                 ErrorInfo::new(
                     "ERROR".to_string(),
                     "42501".to_string(),
                     format!(
-                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{action_label}' on {resource}. next_steps: Request an authorized scoped grant, then retry.{audit_status}"
+                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{action_label}' on {resource}. next_steps: Request an authorized scoped grant, then retry."
                     ),
                 ),
-            )))]);
+            )))]));
         }
 
         // Compatibility path for auth-off fixtures that exercise the legacy
         // ACL store. Release authentication modes always use durable policy.
         let id = match conn_id {
             Some(id) => id,
-            None => return None,
+            None => return Ok(None),
         };
         let (principal, namespace) = self
             .sessions
@@ -3010,7 +3026,7 @@ impl GatewayHandler {
             .map(|session| (session.principal.clone(), session.current_namespace.clone()))
             .unwrap_or((Principal::System, "public".to_string()));
         if principal.is_system() {
-            return None;
+            return Ok(None);
         }
 
         let resource = Self::mutation_resource(query, spec.operation);
@@ -3024,7 +3040,7 @@ impl GatewayHandler {
             )
             .is_ok()
         {
-            return None;
+            return Ok(None);
         }
 
         if let Some(log) = &self.audit_log {
@@ -3039,7 +3055,7 @@ impl GatewayHandler {
             );
         }
 
-        Some(vec![promote_response(Response::Error(Box::new(
+        Ok(Some(vec![promote_response(Response::Error(Box::new(
             ErrorInfo::new(
                 "ERROR".to_string(),
                 "42501".to_string(),
@@ -3048,7 +3064,7 @@ impl GatewayHandler {
                     principal.identity(), spec.minimum_role, resource
                 ),
             ),
-        )))])
+        )))]))
     }
 
     /// Fill-level snapshot of every per-connection state map (v0.51.6
@@ -5907,7 +5923,7 @@ impl GatewayHandler {
         // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
         let ql = query.trim().to_lowercase();
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
-            if let Some(response) = self.authorize_mutation(query, Some(conn_id)).await {
+            if let Some(response) = self.authorize_mutation(query, Some(conn_id)).await? {
                 return Ok(response);
             }
             return self.handle_copy_from_stdin(query, conn_id);
@@ -5920,7 +5936,7 @@ impl GatewayHandler {
                 // Do not read rows or emit a COPY frame before checking access.
                 if let Some(denied) = self
                     .select_access_error_response(&view_name, Some(conn_id))
-                    .await
+                    .await?
                 {
                     return Ok(denied);
                 }
@@ -6309,7 +6325,7 @@ impl GatewayHandler {
         // a snapshot or reserving a stream slot.
         if let Some(denied) = self
             .select_access_error_response(&request.view_name, conn_id)
-            .await
+            .await?
         {
             return Ok(denied);
         }
@@ -6523,7 +6539,7 @@ impl GatewayHandler {
         let q = query.trim();
         let ql = q.to_lowercase();
 
-        if let Some(response) = self.authorize_mutation(q, conn_id).await {
+        if let Some(response) = self.authorize_mutation(q, conn_id).await? {
             return Ok(response);
         }
 
@@ -6556,7 +6572,7 @@ impl GatewayHandler {
         if ql.trim_end_matches(';') == "show secrets" || ql.trim_end_matches(';') == "show secret" {
             if let Some(response) = self
                 .authorize_secret_metadata_read_for_connection(conn_id)
-                .await
+                .await?
             {
                 return Ok(response);
             }
@@ -7959,7 +7975,7 @@ impl GatewayHandler {
 
                         if let Some(denied) = self
                             .select_access_error_response(&target_rel, conn_id)
-                            .await
+                            .await?
                         {
                             return Ok(denied);
                         }
@@ -8498,7 +8514,7 @@ impl GatewayHandler {
         for relation_name in referenced_tables {
             if let Some(error_responses) = self
                 .select_access_error_response(relation_name, conn_id)
-                .await
+                .await?
             {
                 return Ok(error_responses);
             }
@@ -8563,7 +8579,7 @@ impl GatewayHandler {
         &self,
         relation_name: &str,
         conn_id: Option<&str>,
-    ) -> Option<Vec<Response<'static>>> {
+    ) -> PgWireResult<Option<Vec<Response<'static>>>> {
         let session = conn_id.and_then(|id| {
             self.sessions
                 .get(id)
@@ -8576,7 +8592,7 @@ impl GatewayHandler {
 
         if durable_policy_required {
             if principal.is_some_and(Principal::is_system) && self.auth_mode == AuthMode::Off {
-                return None;
+                return Ok(None);
             }
 
             let policy_scope = session_namespace
@@ -8624,7 +8640,7 @@ impl GatewayHandler {
                         })
                     });
             if data_read_allowed && cross_namespace_allowed {
-                return None;
+                return Ok(None);
             }
 
             let (audit_scope, target, denied_action) = if data_read_allowed {
@@ -8654,23 +8670,27 @@ impl GatewayHandler {
                 if let Some(id) = conn_id {
                     self.sessions.remove(id);
                 }
+                let identity = principal.map_or("unknown", Principal::identity);
+                let resource = target.unwrap_or("<unknown>");
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_owned(),
+                    "42501".to_owned(),
+                    format!(
+                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{denied_action:?}' on {resource}. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated."
+                    ),
+                ))));
             }
             let identity = principal.map_or("unknown", Principal::identity);
             let resource = target.unwrap_or("<unknown>");
-            let audit_status = if audit_recorded {
-                ""
-            } else {
-                " The required security audit could not be persisted; this session's authorization state was invalidated."
-            };
-            return Some(vec![promote_response(Response::Error(Box::new(
+            return Ok(Some(vec![promote_response(Response::Error(Box::new(
                 ErrorInfo::new(
                     "ERROR".to_owned(),
                     "42501".to_owned(),
                     format!(
-                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{denied_action:?}' on {resource}. next_steps: Request an authorized scoped grant, then retry.{audit_status}"
+                        "[RS-2401] auth.permission_denied: principal '{identity}' is not authorized for action '{denied_action:?}' on {resource}. next_steps: Request an authorized scoped grant, then retry."
                     ),
                 ),
-            )))]);
+            )))]));
         }
 
         // Compatibility path for auth-off fixtures that exercise the legacy
@@ -8685,9 +8705,9 @@ impl GatewayHandler {
                 Some(relation_name),
                 Role::Viewer,
             ) {
-                return Some(vec![promote_response(Response::Error(Box::new(
+                return Ok(Some(vec![promote_response(Response::Error(Box::new(
                     ErrorInfo::new("ERROR".to_owned(), "42501".to_owned(), error.to_string()),
-                )))]);
+                )))]));
             }
         }
 
@@ -8704,7 +8724,7 @@ impl GatewayHandler {
                     )
                     .is_ok();
                 if !is_admin {
-                    return Some(vec![promote_response(Response::Error(Box::new(
+                    return Ok(Some(vec![promote_response(Response::Error(Box::new(
                         ErrorInfo::new(
                             "ERROR".to_owned(),
                             "42501".to_owned(),
@@ -8713,12 +8733,12 @@ impl GatewayHandler {
                                 principal.identity(), view_namespace, session_namespace
                             ),
                         ),
-                    )))]);
+                    )))]));
                 }
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Read rows from a view and build a pgwire `Response::Query`.
@@ -8730,7 +8750,10 @@ impl GatewayHandler {
         order_by: Vec<(String, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        if let Some(error_responses) = self.select_access_error_response(view_name, conn_id).await {
+        if let Some(error_responses) = self
+            .select_access_error_response(view_name, conn_id)
+            .await?
+        {
             return Ok(error_responses);
         }
         if self.catalog.get_view(view_name).is_some()
@@ -10032,10 +10055,10 @@ impl GatewayHandler {
         let secret_scope = if let Some(secret_name) = secret_name {
             match self
                 .authorize_secret_use_for_connection(conn_id, secret_name)
-                .await
+                .await?
             {
-                Ok(scope) => scope,
-                Err(()) => {
+                Some(scope) => Some(scope),
+                None => {
                     return Ok(vec![create_sink_error_response(
                         "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
                             .to_string(),
@@ -10319,10 +10342,10 @@ impl GatewayHandler {
         let secret_scope = if let Some(secret_name) = secret_name {
             match self
                 .authorize_secret_use_for_connection(conn_id, secret_name)
-                .await
+                .await?
             {
-                Ok(scope) => scope,
-                Err(()) => {
+                Some(scope) => Some(scope),
+                None => {
                     return Ok(vec![create_source_error_response(
                         "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
                             .to_string(),
@@ -11977,7 +12000,7 @@ impl GatewayHandler {
         // Retain that compatibility path; only relation reads need view ACL.
         let view_name = extract_view_name_from_select(inner_sql);
         if let Some(name) = view_name.as_deref() {
-            if let Some(denied) = self.select_access_error_response(name, conn_id).await {
+            if let Some(denied) = self.select_access_error_response(name, conn_id).await? {
                 return Ok(denied);
             }
             if self.catalog.get_view(name).is_some() && !self.catalog.is_backfill_published(name) {
@@ -13511,7 +13534,7 @@ impl GatewayHandler {
         query: &str,
         conn_id: &str,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        if let Some(response) = self.authorize_mutation(query, Some(conn_id)).await {
+        if let Some(response) = self.authorize_mutation(query, Some(conn_id)).await? {
             return Ok(response);
         }
         self.handle_copy_from_stdin(query, conn_id)
@@ -14927,7 +14950,7 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // COPY IN via extended query protocol (e.g. tokio_postgres.copy_in()).
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
-            if let Some(response) = self.authorize_mutation(query, Some(&conn_id)).await {
+            if let Some(response) = self.authorize_mutation(query, Some(&conn_id)).await? {
                 return Ok(response
                     .into_iter()
                     .next()

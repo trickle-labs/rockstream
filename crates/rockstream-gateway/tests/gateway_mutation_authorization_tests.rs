@@ -170,10 +170,32 @@ async fn denied_matrix(handler: &GatewayHandler, conn_id: &str) -> Vec<(String, 
         set_viewer(handler, &case_conn_id);
         let spec = pgwire_mutation_policy(query).expect("matrix query must be policy-covered");
         assert_eq!(spec.operation, operation);
-        let responses = handler
+        let result = handler
             .dispatch_async_with_conn(query, Some(&case_conn_id))
-            .await
-            .expect("authorization denial must be a pgwire response");
+            .await;
+        if matches!(operation, "CREATE SECRET" | "ALTER SECRET" | "DROP SECRET") {
+            let error = match result {
+                Err(pgwire::error::PgWireError::UserError(error)) => error,
+                Ok(_) => panic!("expected fatal audit failure for {query}, got a response"),
+                Err(_) => panic!("expected fatal user error for {query}, got another error"),
+            };
+            assert_eq!(error.severity, "FATAL");
+            assert_eq!(error.code, "42501");
+            assert_eq!(
+                error.message,
+                format!(
+                    "[RS-2401] auth.permission_denied: principal 'viewer' is not authorized for action 'SecretManage' on public.{resource}. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated."
+                )
+            );
+            assert!(!handler.sessions.contains_key(&case_conn_id));
+            results.push((
+                spec.operation.to_string(),
+                spec.audit_action.to_string(),
+                resource.to_string(),
+            ));
+            continue;
+        }
+        let responses = result.expect("authorization denial must be a pgwire response");
         assert_eq!(responses.len(), 1, "exact denial response for {query}");
         let error = match &responses[0] {
             pgwire::api::results::Response::Error(error) => error,
@@ -181,19 +203,10 @@ async fn denied_matrix(handler: &GatewayHandler, conn_id: &str) -> Vec<(String, 
         };
         assert_eq!(error.severity, "ERROR");
         assert_eq!(error.code, "42501");
-        let expected_message = if matches!(
-            operation,
-            "CREATE SECRET" | "ALTER SECRET" | "DROP SECRET"
-        ) {
-            format!(
-                "[RS-2401] auth.permission_denied: principal 'viewer' is not authorized for action 'SecretManage' on public.{resource}. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated."
-            )
-        } else {
-            format!(
-                "[RS-2401] auth.permission_denied: principal 'viewer' lacks required role '{:?}' on {resource}. next_steps: Request an ACL grant for the required role, then retry.",
-                spec.minimum_role
-            )
-        };
+        let expected_message = format!(
+            "[RS-2401] auth.permission_denied: principal 'viewer' lacks required role '{:?}' on {resource}. next_steps: Request an ACL grant for the required role, then retry.",
+            spec.minimum_role
+        );
         assert_eq!(
             error.message, expected_message,
             "operation={operation} query={query}"

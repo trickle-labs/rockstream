@@ -94,6 +94,8 @@ async fn unauthenticated_pgwire_cannot_manage_or_list_secrets() {
             db_error_message(error),
             format!("[RS-2401] auth.permission_denied: principal 'system' is not authorized for action '{action}' on {target}. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated.")
         );
+        let closed = client.simple_query("SELECT 1").await.unwrap_err();
+        assert_eq!(db_error_message(closed), "connection closed");
     }
     assert!(!secret_store.contains_secret(0, "kafka_auth").await.unwrap());
 }
@@ -102,13 +104,14 @@ async fn unauthenticated_pgwire_cannot_manage_or_list_secrets() {
 async fn secret_ddl_negative_paths_return_actionable_codes() {
     let catalog = Arc::new(CatalogStubs::new());
     let (port, _server, _secret_store) = start_gateway(Arc::clone(&catalog)).await;
-    let client = connect(port).await;
+    let mut client = connect(port).await;
 
     let error = client
         .simple_query("CREATE SECRET malformed")
         .await
         .unwrap_err();
     assert!(db_error_message(error).contains("RS-2401"));
+    client = connect(port).await;
 
     let error = client
         .simple_query(
@@ -129,14 +132,16 @@ async fn secret_ddl_negative_paths_return_actionable_codes() {
         .unwrap_err();
     assert_eq!(
         db_error_message(error),
-        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
+        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant. The required security audit could not be persisted; this session's authorization state was invalidated."
     );
+    client = connect(port).await;
 
     let error = client
         .simple_query("CREATE SECRET in_use (TYPE = 'sasl_plain', username = 'u', password = 'p')")
         .await
         .unwrap_err();
     assert!(db_error_message(error).contains("RS-2401"));
+    client = connect(port).await;
     let error = client
         .simple_query(
             "CREATE SOURCE kafka_src TYPE kafka (bootstrap_servers = 'localhost:9092', secret = 'in_use', topic = 'orders') FORMAT json",
@@ -145,9 +150,10 @@ async fn secret_ddl_negative_paths_return_actionable_codes() {
         .unwrap_err();
     assert_eq!(
         db_error_message(error),
-        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
+        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant. The required security audit could not be persisted; this session's authorization state was invalidated."
     );
     assert!(catalog.get_source("kafka_src").is_none());
+    client = connect(port).await;
     let error = client.simple_query("DROP SECRET in_use").await.unwrap_err();
     assert!(db_error_message(error).contains("RS-2401"));
 }
