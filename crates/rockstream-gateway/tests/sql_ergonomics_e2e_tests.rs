@@ -11,6 +11,9 @@ use rockstream_storage::ShardDb;
 use tempfile::TempDir;
 use tokio_postgres::NoTls;
 
+#[path = "common/security_policy.rs"]
+mod security_policy;
+
 struct NoopViewReader;
 
 #[async_trait::async_trait]
@@ -45,6 +48,29 @@ async fn start_gateway(
     (addr.port(), handle, shard_db)
 }
 
+async fn start_gateway_with_admin(
+    shard_path: &str,
+    store: Arc<dyn ObjectStore>,
+    catalog: Arc<CatalogStubs>,
+) -> (u16, tokio::task::JoinHandle<()>, Arc<ShardDb>) {
+    let shard_db = Arc::new(ShardDb::builder(shard_path, store).build().await.unwrap());
+    let role_catalog = security_policy::role_catalog_with_admin_and_builder(
+        &catalog,
+        "test-builder",
+        "test-password",
+    )
+    .await;
+    let server = GatewayServer::with_shard_db_and_scram_auth(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+        shard_db.clone(),
+        role_catalog,
+    );
+    let (addr, handle) = server.serve_background().await.unwrap();
+    (addr.port(), handle, shard_db)
+}
+
 async fn connect_port(port: u16) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={port} user=test dbname=test"),
@@ -65,8 +91,9 @@ async fn test_sql_ergonomics_e2e_workflow() {
     let catalog = Arc::new(CatalogStubs::new());
 
     let (port, _handle, _shard_db) =
-        start_gateway("e2e-workflow", store.clone(), catalog.clone()).await;
-    let client = connect_port(port).await;
+        start_gateway_with_admin("e2e-workflow", store.clone(), catalog.clone()).await;
+    let client = security_policy::connect_test_builder(port).await;
+    let admin = security_policy::connect_test_admin(port).await;
 
     // 1. DDL IF NOT EXISTS workflow for Table
     client
@@ -170,19 +197,19 @@ async fn test_sql_ergonomics_e2e_workflow() {
         .await
         .unwrap();
 
-    client
+    admin
         .batch_execute("CREATE INDEX IF NOT EXISTS idx_items_title ON items(title);")
         .await
         .unwrap();
-    client
+    admin
         .batch_execute("CREATE INDEX IF NOT EXISTS idx_items_title ON items(title);")
         .await
         .unwrap();
-    client
+    admin
         .batch_execute("DROP INDEX IF EXISTS idx_items_title;")
         .await
         .unwrap();
-    client
+    admin
         .batch_execute("DROP INDEX IF EXISTS idx_items_title;")
         .await
         .unwrap();
@@ -196,11 +223,11 @@ async fn test_sql_ergonomics_e2e_workflow() {
         .await
         .unwrap();
 
-    client
+    admin
         .batch_execute("CREATE SECRET IF NOT EXISTS sec_api_key (TYPE = 'postgres_role', PASSWORD = 'secret_123');")
         .await
         .unwrap();
-    client
+    admin
         .batch_execute("DROP SECRET IF EXISTS sec_api_key;")
         .await
         .unwrap();
@@ -209,7 +236,7 @@ async fn test_sql_ergonomics_e2e_workflow() {
         .batch_execute("CREATE SCHEMA IF NOT EXISTS reporting;")
         .await
         .unwrap();
-    client
+    admin
         .batch_execute("DROP SCHEMA IF EXISTS reporting;")
         .await
         .unwrap();

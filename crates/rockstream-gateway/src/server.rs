@@ -2242,7 +2242,17 @@ impl GatewayHandler {
             | "ALTER SOURCE PAUSE"
             | "ALTER SOURCE RESUME" => after("source"),
             "CREATE SECRET" | "ALTER SECRET" | "DROP SECRET" => after("secret"),
-            "CREATE INDEX" | "DROP INDEX" | "REBUILD INDEX" | "MARK INDEX" => after("index"),
+            "CREATE INDEX" | "DROP INDEX" | "REBUILD INDEX" | "MARK INDEX" => after("index")
+                .and_then(|name| {
+                    if name.eq_ignore_ascii_case("if") {
+                        words
+                            .iter()
+                            .position(|word| word.eq_ignore_ascii_case("exists"))
+                            .and_then(|index| words.get(index + 1).copied())
+                    } else {
+                        Some(name)
+                    }
+                }),
             "CREATE WORKLOAD" | "ALTER WORKLOAD" | "DROP WORKLOAD" => after("workload"),
             "INSERT" => after("into"),
             "UPDATE" => words.get(1).copied(),
@@ -6090,10 +6100,6 @@ impl GatewayHandler {
             return Some(Ok(vec![response]));
         }
 
-        if is_removed_connector_ddl(&ql) {
-            return Some(Ok(vec![connector_removed_error_response()]));
-        }
-
         if let Err(e) = rockstream_storage::catalog::validate_unsupported_ddl(q) {
             return Some(Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -6539,6 +6545,18 @@ impl GatewayHandler {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        if is_removed_connector_ddl(&ql) {
+            if let Some(id) = conn_id {
+                if let Some(mut session) = self.sessions.get_mut(id) {
+                    if session.is_in_failed_block() {
+                        return Ok(vec![promote_response(failed_transaction_error_response())]);
+                    }
+                    session.fail_transaction();
+                }
+            }
+            return Ok(vec![connector_removed_error_response()]);
+        }
+
         if let Some(response) = self.authorize_mutation(q, conn_id).await? {
             return Ok(response);
         }
@@ -6595,13 +6613,7 @@ impl GatewayHandler {
                 let is_rollback =
                     ql == "rollback" || ql == "rollback;" || ql.starts_with("rollback to");
                 if !is_rollback {
-                    return Ok(vec![promote_response(Response::Error(Box::new(
-                        ErrorInfo::new(
-                            "ERROR".to_owned(),
-                            "25P02".to_owned(),
-                            "[RS-2560] transaction.in_failed_sql_transaction: query cannot run inside a failed transaction block. next_steps: Issue ROLLBACK to exit the failed block, then retry.".to_owned(),
-                        ),
-                    )))]);
+                    return Ok(vec![promote_response(failed_transaction_error_response())]);
                 }
             }
 
@@ -19199,6 +19211,14 @@ fn connector_removed_error_response() -> Response<'static> {
     )))
 }
 
+fn failed_transaction_error_response() -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "25P02".to_owned(),
+        "[RS-2560] transaction.in_failed_sql_transaction: query cannot run inside a failed transaction block. next_steps: Issue ROLLBACK to exit the failed block, then retry.".to_owned(),
+    )))
+}
+
 fn is_removed_connector_ddl(query: &str) -> bool {
     let removed_sink = query.starts_with("create sink ")
         && query.contains(" for view ")
@@ -21540,6 +21560,93 @@ mod s4_tests {
         Arc::new(GatewayHandler::new(catalog, reader))
     }
 
+    async fn make_handler_with_admin() -> (Arc<GatewayHandler>, String) {
+        use rockstream_storage::catalog::{
+            CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn, DurableCatalogStore,
+        };
+        use rockstream_types::authorization::{
+            LoginMethod, PermissionPreset, PolicyScope, ScopedActionGrant, ScopedPresetGrant,
+            SecurityAction, SecurityPrincipal, SECURITY_PRINCIPAL_FORMAT_VERSION,
+        };
+        use rockstream_types::ids::{DatabaseId, NamespaceId, PrincipalId};
+
+        let catalog = Arc::new(CatalogStubs::new());
+        let role = crate::role_catalog::create_role_entry("unit-admin", "unit-password");
+        let (_, stored_key, server_key) = crate::role_catalog::gen_scram_verifiers(
+            "unit-password",
+            &role.scram_salt,
+            role.scram_iterations,
+        );
+        let principal = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(1),
+            display_name: "Unit test administrator".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::ScramSha256 {
+                username: "unit-admin".to_string(),
+                salt: role.scram_salt,
+                iterations: role.scram_iterations,
+                stored_key: stored_key.to_vec(),
+                server_key: server_key.to_vec(),
+            }],
+            preset_grants: vec![
+                ScopedPresetGrant {
+                    preset: PermissionPreset::Administrator,
+                    scope: PolicyScope::Cluster,
+                },
+                ScopedPresetGrant {
+                    preset: PermissionPreset::Builder,
+                    scope: PolicyScope::Namespace {
+                        namespace: "public".to_string(),
+                    },
+                },
+            ],
+            scoped_grants: vec![ScopedActionGrant {
+                action: SecurityAction::SecretUse,
+                scope: PolicyScope::Secret {
+                    namespace: "public".to_string(),
+                    name: "sink_secret".to_string(),
+                    consumer: Some(PrincipalId(1)),
+                },
+            }],
+        };
+        let durable = Arc::new(DurableCatalogStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            "gateway-unit-admin".to_string(),
+        ));
+        durable
+            .preprovision_first_administrator(principal, 1)
+            .await
+            .unwrap();
+        durable
+            .commit_txn(
+                CatalogTxn::new(
+                    2,
+                    2,
+                    vec![CatalogMutation::PutNamespace(CatalogNamespace {
+                        id: NamespaceId(1),
+                        name: "public".to_string(),
+                        database_id: DatabaseId(1),
+                        created_at: 1,
+                    })],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        catalog.set_durable_store(durable);
+
+        let handler = Arc::new(GatewayHandler::new(catalog, Arc::new(NoopViewReader)));
+        let conn_id = "unit-admin-session".to_string();
+        let mut session = crate::session::SessionState::new();
+        session.principal = Principal::ScramUser {
+            username: "unit-admin".to_string(),
+        };
+        handler.sessions.insert(conn_id.clone(), session);
+        (handler, conn_id)
+    }
+
     fn assert_authentication_event(
         record: &SecurityAuditRecord,
         actor: AuditIdentity,
@@ -21840,6 +21947,41 @@ mod s4_tests {
             .unwrap_or_default()
     }
 
+    #[test]
+    fn mutation_resource_skips_index_if_exists() {
+        assert_eq!(
+            GatewayHandler::mutation_resource(
+                "CREATE INDEX IF NOT EXISTS idx_items_title ON items(title)",
+                "CREATE INDEX",
+            ),
+            "idx_items_title"
+        );
+        assert_eq!(
+            GatewayHandler::mutation_resource("DROP INDEX IF EXISTS idx_items_title", "DROP INDEX"),
+            "idx_items_title"
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_connector_error_marks_active_transaction_failed() {
+        let handler = make_handler();
+        let conn_id = "removed-connector-session".to_string();
+        let mut session = crate::session::SessionState::new();
+        session.begin_explicit();
+        handler.sessions.insert(conn_id.clone(), session);
+
+        let response = handler
+            .dispatch_async_with_conn(
+                "CREATE SOURCE src TYPE s3 (bucket='b') FORMAT json",
+                Some(&conn_id),
+            )
+            .await
+            .unwrap();
+
+        assert!(create_sink_error_message(response).contains("RS-4017"));
+        assert!(handler.sessions.get(&conn_id).unwrap().is_in_failed_block());
+    }
+
     #[tokio::test]
     async fn create_sink_registers_catalog_entry() {
         let handler = make_handler();
@@ -21881,7 +22023,7 @@ mod s4_tests {
 
     #[tokio::test]
     async fn sink_secret_reference_blocks_secret_drop_until_sink_drop() {
-        let handler = make_handler();
+        let (handler, conn_id) = make_handler_with_admin().await;
         handler.catalog.add_view_in_namespace(CatalogView {
             name: "orders_view".to_string(),
             sql: "SELECT 1".to_string(),
@@ -21889,20 +22031,30 @@ mod s4_tests {
             namespace: "public".to_string(),
             op_id: None,
         });
-        handler
+        let create_secret = handler
             .dispatch_async_with_conn(
                 "CREATE SECRET sink_secret (TYPE = 'sasl_plain', username = 'u', password = 'p')",
-                None,
+                Some(&conn_id),
             )
             .await
             .unwrap();
-        handler
+        assert!(
+            matches!(create_secret.as_slice(), [Response::Execution(_)]),
+            "unexpected CREATE SECRET error: {}",
+            create_sink_error_message(create_secret)
+        );
+        let create_sink = handler
             .dispatch_async_with_conn(
                 "CREATE SINK credentialed_sink FOR VIEW orders_view TO ICEBERG 'file:///warehouse/orders' WITH (snapshot_interval_epochs=3, catalog=filesystem, secret='sink_secret')",
-                None,
+                Some(&conn_id),
             )
             .await
             .unwrap();
+        assert!(
+            matches!(create_sink.as_slice(), [Response::Execution(_)]),
+            "unexpected CREATE SINK error: {}",
+            create_sink_error_message(create_sink)
+        );
 
         assert_eq!(
             handler
@@ -21911,23 +22063,23 @@ mod s4_tests {
                 .unwrap()
                 .secret_name
                 .as_deref(),
-            Some("sink_secret")
+            Some("secret://sink_secret")
         );
         assert_eq!(
             create_sink_error_message(
                 handler
-                    .dispatch_async_with_conn("DROP SECRET sink_secret", None)
+                .dispatch_async_with_conn("DROP SECRET sink_secret", Some(&conn_id))
                     .await
                     .unwrap()
             ),
             "[RS-2426] secret.in_use_by_source_or_sink: secret 'sink_secret' is in use by sources/sinks [credentialed_sink]. Next steps: drop or alter referencing sources and sinks before dropping the secret."
         );
         handler
-            .dispatch_async_with_conn("DROP SINK credentialed_sink", None)
+            .dispatch_async_with_conn("DROP SINK credentialed_sink", Some(&conn_id))
             .await
             .unwrap();
         let drop_secret = handler
-            .dispatch_async_with_conn("DROP SECRET sink_secret", None)
+            .dispatch_async_with_conn("DROP SECRET sink_secret", Some(&conn_id))
             .await
             .unwrap();
         assert!(matches!(drop_secret.as_slice(), [Response::Execution(_)]));

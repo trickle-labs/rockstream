@@ -4,19 +4,80 @@ use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
     role_catalog::{create_role_entry, gen_scram_verifiers, RoleCatalog},
 };
-use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
+use rockstream_storage::catalog::{
+    CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn, DurableCatalogStore,
+};
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
-    ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
-    SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
+    ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
+    SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
-use rockstream_types::ids::PrincipalId;
+use rockstream_types::ids::{DatabaseId, NamespaceId, PrincipalId};
+use tokio_postgres::NoTls;
+
+pub async fn connect_test_builder(port: u16) -> tokio_postgres::Client {
+    connect_test_login(port, "test-builder", "test-password").await
+}
+
+pub async fn connect_test_admin(port: u16) -> tokio_postgres::Client {
+    connect_test_login(port, "bootstrap-admin", "bootstrap-password").await
+}
+
+async fn connect_test_login(port: u16, username: &str, password: &str) -> tokio_postgres::Client {
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user={username} password={password} dbname=test"),
+        NoTls,
+    )
+    .await
+    .expect("connect using test principal");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
 
 /// Build a test SCRAM login backed by an explicitly bootstrapped durable policy.
 pub async fn role_catalog_with_authorized_builder(
     catalog: &Arc<CatalogStubs>,
     username: &str,
     password: &str,
+) -> Arc<RoleCatalog> {
+    role_catalog_with_policy(catalog, username, password, None, false, false).await
+}
+
+pub async fn role_catalog_with_authorized_admin(
+    catalog: &Arc<CatalogStubs>,
+    username: &str,
+    password: &str,
+) -> Arc<RoleCatalog> {
+    role_catalog_with_policy(catalog, username, password, None, false, true).await
+}
+
+pub async fn role_catalog_with_admin_and_builder(
+    catalog: &Arc<CatalogStubs>,
+    username: &str,
+    password: &str,
+) -> Arc<RoleCatalog> {
+    role_catalog_with_policy(catalog, username, password, None, true, true).await
+}
+
+pub async fn role_catalog_with_builder_secret_use(
+    catalog: &Arc<CatalogStubs>,
+    username: &str,
+    password: &str,
+    secret_name: &str,
+) -> Arc<RoleCatalog> {
+    role_catalog_with_policy(catalog, username, password, Some(secret_name), false, true).await
+}
+
+async fn role_catalog_with_policy(
+    catalog: &Arc<CatalogStubs>,
+    username: &str,
+    password: &str,
+    secret_name: Option<&str>,
+    admin_namespace: bool,
+    seed_public_namespace: bool,
 ) -> Arc<RoleCatalog> {
     let role_catalog = Arc::new(RoleCatalog::new());
     let admin_role = create_role_entry("bootstrap-admin", "bootstrap-password");
@@ -35,6 +96,18 @@ pub async fn role_catalog_with_authorized_builder(
         gen_scram_verifiers(password, &role.scram_salt, role.scram_iterations);
     role_catalog.insert(role).expect("insert test login");
 
+    let mut admin_grants = vec![ScopedPresetGrant {
+        preset: PermissionPreset::Administrator,
+        scope: PolicyScope::Cluster,
+    }];
+    if admin_namespace {
+        admin_grants.push(ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Namespace {
+                namespace: "public".to_string(),
+            },
+        });
+    }
     let principal = SecurityPrincipal {
         format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
         id: PrincipalId(1),
@@ -48,10 +121,7 @@ pub async fn role_catalog_with_authorized_builder(
             stored_key: admin_stored_key.to_vec(),
             server_key: admin_server_key.to_vec(),
         }],
-        preset_grants: vec![ScopedPresetGrant {
-            preset: PermissionPreset::Administrator,
-            scope: PolicyScope::Cluster,
-        }],
+        preset_grants: admin_grants,
         scoped_grants: vec![],
     };
     let builder = SecurityPrincipal {
@@ -73,7 +143,18 @@ pub async fn role_catalog_with_authorized_builder(
                 namespace: "public".to_string(),
             },
         }],
-        scoped_grants: vec![],
+        scoped_grants: secret_name
+            .map(|name| {
+                vec![ScopedActionGrant {
+                    action: SecurityAction::SecretUse,
+                    scope: PolicyScope::Secret {
+                        namespace: "public".to_string(),
+                        name: name.to_string(),
+                        consumer: Some(PrincipalId(2)),
+                    },
+                }]
+            })
+            .unwrap_or_default(),
     };
     let builder_policy = serde_json::to_string(&(
         builder.enabled,
@@ -124,6 +205,24 @@ pub async fn role_catalog_with_authorized_builder(
         )
         .await
         .expect("persist test Builder grant and audit");
+    if seed_public_namespace {
+        durable
+            .commit_txn(
+                CatalogTxn::new(
+                    3,
+                    3,
+                    vec![CatalogMutation::PutNamespace(CatalogNamespace {
+                        id: NamespaceId(1),
+                        name: "public".to_string(),
+                        database_id: DatabaseId(1),
+                        created_at: 1,
+                    })],
+                )
+                .expect("valid public namespace transaction"),
+            )
+            .await
+            .expect("persist test public namespace");
+    }
     catalog.set_durable_store(durable);
     role_catalog
 }

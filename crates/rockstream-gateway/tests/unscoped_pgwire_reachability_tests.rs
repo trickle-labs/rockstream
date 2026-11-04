@@ -18,6 +18,9 @@ use rockstream_storage::ShardDb;
 use tempfile::TempDir;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
+#[path = "common/security_policy.rs"]
+mod security_policy;
+
 struct StubViewReader;
 
 #[async_trait::async_trait]
@@ -43,6 +46,14 @@ struct TestGateway {
 }
 
 async fn start_test_gateway() -> (tokio_postgres::Client, TestGateway) {
+    start_test_gateway_inner(false).await
+}
+
+async fn start_test_gateway_with_admin() -> (tokio_postgres::Client, TestGateway) {
+    start_test_gateway_inner(true).await
+}
+
+async fn start_test_gateway_inner(authenticated: bool) -> (tokio_postgres::Client, TestGateway) {
     let temp_dir = TempDir::new().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap());
     let shard_db = Arc::new(
@@ -59,26 +70,46 @@ async fn start_test_gateway() -> (tokio_postgres::Client, TestGateway) {
         Arc::new(EnvKekProvider::from_passphrase("test-passphrase")),
     ));
 
-    let server = GatewayServer::with_shard_db(
-        "127.0.0.1:0".parse().unwrap(),
-        Arc::clone(&catalog),
-        Arc::new(StubViewReader),
-        shard_db,
-    )
+    let server = if authenticated {
+        let role_catalog = security_policy::role_catalog_with_authorized_admin(
+            &catalog,
+            "test-builder",
+            "test-password",
+        )
+        .await;
+        GatewayServer::with_shard_db_and_scram_auth(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&catalog),
+            Arc::new(StubViewReader),
+            shard_db,
+            role_catalog,
+        )
+    } else {
+        GatewayServer::with_shard_db(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&catalog),
+            Arc::new(StubViewReader),
+            shard_db,
+        )
+    }
     .with_secret_store(secret_store);
 
     let (addr, handle) = server.serve_background().await.unwrap();
 
-    let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=test dbname=test", addr.port()),
-        NoTls,
-    )
-    .await
-    .unwrap();
-
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let client = if authenticated {
+        security_policy::connect_test_admin(addr.port()).await
+    } else {
+        let (client, connection) = tokio_postgres::connect(
+            &format!("host=127.0.0.1 port={} user=test dbname=test", addr.port()),
+            NoTls,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    };
 
     (
         client,
@@ -320,7 +351,7 @@ async fn test_reachability_workload_and_resource_ddl() {
 
 #[tokio::test]
 async fn test_reachability_secret_ddl() {
-    let (client, _gw) = start_test_gateway().await;
+    let (client, _gw) = start_test_gateway_with_admin().await;
     assert_command_ok(
         &client,
         "CREATE SECRET s_kfk (TYPE = 'sasl_plain', username = 'u', password = 'p');",

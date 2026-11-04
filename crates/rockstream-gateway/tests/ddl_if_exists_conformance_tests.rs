@@ -10,6 +10,9 @@ use rockstream_gateway::{
 use rockstream_storage::ShardDb;
 use tokio_postgres::NoTls;
 
+#[path = "common/security_policy.rs"]
+mod security_policy;
+
 struct NoopViewReader;
 
 #[async_trait::async_trait]
@@ -51,6 +54,43 @@ async fn start_gateway(
         catalog,
         Arc::new(NoopViewReader),
         shard_db.clone(),
+    );
+    let (addr, handle) = server.serve_background().await.unwrap();
+    (addr.port(), handle, shard_db)
+}
+
+async fn start_gateway_with_admin(
+    shard_path: &str,
+    store: Arc<dyn ObjectStore>,
+    catalog: Arc<CatalogStubs>,
+    secret_use: Option<&str>,
+) -> (u16, tokio::task::JoinHandle<()>, Arc<ShardDb>) {
+    let shard_db = Arc::new(ShardDb::builder(shard_path, store).build().await.unwrap());
+    let role_catalog = match secret_use {
+        Some(secret_name) => {
+            security_policy::role_catalog_with_builder_secret_use(
+                &catalog,
+                "test-builder",
+                "test-password",
+                secret_name,
+            )
+            .await
+        }
+        None => {
+            security_policy::role_catalog_with_authorized_admin(
+                &catalog,
+                "test-builder",
+                "test-password",
+            )
+            .await
+        }
+    };
+    let server = GatewayServer::with_shard_db_and_scram_auth(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+        shard_db.clone(),
+        role_catalog,
     );
     let (addr, handle) = server.serve_background().await.unwrap();
     (addr.port(), handle, shard_db)
@@ -319,8 +359,9 @@ async fn test_secret_if_exists_semantics() {
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let catalog = Arc::new(CatalogStubs::new());
-    let (port, _handle, _shard_db) = start_gateway("secret-if-exists", store, catalog).await;
-    let client = connect_port(port).await;
+    let (port, _handle, _shard_db) =
+        start_gateway_with_admin("secret-if-exists", store, catalog, None).await;
+    let client = security_policy::connect_test_admin(port).await;
 
     // CREATE SECRET IF NOT EXISTS
     client
@@ -361,10 +402,12 @@ async fn test_source_if_exists_semantics() {
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let catalog = Arc::new(CatalogStubs::new());
-    let (port, _handle, _shard_db) = start_gateway("source-if-exists", store, catalog).await;
-    let client = connect_port(port).await;
+    let (port, _handle, _shard_db) =
+        start_gateway_with_admin("source-if-exists", store, catalog, Some("s_cdc")).await;
+    let admin = security_policy::connect_test_admin(port).await;
+    let client = security_policy::connect_test_builder(port).await;
 
-    client
+    admin
         .simple_query("CREATE SECRET s_cdc (TYPE = 'postgres_role', PASSWORD = 'p')")
         .await
         .unwrap();

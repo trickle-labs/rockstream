@@ -566,7 +566,7 @@ pub async fn start_gateway_with_shard_and_catalog(
         )
     })?;
 
-    let auth_mode_str = opts.auth_mode.trim().to_lowercase();
+    let auth_mode_str = effective_start_auth_mode(&opts.auth_mode, &node_config);
     tracing::info!("Gateway server starting with auth mode: {}", auth_mode_str);
 
     let server = match auth_mode_str.as_str() {
@@ -725,14 +725,29 @@ fn validate_auth_mode(auth_mode: &str) -> Result<(), CliError> {
     Err(CliError::new(RS_0002, message, next_steps))
 }
 
+fn effective_start_auth_mode(
+    auth_mode: &str,
+    node_config: &rockstream_types::config::NodeConfig,
+) -> String {
+    let configured = node_config.auth.mode.trim();
+    let requested = auth_mode.trim();
+    if requested.eq_ignore_ascii_case("off") && !configured.eq_ignore_ascii_case("off") {
+        configured.to_ascii_lowercase()
+    } else {
+        requested.to_ascii_lowercase()
+    }
+}
+
 fn validate_start_auth_modes(
     auth_mode: &str,
     node_config: Option<&rockstream_types::config::NodeConfig>,
 ) -> Result<(), CliError> {
-    validate_auth_mode(auth_mode)?;
+    let selected_mode = node_config
+        .map(|config| effective_start_auth_mode(auth_mode, config))
+        .unwrap_or_else(|| auth_mode.trim().to_ascii_lowercase());
+    validate_auth_mode(&selected_mode)?;
     if let Some(node_config) = node_config {
-        let selected = auth_mode.trim().to_ascii_lowercase();
-        match selected.as_str() {
+        match selected_mode.as_str() {
             "oidc"
                 if node_config
                     .auth
@@ -779,15 +794,12 @@ fn validate_start_auth_modes(
             }
             _ => {}
         }
-    } else if matches!(
-        auth_mode.trim().to_ascii_lowercase().as_str(),
-        "oidc" | "mtls"
-    ) {
+    } else if matches!(selected_mode.as_str(), "oidc" | "mtls") {
         return Err(CliError::new(
             RS_0002,
             format!(
                 "authentication mode `{}` requires node configuration",
-                auth_mode
+                selected_mode
             ),
             "Provide a node configuration with the required authentication settings.",
         ));

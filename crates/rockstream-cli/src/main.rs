@@ -33,9 +33,13 @@ use rockstream_types::config_resolver::CliConfigOverrides;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 
 fn selected_auth_mode(cli_mode: Option<AuthMode>, configured_mode: &str) -> String {
-    cli_mode
-        .map(|mode| mode.to_string())
-        .unwrap_or_else(|| configured_mode.to_string())
+    match cli_mode {
+        Some(AuthMode::Off) if !configured_mode.trim().eq_ignore_ascii_case("off") => {
+            configured_mode.to_string()
+        }
+        Some(mode) => mode.to_string(),
+        None => configured_mode.to_string(),
+    }
 }
 
 fn main() -> ExitCode {
@@ -919,7 +923,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auth_flag_overrides_config_only_when_explicit() {
+    fn auth_flag_cannot_disable_configured_auth() {
         let cli = Cli::try_parse_from(["rockstream", "start", "--storage", "unused"])
             .expect("start should parse without an explicit auth flag");
         let Command::Start { auth, .. } = cli.command else {
@@ -927,6 +931,7 @@ mod tests {
         };
         assert_eq!(auth, None);
         assert_eq!(selected_auth_mode(None, "scram"), "scram");
-        assert_eq!(selected_auth_mode(Some(AuthMode::Off), "scram"), "off");
+        assert_eq!(selected_auth_mode(Some(AuthMode::Off), "scram"), "scram");
+        assert_eq!(selected_auth_mode(Some(AuthMode::Scram), "off"), "scram");
     }
 }

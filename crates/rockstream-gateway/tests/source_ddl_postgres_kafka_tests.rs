@@ -20,6 +20,9 @@ use testcontainers::{GenericImage, ImageExt};
 use testcontainers_modules::kafka::apache::{self, KAFKA_PORT};
 use tokio_postgres::NoTls;
 
+#[path = "common/security_policy.rs"]
+mod security_policy;
+
 struct NoopViewReader;
 
 #[async_trait::async_trait]
@@ -1217,26 +1220,25 @@ async fn test_kafka_source_ddl_complete_valid_options() {
 
 #[tokio::test]
 async fn test_kafka_source_ddl_dot_notation_aliases() {
-    let server = GatewayServer::with_catalog(
+    let catalog = Arc::new(CatalogStubs::new());
+    let role_catalog = security_policy::role_catalog_with_builder_secret_use(
+        &catalog,
+        "test-builder",
+        "test-password",
+        "kafka_secret",
+    )
+    .await;
+    let server = GatewayServer::with_scram_auth(
         "127.0.0.1:0".parse().unwrap(),
-        Arc::new(CatalogStubs::new()),
+        catalog,
         Arc::new(NoopViewReader),
+        role_catalog,
     );
     let (address, _handle) = server.serve_background().await.unwrap();
-    let (client, connection) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=test dbname=test",
-            address.port()
-        ),
-        NoTls,
-    )
-    .await
-    .unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let admin = security_policy::connect_test_admin(address.port()).await;
+    let client = security_policy::connect_test_builder(address.port()).await;
 
-    client
+    admin
         .execute(
             "CREATE SECRET kafka_secret (TYPE = 'sasl_plain', username = 'u', password = 'p');",
             &[],

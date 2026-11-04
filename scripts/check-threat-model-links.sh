@@ -40,18 +40,23 @@ else
       fi
     done
 
-    proof="${fields[5]//\`/}"
-    if [[ "$proof" == *"::"* ]]; then
-      proof_file="${proof%%::*}"
-      proof_symbol="${proof##*::}"
-      if [[ ! -f "$ROOT/$proof_file" ]]; then
-        fail "$boundary proof file is missing: $proof_file"
-      elif ! grep -Fq "$proof_symbol" "$ROOT/$proof_file"; then
-        fail "$boundary proof symbol is missing: $proof"
+    IFS=';' read -ra proof_links <<< "${fields[5]//\`/}"
+    for proof in "${proof_links[@]}"; do
+      proof="${proof#"${proof%%[![:space:]]*}"}"
+      proof="${proof%"${proof##*[![:space:]]}"}"
+      [[ -n "$proof" ]] || continue
+      if [[ "$proof" == *"::"* ]]; then
+        proof_file="${proof%%::*}"
+        proof_symbol="${proof##*::}"
+        if [[ ! -f "$ROOT/$proof_file" ]]; then
+          fail "$boundary proof file is missing: $proof_file"
+        elif ! grep -Fq "$proof_symbol" "$ROOT/$proof_file"; then
+          fail "$boundary proof symbol is missing: $proof"
+        fi
+      elif [[ ! -f "$ROOT/$proof" ]]; then
+        fail "$boundary proof link is missing: $proof"
       fi
-    elif [[ ! -f "$ROOT/$proof" ]]; then
-      fail "$boundary proof link is missing: $proof"
-    fi
+    done
   done
 fi
 
