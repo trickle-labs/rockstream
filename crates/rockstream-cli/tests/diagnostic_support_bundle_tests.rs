@@ -210,3 +210,57 @@ fn support_bundle_redacts_nested_json_secrets_in_exact_output_artifact_and_audit
     };
     assert_eq!(events, vec![expected_event]);
 }
+
+#[test]
+fn support_bundle_redacts_private_key_material_in_exact_output_artifact_and_audit() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("support.json");
+    let storage = StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS);
+    let raw_view =
+        "private_key=-----BEGIN PRIVATE KEY-----\nfixture-key-material\n-----END PRIVATE KEY-----";
+    let safe_view = "selected";
+    let expected_bundle = json!({
+        "generated_at_ms": BUNDLE_TIME_MS,
+        "candidate_identity": CandidateIdentity::current(),
+        "view": safe_view,
+        "audit_events": [],
+        "diagnostic_occurrences": [],
+        "redaction": "secret values are never included; only metadata and audit events are exported"
+    });
+    let expected_bytes = serde_json::to_vec_pretty(&expected_bundle).unwrap();
+    let expected_output = serde_json::to_string_pretty(&SupportBundleInfo {
+        bundle_path: output_path.to_string_lossy().into_owned(),
+        view: Some(safe_view.to_string()),
+        size_bytes: expected_bytes.len() as u64,
+        redacted_secrets_count: 1,
+        generated_at_ms: BUNDLE_TIME_MS,
+    })
+    .unwrap();
+
+    let actual_output = run_support_bundle(
+        OutputFormat::Json,
+        &storage,
+        temp.path(),
+        Some(raw_view),
+        None,
+        Some(&output_path),
+    )
+    .unwrap();
+    let actual_bytes = std::fs::read(&output_path).unwrap();
+    assert_eq!(actual_output, expected_output);
+    assert_eq!(actual_bytes, expected_bytes);
+    assert!(!actual_output.contains("fixture-key-material"));
+    assert!(!String::from_utf8_lossy(&actual_bytes).contains("fixture-key-material"));
+
+    let events = storage.audit_tail(temp.path(), 10).unwrap();
+    let expected_event = AuditEvent {
+        timestamp_ms: events[0].timestamp_ms,
+        actor: "admin".to_string(),
+        action: "support.bundle".to_string(),
+        resource: safe_view.to_string(),
+        error_code: None,
+        detail: Some("support bundle generated".to_string()),
+    };
+    assert_eq!(events, vec![expected_event]);
+}
