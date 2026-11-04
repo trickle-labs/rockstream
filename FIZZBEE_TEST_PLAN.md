@@ -783,6 +783,17 @@ The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
 `crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
 deletion until `DROP SINK` removes it.
 
+The v0.73 principal, grant, and audit changes persist reviewed policy revisions
+with their mutation audit records through the durable catalog. The
+`catalog_security_policy_tests.rs` suite checks exact principal and audit
+recovery through log replay, snapshot recovery, and reopen, along with one-time
+audited bootstrap, stale-revision rejection, last-administrator protection,
+and self-grant denial. `authorization.rs` tests the preset and scoped-grant
+boundaries. The M1–M7 models do not represent principal policy or audit-retention
+state; this change adds no worker, epoch, lease, or sink transition. Release
+endpoint, concurrency, and bounded-retention qualification remains separate
+evidence.
+
 Issue #276 qualifies the local filesystem object-store durability boundary below
 the M1–M7 coordination state machines. Runtime, migration, and validated-file
 store builders enable `LocalFileSystem::with_fsync(true)`, so successful local
