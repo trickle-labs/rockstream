@@ -507,6 +507,14 @@ pub async fn start_gateway_with_shard_and_catalog(
             "Check that the durable catalog is intact and storage is accessible.",
         )
     })?;
+    let security_audit_catalog: Arc<dyn rockstream_storage::catalog::CatalogStore> =
+        catalog.get_durable_store().ok_or_else(|| {
+            CliError::new(
+                RS_0003,
+                "gateway security audit catalog is unavailable",
+                "Restore durable catalog access before starting the gateway.",
+            )
+        })?;
 
     // Flush to create the initial manifest so ShardReader can open on a fresh node.
     shard_db.flush().await.map_err(|e| {
@@ -667,7 +675,6 @@ pub async fn start_gateway_with_shard_and_catalog(
         Arc::new(rockstream_control::EnvKekProvider::from_env()),
     )
     .await
-    .map(Arc::new)
     .map_err(|error| {
         CliError::new(
             RS_0003,
@@ -675,6 +682,18 @@ pub async fn start_gateway_with_shard_and_catalog(
             "Check that gateway storage is accessible and the configured key provider is available.",
         )
     })?;
+    let secret_store = secret_store.with_security_audit_catalog(security_audit_catalog);
+    secret_store
+        .flush_pending_security_audit_outbox()
+        .await
+        .map_err(|_| {
+            CliError::new(
+                RS_0003,
+                "gateway secret-rotation audit recovery failed",
+                "Restore durable catalog and secret-store access before starting the gateway.",
+            )
+        })?;
+    let secret_store = Arc::new(secret_store);
     let mut server = server
         .with_secret_store(secret_store)
         .with_query_time_shard_topology_provider(topology_provider)

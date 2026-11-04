@@ -712,6 +712,19 @@ fn append_security_audit_record_to_state(
     state: &mut CatalogInnerState,
     record: &SecurityAuditRecord,
 ) -> Result<(), CatalogError> {
+    if let Some(existing) = state
+        .security_audit_records
+        .iter()
+        .find(|existing| existing.event_id == record.event_id)
+    {
+        return if existing == record {
+            Ok(())
+        } else {
+            Err(invalid_security_policy(
+                "audit event identity is already present with different contents",
+            ))
+        };
+    }
     let separator_bytes = if state.security_audit_records.is_empty() {
         2
     } else {
@@ -751,6 +764,12 @@ fn ensure_txn_security_audit_budget(
         .mutations
         .iter()
         .filter_map(security_audit_record)
+        .filter(|record| {
+            !state
+                .security_audit_records
+                .iter()
+                .any(|existing| existing.event_id == record.event_id)
+        })
         .collect::<Vec<_>>();
     if new_records
         .iter()
@@ -940,7 +959,12 @@ fn validate_security_mutations(
                         "invalid security audit record: {error}"
                     ))
                 })?;
-                if !audit_ids.insert(record.event_id.as_str()) {
+                if !audit_ids.insert(record.event_id.as_str())
+                    && !state
+                        .security_audit_records
+                        .iter()
+                        .any(|existing| existing == record)
+                {
                     return Err(invalid_security_policy(
                         "audit event identity is already present",
                     ));
@@ -1689,6 +1713,65 @@ mod security_audit_budget_tests {
         assert_eq!(
             recovered.list_security_audit_records().await.unwrap(),
             vec![current]
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_the_same_audit_outbox_event_is_idempotent() {
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let catalog = DurableCatalogStore::new(object_store.clone(), "audit-outbox-replay");
+        let record = audit_record("rotation-event", current_time_ms().unwrap());
+
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    1,
+                    1,
+                    vec![CatalogMutation::AppendSecurityAudit(record.clone())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    2,
+                    2,
+                    vec![CatalogMutation::AppendSecurityAudit(record.clone())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut conflicting_record = record.clone();
+        conflicting_record.outcome = SecurityAuditOutcome::Denied;
+        let conflict = catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    3,
+                    3,
+                    vec![CatalogMutation::AppendSecurityAudit(conflicting_record)],
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(
+                &conflict,
+                Err(CatalogError::InvalidSecurityPolicy(message))
+                    if message == "audit event identity is already present"
+            ),
+            "conflicting audit event was accepted or failed unexpectedly: {conflict:?}"
+        );
+
+        let recovered = DurableCatalogStore::recover(object_store, "audit-outbox-replay")
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.list_security_audit_records().await.unwrap(),
+            vec![record]
         );
     }
 }

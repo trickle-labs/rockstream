@@ -6429,7 +6429,11 @@ impl GatewayHandler {
             return Some(self.handle_create_secret(q, "public").await);
         }
         if ql.starts_with("alter secret ") {
-            return Some(self.handle_alter_secret(q, "public").await);
+            let conn_id = CONN_ID.try_with(|id| id.clone()).ok();
+            return Some(
+                self.handle_alter_secret(q, "public", conn_id.as_deref())
+                    .await,
+            );
         }
         if ql.starts_with("drop secret ") {
             return Some(self.handle_drop_secret(q, "public").await);
@@ -6733,7 +6737,7 @@ impl GatewayHandler {
         }
         if ql.starts_with("alter secret ") {
             return self
-                .handle_alter_secret(q, &namespace)
+                .handle_alter_secret(q, &namespace, conn_id)
                 .await
                 .map(|responses| responses.into_iter().map(promote_response).collect());
         }
@@ -10749,6 +10753,7 @@ impl GatewayHandler {
         &'a self,
         q: &str,
         namespace: &str,
+        conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_alter_secret_ddl(q) {
             Ok(parsed) => parsed,
@@ -10763,9 +10768,68 @@ impl GatewayHandler {
                 )]);
             }
         };
+        let session_principal = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .map(|session| session.principal.clone())
+        });
+        let durable_principal = match session_principal.as_ref() {
+            Some(principal) if !principal.is_system() => {
+                match self.security_principal_for_login(principal).await {
+                    Ok(principal) => principal,
+                    Err(_) => {
+                        return Ok(vec![secret_error_response(
+                            "[RS-0003] secret.audit_unavailable: unable to resolve the authenticated principal for the durable rotation audit. Next steps: verify catalog storage health and retry.".to_string(),
+                        )]);
+                    }
+                }
+            }
+            _ => None,
+        };
+        let actor = durable_principal.as_ref().map_or_else(
+            || match session_principal.as_ref() {
+                Some(Principal::System) | None => AuditIdentity::Unknown,
+                Some(principal) => AuditIdentity::Unverified(principal.actor()),
+            },
+            |principal| AuditIdentity::Verified(format!("principal:{}", principal.id.0)),
+        );
+        let scope = PolicyScope::Secret {
+            namespace: namespace.to_string(),
+            name: parsed.name.clone(),
+            consumer: None,
+        };
+        let scope = match serde_json::to_string(&scope) {
+            Ok(scope) => scope,
+            Err(_) => {
+                return Ok(vec![secret_error_response(
+                    "[RS-0003] secret.audit_unavailable: unable to encode the secret rotation scope for audit. Next steps: verify the deployment version and retry.".to_string(),
+                )]);
+            }
+        };
+        let audit = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("gateway-secret-rotation-{:032x}", rand::random::<u128>()),
+            timestamp_ms: current_time_ms().max(1),
+            actor,
+            target: AuditField::Known(format!("secret:{namespace}/{}", parsed.name)),
+            scope: AuditField::Known(scope),
+            action: SecurityAuditClass::SecretRotation,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: conn_id.map_or(AuditCorrelation::Unknown, |id| {
+                AuditCorrelation::Observed(id.to_string())
+            }),
+            operation_id: AuditField::Unknown,
+            policy_revision: durable_principal
+                .as_ref()
+                .map_or(AuditField::Unknown, |principal| {
+                    AuditField::Known(principal.revision)
+                }),
+            before_state: AuditField::Unknown,
+            after_state: AuditField::Unknown,
+        };
         if let Err(err) = self
             .secret_store
-            .alter_secret(ns, &parsed.name, parsed.payload, "pgwire")
+            .alter_secret_with_security_audit(ns, &parsed.name, parsed.payload, "pgwire", audit)
             .await
         {
             return Ok(vec![secret_error_response(err.to_string())]);

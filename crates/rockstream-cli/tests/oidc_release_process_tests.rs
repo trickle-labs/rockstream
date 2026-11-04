@@ -1180,6 +1180,57 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .payload
         .get("password")
         .is_some_and(|value| value == "rotated-fixture-value"));
+    let rotation_audits = durable_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.action == SecurityAuditClass::SecretRotation)
+        .collect::<Vec<_>>();
+    assert_eq!(rotation_audits.len(), 1);
+    let rotation_audit = &rotation_audits[0];
+    assert!(rotation_audit
+        .event_id
+        .starts_with("gateway-secret-rotation-"));
+    assert!(rotation_audit.timestamp_ms > 0);
+    assert_eq!(
+        rotation_audit.format_version,
+        rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION
+    );
+    assert_eq!(
+        rotation_audit.actor,
+        AuditIdentity::Verified("principal:1".to_string())
+    );
+    assert_eq!(
+        rotation_audit.target,
+        AuditField::Known("secret:public/pg_auth".to_string())
+    );
+    assert_eq!(
+        rotation_audit.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::Secret {
+                namespace: "public".to_string(),
+                name: "pg_auth".to_string(),
+                consumer: None,
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(rotation_audit.outcome, SecurityAuditOutcome::Success);
+    assert!(matches!(
+        &rotation_audit.correlation,
+        AuditCorrelation::Observed(id) if !id.is_empty()
+    ));
+    assert_eq!(rotation_audit.operation_id, AuditField::Unknown);
+    assert_eq!(rotation_audit.policy_revision, AuditField::Known(1));
+    assert_eq!(
+        rotation_audit.before_state,
+        AuditField::Known("version=1".to_string())
+    );
+    assert_eq!(
+        rotation_audit.after_state,
+        AuditField::Known("version=2".to_string())
+    );
 }
 
 #[tokio::test]
