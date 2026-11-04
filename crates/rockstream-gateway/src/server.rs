@@ -10401,9 +10401,20 @@ impl GatewayHandler {
 
         let ops = entry.drain();
         drop(entry); // release DashMap entry guard before await
-                     // Serialize the entire local commit through materialized-view refresh,
-                     // durable flush and subscription publication. Releasing this guard
-                     // before flushing allowed a later epoch to publish out of order.
+        self.commit_local_ops(shard_db, ops, idempotency_key, Some(conn_id))
+            .await
+    }
+
+    async fn commit_local_ops(
+        &self,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+        ops: Vec<DmlOp>,
+        idempotency_key: Option<[u8; 16]>,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        // Serialize the entire local commit through materialized-view refresh,
+        // durable flush and subscription publication. Releasing this guard
+        // before flushing allowed a later epoch to publish out of order.
         let _commit_guard = self.shard_commit_lock.lock().await;
         self.recover_pending_views_locked()
             .await
@@ -10413,7 +10424,9 @@ impl GatewayHandler {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
             if ops.is_empty() {
-                self.flush_pending_notifies(conn_id);
+                if let Some(conn_id) = conn_id {
+                    self.flush_pending_notifies(conn_id);
+                }
                 return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
                     "COMMIT",
                 )))]);
@@ -10631,7 +10644,7 @@ impl GatewayHandler {
             })
             .unwrap_or_default();
         if let Some(log) = &self.audit_log {
-            let actor = if let Some(s) = self.sessions.get(conn_id) {
+            let actor = if let Some(s) = conn_id.and_then(|id| self.sessions.get(id)) {
                 s.principal.actor()
             } else {
                 "system".to_string()
@@ -10644,12 +10657,14 @@ impl GatewayHandler {
         }
 
         // Update session's last_written_epoch with a FreshnessToken (S7).
-        if let Some(mut session) = self.sessions.get_mut(conn_id) {
+        if let Some(mut session) = conn_id.and_then(|id| self.sessions.get_mut(id)) {
             session.last_written_epoch = Some(FreshnessToken::new(table_name, epoch));
         }
 
         // Deliver transactional NOTIFYs buffered during this transaction.
-        self.flush_pending_notifies(conn_id);
+        if let Some(conn_id) = conn_id {
+            self.flush_pending_notifies(conn_id);
+        }
 
         Ok(vec![promote_response(Response::TransactionEnd(
             Tag::new("COMMIT").with_rows(affected),
@@ -12415,39 +12430,8 @@ impl GatewayHandler {
         let Some(shard_db) = &self.shard_db else {
             return Ok(rows.len()); // no storage — pretend success
         };
-        let _commit_guard = self.shard_commit_lock.lock().await;
-        self.recover_pending_views_locked()
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-
-        let epoch = shard_db.try_next_epoch().ok_or_else(|| {
-            PgWireError::ApiError(Box::new(crate::error::GatewayError::CommitEpochExhausted))
-        })?;
-        let mut batch = rockstream_storage::WriteBatch::new();
-        for op in rows {
-            if let DmlOp::Insert {
-                table: op_table,
-                row_key,
-                values_tsv,
-                ..
-            } = op
-            {
-                let key = format!("view_output/{op_table}/{row_key}");
-                batch.put(key.as_bytes(), values_tsv.as_bytes());
-            }
-        }
-        // Advance shard frontier.
-        batch.put(
-            &rockstream_storage::ShardKeyEncoder::frontier_key(),
-            &epoch.to_be_bytes(),
-        );
-
-        shard_db
-            .write_batch(batch)
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
-        self.frontier_published_at_ms
-            .store(current_time_ms(), Ordering::SeqCst);
+        self.commit_local_ops(shard_db, rows.to_vec(), None, None)
+            .await?;
 
         // Audit: log the flush.
         if let Some(log) = &self.audit_log {

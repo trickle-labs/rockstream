@@ -138,6 +138,88 @@ async fn read_text_pairs(client: &tokio_postgres::Client, relation: &str) -> Vec
 }
 
 #[tokio::test]
+async fn copy_from_stdin_updates_compiled_views() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) = start_gateway("copy-views", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE copy_source (id BIGINT, value BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW copy_view AS SELECT id, value FROM copy_source")
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let sink: tokio_postgres::CopyInSink<bytes::Bytes> =
+            client.copy_in("COPY copy_source FROM STDIN").await.unwrap();
+        tokio::pin!(sink);
+        futures::SinkExt::send(&mut sink, bytes::Bytes::from_static(b"1\t10\n2\t20\n"))
+            .await
+            .unwrap();
+        assert_eq!(sink.finish().await.unwrap(), 2);
+    })
+    .await
+    .expect("COPY did not finish");
+    let reader = connect_port(port).await;
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_pairs(&reader, "copy_source")
+        )
+        .await
+        .expect("base read timed out"),
+        vec![(1, 10), (2, 20)]
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_pairs(&reader, "copy_view")
+        )
+        .await
+        .expect("view read timed out"),
+        vec![(1, 10), (2, 20)]
+    );
+    db.fail_next_view_output_write();
+    let failing_client = connect_port(port).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let sink: tokio_postgres::CopyInSink<bytes::Bytes> = failing_client
+            .copy_in("COPY copy_source FROM STDIN")
+            .await
+            .unwrap();
+        tokio::pin!(sink);
+        futures::SinkExt::send(&mut sink, bytes::Bytes::from_static(b"3\t30\n"))
+            .await
+            .unwrap();
+        assert!(sink.finish().await.is_err());
+    })
+    .await
+    .expect("failed COPY did not finish");
+    assert_eq!(
+        read_pairs(&reader, "copy_source").await,
+        vec![(1, 10), (2, 20)]
+    );
+    assert_eq!(
+        read_pairs(&reader, "copy_view").await,
+        vec![(1, 10), (2, 20)]
+    );
+    reader
+        .simple_query("INSERT INTO copy_source VALUES (4, 40)")
+        .await
+        .unwrap();
+    let expected = vec![(1, 10), (2, 20), (4, 40)];
+    assert_eq!(read_pairs(&reader, "copy_view").await, expected);
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("copy-views", store, catalog).await;
+    let reopened = connect_port(port).await;
+    assert_eq!(read_pairs(&reopened, "copy_source").await, expected);
+    assert_eq!(read_pairs(&reopened, "copy_view").await, expected);
+}
+
+#[tokio::test]
 async fn failed_atomic_commit_restores_window_before_next_commit() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =

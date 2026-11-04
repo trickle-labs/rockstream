@@ -18,6 +18,13 @@ frontier: it advanced from 1 to 2 despite the rejected batch. Separating
 allocation from publication makes that focused test pass. This alone does not
 repair the view-output failure above; the base batch still precedes refresh.
 
+On candidate `ccd2ac7b`, COPY FROM STDIN acknowledged two rows and the base
+table contained `[(1, 10), (2, 20)]`, but its compiled projection was empty.
+COPY batches now use the same commit path as SQL writes. The filesystem-backed
+wire test checks exact rows after COPY, an injected view-output failure, a later
+insert, and reopening. COPY can still flush multiple batches; this test does not
+claim whole-COPY atomicity across those batches.
+
 DISTINCT checkpoint recovery also resurrected a removed row: after a persisted
 insert and persisted delete, reloading suppressed the next insert of that row.
 The checkpoint now records point deletions and supports in-place restore;
