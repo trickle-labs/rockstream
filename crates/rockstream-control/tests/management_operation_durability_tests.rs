@@ -743,7 +743,7 @@ async fn operation_store_cleans_expired_terminal_records_before_acceptance() {
         .unwrap();
     seed_operation(backing.as_ref(), &expired).await;
     let store = ManagementOperationStore::new(backing);
-    let now = 7 * 24 * 60 * 60 * 1_000 + 1_003;
+    let now = TERMINAL_OPERATION_RETENTION_MS + 1_003;
     let accepted = store
         .accept("after_cleanup", OperationKind::DrainWorker, now)
         .await
