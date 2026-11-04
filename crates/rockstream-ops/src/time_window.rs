@@ -243,6 +243,9 @@ struct SessionWindowState {
     partitions: HashMap<Vec<u8>, SessionPartitionState>,
     watermark: WatermarkState,
     input_frontier: Option<rockstream_types::frontier::FreshnessToken>,
+    deleted: HashMap<(i64, Vec<u8>), u64>,
+    appended_deletions: HashMap<(i64, Vec<u8>), u64>,
+    deletion_generation: u64,
 }
 
 impl SessionWindowState {
@@ -251,6 +254,9 @@ impl SessionWindowState {
             partitions: HashMap::new(),
             watermark: WatermarkState::new(),
             input_frontier: None,
+            deleted: HashMap::new(),
+            appended_deletions: HashMap::new(),
+            deletion_generation: 0,
         }
     }
 
@@ -262,7 +268,14 @@ impl SessionWindowState {
     }
 
     fn state_bytes(&self) -> u64 {
-        let mut bytes = 0u64;
+        let mut bytes = self
+            .deleted
+            .keys()
+            .chain(self.appended_deletions.keys())
+            .map(|(_, key)| {
+                (key.len() + std::mem::size_of::<i64>() + std::mem::size_of::<u64>()) as u64
+            })
+            .sum();
         for (pk, ppart) in &self.partitions {
             bytes += pk.len() as u64;
             for (gk, (vals, _)) in &ppart.rows {
@@ -361,9 +374,9 @@ impl TumbleWindowOp {
         let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
         let prefix_len = prefix.len();
         let wm_key = ShardKeyEncoder::watermark_key(oid);
-        let wm_bytes = db.get(&wm_key).await.ok().flatten();
+        let wm_bytes = db.get(&wm_key).await.map_err(OpError::storage)?;
 
-        let mut st = self.state.lock().unwrap();
+        let mut st = TumbleWindowState::new();
         for (key, value) in entries {
             if let Some((row_vals, weight)) = decode_tumble_window_value(&value, self.n_input_cols)
             {
@@ -417,7 +430,7 @@ impl TumbleWindowOp {
             }
         }
         let total = st.total_rows();
-        drop(st);
+        *self.state.lock().unwrap() = st;
         self.fill_level.store(total, Ordering::Relaxed);
         Ok(())
     }
@@ -942,6 +955,15 @@ impl SessionWindowOp {
         self.state.lock().unwrap().state_bytes()
     }
 
+    pub(crate) fn ack_persisted_state(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (key, generation) in std::mem::take(&mut state.appended_deletions) {
+            if state.deleted.get(&key) == Some(&generation) {
+                state.deleted.remove(&key);
+            }
+        }
+    }
+
     /// Load persisted state from `db` into this already-constructed
     /// instance in place — see `TumbleWindowOp::restore_in_place` for why.
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
@@ -949,9 +971,9 @@ impl SessionWindowOp {
         let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
         let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
         let wm_key = ShardKeyEncoder::watermark_key(oid);
-        let wm_bytes = db.get(&wm_key).await.ok().flatten();
+        let wm_bytes = db.get(&wm_key).await.map_err(OpError::storage)?;
 
-        let mut st = self.state.lock().unwrap();
+        let mut st = SessionWindowState::new();
         for (_key, value) in entries {
             if let Some((row_vals, weight)) = decode_window_value(&value, self.n_input_cols) {
                 let partition_key = encode_partition_key(&row_vals, self.time_col);
@@ -989,7 +1011,7 @@ impl SessionWindowOp {
             }
         }
         let total = st.total_sessions();
-        drop(st);
+        *self.state.lock().unwrap() = st;
         self.fill_level.store(total, Ordering::Relaxed);
         Ok(())
     }
@@ -1057,6 +1079,9 @@ impl SessionWindowOp {
             entry.1 += weight;
             if entry.1 == 0 {
                 partition.rows.remove(&row_key);
+                next.deletion_generation = next.deletion_generation.wrapping_add(1);
+                next.deleted
+                    .insert((event_time_ms, row_key), next.deletion_generation);
             }
             dirty_partitions.insert(partition_key);
         }
@@ -1530,9 +1555,17 @@ pub fn append_session_window_state(
     target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
-        let state = op.state.lock().unwrap();
+        let mut state = op.state.lock().unwrap();
         let mut batch = WriteBatch::new();
         let oid = op_id.0;
+        state.appended_deletions = state.deleted.clone();
+        for (event_time, row_key) in state.deleted.keys() {
+            batch.delete(&ShardKeyEncoder::tumble_window_key(
+                oid,
+                *event_time,
+                row_key,
+            ));
+        }
         for partition in state.partitions.values() {
             for (row_key, (row_vals, weight)) in &partition.rows {
                 let event_time_ms = row_vals.get(op.time_col).copied().unwrap_or(0);
@@ -1556,7 +1589,9 @@ pub async fn persist_session_window_state(
 ) -> Result<(), OpError> {
     let mut batch = WriteBatch::new();
     append_session_window_state(op, op_id, &mut batch)?;
-    db.write_batch(batch).await.map_err(OpError::storage)
+    db.write_batch(batch).await.map_err(OpError::storage)?;
+    op.ack_persisted_state();
+    Ok(())
 }
 
 /// Load SessionWindowOp state from a ShardDb using the shared TW keyspace.

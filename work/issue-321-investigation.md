@@ -29,6 +29,14 @@ the abandoned attempt. Its next checkpoint deleted an evicted but committed
 group. In-place restoration now clears those keys after a successful reload;
 the regression compares all stored records before and after checkpointing.
 
+Window rollback tests found session restoration retained uncommitted rows.
+Tumble and session restores now replace the old state after a successful read.
+Session checkpointing also omitted deleted rows without deleting their old
+records; point deletions, failed-write retry, and acknowledgement after a
+snapshot are covered by filesystem tests. Input frontier persistence and the
+remaining operator families still need examination before using restoration
+as a general transaction rollback mechanism.
+
 The direct gRPC closed-inlet observation received exactly one ACK with fields
 `(exchange_id, src_shard, target_shard, epoch, seq, credit_grant) =
 (100, 0, 1, 1, 1, 2)` and then end-of-stream. Healthy direct delivery and the

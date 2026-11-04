@@ -377,6 +377,7 @@ impl Stage {
         match self {
             Stage::Aggregate(op) => op.clear_dirty_keys(),
             Stage::Distinct(op, _) => op.ack_persisted_state(),
+            Stage::SessionWindow(op, _) => op.ack_persisted_state(),
             Stage::MultiAggregate(op) => op.ack_persisted_state(),
             _ => {}
         }
