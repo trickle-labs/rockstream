@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use rockstream_cli::{run_start, StartOptions};
+use rockstream_cli::{run_start, run_start_with_dev_transport, StartOptions};
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
 use rockstream_storage::ShardDb;
 use rockstream_types::config::RockstreamConfig;
@@ -88,7 +88,7 @@ async fn test_binary_lifecycle_gateway_worker_control_roles() {
     std::env::set_var("ROCKSTREAM_E2E_SLEEP_MS", "300");
 
     let opts_thread = opts.clone();
-    let server_task = std::thread::spawn(move || run_start(&opts_thread));
+    let server_task = std::thread::spawn(move || run_start_with_dev_transport(&opts_thread, true));
 
     let m_addr: SocketAddr = metrics_addr.parse().unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -167,7 +167,11 @@ async fn test_binary_lifecycle_gateway_worker_control_roles() {
     let shard_manager = ShardManager::new();
     let control_service =
         ControlService::new(catalog.clone()).with_shard_manager(shard_manager.clone());
-    let control_handle = control_service.start("127.0.0.1:0").await.unwrap();
+    let control_handle = control_service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
 
     let w1_storage = dir.path().join("worker-101");
     std::fs::create_dir_all(&w1_storage).unwrap();
@@ -457,7 +461,7 @@ async fn test_server_roles_remain_alive_until_explicit_signal() {
     // Set a controlled test duration via ROCKSTREAM_E2E_SLEEP_MS to prove server remains alive beyond old 50ms default
     std::env::set_var("ROCKSTREAM_E2E_SLEEP_MS", "400");
 
-    let server_thread = std::thread::spawn(move || run_start(&opts));
+    let server_thread = std::thread::spawn(move || run_start_with_dev_transport(&opts, true));
 
     let m_addr: SocketAddr = metrics_addr.parse().unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

@@ -78,7 +78,11 @@ async fn start(
     if let Some(donor) = donor {
         service = service.with_migration_recovery_donor(donor);
     }
-    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let handle = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     assert_eq!(
         persistent.load_active().await.unwrap().len(),
         handle

@@ -93,7 +93,11 @@ async fn management_drain_retries_after_mismatched_recipient_ack() {
             Arc::new(InMemory::new()),
             NodeConfig::default(),
         );
-    let control = service.start("127.0.0.1:0").await.unwrap();
+    let control = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     let mut donor = register_worker(control.addr, 31).await;
     let mut recipient = register_worker(control.addr, 32).await;
     shard_manager.acquire(ShardId(301), WorkerId(31)).unwrap();
