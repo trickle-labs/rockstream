@@ -376,6 +376,7 @@ impl Stage {
     fn ack_persisted_state(&self) {
         match self {
             Stage::Aggregate(op) => op.clear_dirty_keys(),
+            Stage::Distinct(op, _) => op.ack_persisted_state(),
             Stage::MultiAggregate(op) => op.ack_persisted_state(),
             _ => {}
         }
@@ -389,13 +390,14 @@ impl Stage {
     /// constructors). Covers exactly the operator families the v0.51.4
     /// Durability Slices require (Aggregate, TumbleWindow, SessionWindow;
     /// Join is restored separately by `JoinPipeline::restore`, keyed off
-    /// `JoinKind`, not `Stage`). `HopWindow`/`Window`/`TopK`/`Distinct`/
+    /// `JoinKind`, not `Stage`). `HopWindow`/`Window`/`TopK`/
     /// `MultiAggregate` are out of this restore path's scope for now (not
     /// named by the Durability Slices plan) and remain a no-op here, same
     /// as the composite-key packers below.
     async fn restore(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
             Stage::Aggregate(op) => op.restore_in_place(db).await,
+            Stage::Distinct(op, id) => op.restore_in_place(db, *id).await,
             Stage::TumbleWindow(op, id) => op.restore_in_place(db, *id).await,
             Stage::SessionWindow(op, id) => op.restore_in_place(db, *id).await,
             // Same pairing note as `Stage::persist`'s `KeyPack` arm — the

@@ -18,6 +18,12 @@ frontier: it advanced from 1 to 2 despite the rejected batch. Separating
 allocation from publication makes that focused test pass. This alone does not
 repair the view-output failure above; the base batch still precedes refresh.
 
+DISTINCT checkpoint recovery also resurrected a removed row: after a persisted
+insert and persisted delete, reloading suppressed the next insert of that row.
+The checkpoint now records point deletions and supports in-place restore;
+filesystem tests cover failed-write retry and deletions made after a snapshot.
+Other operator families and the atomic commit path still require review.
+
 The direct gRPC closed-inlet observation received exactly one ACK with fields
 `(exchange_id, src_shard, target_shard, epoch, seq, credit_grant) =
 (100, 0, 1, 1, 1, 2)` and then end-of-stream. Healthy direct delivery and the
