@@ -225,21 +225,28 @@ impl TopKOp {
                         row_vals,
                         net_weight,
                     };
-                    if net_weight > 0 && part.positive_count >= TOPK_BUFFER_LIMIT {
-                        if spill_db.is_none() {
-                            return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
-                        }
+                    if net_weight > 0
+                        && part.positive_count >= TOPK_BUFFER_LIMIT
+                        && spill_db.is_none()
+                    {
+                        return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
+                    }
+                    if spill_db.is_some()
+                        && (net_weight < 0 || part.positive_count >= TOPK_BUFFER_LIMIT)
+                    {
                         let mut spill_key = self.spill_partition_prefix_at(target_slot, &part_key);
                         spill_key.extend_from_slice(&row_id.to_be_bytes());
                         spill_batch.put(&spill_key, &value);
                         part.spilled.insert(row_id);
-                        let best = candidates.entry(part_key).or_default();
-                        best.insert(
-                            (rank_value, Reverse(encode_row(&entry.row_vals)), row_id),
-                            entry,
-                        );
-                        if best.len() > self.k {
-                            best.pop_first();
+                        if net_weight > 0 {
+                            let best = candidates.entry(part_key).or_default();
+                            best.insert(
+                                (rank_value, Reverse(encode_row(&entry.row_vals)), row_id),
+                                entry,
+                            );
+                            if best.len() > self.k {
+                                best.pop_first();
+                            }
                         }
                     } else {
                         if net_weight > 0 {
@@ -389,15 +396,38 @@ impl TopKOp {
             // deleted. TOPK_BUFFER_LIMIT is a hard safety cap (not a correctness eviction).
             match part.buffer.entry(row_id) {
                 std::collections::hash_map::Entry::Occupied(mut entry_occ) => {
-                    let entry = entry_occ.get_mut();
-                    part.positive_count -= usize::from(entry.net_weight > 0);
-                    entry.net_weight += w;
-                    part.positive_count += usize::from(entry.net_weight > 0);
-                    entry.rank_value = rank_value;
-                    entry.row_vals = row_vals;
-                    // Remove entries that cancel to zero.
-                    if entry.net_weight == 0 {
+                    let old_weight = entry_occ.get().net_weight;
+                    let net_weight = old_weight + w;
+                    if old_weight < 0 && net_weight > 0 && part.positive_count >= TOPK_BUFFER_LIMIT
+                    {
+                        if db_guard.is_none() {
+                            return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
+                        }
                         entry_occ.remove();
+                        let prefix = self.spill_partition_prefix(&part_key);
+                        let db_key = [prefix.as_slice(), &row_id.to_be_bytes()].concat();
+                        let value = encode_topk_value(rank_value, net_weight, &row_vals);
+                        writes.put(&db_key, &value);
+                        spilled_bytes += (db_key.len() + value.len()) as u64;
+                        spilled_entries.insert(
+                            row_id,
+                            BufferEntry {
+                                rank_value,
+                                row_vals,
+                                net_weight,
+                            },
+                        );
+                        part.spilled.insert(row_id);
+                    } else if net_weight == 0 {
+                        part.positive_count -= usize::from(old_weight > 0);
+                        entry_occ.remove();
+                    } else {
+                        let entry = entry_occ.get_mut();
+                        part.positive_count -= usize::from(old_weight > 0);
+                        part.positive_count += usize::from(net_weight > 0);
+                        entry.net_weight = net_weight;
+                        entry.rank_value = rank_value;
+                        entry.row_vals = row_vals;
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(entry_vac) => {

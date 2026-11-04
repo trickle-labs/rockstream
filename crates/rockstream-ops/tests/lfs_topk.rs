@@ -308,6 +308,72 @@ async fn spilled_topk_restores_candidates_beyond_buffer_limit() {
         weighted_rows(&op.process_epoch(make_input(&[(100_003, 0, 3)]), 2).unwrap()),
         BTreeMap::from([((2, 0), -1), ((100_003, 0), 1)])
     );
+    assert_eq!(op.fill_level(), TOPK_BUFFER_LIMIT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn topk_debt_turning_positive_respects_buffer_limit() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let memory = TopKOp::new(schema_kv(), 1, 0, vec![]);
+    let spilled = TopKOp::new(schema_kv(), 1, 0, vec![]).with_db(db.clone());
+    let initial: Vec<_> = (1..=100_000).map(|rank| (rank, 0, 1)).collect();
+    for op in [&memory, &spilled] {
+        assert_eq!(
+            weighted_rows(&op.process_epoch(make_input(&initial), 1).unwrap()),
+            BTreeMap::from([((100_000, 0), 1)])
+        );
+        assert_eq!(
+            weighted_rows(
+                &op.process_epoch(make_input(&[(100_001, 0, -1)]), 2)
+                    .unwrap()
+            ),
+            BTreeMap::new()
+        );
+    }
+    assert!(matches!(
+        memory.process_epoch(make_input(&[(100_001, 0, 2)]), 3),
+        Err(rockstream_ops::OpError::TopKBufferOverflow {
+            limit: TOPK_BUFFER_LIMIT,
+            ..
+        })
+    ));
+    assert_eq!(
+        weighted_rows(
+            &memory
+                .process_epoch(make_input(&[(100_001, 0, 1)]), 4)
+                .unwrap()
+        ),
+        BTreeMap::new()
+    );
+    assert_eq!(memory.fill_level(), TOPK_BUFFER_LIMIT);
+    db.set_fail_writes(true);
+    assert!(
+        matches!(spilled.process_epoch(make_input(&[(100_001, 0, 2)]), 3), Err(rockstream_ops::OpError::Storage { source: rockstream_storage::StorageError::Unsupported(message), .. }) if message == "injected storage write failure")
+    );
+    db.set_fail_writes(false);
+    assert_eq!(db.scan_prefix(b"topk_spill:").await.unwrap(), vec![]);
+    assert_eq!(
+        weighted_rows(
+            &spilled
+                .process_epoch(make_input(&[(100_001, 0, 2)]), 3)
+                .unwrap()
+        ),
+        BTreeMap::from([((100_000, 0), -1), ((100_001, 0), 1)])
+    );
+    assert_eq!(spilled.fill_level(), TOPK_BUFFER_LIMIT);
+    let values = db
+        .scan_prefix(b"topk_spill:")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, value)| value.to_vec())
+        .collect::<Vec<_>>();
+    let expected = [100_001i64, 1, 100_001, 0]
+        .into_iter()
+        .flat_map(i64::to_be_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![expected]);
 }
 
 // #113 R1-R5: real spill, exact weighted deltas/bags, and shared-storage isolation.

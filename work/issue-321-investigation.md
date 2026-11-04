@@ -80,6 +80,9 @@ large K, another operator sharing storage, and close/reopen. Other source paths,
 the distributed path, and shuffle owning-epoch recovery remain unqualified.
 The spill-ID index still grows with overflow, processing materializes a spilled
 partition, and abandoned spill namespaces are not yet garbage-collected.
+An over-retracted row becoming positive previously exceeded the 100,000-row
+buffer limit. It now spills when storage is configured, or fails without
+changing state when it is not; tests also cover a failed spill write.
 
 A test-only storage pause cancels the local handler before the combined write,
 after storage accepts it but before the durable-write future completes, and
