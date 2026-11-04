@@ -831,6 +831,108 @@ async fn failed_flush_blocks_reads_until_complete_epoch_is_visible() {
 }
 
 #[tokio::test]
+async fn pgwire_cancel_during_commit_preserves_complete_view() {
+    for phase in 0..3 {
+        let dir = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let catalog = Arc::new(CatalogStubs::new());
+        let db = Arc::new(
+            ShardDb::builder("pgwire-cancel-commit", store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let server = GatewayServer::with_shard_db(
+            "127.0.0.1:0".parse().unwrap(),
+            catalog.clone(),
+            Arc::new(NoopViewReader),
+            db.clone(),
+        );
+        let handler = server.handler().clone();
+        let (addr, handle) = server.serve_background().await.unwrap();
+        let port = addr.port();
+        let client = connect_port(port).await;
+        client
+            .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+            .await
+            .unwrap();
+        client
+            .simple_query("INSERT INTO t VALUES (1, 10)")
+            .await
+            .unwrap();
+        client
+            .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, SUM(v) FROM t GROUP BY id")
+            .await
+            .unwrap();
+        let before = db.last_epoch().load(std::sync::atomic::Ordering::SeqCst);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        match phase {
+            0 => db.pause_next_view_output_write(entered.clone(), release.clone()),
+            1 => db.pause_after_next_view_write(entered.clone(), release.clone()),
+            _ => db.pause_next_flush(entered.clone(), release.clone()),
+        }
+        let token = client.cancel_token();
+        let mut cancellation = handler
+            .cancellation_registry
+            .iter()
+            .next()
+            .unwrap()
+            .value()
+            .clone();
+        let commit =
+            tokio::spawn(async move { client.simple_query("INSERT INTO t VALUES (2, 20)").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        token.cancel_query(NoTls).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancellation.cancelled())
+            .await
+            .unwrap();
+        release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), commit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                result.as_deref(),
+                Ok([tokio_postgres::SimpleQueryMessage::CommandComplete(1)])
+            ),
+            "unexpected commit response: {result:?}"
+        );
+        assert!(db.last_epoch().load(std::sync::atomic::Ordering::SeqCst) > before);
+        let observer = connect_port(port).await;
+        assert_eq!(read_pairs(&observer, "t").await, vec![(1, 10), (2, 20)]);
+        assert_eq!(read_pairs(&observer, "mv").await, vec![(1, 10), (2, 20)]);
+        observer
+            .simple_query("INSERT INTO t VALUES (3, 30)")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_pairs(&observer, "t").await,
+            vec![(1, 10), (2, 20), (3, 30)]
+        );
+        assert_eq!(
+            read_pairs(&observer, "mv").await,
+            vec![(1, 10), (2, 20), (3, 30)]
+        );
+        handle.abort();
+        let (port, _handle, _db) = start_gateway("pgwire-cancel-commit", store, catalog).await;
+        let reopened = connect_port(port).await;
+        assert_eq!(
+            read_pairs(&reopened, "t").await,
+            vec![(1, 10), (2, 20), (3, 30)]
+        );
+        assert_eq!(
+            read_pairs(&reopened, "mv").await,
+            vec![(1, 10), (2, 20), (3, 30)]
+        );
+    }
+}
+
+#[tokio::test]
 async fn cancelled_commit_restores_staged_view_before_next_query() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =

@@ -31,6 +31,13 @@ cover mixed text and numeric keys across a real gateway restart and exercise
 all supported scalar encodings. Unknown or unsupported types and malformed
 records remain explicit recovery errors rather than guessed values.
 
+On the local pgwire path, a real CancelRequest was observed by the gateway at
+each of three paused commit boundaries: before the atomic write, after that
+write, and before flush. In each case the commit returned `CommandComplete(1)`;
+the complete table and view, a subsequent insert, and the reopened results
+matched exactly. These observations do not claim the request aborts a commit.
+Separate handler-future cancellation tests cover recovery when execution stops.
+
 DISTINCT checkpoint recovery also resurrected a removed row: after a persisted
 insert and persisted delete, reloading suppressed the next insert of that row.
 The checkpoint now records point deletions and supports in-place restore;
