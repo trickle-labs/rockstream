@@ -44,11 +44,11 @@ check_exception_records "$DENY" "$POLICY" || fail "real advisory exceptions are 
 
 audit_output="$TMP_ROOT/audit.out"
 if cargo audit --file "$FIXTURE/Cargo.lock" >"$audit_output" 2>&1; then
-  cat "$audit_output"
+  cat "$audit_output" >&2
   fail "cargo audit accepted the known-vulnerable fixture"
 fi
 if ! grep -Eq 'RUSTSEC-|vulnerabilit' "$audit_output"; then
-  cat "$audit_output"
+  cat "$audit_output" >&2
   fail "cargo audit did not report an advisory"
 fi
 

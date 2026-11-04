@@ -5468,7 +5468,7 @@ impl GatewayHandler {
 
         // DROP TABLE [IF EXISTS]
         if ql.starts_with("drop table ") {
-            return Some(self.handle_drop_table(q));
+            return Some(self.handle_drop_table(q).await);
         }
 
         // DROP VIEW / DROP MATERIALIZED VIEW [IF EXISTS]
@@ -8838,7 +8838,7 @@ impl GatewayHandler {
         )])
     }
 
-    fn handle_drop_table<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_drop_table<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let if_exists = ql.contains("if exists");
         let after = if if_exists {
@@ -8883,20 +8883,29 @@ impl GatewayHandler {
             )))]);
         }
 
-        if self.catalog.get_table(&name).is_none() {
-            if if_exists {
+        match self.catalog.remove_table_durably(&name).await {
+            Ok(true) => {}
+            Ok(false) if if_exists => {
                 return Ok(vec![Response::Execution(
                     Tag::new("DROP TABLE").with_rows(0),
                 )]);
             }
-            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "42P01".to_owned(),
-                format!("[RS-4004] table.not_found: table '{name}' does not exist"),
-            )))]);
+            Ok(false) => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42P01".to_owned(),
+                    format!("[RS-4004] table.not_found: table '{name}' does not exist"),
+                )))])
+            }
+            Err(error) => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "58030".to_owned(),
+                    format!("[RS-0003] catalog write failed: {error}"),
+                )))])
+            }
         }
 
-        self.catalog.remove_table(&name);
         self.table_insert_metadata.remove(&name);
         if let Some(log) = &self.audit_log {
             let _ = log.append(&rockstream_types::audit::AuditEvent::now(

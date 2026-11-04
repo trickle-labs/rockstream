@@ -14,7 +14,7 @@ use rockstream_gateway::{
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
-use rockstream_storage::catalog::DurableCatalogStore;
+use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
 use rockstream_storage::ShardDb;
 use tokio_postgres::NoTls;
 
@@ -172,6 +172,141 @@ async fn public_tables(client: &tokio_postgres::Client) -> Vec<String> {
         .into_iter()
         .map(|row| row.get(0))
         .collect()
+}
+
+async fn table_columns(client: &tokio_postgres::Client) -> Vec<Vec<Option<String>>> {
+    client
+        .simple_query("SELECT * FROM information_schema.columns WHERE table_name = 'durable_rows'")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|index| row.get(index).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn durable_table(
+    store: Arc<dyn ObjectStore>,
+) -> Option<rockstream_storage::catalog::CatalogTable> {
+    DurableCatalogStore::recover(store, "catalog-write-failure")
+        .await
+        .unwrap()
+        .get_table_by_name("durable_rows")
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_drop_preserves_table_until_durable_deletion() {
+    let store = Arc::new(FailCatalogLogWrites {
+        inner: InMemory::new(),
+        fail: AtomicBool::new(false),
+        failed_appends: AtomicUsize::new(0),
+    });
+    let object_store: Arc<dyn ObjectStore> = store.clone();
+    let (port, handle) = start_gateway(object_store.clone()).await;
+    let client = connect(port).await;
+    client
+        .simple_query("CREATE TABLE durable_rows (id BIGINT PRIMARY KEY, label TEXT)")
+        .await
+        .unwrap();
+    let original = durable_table(object_store.clone()).await.unwrap();
+    let columns = table_columns(&client).await;
+    assert_eq!(
+        columns,
+        vec![
+            vec![
+                Some("rockstream"),
+                Some("public"),
+                Some("durable_rows"),
+                Some("id"),
+                Some("1"),
+                Some("bigint"),
+                Some("pg_catalog"),
+                Some("int8"),
+                Some("YES"),
+                Some("NO"),
+                Some("64"),
+                Some("0"),
+                Some("2"),
+                None,
+                None
+            ],
+            vec![
+                Some("rockstream"),
+                Some("public"),
+                Some("durable_rows"),
+                Some("label"),
+                Some("2"),
+                Some("text"),
+                Some("pg_catalog"),
+                Some("text"),
+                Some("YES"),
+                Some("NO"),
+                None,
+                None,
+                None,
+                None,
+                None
+            ],
+        ]
+        .into_iter()
+        .map(|row| row
+            .into_iter()
+            .map(|value| value.map(str::to_owned))
+            .collect::<Vec<_>>())
+        .collect::<Vec<_>>()
+    );
+    store.fail.store(true, Ordering::SeqCst);
+    let result = client.simple_query("DROP TABLE durable_rows").await;
+    assert_eq!(store.failed_appends.load(Ordering::SeqCst), 1);
+    assert!(
+        result.is_err(),
+        "DROP TABLE must report the failed append: {result:?}"
+    );
+    assert_eq!(public_tables(&client).await, vec!["durable_rows"]);
+    assert_eq!(table_columns(&client).await, columns);
+    assert_eq!(
+        durable_table(object_store.clone()).await,
+        Some(original.clone())
+    );
+    drop(client);
+    handle.abort();
+
+    let (port, handle) = start_gateway(object_store.clone()).await;
+    let client = connect(port).await;
+    assert_eq!(public_tables(&client).await, vec!["durable_rows"]);
+    assert_eq!(table_columns(&client).await, columns);
+    assert_eq!(durable_table(object_store.clone()).await, Some(original));
+    store.fail.store(false, Ordering::SeqCst);
+    client
+        .simple_query("DROP TABLE durable_rows")
+        .await
+        .unwrap();
+    assert_eq!(public_tables(&client).await, Vec::<String>::new());
+    assert_eq!(
+        table_columns(&client).await,
+        Vec::<Vec<Option<String>>>::new()
+    );
+    assert_eq!(durable_table(object_store.clone()).await, None);
+    drop(client);
+    handle.abort();
+
+    let (port, handle) = start_gateway(object_store.clone()).await;
+    let client = connect(port).await;
+    assert_eq!(public_tables(&client).await, Vec::<String>::new());
+    assert_eq!(
+        table_columns(&client).await,
+        Vec::<Vec<Option<String>>>::new()
+    );
+    assert_eq!(durable_table(object_store).await, None);
+    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -139,6 +139,74 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+fn validate_internal_transport(
+    opts: &StartOptions,
+    allow_insecure_internal_dev: bool,
+) -> Result<(), CliError> {
+    if !matches!(opts.role.as_str(), "all" | "control" | "worker") {
+        return Ok(());
+    }
+
+    let tls = &opts.config.internal_tls;
+    let tls_material_configured =
+        tls.cert_path.is_some() || tls.key_path.is_some() || tls.ca_cert_path.is_some();
+    if tls.is_enabled() {
+        if !tls.client_auth_required {
+            return Err(CliError::new(
+                rockstream_types::error_code::RS_2405,
+                "internal control transport requires client certificate authentication",
+                "Set internal_tls.client_auth_required = true and configure the certificate, key, and trust roots.",
+            ));
+        }
+        tls.validate().map_err(|error| {
+            CliError::new(
+                rockstream_types::error_code::RS_2405,
+                error,
+                "Check the internal TLS certificate, private key, and trust-root configuration.",
+            )
+        })?;
+        return Ok(());
+    }
+
+    if tls_material_configured {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_2405,
+            "internal mTLS requires a certificate, private key, and trust roots",
+            "Configure all internal TLS paths or remove the incomplete TLS configuration.",
+        ));
+    }
+
+    if !allow_insecure_internal_dev {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_2405,
+            "control and worker roles require internal mTLS",
+            "Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development.",
+        ));
+    }
+
+    let addr = match opts.role.as_str() {
+        "all" => "127.0.0.1:0",
+        "control" => opts.control_bind.as_deref().unwrap_or("127.0.0.1:8000"),
+        "worker" => opts.control.as_deref().unwrap_or("127.0.0.1:8000"),
+        _ => unreachable!("role was restricted above"),
+    };
+    let addr = addr
+        .strip_prefix("http://")
+        .or_else(|| addr.strip_prefix("https://"))
+        .unwrap_or(addr);
+    let loopback = addr
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_loopback());
+    if !loopback {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_2405,
+            "plaintext internal control transport is restricted to loopback addresses",
+            "Configure internal mTLS for remote control or worker traffic.",
+        ));
+    }
+    Ok(())
+}
+
 /// Options for `rockstream start`.
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -581,13 +649,21 @@ fn validate_start_auth_modes(
 /// For all other roles (and for gateway/all without a listen address) it runs
 /// the embedded no-op node, writes an audit log and support bundle, and exits.
 pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
+    run_start_with_dev_transport(opts, false)
+}
+
+/// Run `rockstream start`, optionally allowing explicitly requested
+/// loopback-only plaintext control traffic for local development.
+pub fn run_start_with_dev_transport(
+    opts: &StartOptions,
+    allow_insecure_internal_dev: bool,
+) -> Result<StartOutcome, CliError> {
     let started_ms = now_ms();
     validate_role(&opts.role)?;
     let node_config = opts
         .node_config
         .clone()
         .unwrap_or_else(|| rockstream_types::config::NodeConfig::from(&opts.config));
-
     if let Err(e) = rockstream_types::platform::PlatformClassifier::validate_startup() {
         return Err(CliError::new(
             rockstream_types::error_code::RS_3028,
@@ -656,6 +732,8 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             )
         })?;
     }
+
+    validate_internal_transport(opts, allow_insecure_internal_dev)?;
 
     fs::create_dir_all(&opts.storage).map_err(|e| {
         CliError::new(
@@ -750,6 +828,11 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             let mut service = rockstream_control::ControlService::new(catalog.clone())
                 .with_shard_manager(manager.clone())
                 .with_audit(audit_log.clone());
+            if opts.config.internal_tls.is_enabled() {
+                service = service.with_internal_tls(opts.config.internal_tls.clone());
+            } else if allow_insecure_internal_dev {
+                service = service.with_insecure_dev_mode();
+            }
             if opts.listen_addr.is_some() {
                 let store: Arc<dyn object_store::ObjectStore> = Arc::new(
                     object_store::local::LocalFileSystem::new_with_prefix(&opts.storage).map_err(
@@ -789,7 +872,16 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     );
                 }
             }
-            let handle = service.start("127.0.0.1:0").await.unwrap();
+            let handle = service
+                .start("127.0.0.1:0")
+                .await
+                .map_err(|error| {
+                    CliError::new(
+                        rockstream_types::error_code::RS_2405,
+                        error.to_string(),
+                        "Configure valid internal mTLS or explicitly enable loopback development transport.",
+                    )
+                })?;
             control_url = Some(handle.addr.to_string());
             control_handle = Some(handle);
         } else if opts.role == "control" {
@@ -800,6 +892,11 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 .with_shard_manager(manager.clone())
                 .with_frontier(frontier)
                 .with_audit(audit_log.clone());
+            if opts.config.internal_tls.is_enabled() {
+                service = service.with_internal_tls(opts.config.internal_tls.clone());
+            } else if allow_insecure_internal_dev {
+                service = service.with_insecure_dev_mode();
+            }
 
             // v0.45.2 M7 S4/S5: state that must be visible to whichever
             // control node in the group is currently elected leader (the
@@ -930,7 +1027,16 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             }
 
             let control_bind = opts.control_bind.as_deref().unwrap_or("127.0.0.1:8000");
-            let handle = service.start(control_bind).await.unwrap();
+            let handle = service
+                .start(control_bind)
+                .await
+                .map_err(|error| {
+                    CliError::new(
+                        rockstream_types::error_code::RS_2405,
+                        error.to_string(),
+                        "Configure valid internal mTLS or explicitly enable loopback development transport.",
+                    )
+                })?;
             control_handle = Some(handle);
         }
 
@@ -940,15 +1046,27 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             let mut worker = None;
             let mut last_error = None;
             for _ in 0..20 {
-                match rockstream_runtime::start_worker_client_with_metadata(
-                    proposed_worker_id,
-                    url,
-                    &opts.storage,
-                    opts.worker_location.clone(),
-                    opts.worker_capabilities,
-                )
-                .await
-                {
+                let connection = if opts.config.internal_tls.is_enabled() {
+                    rockstream_runtime::start_worker_client_with_tls_and_metadata(
+                        proposed_worker_id,
+                        url,
+                        &opts.storage,
+                        opts.worker_location.clone(),
+                        opts.worker_capabilities,
+                        opts.config.internal_tls.clone(),
+                    )
+                    .await
+                } else {
+                    rockstream_runtime::start_worker_client_with_metadata(
+                        proposed_worker_id,
+                        url,
+                        &opts.storage,
+                        opts.worker_location.clone(),
+                        opts.worker_capabilities,
+                    )
+                    .await
+                };
+                match connection {
                     Ok(connected) => {
                         worker = Some(connected);
                         break;
@@ -2631,6 +2749,27 @@ pub fn run_config_print_effective(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
+        run_start_with_dev_transport(opts, true)
+    }
+
+    #[test]
+    fn default_start_requires_internal_mtls_before_storage_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("unused");
+        let opts = StartOptions {
+            storage: storage.clone(),
+            ..StartOptions::default()
+        };
+
+        let err = super::run_start(&opts).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RS-2405 control and worker roles require internal mTLS\n  next steps: Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development."
+        );
+        assert!(!storage.exists());
+    }
 
     #[test]
     fn unknown_role_is_rejected_with_rs_0002() {
