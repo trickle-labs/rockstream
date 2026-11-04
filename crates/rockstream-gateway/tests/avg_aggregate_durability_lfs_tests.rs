@@ -160,6 +160,89 @@ async fn view_output_failure_must_not_acknowledge_incomplete_commit() {
 }
 
 #[tokio::test]
+async fn failed_atomic_commit_restores_aggregate_before_next_commit() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("aggregate-view-failure", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, SUM(v) FROM t GROUP BY id")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10)]);
+    let before = db.last_epoch().load(std::sync::atomic::Ordering::SeqCst);
+    db.fail_next_view_output_write();
+    assert!(client
+        .simple_query("INSERT INTO t VALUES (2, 20)")
+        .await
+        .is_err());
+    assert_eq!(
+        db.last_epoch().load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10)]);
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10)]);
+    client
+        .simple_query("INSERT INTO t VALUES (3, 30)")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (3, 30)]);
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (3, 30)]);
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("aggregate-view-failure", store, catalog).await;
+    let client = connect_port(port).await;
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (3, 30)]);
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (3, 30)]);
+}
+
+#[tokio::test]
+async fn failed_rollback_cannot_corrupt_a_later_commit() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, _handle, db) = start_gateway("failed-aggregate-rollback", store, catalog).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, SUM(v) FROM t GROUP BY id")
+        .await
+        .unwrap();
+    db.fail_next_view_output_write();
+    db.set_fail_scans(true);
+    assert!(client
+        .simple_query("INSERT INTO t VALUES (2, 20)")
+        .await
+        .is_err());
+    assert!(client.simple_query("SELECT * FROM mv").await.is_err());
+    db.set_fail_scans(false);
+    client
+        .simple_query("INSERT INTO t VALUES (2, 30)")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (2, 30)]);
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (2, 30)]);
+}
+
+#[tokio::test]
 async fn avg_aggregate_fractional_mean_persists_across_restart_lfs() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =

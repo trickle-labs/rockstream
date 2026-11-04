@@ -389,7 +389,7 @@ impl Stage {
     /// see `AggregateOp::restore_in_place` for why an in-place load is
     /// needed instead of just calling the existing `load_from_storage`
     /// constructors). Join is restored separately by `JoinPipeline::restore`.
-    /// Window and TopK restoration remain no-ops.
+    /// Window and TopK restoration report an error until their state can be restored.
     async fn restore(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
             Stage::Aggregate(op) => op.restore_in_place(db).await,
@@ -405,6 +405,9 @@ impl Stage {
             Stage::Utf8ColumnPack(packer, _, id) => packer.restore_in_place(db, *id).await,
             Stage::MinMax(op, _) => op.restore_in_place(db).await,
             Stage::MultiAggregate(op) => Box::pin(op.restore_in_place(db)).await,
+            Stage::Window(_, _) | Stage::TopK(_, _) => Err(OpError::internal(
+                "window or top-k state recovery is unavailable",
+            )),
             _ => Ok(()),
         }
     }

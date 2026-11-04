@@ -29,6 +29,16 @@ the abandoned attempt. Its next checkpoint deleted an evicted but committed
 group. In-place restoration now clears those keys after a successful reload;
 the regression compares all stored records before and after checkpointing.
 
+Work in progress: local SQL stages base rows, view output, state, and frontier
+in one batch. Projection and aggregate write-failure tests now pass. A failed
+state restore previously let the next aggregate commit produce 50 instead of
+30; a recovery gate now rejects reads while the failed scan persists and
+restores state before the next commit. This is not yet release evidence:
+Window and TopK restoration remain unavailable, recovery after cancellation
+and process restart needs full-path testing, and the source-path locking changes
+need their own tests. The distributed path and shuffle owning-epoch recovery
+are not established by these tests.
+
 Window rollback tests found session restoration retained uncommitted rows.
 Tumble and session restores now replace the old state after a successful read.
 Session checkpointing also omitted deleted rows without deleting their old

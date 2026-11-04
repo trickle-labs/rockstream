@@ -1118,6 +1118,11 @@ impl ShardDb {
         page_size: usize,
         max_buffer_bytes: usize,
     ) -> Result<ScanPage, StorageError> {
+        if self.fail_scans.load(Ordering::SeqCst) {
+            return Err(StorageError::Unsupported(
+                "injected storage scan failure".to_string(),
+            ));
+        }
         let strip_version_prefix = (self.format_version == 2 || self.format_version == 3)
             && prefix.first().copied() != Some(0x06);
         let physical_prefix = if strip_version_prefix {
