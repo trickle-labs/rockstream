@@ -38,6 +38,13 @@ the complete table and view, a subsequent insert, and the reopened results
 matched exactly. These observations do not claim the request aborts a commit.
 Separate handler-future cancellation tests cover recovery when execution stops.
 
+The real PostgreSQL 11 CDC fixture was run locally with Docker. After backfill,
+live updates, and a gateway restart, a source commit was paused at its atomic
+write while a local insert attempted to commit. The local insert waited; after
+release the complete table was `[(1,7),(2,20),(3,5),(4,11),(5,13),(6,17)]`
+and the aggregate was `73`. Both results survived another gateway restart.
+This covers the tested pgoutput path, not every source or failure mode.
+
 DISTINCT checkpoint recovery also resurrected a removed row: after a persisted
 insert and persisted delete, reloading suppressed the next insert of that row.
 The checkpoint now records point deletions and supports in-place restore;

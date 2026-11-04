@@ -48,6 +48,24 @@ async fn read_order_total(client: &tokio_postgres::Client) -> Vec<String> {
         .collect()
 }
 
+async fn read_order_rows(client: &tokio_postgres::Client) -> Vec<(i64, i64)> {
+    let mut rows = client
+        .simple_query("SELECT id, amount FROM orders")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap().parse::<i64>().unwrap(),
+                row.get(1).unwrap().parse::<i64>().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
+}
+
 #[tokio::test]
 async fn postgres_cdc_source_ddl_rejects_invalid_options_and_redacts_credentials() {
     let server = GatewayServer::with_catalog(
@@ -486,11 +504,11 @@ async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
     recovered_catalog.add_view_with_deps(persisted_view, vec!["orders".to_string()]);
     let restarted = GatewayServer::with_shard_db(
         "127.0.0.1:0".parse().unwrap(),
-        recovered_catalog,
+        recovered_catalog.clone(),
         Arc::new(NoopViewReader),
-        shard_db,
+        shard_db.clone(),
     );
-    let (restarted_address, _restarted_handle) = restarted.serve_background().await.unwrap();
+    let (restarted_address, restarted_handle) = restarted.serve_background().await.unwrap();
     let (restarted_client, restarted_connection) = tokio_postgres::connect(
         &format!(
             "host=127.0.0.1 port={} user=test dbname=test",
@@ -522,6 +540,85 @@ async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    shard_db.pause_next_view_output_write(entered.clone(), release.clone());
+    upstream
+        .execute("INSERT INTO orders VALUES (5, 13)", &[])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), entered.notified())
+        .await
+        .expect("source commit did not reach the atomic write");
+    let (local, local_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            restarted_address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = local_connection.await;
+    });
+    let started = Arc::new(tokio::sync::Notify::new());
+    let task_started = started.clone();
+    let mut local_commit = tokio::spawn(async move {
+        task_started.notify_one();
+        local
+            .execute("INSERT INTO orders VALUES (6, 17)", &[])
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut local_commit)
+            .await
+            .is_err(),
+        "local commit passed a paused source commit"
+    );
+    release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(15), local_commit)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        read_order_total(&restarted_client).await,
+        vec!["73".to_string()]
+    );
+    let expected = vec![(1, 7), (2, 20), (3, 5), (4, 11), (5, 13), (6, 17)];
+    assert_eq!(read_order_rows(&restarted_client).await, expected);
+    drop(restarted_client);
+    restarted_handle.abort();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        recovered_catalog,
+        Arc::new(NoopViewReader),
+        shard_db,
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    assert_eq!(read_order_total(&client).await, vec!["73".to_string()]);
+    assert_eq!(read_order_rows(&client).await, expected);
 }
 
 #[tokio::test]
