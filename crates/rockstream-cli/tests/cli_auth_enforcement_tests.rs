@@ -9,7 +9,6 @@ use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use tokio_postgres::NoTls;
 
 fn normalize_correlation_id(stderr: Vec<u8>) -> String {
     let stderr = String::from_utf8(stderr).unwrap();
@@ -111,8 +110,7 @@ async fn configured_oidc_auth_mode_cannot_be_disabled_by_start_options() {
 
     let error = start_gateway(&opts)
         .await
-        .err()
-        .expect("off must not mask configured OIDC");
+        .expect_err("off must not mask configured OIDC");
     assert_eq!(
         error.to_string(),
         "RS-0002 OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url\n  next steps: Configure the issuer, audience, and JWKS endpoint before starting the gateway."

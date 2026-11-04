@@ -9,7 +9,6 @@ use rockstream_gateway::{
 };
 use rockstream_storage::ShardDb;
 use tempfile::TempDir;
-use tokio_postgres::NoTls;
 
 #[path = "common/security_policy.rs"]
 mod security_policy;
@@ -30,22 +29,6 @@ impl ViewReader for NoopViewReader {
     fn published_frontier(&self) -> Option<u64> {
         None
     }
-}
-
-async fn start_gateway(
-    shard_path: &str,
-    store: Arc<dyn ObjectStore>,
-    catalog: Arc<CatalogStubs>,
-) -> (u16, tokio::task::JoinHandle<()>, Arc<ShardDb>) {
-    let shard_db = Arc::new(ShardDb::builder(shard_path, store).build().await.unwrap());
-    let server = GatewayServer::with_shard_db(
-        "127.0.0.1:0".parse().unwrap(),
-        catalog,
-        Arc::new(NoopViewReader),
-        shard_db.clone(),
-    );
-    let (addr, handle) = server.serve_background().await.unwrap();
-    (addr.port(), handle, shard_db)
 }
 
 async fn start_gateway_with_admin(
@@ -69,19 +52,6 @@ async fn start_gateway_with_admin(
     );
     let (addr, handle) = server.serve_background().await.unwrap();
     (addr.port(), handle, shard_db)
-}
-
-async fn connect_port(port: u16) -> tokio_postgres::Client {
-    let (client, conn) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={port} user=test dbname=test"),
-        NoTls,
-    )
-    .await
-    .unwrap();
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    client
 }
 
 #[tokio::test]
