@@ -1549,7 +1549,7 @@ mod tests {
             row_count: 2,
         };
         let (tx, rx) = mpsc::channel(1);
-        tx.send(frame).await.unwrap();
+        tx.send(frame.clone()).await.unwrap();
         drop(tx);
         let mut request = Request::new(RxStream { rx });
         request.metadata_mut().insert(
@@ -1570,6 +1570,38 @@ mod tests {
             (100, 0, 1, 1, 1, 2)
         );
         assert!(response.next().await.is_none());
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        peers.write().insert(WorkerId(132), addr.to_string());
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(131, "127.0.0.1:9131".into(), "host-a", "az-1"));
+        pool.upsert_peer_info(worker_info(132, addr.to_string(), "host-b", "az-1"));
+        let flow = FlowController::new();
+        let mux = WorkerStreamMultiplexer::new(pool, flow.clone());
+        assert_eq!(mux.send_frame(WorkerId(132), frame.clone()).await, Ok(()));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while flow.rows_in_flight(100, 0, 1) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let schema = registry.get(100, 1).unwrap().schema;
+        let (inlet_tx, mut inlet_rx) = mpsc::channel(10);
+        registry.register(100, 1, inlet_tx, schema);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), inlet_rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(mux.send_frame(WorkerId(132), frame).await, Ok(()));
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), inlet_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.positive_ab_rows(), vec![(1, 10), (2, 20)]);
+        mux.shutdown().await;
         server_handle.abort();
     }
 

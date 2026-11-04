@@ -143,8 +143,18 @@ async fn view_output_failure_must_not_acknowledge_incomplete_commit() {
         .unwrap();
     let final_table = read_pairs(&client2, "t").await;
     let final_view = read_pairs(&client2, "mv").await;
+    let initial = vec![(1, 10)];
+    let committed = vec![(1, 10), (2, 20)];
+    let valid_outcome = if result.is_ok() {
+        frontier > before && table == committed
+    } else {
+        (table == initial && frontier == before) || (table == committed && frontier > before)
+    };
+    let mut expected_final = table.clone();
+    expected_final.push((3, 30));
     assert!(
-        result.is_err() || (frontier > before && table == vec![(1, 10), (2, 20)] && view == table),
+        valid_outcome && view == table && reopened_table == table && reopened_view == table
+            && final_table == expected_final && final_view == expected_final,
         "commit={result:?}, frontier={before}->{frontier}, table={table:?}, view={view:?}, reopened table={reopened_table:?}, reopened view={reopened_view:?}, final table={final_table:?}, final view={final_view:?}"
     );
 }

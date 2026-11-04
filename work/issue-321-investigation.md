@@ -1,7 +1,7 @@
 # Issue 321 investigation (in progress)
 
-Base revision: `febf9c7c` (clean checkout). Local changes add only the
-failure injection and observation tests; no repair was applied. The SQL test
+Base revision: `febf9c7c` (clean checkout). The initial reproductions ran with
+only the failure injection and observation tests; no repair had been applied. The SQL test
 uses a local pgwire gateway and a SlateDB shard backed by LocalFileSystem.
 
 The injection rejects the first batch containing a view-output key, after the
@@ -13,11 +13,20 @@ After inserting `(3, 30)`, the table contained `[(1, 10), (2, 20), (3, 30)]`
 and the view contained `[(1, 10), (3, 30)]`. The regression deliberately
 fails on this observation. The fault was injected before any production repair.
 
+The existing failed-base-write test also exposed an allocated epoch as the
+frontier: it advanced from 1 to 2 despite the rejected batch. Separating
+allocation from publication makes that focused test pass. This alone does not
+repair the view-output failure above; the base batch still precedes refresh.
+
 The direct gRPC closed-inlet observation received exactly one ACK with fields
 `(exchange_id, src_shard, target_shard, epoch, seq, credit_grant) =
 (100, 0, 1, 1, 1, 2)` and then end-of-stream. Healthy direct delivery and the
 existing filesystem-backed committed-frontier replay test passed. These do
-not establish recovery of a rejected frame by an owning epoch. A repository
+not establish recovery of a rejected frame by an owning epoch. The multiplexer
+returned `Ok(())` for a closed-inlet frame and released its in-flight credits.
+After reopening the inlet, no frame arrived during a 100 ms observation;
+explicit replay delivered exactly `[(1, 10), (2, 20)]`. This manual replay is
+not an owning recovery path. A repository
 search found `WorkerStreamMultiplexer::send_frame` callers in tests,
 simulations and benchmarks, but no production caller; the owning recovery
 observation remains inconclusive.

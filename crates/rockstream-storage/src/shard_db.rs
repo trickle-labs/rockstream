@@ -153,6 +153,7 @@ pub struct ShardDb {
     path: String,
     object_store: Arc<dyn ObjectStore>,
     last_epoch: Arc<std::sync::atomic::AtomicU64>,
+    allocated_epoch: Arc<std::sync::atomic::AtomicU64>,
     format_version: u8,
     migration_pending: bool,
     storage_context: Option<Arc<crate::storage_context::WorkerStorageContext>>,
@@ -492,6 +493,7 @@ impl ShardDbBuilder {
             path: self.path,
             object_store: self.object_store,
             last_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
+            allocated_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
             format_version,
             migration_pending,
             storage_context: self.storage_context,
@@ -648,17 +650,19 @@ impl ShardDb {
         Ok((results, false))
     }
 
-    /// Access the last epoch atomic (for epoch allocation in direct-write commits).
+    /// Access the last committed epoch.
     pub fn last_epoch(&self) -> &Arc<std::sync::atomic::AtomicU64> {
         &self.last_epoch
     }
 
     /// Allocate the next direct-write epoch without allowing atomic wraparound.
     pub fn try_next_epoch(&self) -> Option<u64> {
-        let mut current = self.last_epoch.load(Ordering::SeqCst);
+        let mut current = self.allocated_epoch.load(Ordering::SeqCst);
         loop {
-            let next = current.checked_add(1)?;
-            match self.last_epoch.compare_exchange_weak(
+            let next = current
+                .max(self.last_epoch.load(Ordering::SeqCst))
+                .checked_add(1)?;
+            match self.allocated_epoch.compare_exchange_weak(
                 current,
                 next,
                 Ordering::SeqCst,
@@ -702,6 +706,7 @@ impl ShardDb {
                         epoch >= old_epoch,
                         "M1-S2: committed_epoch read must be non-decreasing (got {epoch}, was {old_epoch})"
                     );
+                    self.allocated_epoch.fetch_max(epoch, Ordering::SeqCst);
                     self.last_epoch.store(epoch, Ordering::SeqCst);
                 }
             }
@@ -721,13 +726,17 @@ impl ShardDb {
                 new_epoch >= old_epoch,
                 "M1-S2: committed_epoch must be non-decreasing (got {new_epoch}, was {old_epoch})"
             );
-            self.last_epoch.store(new_epoch, Ordering::SeqCst);
         }
         self.db
             .put(self.physical_key(key), value)
             .await?
             .await_durable()
             .await?;
+        if key == ShardKeyEncoder::frontier_key() && value.len() == 8 {
+            let epoch = u64::from_be_bytes(value[..8].try_into().unwrap());
+            self.allocated_epoch.fetch_max(epoch, Ordering::SeqCst);
+            self.last_epoch.fetch_max(epoch, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -789,6 +798,7 @@ impl ShardDb {
             });
         }
         let frontier_key = ShardKeyEncoder::frontier_key();
+        let mut written_frontier = None;
         for op in &batch.ops {
             if let BatchOp::Put { key, value } = op {
                 if key == &frontier_key && value.len() == 8 {
@@ -798,7 +808,7 @@ impl ShardDb {
                         new_epoch >= old_epoch,
                         "M1-S2: committed_epoch must be non-decreasing (got {new_epoch}, was {old_epoch})"
                     );
-                    self.last_epoch.store(new_epoch, Ordering::SeqCst);
+                    written_frontier = Some(new_epoch);
                 }
             }
         }
@@ -811,6 +821,10 @@ impl ShardDb {
             }
         }
         self.db.write(inner).await?.await_durable().await?;
+        if let Some(epoch) = written_frontier {
+            self.allocated_epoch.fetch_max(epoch, Ordering::SeqCst);
+            self.last_epoch.fetch_max(epoch, Ordering::SeqCst);
+        }
         Ok(())
     }
 
