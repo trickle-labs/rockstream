@@ -323,6 +323,46 @@ async fn failed_atomic_commit_restores_aggregate_before_next_commit() {
 }
 
 #[tokio::test]
+async fn failed_atomic_commit_restores_minmax_before_next_commit() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("minmax-view-failure", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, MIN(v) FROM t GROUP BY id")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10)]);
+    db.fail_next_view_output_write();
+    assert!(client
+        .simple_query("INSERT INTO t VALUES (2, 20)")
+        .await
+        .is_err());
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10)]);
+    client
+        .simple_query("INSERT INTO t VALUES (2, 30)")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (2, 30)]);
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (2, 30)]);
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("minmax-view-failure", store, catalog).await;
+    let client = connect_port(port).await;
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (2, 30)]);
+}
+
+#[tokio::test]
 async fn failed_atomic_commit_restores_join_before_next_commit() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =

@@ -1173,11 +1173,6 @@ impl ShardDb {
             prefix.to_vec()
         };
 
-        let mut iter = self.db.scan_prefix(&physical_prefix, ..).await?;
-        let mut rows = Vec::new();
-        let mut page_bytes = 0usize;
-        let mut is_last_page = true;
-
         let resume_after: Option<Vec<u8>> = continuation_token.map(|tok| {
             if strip_version_prefix {
                 if self.format_version == 3 {
@@ -1189,6 +1184,25 @@ impl ShardDb {
                 tok.to_vec()
             }
         });
+        let suffix = resume_after
+            .as_deref()
+            .and_then(|key| key.strip_prefix(physical_prefix.as_slice()));
+        let mut iter = if let Some(suffix) = suffix {
+            self.db
+                .scan_prefix(
+                    &physical_prefix,
+                    (
+                        std::ops::Bound::Excluded(suffix),
+                        std::ops::Bound::Unbounded,
+                    ),
+                )
+                .await?
+        } else {
+            self.db.scan_prefix(&physical_prefix, ..).await?
+        };
+        let mut rows = Vec::new();
+        let mut page_bytes = 0usize;
+        let mut is_last_page = true;
 
         while let Some(entry) = iter.next().await? {
             if let Some(ref resume) = resume_after {

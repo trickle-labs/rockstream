@@ -317,62 +317,70 @@ impl MinMaxOp {
 
         // Load multiset entries.
         let multiset_prefix = ShardKeyEncoder::minmax_operator_prefix(op_id.0);
-        let (entries, _truncated) = db
-            .scan_prefix_bounded(&multiset_prefix, 64 * 1024 * 1024)
-            .await
-            .map_err(OpError::storage)?;
-
-        for (key, value) in &entries {
-            // Key: [0x01][0x4D][op_id:8][group_key:8][sort_key:8]
-            let expected_prefix_len = 1 + 1 + 8 + 8 + 8;
-            if key.len() < expected_prefix_len {
-                continue;
+        let mut continuation = None;
+        loop {
+            let page = db
+                .scan_prefix_page(&multiset_prefix, continuation.as_deref(), 1024, 1024 * 1024)
+                .await
+                .map_err(OpError::storage)?;
+            for (key, value) in &page.rows {
+                // Key: [0x01][0x4D][op_id:8][group_key:8][sort_key:8]
+                let expected_prefix_len = 1 + 1 + 8 + 8 + 8;
+                if key.len() != expected_prefix_len || value.len() != 8 {
+                    return Err(OpError::storage_error("corrupt minmax multiset record"));
+                }
+                let group_key_bytes: [u8; 8] = key[1 + 1 + 8..1 + 1 + 8 + 8].try_into().unwrap();
+                let sort_key: [u8; 8] = key[1 + 1 + 8 + 8..1 + 1 + 8 + 8 + 8].try_into().unwrap();
+                let weight = i64::from_be_bytes(value[..8].try_into().unwrap());
+                if weight <= 0 {
+                    return Err(OpError::storage_error("corrupt minmax multiset weight"));
+                }
+                let group_key = i64::from_be_bytes(group_key_bytes);
+                state
+                    .multiset
+                    .entry(group_key)
+                    .or_default()
+                    .insert(sort_key, weight);
             }
-            let group_key_bytes: [u8; 8] = match key[1 + 1 + 8..1 + 1 + 8 + 8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let sort_key: [u8; 8] = match key[1 + 1 + 8 + 8..1 + 1 + 8 + 8 + 8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            if value.len() < 8 {
-                continue;
+            if page.is_last_page {
+                break;
             }
-            let weight = i64::from_be_bytes(value[..8].try_into().unwrap());
-            if weight <= 0 {
-                continue;
-            }
-            let group_key = i64::from_be_bytes(group_key_bytes);
-            state
-                .multiset
-                .entry(group_key)
-                .or_default()
-                .insert(sort_key, weight);
+            continuation = page.next_token;
         }
 
         // Load extremum cache.
         let extremum_prefix = ShardKeyEncoder::minmax_extremum_op_prefix(op_id.0);
-        let (ext_entries, _) = db
-            .scan_prefix_bounded(&extremum_prefix, 4 * 1024 * 1024)
-            .await
-            .map_err(OpError::storage)?;
-
-        for (key, value) in &ext_entries {
-            // Key: [0x02][0x4D][op_id:8][group_key:8]
-            let expected_len = 1 + 1 + 8 + 8;
-            if key.len() < expected_len || value.len() < 8 {
-                continue;
+        let mut continuation = None;
+        loop {
+            let page = db
+                .scan_prefix_page(&extremum_prefix, continuation.as_deref(), 1024, 1024 * 1024)
+                .await
+                .map_err(OpError::storage)?;
+            for (key, value) in &page.rows {
+                // Key: [0x02][0x4D][op_id:8][group_key:8]
+                let expected_len = 1 + 1 + 8 + 8;
+                if key.len() != expected_len || value.len() != 8 {
+                    return Err(OpError::storage_error("corrupt minmax extremum record"));
+                }
+                let group_key_bytes: [u8; 8] = key[1 + 1 + 8..1 + 1 + 8 + 8].try_into().unwrap();
+                let group_key = i64::from_be_bytes(group_key_bytes);
+                let extremum = i64::from_be_bytes(value[..8].try_into().unwrap());
+                state.extremum_cache.insert(group_key, extremum);
             }
-            let group_key_bytes: [u8; 8] = match key[1 + 1 + 8..1 + 1 + 8 + 8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let group_key = i64::from_be_bytes(group_key_bytes);
-            let extremum = i64::from_be_bytes(value[..8].try_into().unwrap());
-            state.extremum_cache.insert(group_key, extremum);
+            if page.is_last_page {
+                break;
+            }
+            continuation = page.next_token;
         }
 
+        if state.multiset.len() != state.extremum_cache.len()
+            || state
+                .multiset
+                .keys()
+                .any(|key| state.true_extremum(*key) != state.extremum_cache.get(key).copied())
+        {
+            return Err(OpError::storage_error("inconsistent minmax checkpoint"));
+        }
         Ok(Self::with_state(op_id, state))
     }
 
@@ -493,57 +501,68 @@ pub async fn append_minmax_state(
     let multiset_prefix = ShardKeyEncoder::minmax_operator_prefix(op.op_id.0);
     let extremum_prefix = ShardKeyEncoder::minmax_extremum_op_prefix(op.op_id.0);
 
-    // Scan existing entries (64 MB cap).
-    let (existing_multiset, _) = db
-        .scan_prefix_bounded(&multiset_prefix, 64 * 1024 * 1024)
-        .await
-        .map_err(OpError::storage)?;
-    let (existing_extremum, _) = db
-        .scan_prefix_bounded(&extremum_prefix, 4 * 1024 * 1024)
-        .await
-        .map_err(OpError::storage)?;
-
-    // Build write batch while holding the state lock, drop lock before await.
-    let wb = {
+    let mut wb = WriteBatch::new();
+    let mut continuation = None;
+    loop {
+        let page = db
+            .scan_prefix_page(&multiset_prefix, continuation.as_deref(), 1024, 1024 * 1024)
+            .await
+            .map_err(OpError::storage)?;
+        {
+            let state = op.state.lock().expect("MinMaxOp mutex poisoned");
+            for (key, _) in &page.rows {
+                let expected_len = 1 + 1 + 8 + 8 + 8;
+                if key.len() != expected_len {
+                    return Err(OpError::storage_error("corrupt minmax multiset key"));
+                }
+                let group_key =
+                    i64::from_be_bytes(key[1 + 1 + 8..1 + 1 + 8 + 8].try_into().unwrap());
+                let sort_key: [u8; 8] = key[1 + 1 + 8 + 8..expected_len].try_into().unwrap();
+                let still_live = state
+                    .multiset
+                    .get(&group_key)
+                    .map(|m| m.contains_key(&sort_key))
+                    .unwrap_or(false);
+                if !still_live {
+                    wb.delete(key);
+                }
+            }
+        }
+        if page.is_last_page {
+            break;
+        }
+        continuation = page.next_token;
+    }
+    let mut continuation = None;
+    loop {
+        let page = db
+            .scan_prefix_page(&extremum_prefix, continuation.as_deref(), 1024, 1024 * 1024)
+            .await
+            .map_err(OpError::storage)?;
+        {
+            let state = op.state.lock().expect("MinMaxOp mutex poisoned");
+            for (key, _) in &page.rows {
+                let expected_len = 1 + 1 + 8 + 8;
+                if key.len() != expected_len {
+                    return Err(OpError::storage_error("corrupt minmax extremum key"));
+                }
+                let group_key =
+                    i64::from_be_bytes(key[1 + 1 + 8..expected_len].try_into().unwrap());
+                if !state.extremum_cache.contains_key(&group_key) {
+                    wb.delete(key);
+                }
+            }
+        }
+        if page.is_last_page {
+            break;
+        }
+        continuation = page.next_token;
+    }
+    {
         let state = op.state.lock().expect("MinMaxOp mutex poisoned");
-        let mut wb = WriteBatch::new();
-
-        // Delete stale multiset entries.
-        for (key, _) in &existing_multiset {
-            let expected_len = 1 + 1 + 8 + 8 + 8;
-            if key.len() < expected_len {
-                continue;
-            }
-            let group_key = i64::from_be_bytes(key[1 + 1 + 8..1 + 1 + 8 + 8].try_into().unwrap());
-            let sort_key: [u8; 8] = key[1 + 1 + 8 + 8..expected_len].try_into().unwrap();
-            let still_live = state
-                .multiset
-                .get(&group_key)
-                .map(|m| m.contains_key(&sort_key))
-                .unwrap_or(false);
-            if !still_live {
-                wb.delete(key);
-            }
-        }
-
-        // Delete stale extremum cache entries.
-        for (key, _) in &existing_extremum {
-            let expected_len = 1 + 1 + 8 + 8;
-            if key.len() < expected_len {
-                continue;
-            }
-            let group_key = i64::from_be_bytes(key[1 + 1 + 8..expected_len].try_into().unwrap());
-            if !state.extremum_cache.contains_key(&group_key) {
-                wb.delete(key);
-            }
-        }
-
-        // Write all live entries.
         wb.merge_from(state.encode_multiset_batch(op.op_id.0));
         wb.merge_from(state.encode_extremum_batch(op.op_id.0));
-        wb
-        // Lock released here.
-    };
+    }
 
     target.merge_from(wb);
     Ok(())

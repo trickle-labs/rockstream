@@ -68,6 +68,12 @@ causing stale retractions after reload. Point deletions and in-place restore now
 cover that boundary, including failed writes, concurrent snapshot acknowledgement,
 corrupt records, and a pgwire rollback/restart test.
 
+MIN/MAX checkpoint scans previously ignored truncation. Recovery and stale-key
+removal now scan in bounded pages; the loader rejects malformed or inconsistent
+records. Page continuation seeks from the prior key rather than rescanning
+earlier pages. Tests compare all records across multiple pages and exercise a failed
+MIN view commit followed by recovery and reopen.
+
 Window rollback tests found session restoration retained uncommitted rows.
 Tumble and session restores now replace the old state after a successful read.
 Session checkpointing also omitted deleted rows without deleting their old
