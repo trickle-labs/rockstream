@@ -33,9 +33,10 @@ Window rollback tests found session restoration retained uncommitted rows.
 Tumble and session restores now replace the old state after a successful read.
 Session checkpointing also omitted deleted rows without deleting their old
 records; point deletions, failed-write retry, and acknowledgement after a
-snapshot are covered by filesystem tests. Input frontier persistence and the
-remaining operator families still need examination before using restoration
-as a general transaction rollback mechanism.
+snapshot are covered by filesystem tests. Tumble and session checkpoints now
+retain the complete input frontier in a versioned record; malformed records
+fail restoration without replacing live state. The remaining operator families
+still need examination before using restoration as a general rollback mechanism.
 
 The direct gRPC closed-inlet observation received exactly one ACK with fields
 `(exchange_id, src_shard, target_shard, epoch, seq, credit_grant) =

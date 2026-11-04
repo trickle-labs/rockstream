@@ -20,6 +20,7 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
+use rockstream_ops::op::Operator;
 use rockstream_ops::time_window::{
     load_hop_window_state, load_session_window_state, load_tumble_window_state,
     persist_hop_window_state, persist_session_window_state, persist_tumble_window_state,
@@ -223,6 +224,61 @@ async fn session_checkpoint_does_not_resurrect_deleted_rows() {
         rows,
         std::collections::HashMap::from([((100, 100, 100, 10), 1)])
     );
+}
+
+#[tokio::test]
+async fn window_restore_preserves_checkpointed_input_frontier() {
+    use rockstream_types::frontier::{FreshnessToken, SourceProgress};
+    use rockstream_types::ids::SourceId;
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let frontier = FreshnessToken::new(
+        std::collections::BTreeMap::from([(SourceId(7), SourceProgress::new(12, Some(150)))]),
+        42,
+    );
+    let tumble = TumbleWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+    tumble.push_input_frontier(frontier.clone()).unwrap();
+    persist_tumble_window_state(&db, &tumble, OperatorId(485))
+        .await
+        .unwrap();
+    tumble
+        .push_input_frontier(FreshnessToken::new(Default::default(), 99))
+        .unwrap();
+    tumble.restore_in_place(&db, OperatorId(485)).await.unwrap();
+    assert_eq!(tumble.input_frontier(), Some(frontier.clone()));
+
+    let session = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+    session.push_input_frontier(frontier.clone()).unwrap();
+    persist_session_window_state(&db, &session, OperatorId(486))
+        .await
+        .unwrap();
+    session
+        .push_input_frontier(FreshnessToken::new(Default::default(), 99))
+        .unwrap();
+    session
+        .restore_in_place(&db, OperatorId(486))
+        .await
+        .unwrap();
+    assert_eq!(session.input_frontier(), Some(frontier.clone()));
+    let reopened = load_session_window_state(
+        &db,
+        input_schema(),
+        0,
+        1000,
+        LateDataPolicy::Drop,
+        OperatorId(486),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.input_frontier(), Some(frontier.clone()));
+    let mut key = ShardKeyEncoder::watermark_key(486);
+    key.extend_from_slice(b"IF1");
+    db.put(&key, b"invalid").await.unwrap();
+    assert!(session
+        .restore_in_place(&db, OperatorId(486))
+        .await
+        .is_err());
+    assert_eq!(session.input_frontier(), Some(frontier));
 }
 
 #[tokio::test]
