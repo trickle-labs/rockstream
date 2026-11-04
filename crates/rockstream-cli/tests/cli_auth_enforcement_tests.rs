@@ -98,7 +98,7 @@ async fn scram_mode_fails_closed_without_enabled_login() {
 }
 
 #[tokio::test]
-async fn explicit_off_auth_mode_overrides_configured_oidc_mode() {
+async fn configured_oidc_auth_mode_cannot_be_disabled_by_start_options() {
     let tmp = tempfile::tempdir().unwrap();
     let mut node_config = NodeConfig::default();
     node_config.auth.mode = "oidc".to_string();
@@ -109,23 +109,15 @@ async fn explicit_off_auth_mode_overrides_configured_oidc_mode() {
     );
     opts.node_config = Some(node_config);
 
-    let (address, handle) = start_gateway(&opts).await.unwrap();
-    let (client, connection) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=alice password=unused dbname=test sslmode=disable",
-            address.port()
-        ),
-        NoTls,
-    )
-    .await
-    .expect("explicit auth mode should control the listener");
-    let connection_handle = tokio::spawn(connection);
-    let rows = client.query("SELECT 1 AS value", &[]).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get::<_, i64>(0), 1);
-    drop(client);
-    connection_handle.abort();
-    handle.abort();
+    let error = start_gateway(&opts)
+        .await
+        .err()
+        .expect("off must not mask configured OIDC");
+    assert_eq!(
+        error.to_string(),
+        "RS-0002 OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url\n  next steps: Configure the issuer, audience, and JWKS endpoint before starting the gateway."
+    );
+    assert!(!opts.storage.exists(), "failed startup created storage");
 }
 
 #[tokio::test]
