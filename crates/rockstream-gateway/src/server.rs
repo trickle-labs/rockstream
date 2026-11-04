@@ -3029,6 +3029,7 @@ impl GatewayHandler {
                         detail: "local view recovery requires its shard".to_string(),
                     })?;
             self.rollback_compiled_views(&views, db).await?;
+            db.flush().await?;
             self.pending_view_recovery.lock().clear();
         }
         Ok(())
@@ -10460,10 +10461,6 @@ impl GatewayHandler {
                     }
                 }
             }
-            self.pending_view_recovery.lock().clear();
-            self.frontier_published_at_ms
-                .store(current_time_ms(), Ordering::SeqCst);
-
             // Publish a complete committed epoch per table under one registry
             // lock. Readers cannot poll half an UPDATE or half an epoch.
             let mut changes: std::collections::HashMap<
@@ -10583,6 +10580,9 @@ impl GatewayHandler {
             shard_db.flush().await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
+            self.frontier_published_at_ms
+                .store(current_time_ms(), Ordering::SeqCst);
+            self.pending_view_recovery.lock().clear();
         }
 
         // Only successfully flushed commits may become visible in the

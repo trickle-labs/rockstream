@@ -118,6 +118,17 @@ async fn compiled_topk_restore_discards_uncommitted_delta() {
         weighted_rows(&output),
         BTreeMap::from([((2, 2), -1), ((4, 4), 1)])
     );
+    let records = db
+        .scan_prefix(&rockstream_storage::ShardKeyEncoder::topk_op_prefix(id.0))
+        .await
+        .unwrap();
+    db.put(&records[0].0, b"invalid").await.unwrap();
+    assert!(pipeline.restore(&db).await.is_err());
+    let output = pipeline.process(make_input(&[(5, 5, 1)])).unwrap();
+    assert_eq!(
+        weighted_rows(&output),
+        BTreeMap::from([((3, 3), -1), ((5, 5), 1)])
+    );
 }
 
 // #113 R1-R5: real spill, exact weighted deltas/bags, and shared-storage isolation.

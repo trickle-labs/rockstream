@@ -323,6 +323,52 @@ async fn failed_atomic_commit_restores_aggregate_before_next_commit() {
 }
 
 #[tokio::test]
+async fn failed_atomic_commit_restores_join_before_next_commit() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("join-view-failure", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client.simple_query("CREATE TABLE a (id BIGINT PRIMARY KEY, v BIGINT); CREATE TABLE b (id BIGINT PRIMARY KEY, v BIGINT)").await.unwrap();
+    client
+        .simple_query("INSERT INTO a VALUES (1, 10); INSERT INTO b VALUES (1, 100)")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW mv AS SELECT a.id, a.v, b.v FROM a JOIN b ON a.id = b.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_triples(&client, "mv").await, vec![(1, 10, 100)]);
+    db.fail_next_view_output_write();
+    assert!(client
+        .simple_query("UPDATE a SET v = 20 WHERE id = 1")
+        .await
+        .is_err());
+    assert_eq!(read_triples(&client, "mv").await, vec![(1, 10, 100)]);
+    client
+        .simple_query("UPDATE a SET v = 30 WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "a").await, vec![(1, 30)]);
+    assert_eq!(read_triples(&client, "mv").await, vec![(1, 30, 100)]);
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("join-view-failure", store, catalog).await;
+    let client = connect_port(port).await;
+    assert_eq!(read_triples(&client, "mv").await, vec![(1, 30, 100)]);
+    client
+        .simple_query("UPDATE b SET v = 200 WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "a").await, vec![(1, 30)]);
+    assert_eq!(read_pairs(&client, "b").await, vec![(1, 200)]);
+    assert_eq!(read_triples(&client, "mv").await, vec![(1, 30, 200)]);
+}
+
+#[tokio::test]
 async fn failed_rollback_cannot_corrupt_a_later_commit() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =
@@ -356,6 +402,149 @@ async fn failed_rollback_cannot_corrupt_a_later_commit() {
         .unwrap();
     assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (2, 30)]);
     assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (2, 30)]);
+}
+
+#[tokio::test]
+async fn failed_flush_blocks_reads_until_complete_epoch_is_visible() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("failed-view-flush", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, SUM(v) FROM t GROUP BY id")
+        .await
+        .unwrap();
+    db.set_fail_flushes(true);
+    assert!(client
+        .simple_query("INSERT INTO t VALUES (2, 20)")
+        .await
+        .is_err());
+    assert!(client.simple_query("SELECT * FROM mv").await.is_err());
+    db.set_fail_flushes(false);
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (2, 20)]);
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (2, 20)]);
+    client
+        .simple_query("INSERT INTO t VALUES (3, 30)")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_pairs(&client, "mv").await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("failed-view-flush", store, catalog).await;
+    let client = connect_port(port).await;
+    assert_eq!(
+        read_pairs(&client, "t").await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+    assert_eq!(
+        read_pairs(&client, "mv").await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+}
+
+#[tokio::test]
+async fn cancelled_commit_restores_staged_view_before_next_query() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let db = Arc::new(
+        ShardDb::builder("cancelled-view-commit", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+        db.clone(),
+    );
+    let handler = server.handler().clone();
+    let (addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, SUM(v) FROM t GROUP BY id")
+        .await
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    db.pause_next_view_output_write(entered.clone(), release);
+    let first_handler = handler.clone();
+    let commit = tokio::spawn(async move {
+        first_handler
+            .dispatch_async_with_conn("INSERT INTO t VALUES (2, 20)", Some("cancelled-test"))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    commit.abort();
+    assert!(matches!(commit.await, Err(error) if error.is_cancelled()));
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10)]);
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10)]);
+    client
+        .simple_query("INSERT INTO t VALUES (2, 30)")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (2, 30)]);
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (2, 30)]);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    db.pause_next_flush(entered.clone(), release);
+    let commit = tokio::spawn(async move {
+        handler
+            .dispatch_async_with_conn(
+                "INSERT INTO t VALUES (3, 40)",
+                Some("cancelled-after-write"),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    let observer = connect_port(addr.port()).await;
+    let mut read = tokio::spawn(async move { read_pairs(&observer, "mv").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut read)
+            .await
+            .is_err()
+    );
+    commit.abort();
+    assert!(matches!(commit.await, Err(error) if error.is_cancelled()));
+    assert_eq!(read.await.unwrap(), vec![(1, 10), (2, 30), (3, 40)]);
+    assert_eq!(
+        read_pairs(&client, "t").await,
+        vec![(1, 10), (2, 30), (3, 40)]
+    );
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("cancelled-view-commit", store, catalog).await;
+    let client = connect_port(port).await;
+    assert_eq!(
+        read_pairs(&client, "mv").await,
+        vec![(1, 10), (2, 30), (3, 40)]
+    );
 }
 
 #[tokio::test]

@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static ALLOW_LAW_OPERAND_FALLBACK: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "test-utils")]
+type TestPause =
+    Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
+
 /// Max rows (groups) returned by a single shard's partial_query.
 /// Bound: MAX_PARTIAL_AGG_RESULT_ROWS; fill metric: partial_agg_result_rows gauge.
 pub const MAX_PARTIAL_AGG_RESULT_ROWS: usize = 1_000_000;
@@ -162,6 +166,10 @@ pub struct ShardDb {
     cleanup_on_drop: bool,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
     fail_view_output_once: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-utils")]
+    pause_view_output_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_flush_once: TestPause,
     fail_flushes: Arc<std::sync::atomic::AtomicBool>,
     fail_scans: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -502,6 +510,10 @@ impl ShardDbBuilder {
             cleanup_on_drop: self.cleanup_on_drop,
             fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_view_output_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-utils")]
+            pause_view_output_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_flush_once: Arc::new(std::sync::Mutex::new(None)),
             fail_flushes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_scans: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -785,6 +797,14 @@ impl ShardDb {
     /// INVARIANT-BY-CONSTRUCTION: M1-S6 — point deletes and tombstones in atomic
     /// write batches prevent state resurrection without relying on range deletions.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        #[cfg(feature = "test-utils")]
+        if batch.ops.iter().any(|op| matches!(op, BatchOp::Put { key, .. } if key.first() == Some(&crate::keys::ShardPrefix::ViewOutput.as_byte()))) {
+            let pause = self.pause_view_output_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
         if batch.ops.iter().any(|op| matches!(op, BatchOp::Put { key, .. } if key.first() == Some(&crate::keys::ShardPrefix::ViewOutput.as_byte())))
             && self.fail_view_output_once.swap(false, Ordering::SeqCst)
         {
@@ -1201,6 +1221,14 @@ impl ShardDb {
 
     /// Flush the WAL to durable storage.
     pub async fn flush(&self) -> Result<(), StorageError> {
+        #[cfg(feature = "test-utils")]
+        {
+            let pause = self.pause_flush_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
         if self.fail_flushes.load(Ordering::SeqCst) {
             return Err(StorageError::Unsupported(
                 "injected storage flush failure".to_string(),
@@ -1218,6 +1246,26 @@ impl ShardDb {
     /// Inject one view-output write failure for testing.
     pub fn fail_next_view_output_write(&self) {
         self.fail_view_output_once.store(true, Ordering::SeqCst);
+    }
+
+    /// Pause the next view-output write for cancellation tests.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_view_output_write(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_view_output_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Pause the next flush for cancellation tests.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_flush(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_flush_once.lock().unwrap() = Some((entered, release));
     }
 
     /// Inject prefix-scan failures for testing.

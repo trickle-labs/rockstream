@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Storage abstraction layer wrapping SlateDB for RockStream"
 
+[features]
+test-utils = []
+
 [[bench]]
 name = "storage_bench"
 harness = false

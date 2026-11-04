@@ -41,6 +41,17 @@ and process restart needs full-path testing, and the source-path locking changes
 need their own tests. The distributed path and shuffle owning-epoch recovery
 are not established by these tests.
 
+A test-only storage pause cancels the local handler before the combined write
+and after it but before flush. The first case restores the old rows; the second
+blocks a concurrent pgwire read until recovery flushes and exposes the complete
+committed rows, which also survive reopen. This directly cancels the handler
+future; the pgwire CancelRequest path remains untested.
+A separate injected flush failure rejects reads until a successful recovery
+flush, after which complete table and view rows survive a later commit and reopen.
+
+A join-view write failure is followed by an exact update, reopen, and an update
+to the other join input; all resulting table and view rows match expectations.
+
 A local pgwire test confirms its incremental plan includes TopK, then checks
 exact rows after an injected write failure, a valid transaction, reopen, and
 another valid transaction. A spilled checkpoint above the in-memory limit is
