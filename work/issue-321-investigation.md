@@ -24,6 +24,11 @@ The checkpoint now records point deletions and supports in-place restore;
 filesystem tests cover failed-write retry and deletions made after a snapshot.
 Other operator families and the atomic commit path still require review.
 
+An aggregate restored under a one-group memory limit retained dirty keys from
+the abandoned attempt. Its next checkpoint deleted an evicted but committed
+group. In-place restoration now clears those keys after a successful reload;
+the regression compares all stored records before and after checkpointing.
+
 The direct gRPC closed-inlet observation received exactly one ACK with fields
 `(exchange_id, src_shard, target_shard, epoch, seq, credit_grant) =
 (100, 0, 1, 1, 1, 2)` and then end-of-stream. Healthy direct delivery and the
