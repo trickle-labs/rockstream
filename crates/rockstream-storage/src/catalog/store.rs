@@ -1606,7 +1606,9 @@ mod security_audit_budget_tests {
         let encoded = encoded_security_audit_bytes([&event]).unwrap();
         assert_eq!(
             encoded,
-            serde_json::to_vec(&[event.clone()]).unwrap().len() as u64
+            serde_json::to_vec(std::slice::from_ref(&event))
+                .unwrap()
+                .len() as u64
         );
         assert!(matches!(
             ensure_security_audit_budget_bytes(encoded, encoded),

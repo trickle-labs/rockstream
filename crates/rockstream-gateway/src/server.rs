@@ -13596,6 +13596,94 @@ impl GatewayHandler {
     }
 }
 
+impl GatewayHandler {
+    async fn authenticate_oidc_token<C>(
+        &self,
+        client: &mut C,
+        token: &str,
+    ) -> pgwire::error::PgWireResult<()>
+    where
+        C: pgwire::api::ClientInfo,
+    {
+        let Some(verifier) = self.oidc_verifier.as_ref() else {
+            self.record_authentication_or_fail(AuditIdentity::Unknown, None, None, false)
+                .await?;
+            return Err(pgwire::error::PgWireError::UserError(Box::new(
+                pgwire::error::ErrorInfo::new(
+                    "FATAL".to_string(),
+                    "28000".to_string(),
+                    "[RS-2400] auth.unauthenticated: OIDC verifier is unavailable. next_steps: Configure a valid OIDC issuer, audience, and JWKS endpoint before startup".to_string(),
+                ),
+            )));
+        };
+
+        match verifier.verify(token).await {
+            Ok(claims) => {
+                let Some(issuer) = claims.issuer else {
+                    self.record_authentication_or_fail(AuditIdentity::Unknown, None, None, false)
+                        .await?;
+                    return Err(pgwire::error::PgWireError::UserError(Box::new(
+                        pgwire::error::ErrorInfo::new(
+                            "FATAL".to_string(),
+                            "28000".to_string(),
+                            "[RS-2400] auth.unauthenticated: OIDC token has no verified issuer. next_steps: Provide a token with the configured issuer".to_string(),
+                        ),
+                    )));
+                };
+                let principal = Principal::Oidc {
+                    issuer: issuer.clone(),
+                    sub: claims.sub.clone(),
+                };
+                let durable_principal = self.security_principal_for_login(&principal).await;
+                let durable_principal = match durable_principal {
+                    Ok(Some(principal)) => principal,
+                    _ => {
+                        self.record_authentication_or_fail(
+                            AuditIdentity::Verified(principal.actor()),
+                            None,
+                            None,
+                            false,
+                        )
+                        .await?;
+                        return Err(pgwire::error::PgWireError::UserError(Box::new(
+                            pgwire::error::ErrorInfo::new(
+                                "FATAL".to_string(),
+                                "28000".to_string(),
+                                "[RS-2400] auth.unauthenticated: verified OIDC identity has no enabled principal mapping. next_steps: Configure the issuer and subject in the durable security catalog".to_string(),
+                            ),
+                        )));
+                    }
+                };
+                self.record_authentication_or_fail(
+                    AuditIdentity::Verified(principal.actor()),
+                    Some(durable_principal.id),
+                    Some(durable_principal.revision),
+                    true,
+                )
+                .await?;
+                client
+                    .metadata_mut()
+                    .insert("_rs_principal".to_string(), format!("jwt:{}", claims.sub));
+                client
+                    .metadata_mut()
+                    .insert("_rs_oidc_issuer".to_string(), issuer);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_authentication_or_fail(AuditIdentity::Unknown, None, None, false)
+                    .await?;
+                Err(pgwire::error::PgWireError::UserError(Box::new(
+                    pgwire::error::ErrorInfo::new(
+                        "FATAL".to_string(),
+                        "28000".to_string(),
+                        format!("{error}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
+                    ),
+                )))
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl StartupHandler for GatewayHandler {
     async fn on_startup<C>(
@@ -13634,6 +13722,22 @@ impl StartupHandler for GatewayHandler {
                         .insert("_rs_principal".to_string(), "system".to_string());
                 }
                 AuthMode::Oidc => {
+                    if !client.is_secure() {
+                        self.record_authentication_or_fail(
+                            AuditIdentity::Unknown,
+                            None,
+                            None,
+                            false,
+                        )
+                        .await?;
+                        return Err(pgwire::error::PgWireError::UserError(Box::new(
+                            pgwire::error::ErrorInfo::new(
+                                "FATAL".to_string(),
+                                "28000".to_string(),
+                                "[RS-2400] auth.unauthenticated: OIDC requires a TLS connection. next_steps: Connect to the gateway with TLS enabled".to_string(),
+                            ),
+                        )));
+                    }
                     let auth_param = startup
                         .parameters
                         .iter()
@@ -13642,20 +13746,18 @@ impl StartupHandler for GatewayHandler {
 
                     match auth_param {
                         None => {
-                            self.record_authentication_or_fail(
-                                AuditIdentity::Unknown,
-                                None,
-                                None,
-                                false,
-                            )
-                            .await?;
-                            return Err(pgwire::error::PgWireError::UserError(Box::new(
-                                pgwire::error::ErrorInfo::new(
-                                    "FATAL".to_string(),
-                                    "28000".to_string(),
-                                    "[RS-2400] auth.unauthenticated: Request missing credentials; provide Authorization: Bearer <token> in startup parameters. next_steps: Provide valid credentials (Bearer token or mTLS certificate)".to_string(),
-                                ),
-                            )));
+                            if let Ok(conn_id) = CONN_ID.try_with(|id| id.clone()) {
+                                client
+                                    .metadata_mut()
+                                    .insert("_rs_conn_id".to_string(), conn_id.clone());
+                            }
+                            client
+                                .send(PgWireBackendMessage::Authentication(
+                                    Authentication::CleartextPassword,
+                                ))
+                                .await?;
+                            client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                            return Ok(());
                         }
                         Some(auth_val) => {
                             let token = auth_val.strip_prefix("Bearer ").unwrap_or("").trim();
@@ -13675,98 +13777,7 @@ impl StartupHandler for GatewayHandler {
                                     ),
                                 )));
                             }
-                            let Some(verifier) = self.oidc_verifier.as_ref() else {
-                                self.record_authentication_or_fail(
-                                    AuditIdentity::Unknown,
-                                    None,
-                                    None,
-                                    false,
-                                )
-                                .await?;
-                                return Err(pgwire::error::PgWireError::UserError(Box::new(
-                                    pgwire::error::ErrorInfo::new(
-                                        "FATAL".to_string(),
-                                        "28000".to_string(),
-                                        "[RS-2400] auth.unauthenticated: OIDC verifier is unavailable. next_steps: Configure a valid OIDC issuer, audience, and JWKS endpoint before startup".to_string(),
-                                    ),
-                                )));
-                            };
-                            let verified = verifier.verify(token).await;
-                            match verified {
-                                Ok(claims) => {
-                                    let Some(issuer) = claims.issuer else {
-                                        self.record_authentication_or_fail(
-                                            AuditIdentity::Unknown,
-                                            None,
-                                            None,
-                                            false,
-                                        )
-                                        .await?;
-                                        return Err(pgwire::error::PgWireError::UserError(
-                                            Box::new(pgwire::error::ErrorInfo::new(
-                                                "FATAL".to_string(),
-                                                "28000".to_string(),
-                                                "[RS-2400] auth.unauthenticated: OIDC token has no verified issuer. next_steps: Provide a token with the configured issuer".to_string(),
-                                            )),
-                                        ));
-                                    };
-                                    let principal = Principal::Oidc {
-                                        issuer: issuer.clone(),
-                                        sub: claims.sub.clone(),
-                                    };
-                                    let durable_principal =
-                                        self.security_principal_for_login(&principal).await;
-                                    let durable_principal = match durable_principal {
-                                        Ok(Some(principal)) => principal,
-                                        _ => {
-                                            self.record_authentication_or_fail(
-                                                AuditIdentity::Verified(principal.actor()),
-                                                None,
-                                                None,
-                                                false,
-                                            )
-                                            .await?;
-                                            return Err(pgwire::error::PgWireError::UserError(
-                                                Box::new(pgwire::error::ErrorInfo::new(
-                                                    "FATAL".to_string(),
-                                                    "28000".to_string(),
-                                                    "[RS-2400] auth.unauthenticated: verified OIDC identity has no enabled principal mapping. next_steps: Configure the issuer and subject in the durable security catalog".to_string(),
-                                                )),
-                                            ));
-                                        }
-                                    };
-                                    self.record_authentication_or_fail(
-                                        AuditIdentity::Verified(principal.actor()),
-                                        Some(durable_principal.id),
-                                        Some(durable_principal.revision),
-                                        true,
-                                    )
-                                    .await?;
-                                    client.metadata_mut().insert(
-                                        "_rs_principal".to_string(),
-                                        format!("jwt:{}", claims.sub),
-                                    );
-                                    client
-                                        .metadata_mut()
-                                        .insert("_rs_oidc_issuer".to_string(), issuer);
-                                }
-                                Err(e) => {
-                                    self.record_authentication_or_fail(
-                                        AuditIdentity::Unknown,
-                                        None,
-                                        None,
-                                        false,
-                                    )
-                                    .await?;
-                                    return Err(pgwire::error::PgWireError::UserError(
-                                        Box::new(pgwire::error::ErrorInfo::new(
-                                            "FATAL".to_string(),
-                                            "28000".to_string(),
-                                            format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
-                                        )),
-                                    ));
-                                }
-                            }
+                            self.authenticate_oidc_token(client, token).await?;
                         }
                     }
                 }
@@ -13968,6 +13979,76 @@ impl StartupHandler for GatewayHandler {
                 .unwrap_or_default();
 
             match &self.auth_mode {
+                AuthMode::Oidc => {
+                    if !matches!(
+                        client.state(),
+                        PgWireConnectionState::AuthenticationInProgress
+                    ) {
+                        self.record_authentication_or_fail(
+                            AuditIdentity::Unknown,
+                            None,
+                            None,
+                            false,
+                        )
+                        .await?;
+                        return Err(pgwire::error::PgWireError::UserError(Box::new(
+                            pgwire::error::ErrorInfo::new(
+                                "FATAL".to_string(),
+                                "28000".to_string(),
+                                "[RS-2400] auth.unauthenticated: OIDC password response was not requested. next_steps: Start a new TLS connection and provide valid credentials".to_string(),
+                            ),
+                        )));
+                    }
+                    let password = msg.into_password()?.password;
+                    let token = password.strip_prefix("Bearer ").unwrap_or(&password).trim();
+                    self.authenticate_oidc_token(client, token).await?;
+
+                    let app_name = client
+                        .metadata()
+                        .get("application_name")
+                        .cloned()
+                        .unwrap_or_default();
+                    if conn_id.is_empty() {
+                        finish_authentication(client, &GatewayServerParameterProvider).await?;
+                        return Ok(());
+                    }
+                    let (pid, secret) = {
+                        let mut session = self.sessions.entry(conn_id.clone()).or_default();
+                        session.application_name = app_name;
+                        (session.backend_pid, session.cancel_secret)
+                    };
+                    if self.cancellation_registry.len() < MAX_CONNECTIONS {
+                        let token = CANCEL_TOKEN
+                            .try_with(|token| token.clone())
+                            .unwrap_or_else(|_| CancelToken::new());
+                        self.cancellation_registry.insert((pid, secret), token);
+                    }
+
+                    client
+                        .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
+                        .await?;
+                    if let Some(params) = GatewayServerParameterProvider.server_parameters(client) {
+                        for (key, value) in params {
+                            client
+                                .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                                    key, value,
+                                )))
+                                .await?;
+                        }
+                    }
+                    client
+                        .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+                            pid as i32,
+                            secret as i32,
+                        )))
+                        .await?;
+                    client
+                        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                            TransactionStatus::Idle,
+                        )))
+                        .await?;
+                    client.set_state(PgWireConnectionState::ReadyForQuery);
+                }
                 AuthMode::Scram => {
                     // Read current auth state
                     let auth_state = self
@@ -22038,7 +22119,7 @@ mod s4_tests {
         let client_tls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls.clone()));
         let server = GatewayServer::with_oidc_auth(
             "127.0.0.1:0".parse().unwrap(),
             catalog,
@@ -22165,6 +22246,100 @@ mod s4_tests {
         );
         assert_ne!(audit[1].event_id, audit[2].event_id);
         assert!(!audit[2].event_id.contains("bad-token"));
+
+        let audit_before_plain = durable.list_security_audit_records().await.unwrap();
+        let mut plain_client = tokio_postgres::Config::new();
+        plain_client
+            .host("127.0.0.1")
+            .port(address.port())
+            .user("alice")
+            .password(crate::auth::VALID_TOKEN)
+            .dbname("test")
+            .ssl_mode(tokio_postgres::config::SslMode::Disable);
+        let plain_error = match plain_client.connect(tokio_postgres::NoTls).await {
+            Err(error) => error,
+            Ok(_) => panic!("OIDC must reject password authentication without TLS"),
+        };
+        assert_eq!(plain_error.as_db_error().unwrap().code().code(), "28000");
+        assert_eq!(
+            plain_error.as_db_error().unwrap().message(),
+            "[RS-2400] auth.unauthenticated: OIDC requires a TLS connection. next_steps: Connect to the gateway with TLS enabled"
+        );
+        assert_eq!(handler.sessions.len(), 1);
+        let audit_after_plain = durable.list_security_audit_records().await.unwrap();
+        assert_eq!(audit_after_plain.len(), audit_before_plain.len() + 1);
+        assert_authentication_event(
+            audit_after_plain.last().unwrap(),
+            AuditIdentity::Unknown,
+            AuditField::Unknown,
+            SecurityAuditClass::AuthenticationFailure,
+            SecurityAuditOutcome::Failure,
+            AuditField::Unknown,
+        );
+
+        let audit_before_password = audit_after_plain;
+        let mut password_client = tokio_postgres::Config::new();
+        password_client
+            .host("127.0.0.1")
+            .port(address.port())
+            .user("alice")
+            .password("bad-token")
+            .dbname("test")
+            .ssl_mode(tokio_postgres::config::SslMode::Require);
+        let password_error = match password_client
+            .connect(tokio_postgres_rustls::MakeRustlsConnect::new(
+                client_tls.clone(),
+            ))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("OIDC must reject an invalid password token"),
+        };
+        assert_eq!(password_error.as_db_error().unwrap().code().code(), "28000");
+        assert_eq!(
+            password_error.as_db_error().unwrap().message(),
+            "[RS-2400] auth.unauthenticated: malformed JWT: expected 3 parts. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"
+        );
+        assert_eq!(handler.sessions.len(), 1);
+        let audit_after_password = durable.list_security_audit_records().await.unwrap();
+        assert_eq!(audit_after_password.len(), audit_before_password.len() + 1);
+        assert_authentication_event(
+            audit_after_password.last().unwrap(),
+            AuditIdentity::Unknown,
+            AuditField::Unknown,
+            SecurityAuditClass::AuthenticationFailure,
+            SecurityAuditOutcome::Failure,
+            AuditField::Unknown,
+        );
+
+        let mut valid_password_client = tokio_postgres::Config::new();
+        valid_password_client
+            .host("127.0.0.1")
+            .port(address.port())
+            .user("alice")
+            .password(crate::auth::VALID_TOKEN)
+            .dbname("test")
+            .ssl_mode(tokio_postgres::config::SslMode::Require);
+        let (_client, _connection) = valid_password_client
+            .connect(tokio_postgres_rustls::MakeRustlsConnect::new(client_tls))
+            .await
+            .expect("normal PostgreSQL client should authenticate with an OIDC token");
+        assert_eq!(handler.sessions.len(), 2);
+        let audit = durable.list_security_audit_records().await.unwrap();
+        assert_authentication_event(
+            audit.last().unwrap(),
+            AuditIdentity::Verified(
+                Principal::Oidc {
+                    issuer: "https://issuer.example".to_string(),
+                    sub: "alice".to_string(),
+                }
+                .actor(),
+            ),
+            AuditField::Known("principal:1".to_string()),
+            SecurityAuditClass::AuthenticationSuccess,
+            SecurityAuditOutcome::Success,
+            AuditField::Known(1),
+        );
 
         let unmapped_catalog = Arc::new(CatalogStubs::new());
         let unmapped_durable = Arc::new(DurableCatalogStore::new(

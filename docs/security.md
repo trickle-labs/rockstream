@@ -99,8 +99,10 @@ For full assessor findings, verification records, and machine-readable audit met
 The gateway supports unauthenticated `off`, RS256 OIDC bearer authentication,
 and client-certificate mTLS. OIDC requires `[auth].oidc_issuer`,
 `[auth].oidc_audience`, `[auth].oidc_jwks_url`, and gateway TLS certificate
-and key paths; it fetches and validates JWKS before opening the listener and
-rejects requests when token verification fails. The verified `(issuer, subject)`
+and key paths. Clients may supply the bearer token in the PostgreSQL password
+response or the `Authorization` startup parameter; both require an encrypted
+TLS connection. The gateway fetches and validates JWKS before opening the
+listener and rejects requests when token verification fails. The verified `(issuer, subject)`
 must map to an enabled durable principal before the gateway creates an
 application session. Gateway mTLS requires `gateway.tls.cert_path`, `key_path`,
 and `ca_cert_path`; a CA-verified client certificate must map by SHA-256

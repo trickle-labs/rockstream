@@ -104,6 +104,7 @@ pub fn build_tls_acceptor(
     key_path: &Path,
     ca_cert_path: Option<&Path>,
 ) -> Result<Arc<TlsAcceptor>, GatewayTlsError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 

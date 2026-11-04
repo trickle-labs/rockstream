@@ -44,6 +44,9 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio_postgres::NoTls;
 
+#[path = "common/security_policy.rs"]
+mod security_policy;
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 struct NoopViewReader;
@@ -5576,13 +5579,9 @@ async fn md5_auth_is_unavailable_at_startup() {
 /// pg_postmaster_start_time, txid_current, current_schemas via live gateway.
 #[tokio::test]
 async fn test_bootstrap_functions() {
-    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
-
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
-    let role_catalog = Arc::new(RoleCatalog::new());
-    role_catalog
-        .insert(create_role_entry("alice", "pencil"))
-        .expect("insert alice");
+    let role_catalog =
+        security_policy::role_catalog_with_authorized_builder(&catalog, "alice", "pencil").await;
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server =
@@ -5699,13 +5698,9 @@ async fn test_bootstrap_functions() {
 /// SET search_path / client_encoding / timezone then SHOW verifies round-trip.
 #[tokio::test]
 async fn test_guc_round_trip() {
-    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
-
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
-    let role_catalog = Arc::new(RoleCatalog::new());
-    role_catalog
-        .insert(create_role_entry("alice", "pencil"))
-        .expect("insert alice");
+    let role_catalog =
+        security_policy::role_catalog_with_authorized_builder(&catalog, "alice", "pencil").await;
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server =
