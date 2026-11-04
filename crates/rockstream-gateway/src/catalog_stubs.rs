@@ -689,6 +689,8 @@ impl CatalogStubs {
     }
 
     /// Reconstruct gateway catalog state from the attached durable catalog store.
+    // Clippy misses the map mutations and explicit guard drops before async persistence.
+    #[allow(clippy::await_holding_lock, clippy::readonly_write_lock)]
     pub async fn sync_from_durable_store(&self) -> Result<(), String> {
         let Some(store) = self.get_durable_store() else {
             return Ok(());
@@ -2061,7 +2063,7 @@ impl CatalogStubs {
     /// Durably remove a sink before acknowledging DROP SINK.
     pub async fn remove_sink_durable(&self, name: &str) -> Result<bool, String> {
         let _guard = self.connector_edit_lock.lock().await;
-        if self.inner.read().unwrap().sinks.get(name).is_none() {
+        if !self.inner.read().unwrap().sinks.contains_key(name) {
             return Ok(false);
         }
         let sink_id = rockstream_types::ids::SinkId(rockstream_storage::catalog::stable_name_id(
@@ -2319,7 +2321,7 @@ impl CatalogStubs {
     /// Durably remove a source before acknowledging DROP SOURCE.
     pub async fn remove_source_durable(&self, name: &str) -> Result<bool, String> {
         let _guard = self.connector_edit_lock.lock().await;
-        if self.inner.read().unwrap().sources.get(name).is_none() {
+        if !self.inner.read().unwrap().sources.contains_key(name) {
             return Ok(false);
         }
         let source_id = rockstream_types::ids::SourceId(

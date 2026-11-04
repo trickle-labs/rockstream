@@ -101,10 +101,10 @@ fn output_row_hash(output_vals: &[i64], nulls: &[bool]) -> u128 {
         bytes.push(u8::from(*is_null));
     }
     let (chunks, remainder) = bytes.as_chunks::<8>();
-    let mut words: Vec<i64> = chunks
-        .iter()
-        .map(|chunk| i64::from_be_bytes(*chunk))
-        .collect();
+    let mut words = Vec::with_capacity(chunks.len() + usize::from(!remainder.is_empty()));
+    for chunk in chunks {
+        words.push(i64::from_be_bytes(*chunk));
+    }
     if !remainder.is_empty() {
         let mut tail = [0; 8];
         tail[..remainder.len()].copy_from_slice(remainder);

@@ -139,7 +139,7 @@ pub(crate) fn parse_certificate_sha256_hex(encoded: &str) -> Option<[u8; 32]> {
     }
 
     let mut fingerprint = [0; 32];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = (pair[0] as char).to_digit(16)? as u8;
         let low = (pair[1] as char).to_digit(16)? as u8;
         fingerprint[index] = (high << 4) | low;

@@ -113,13 +113,12 @@ pub fn fault_count() -> usize {
 /// invoked the first time each ID is missing.
 pub fn register_scenario_faults() {
     let id = "v05917.scenario.mismatch_injection";
-    let description = "Injects a deliberate scenario-transcript mismatch during a SimRuntime \
-         run, so the reproducibility-artifact machinery can be exercised under \
-         deterministic replay (same seed must reproduce the same mismatch).";
     if get_fault(id).is_none() {
         register_fault(FaultEntry {
             id,
-            description,
+            description: "Injects a deliberate scenario-transcript mismatch during a SimRuntime \
+                         run, so the reproducibility-artifact machinery can be exercised under \
+                         deterministic replay (same seed must reproduce the same mismatch).",
             category: FaultCategory::Logic,
         });
     }

@@ -2980,44 +2980,43 @@ mod tests {
     #[test]
     fn unavailable_auth_modes_fail_before_startup_side_effects() {
         let parent = tempfile::tempdir().unwrap();
-        for (mode, detail, next_steps) in [(
+        let (mode, detail, next_steps) = (
             "md5",
             "MD5 is not a release authentication mode",
             "Use a release-supported authentication mode.",
-        )] {
-            let storage = parent.path().join(mode);
-            let opts = StartOptions {
-                storage: storage.clone(),
-                role: "all".to_string(),
-                control: None,
-                worker_id: None,
-                auth_mode: mode.to_string(),
-                worker_location: WorkerLocation::default(),
-                worker_capabilities: WorkerCapabilities::default(),
-                config: RockstreamConfig::default(),
-                node_config: None,
-                metrics_addr: None,
-                listen_addr: None,
-                raft_peers: None,
-                raft_node_id: None,
-                raft_bind: None,
-                raft_bootstrap: false,
-                daemon: false,
-                control_bind: None,
-                control_shared_storage: None,
-                query_time_shard_dirs: Vec::new(),
-                shutdown_timeout_secs: None,
-            };
+        );
+        let storage = parent.path().join(mode);
+        let opts = StartOptions {
+            storage: storage.clone(),
+            role: "all".to_string(),
+            control: None,
+            worker_id: None,
+            auth_mode: mode.to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
+            node_config: None,
+            metrics_addr: None,
+            listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
+        };
 
-            let err = run_start(&opts).unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                format!(
-                    "RS-0002 authentication mode `{mode}` is unavailable: {detail}\n  next steps: {next_steps}"
-                )
-            );
-            assert!(!storage.exists(), "{mode} created startup storage");
-        }
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "RS-0002 authentication mode `{mode}` is unavailable: {detail}\n  next steps: {next_steps}"
+            )
+        );
+        assert!(!storage.exists(), "{mode} created startup storage");
     }
 
     #[test]

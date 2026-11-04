@@ -100,7 +100,8 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         if: needs.ci-policy.outputs.scope == 'full'
-        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::uninlined_format_args
+        # async_trait emits must_use on futures, which current Clippy also flags as redundant.
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::uninlined_format_args -A clippy::double_must_use
       - name: install cargo-deny
         if: needs.ci-policy.outputs.scope == 'full'
         uses: taiki-e/install-action@cargo-deny
@@ -358,6 +359,9 @@ jobs:
     if: needs.ci-policy.outputs.scope == 'full'
     name: Check tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     strategy:
       fail-fast: false
       matrix:
