@@ -57,6 +57,23 @@ The reload now takes the commit lock: the same test observes the local commit
 wait, then verifies the exact table rows and aggregate `96`. The failed source
 does not automatically retry in this fixture; its blocked status is explicit.
 
+A separate local fixture drives the production pgoutput commit routine without
+a PostgreSQL process. On candidate `1bddd8e9`, inserting `(2,20)` into a base
+table produced `(2,80)` in a transitive view instead of `(2,60)`: the inlined
+pipeline received an already-transformed delta. The source path now supplies
+the base delta. The fixture verifies exact rows through an injected write
+failure, checkpoint recovery, replay, gateway reopen, and a later SQL commit.
+This synthetic fixture does not replace release-process CDC qualification.
+
+The same transitive views were exercised against a real local PostgreSQL 18
+replication stream. Initially the source blocked because the outer view had no
+lifecycle cursor; after attaching it to the inlined base source, backfill failed
+with an Int64/Utf8 mismatch because it read the intermediate view. Attachment
+and backfill now use the base source. Exact rows pass through backfill, live
+updates, gateway restart, a concurrent local commit, and the injected source
+write failure. This runs the source and gateway in the test process, not a
+release-process qualification.
+
 DISTINCT checkpoint recovery also resurrected a removed row: after a persisted
 insert and persisted delete, reloading suppressed the next insert of that row.
 The checkpoint now records point deletions and supports in-place restore;

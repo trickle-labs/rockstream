@@ -160,6 +160,211 @@ async fn read_text_triples(
 }
 
 #[tokio::test]
+async fn pgoutput_transitive_view_uses_base_delta_once() {
+    use rockstream_connectors::{
+        CdcOperation, CdcWireFormat, OffsetToken, PgLsn, PostgresCdcSource, SourceCheckpointStore,
+        SourceRuntimeCoordinator,
+    };
+    use rockstream_gateway::pgoutput_coordinator::{
+        ColumnRoute, RelationRoute, ReplicaIdentity, SharedPgOutputCoordinator, SourceIdentityV1,
+    };
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let db = Arc::new(
+        ShardDb::builder("pgoutput-transitive", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+        db.clone(),
+    );
+    let handler = server.handler().clone();
+    let (addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW inner_mv AS SELECT id, v + 10 AS v FROM t")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW outer_mv AS SELECT id, v * 2 AS v FROM inner_mv")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "inner_mv").await, vec![(1, 20)]);
+    assert_eq!(read_pairs(&client, "outer_mv").await, vec![(1, 40)]);
+    let identity = SourceIdentityV1::new(
+        "example",
+        None,
+        "postgres",
+        "slot",
+        "pub",
+        "postgres",
+        "none://trusted",
+    )
+    .unwrap();
+    let connector_id = identity.connector_id();
+    let source = PostgresCdcSource::new(
+        connector_id,
+        Arc::new(arrow::datatypes::Schema::empty()),
+        CdcWireFormat::PgOutput,
+    );
+    let checkpoints = SourceCheckpointStore::new(db.clone(), connector_id.0 as u128, connector_id);
+    let mut runtime =
+        SourceRuntimeCoordinator::new(source, connector_id, OffsetToken::new(vec![]), checkpoints);
+    runtime.recover().await.unwrap();
+    let lease = runtime.acquire_owner("test").unwrap();
+    let mut coordinator = SharedPgOutputCoordinator::new(identity, runtime, db.clone());
+    coordinator.owner_lease = Some(lease);
+    coordinator.activate_view("inner_mv");
+    coordinator.activate_view("outer_mv");
+    let column = |name: &str, key| ColumnRoute {
+        upstream_name: name.to_string(),
+        imported_name: name.to_string(),
+        type_oid: 20,
+        type_modifier: -1,
+        nullable: false,
+        has_default: false,
+        key,
+    };
+    let route = RelationRoute {
+        version: 1,
+        relation_id: 52,
+        upstream_namespace: "public".to_string(),
+        upstream_relation: "t".to_string(),
+        imported_table_id: 52,
+        imported_table_name: "t".to_string(),
+        columns: vec![column("id", true), column("v", false)],
+        replica_identity: ReplicaIdentity::Full,
+        schema_version: 1,
+    };
+    coordinator.begin(1).unwrap();
+    coordinator.stage_route(1, route).unwrap();
+    coordinator
+        .push_change(
+            1,
+            52,
+            CdcOperation::Insert,
+            None,
+            Some(vec![Some("2".to_string()), Some("20".to_string())]),
+        )
+        .unwrap();
+    let envelope = coordinator.finish_envelope(1, PgLsn(1)).unwrap();
+    coordinator
+        .commit_envelope(envelope, &handler, &db)
+        .await
+        .unwrap();
+    db.flush().await.unwrap();
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (2, 20)]);
+    assert_eq!(
+        read_pairs(&client, "inner_mv").await,
+        vec![(1, 20), (2, 30)]
+    );
+    assert_eq!(
+        read_pairs(&client, "outer_mv").await,
+        vec![(1, 40), (2, 60)]
+    );
+    coordinator.activate_view("inner_mv");
+    coordinator.activate_view("outer_mv");
+    coordinator.begin(2).unwrap();
+    coordinator
+        .push_change(
+            2,
+            52,
+            CdcOperation::Insert,
+            None,
+            Some(vec![Some("3".to_string()), Some("30".to_string())]),
+        )
+        .unwrap();
+    let envelope = coordinator.finish_envelope(2, PgLsn(2)).unwrap();
+    let before = db.last_epoch().load(std::sync::atomic::Ordering::SeqCst);
+    db.fail_next_view_output_write();
+    let result = coordinator
+        .commit_envelope(envelope.clone(), &handler, &db)
+        .await;
+    let detail = match result {
+        Err(GatewayError::QueryTimeExecutionFailed { detail }) => detail,
+        other => panic!("unexpected source result: {other:?}"),
+    };
+    assert_eq!(detail, "source-backed backfill: RS-4001: source I/O error: RS-4001: source I/O error: RS-4010: durable source checkpoint operation failed: unsupported operation: injected view output write failure; next steps: keep the source paused, recover the highest committed checkpoint, then retry");
+    assert_eq!(
+        db.last_epoch().load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (2, 20)]);
+    assert_eq!(
+        read_pairs(&client, "inner_mv").await,
+        vec![(1, 20), (2, 30)]
+    );
+    assert_eq!(
+        read_pairs(&client, "outer_mv").await,
+        vec![(1, 40), (2, 60)]
+    );
+    coordinator.runtime.recover().await.unwrap();
+    coordinator.owner_lease = Some(coordinator.runtime.acquire_owner("retry").unwrap());
+    coordinator
+        .commit_envelope(envelope, &handler, &db)
+        .await
+        .unwrap();
+    db.flush().await.unwrap();
+    assert_eq!(
+        read_pairs(&client, "t").await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+    assert_eq!(
+        read_pairs(&client, "inner_mv").await,
+        vec![(1, 20), (2, 30), (3, 40)]
+    );
+    assert_eq!(
+        read_pairs(&client, "outer_mv").await,
+        vec![(1, 40), (2, 60), (3, 80)]
+    );
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("pgoutput-transitive", store, catalog).await;
+    let client = connect_port(port).await;
+    assert_eq!(
+        read_pairs(&client, "t").await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+    assert_eq!(
+        read_pairs(&client, "inner_mv").await,
+        vec![(1, 20), (2, 30), (3, 40)]
+    );
+    assert_eq!(
+        read_pairs(&client, "outer_mv").await,
+        vec![(1, 40), (2, 60), (3, 80)]
+    );
+    client
+        .simple_query("INSERT INTO t VALUES (4, 40)")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_pairs(&client, "t").await,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+    );
+    assert_eq!(
+        read_pairs(&client, "inner_mv").await,
+        vec![(1, 20), (2, 30), (3, 40), (4, 50)]
+    );
+    assert_eq!(
+        read_pairs(&client, "outer_mv").await,
+        vec![(1, 40), (2, 60), (3, 80), (4, 100)]
+    );
+}
+
+#[tokio::test]
 async fn legacy_mixed_group_checkpoint_survives_restart() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =

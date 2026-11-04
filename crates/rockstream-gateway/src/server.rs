@@ -3771,14 +3771,11 @@ impl GatewayHandler {
                     let right = self.full_table_zset(&join.right_source, shard_db).await?;
                     join.pipeline.process(left, right)
                 } else {
-                    let dependency = self
-                        .catalog
-                        .get_view_deps(view_name)
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                            detail: format!("compiled view '{view_name}' has no dependency"),
-                        })?;
+                    let dependency = self.compiled_single_source(view_name)?.ok_or_else(|| {
+                        GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("compiled view '{view_name}' has no base source"),
+                        }
+                    })?;
                     compiled
                         .pipeline
                         .process(self.full_table_zset(&dependency, shard_db).await?)
@@ -4719,21 +4716,19 @@ impl GatewayHandler {
                 });
                 join.pipeline.process(left, right)
             } else {
-                let deps = self.catalog.get_view_deps(view_name);
-                let schema = deps
-                    .first()
-                    .map(|dep| query_time_relation_schema(&self.catalog, dep))
-                    .unwrap_or_else(|| query_time_relation_schema(&self.catalog, view_name));
-                let inputs = deps
-                    .iter()
-                    .filter_map(|dep| deltas.get(dep).cloned())
-                    .collect::<Vec<_>>();
-                let input =
-                    rockstream_ops::join::concat_zsets(inputs, schema).map_err(|error| {
-                        GatewayError::QueryTimeExecutionFailed {
-                            detail: format!("combine compiled view input({view_name}): {error}"),
-                        }
-                    })?;
+                let source = self.compiled_single_source(view_name)?.ok_or_else(|| {
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("compiled view '{view_name}' has no base source"),
+                    }
+                })?;
+                let input = deltas.get(&source).cloned().unwrap_or_else(|| {
+                    ArrowZSet::empty(
+                        route_schemas
+                            .get(&source)
+                            .cloned()
+                            .unwrap_or_else(|| query_time_relation_schema(&self.catalog, &source)),
+                    )
+                });
                 compiled.pipeline.process(input)
             }
             .map_err(|error| GatewayError::QueryTimeExecutionFailed {
@@ -8375,6 +8370,16 @@ impl GatewayHandler {
                 None
             };
 
+            let source_deps = if is_materialized {
+                extract_sql_refs(&inline_view_dependencies(
+                    &select_sql,
+                    &self.catalog,
+                    MAX_VIEW_INLINE_DEPTH,
+                ))
+            } else {
+                Vec::new()
+            };
+
             // Register view in the catalog — only reached once compilation
             // (when attempted) has already succeeded.
             use crate::catalog_stubs::CatalogView;
@@ -8421,7 +8426,8 @@ impl GatewayHandler {
             // population step now — no redundant double-write through a
             // separately-materialized legacy pass.
             let bound_sources = if is_materialized {
-                deps.iter()
+                source_deps
+                    .iter()
                     .filter_map(|relation| {
                         self.catalog.get_source(relation).filter(|source| {
                             source.table_name.as_deref() == Some(relation.as_str())
