@@ -774,9 +774,18 @@ These tests do not claim live KMS or abrupt process-termination qualification.
 Issue #304 persists source/sink secret bindings in `SecretMetadata.source_refs`
 and retains sink bindings in `CatalogSinkEntry.secret_name`. Source/sink DDL
 adds and removes those references; `DROP SECRET` combines persisted and cached
-references and rejects deletion with `RS-2426` while a binding remains. This is
-catalog metadata lifecycle coverage, not a new M1–M7 coordination transition.
-The `test_secret_references_survive_store_reopen` regression in
+references and rejects deletion with `RS-2426` while a binding remains. The
+gateway pgoutput worker rechecks the durable secret version at transaction
+boundaries, resolves a changed value under the consumer's current grant, and
+reconnects only after the epoch result, source checkpoint, and slot ACK commit.
+The worker process and committed result state remain in place. A Docker-backed
+release-process regression rotates credentials with an upstream transaction
+pending, compares the complete result multiset after the transaction and a
+post-rotation write, then kills and restarts the gateway and compares the
+recovered result multiset. It does not yet verify the corresponding durable
+security-audit sequence or lost-response reconciliation. Kafka source/sink
+runtime rotation remains unqualified; SQL `CREATE SINK` does not configure the
+experimental runtime adapter. The `test_secret_references_survive_store_reopen` regression in
 `crates/rockstream-control/tests/secrets_lifecycle_tests.rs` verifies that a
 reopened store retains the reference and continues to reject secret deletion.
 The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in

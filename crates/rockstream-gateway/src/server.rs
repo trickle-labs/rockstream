@@ -2851,6 +2851,94 @@ impl GatewayHandler {
             .map_err(|error| error.to_string())
     }
 
+    async fn refresh_pgoutput_secret_at_epoch(
+        &self,
+        coordinator: &mut SharedPgOutputCoordinator,
+        lease: &SourceOwnerLease,
+        aliases: &[CatalogSourceEntry],
+    ) -> Result<bool, GatewayError> {
+        let (bound_name, active_version) = coordinator
+            .runtime
+            .pgoutput_secret_binding(lease)
+            .map_err(source_backfill_error)?;
+        let Some(bound_name) = bound_name.map(str::to_string) else {
+            return Ok(false);
+        };
+        let source = aliases
+            .iter()
+            .find(|source| {
+                source.options.get("secret").is_some_and(|reference| {
+                    rockstream_types::secret::secret_name_from_reference(reference)
+                        == Some(bound_name.as_str())
+                })
+            })
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: "PostgreSQL CDC secret binding is unavailable".to_string(),
+            })?;
+        let reference =
+            source
+                .options
+                .get("secret")
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "PostgreSQL CDC secret reference is unavailable".to_string(),
+                })?;
+        let secret_name = self
+            .authorize_source_secret_use(source, reference)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        if secret_name != bound_name {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "PostgreSQL CDC secret binding changed".to_string(),
+            });
+        }
+        let namespace = source.secret_namespace.as_deref().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "source secret reference has no durable namespace".to_string(),
+            }
+        })?;
+        let namespace_id = self
+            .secret_namespace_id(namespace)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        let metadata = self
+            .secret_store
+            .get_secret_metadata(namespace_id, &secret_name)
+            .await
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: error.to_string(),
+            })?;
+        if metadata.version < active_version {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "PostgreSQL CDC secret version moved backwards".to_string(),
+            });
+        }
+        if metadata.version == active_version {
+            return Ok(false);
+        }
+        let secret = self
+            .resolve_source_secret(source, reference)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        if secret.metadata.version < metadata.version {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "PostgreSQL CDC secret changed during credential resolution".to_string(),
+            });
+        }
+        let password = secret
+            .payload
+            .get("password")
+            .filter(|password| !password.is_empty())
+            .cloned()
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: "PostgreSQL CDC source secret has no password".to_string(),
+            })?;
+        coordinator
+            .runtime
+            .rotate_pgoutput_secret_at_epoch(lease, &secret_name, secret.metadata.version, password)
+            .await
+            .map_err(source_backfill_error)
+    }
+
     async fn append_authorization_denial(
         &self,
         principal: Option<&Principal>,
@@ -3099,9 +3187,7 @@ impl GatewayHandler {
     }
 
     pub fn new(catalog: Arc<CatalogStubs>, view_reader: Arc<dyn ViewReader>) -> Self {
-        let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env_or_default(
-            "rockstream-default-kek",
-        ));
+        let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env());
         let secret_store = Arc::new(rockstream_control::SecretStore::new(None, kek_provider));
         GatewayHandler {
             catalog: catalog.clone(),
@@ -3150,9 +3236,7 @@ impl GatewayHandler {
         view_reader: Arc<dyn ViewReader>,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) -> Self {
-        let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env_or_default(
-            "rockstream-default-kek",
-        ));
+        let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env());
         let secret_store = Arc::new(rockstream_control::SecretStore::new(None, kek_provider));
         GatewayHandler {
             catalog: catalog.clone(),
@@ -4125,7 +4209,9 @@ impl GatewayHandler {
             })
         };
         let secret_reference = source.options.get("secret").cloned();
-        let (password, secret_name) = if let Some(secret_reference) = secret_reference {
+        let (password, secret_name, secret_version) = if let Some(secret_reference) =
+            secret_reference
+        {
             let secret = self
                 .resolve_source_secret(source, &secret_reference)
                 .await
@@ -4136,8 +4222,15 @@ impl GatewayHandler {
                         detail: "source has an unsupported secret reference".to_string(),
                     })?
                     .to_string();
-            let password = secret.payload.get("password").cloned();
-            (password, Some(secret_name))
+            let password = secret
+                .payload
+                .get("password")
+                .filter(|password| !password.is_empty())
+                .cloned()
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "PostgreSQL CDC source secret has no password".to_string(),
+                })?;
+            (Some(password), Some(secret_name), secret.metadata.version)
         } else {
             let credential_ref = option("credential_ref")?;
             let password = if let Some(variable) = credential_ref.strip_prefix("env://") {
@@ -4159,7 +4252,7 @@ impl GatewayHandler {
                     ),
                 });
             };
-            (password, None)
+            (password, None, 0)
         };
         let identity = pgoutput_source_identity(source)?;
         let connector_id = identity.connector_id();
@@ -4183,7 +4276,7 @@ impl GatewayHandler {
         )
         .map_err(source_backfill_error)?;
         if let Some(secret_name) = secret_name {
-            runtime.bind_secret(secret_name);
+            runtime.bind_secret_version(secret_name, secret_version);
         }
         Ok((table, connector_id, runtime))
     }
@@ -4454,6 +4547,7 @@ impl GatewayHandler {
     ) -> Result<(), GatewayError> {
         let mut coordinator = coordinator.lock().await;
         let _guard = self.shard_commit_lock.lock().await;
+        self.validate_pgoutput_lifecycles(&coordinator).await?;
         let compiled = self
             .compiled_views
             .get(view_name)
@@ -4926,7 +5020,18 @@ impl GatewayHandler {
                     break;
                 }
             };
-            let result = match event {
+            let is_commit = matches!(&event, PgOutputEvent::Commit { .. });
+            let mut result = match event {
+                PgOutputEvent::Begin { xid } if coordinator.active_envelope.is_none() => {
+                    match handler
+                        .refresh_pgoutput_secret_at_epoch(&mut coordinator, &lease, &aliases)
+                        .await
+                    {
+                        Ok(true) => continue,
+                        Ok(false) => coordinator.begin(xid),
+                        Err(error) => Err(error),
+                    }
+                }
                 PgOutputEvent::Begin { xid } => coordinator.begin(xid),
                 PgOutputEvent::Relation { xid, relation } => {
                     match coordinator
@@ -4994,6 +5099,14 @@ impl GatewayHandler {
                     }
                 }
             };
+            if is_commit && result.is_ok() {
+                if let Err(error) = handler
+                    .refresh_pgoutput_secret_at_epoch(&mut coordinator, &lease, &aliases)
+                    .await
+                {
+                    result = Err(error);
+                }
+            }
             if let Err(error) = result {
                 let reason = match &error {
                     GatewayError::QueryTimeExecutionFailed { detail }
@@ -5095,6 +5208,36 @@ impl GatewayHandler {
         &self,
         coordinator: &SharedPgOutputCoordinator,
     ) -> Result<(), GatewayError> {
+        let aliases = self.pgoutput_source_aliases(coordinator.connector_id);
+        let bindings = aliases
+            .iter()
+            .map(|alias| {
+                let credential = alias
+                    .options
+                    .get("secret")
+                    .map(|reference| {
+                        rockstream_types::secret::secret_name_from_reference(reference)
+                            .map(|name| format!("secret://{name}"))
+                            .unwrap_or_else(|| format!("invalid:{reference}"))
+                    })
+                    .or_else(|| alias.options.get("credential_ref").cloned());
+                (
+                    credential,
+                    alias.secret_consumer,
+                    alias.secret_namespace.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if bindings
+            .first()
+            .is_some_and(|first| bindings.iter().skip(1).any(|binding| binding != first))
+        {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail:
+                    "PostgreSQL CDC aliases must share one credential reference and consumer scope"
+                        .to_string(),
+            });
+        }
         if coordinator.runtime.committed_epoch() == 0 {
             return Ok(());
         }
@@ -18079,6 +18222,16 @@ fn pgoutput_source_identity(source: &CatalogSourceEntry) -> Result<SourceIdentit
                 }
             })
         };
+    let credential_ref = match source.options.get("secret") {
+        Some(reference) => rockstream_types::secret::canonical_secret_reference(reference)
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: format!(
+                    "PostgreSQL CDC source '{}' has an unsupported secret reference",
+                    source.name
+                ),
+            })?,
+        None => required("credential_ref")?,
+    };
     SourceIdentityV1::new(
         source
             .options
@@ -18098,7 +18251,7 @@ fn pgoutput_source_identity(source: &CatalogSourceEntry) -> Result<SourceIdentit
             .get("user")
             .cloned()
             .unwrap_or_else(|| "postgres".to_string()),
-        required("credential_ref")?,
+        credential_ref,
     )
 }
 
@@ -21637,7 +21790,15 @@ mod s4_tests {
             .unwrap();
         catalog.set_durable_store(durable);
 
-        let handler = Arc::new(GatewayHandler::new(catalog, Arc::new(NoopViewReader)));
+        let secret_store = Arc::new(rockstream_control::SecretStore::new(
+            None,
+            Arc::new(rockstream_control::EnvKekProvider::from_passphrase(
+                "gateway-unit-test-kek",
+            )),
+        ));
+        let handler = Arc::new(
+            GatewayHandler::new(catalog, Arc::new(NoopViewReader)).with_secret_store(secret_store),
+        );
         let conn_id = "unit-admin-session".to_string();
         let mut session = crate::session::SessionState::new();
         session.principal = Principal::ScramUser {

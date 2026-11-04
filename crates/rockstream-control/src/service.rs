@@ -351,9 +351,7 @@ impl ControlService {
             insecure_dev_mode: false,
             secret_store: Arc::new(SecretStore::new(
                 None,
-                Arc::new(crate::kek::EnvKekProvider::from_env_or_default(
-                    "rockstream-default-kek",
-                )),
+                Arc::new(crate::kek::EnvKekProvider::from_env()),
             )),
             worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
             data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),

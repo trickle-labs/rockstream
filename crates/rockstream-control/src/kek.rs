@@ -104,22 +104,28 @@ impl KekProvider for RetainedKekProvider {
 
 /// KEK provider backed by environment variable or raw 256-bit key.
 pub struct EnvKekProvider {
-    key_bytes: [u8; 32],
+    key_bytes: Option<[u8; 32]>,
 }
 
 impl EnvKekProvider {
     /// Create an `EnvKekProvider` from a 32-byte key.
     pub fn new(key: [u8; 32]) -> Self {
-        Self { key_bytes: key }
+        Self {
+            key_bytes: Some(key),
+        }
     }
 
-    /// Create an `EnvKekProvider` from the `RS_SECRET_KEK` environment variable,
-    /// or fallback to a deterministic sha256 derivation of the given string / fallback.
-    pub fn from_env_or_default(fallback_name: &str) -> Self {
-        if let Ok(val) = std::env::var("RS_SECRET_KEK") {
-            Self::from_passphrase(&val)
-        } else {
-            Self::from_passphrase(fallback_name)
+    /// Use `RS_SECRET_KEK` when configured; missing or empty configuration fails
+    /// closed when an operation needs the key.
+    pub fn from_env() -> Self {
+        let passphrase = std::env::var("RS_SECRET_KEK").ok();
+        Self::from_optional_passphrase(passphrase.as_deref())
+    }
+
+    fn from_optional_passphrase(passphrase: Option<&str>) -> Self {
+        match passphrase.filter(|passphrase| !passphrase.is_empty()) {
+            Some(passphrase) => Self::from_passphrase(passphrase),
+            None => Self { key_bytes: None },
         }
     }
 
@@ -129,7 +135,9 @@ impl EnvKekProvider {
         let hash = Sha256::digest(passphrase.as_bytes());
         let mut key = [0u8; 32];
         key.copy_from_slice(&hash);
-        Self { key_bytes: key }
+        Self {
+            key_bytes: Some(key),
+        }
     }
 }
 
@@ -140,7 +148,11 @@ impl KekProvider for EnvKekProvider {
     }
 
     async fn wrap_dek(&self, dek: &[u8]) -> Result<Vec<u8>, KekError> {
-        let (ciphertext, nonce) = encrypt_aes_256_gcm(&self.key_bytes, dek)?;
+        let key = self
+            .key_bytes
+            .as_ref()
+            .ok_or_else(|| KekError::provider_error("RS_SECRET_KEK is not configured"))?;
+        let (ciphertext, nonce) = encrypt_aes_256_gcm(key, dek)?;
         let mut out = Vec::with_capacity(nonce.len() + ciphertext.len());
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
@@ -153,9 +165,13 @@ impl KekProvider for EnvKekProvider {
                 "wrapped DEK is too short to contain nonce",
             ));
         }
+        let key = self
+            .key_bytes
+            .as_ref()
+            .ok_or_else(|| KekError::provider_error("RS_SECRET_KEK is not configured"))?;
         let nonce = &wrapped_dek[..NONCE_LEN];
         let ciphertext = &wrapped_dek[NONCE_LEN..];
-        decrypt_aes_256_gcm(&self.key_bytes, ciphertext, nonce)
+        decrypt_aes_256_gcm(key, ciphertext, nonce)
     }
 }
 
@@ -478,4 +494,20 @@ pub async fn rotate_secret_kek(
     rotated.kek_provider = new_kek_provider.provider_name().to_string();
     rotated.wrapped_dek = new_wrapped_dek;
     Ok(rotated)
+}
+
+#[cfg(test)]
+mod env_kek_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_or_empty_environment_key_fails_closed() {
+        for provider in [
+            EnvKekProvider::from_optional_passphrase(None),
+            EnvKekProvider::from_optional_passphrase(Some("")),
+        ] {
+            assert!(provider.wrap_dek(b"dek").await.is_err());
+            assert!(provider.unwrap_dek(b"wrapped-dek").await.is_err());
+        }
+    }
 }

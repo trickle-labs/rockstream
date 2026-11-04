@@ -244,6 +244,22 @@ impl SecretStore {
         }
     }
 
+    /// Open a durable SlateDB-backed secret store. Storage failures are
+    /// returned to the caller; this constructor never falls back to memory.
+    pub async fn open_durable(
+        path: impl Into<String>,
+        object_store: Arc<dyn object_store::ObjectStore>,
+        kek_provider: Arc<dyn KekProvider>,
+    ) -> Result<Self, SecretStoreError> {
+        let db = Db::builder(path.into(), object_store)
+            .build()
+            .await
+            .map_err(|error| {
+                SecretStoreError::storage(format!("open durable secret store: {error}"))
+            })?;
+        Ok(Self::new(Some(Arc::new(db)), kek_provider))
+    }
+
     /// Set an optional audit log.
     pub fn with_audit_log(mut self, audit_log: Arc<FileAuditLog>) -> Self {
         self.audit_log = Some(audit_log);
@@ -488,7 +504,12 @@ impl SecretStore {
             // A cancelled writer must finish before rotation scans the catalog.
             tokio::spawn(async move {
                 let _rotation = rotation;
-                db.put(&key, &serialized)
+                let write = db
+                    .put(&key, &serialized)
+                    .await
+                    .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+                write
+                    .await_durable()
                     .await
                     .map_err(|e| SecretStoreError::storage(e.to_string()))
             })
@@ -508,7 +529,12 @@ impl SecretStore {
         let key = secret_key(namespace_id, name);
         if let Some(db) = &self.db {
             // Assert point delete (zero range deletions)
-            db.delete(&key)
+            let write = db
+                .delete(&key)
+                .await
+                .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+            write
+                .await_durable()
                 .await
                 .map_err(|e| SecretStoreError::storage(e.to_string()))?;
         }

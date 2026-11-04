@@ -137,6 +137,7 @@ async fn test_source_id_invariance_across_status_changes() {
         name: "kafka_stream".to_string(),
         connector_type: "kafka".to_string(),
         table_name: None,
+        format: "json".to_string(),
         options: opts,
         secret_consumer: None,
         secret_namespace: None,

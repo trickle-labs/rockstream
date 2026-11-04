@@ -2,20 +2,28 @@ use std::{
     io::Read,
     path::Path,
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use rockstream_control::audit::FileAuditLog;
-use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
+use rockstream_storage::catalog::{
+    CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn,
+    DurableCatalogStore,
+};
 use rockstream_types::{
     authorization::{
         AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
-        ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
-        SecurityPrincipal, SECURITY_PRINCIPAL_FORMAT_VERSION,
+        ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass,
+        SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
+        SECURITY_PRINCIPAL_FORMAT_VERSION,
     },
-    ids::PrincipalId,
+    ids::{DatabaseId, NamespaceId, PrincipalId},
 };
 use sha2::Digest;
+use testcontainers::core::{ContainerPort, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{GenericImage, ImageExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -166,7 +174,7 @@ async fn mtls_connection_error(
 }
 
 async fn wait_for_gateway(process: &mut Child, address: std::net::SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = process.try_wait().unwrap() {
             let mut stderr = String::new();
@@ -178,7 +186,15 @@ async fn wait_for_gateway(process: &mut Child, address: std::net::SocketAddr) {
         if tokio::net::TcpStream::connect(address).await.is_ok() {
             return;
         }
-        assert!(Instant::now() < deadline, "gateway process never listened");
+        if Instant::now() >= deadline {
+            let _ = process.kill();
+            let status = process.wait().ok();
+            let mut stderr = String::new();
+            if let Some(mut pipe) = process.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!("gateway process never listened ({status:?}): {stderr}");
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -276,7 +292,8 @@ fn start_gateway_process(
 
     let child = Command::new(env!("CARGO_BIN_EXE_rockstream"))
         .current_dir(working_dir)
-        .env("RUST_LOG", "off")
+        .env("RUST_LOG", "info")
+        .env("RS_SECRET_KEK", "release-test-kek")
         .env_remove("ROCKSTREAM_CONFIG")
         .env_remove("ROCKSTREAM_OBJECT_STORE_ENDPOINT")
         .args([
@@ -351,6 +368,20 @@ fn parse_error_fields(payload: &[u8]) -> std::collections::BTreeMap<u8, String> 
     fields
 }
 
+fn simple_query_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Vec<Option<String>>> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|column| row.get(column).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -359,7 +390,7 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     let shard_dir = storage.join("gateway-shard");
     let store =
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
-    let durable = DurableCatalogStore::new(store, "gateway");
+    let durable = DurableCatalogStore::new(store.clone(), "gateway");
     let administrator = oidc_bootstrap_administrator();
     let reader = oidc_principal();
     durable
@@ -807,6 +838,351 @@ async fn scram_failures_run_in_release_process_and_audit_after_restart() {
 }
 
 #[tokio::test]
+async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_results() {
+    assert!(
+        rockstream_test_support::docker_available(),
+        "Docker is required for the PostgreSQL secret-rotation release proof"
+    );
+    let postgres = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "rotation-fixture-value")
+        .with_cmd(["postgres", "-c", "wal_level=logical"])
+        .start()
+        .await
+        .unwrap();
+    let postgres_host = postgres.get_host().await.unwrap();
+    let postgres_port = postgres.get_host_port_ipv4(5432).await.unwrap();
+    let (upstream, upstream_connection) = tokio_postgres::connect(
+        &format!(
+            "host={postgres_host} port={postgres_port} user=postgres password=rotation-fixture-value dbname=postgres"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = upstream_connection.await;
+    });
+    upstream
+        .batch_execute(concat!(
+            "CREATE TABLE public.orders (id BIGINT, amount BIGINT); ",
+            "ALTER TABLE public.orders REPLICA IDENTITY FULL; ",
+            "INSERT INTO public.orders VALUES (1, 10), (1, 10), (2, NULL); ",
+            "CREATE PUBLICATION orders_pub FOR TABLE public.orders;",
+        ))
+        .await
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("node-storage");
+    let shard_dir = storage.join("gateway-shard");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+    let mut principal = scram_principal();
+    principal.preset_grants.push(ScopedPresetGrant {
+        preset: PermissionPreset::Builder,
+        scope: PolicyScope::Namespace {
+            namespace: "public".to_string(),
+        },
+    });
+    principal.scoped_grants.push(ScopedActionGrant {
+        action: SecurityAction::SecretUse,
+        scope: PolicyScope::Secret {
+            namespace: "public".to_string(),
+            name: "pg_auth".to_string(),
+            consumer: Some(PrincipalId(1)),
+        },
+    });
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let durable = DurableCatalogStore::new(store.clone(), "gateway");
+    durable
+        .preprovision_first_administrator(principal, 1)
+        .await
+        .unwrap();
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![
+                    CatalogMutation::PutDatabase(CatalogDatabase {
+                        id: DatabaseId(1),
+                        name: "default".to_string(),
+                        default_namespace: "public".to_string(),
+                        created_at: 1,
+                    }),
+                    CatalogMutation::PutNamespace(CatalogNamespace {
+                        id: NamespaceId(1),
+                        name: "public".to_string(),
+                        database_id: DatabaseId(1),
+                        created_at: 1,
+                    }),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let tls_cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .self_signed(&tls_key)
+        .unwrap();
+    let cert_path = temp.path().join("gateway.pem");
+    let key_path = temp.path().join("gateway-key.pem");
+    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
+    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
+
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut process.0, address).await;
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection_task = tokio::spawn(connection);
+    client
+        .simple_query(
+            "CREATE SECRET pg_auth (TYPE = 'postgres_role', PASSWORD = 'rotation-fixture-value')",
+        )
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .unwrap();
+    let slot_name = format!("rotation_{}", address.port());
+    client
+        .simple_query(&format!(
+            "CREATE SOURCE orders TYPE postgres_cdc (host='{postgres_host}', port='{postgres_port}', database='postgres', user='postgres', publication='orders_pub', slot='{slot_name}', table='public.orders', secret='pg_auth') FORMAT pgoutput"
+        ))
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW order_rows AS SELECT id, amount FROM orders")
+        .await
+        .unwrap();
+
+    let row =
+        |id: &str, amount: Option<&str>| vec![Some(id.to_string()), amount.map(str::to_string)];
+    let mut expected_rows = vec![row("1", Some("10")), row("1", Some("10")), row("2", None)];
+    expected_rows.sort();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let observed = client
+            .simple_query("SELECT * FROM order_rows")
+            .await
+            .ok()
+            .map(|messages| {
+                let mut rows = simple_query_rows(&messages);
+                rows.sort();
+                rows
+            });
+        if observed.as_ref() == Some(&expected_rows) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "release PostgreSQL source did not publish its exact initial rows"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    upstream
+        .batch_execute("BEGIN; INSERT INTO public.orders VALUES (3, 30), (3, 30), (4, NULL);")
+        .await
+        .unwrap();
+    upstream
+        .simple_query("ALTER ROLE postgres PASSWORD 'rotated-fixture-value'")
+        .await
+        .unwrap();
+    client
+        .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')")
+        .await
+        .unwrap();
+    upstream.batch_execute("COMMIT").await.unwrap();
+    expected_rows.extend([row("3", Some("30")), row("3", Some("30")), row("4", None)]);
+    expected_rows.sort();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let observed = client
+            .simple_query("SELECT * FROM order_rows")
+            .await
+            .ok()
+            .map(|messages| {
+                let mut rows = simple_query_rows(&messages);
+                rows.sort();
+                rows
+            });
+        if observed.as_ref() == Some(&expected_rows) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "release PostgreSQL source did not preserve rows across secret rotation"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(process.0.try_wait().unwrap().is_none());
+    upstream
+        .batch_execute("INSERT INTO public.orders VALUES (5, 50)")
+        .await
+        .unwrap();
+    let committed_wal_lsn: String = upstream
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    expected_rows.push(row("5", Some("50")));
+    expected_rows.sort();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let observed = client
+            .simple_query("SELECT * FROM order_rows")
+            .await
+            .ok()
+            .map(|messages| {
+                let mut rows = simple_query_rows(&messages);
+                rows.sort();
+                rows
+            });
+        let slot_checkpointed = upstream
+            .query_opt(
+                "SELECT COALESCE(confirmed_flush_lsn >= ($2::text)::pg_lsn, false) FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot_name, &committed_wal_lsn],
+            )
+            .await
+            .unwrap()
+            .is_some_and(|row| row.get::<_, bool>(0));
+        if observed.as_ref() == Some(&expected_rows) && slot_checkpointed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "release PostgreSQL source did not durably checkpoint after secret rotation; observed: {observed:?}, slot_checkpointed: {slot_checkpointed}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let before_restart = simple_query_rows(&client.simple_query("SHOW SECRETS").await.unwrap());
+    assert_eq!(before_restart.len(), 1);
+    assert_eq!(before_restart[0][0].as_deref(), Some("pg_auth"));
+    assert_eq!(before_restart[0][1].as_deref(), Some("postgres_role"));
+    assert!(!serde_json::to_string(&before_restart)
+        .unwrap()
+        .contains("rotated-fixture-value"));
+    drop(client);
+    connection_task.abort();
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let mut recovered = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut recovered.0, address).await;
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection_task = tokio::spawn(connection);
+    let after_restart = simple_query_rows(&client.simple_query("SHOW SECRETS").await.unwrap());
+    assert_eq!(after_restart, before_restart);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = match client.simple_query("SELECT * FROM order_rows").await {
+            Ok(messages) => {
+                let mut rows = simple_query_rows(&messages);
+                rows.sort();
+                Ok(rows)
+            }
+            Err(error) => Err(format!("{error:?}")),
+        };
+        if observed.as_ref().is_ok_and(|rows| rows == &expected_rows) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "release PostgreSQL source did not recover the complete committed rows: {observed:?}; backfill status: {:?}",
+            simple_query_rows(
+                &client
+                    .simple_query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW order_rows")
+                    .await
+                    .unwrap()
+            )
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(client);
+    connection_task.abort();
+    recovered.0.kill().unwrap();
+    recovered.0.wait().unwrap();
+
+    let durable_catalog = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    let namespace = durable_catalog
+        .get_namespace_by_name("public")
+        .await
+        .unwrap()
+        .unwrap();
+    let secret_store = rockstream_control::SecretStore::open_durable(
+        "gateway-secrets",
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap(),
+        Arc::new(rockstream_control::EnvKekProvider::from_passphrase(
+            "release-test-kek",
+        )),
+    )
+    .await
+    .unwrap();
+    let secret = secret_store
+        .get_secret(u128::from(namespace.id.0), "pg_auth")
+        .await
+        .unwrap();
+    assert_eq!(secret.metadata.version, 2);
+    assert!(secret
+        .payload
+        .get("password")
+        .is_some_and(|value| value == "rotated-fixture-value"));
+}
+
+#[tokio::test]
 async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_restart() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
@@ -991,7 +1367,7 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
         }
         assert!(
             Instant::now() < deadline,
-            "release control process did not audit the wrong-node rejection"
+            "release control process did not audit the wrong-node rejection; records: {events:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

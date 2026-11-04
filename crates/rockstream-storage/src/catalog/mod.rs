@@ -181,11 +181,17 @@ pub struct CatalogSourceEntry {
     pub name: String,
     pub connector_type: String,
     pub table_name: Option<String>,
+    #[serde(default = "default_source_format")]
+    pub format: String,
     pub options: HashMap<String, String>,
     #[serde(default)]
     pub secret_consumer: Option<PrincipalId>,
     #[serde(default)]
     pub secret_namespace: Option<String>,
+}
+
+fn default_source_format() -> String {
+    "json".to_string()
 }
 
 /// Persisted source record with explicit version tag (v0.69 Step 1, V069-01).

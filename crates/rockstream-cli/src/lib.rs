@@ -534,7 +534,8 @@ pub async fn start_gateway_with_shard_and_catalog(
         });
 
     let mut topology_readers = vec![rockstream_gateway::QueryTimeShardReaderSpec::new(
-        shard_path, store,
+        shard_path,
+        store.clone(),
     )];
     for shard_dir in &opts.query_time_shard_dirs {
         let shard_store: Arc<dyn object_store::ObjectStore> = Arc::new(
@@ -660,7 +661,22 @@ pub async fn start_gateway_with_shard_and_catalog(
         }
     };
 
+    let secret_store = rockstream_control::SecretStore::open_durable(
+        format!("{shard_path}-secrets"),
+        store,
+        Arc::new(rockstream_control::EnvKekProvider::from_env()),
+    )
+    .await
+    .map(Arc::new)
+    .map_err(|error| {
+        CliError::new(
+            RS_0003,
+            format!("gateway secret store failed to open: {error}"),
+            "Check that gateway storage is accessible and the configured key provider is available.",
+        )
+    })?;
     let mut server = server
+        .with_secret_store(secret_store)
         .with_query_time_shard_topology_provider(topology_provider)
         .with_join_strategy(opts.config.execution.join_strategy);
     if opts.role == "gateway" {

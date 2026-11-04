@@ -4,7 +4,8 @@
 
 `CREATE SECRET`, `ALTER SECRET`, `DROP SECRET`, and `SHOW SECRETS` store only
 AES-256-GCM envelopes under `catalog/secrets/`. The control plane uses
-`RS_SECRET_KEK` by default. `SHOW SECRETS` returns metadata only.
+`RS_SECRET_KEK` for wrapping keys; if it is unset or empty, secret operations
+fail closed without a built-in local key. `SHOW SECRETS` returns metadata only.
 
 Secret SQL is authorized through the durable principal policy. `CREATE SECRET`,
 `ALTER SECRET`, and `DROP SECRET` require `secret.manage` for the selected

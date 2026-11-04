@@ -179,6 +179,7 @@ async fn legacy_source_and_sink_secret_names_migrate_before_gateway_use() {
                         name: "legacy_pg_source".to_string(),
                         connector_type: "postgres_cdc".to_string(),
                         table_name: Some("orders".to_string()),
+                        format: "pgoutput".to_string(),
                         options: source_options,
                         secret_consumer: Some(PrincipalId(21)),
                         secret_namespace: Some("sales".to_string()),

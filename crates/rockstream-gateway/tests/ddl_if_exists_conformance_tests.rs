@@ -85,13 +85,20 @@ async fn start_gateway_with_admin(
             .await
         }
     };
+    let secret_store = Arc::new(rockstream_control::SecretStore::new(
+        None,
+        Arc::new(rockstream_control::EnvKekProvider::from_passphrase(
+            "ddl-if-exists-test-kek",
+        )),
+    ));
     let server = GatewayServer::with_shard_db_and_scram_auth(
         "127.0.0.1:0".parse().unwrap(),
         catalog,
         Arc::new(NoopViewReader),
         shard_db.clone(),
         role_catalog,
-    );
+    )
+    .with_secret_store(secret_store);
     let (addr, handle) = server.serve_background().await.unwrap();
     (addr.port(), handle, shard_db)
 }

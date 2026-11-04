@@ -3,8 +3,6 @@
 ## Secret rotation
 
 Kafka sources/sinks and PostgreSQL CDC sources can bind to `secret = '<name>'`.
-An altered secret queues one encrypted replacement token and applies it at the
-next epoch boundary, preserving the connector process and committed batches.
 New source and sink catalog entries store the binding as `secret://<name>`;
 resolved credential values are not copied into connector metadata. Attaching a
 secret requires an explicit `SecretUse` grant scoped to the secret and consumer
@@ -13,6 +11,14 @@ metadata is committed before CREATE or DROP is acknowledged. The gateway
 rechecks a source consumer's current grant before resolving its credential.
 Older entries without persisted consumer scope fail closed; an authorized
 migration route remains to be qualified.
+
+The gateway pgoutput source checks the durable secret version before a source
+transaction and after its committed epoch. If it changes during the transaction,
+the worker commits the complete result and slot checkpoint, then opens a new
+upstream connection with the authorized replacement while keeping the source
+worker alive. Kafka source/sink rotation remains unqualified; the experimental
+sink is not configured by SQL `CREATE SINK` and has no supported full-Core
+qualification route.
 
 RockStream supports exactly three external connector boundaries: PostgreSQL
 CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,
