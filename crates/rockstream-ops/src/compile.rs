@@ -316,11 +316,29 @@ fn expr_is_int64(expr: &Expr, schema: &Schema) -> bool {
 }
 
 fn legacy_group_key_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
-    // Legacy records have no type tag; inferred expression types are not definitive.
-    match expr {
-        Expr::Column(index) => schema.fields().get(*index).map(|f| f.data_type().clone()),
-        _ => None,
+    fn has_udf(expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(_) | Expr::Literal(_) => false,
+            Expr::BinaryOp { left, right, .. } => has_udf(left) || has_udf(right),
+            Expr::Case {
+                when_then,
+                else_expr,
+            } => {
+                when_then
+                    .iter()
+                    .any(|(when, then)| has_udf(when) || has_udf(then))
+                    || has_udf(else_expr)
+            }
+            Expr::ScalarUdf { .. } => true,
+        }
     }
+    if has_udf(expr) {
+        return None;
+    }
+    let batch = arrow::record_batch::RecordBatch::new_empty(Arc::new(schema.clone()));
+    crate::expr::eval_to_array(expr, &batch)
+        .ok()
+        .map(|array| array.data_type().clone())
 }
 
 #[allow(dead_code)]
@@ -1775,7 +1793,7 @@ mod tests {
     use super::*;
     use crate::expr::lit;
     use crate::zset::ArrowZSet;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use object_store::local::LocalFileSystem;
@@ -1803,6 +1821,96 @@ mod tests {
         )
         .unwrap();
         ArrowZSet::new(data, vec![1; ids.len()])
+    }
+
+    #[test]
+    fn legacy_key_types_follow_expression_output_types() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let expression = |op| Expr::BinaryOp {
+            op,
+            left: Box::new(Expr::Column(0)),
+            right: Box::new(Expr::Literal(1i64.to_be_bytes().to_vec())),
+        };
+        assert_eq!(
+            legacy_group_key_type(&expression(BinaryOp::Add), &schema),
+            Some(DataType::Int64)
+        );
+        assert_eq!(
+            legacy_group_key_type(&expression(BinaryOp::Gt), &schema),
+            Some(DataType::Boolean)
+        );
+        let unknown = Expr::ScalarUdf {
+            name: "unknown".to_string(),
+            args: vec![Expr::Column(0)],
+        };
+        assert_eq!(legacy_group_key_type(&unknown, &schema), None);
+        let nested = Expr::BinaryOp {
+            op: BinaryOp::Add,
+            left: Box::new(unknown),
+            right: Box::new(lit(1)),
+        };
+        assert_eq!(legacy_group_key_type(&nested, &schema), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_expression_keys_restore_without_reassigning_surrogates() {
+        let (_dir, db) = make_db().await;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let expr = |op| Expr::BinaryOp {
+            op,
+            left: Box::new(Expr::Column(0)),
+            right: Box::new(lit(1)),
+        };
+        let keys = [expr(BinaryOp::Add), expr(BinaryOp::Gt)];
+        let packer = GroupKeyPacker::new_with_key_types(
+            keys.iter()
+                .map(|e| legacy_group_key_type(e, &schema))
+                .collect(),
+        );
+        let op_id = OperatorId(47);
+        let mut batch = rockstream_storage::WriteBatch::new();
+        for (surrogate, (number, flag)) in [(2i64, false), (3, true)].into_iter().enumerate() {
+            let mut key = vec![0x01, 0x4b, 0x50];
+            key.extend_from_slice(&op_id.0.to_be_bytes());
+            key.push(1);
+            key.extend_from_slice(&number.to_be_bytes());
+            key.extend_from_slice(&[1, u8::from(flag)]);
+            batch.put(&key, &(surrogate as i64).to_be_bytes());
+        }
+        db.write_batch(batch).await.unwrap();
+        packer.restore_in_place(&db, op_id).await.unwrap();
+        let input =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+        let arrays = keys
+            .iter()
+            .map(|e| crate::expr::eval_to_array(e, &input).unwrap())
+            .collect::<Vec<_>>();
+        let projected = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Boolean, false),
+                Field::new("v", DataType::Int64, false),
+            ])),
+            vec![
+                arrays[0].clone(),
+                arrays[1].clone(),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let packed = packer.pack(ArrowZSet::new(projected, vec![1, 1])).unwrap();
+        assert_eq!(
+            packed.data.column(0).to_data(),
+            Int64Array::from(vec![0, 1]).to_data()
+        );
+        let unpacked = packer.unpack(packed).unwrap();
+        assert_eq!(unpacked.data.column(0).to_data(), arrays[0].to_data());
+        assert_eq!(unpacked.data.column(1).to_data(), arrays[1].to_data());
+        assert_eq!(
+            unpacked.data.column(2).to_data(),
+            Int64Array::from(vec![10, 20]).to_data()
+        );
+        assert_eq!(unpacked.weights, vec![1, 1]);
     }
 
     #[tokio::test]
