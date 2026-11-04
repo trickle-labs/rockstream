@@ -43,10 +43,14 @@ check_exception_records() {
 check_exception_records "$DENY" "$POLICY" || fail "real advisory exceptions are not governed"
 
 audit_output="$TMP_ROOT/audit.out"
-if cargo audit --no-fetch --file "$FIXTURE/Cargo.lock" >"$audit_output" 2>&1; then
+if cargo audit --file "$FIXTURE/Cargo.lock" >"$audit_output" 2>&1; then
+  cat "$audit_output" >&2
   fail "cargo audit accepted the known-vulnerable fixture"
 fi
-grep -Eq 'RUSTSEC-|vulnerabilit' "$audit_output" || fail "cargo audit did not report an advisory"
+grep -Eq 'RUSTSEC-|vulnerabilit' "$audit_output" || {
+  cat "$audit_output" >&2
+  fail "cargo audit did not report an advisory"
+}
 
 deny_output="$TMP_ROOT/deny.out"
 if cargo deny --manifest-path "$FIXTURE/Cargo.toml" --config "$DENY" check advisories >"$deny_output" 2>&1; then
