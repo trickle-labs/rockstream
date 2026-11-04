@@ -15,6 +15,17 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 const BUNDLE_TIME_MS: u64 = 1_724_000_000_000;
 
 fn occurrence() -> DiagnosticOccurrence {
+    let cause = DiagnosticOccurrence::new(
+        RS_2018,
+        Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        [(
+            "query".to_string(),
+            "SELECT * FROM accounts WHERE id = 'support-fixture-cause-literal'".to_string(),
+        )],
+        None,
+        None,
+    )
+    .unwrap();
     DiagnosticOccurrence::new(
         RS_2018,
         Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
@@ -30,7 +41,7 @@ fn occurrence() -> DiagnosticOccurrence {
             ),
         ],
         None,
-        None,
+        Some(cause),
     )
     .unwrap()
 }
@@ -50,9 +61,29 @@ fn expected_bundle(occurrence: &DiagnosticOccurrence) -> serde_json::Value {
 fn support_diagnose_exact_bundle() {
     let _guard = TEST_LOCK.lock().unwrap();
     global_diagnostic_journal().lock().clear();
-    let raw_occurrence = occurrence();
-    let expected_occurrence = raw_occurrence.sanitized_for_support().0;
+    let mut raw_occurrence = occurrence();
+    raw_occurrence.context.insert(
+        "detail".to_string(),
+        "password=support-fixture-secret".to_string(),
+    );
     record_diagnostic(raw_occurrence);
+    let expected_occurrence = DiagnosticOccurrence::new(
+        RS_2018,
+        Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+        [],
+        None,
+        Some(
+            DiagnosticOccurrence::new(
+                RS_2018,
+                Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+                [],
+                None,
+                None,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
 
     let temp = tempfile::tempdir().unwrap();
     let output_path = temp.path().join("diagnostic.json");
@@ -106,6 +137,57 @@ fn support_diagnose_exact_bundle() {
             output_path.display()
         )
     );
+}
+
+#[test]
+fn support_bundle_sanitizes_diagnostics_in_exact_artifact() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("diagnostic.json");
+    let mut raw_occurrence = occurrence();
+    raw_occurrence.context.insert(
+        "detail".to_string(),
+        "password=support-fixture-secret".to_string(),
+    );
+    let expected_occurrence = DiagnosticOccurrence::new(
+        RS_2018,
+        Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+        [],
+        None,
+        Some(
+            DiagnosticOccurrence::new(
+                RS_2018,
+                Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+                [],
+                None,
+                None,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let expected_bytes = serde_json::to_vec_pretty(&expected_bundle(&expected_occurrence)).unwrap();
+    let storage = StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS);
+
+    assert_eq!(
+        storage
+            .generate_support_bundle_with_diagnostics(
+                temp.path(),
+                None,
+                None,
+                Some(&output_path),
+                &[raw_occurrence],
+            )
+            .unwrap(),
+        SupportBundleInfo {
+            bundle_path: output_path.to_string_lossy().into_owned(),
+            view: None,
+            size_bytes: expected_bytes.len() as u64,
+            redacted_secrets_count: 1,
+            generated_at_ms: BUNDLE_TIME_MS,
+        }
+    );
+    assert_eq!(std::fs::read(&output_path).unwrap(), expected_bytes);
 }
 
 #[test]
