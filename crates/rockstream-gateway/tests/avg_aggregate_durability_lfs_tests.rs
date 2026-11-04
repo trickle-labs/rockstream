@@ -163,6 +163,60 @@ async fn failed_atomic_commit_restores_window_before_next_commit() {
 }
 
 #[tokio::test]
+async fn failed_atomic_commit_restores_topk_before_next_commit() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("topk-view-failure", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    let select = "SELECT id, v FROM (SELECT id, v, ROW_NUMBER() OVER (ORDER BY v DESC) AS rn FROM t) WHERE rn <= 1";
+    let explain = client
+        .simple_query(&format!("EXPLAIN INCREMENTAL {select}"))
+        .await
+        .unwrap();
+    assert!(
+        explain.iter().any(|message| matches!(message, tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0).is_some_and(|value| value.contains("TopK")))),
+        "{explain:?}"
+    );
+    client
+        .simple_query(&format!("CREATE MATERIALIZED VIEW mv AS {select}"))
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10)]);
+    db.fail_next_view_output_write();
+    assert!(client
+        .simple_query("INSERT INTO t VALUES (2, 20)")
+        .await
+        .is_err());
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10)]);
+    client
+        .simple_query("INSERT INTO t VALUES (3, 30)")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (3, 30)]);
+    assert_eq!(read_pairs(&client, "mv").await, vec![(3, 30)]);
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("topk-view-failure", store, catalog).await;
+    let client = connect_port(port).await;
+    assert_eq!(read_pairs(&client, "mv").await, vec![(3, 30)]);
+    client
+        .simple_query("INSERT INTO t VALUES (4, 5)")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "mv").await, vec![(3, 30)]);
+}
+
+#[tokio::test]
 async fn view_output_failure_must_not_acknowledge_incomplete_commit() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =

@@ -96,6 +96,30 @@ fn weighted_rows(zset: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
     rows
 }
 
+#[tokio::test]
+async fn compiled_topk_restore_discards_uncommitted_delta() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(481);
+    let op = Arc::new(TopKOp::new(schema_kv(), 2, 0, vec![]));
+    let pipeline = rockstream_ops::live_exec::StatefulPipeline::new()
+        .push(rockstream_ops::live_exec::Stage::TopK(op.clone(), id));
+    pipeline
+        .process(make_input(&[(1, 1, 1), (2, 2, 1), (3, 3, 1)]))
+        .unwrap();
+    persist_topk_state(&db, &op, id).await.unwrap();
+    pipeline.process(make_input(&[(4, 4, 1)])).unwrap();
+    db.set_fail_scans(true);
+    assert!(pipeline.restore(&db).await.is_err());
+    db.set_fail_scans(false);
+    pipeline.restore(&db).await.unwrap();
+    let output = pipeline.process(make_input(&[(4, 4, 1)])).unwrap();
+    assert_eq!(
+        weighted_rows(&output),
+        BTreeMap::from([((2, 2), -1), ((4, 4), 1)])
+    );
+}
+
 // #113 R1-R5: real spill, exact weighted deltas/bags, and shared-storage isolation.
 #[tokio::test(flavor = "multi_thread")]
 async fn lfs_topk_spilled_multiplicity_and_operator_isolation() {
@@ -149,6 +173,22 @@ async fn lfs_topk_spilled_multiplicity_and_operator_isolation() {
         }
         bag.retain(|_, weight| *weight != 0);
         assert_eq!(bag, expected_bag.into_iter().collect(), "epoch {epoch} bag");
+
+        if epoch == 2 {
+            let id = OperatorId(489);
+            persist_topk_state(&db, &op, id).await.unwrap();
+            let bounded = TopKOp::new(schema_kv(), 2, 0, vec![1]);
+            bounded.process_epoch(make_input(&[(10, 0, 1)]), 1).unwrap();
+            assert!(matches!(
+                bounded.restore_in_place(&db, id).await,
+                Err(rockstream_ops::OpError::TopKBufferOverflow {
+                    limit: TOPK_BUFFER_LIMIT,
+                    ..
+                })
+            ));
+            let output = bounded.process_epoch(make_input(&[(20, 0, 1)]), 2).unwrap();
+            assert_eq!(weighted_rows(&output), BTreeMap::from([((20, 0), 1)]));
+        }
 
         let spill_before = db.scan_prefix(b"topk_spill:").await.unwrap();
         let mut expected_spill_value = Vec::new();

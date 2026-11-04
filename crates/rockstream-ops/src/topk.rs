@@ -161,6 +161,70 @@ impl TopKOp {
         self.state.lock().unwrap().state_bytes()
     }
 
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        // shortcut: spill-backed recovery is unavailable, restore spill generations before enabling it.
+        if self.db.lock().unwrap().is_some() {
+            return Err(OpError::storage_error(
+                "spill-backed topk state recovery is unavailable",
+            ));
+        }
+        let prefix = ShardKeyEncoder::topk_op_prefix(op_id.0);
+        let mut state = TopKState::new();
+        let mut continuation = None;
+        loop {
+            let page = db
+                .scan_prefix_page(&prefix, continuation.as_deref(), 1024, 1024 * 1024)
+                .await
+                .map_err(OpError::storage)?;
+            for (key, value) in page.rows {
+                if key.len() != prefix.len() + self.partition_by.len() * 8 + 8 + 16 {
+                    return Err(topk_corruption());
+                }
+                let (rank_value, net_weight, row_vals) =
+                    decode_topk_value(&value, self.n_input_cols).ok_or_else(topk_corruption)?;
+                let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap());
+                let part_key = self.partition_key_bytes(&row_vals);
+                if key.as_ref() != ShardKeyEncoder::topk_key(op_id.0, &part_key, rank_value, row_id)
+                    || row_id_hash(&row_vals) != row_id
+                    || rank_value != row_vals.get(self.rank_col).copied().unwrap_or(0)
+                {
+                    return Err(topk_corruption());
+                }
+                if net_weight != 0 {
+                    let part = state
+                        .partitions
+                        .entry(part_key)
+                        .or_insert_with(PartitionState::new);
+                    if net_weight > 0 {
+                        part.positive_count += 1;
+                        if part.positive_count > TOPK_BUFFER_LIMIT {
+                            return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
+                        }
+                    }
+                    part.buffer.insert(
+                        row_id,
+                        BufferEntry {
+                            rank_value,
+                            row_vals,
+                            net_weight,
+                        },
+                    );
+                }
+            }
+            if page.is_last_page {
+                break;
+            }
+            continuation = page.next_token;
+        }
+        for part in state.partitions.values_mut() {
+            part.emitted = select_topk(part, self.k, &HashMap::new());
+        }
+        let total = state.total_entries();
+        *self.state.lock().unwrap() = state;
+        self.fill_level.store(total, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Process one epoch: apply `delta` and return the output delta.
     pub fn process_epoch(&self, delta: ArrowZSet, _epoch: u64) -> Result<ArrowZSet, OpError> {
         if delta.is_empty() {
