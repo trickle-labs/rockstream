@@ -23,6 +23,9 @@ static ALLOW_LAW_OPERAND_FALLBACK: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "test-utils")]
 type TestPause =
     Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
+#[cfg(feature = "test-utils")]
+type TestPrefixPause =
+    Arc<std::sync::Mutex<Option<(Vec<u8>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
 
 /// Max rows (groups) returned by a single shard's partial_query.
 /// Bound: MAX_PARTIAL_AGG_RESULT_ROWS; fill metric: partial_agg_result_rows gauge.
@@ -175,6 +178,8 @@ pub struct ShardDb {
     pause_flush_once: TestPause,
     #[cfg(feature = "test-utils")]
     pause_scan_page_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_after_put_prefix_once: TestPrefixPause,
     fail_flushes: Arc<std::sync::atomic::AtomicBool>,
     fail_scans: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -524,6 +529,8 @@ impl ShardDbBuilder {
             pause_flush_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             pause_scan_page_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_after_put_prefix_once: Arc::new(std::sync::Mutex::new(None)),
             fail_flushes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_scans: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -808,6 +815,20 @@ impl ShardDb {
     /// write batches prevent state resurrection without relying on range deletions.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
         #[cfg(feature = "test-utils")]
+        let after_put_pause = {
+            let mut pause = self.pause_after_put_prefix_once.lock().unwrap();
+            if pause.as_ref().is_some_and(|(prefix, _, _)| {
+                batch
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, BatchOp::Put { key, .. } if key.starts_with(prefix)))
+            }) {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        #[cfg(feature = "test-utils")]
         let has_view_output = batch.ops.iter().any(|op| matches!(op, BatchOp::Put { key, .. } if key.first() == Some(&crate::keys::ShardPrefix::ViewOutput.as_byte())));
         #[cfg(feature = "test-utils")]
         if has_view_output {
@@ -863,6 +884,11 @@ impl ShardDb {
             }
         }
         pending.await_durable().await?;
+        #[cfg(feature = "test-utils")]
+        if let Some((_, entered, release)) = after_put_pause {
+            entered.notify_one();
+            release.notified().await;
+        }
         if let Some(epoch) = written_frontier {
             self.allocated_epoch.fetch_max(epoch, Ordering::SeqCst);
             self.last_epoch.fetch_max(epoch, Ordering::SeqCst);
@@ -1322,6 +1348,17 @@ impl ShardDb {
         release: Arc<tokio::sync::Notify>,
     ) {
         *self.pause_scan_page_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Pause after the next durable put matching a prefix.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_after_next_put_with_prefix(
+        &self,
+        prefix: Vec<u8>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_after_put_prefix_once.lock().unwrap() = Some((prefix, entered, release));
     }
 
     /// Pause after the next view batch is accepted by storage.

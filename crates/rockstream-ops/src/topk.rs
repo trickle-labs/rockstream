@@ -16,9 +16,10 @@
 //! O(log N) scan via the value-descending sort key for inserts and refills.
 //! Buffer size = 2K (K + epsilon). Fill-level metric = buffer entry count.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -36,7 +37,13 @@ use crate::zset::ArrowZSet;
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 pub const TOPK_BUFFER_LIMIT: usize = 100_000;
-static NEXT_SPILL_ID: AtomicU64 = AtomicU64::new(1);
+struct RecoveryGuard<'a>(&'a AtomicBool);
+
+impl Drop for RecoveryGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -52,6 +59,8 @@ struct BufferEntry {
     row_vals: Vec<i64>,
     net_weight: i64,
 }
+
+type SpillCandidates = BTreeMap<(i64, Reverse<Vec<u8>>, u128), BufferEntry>;
 
 /// Per-partition state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +130,10 @@ pub struct TopKOp {
     k: usize,
     rank_col: usize,
     partition_by: Vec<usize>,
-    spill_id: u64,
+    // shortcut: abandoned spill namespaces remain on disk, reclaim them when durable spill ownership exists.
+    spill_id: u128,
+    spill_slot: AtomicU8,
+    recovering: AtomicBool,
     db: Mutex<Option<Arc<ShardDb>>>,
     state: Mutex<TopKState>,
     fill_level: Arc<AtomicUsize>,
@@ -137,7 +149,9 @@ impl TopKOp {
             k,
             rank_col,
             partition_by,
-            spill_id: NEXT_SPILL_ID.fetch_add(1, Ordering::Relaxed),
+            spill_id: rand::random(),
+            spill_slot: AtomicU8::new(0),
+            recovering: AtomicBool::new(false),
             db: Mutex::new(None),
             state: Mutex::new(TopKState::new()),
             fill_level: Arc::new(AtomicUsize::new(0)),
@@ -162,20 +176,28 @@ impl TopKOp {
     }
 
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
-        // shortcut: spill-backed recovery is unavailable, restore spill generations before enabling it.
-        if self.db.lock().unwrap().is_some() {
-            return Err(OpError::storage_error(
-                "spill-backed topk state recovery is unavailable",
-            ));
+        {
+            let _state = self.state.lock().unwrap();
+            if self.recovering.swap(true, Ordering::AcqRel) {
+                return Err(OpError::storage_error("topk recovery already in progress"));
+            }
+        }
+        let _recovery = RecoveryGuard(&self.recovering);
+        let spill_db = self.db.lock().unwrap().clone();
+        let target_slot = self.spill_slot.load(Ordering::Acquire) ^ 1;
+        if let Some(spill_db) = &spill_db {
+            self.clear_spill_slot(spill_db, target_slot).await?;
         }
         let prefix = ShardKeyEncoder::topk_op_prefix(op_id.0);
         let mut state = TopKState::new();
+        let mut candidates: HashMap<Vec<u8>, SpillCandidates> = HashMap::new();
         let mut continuation = None;
         loop {
             let page = db
                 .scan_prefix_page(&prefix, continuation.as_deref(), 1024, 1024 * 1024)
                 .await
                 .map_err(OpError::storage)?;
+            let mut spill_batch = WriteBatch::new();
             for (key, value) in page.rows {
                 if key.len() != prefix.len() + self.partition_by.len() * 8 + 8 + 16 {
                     return Err(topk_corruption());
@@ -193,35 +215,92 @@ impl TopKOp {
                 if net_weight != 0 {
                     let part = state
                         .partitions
-                        .entry(part_key)
+                        .entry(part_key.clone())
                         .or_insert_with(PartitionState::new);
-                    if net_weight > 0 {
-                        part.positive_count += 1;
-                        if part.positive_count > TOPK_BUFFER_LIMIT {
+                    if part.buffer.contains_key(&row_id) || part.spilled.contains(&row_id) {
+                        return Err(topk_corruption());
+                    }
+                    let entry = BufferEntry {
+                        rank_value,
+                        row_vals,
+                        net_weight,
+                    };
+                    if net_weight > 0 && part.positive_count >= TOPK_BUFFER_LIMIT {
+                        if spill_db.is_none() {
                             return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
                         }
+                        let mut spill_key = self.spill_partition_prefix_at(target_slot, &part_key);
+                        spill_key.extend_from_slice(&row_id.to_be_bytes());
+                        spill_batch.put(&spill_key, &value);
+                        part.spilled.insert(row_id);
+                        let best = candidates.entry(part_key).or_default();
+                        best.insert(
+                            (rank_value, Reverse(encode_row(&entry.row_vals)), row_id),
+                            entry,
+                        );
+                        if best.len() > self.k {
+                            best.pop_first();
+                        }
+                    } else {
+                        if net_weight > 0 {
+                            part.positive_count += 1;
+                        }
+                        part.buffer.insert(row_id, entry);
                     }
-                    part.buffer.insert(
-                        row_id,
-                        BufferEntry {
-                            rank_value,
-                            row_vals,
-                            net_weight,
-                        },
-                    );
                 }
+            }
+            if !spill_batch.is_empty() {
+                spill_db
+                    .as_ref()
+                    .unwrap()
+                    .write_batch(spill_batch)
+                    .await
+                    .map_err(OpError::storage)?;
             }
             if page.is_last_page {
                 break;
             }
             continuation = page.next_token;
         }
-        for part in state.partitions.values_mut() {
-            part.emitted = select_topk(part, self.k, &HashMap::new());
+        for (part_key, part) in &mut state.partitions {
+            let spilled = candidates
+                .remove(part_key)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|((_, _, row_id), entry)| (row_id, entry))
+                .collect();
+            part.emitted = select_topk(part, self.k, &spilled);
         }
         let total = state.total_entries();
-        *self.state.lock().unwrap() = state;
+        let mut current = self.state.lock().unwrap();
+        if spill_db.is_some() {
+            self.spill_slot.store(target_slot, Ordering::Release);
+        }
+        *current = state;
         self.fill_level.store(total, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn clear_spill_slot(&self, db: &ShardDb, slot: u8) -> Result<(), OpError> {
+        let prefix = self.spill_slot_prefix(slot);
+        let mut continuation = None;
+        loop {
+            let page = db
+                .scan_prefix_page(&prefix, continuation.as_deref(), 1024, 1024 * 1024)
+                .await
+                .map_err(OpError::storage)?;
+            let mut batch = WriteBatch::new();
+            for (key, _) in page.rows {
+                batch.delete(&key);
+            }
+            if !batch.is_empty() {
+                db.write_batch(batch).await.map_err(OpError::storage)?;
+            }
+            if page.is_last_page {
+                break;
+            }
+            continuation = page.next_token;
+        }
         Ok(())
     }
 
@@ -232,6 +311,9 @@ impl TopKOp {
         }
 
         let mut accepted = self.state.lock().unwrap();
+        if self.recovering.load(Ordering::Acquire) {
+            return Err(OpError::storage_error("topk recovery in progress"));
+        }
         // Stage only touched partitions; failed reads/writes must not publish an epoch.
         let mut state = TopKState::new();
         let db_guard = self.db.lock().unwrap();
@@ -423,10 +505,23 @@ impl TopKOp {
         key
     }
 
-    fn spill_partition_prefix(&self, part_key: &[u8]) -> Vec<u8> {
+    fn spill_slot_prefix(&self, slot: u8) -> Vec<u8> {
         [
-            b"topk_spill:".as_slice(),
+            b"topk_spill:v2:".as_slice(),
             &self.spill_id.to_be_bytes(),
+            &[slot],
+        ]
+        .concat()
+    }
+
+    fn spill_partition_prefix(&self, part_key: &[u8]) -> Vec<u8> {
+        self.spill_partition_prefix_at(self.spill_slot.load(Ordering::Acquire), part_key)
+    }
+
+    fn spill_partition_prefix_at(&self, slot: u8, part_key: &[u8]) -> Vec<u8> {
+        [
+            self.spill_slot_prefix(slot).as_slice(),
+            &(self.partition_by.len() as u64).to_be_bytes(),
             part_key,
         ]
         .concat()
@@ -655,6 +750,9 @@ pub(crate) fn append_topk_state_with_db(
 ) -> Result<(), OpError> {
     let batch = {
         let state = op.state.lock().unwrap();
+        if op.recovering.load(Ordering::Acquire) {
+            return Err(OpError::storage_error("topk recovery in progress"));
+        }
         let mut batch = WriteBatch::new();
         let oid = op_id.0;
         if let Some(db) = db {
@@ -895,6 +993,38 @@ mod tests {
             .close()
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reused_spill_id_isolated_from_old_partition_layout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let db = Arc::new(
+            ShardDb::builder("topk-stale-layout", store)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let current = TopKOp::new(schema_kv(), 2, 0, vec![]).with_db(db.clone());
+        let mut old = TopKOp::new(schema_kv(), 2, 0, vec![1]);
+        old.spill_id = current.spill_id;
+        let old = old.with_db(db.clone());
+        let stale: Vec<_> = (1..=100_001).map(|rank| (rank, 9, 1)).collect();
+        old.process_epoch(make_input(&stale), 1).unwrap();
+        drop(old);
+        let initial: Vec<_> = (1..=100_001).map(|rank| (rank, 0, 1)).collect();
+        current.process_epoch(make_input(&initial), 1).unwrap();
+        let output = current
+            .process_epoch(make_input(&[(100_001, 0, 1)]), 2)
+            .unwrap();
+        let actual = (0..output.num_rows())
+            .map(|i| (extract_row_vals(&output.data, i, 2), output.weights[i]))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            actual,
+            HashMap::from([(vec![100_001, 0], 1), (vec![100_000, 0], -1)])
+        );
     }
 
     // #114 R5: valid records on both sides of a truncated record cannot yield a partial operator.

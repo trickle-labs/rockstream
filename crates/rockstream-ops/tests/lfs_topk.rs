@@ -15,7 +15,9 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
-use rockstream_ops::topk::{load_topk_state, persist_topk_state, TopKOp, TOPK_BUFFER_LIMIT};
+use rockstream_ops::topk::{
+    append_topk_state, load_topk_state, persist_topk_state, TopKOp, TOPK_BUFFER_LIMIT,
+};
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_storage::{ShardDb, WriteBatch};
 use rockstream_types::ids::OperatorId;
@@ -128,6 +130,183 @@ async fn compiled_topk_restore_discards_uncommitted_delta() {
     assert_eq!(
         weighted_rows(&output),
         BTreeMap::from([((3, 3), -1), ((5, 5), 1)])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spilled_topk_restores_checkpoint_after_abandoned_update() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(482);
+    let op = Arc::new(TopKOp::new(schema_kv(), 2, 0, vec![1]).with_db(db.clone()));
+    let mut initial: Vec<_> = (1..=100_001).map(|rank| (rank, 0, 1)).collect();
+    initial.extend([(4, 1, 1), (5, 1, 1), (6, 1, 1)]);
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&initial), 1).unwrap()),
+        BTreeMap::from([
+            ((100_001, 0), 1),
+            ((100_000, 0), 1),
+            ((5, 1), 1),
+            ((6, 1), 1)
+        ])
+    );
+    let other = TopKOp::new(schema_kv(), 1, 0, vec![1]).with_db(db.clone());
+    let other_input: Vec<_> = (1..=100_001).map(|rank| (rank, 9, 1)).collect();
+    assert_eq!(
+        weighted_rows(&other.process_epoch(make_input(&other_input), 1).unwrap()),
+        BTreeMap::from([((100_001, 9), 1)])
+    );
+    let other_spill = db
+        .scan_prefix(b"topk_spill:")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(_, value)| value[24..32] == 9i64.to_be_bytes())
+        .unwrap();
+    persist_topk_state(&db, &op, id).await.unwrap();
+    assert_eq!(
+        weighted_rows(
+            &op.process_epoch(make_input(&[(100_001, 0, -1)]), 2)
+                .unwrap()
+        ),
+        BTreeMap::from([((100_001, 0), -1), ((99_999, 0), 1)])
+    );
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&[(0, 0, 1)]), 2).unwrap()),
+        BTreeMap::new()
+    );
+    db.set_fail_scans(true);
+    assert!(
+        matches!(op.restore_in_place(&db, id).await, Err(rockstream_ops::OpError::Storage { source: rockstream_storage::StorageError::Unsupported(message), .. }) if message == "injected storage scan failure")
+    );
+    db.set_fail_scans(false);
+    db.set_fail_writes(true);
+    assert!(
+        matches!(op.restore_in_place(&db, id).await, Err(rockstream_ops::OpError::Storage { source: rockstream_storage::StorageError::Unsupported(message), .. }) if message == "injected storage write failure")
+    );
+    db.set_fail_writes(false);
+    let before_cancel = db.scan_prefix(b"topk_spill:").await.unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    db.pause_after_next_put_with_prefix(b"topk_spill:v2:".to_vec(), entered.clone(), release);
+    let restoring = {
+        let op = op.clone();
+        let db = db.clone();
+        tokio::spawn(async move { op.restore_in_place(&db, id).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+        .await
+        .unwrap();
+    let added = db
+        .scan_prefix(b"topk_spill:")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| !before_cancel.contains(record))
+        .map(|(_, value)| value.to_vec())
+        .collect::<Vec<_>>();
+    let expected_spill = [1i64, 1, 1, 0]
+        .into_iter()
+        .flat_map(i64::to_be_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(added, vec![expected_spill]);
+    assert!(
+        matches!(op.restore_in_place(&db, id).await, Err(rockstream_ops::OpError::Storage { source: rockstream_storage::StorageError::KeyEncoding(message), .. }) if message == "topk recovery already in progress")
+    );
+    assert!(
+        matches!(op.process_epoch(make_input(&[(100_001, 0, 1)]), 3), Err(rockstream_ops::OpError::Storage { source: rockstream_storage::StorageError::KeyEncoding(message), .. }) if message == "topk recovery in progress")
+    );
+    let mut snapshot = WriteBatch::new();
+    assert!(
+        matches!(append_topk_state(&op, id, &mut snapshot), Err(rockstream_ops::OpError::Storage { source: rockstream_storage::StorageError::KeyEncoding(message), .. }) if message == "topk recovery in progress")
+    );
+    assert!(snapshot.is_empty());
+    restoring.abort();
+    assert!(matches!(restoring.await, Err(error) if error.is_cancelled()));
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&[(100_001, 0, 1)]), 3).unwrap()),
+        BTreeMap::from([((100_001, 0), 1), ((99_999, 0), -1)])
+    );
+    assert_eq!(
+        weighted_rows(
+            &op.process_epoch(make_input(&[(100_001, 0, -1)]), 4)
+                .unwrap()
+        ),
+        BTreeMap::from([((100_001, 0), -1), ((99_999, 0), 1)])
+    );
+    op.restore_in_place(&db, id).await.unwrap();
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&[(7, 1, 1)]), 3).unwrap()),
+        BTreeMap::from([((5, 1), -1), ((7, 1), 1)])
+    );
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&[(100_001, 0, 1)]), 3).unwrap()),
+        BTreeMap::from([((100_001, 0), 1), ((100_000, 0), -1)])
+    );
+    db.set_fail_writes(true);
+    assert!(
+        matches!(op.restore_in_place(&db, id).await, Err(rockstream_ops::OpError::Storage { source: rockstream_storage::StorageError::Unsupported(message), .. }) if message == "injected storage write failure")
+    );
+    db.set_fail_writes(false);
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&[(100_002, 0, 1)]), 4).unwrap()),
+        BTreeMap::from([((100_001, 0), -1), ((100_002, 0), 1)])
+    );
+    op.restore_in_place(&db, id).await.unwrap();
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&[(100_001, 0, 1)]), 5).unwrap()),
+        BTreeMap::from([((100_001, 0), 1), ((100_000, 0), -1)])
+    );
+    assert_eq!(db.get(&other_spill.0).await.unwrap(), Some(other_spill.1));
+    drop(other);
+    drop(op);
+    Arc::try_unwrap(db)
+        .ok()
+        .expect("single owner")
+        .close()
+        .await
+        .unwrap();
+    let reopened = open_shard(&dir).await;
+    let fresh = TopKOp::new(schema_kv(), 2, 0, vec![1]).with_db(reopened.clone());
+    fresh.restore_in_place(&reopened, id).await.unwrap();
+    assert_eq!(
+        weighted_rows(&fresh.process_epoch(make_input(&[(7, 1, 1)]), 6).unwrap()),
+        BTreeMap::from([((5, 1), -1), ((7, 1), 1)])
+    );
+    assert_eq!(
+        weighted_rows(
+            &fresh
+                .process_epoch(make_input(&[(100_001, 0, 1)]), 6)
+                .unwrap()
+        ),
+        BTreeMap::from([((100_001, 0), 1), ((100_000, 0), -1)])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spilled_topk_restores_candidates_beyond_buffer_limit() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(483);
+    let op = TopKOp::new(schema_kv(), TOPK_BUFFER_LIMIT + 1, 0, vec![1]).with_db(db.clone());
+    let input: Vec<_> = (1..=100_002).map(|rank| (rank, 0, 1)).collect();
+    let expected: BTreeMap<_, _> = (2..=100_002).map(|rank| ((rank, 0), 1)).collect();
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&input), 1).unwrap()),
+        expected
+    );
+    assert_eq!(
+        weighted_rows(
+            &op.process_epoch(make_input(&[(100_003, 0, -2)]), 1)
+                .unwrap()
+        ),
+        BTreeMap::new()
+    );
+    persist_topk_state(&db, &op, id).await.unwrap();
+    op.restore_in_place(&db, id).await.unwrap();
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&[(100_003, 0, 3)]), 2).unwrap()),
+        BTreeMap::from([((2, 0), -1), ((100_003, 0), 1)])
     );
 }
 

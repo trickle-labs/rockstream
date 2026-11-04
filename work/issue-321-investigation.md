@@ -72,21 +72,22 @@ Work in progress: local SQL stages base rows, view output, state, and frontier
 in one batch. Projection and aggregate write-failure tests now pass. A failed
 state restore previously let the next aggregate commit produce 50 instead of
 30; a recovery gate now rejects reads while the failed scan persists and
-restores state before the next commit. This is not yet release evidence:
-Compiled in-memory TopK restoration now reads checkpoint pages within its
-per-partition buffer bound and reconstructs the emitted rows. Spill-backed
-TopK restoration remains unavailable; recovery after cancellation
-and process restart needs full-path testing, and the source-path locking changes
-need their own tests. The distributed path and shuffle owning-epoch recovery
-are not established by these tests.
+restores state before the next commit. This is not yet release evidence.
+TopK restoration scans checkpoint pages within the per-partition buffer bound;
+spill-backed operators rebuild into an inactive slot before publishing recovery.
+Filesystem tests cover failed scans and writes, cancellation, repeated recovery,
+large K, another operator sharing storage, and close/reopen. Other source paths,
+the distributed path, and shuffle owning-epoch recovery remain unqualified.
+The spill-ID index still grows with overflow, processing materializes a spilled
+partition, and abandoned spill namespaces are not yet garbage-collected.
 
 A test-only storage pause cancels the local handler before the combined write,
 after storage accepts it but before the durable-write future completes, and
 after that future but before flush. The first case restores the old rows; the
 latter cases block a concurrent pgwire read until recovery flushes and exposes
 the complete committed rows, which also survive reopen. Recovery refreshes the
-frontier from storage after the ambiguous write. This directly cancels the handler
-future; the pgwire CancelRequest path remains untested.
+frontier from storage after the ambiguous write. This test directly cancels the
+handler future; the separate pgwire CancelRequest observations are above.
 A separate injected flush failure rejects reads until a successful recovery
 flush, after which complete table and view rows survive a later commit and reopen.
 
@@ -99,8 +100,8 @@ are checked across an injected failure, retry, reopen, and later commit.
 
 A local pgwire test confirms its incremental plan includes TopK, then checks
 exact rows after an injected write failure, a valid transaction, reopen, and
-another valid transaction. A spilled checkpoint above the in-memory limit is
-rejected without replacing live state.
+another valid transaction. An in-memory-only operator rejects an oversized
+checkpoint without replacing live state.
 
 Analytic-window checkpoints retained old output-cache rows after a rank change,
 causing stale retractions after reload. Point deletions and in-place restore now

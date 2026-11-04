@@ -406,7 +406,6 @@ impl Stage {
     /// see `AggregateOp::restore_in_place` for why an in-place load is
     /// needed instead of just calling the existing `load_from_storage`
     /// constructors). Join is restored separately by `JoinPipeline::restore`.
-    /// Spill-backed TopK restoration reports an error until it can be restored.
     async fn restore(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
             Stage::Aggregate(op) => op.restore_in_place(db).await,

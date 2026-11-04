@@ -50,8 +50,10 @@ regex = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
+rockstream-storage = { workspace = true, features = ["test-utils"] }
 rdkafka = { workspace = true }
 rockstream-test-support.workspace = true
 criterion = { workspace = true }
@@ -66,7 +68,6 @@ rockstream-gateway = { workspace = true }
 rockstream-sim = { workspace = true }
 tokio-postgres = { workspace = true }
 async-trait = { workspace = true }
-rand = { workspace = true }
 datafusion = { workspace = true }
 
 
