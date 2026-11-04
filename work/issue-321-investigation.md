@@ -29,10 +29,12 @@ Older composite-key checkpoints contain only encoded key bytes and surrogate
 IDs. Recovery now decodes those bytes using known compiled key types; tests
 cover mixed text and numeric keys across a real gateway restart and exercise
 all supported scalar encodings. Unknown or unsupported types and malformed
-records remain explicit recovery errors rather than guessed values. UDF-free
-expressions use the actual expression evaluator on an empty typed batch to
-derive their output type; tests restore arithmetic and boolean expression keys
-with their original surrogate IDs. UDF-dependent types remain unknown.
+records remain explicit recovery errors rather than guessed values. Expressions
+use the actual evaluator on an empty typed batch to derive their output type;
+tests restore arithmetic, boolean, and supported scalar-function keys with their
+original surrogate IDs. A pgwire restart test also restores legacy `upper()`
+group keys and verifies the complete post-restart result. Unknown functions
+remain explicit recovery errors.
 
 On the local pgwire path, a real CancelRequest was observed by the gateway at
 each of three paused commit boundaries: before the atomic write, after that

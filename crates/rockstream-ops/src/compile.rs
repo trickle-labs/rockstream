@@ -316,25 +316,6 @@ fn expr_is_int64(expr: &Expr, schema: &Schema) -> bool {
 }
 
 fn legacy_group_key_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
-    fn has_udf(expr: &Expr) -> bool {
-        match expr {
-            Expr::Column(_) | Expr::Literal(_) => false,
-            Expr::BinaryOp { left, right, .. } => has_udf(left) || has_udf(right),
-            Expr::Case {
-                when_then,
-                else_expr,
-            } => {
-                when_then
-                    .iter()
-                    .any(|(when, then)| has_udf(when) || has_udf(then))
-                    || has_udf(else_expr)
-            }
-            Expr::ScalarUdf { .. } => true,
-        }
-    }
-    if has_udf(expr) {
-        return None;
-    }
     let batch = arrow::record_batch::RecordBatch::new_empty(Arc::new(schema.clone()));
     crate::expr::eval_to_array(expr, &batch)
         .ok()
@@ -1825,7 +1806,10 @@ mod tests {
 
     #[test]
     fn legacy_key_types_follow_expression_output_types() {
-        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]);
         let expression = |op| Expr::BinaryOp {
             op,
             left: Box::new(Expr::Column(0)),
@@ -1839,6 +1823,11 @@ mod tests {
             legacy_group_key_type(&expression(BinaryOp::Gt), &schema),
             Some(DataType::Boolean)
         );
+        let upper = Expr::ScalarUdf {
+            name: "upper".to_string(),
+            args: vec![Expr::Column(1)],
+        };
+        assert_eq!(legacy_group_key_type(&upper, &schema), Some(DataType::Utf8));
         let unknown = Expr::ScalarUdf {
             name: "unknown".to_string(),
             args: vec![Expr::Column(0)],
@@ -1855,13 +1844,23 @@ mod tests {
     #[tokio::test]
     async fn legacy_expression_keys_restore_without_reassigning_surrogates() {
         let (_dir, db) = make_db().await;
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
         let expr = |op| Expr::BinaryOp {
             op,
             left: Box::new(Expr::Column(0)),
             right: Box::new(lit(1)),
         };
-        let keys = [expr(BinaryOp::Add), expr(BinaryOp::Gt)];
+        let keys = [
+            expr(BinaryOp::Add),
+            expr(BinaryOp::Gt),
+            Expr::ScalarUdf {
+                name: "upper".to_string(),
+                args: vec![Expr::Column(1)],
+            },
+        ];
         let packer = GroupKeyPacker::new_with_key_types(
             keys.iter()
                 .map(|e| legacy_group_key_type(e, &schema))
@@ -1869,18 +1868,30 @@ mod tests {
         );
         let op_id = OperatorId(47);
         let mut batch = rockstream_storage::WriteBatch::new();
-        for (surrogate, (number, flag)) in [(2i64, false), (3, true)].into_iter().enumerate() {
+        for (surrogate, (number, flag, text)) in [(2i64, false, "AB"), (3, true, "CD")]
+            .into_iter()
+            .enumerate()
+        {
             let mut key = vec![0x01, 0x4b, 0x50];
             key.extend_from_slice(&op_id.0.to_be_bytes());
             key.push(1);
             key.extend_from_slice(&number.to_be_bytes());
             key.extend_from_slice(&[1, u8::from(flag)]);
+            key.push(1);
+            key.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            key.extend_from_slice(text.as_bytes());
             batch.put(&key, &(surrogate as i64).to_be_bytes());
         }
         db.write_batch(batch).await.unwrap();
         packer.restore_in_place(&db, op_id).await.unwrap();
-        let input =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["ab", "cd"])),
+            ],
+        )
+        .unwrap();
         let arrays = keys
             .iter()
             .map(|e| crate::expr::eval_to_array(e, &input).unwrap())
@@ -1889,11 +1900,13 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("a", DataType::Int64, false),
                 Field::new("b", DataType::Boolean, false),
+                Field::new("c", DataType::Utf8, false),
                 Field::new("v", DataType::Int64, false),
             ])),
             vec![
                 arrays[0].clone(),
                 arrays[1].clone(),
+                arrays[2].clone(),
                 Arc::new(Int64Array::from(vec![10, 20])),
             ],
         )
@@ -1906,8 +1919,9 @@ mod tests {
         let unpacked = packer.unpack(packed).unwrap();
         assert_eq!(unpacked.data.column(0).to_data(), arrays[0].to_data());
         assert_eq!(unpacked.data.column(1).to_data(), arrays[1].to_data());
+        assert_eq!(unpacked.data.column(2).to_data(), arrays[2].to_data());
         assert_eq!(
-            unpacked.data.column(2).to_data(),
+            unpacked.data.column(3).to_data(),
             Int64Array::from(vec![10, 20]).to_data()
         );
         assert_eq!(unpacked.weights, vec![1, 1]);

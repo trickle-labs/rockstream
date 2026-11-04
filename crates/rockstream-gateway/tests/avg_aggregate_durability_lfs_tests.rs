@@ -137,6 +137,28 @@ async fn read_text_pairs(client: &tokio_postgres::Client, relation: &str) -> Vec
     rows
 }
 
+async fn read_text_triples(
+    client: &tokio_postgres::Client,
+    relation: &str,
+) -> Vec<(String, i64, i64)> {
+    let mut rows = client
+        .simple_query(&format!("SELECT * FROM {relation}"))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap().to_string(),
+                row.get(1).unwrap().parse().unwrap(),
+                row.get(2).unwrap().parse().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
+}
+
 #[tokio::test]
 async fn legacy_mixed_group_checkpoint_survives_restart() {
     let dir = TempDir::new().unwrap();
@@ -155,8 +177,18 @@ async fn legacy_mixed_group_checkpoint_survives_restart() {
         .await
         .unwrap();
     client.simple_query("CREATE MATERIALIZED VIEW legacy_mv AS SELECT label, id, SUM(value) FROM legacy_t GROUP BY label, id").await.unwrap();
+    client.simple_query("CREATE MATERIALIZED VIEW legacy_fn AS SELECT upper(label), id, SUM(value) FROM legacy_t GROUP BY upper(label), id").await.unwrap();
     let records = db.scan_prefix(&[0x01, 0x4b, 0x50]).await.unwrap();
-    assert!(!records.is_empty(), "expected persisted group keys");
+    let mut labels = records
+        .iter()
+        .filter_map(|(key, _)| {
+            key.windows(6)
+                .find(|bytes| bytes[..5] == [1, 0, 0, 0, 1] && b"ABab".contains(&bytes[5]))
+                .map(|bytes| bytes[5] as char)
+        })
+        .collect::<Vec<_>>();
+    labels.sort_unstable();
+    assert_eq!(labels, vec!['A', 'B', 'a', 'b']);
     let mut batch = rockstream_storage::WriteBatch::new();
     for (key, value) in records {
         batch.put(&key, &value[..8]);
@@ -170,28 +202,20 @@ async fn legacy_mixed_group_checkpoint_survives_restart() {
         .simple_query("INSERT INTO legacy_t VALUES ('a', 1, 5), ('c', 3, 30)")
         .await
         .unwrap();
-    let rows = client
-        .simple_query("SELECT * FROM legacy_mv")
-        .await
-        .unwrap();
-    let mut actual = rows
-        .into_iter()
-        .filter_map(|message| match message {
-            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
-                row.get(0).unwrap().to_string(),
-                row.get(1).unwrap().parse::<i64>().unwrap(),
-                row.get(2).unwrap().parse::<i64>().unwrap(),
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    actual.sort_unstable();
     assert_eq!(
-        actual,
+        read_text_triples(&client, "legacy_mv").await,
         vec![
             ("a".to_string(), 1, 15),
             ("b".to_string(), 2, 20),
             ("c".to_string(), 3, 30)
+        ]
+    );
+    assert_eq!(
+        read_text_triples(&client, "legacy_fn").await,
+        vec![
+            ("A".to_string(), 1, 15),
+            ("B".to_string(), 2, 20),
+            ("C".to_string(), 3, 30)
         ]
     );
 }
