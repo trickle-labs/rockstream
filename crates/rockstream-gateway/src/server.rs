@@ -4373,6 +4373,7 @@ impl GatewayHandler {
     }
 
     async fn restore_compiled_pipeline_state(&self, shard_db: &rockstream_storage::ShardDb) {
+        let _guard = self.shard_commit_lock.lock().await;
         let compiled = self
             .compiled_views
             .iter()

@@ -45,6 +45,13 @@ release the complete table was `[(1,7),(2,20),(3,5),(4,11),(5,13),(6,17)]`
 and the aggregate was `73`. Both results survived another gateway restart.
 This covers the tested pgoutput path, not every source or failure mode.
 
+A one-shot source view-output failure reported `BLOCKED` with the injected
+storage error and left the frontier at its previous value. Without the recovery
+lock, a local commit completed while the source's pipeline reload was paused.
+The reload now takes the commit lock: the same test observes the local commit
+wait, then verifies the exact table rows and aggregate `96`. The failed source
+does not automatically retry in this fixture; its blocked status is explicit.
+
 DISTINCT checkpoint recovery also resurrected a removed row: after a persisted
 insert and persisted delete, reloading suppressed the next insert of that row.
 The checkpoint now records point deletions and supports in-place restore;

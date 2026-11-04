@@ -602,7 +602,7 @@ async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
         "127.0.0.1:0".parse().unwrap(),
         recovered_catalog,
         Arc::new(NoopViewReader),
-        shard_db,
+        shard_db.clone(),
     );
     let (address, _handle) = server.serve_background().await.unwrap();
     let (client, connection) = tokio_postgres::connect(
@@ -619,6 +619,96 @@ async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
     });
     assert_eq!(read_order_total(&client).await, vec!["73".to_string()]);
     assert_eq!(read_order_rows(&client).await, expected);
+    let frontier_before_failure = shard_db
+        .last_epoch()
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    shard_db.fail_next_view_output_write();
+    shard_db.pause_next_view_output_write(entered.clone(), release.clone());
+    upstream
+        .execute("INSERT INTO orders VALUES (7, 19)", &[])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), entered.notified())
+        .await
+        .expect("source retry test did not reach the injected write");
+    let recovery_entered = Arc::new(tokio::sync::Notify::new());
+    let recovery_release = Arc::new(tokio::sync::Notify::new());
+    shard_db.pause_next_scan_page(recovery_entered.clone(), recovery_release.clone());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(15), recovery_entered.notified())
+        .await
+        .expect("source recovery did not begin");
+    assert_eq!(
+        shard_db
+            .last_epoch()
+            .load(std::sync::atomic::Ordering::SeqCst),
+        frontier_before_failure
+    );
+    let (local, local_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = local_connection.await;
+    });
+    let started = Arc::new(tokio::sync::Notify::new());
+    let task_started = started.clone();
+    let mut local_commit = tokio::spawn(async move {
+        task_started.notify_one();
+        local
+            .execute("INSERT INTO orders VALUES (8, 23)", &[])
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut local_commit)
+            .await
+            .is_err(),
+        "local commit passed a paused source recovery"
+    );
+    recovery_release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(15), local_commit)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let blocked = loop {
+        let status = client
+            .query("SHOW SOURCE STATUS FOR orders", &[])
+            .await
+            .unwrap();
+        let actual = (
+            status[0].get::<_, Option<String>>(3),
+            status[0].get::<_, Option<String>>(9),
+        );
+        if actual.0.as_deref() == Some("BLOCKED") {
+            break actual;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "source did not report the failed write"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(blocked, (Some("BLOCKED".to_string()), Some("[RS-2026] query.query_time_execution_failed: query-time execution failed: source-backed backfill: RS-4001: source I/O error: RS-4001: source I/O error: RS-4010: durable source checkpoint operation failed: unsupported operation: injected view output write failure; next steps: keep the source paused, recover the highest committed checkpoint, then retry. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.".to_string())));
+    assert_eq!(read_order_total(&client).await, vec!["96".to_string()]);
+    assert_eq!(
+        read_order_rows(&client).await,
+        vec![(1, 7), (2, 20), (3, 5), (4, 11), (5, 13), (6, 17), (8, 23)]
+    );
 }
 
 #[tokio::test]

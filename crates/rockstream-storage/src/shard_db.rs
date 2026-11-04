@@ -173,6 +173,8 @@ pub struct ShardDb {
     pause_after_view_write_once: TestPause,
     #[cfg(feature = "test-utils")]
     pause_flush_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_scan_page_once: TestPause,
     fail_flushes: Arc<std::sync::atomic::AtomicBool>,
     fail_scans: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -520,6 +522,8 @@ impl ShardDbBuilder {
             pause_after_view_write_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             pause_flush_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_scan_page_once: Arc::new(std::sync::Mutex::new(None)),
             fail_flushes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_scans: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -1243,6 +1247,15 @@ impl ShardDb {
             None
         };
 
+        #[cfg(feature = "test-utils")]
+        {
+            let pause = self.pause_scan_page_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+
         Ok(ScanPage {
             rows,
             next_token,
@@ -1299,6 +1312,16 @@ impl ShardDb {
         release: Arc<tokio::sync::Notify>,
     ) {
         *self.pause_flush_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Pause the next paged scan for recovery tests.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_scan_page(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_scan_page_once.lock().unwrap() = Some((entered, release));
     }
 
     /// Pause after the next view batch is accepted by storage.
