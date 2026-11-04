@@ -1096,8 +1096,13 @@ fn compile_multi_aggregate_lanes(
 ) -> Result<(Vec<Stage>, SchemaRef), OpError> {
     let _ = in_schema; // already type-checked by the caller
     let n_keys = group_by.len();
-    let packer = (n_keys > 1 || (n_keys == 1 && !expr_is_int64(&group_by[0], in_schema)))
-        .then(|| Arc::new(GroupKeyPacker::new(n_keys)));
+    let packer =
+        (n_keys > 1 || (n_keys == 1 && !expr_is_int64(&group_by[0], in_schema))).then(|| {
+            Arc::new(GroupKeyPacker::new_with_legacy_int64(
+                n_keys,
+                group_by.iter().all(|g| expr_is_int64(g, in_schema)),
+            ))
+        });
     let mut lanes: Vec<StatefulPipeline> = Vec::with_capacity(aggregates.len());
     // Per-lane payload width (columns beyond `k`): 1 for every lane except
     // `AVG`'s, which is 2 — see the `AggregateFunc::Avg` arm below.
@@ -1622,7 +1627,12 @@ pub(crate) fn compile_node(
             } else if has_real_group_by
                 && (n_keys > 1 || !expr_is_int64(&effective_group_by[0], &in_schema))
             {
-                let packer = Arc::new(GroupKeyPacker::new(n_keys));
+                let packer = Arc::new(GroupKeyPacker::new_with_legacy_int64(
+                    n_keys,
+                    effective_group_by
+                        .iter()
+                        .all(|g| expr_is_int64(g, &in_schema)),
+                ));
                 stages.push(Stage::KeyPack(packer.clone(), next_stateful_op_id()));
                 KeyPacking::Composite(packer)
             } else {

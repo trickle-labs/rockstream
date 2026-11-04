@@ -119,6 +119,24 @@ async fn read_triples(client: &tokio_postgres::Client, relation: &str) -> Vec<(i
     rows
 }
 
+async fn read_text_pairs(client: &tokio_postgres::Client, relation: &str) -> Vec<(String, i64)> {
+    let mut rows = client
+        .simple_query(&format!("SELECT * FROM {relation}"))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap().to_string(),
+                row.get(1).unwrap().parse().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
+}
+
 #[tokio::test]
 async fn failed_atomic_commit_restores_window_before_next_commit() {
     let dir = TempDir::new().unwrap();
@@ -360,6 +378,119 @@ async fn failed_atomic_commit_restores_minmax_before_next_commit() {
     let (port, _handle, _db) = start_gateway("minmax-view-failure", store, catalog).await;
     let client = connect_port(port).await;
     assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (2, 30)]);
+}
+
+#[tokio::test]
+async fn failed_commit_does_not_reuse_composite_group_surrogates() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("composite-view-failure", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 1, 1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT a, b, SUM(v) FROM t GROUP BY a, b")
+        .await
+        .unwrap();
+    assert_eq!(read_triples(&client, "mv").await, vec![(1, 1, 10)]);
+    db.fail_next_view_output_write();
+    assert!(client
+        .simple_query("INSERT INTO t VALUES (2, 2, 2, 20)")
+        .await
+        .is_err());
+    client
+        .simple_query("INSERT INTO t VALUES (3, 3, 3, 30)")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_triples(&client, "mv").await,
+        vec![(1, 1, 10), (3, 3, 30)]
+    );
+    client
+        .simple_query("INSERT INTO t VALUES (4, 2, 2, 40)")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_triples(&client, "mv").await,
+        vec![(1, 1, 10), (2, 2, 40), (3, 3, 30)]
+    );
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("composite-view-failure", store, catalog).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("INSERT INTO t VALUES (5, 4, 4, 50)")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_triples(&client, "mv").await,
+        vec![(1, 1, 10), (2, 2, 40), (3, 3, 30), (4, 4, 50)]
+    );
+}
+
+#[tokio::test]
+async fn failed_commit_does_not_reuse_text_group_surrogates() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("text-view-failure", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, k TEXT, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'a', 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT k, SUM(v) FROM t GROUP BY k")
+        .await
+        .unwrap();
+    assert_eq!(read_text_pairs(&client, "mv").await, vec![("a".into(), 10)]);
+    db.fail_next_view_output_write();
+    assert!(client
+        .simple_query("INSERT INTO t VALUES (2, 'b', 20)")
+        .await
+        .is_err());
+    client
+        .simple_query("INSERT INTO t VALUES (3, 'c', 30)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (4, 'b', 40)")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_text_pairs(&client, "mv").await,
+        vec![("a".into(), 10), ("b".into(), 40), ("c".into(), 30)]
+    );
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("text-view-failure", store, catalog).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("INSERT INTO t VALUES (5, 'd', 50)")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_text_pairs(&client, "mv").await,
+        vec![
+            ("a".into(), 10),
+            ("b".into(), 40),
+            ("c".into(), 30),
+            ("d".into(), 50)
+        ]
+    );
 }
 
 #[tokio::test]
