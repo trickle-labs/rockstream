@@ -74,6 +74,14 @@ updates, gateway restart, a concurrent local commit, and the injected source
 write failure. This runs the source and gateway in the test process, not a
 release-process qualification.
 
+The gateway component CI suite exposed stale test expectations: five
+text-key/float-value aggregate cases expected an acknowledged write with an
+empty view, and two catalog fixtures described a constant query as an already
+compiled view. The aggregate cases now check the exact explicit error and empty
+base and view results. The catalog fixtures use a recoverable table-backed view
+while preserving their identifier checks. The complete operator semantics,
+local filesystem catalog, and MinIO catalog suites passed locally.
+
 DISTINCT checkpoint recovery also resurrected a removed row: after a persisted
 insert and persisted delete, reloading suppressed the next insert of that row.
 The checkpoint now records point deletions and supports in-place restore;
