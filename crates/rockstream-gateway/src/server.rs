@@ -2894,6 +2894,31 @@ impl GatewayHandler {
         ordered
     }
 
+    fn compiled_single_source(&self, view_name: &str) -> Result<Option<String>, GatewayError> {
+        let view = self.catalog.get_view(view_name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled view {view_name} is missing from the catalog"),
+            }
+        })?;
+        let sql = inline_view_dependencies(&view.sql, &self.catalog, MAX_VIEW_INLINE_DEPTH);
+        let sources = extract_sql_refs(&sql).into_iter().collect::<HashSet<_>>();
+        if sources
+            .iter()
+            .any(|name| self.catalog.get_table(name).is_none())
+        {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled view {view_name} has an unresolved base source"),
+            });
+        }
+        match sources.len() {
+            0 => Ok(None),
+            1 => Ok(sources.into_iter().next()),
+            _ => Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled single-input view {view_name} has multiple base sources"),
+            }),
+        }
+    }
+
     /// v0.51.4 Slice 0: refresh a compiled view from the commit's own
     /// row-level delta rather than a full-table rescan.
     ///
@@ -2958,11 +2983,9 @@ impl GatewayHandler {
             return Ok(());
         }
 
-        let deps = self.catalog.get_view_deps(view_name);
-        if deps.is_empty() {
+        let Some(source_name) = self.compiled_single_source(view_name)? else {
             return Ok(());
-        }
-        let source_name = deps[0].clone();
+        };
         let source_schema = query_time_relation_schema(&self.catalog, &source_name);
         let input = build_delta_zset_for_table(&source_name, ops, source_schema)?;
         if input.is_empty() {
@@ -3100,11 +3123,9 @@ impl GatewayHandler {
             return Ok(());
         }
 
-        let deps = self.catalog.get_view_deps(view_name);
-        if deps.is_empty() {
+        let Some(source_name) = self.compiled_single_source(view_name)? else {
             return Ok(());
-        }
-        let source_name = deps[0].clone();
+        };
         let input = self
             .full_table_zset(&source_name, shard_db.as_ref())
             .await?;

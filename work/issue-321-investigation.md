@@ -53,6 +53,10 @@ flush, after which complete table and view rows survive a later commit and reope
 
 A join-view write failure is followed by an exact update, reopen, and an update
 to the other join input; all resulting table and view rows match expectations.
+A transitive view initially backfilled no rows because its inlined pipeline was
+fed from the intermediate view name instead of the base relation. Initial
+backfill and local commit refresh now use the inlined base input; exact rows
+are checked across an injected failure, retry, reopen, and later commit.
 
 A local pgwire test confirms its incremental plan includes TopK, then checks
 exact rows after an injected write failure, a valid transaction, reopen, and

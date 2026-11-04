@@ -369,6 +369,69 @@ async fn failed_atomic_commit_restores_join_before_next_commit() {
 }
 
 #[tokio::test]
+async fn committed_rows_reach_transitive_materialized_views() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("transitive-view-commit", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW first AS SELECT id, v FROM t")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW second AS SELECT id, v FROM first WHERE v > 0")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "first").await, vec![(1, 10)]);
+    assert_eq!(read_pairs(&client, "second").await, vec![(1, 10)]);
+    db.fail_next_view_output_write();
+    assert!(client
+        .simple_query("INSERT INTO t VALUES (2, 20)")
+        .await
+        .is_err());
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10)]);
+    assert_eq!(read_pairs(&client, "first").await, vec![(1, 10)]);
+    assert_eq!(read_pairs(&client, "second").await, vec![(1, 10)]);
+    client
+        .simple_query("INSERT INTO t VALUES (2, 20)")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (2, 20)]);
+    assert_eq!(read_pairs(&client, "first").await, vec![(1, 10), (2, 20)]);
+    assert_eq!(read_pairs(&client, "second").await, vec![(1, 10), (2, 20)]);
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("transitive-view-commit", store, catalog).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("INSERT INTO t VALUES (3, 30)")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_pairs(&client, "t").await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+    assert_eq!(
+        read_pairs(&client, "first").await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+    assert_eq!(
+        read_pairs(&client, "second").await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+}
+
+#[tokio::test]
 async fn failed_rollback_cannot_corrupt_a_later_commit() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =
