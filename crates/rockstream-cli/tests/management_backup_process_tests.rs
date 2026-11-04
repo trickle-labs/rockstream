@@ -51,6 +51,7 @@ fn start_embedded(
         "all".to_owned(),
         "--auth".to_owned(),
         "off".to_owned(),
+        "--allow-insecure-internal-dev".to_owned(),
         "--listen".to_owned(),
         listen_addr.to_string(),
     ];

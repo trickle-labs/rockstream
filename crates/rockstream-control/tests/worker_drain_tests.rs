@@ -76,7 +76,11 @@ async fn start_service() -> (
         .with_shard_manager(manager.clone())
         .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
         .with_migration_store(Arc::new(MigrationPersistentStore::new(store)));
-    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let handle = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     (handle, catalog, manager)
 }
 

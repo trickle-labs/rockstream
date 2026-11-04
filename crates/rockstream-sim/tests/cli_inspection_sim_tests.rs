@@ -15,7 +15,9 @@ async fn test_cli_continuous_polling_under_simulated_faults() {
 
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
-    let service = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
+    let service = ControlService::new(catalog.clone())
+        .with_shard_manager(manager.clone())
+        .with_insecure_dev_mode();
 
     let handle = service.start("127.0.0.1:0").await.unwrap();
     let control_url = handle.addr.to_string();

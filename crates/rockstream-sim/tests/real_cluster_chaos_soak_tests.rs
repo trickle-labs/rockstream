@@ -1046,6 +1046,7 @@ async fn run_source_ack_gap_case(
     let control = ControlService::new(catalog.clone())
         .with_shard_manager(manager.clone())
         .with_audit(audit.clone())
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();
@@ -1332,6 +1333,7 @@ async fn sink_transaction_cursor_gap_recovers_exactly_once() {
     let control = ControlService::new(TopologyCatalog::new())
         .with_shard_manager(manager.clone())
         .with_audit(audit.clone())
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();
@@ -1669,6 +1671,7 @@ async fn worker_state_enospc_withholds_source_ack_and_recovers_exactly() {
     let control = ControlService::new(TopologyCatalog::new())
         .with_shard_manager(ShardManager::new())
         .with_audit(audit.clone())
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();
@@ -2102,6 +2105,7 @@ async fn worker_failure_recovery_from_view_and_kafka() {
     let control = ControlService::new(catalog.clone())
         .with_shard_manager(manager.clone())
         .with_audit(audit.clone())
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();
@@ -2326,6 +2330,7 @@ async fn stale_worker_write_and_frontier_report_are_rejected_after_reassignment(
         .with_shard_manager(manager.clone())
         .with_frontier(frontier.clone())
         .with_audit(audit)
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();

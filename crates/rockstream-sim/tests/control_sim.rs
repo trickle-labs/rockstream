@@ -22,7 +22,9 @@ async fn sim_control_plane_leases() {
     // 2. Setup the control service catalog and manager.
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
-    let service = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
+    let service = ControlService::new(catalog.clone())
+        .with_shard_manager(manager.clone())
+        .with_insecure_dev_mode();
 
     let handle = service.start("127.0.0.1:0").await.unwrap();
     let control_url = handle.addr.to_string();

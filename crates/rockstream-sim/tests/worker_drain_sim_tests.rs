@@ -75,6 +75,7 @@ async fn drain_converges_under_buggify_seed() {
         .with_shard_manager(manager.clone())
         .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
         .with_migration_store(Arc::new(MigrationPersistentStore::new(store)))
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();

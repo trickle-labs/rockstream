@@ -708,6 +708,21 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #303's #309 slice binds control-worker registration to the authenticated
+certificate identity. `control_worker_mtls_tests.rs` covers missing, expired,
+and untrusted certificates, identity mismatch, and role-only rejection; the
+role-only case checks that registration leaves the catalog empty and emits the
+exact denial audit event. `identity.rs::tests::node_identity_worker_matching`
+checks worker-ID matching, and
+`cli/src/lib.rs::tests::default_start_requires_internal_mtls_before_storage_creation`
+checks that default startup rejects plaintext before creating storage. The
+control, runtime, and CLI lifecycle fixtures explicitly opt into loopback
+development transport and do not qualify production mTLS. This slice refines
+M4's registration boundary, but its abstract model contains no certificates,
+trust roots, or TLS-handshake state. Gateway authentication, worker-to-worker
+mTLS, management authentication, delegated actor assertions, and release-process
+qualification remain outside this PR and are not qualified by these tests.
+
 Issue #203 replaces the public `aws_kms` provider's ARN/region-derived local
 encryption with signed KMS `Encrypt` and `Decrypt` requests. Both operations
 must send the configured `KeyId`; denied, unavailable, and wrong-key operations
