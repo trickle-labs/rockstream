@@ -128,14 +128,28 @@ async fn acknowledgement_preserves_deletions_after_snapshot() {
     let mut snapshot = rockstream_storage::WriteBatch::new();
     pipeline.append_state(&db, &mut snapshot).await.unwrap();
     pipeline.process(make_batch(&[(1, 10, -1)])).unwrap();
+    assert_eq!(op.state_bytes(), 24);
     db.write_batch(snapshot).await.unwrap();
     pipeline.ack_persisted_state();
+    assert_eq!(op.state_bytes(), 24);
     persist_distinct_state(&db, &op, id).await.unwrap();
+    assert_eq!(op.state_bytes(), 0);
 
     let recovered = load_distinct_state(&db, kv_schema(), id).await.unwrap();
     let output = recovered.process_delta(make_batch(&[(1, 10, 1)])).unwrap();
     assert_eq!(output.weights, vec![1]);
     assert_eq!(collect_positive_kv(&output), BTreeMap::from([((1, 10), 1)]));
+
+    pipeline.process(make_batch(&[(2, 20, 1)])).unwrap();
+    pipeline.restore(&db).await.unwrap();
+    let output = pipeline
+        .process(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
+    assert_eq!(output.weights, vec![1, 1]);
+    assert_eq!(
+        collect_positive_kv(&output),
+        BTreeMap::from([((1, 10), 1), ((2, 20), 1)])
+    );
 }
 
 // ─── Test 1: State persists across close/reopen ────────────────────────────

@@ -124,6 +124,8 @@ pub struct DistinctState {
     deleted: HashMap<Vec<u8>, u64>,
     appended_deletions: HashMap<Vec<u8>, u64>,
     deletion_generation: u64,
+    deleted_bytes: u64,
+    appended_deletion_bytes: u64,
     state_bytes: u64,
 }
 
@@ -134,6 +136,8 @@ impl DistinctState {
             deleted: HashMap::new(),
             appended_deletions: HashMap::new(),
             deletion_generation: 0,
+            deleted_bytes: 0,
+            appended_deletion_bytes: 0,
             state_bytes: 0,
         }
     }
@@ -145,7 +149,7 @@ impl DistinctState {
 
     /// State bytes metric.
     pub fn state_bytes(&self) -> u64 {
-        self.state_bytes
+        self.state_bytes + self.deleted_bytes + self.appended_deletion_bytes
     }
 }
 
@@ -185,8 +189,10 @@ impl DistinctOp {
         for (key, generation) in std::mem::take(&mut state.appended_deletions) {
             if state.deleted.get(&key) == Some(&generation) {
                 state.deleted.remove(&key);
+                state.deleted_bytes -= (key.len() + std::mem::size_of::<u64>()) as u64;
             }
         }
+        state.appended_deletion_bytes = 0;
     }
 
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
@@ -239,7 +245,10 @@ impl Operator for DistinctOp {
                 state.entries.remove(&key);
                 state.deletion_generation = state.deletion_generation.wrapping_add(1);
                 let generation = state.deletion_generation;
-                state.deleted.insert(key, generation);
+                let bytes = (key.len() + std::mem::size_of::<u64>()) as u64;
+                if state.deleted.insert(key, generation).is_none() {
+                    state.deleted_bytes += bytes;
+                }
                 state.state_bytes = state.state_bytes.saturating_sub(entry_bytes);
             }
 
@@ -562,6 +571,7 @@ pub fn append_distinct_state(
         let mut batch = WriteBatch::new();
 
         state.appended_deletions = state.deleted.clone();
+        state.appended_deletion_bytes = state.deleted_bytes;
         for row_bytes in state.deleted.keys() {
             batch.delete(&ShardKeyEncoder::distinct_key(
                 op_id.0,
