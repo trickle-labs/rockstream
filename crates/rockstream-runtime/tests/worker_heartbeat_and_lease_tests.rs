@@ -16,7 +16,9 @@ async fn test_worker_heartbeat_timeout_and_lease_reassignment() {
     // 1. Start Control Service
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
-    let control_service = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
+    let control_service = ControlService::new(catalog.clone())
+        .with_shard_manager(manager.clone())
+        .with_insecure_dev_mode();
     let control_handle = control_service.start("127.0.0.1:0").await.unwrap();
     let control_addr = control_handle.addr.to_string();
 

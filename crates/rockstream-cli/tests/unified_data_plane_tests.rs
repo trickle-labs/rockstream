@@ -25,6 +25,7 @@ fn role_all_creates_exactly_one_shard_directory() {
             "all",
             "--auth",
             "off",
+            "--allow-insecure-internal-dev",
             "--listen",
             &listen_addr.to_string(),
         ])

@@ -378,13 +378,17 @@ mod tc {
     use testcontainers::core::{ContainerPort, Mount, WaitFor};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
+    use tokio_rustls::client::TlsStream;
 
+    use rockstream_test_support::pki::TestPki;
     use rockstream_types::ids::{ShardId, WorkerId};
     use rockstream_types::topology::{
         CapacityHeadroom, ControlMessage, NodeRole, RaftRoleWire, WorkerMessage, WorkerRegistration,
     };
+
+    type WorkerStream = TlsStream<TcpStream>;
 
     pub const IMAGE_NAME: &str = "rockstream-tc-test";
     pub const IMAGE_TAG: &str = "latest";
@@ -413,6 +417,7 @@ mod tc {
     pub struct TcCluster {
         pub nodes: Vec<TcNode>,
         pub network: String,
+        pub pki: TestPki,
         /// Host directory bind-mounted into every node at `/shared` as
         /// `--control-shared-storage=/shared` — the real, shared, durable
         /// control-plane backing store every node in the group reads/writes
@@ -424,6 +429,15 @@ mod tc {
         pub async fn boot(test_id: &str) -> Self {
             let network = format!("rs-net-{test_id}");
             let shared_dir = tempfile::tempdir().unwrap();
+            let pki = TestPki::generate_with_worker_ids([1, 2, 3, 4, 5, 10, 20, 99]);
+            for (source, name) in [
+                (&pki.ca_cert_path, "cluster-ca.pem"),
+                (&pki.control_cert_path, "control.pem"),
+                (&pki.control_key_path, "control-key.pem"),
+            ] {
+                std::fs::copy(source, shared_dir.path().join(name))
+                    .unwrap_or_else(|error| panic!("copy test TLS file {name}: {error}"));
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -450,6 +464,9 @@ mod tc {
                     "--raft-bind=0.0.0.0:7000".to_string(),
                     "--control-bind=0.0.0.0:8000".to_string(),
                     "--control-shared-storage=/shared".to_string(),
+                    "--internal-tls-cert-path=/shared/control.pem".to_string(),
+                    "--internal-tls-key-path=/shared/control-key.pem".to_string(),
+                    "--internal-tls-ca-cert-path=/shared/cluster-ca.pem".to_string(),
                 ];
                 if i == 0 {
                     cmd.push("--raft-bootstrap".to_string());
@@ -481,19 +498,24 @@ mod tc {
             Self {
                 nodes,
                 network,
+                pki,
                 shared_dir,
             }
         }
 
         /// Query one node's cluster-status; `None` if the node is
         /// unreachable (e.g. it was just killed).
-        pub async fn query_status(addr: SocketAddr) -> Option<(Option<u64>, RaftRoleWire, u64)> {
-            let connect =
-                tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(addr))
-                    .await
-                    .ok()?
-                    .ok()?;
-            let mut stream = connect;
+        pub async fn query_status(
+            addr: SocketAddr,
+            pki: &TestPki,
+        ) -> Option<(Option<u64>, RaftRoleWire, u64)> {
+            let mut stream = tokio::time::timeout(
+                Duration::from_millis(800),
+                connect_tls(addr, pki.control_tls_config()),
+            )
+            .await
+            .ok()?
+            .ok()?;
             let line = serde_json::to_string(&WorkerMessage::ClusterStatusQuery).unwrap() + "\n";
             stream.write_all(line.as_bytes()).await.ok()?;
             let mut reader = BufReader::new(&mut stream);
@@ -523,7 +545,7 @@ mod tc {
             loop {
                 let mut statuses = Vec::new();
                 for node in &self.nodes {
-                    statuses.push(Self::query_status(node.control_addr).await);
+                    statuses.push(Self::query_status(node.control_addr, &self.pki).await);
                 }
                 let leaders: Vec<usize> = statuses
                     .iter()
@@ -642,15 +664,77 @@ mod tc {
         }
     }
 
-    pub async fn register_worker(addr: SocketAddr, worker_id: u64) -> TcpStream {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
+    fn tls_connector(
+        tls: rockstream_types::identity::InternalTlsConfig,
+    ) -> tokio_rustls::TlsConnector {
+        use std::io::BufReader;
+
+        use rustls::pki_types::CertificateDer;
+        use rustls::{ClientConfig, RootCertStore};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca_path = tls.ca_cert_path.expect("test PKI has a CA path");
+        let mut ca_reader = BufReader::new(std::fs::File::open(ca_path).unwrap());
+        let mut roots = RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_reader) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+
+        let cert_path = tls.cert_path.expect("worker test certificate path");
+        let mut cert_reader = BufReader::new(std::fs::File::open(cert_path).unwrap());
+        let certificates: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let key_path = tls.key_path.expect("worker test private key path");
+        let mut key_reader = BufReader::new(std::fs::File::open(key_path).unwrap());
+        let key = rustls_pemfile::private_key(&mut key_reader)
+            .unwrap()
+            .expect("worker test private key");
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certificates, key)
+            .unwrap();
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+    }
+
+    async fn connect_tls(
+        addr: SocketAddr,
+        tls: rockstream_types::identity::InternalTlsConfig,
+    ) -> std::io::Result<WorkerStream> {
+        let connector = tls_connector(tls);
+        let server_name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+        connector
+            .connect(server_name, TcpStream::connect(addr).await?)
+            .await
+    }
+
+    pub async fn connect_worker(
+        addr: SocketAddr,
+        worker_id: u64,
+        pki: &TestPki,
+    ) -> std::io::Result<WorkerStream> {
+        connect_tls(addr, pki.worker_tls_config(worker_id)).await
+    }
+
+    pub async fn register_worker(addr: SocketAddr, worker_id: u64, pki: &TestPki) -> WorkerStream {
+        let mut stream = connect_worker(addr, worker_id, pki)
+            .await
+            .expect("TLS worker connection");
         let reg = WorkerRegistration::new(
             WorkerId(worker_id),
             NodeRole::Worker,
             format!("127.0.0.1:{}", 9000 + worker_id),
             CapacityHeadroom::FULL,
         );
-        send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
+        let response = send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
+        assert!(
+            matches!(
+                serde_json::from_str::<ControlMessage>(response.trim()),
+                Ok(ControlMessage::Registered { worker_id: registered })
+                    if registered == WorkerId(worker_id)
+            ),
+            "worker registration was rejected; response: {response:?}"
+        );
         stream
     }
 
@@ -665,7 +749,7 @@ mod tc {
         let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
         let mut addr = cluster.nodes[leader_idx].control_addr;
         for _ in 0..50 {
-            let Ok(mut stream) = TcpStream::connect(addr).await else {
+            let Ok(mut stream) = connect_worker(addr, worker_id, &cluster.pki).await else {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
@@ -714,13 +798,13 @@ mod tc {
         cluster: &TcCluster,
         worker_id: u64,
         shard_id: u64,
-    ) -> (usize, rockstream_types::lease::ShardLease, TcpStream) {
+    ) -> (usize, rockstream_types::lease::ShardLease, WorkerStream) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
             let addr = cluster.nodes[leader_idx].control_addr;
-            let mut worker_stream = register_worker(addr, worker_id).await;
-            let response = send_and_recv(
+            let mut worker_stream = register_worker(addr, worker_id, &cluster.pki).await;
+            let response = send_and_recv_ignoring_topology(
                 &mut worker_stream,
                 &WorkerMessage::RequestShard {
                     worker_id: WorkerId(worker_id),
@@ -735,7 +819,7 @@ mod tc {
             }
             assert!(
                 Instant::now() < deadline,
-                "shard-lease request did not converge"
+                "shard-lease request did not converge; last response: {response:?}"
             );
         }
     }
@@ -745,7 +829,7 @@ mod tc {
     /// node is currently leader), `false` for `NotLeader` or no reply within
     /// the timeout.
     pub async fn report_shard_frontier(
-        mut stream: &mut TcpStream,
+        mut stream: &mut WorkerStream,
         shard_id: u64,
         epoch: u64,
     ) -> bool {
@@ -777,13 +861,51 @@ mod tc {
         }
     }
 
-    async fn send_and_recv(stream: &mut TcpStream, msg: &WorkerMessage) -> String {
+    async fn send_and_recv<S>(stream: &mut S, msg: &WorkerMessage) -> String
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let line = serde_json::to_string(msg).unwrap() + "\n";
         stream.write_all(line.as_bytes()).await.unwrap();
         let mut reader = BufReader::new(&mut *stream);
         let mut resp = String::new();
         reader.read_line(&mut resp).await.unwrap();
         resp
+    }
+
+    async fn send_and_recv_ignoring_topology<S>(stream: &mut S, msg: &WorkerMessage) -> String
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let line = serde_json::to_string(msg).unwrap() + "\n";
+        stream.write_all(line.as_bytes()).await.unwrap();
+        loop {
+            let response = read_message_line(stream).await.unwrap();
+            if matches!(
+                serde_json::from_str::<ControlMessage>(response.trim()),
+                Ok(ControlMessage::TopologyChanged { .. })
+            ) {
+                continue;
+            }
+            return response;
+        }
+    }
+
+    async fn read_message_line<S>(stream: &mut S) -> std::io::Result<String>
+    where
+        S: AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = [0; 1];
+            if stream.read(&mut byte).await? == 0 || byte[0] == b'\n' {
+                break;
+            }
+            bytes.push(byte[0]);
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
 
@@ -915,8 +1037,12 @@ async fn leader_kill_recovers_within_budget_tc() {
     // (c): frontier publication resumes against the new leader, within the
     // pipeline-freshness-recovery budget.
     let (report_leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
-    let mut worker_10_reconnected =
-        tc::register_worker(cluster.nodes[report_leader_idx].control_addr, 10).await;
+    let mut worker_10_reconnected = tc::register_worker(
+        cluster.nodes[report_leader_idx].control_addr,
+        10,
+        &cluster.pki,
+    )
+    .await;
     let freshness_start = Instant::now();
     assert!(
         tc::report_shard_frontier(&mut worker_10_reconnected, 7, 101).await,
@@ -1197,16 +1323,24 @@ mod real_leader_fencing_108 {
 
     use object_store::local::LocalFileSystem;
     use rockstream_storage::ShardDb;
+    use rockstream_test_support::pki::TestPki;
     use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
     use rockstream_types::topology::{ControlMessage, WorkerMessage};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpStream;
 
     /// A real worker authorization round trip against an actual control
     /// process. Never infer an acceptance from a local ShardManager.
-    async fn fence(addr: std::net::SocketAddr, token: LeaseToken) -> bool {
-        let Ok(Ok(mut stream)) =
-            tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await
+    async fn fence(
+        addr: std::net::SocketAddr,
+        worker_id: u64,
+        token: LeaseToken,
+        pki: &TestPki,
+    ) -> bool {
+        let Ok(Ok(mut stream)) = tokio::time::timeout(
+            Duration::from_secs(2),
+            tc::connect_worker(addr, worker_id, pki),
+        )
+        .await
         else {
             return false;
         };
@@ -1242,12 +1376,13 @@ mod real_leader_fencing_108 {
     async fn attempt(
         addr: std::net::SocketAddr,
         token: LeaseToken,
+        pki: &TestPki,
         db: &ShardDb,
         key: &'static [u8],
         value: &'static [u8],
         committed: &mut Vec<(Vec<u8>, Vec<u8>)>,
     ) -> bool {
-        let accepted = fence(addr, token).await;
+        let accepted = fence(addr, 10, token, pki).await;
         if accepted {
             db.put(key, value).await.unwrap();
             db.flush().await.unwrap();
@@ -1281,6 +1416,7 @@ mod real_leader_fencing_108 {
             attempt(
                 old_addr,
                 old_lease.lease_token,
+                &cluster.pki,
                 &db,
                 b"row/01",
                 b"ack-before",
@@ -1331,7 +1467,7 @@ mod real_leader_fencing_108 {
         // Keep original socket alive for isolation: avoid a synthetic worker
         // disconnect that would release the original lease.
         let _old_worker = old_worker;
-        let mut new_worker = tc::register_worker(new_addr, 10).await;
+        let mut new_worker = tc::register_worker(new_addr, 10, &cluster.pki).await;
         let wire = serde_json::to_string(&WorkerMessage::RequestShard {
             worker_id: WorkerId(10),
             shard_id: ShardId(108),
@@ -1359,6 +1495,7 @@ mod real_leader_fencing_108 {
             attempt(
                 new_addr,
                 old_lease.lease_token,
+                &cluster.pki,
                 &db,
                 b"row/stale",
                 b"never-commit",
@@ -1370,6 +1507,7 @@ mod real_leader_fencing_108 {
             attempt(
                 new_addr,
                 new_lease.lease_token,
+                &cluster.pki,
                 &db,
                 b"row/02",
                 b"ack-after",
@@ -1383,6 +1521,7 @@ mod real_leader_fencing_108 {
                 attempt(
                     old_addr,
                     old_lease.lease_token,
+                    &cluster.pki,
                     &db,
                     b"row/isolated",
                     b"never-commit",

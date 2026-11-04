@@ -51,6 +51,7 @@ fn start_embedded(
         "all".to_owned(),
         "--auth".to_owned(),
         "off".to_owned(),
+        "--allow-insecure-internal-dev".to_owned(),
         "--listen".to_owned(),
         listen_addr.to_string(),
     ];
@@ -71,7 +72,7 @@ fn start_embedded(
             .env("RUST_LOG", "off")
             .args(args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("start embedded role-all node"),
     )
@@ -105,23 +106,29 @@ async fn connect_gateway(addr: SocketAddr) -> Client {
     }
 }
 
-async fn wait_for_management(management: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+async fn wait_for_management(management: SocketAddr, node: &mut RunningNode) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_error;
     loop {
-        if let Ok(mut client) =
-            ManagementServiceClient::connect(format!("http://{management}")).await
-        {
-            if client
+        match ManagementServiceClient::connect(format!("http://{management}")).await {
+            Ok(mut client) => match client
                 .get_cluster_status(GetClusterStatusRequest {
                     protocol_version: 1,
                 })
                 .await
-                .is_ok()
             {
-                return;
-            }
+                Ok(_) => return,
+                Err(error) => last_error = error.to_string(),
+            },
+            Err(error) => last_error = error.to_string(),
         }
-        assert!(Instant::now() < deadline, "management server did not start");
+        if let Some(status) = node.0.try_wait().expect("check management process status") {
+            panic!("management process exited with {status}: {last_error}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "management server did not start at {management}: {last_error}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -968,7 +975,7 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     let shared_storage = root.path().join("shared-control");
     let first_management = free_addr();
     let second_management = free_addr();
-    let first_node = start_embedded(
+    let mut first_node = start_embedded(
         binary,
         &root.path().join("control-one"),
         free_addr(),
@@ -976,7 +983,7 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
         Some(&shared_storage),
         Some(1),
     );
-    let second_node = start_embedded(
+    let mut second_node = start_embedded(
         binary,
         &root.path().join("control-two"),
         free_addr(),
@@ -984,8 +991,8 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
         Some(&shared_storage),
         Some(2),
     );
-    wait_for_management(first_management).await;
-    wait_for_management(second_management).await;
+    wait_for_management(first_management, &mut first_node).await;
+    wait_for_management(second_management, &mut second_node).await;
 
     let destination = root.path().join("backup");
     let idempotency_key = "v066-cross-process-idempotency-key";
@@ -1039,8 +1046,8 @@ async fn release_management_backups_allocate_distinct_checkpoints_concurrently()
     let storage = root.path().join("source-storage");
     seed_backup_value(&storage, 0).await;
     let management = free_addr();
-    let node = start_embedded(binary, &storage, free_addr(), Some(management), None, None);
-    wait_for_management(management).await;
+    let mut node = start_embedded(binary, &storage, free_addr(), Some(management), None, None);
+    wait_for_management(management, &mut node).await;
     let first_destination = root.path().join("backup-one");
     let second_destination = root.path().join("backup-two");
     let (first, second) = tokio::join!(
