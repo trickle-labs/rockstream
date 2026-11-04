@@ -106,7 +106,11 @@ async fn connect_gateway(addr: SocketAddr) -> Client {
     }
 }
 
-async fn wait_for_management(management: SocketAddr, node: &mut RunningNode) {
+async fn wait_for_management(
+    management: SocketAddr,
+    node: &mut RunningNode,
+    expected_nodes: usize,
+) {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut last_error;
     loop {
@@ -117,7 +121,16 @@ async fn wait_for_management(management: SocketAddr, node: &mut RunningNode) {
                 })
                 .await
             {
-                Ok(_) => return,
+                Ok(response) => {
+                    let response = response.into_inner();
+                    if response.nodes.len() == expected_nodes {
+                        return;
+                    }
+                    last_error = format!(
+                        "expected {expected_nodes} registered workers, got {}",
+                        response.nodes.len()
+                    );
+                }
                 Err(error) => last_error = error.to_string(),
             },
             Err(error) => last_error = error.to_string(),
@@ -1005,8 +1018,8 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
         Some(&shared_storage),
         Some(2),
     );
-    wait_for_management(first_management, &mut first_node).await;
-    wait_for_management(second_management, &mut second_node).await;
+    wait_for_management(first_management, &mut first_node, 1).await;
+    wait_for_management(second_management, &mut second_node, 1).await;
 
     let destination = root.path().join("backup");
     let idempotency_key = "8588bd32-b83a-4cb1-a4de-13c0c2e2cc19";
@@ -1061,7 +1074,7 @@ async fn release_management_backups_allocate_distinct_checkpoints_concurrently()
     seed_backup_value(&storage, 0).await;
     let management = free_addr();
     let mut node = start_embedded(binary, &storage, free_addr(), Some(management), None, None);
-    wait_for_management(management, &mut node).await;
+    wait_for_management(management, &mut node, 1).await;
     let first_destination = root.path().join("backup-one");
     let second_destination = root.path().join("backup-two");
     let (first, second) = tokio::join!(
