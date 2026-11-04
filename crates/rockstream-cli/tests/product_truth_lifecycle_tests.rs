@@ -204,6 +204,7 @@ fn acceptance_suite_proves_product_truth_lifecycle() {
                 &control_addr,
                 "--management-addr",
                 &management_addr,
+                "--allow-insecure-internal-dev",
                 "--daemon",
             ])
             .spawn()
@@ -285,6 +286,7 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
                 &control_addr,
                 "--management-addr",
                 &management_addr,
+                "--allow-insecure-internal-dev",
                 "--daemon",
             ])
             .stdout(Stdio::null())
@@ -308,6 +310,7 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
                 worker_storage.to_str().unwrap(),
                 "--control",
                 &control_addr,
+                "--allow-insecure-internal-dev",
                 "--worker-id",
                 "77",
                 "--host-id",

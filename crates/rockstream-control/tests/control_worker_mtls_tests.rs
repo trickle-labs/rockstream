@@ -196,3 +196,42 @@ async fn test_control_worker_mtls_identity_mismatch_rejected() {
     worker_handle.abort();
     handle.shutdown();
 }
+
+#[tokio::test]
+async fn test_control_worker_mtls_role_only_certificate_cannot_register() {
+    let pki = TestPki::generate();
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
+
+    let catalog = TopologyCatalog::new();
+    let svc = ControlService::new(catalog.clone())
+        .with_audit(audit.clone())
+        .with_internal_tls(pki.control_tls_config());
+    let handle = svc.start("127.0.0.1:0").await.unwrap();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let (client, worker_handle) = start_worker_client_with_tls(
+        1,
+        &handle.addr.to_string(),
+        storage_dir.path(),
+        pki.role_only_worker_tls_config(),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(client.worker_id(), None);
+    assert_eq!(catalog.len(), 0);
+    let expected_detail = "node identity mismatch: cert=worker:worker, requested_worker_id=worker-1, error_code=RS-2412";
+    let events = audit.read_all().unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event.action == "security.internal_mtls_denied"
+                && event.detail.as_deref() == Some(expected_detail)
+        }),
+        "unexpected audit events: {events:?}"
+    );
+
+    worker_handle.abort();
+    handle.shutdown();
+}

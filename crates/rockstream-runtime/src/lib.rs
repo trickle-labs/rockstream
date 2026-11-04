@@ -79,8 +79,9 @@ mod tests {
     async fn test_worker_registration_and_heartbeats() {
         let catalog = rockstream_control::TopologyCatalog::new();
         let manager = rockstream_control::ShardManager::new();
-        let svc =
-            rockstream_control::ControlService::new(catalog.clone()).with_shard_manager(manager);
+        let svc = rockstream_control::ControlService::new(catalog.clone())
+            .with_shard_manager(manager)
+            .with_insecure_dev_mode();
 
         let handle = svc.start("127.0.0.1:0").await.unwrap();
         let control_url = handle.addr.to_string();
