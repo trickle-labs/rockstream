@@ -109,7 +109,7 @@ async fn explicit_off_auth_mode_overrides_configured_oidc_mode() {
     )
     .await
     .expect("explicit auth mode should control the listener");
-    let connection_handle = tokio::spawn(async move { connection.await });
+    let connection_handle = tokio::spawn(connection);
     let rows = client.query("SELECT 1 AS value", &[]).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i64>(0), 1);

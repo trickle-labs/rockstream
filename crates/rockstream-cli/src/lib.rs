@@ -3019,7 +3019,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_auth_mode_cannot_be_masked_by_off_in_start_options() {
+    fn selected_oidc_mode_requires_complete_config_before_startup_side_effects() {
         let parent = tempfile::tempdir().unwrap();
         let storage = parent.path().join("configured-auth");
         let mut node_config =
@@ -3027,6 +3027,7 @@ mod tests {
         node_config.auth.mode = "oidc".to_string();
         let opts = StartOptions {
             storage: storage.clone(),
+            auth_mode: "oidc".to_string(),
             node_config: Some(node_config),
             ..StartOptions::default()
         };
@@ -3081,6 +3082,7 @@ mod tests {
         node_config.auth.mode.clear();
         let opts = StartOptions {
             storage: storage.clone(),
+            auth_mode: String::new(),
             node_config: Some(node_config),
             ..StartOptions::default()
         };
