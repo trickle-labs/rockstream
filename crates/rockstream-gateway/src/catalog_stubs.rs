@@ -818,7 +818,9 @@ impl CatalogStubs {
                 let Some(canonical) =
                     rockstream_types::secret::canonical_secret_reference(reference)
                 else {
-                    return Err("durable source has an unsupported secret reference".to_string());
+                    return Err(
+                        "[RS-4008] durable source has an unsupported secret reference".to_string(),
+                    );
                 };
                 if *reference != canonical {
                     *reference = canonical;
@@ -1998,7 +2000,7 @@ impl CatalogStubs {
         if let Some(reference) = persisted_entry.secret_name.as_deref() {
             let Some(canonical) = rockstream_types::secret::canonical_secret_reference(reference)
             else {
-                return Err("sink has an unsupported secret reference".to_string());
+                return Err("[RS-4007] sink has an unsupported secret reference".to_string());
             };
             persisted_entry.secret_name = Some(canonical);
         }
@@ -2026,7 +2028,7 @@ impl CatalogStubs {
             )
             .await?;
         if !self.add_sink_inner(persisted_entry, false) {
-            return Err("sink catalog changed during durable insertion".to_string());
+            return Err("[RS-0001] sink catalog changed during durable insertion".to_string());
         }
         self.catalog_revision
             .store(committed_revision, std::sync::atomic::Ordering::SeqCst);
@@ -2164,7 +2166,7 @@ impl CatalogStubs {
         if let Some(reference) = persisted_entry.options.get_mut("secret") {
             let Some(canonical) = rockstream_types::secret::canonical_secret_reference(reference)
             else {
-                return Err("source has an unsupported secret reference".to_string());
+                return Err("[RS-4008] source has an unsupported secret reference".to_string());
             };
             *reference = canonical;
         }
@@ -2187,7 +2189,7 @@ impl CatalogStubs {
             )
             .await?;
         if !self.add_source_inner(persisted_entry, false) {
-            return Err("source catalog changed during durable insertion".to_string());
+            return Err("[RS-0001] source catalog changed during durable insertion".to_string());
         }
         self.catalog_revision
             .store(committed_revision, std::sync::atomic::Ordering::SeqCst);

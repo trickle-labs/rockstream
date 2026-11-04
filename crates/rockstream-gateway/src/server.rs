@@ -2517,7 +2517,7 @@ impl GatewayHandler {
                 Err(error) => return Err(error.to_string()),
             }
         }
-        Err("durable authentication audit retry was exhausted".to_string())
+        Err("[RS-0003] durable authentication audit retry was exhausted".to_string())
     }
 
     async fn record_authentication_or_fail(
@@ -2634,7 +2634,9 @@ impl GatewayHandler {
         });
         let found = matches.next();
         if matches.next().is_some() {
-            return Err("authenticated login is bound to multiple durable principals".to_string());
+            return Err(
+                "[RS-2400] authenticated login is bound to multiple durable principals".to_string(),
+            );
         }
         Ok(found)
     }
@@ -2715,7 +2717,9 @@ impl GatewayHandler {
             .await
             .map_err(|error| error.to_string())?
             .map(|namespace| u128::from(namespace.id.0))
-            .ok_or_else(|| "secret namespace is absent from the durable catalog".to_string())
+            .ok_or_else(|| {
+                "[RS-0003] secret namespace is absent from the durable catalog".to_string()
+            })
     }
 
     async fn authorize_secret_metadata_read_for_connection(
@@ -2829,7 +2833,7 @@ impl GatewayHandler {
         };
         if !rockstream_control::authorization::allows(&consumer, SecurityAction::SecretUse, &scope)
         {
-            return Err("source secret consumer is no longer authorized".to_string());
+            return Err("[RS-2401] source secret consumer is no longer authorized".to_string());
         }
         Ok(secret_name.to_string())
     }
@@ -3012,7 +3016,7 @@ impl GatewayHandler {
                 Err(error) => return Err(error.to_string()),
             }
         }
-        Err("durable security audit retry was exhausted".to_string())
+        Err("[RS-0003] durable security audit retry was exhausted".to_string())
     }
 
     async fn authorize_mutation(
@@ -15610,7 +15614,7 @@ async fn audit_tls_handshake_failure(handler: &GatewayHandler, reason: String) {
         )
         .await
     {
-        tracing::error!(%error, "failed to durably audit gateway TLS authentication rejection");
+        tracing::error!(code = %rockstream_types::error_code::RS_0003, %error, "failed to durably audit gateway TLS authentication rejection");
     }
 }
 

@@ -2779,13 +2779,13 @@ fn append_required_security_audit(
     context: &'static str,
 ) -> bool {
     let Some(audit) = audit else {
-        tracing::error!(context, "required security audit log is unavailable");
+        tracing::error!(code = %rockstream_types::error_code::RS_0003, context, "required security audit log is unavailable");
         return false;
     };
     match audit.append(event) {
         Ok(()) => true,
         Err(error) => {
-            tracing::error!(%error, context, "required security audit append failed");
+            tracing::error!(code = %rockstream_types::error_code::RS_0003, %error, context, "required security audit append failed");
             false
         }
     }

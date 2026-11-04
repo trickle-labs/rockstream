@@ -1132,7 +1132,7 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
                 rows.sort();
                 Ok(rows)
             }
-            Err(error) => Err(format!("{error:?}")),
+            Err(error) => Err(format!("[RS-0001] {error:?}")),
         };
         if observed.as_ref().is_ok_and(|rows| rows == &expected_rows) {
             break;
