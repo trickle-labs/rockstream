@@ -139,7 +139,7 @@ Inspect cluster state, quotas, and worker fleet.
 - `rockstream cluster quotas` — Show total memory budgets, used memory, and parallelism limits.
 - `rockstream cluster workers list` — List all registered workers, addresses, availability zones, and health.
 - `rockstream cluster workers status [<worker_id>]` — Show detailed worker status, capacity headroom, and lifecycle state.
-- `rockstream cluster workers drain <worker_id> [--control <addr>] [--yes]` — Signal a worker to drain shard assignments before shutdown.
+- `rockstream cluster workers drain <worker_id> [--control <addr>] [--idempotency-key <uuid>] [--yes]` — Signal a worker to drain shard assignments before shutdown.
 
 ---
 
@@ -148,7 +148,9 @@ Inspect cluster state, quotas, and worker fleet.
 Inspect shard lease ownership and key ranges, and trigger shard migrations.
 
 - `rockstream shard list` — List all shards, lease tokens, owner workers, and active key ranges.
-- `rockstream shard migrate <shard_id> --to <worker_id> [--yes]` — Migrate a shard lease and state to another worker.
+- `rockstream shard migrate <shard_id> --to <worker_id> [--idempotency-key <uuid>] [--yes]` — Migrate a shard lease and state to another worker.
+
+For management drain, migration, and backup operations, RockStream prints `Idempotency-Key: <key>` to stderr before submitting the request. The key is also the operation ID, so after a lost response, retry with the same `--idempotency-key <key>` or inspect it with `rockstream admin operation show <key>`.
 
 ---
 

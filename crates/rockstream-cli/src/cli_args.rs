@@ -733,6 +733,9 @@ pub enum ShardCommand {
         /// Target worker ID.
         #[arg(long)]
         to: u64,
+        /// Caller-known key for retrying or looking up this operation.
+        #[arg(long)]
+        idempotency_key: Option<String>,
         /// Confirm destructive action without interactive prompt.
         #[arg(long)]
         yes: bool,
@@ -862,6 +865,9 @@ pub enum WorkerCommand {
         /// Control-plane worker-facing TCP address.
         #[arg(long)]
         control: Option<String>,
+        /// Caller-known key for retrying or looking up this operation.
+        #[arg(long)]
+        idempotency_key: Option<String>,
         /// Worker ID to drain.
         worker_id: u64,
         /// Confirm destructive action without interactive prompt.
@@ -880,6 +886,9 @@ pub enum AdminCommand {
         /// Control service URL.
         #[arg(long)]
         control: Option<String>,
+        /// Caller-known key for retrying or looking up this operation.
+        #[arg(long)]
+        idempotency_key: Option<String>,
         /// Automatically confirm execution without interactive prompt.
         #[arg(long, short = 'y')]
         yes: bool,
@@ -895,6 +904,9 @@ pub enum AdminCommand {
         /// Control service URL.
         #[arg(long)]
         control: Option<String>,
+        /// Caller-known key for retrying or looking up this operation.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Inspect or cancel durable management operations.
     Operation {
@@ -945,6 +957,9 @@ pub enum BackupCommand {
     Create {
         /// Destination directory or URI.
         destination: String,
+        /// Caller-known key for retrying or looking up a management operation.
+        #[arg(long, requires = "management")]
+        idempotency_key: Option<String>,
     },
     /// Inspect a backup manifest and point-in-time consistency metadata.
     Inspect {

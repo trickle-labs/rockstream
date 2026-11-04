@@ -1,6 +1,6 @@
 //! Tests verifying the restructured CLI command hierarchy (v0.60 Slice 3).
 
-use clap::Parser;
+use clap::{error::ErrorKind, Parser};
 use rockstream_cli::cli_args::{
     AdminCommand, BackupCommand, Cli, Command, DevCommand, ProjectCommand,
 };
@@ -147,6 +147,48 @@ fn test_admin_commands_hierarchy() {
             }
         } if source == "/tmp/backup" && target == "/tmp/target"
     ));
+}
+
+#[test]
+fn admin_drain_accepts_a_client_known_idempotency_key() {
+    let cli = Cli::try_parse_from([
+        "rockstream",
+        "admin",
+        "drain",
+        "--worker-id",
+        "42",
+        "--idempotency-key",
+        "55e6d4db-7097-4dbf-af3f-6e1f54bb9b17",
+        "--yes",
+    ])
+    .expect("admin drain must accept the reconciliation key");
+    match cli.command {
+        Command::Admin {
+            command: AdminCommand::Drain {
+                idempotency_key, ..
+            },
+        } => assert_eq!(
+            idempotency_key.as_deref(),
+            Some("55e6d4db-7097-4dbf-af3f-6e1f54bb9b17")
+        ),
+        other => panic!("expected AdminCommand::Drain, got {other:?}"),
+    }
+}
+
+#[test]
+fn backup_idempotency_key_requires_management_endpoint() {
+    let error = Cli::try_parse_from([
+        "rockstream",
+        "admin",
+        "backup",
+        "create",
+        "./backup",
+        "--idempotency-key",
+        "client-key",
+    ])
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    assert!(error.to_string().contains("--management"));
 }
 
 #[test]
