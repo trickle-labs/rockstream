@@ -165,9 +165,12 @@ pub struct ShardDb {
     disk_cache_dir: Option<std::path::PathBuf>,
     cleanup_on_drop: bool,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-utils")]
     fail_view_output_once: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "test-utils")]
     pause_view_output_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_after_view_write_once: TestPause,
     #[cfg(feature = "test-utils")]
     pause_flush_once: TestPause,
     fail_flushes: Arc<std::sync::atomic::AtomicBool>,
@@ -509,9 +512,12 @@ impl ShardDbBuilder {
             disk_cache_dir: self.disk_cache_dir,
             cleanup_on_drop: self.cleanup_on_drop,
             fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-utils")]
             fail_view_output_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-utils")]
             pause_view_output_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_after_view_write_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             pause_flush_once: Arc::new(std::sync::Mutex::new(None)),
             fail_flushes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -798,17 +804,20 @@ impl ShardDb {
     /// write batches prevent state resurrection without relying on range deletions.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
         #[cfg(feature = "test-utils")]
-        if batch.ops.iter().any(|op| matches!(op, BatchOp::Put { key, .. } if key.first() == Some(&crate::keys::ShardPrefix::ViewOutput.as_byte()))) {
+        let has_view_output = batch.ops.iter().any(|op| matches!(op, BatchOp::Put { key, .. } if key.first() == Some(&crate::keys::ShardPrefix::ViewOutput.as_byte())));
+        #[cfg(feature = "test-utils")]
+        if has_view_output {
             let pause = self.pause_view_output_once.lock().unwrap().take();
             if let Some((entered, release)) = pause {
                 entered.notify_one();
                 release.notified().await;
             }
         }
-        if batch.ops.iter().any(|op| matches!(op, BatchOp::Put { key, .. } if key.first() == Some(&crate::keys::ShardPrefix::ViewOutput.as_byte())))
-            && self.fail_view_output_once.swap(false, Ordering::SeqCst)
-        {
-            return Err(StorageError::Unsupported("injected view output write failure".to_string()));
+        #[cfg(feature = "test-utils")]
+        if has_view_output && self.fail_view_output_once.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::Unsupported(
+                "injected view output write failure".to_string(),
+            ));
         }
         if self.migration_pending || self.fail_writes.load(Ordering::SeqCst) {
             return Err(if self.migration_pending {
@@ -840,7 +849,16 @@ impl ShardDb {
                 BatchOp::Merge { key, value } => inner.merge(self.physical_key(&key), &value),
             }
         }
-        self.db.write(inner).await?.await_durable().await?;
+        let pending = self.db.write(inner).await?;
+        #[cfg(feature = "test-utils")]
+        if has_view_output {
+            let pause = self.pause_after_view_write_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        pending.await_durable().await?;
         if let Some(epoch) = written_frontier {
             self.allocated_epoch.fetch_max(epoch, Ordering::SeqCst);
             self.last_epoch.fetch_max(epoch, Ordering::SeqCst);
@@ -1244,6 +1262,7 @@ impl ShardDb {
     }
 
     /// Inject one view-output write failure for testing.
+    #[cfg(feature = "test-utils")]
     pub fn fail_next_view_output_write(&self) {
         self.fail_view_output_once.store(true, Ordering::SeqCst);
     }
@@ -1266,6 +1285,16 @@ impl ShardDb {
         release: Arc<tokio::sync::Notify>,
     ) {
         *self.pause_flush_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Pause after the next view batch is accepted by storage.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_after_next_view_write(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_after_view_write_once.lock().unwrap() = Some((entered, release));
     }
 
     /// Inject prefix-scan failures for testing.

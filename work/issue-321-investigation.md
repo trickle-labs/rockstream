@@ -41,10 +41,12 @@ and process restart needs full-path testing, and the source-path locking changes
 need their own tests. The distributed path and shuffle owning-epoch recovery
 are not established by these tests.
 
-A test-only storage pause cancels the local handler before the combined write
-and after it but before flush. The first case restores the old rows; the second
-blocks a concurrent pgwire read until recovery flushes and exposes the complete
-committed rows, which also survive reopen. This directly cancels the handler
+A test-only storage pause cancels the local handler before the combined write,
+after storage accepts it but before the durable-write future completes, and
+after that future but before flush. The first case restores the old rows; the
+latter cases block a concurrent pgwire read until recovery flushes and exposes
+the complete committed rows, which also survive reopen. Recovery refreshes the
+frontier from storage after the ambiguous write. This directly cancels the handler
 future; the pgwire CancelRequest path remains untested.
 A separate injected flush failure rejects reads until a successful recovery
 flush, after which complete table and view rows survive a later commit and reopen.

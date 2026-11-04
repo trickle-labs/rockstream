@@ -510,14 +510,49 @@ async fn cancelled_commit_restores_staged_view_before_next_query() {
         .unwrap();
     assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (2, 30)]);
     assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10), (2, 30)]);
+    let previous_epoch = db.last_epoch().load(std::sync::atomic::Ordering::SeqCst);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    db.pause_after_next_view_write(entered.clone(), release);
+    let second_handler = handler.clone();
+    let commit = tokio::spawn(async move {
+        second_handler
+            .dispatch_async_with_conn(
+                "INSERT INTO t VALUES (3, 40)",
+                Some("cancelled-after-write"),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.last_epoch().load(std::sync::atomic::Ordering::SeqCst),
+        previous_epoch
+    );
+    let observer = connect_port(addr.port()).await;
+    let mut read = tokio::spawn(async move { read_pairs(&observer, "mv").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut read)
+            .await
+            .is_err()
+    );
+    commit.abort();
+    assert!(matches!(commit.await, Err(error) if error.is_cancelled()));
+    assert_eq!(read.await.unwrap(), vec![(1, 10), (2, 30), (3, 40)]);
+    assert!(db.last_epoch().load(std::sync::atomic::Ordering::SeqCst) > previous_epoch);
+    assert_eq!(
+        read_pairs(&client, "t").await,
+        vec![(1, 10), (2, 30), (3, 40)]
+    );
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     db.pause_next_flush(entered.clone(), release);
     let commit = tokio::spawn(async move {
         handler
             .dispatch_async_with_conn(
-                "INSERT INTO t VALUES (3, 40)",
-                Some("cancelled-after-write"),
+                "INSERT INTO t VALUES (4, 50)",
+                Some("cancelled-before-flush"),
             )
             .await
     });
@@ -533,17 +568,16 @@ async fn cancelled_commit_restores_staged_view_before_next_query() {
     );
     commit.abort();
     assert!(matches!(commit.await, Err(error) if error.is_cancelled()));
-    assert_eq!(read.await.unwrap(), vec![(1, 10), (2, 30), (3, 40)]);
     assert_eq!(
-        read_pairs(&client, "t").await,
-        vec![(1, 10), (2, 30), (3, 40)]
+        read.await.unwrap(),
+        vec![(1, 10), (2, 30), (3, 40), (4, 50)]
     );
     handle.abort();
     let (port, _handle, _db) = start_gateway("cancelled-view-commit", store, catalog).await;
     let client = connect_port(port).await;
     assert_eq!(
         read_pairs(&client, "mv").await,
-        vec![(1, 10), (2, 30), (3, 40)]
+        vec![(1, 10), (2, 30), (3, 40), (4, 50)]
     );
 }
 

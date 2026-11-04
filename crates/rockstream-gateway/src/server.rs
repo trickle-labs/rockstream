@@ -3030,6 +3030,8 @@ impl GatewayHandler {
                     })?;
             self.rollback_compiled_views(&views, db).await?;
             db.flush().await?;
+            db.get(&rockstream_storage::ShardKeyEncoder::frontier_key())
+                .await?;
             self.pending_view_recovery.lock().clear();
         }
         Ok(())
