@@ -76,8 +76,9 @@ restores state before the next commit. This is not yet release evidence.
 TopK restoration scans checkpoint pages within the per-partition buffer bound;
 spill-backed operators rebuild into an inactive slot before publishing recovery.
 Filesystem tests cover failed scans and writes, cancellation, repeated recovery,
-large K, another operator sharing storage, and close/reopen. Other source paths,
-the distributed path, and shuffle owning-epoch recovery remain unqualified.
+large K, tied ranks and multiplicity, another operator sharing storage, and
+close/reopen. Other source paths, the distributed path, and shuffle owning-epoch
+recovery remain unqualified.
 The spill-ID index still grows with overflow, processing materializes a spilled
 partition, and abandoned spill namespaces are not yet garbage-collected.
 An over-retracted row becoming positive previously exceeded the 100,000-row

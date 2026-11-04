@@ -312,6 +312,29 @@ async fn spilled_topk_restores_candidates_beyond_buffer_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn spilled_topk_restores_ties_and_multiplicity() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(484);
+    let op = TopKOp::new(schema_kv(), TOPK_BUFFER_LIMIT + 1, 0, vec![]).with_db(db.clone());
+    let input: Vec<_> = (1..=100_002)
+        .map(|key| (5, key, if key == 1 { 2 } else { 1 }))
+        .collect();
+    let mut expected: BTreeMap<_, _> = (2..=100_000).map(|key| ((5, key), 1)).collect();
+    expected.insert((5, 1), 2);
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&input), 1).unwrap()),
+        expected
+    );
+    persist_topk_state(&db, &op, id).await.unwrap();
+    op.restore_in_place(&db, id).await.unwrap();
+    assert_eq!(
+        weighted_rows(&op.process_epoch(make_input(&[(5, 0, 1)]), 2).unwrap()),
+        BTreeMap::from([((5, 0), 1), ((5, 100_000), -1)])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn topk_debt_turning_positive_respects_buffer_limit() {
     let dir = TempDir::new().unwrap();
     let db = open_shard(&dir).await;
