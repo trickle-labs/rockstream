@@ -264,6 +264,15 @@ mod tests {
         ));
         assert!(!allows(
             &policy,
+            SecurityAction::DataWrite,
+            &PolicyScope::Resource {
+                namespace: "sales".to_string(),
+                kind: rockstream_types::authorization::ResourceKind::Table,
+                name: "orders".to_string(),
+            }
+        ));
+        assert!(!allows(
+            &policy,
             SecurityAction::SecretUse,
             &PolicyScope::Secret {
                 namespace: "sales".to_string(),

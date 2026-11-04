@@ -13438,7 +13438,7 @@ impl GatewayHandler {
     /// Detect `COPY <table> FROM STDIN`, register CopyState, return CopyInResponse.
     ///
     /// Returns RS-2500 if the table is not in the catalog (S6).
-    /// Enforces PipelineOwner role (RS-2400/RS-2401) when auth is enabled (S7).
+    /// The legacy ACL is used only for the auth-off, no-durable-store path.
     fn handle_copy_from_stdin(
         &self,
         query: &str,
@@ -13469,7 +13469,7 @@ impl GatewayHandler {
             )))]);
         }
 
-        // S7: Auth enforcement — PipelineOwner role required.
+        // Callers check durable policy before reaching this legacy fallback.
         let principal = if let Some(session) = self.sessions.get(conn_id) {
             session.principal.clone()
         } else {
@@ -13477,7 +13477,10 @@ impl GatewayHandler {
         };
 
         use rockstream_types::acl::Role;
-        if !principal.is_system() {
+        if !principal.is_system()
+            && self.auth_mode == AuthMode::Off
+            && self.catalog.get_durable_store().is_none()
+        {
             let session_namespace = self
                 .sessions
                 .get(conn_id)

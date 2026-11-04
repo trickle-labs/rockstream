@@ -363,6 +363,129 @@ async fn pgwire_mutation_policy_simple_and_extended() {
 }
 
 #[tokio::test]
+async fn scoped_data_write_grant_allows_copy_for_operator_without_legacy_acl() {
+    let catalog = Arc::new(CatalogStubs::new());
+    assert!(catalog.add_table(CatalogTable::new(
+        "copy_target",
+        vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    )));
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "copy-operator-policy-test",
+    ));
+    let administrator = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "Administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: "https://issuer.example".to_string(),
+            subject: "admin".to_string(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    durable
+        .preprovision_first_administrator(administrator, 1)
+        .await
+        .unwrap();
+
+    let operator = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Operator with scoped builder grant".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: "https://issuer.example".to_string(),
+            subject: "operator".to_string(),
+        }],
+        preset_grants: vec![
+            ScopedPresetGrant {
+                preset: PermissionPreset::Operator,
+                scope: PolicyScope::Cluster,
+            },
+            ScopedPresetGrant {
+                preset: PermissionPreset::Builder,
+                scope: PolicyScope::Namespace {
+                    namespace: "public".to_string(),
+                },
+            },
+        ],
+        scoped_grants: vec![],
+    };
+    let policy = serde_json::to_string(&(
+        operator.enabled,
+        &operator.preset_grants,
+        &operator.scoped_grants,
+    ))
+    .unwrap();
+    let grant_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "copy-operator-builder-grant".to_string(),
+        timestamp_ms: current_timestamp_ms(),
+        actor: AuditIdentity::Verified("principal:1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("2".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={policy}")),
+    };
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: operator,
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    catalog.set_durable_store(durable);
+
+    let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader));
+    handler
+        .sessions
+        .entry("operator-copy".to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: "https://issuer.example".to_string(),
+        sub: "operator".to_string(),
+    };
+    let responses = handler
+        .copy_from_stdin_response("COPY copy_target FROM STDIN", "operator-copy")
+        .await
+        .unwrap();
+    let copy = match responses.as_slice() {
+        [pgwire::api::results::Response::CopyIn(copy)] => copy,
+        [pgwire::api::results::Response::Error(error)] => {
+            panic!("scoped data-write grant was denied: {}", error.message)
+        }
+        _ => panic!("scoped data-write grant returned an unexpected response"),
+    };
+    assert_eq!(copy.format, 0);
+    assert_eq!(copy.columns, 1);
+    assert_eq!(copy.column_formats, vec![0]);
+}
+
+#[tokio::test]
 async fn viewer_cannot_bypass_mutation_policy_with_multi_statement_sql() {
     let temp = tempfile::tempdir().unwrap();
     let audit_path = temp.path().join("multi.jsonl");
