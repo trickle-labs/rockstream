@@ -91,16 +91,34 @@ fn test_admin_commands_hierarchy() {
     ));
 
     // admin backup create
-    let cli = Cli::try_parse_from(["rockstream", "admin", "backup", "create", "/tmp/backup"])
-        .expect("failed to parse admin backup create");
-    assert!(matches!(
-        cli.command,
-        Command::Admin {
-            command: AdminCommand::Backup {
-                command: BackupCommand::Create { .. }
-            }
+    let idempotency_key = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000314").unwrap();
+    let cli = Cli::try_parse_from([
+        "rockstream",
+        "admin",
+        "backup",
+        "create",
+        "/tmp/backup",
+        "--management",
+        "http://127.0.0.1:9201",
+        "--idempotency-key",
+        "00000000-0000-4000-8000-000000000314",
+    ])
+    .expect("failed to parse admin backup create");
+    assert!(matches!(cli.command, Command::Admin {
+        command: AdminCommand::Backup {
+            command: BackupCommand::Create { idempotency_key: Some(key), .. }
         }
-    ));
+    } if key == idempotency_key));
+    assert!(Cli::try_parse_from([
+        "rockstream",
+        "admin",
+        "backup",
+        "create",
+        "/tmp/backup",
+        "--idempotency-key",
+        "00000000-0000-4000-8000-000000000314",
+    ])
+    .is_err());
 
     // admin backup inspect
     let cli = Cli::try_parse_from(["rockstream", "admin", "backup", "inspect", "/tmp/backup"])

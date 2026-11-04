@@ -38,6 +38,12 @@ fn selected_auth_mode(cli_mode: Option<AuthMode>, configured_mode: &str) -> Stri
         .unwrap_or_else(|| configured_mode.to_string())
 }
 
+fn management_idempotency_key(idempotency_key: Option<uuid::Uuid>) -> uuid::Uuid {
+    let key = idempotency_key.unwrap_or_else(uuid::Uuid::new_v4);
+    eprintln!("Idempotency-Key: {key}");
+    key
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -77,19 +83,25 @@ fn main() -> ExitCode {
                 worker_id,
                 control: ref ctrl_addr,
                 yes,
+                idempotency_key,
             } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
                 rockstream_cli::prompt_confirmation(
                     &format!("Are you sure you want to drain worker {worker_id}?"),
                     *yes,
                 )?;
-                client.drain_worker(*worker_id)
+                client.drain_worker(*worker_id, management_idempotency_key(*idempotency_key))
             }),
             AdminCommand::Migrate {
                 shard_id,
                 target_worker,
                 control: ref ctrl_addr,
+                idempotency_key,
             } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
-                client.migrate_shard(*shard_id, *target_worker)
+                client.migrate_shard(
+                    *shard_id,
+                    *target_worker,
+                    management_idempotency_key(*idempotency_key),
+                )
             }),
             AdminCommand::Operation { command } => match command {
                 OperationCommand::List => {
@@ -141,16 +153,24 @@ fn main() -> ExitCode {
                 handle_result(res, format)
             }
             AdminCommand::Backup { ref command } => {
-                if let (BackupCommand::Create { destination }, Some(addr)) =
-                    (command, cli.management.as_deref())
+                if let (
+                    BackupCommand::Create {
+                        destination,
+                        idempotency_key,
+                    },
+                    Some(addr),
+                ) = (command, cli.management.as_deref())
                 {
                     return run_management(&cli, Some(addr), format, |client| {
-                        client.create_backup(destination)
+                        client.create_backup(
+                            destination,
+                            management_idempotency_key(*idempotency_key),
+                        )
                     });
                 }
                 let storage = StorageClient::with_identity(identity.clone());
                 let res = match command {
-                    BackupCommand::Create { destination } => {
+                    BackupCommand::Create { destination, .. } => {
                         let storage_path = cli
                             .storage_dir
                             .as_deref()
@@ -538,13 +558,14 @@ fn main() -> ExitCode {
                         control: ctrl_addr,
                         worker_id,
                         yes,
+                        idempotency_key,
                     },
             } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
                 rockstream_cli::prompt_confirmation(
                     &format!("Are you sure you want to drain worker {worker_id}?"),
                     *yes,
                 )?;
-                client.drain_worker(*worker_id)
+                client.drain_worker(*worker_id, management_idempotency_key(*idempotency_key))
             }),
         },
         Command::Shard { ref command } => match command {
@@ -552,17 +573,18 @@ fn main() -> ExitCode {
             ShardCommand::Show { shard_id } => {
                 run_management(&cli, None, format, |client| client.get_shard(*shard_id))
             }
-            ShardCommand::Migrate { shard_id, to, yes } => {
-                run_management(&cli, None, format, |client| {
-                    rockstream_cli::prompt_confirmation(
-                        &format!(
-                            "Are you sure you want to migrate shard {shard_id} to worker {to}?"
-                        ),
-                        *yes,
-                    )?;
-                    client.migrate_shard(*shard_id, *to)
-                })
-            }
+            ShardCommand::Migrate {
+                shard_id,
+                to,
+                yes,
+                idempotency_key,
+            } => run_management(&cli, None, format, |client| {
+                rockstream_cli::prompt_confirmation(
+                    &format!("Are you sure you want to migrate shard {shard_id} to worker {to}?"),
+                    *yes,
+                )?;
+                client.migrate_shard(*shard_id, *to, management_idempotency_key(*idempotency_key))
+            }),
         },
         Command::Checkpoint { command } => {
             let storage = StorageClient::with_identity(identity.clone());
