@@ -342,6 +342,7 @@ fn normalize_operation(mut operation: ManagementOperationInfo) -> ManagementOper
 fn assert_operation_transcript(
     output: &Output,
     expected: &ManagementOperationInfo,
+    announces_idempotency_key: bool,
 ) -> ManagementOperationInfo {
     assert!(
         output.status.success(),
@@ -349,10 +350,15 @@ fn assert_operation_transcript(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stderr, b"");
     let transcript = String::from_utf8(output.stdout.clone()).expect("CLI JSON is UTF-8");
     let operation: ManagementOperationInfo =
         serde_json::from_slice(&output.stdout).expect("management operation JSON");
+    let expected_stderr = if announces_idempotency_key {
+        format!("Idempotency-Key: {}\n", operation.operation_id)
+    } else {
+        String::new()
+    };
+    assert_eq!(output.stderr, expected_stderr.as_bytes());
     assert_eq!(
         transcript,
         format!("{}\n", serde_json::to_string_pretty(&operation).unwrap()),
@@ -480,7 +486,7 @@ async fn wait_for_backup_success(
             }
             other => panic!("unexpected backup operation state {other:?}"),
         };
-        let verified = assert_operation_transcript(&output, &expected);
+        let verified = assert_operation_transcript(&output, &expected, false);
         if verified.state == "succeeded" {
             return verified;
         }
@@ -507,7 +513,7 @@ async fn wait_for_backup_failure(
         let operation: ManagementOperationInfo =
             serde_json::from_slice(&output.stdout).expect("failed backup operation JSON");
         match operation.state.as_str() {
-            "failed" => return assert_operation_transcript(&output, expected),
+            "failed" => return assert_operation_transcript(&output, expected, false),
             "pending" | "running" => {}
             other => panic!("backup ended in unexpected state {other}: {operation:?}"),
         }
@@ -590,7 +596,7 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
 
     let created = run_backup_create(binary, management_addr, &destination);
     let create_response =
-        assert_operation_transcript(&created, &expected_operation("pending", "", ""));
+        assert_operation_transcript(&created, &expected_operation("pending", "", ""), true);
     let operation_id = create_response.operation_id.clone();
     assert!(uuid::Uuid::parse_str(&operation_id).is_ok());
 
@@ -778,7 +784,7 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
     let accepted_failure = submit_backup_request(
         management_addr,
         &invalid_destination,
-        "v066-release-process-backup-failure",
+        "06600000-0000-4000-8000-000000000001",
     )
     .await;
     assert_eq!(
@@ -810,7 +816,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     let root = TempDir::new().expect("create restart fixture");
     let storage = root.path().join("source-storage");
     let destination = root.path().join("backup");
-    let idempotency_key = "v066-backup-restart-idempotency-key";
+    let idempotency_key = "06600000-0000-4000-8000-000000000002";
     let first_listen = free_addr();
     let first_management = free_addr();
     seed_backup_value(&storage, 32 * 1024 * 1024).await;
@@ -940,6 +946,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     let after_restart = assert_operation_transcript(
         &shown,
         &expected_operation("succeeded", "100%", "completed"),
+        false,
     );
     assert_eq!(after_restart, completed);
 
@@ -989,7 +996,7 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     wait_for_management(second_management).await;
 
     let destination = root.path().join("backup");
-    let idempotency_key = "v066-cross-process-idempotency-key";
+    let idempotency_key = "06600000-0000-4000-8000-000000000003";
     let (first, second) = tokio::join!(
         submit_backup_request(first_management, &destination, idempotency_key),
         submit_backup_request(second_management, &destination, idempotency_key),
@@ -1045,8 +1052,16 @@ async fn release_management_backups_allocate_distinct_checkpoints_concurrently()
     let first_destination = root.path().join("backup-one");
     let second_destination = root.path().join("backup-two");
     let (first, second) = tokio::join!(
-        submit_backup_request(management, &first_destination, "concurrent-backup-one"),
-        submit_backup_request(management, &second_destination, "concurrent-backup-two"),
+        submit_backup_request(
+            management,
+            &first_destination,
+            "06600000-0000-4000-8000-000000000004",
+        ),
+        submit_backup_request(
+            management,
+            &second_destination,
+            "06600000-0000-4000-8000-000000000005",
+        ),
     );
     assert_ne!(first.operation_id, second.operation_id);
 

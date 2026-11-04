@@ -6692,20 +6692,30 @@ impl GatewayHandler {
         let q = query.trim();
         let ql = q.to_lowercase();
 
-        if is_removed_connector_ddl(&ql) {
+        let removed_connector_ddl = is_removed_connector_ddl(&ql);
+        if removed_connector_ddl {
             if let Some(id) = conn_id {
-                if let Some(mut session) = self.sessions.get_mut(id) {
-                    if session.is_in_failed_block() {
-                        return Ok(vec![promote_response(failed_transaction_error_response())]);
-                    }
-                    session.fail_transaction();
+                let in_failed_block = self
+                    .sessions
+                    .get(id)
+                    .is_some_and(|session| session.is_in_failed_block());
+                if in_failed_block {
+                    return Ok(vec![promote_response(failed_transaction_error_response())]);
                 }
             }
-            return Ok(vec![connector_removed_error_response()]);
         }
 
         if let Some(response) = self.authorize_mutation(q, conn_id).await? {
             return Ok(response);
+        }
+
+        if removed_connector_ddl {
+            if let Some(id) = conn_id {
+                if let Some(mut session) = self.sessions.get_mut(id) {
+                    session.fail_transaction();
+                }
+            }
+            return Ok(vec![connector_removed_error_response()]);
         }
 
         let namespace = conn_id

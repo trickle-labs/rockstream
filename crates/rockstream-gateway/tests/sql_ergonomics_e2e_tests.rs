@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
+use rockstream_control::{kek::EnvKekProvider, SecretStore};
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
     view_reader::{ViewReadStrategy, ViewReader},
@@ -43,13 +44,18 @@ async fn start_gateway_with_admin(
         "test-password",
     )
     .await;
+    let secret_store = Arc::new(SecretStore::new(
+        None,
+        Arc::new(EnvKekProvider::from_passphrase("sql-ergonomics-test-kek")),
+    ));
     let server = GatewayServer::with_shard_db_and_scram_auth(
         "127.0.0.1:0".parse().unwrap(),
         catalog,
         Arc::new(NoopViewReader),
         shard_db.clone(),
         role_catalog,
-    );
+    )
+    .with_secret_store(secret_store);
     let (addr, handle) = server.serve_background().await.unwrap();
     (addr.port(), handle, shard_db)
 }

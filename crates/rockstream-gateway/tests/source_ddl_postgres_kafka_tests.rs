@@ -8,6 +8,7 @@ use rdkafka::{
     producer::{FutureProducer, FutureRecord},
     ClientConfig,
 };
+use rockstream_control::{kek::EnvKekProvider, SecretStore};
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
     view_reader::{ViewReadStrategy, ViewReader},
@@ -1228,12 +1229,17 @@ async fn test_kafka_source_ddl_dot_notation_aliases() {
         "kafka_secret",
     )
     .await;
+    let secret_store = Arc::new(SecretStore::new(
+        None,
+        Arc::new(EnvKekProvider::from_passphrase("source-ddl-test-kek")),
+    ));
     let server = GatewayServer::with_scram_auth(
         "127.0.0.1:0".parse().unwrap(),
         catalog,
         Arc::new(NoopViewReader),
         role_catalog,
-    );
+    )
+    .with_secret_store(secret_store);
     let (address, _handle) = server.serve_background().await.unwrap();
     let admin = security_policy::connect_test_admin(address.port()).await;
     let client = security_policy::connect_test_builder(address.port()).await;

@@ -202,7 +202,7 @@ async fn denied_matrix(handler: &GatewayHandler, conn_id: &str) -> Vec<(String, 
             _ => panic!("expected denial for {query}"),
         };
         assert_eq!(error.severity, "ERROR");
-        assert_eq!(error.code, "42501");
+        assert_eq!(error.code, "42501", "operation={operation} query={query}");
         let expected_message = format!(
             "[RS-2401] auth.permission_denied: principal 'viewer' lacks required role '{:?}' on {resource}. next_steps: Request an ACL grant for the required role, then retry.",
             spec.minimum_role
@@ -211,6 +211,7 @@ async fn denied_matrix(handler: &GatewayHandler, conn_id: &str) -> Vec<(String, 
             error.message, expected_message,
             "operation={operation} query={query}"
         );
+        assert!(handler.sessions.contains_key(&case_conn_id));
         results.push((
             spec.operation.to_string(),
             spec.audit_action.to_string(),

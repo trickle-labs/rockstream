@@ -857,7 +857,7 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
         protocol_version: 1,
         shard_id: shard_id.clone(),
         target_node_id: target_node_id.to_string(),
-        idempotency_key: "v066-release-process-migration-cancel".to_owned(),
+        idempotency_key: "06600000-0000-4000-8000-000000000006".to_owned(),
     };
     let cancel_accepted = management
         .migrate_shard(cancel_request)
@@ -1033,7 +1033,7 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
         protocol_version: 1,
         shard_id: shard_id.clone(),
         target_node_id: target_node_id.to_string(),
-        idempotency_key: "v066-release-process-migration".to_owned(),
+        idempotency_key: "06600000-0000-4000-8000-000000000007".to_owned(),
     };
     unsafe {
         assert_eq!(
@@ -1219,9 +1219,12 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
         .output()
         .expect("drain worker through release CLI");
     assert!(drain_accepted_output.status.success());
-    assert_eq!(drain_accepted_output.stderr, b"");
     let drain_accepted: ManagementOperationInfo =
         serde_json::from_slice(&drain_accepted_output.stdout).expect("drain operation JSON");
+    assert_eq!(
+        drain_accepted_output.stderr,
+        format!("Idempotency-Key: {}\n", drain_accepted.operation_id).as_bytes()
+    );
     assert_eq!(
         drain_accepted_output.stdout,
         format!(
