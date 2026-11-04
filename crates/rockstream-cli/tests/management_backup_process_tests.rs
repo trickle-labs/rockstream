@@ -108,7 +108,7 @@ async fn connect_gateway(addr: SocketAddr) -> Client {
 
 async fn wait_for_management(management: SocketAddr, node: &mut RunningNode) {
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut last_error = String::from("management connection was not attempted");
+    let mut last_error;
     loop {
         match ManagementServiceClient::connect(format!("http://{management}")).await {
             Ok(mut client) => match client
