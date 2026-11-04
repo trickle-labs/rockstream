@@ -138,6 +138,65 @@ async fn read_text_pairs(client: &tokio_postgres::Client, relation: &str) -> Vec
 }
 
 #[tokio::test]
+async fn legacy_mixed_group_checkpoint_survives_restart() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("legacy-group-keys", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE legacy_t (label TEXT, id BIGINT, value BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO legacy_t VALUES ('a', 1, 10), ('b', 2, 20)")
+        .await
+        .unwrap();
+    client.simple_query("CREATE MATERIALIZED VIEW legacy_mv AS SELECT label, id, SUM(value) FROM legacy_t GROUP BY label, id").await.unwrap();
+    let records = db.scan_prefix(&[0x01, 0x4b, 0x50]).await.unwrap();
+    assert!(!records.is_empty(), "expected persisted group keys");
+    let mut batch = rockstream_storage::WriteBatch::new();
+    for (key, value) in records {
+        batch.put(&key, &value[..8]);
+    }
+    db.write_batch(batch).await.unwrap();
+    db.flush().await.unwrap();
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("legacy-group-keys", store, catalog).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("INSERT INTO legacy_t VALUES ('a', 1, 5), ('c', 3, 30)")
+        .await
+        .unwrap();
+    let rows = client
+        .simple_query("SELECT * FROM legacy_mv")
+        .await
+        .unwrap();
+    let mut actual = rows
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap().to_string(),
+                row.get(1).unwrap().parse::<i64>().unwrap(),
+                row.get(2).unwrap().parse::<i64>().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    assert_eq!(
+        actual,
+        vec![
+            ("a".to_string(), 1, 15),
+            ("b".to_string(), 2, 20),
+            ("c".to_string(), 3, 30)
+        ]
+    );
+}
+
+#[tokio::test]
 async fn copy_from_stdin_updates_compiled_views() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =

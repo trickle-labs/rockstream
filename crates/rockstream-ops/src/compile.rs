@@ -315,6 +315,14 @@ fn expr_is_int64(expr: &Expr, schema: &Schema) -> bool {
     static_expr_type(expr, schema) == Some(DataType::Int64)
 }
 
+fn legacy_group_key_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
+    // Legacy records have no type tag; inferred expression types are not definitive.
+    match expr {
+        Expr::Column(index) => schema.fields().get(*index).map(|f| f.data_type().clone()),
+        _ => None,
+    }
+}
+
 #[allow(dead_code)]
 fn expr_is_utf8(expr: &Expr, schema: &Schema) -> bool {
     static_expr_type(expr, schema) == Some(DataType::Utf8)
@@ -1098,9 +1106,11 @@ fn compile_multi_aggregate_lanes(
     let n_keys = group_by.len();
     let packer =
         (n_keys > 1 || (n_keys == 1 && !expr_is_int64(&group_by[0], in_schema))).then(|| {
-            Arc::new(GroupKeyPacker::new_with_legacy_int64(
-                n_keys,
-                group_by.iter().all(|g| expr_is_int64(g, in_schema)),
+            Arc::new(GroupKeyPacker::new_with_key_types(
+                group_by
+                    .iter()
+                    .map(|g| legacy_group_key_type(g, in_schema))
+                    .collect(),
             ))
         });
     let mut lanes: Vec<StatefulPipeline> = Vec::with_capacity(aggregates.len());
@@ -1627,11 +1637,11 @@ pub(crate) fn compile_node(
             } else if has_real_group_by
                 && (n_keys > 1 || !expr_is_int64(&effective_group_by[0], &in_schema))
             {
-                let packer = Arc::new(GroupKeyPacker::new_with_legacy_int64(
-                    n_keys,
+                let packer = Arc::new(GroupKeyPacker::new_with_key_types(
                     effective_group_by
                         .iter()
-                        .all(|g| expr_is_int64(g, &in_schema)),
+                        .map(|g| legacy_group_key_type(g, &in_schema))
+                        .collect(),
                 ));
                 stages.push(Stage::KeyPack(packer.clone(), next_stateful_op_id()));
                 KeyPacking::Composite(packer)

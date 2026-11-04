@@ -25,6 +25,12 @@ wire test checks exact rows after COPY, an injected view-output failure, a later
 insert, and reopening. COPY can still flush multiple batches; this test does not
 claim whole-COPY atomicity across those batches.
 
+Older composite-key checkpoints contain only encoded key bytes and surrogate
+IDs. Recovery now decodes those bytes using known compiled key types; tests
+cover mixed text and numeric keys across a real gateway restart and exercise
+all supported scalar encodings. Unknown or unsupported types and malformed
+records remain explicit recovery errors rather than guessed values.
+
 DISTINCT checkpoint recovery also resurrected a removed row: after a persisted
 insert and persisted delete, reloading suppressed the next insert of that row.
 The checkpoint now records point deletions and supports in-place restore;

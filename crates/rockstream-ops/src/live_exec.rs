@@ -447,7 +447,7 @@ impl Stage {
 /// hash — no collision risk regardless of the key columns' value domain).
 pub struct GroupKeyPacker {
     n_key_cols: usize,
-    legacy_int64: bool,
+    key_types: Vec<Option<DataType>>,
     forward: Mutex<HashMap<Vec<u8>, i64>>,
     reverse: Mutex<HashMap<i64, Vec<i64>>>,
     reverse_slices: Mutex<HashMap<i64, Vec<ArrayRef>>>,
@@ -458,13 +458,13 @@ pub struct GroupKeyPacker {
 
 impl GroupKeyPacker {
     pub fn new(n_key_cols: usize) -> Self {
-        Self::new_with_legacy_int64(n_key_cols, true)
+        Self::new_with_key_types(vec![Some(DataType::Int64); n_key_cols])
     }
 
-    pub(crate) fn new_with_legacy_int64(n_key_cols: usize, legacy_int64: bool) -> Self {
+    pub(crate) fn new_with_key_types(key_types: Vec<Option<DataType>>) -> Self {
         GroupKeyPacker {
-            n_key_cols,
-            legacy_int64,
+            n_key_cols: key_types.len(),
+            key_types,
             forward: Mutex::new(HashMap::new()),
             reverse: Mutex::new(HashMap::new()),
             reverse_slices: Mutex::new(HashMap::new()),
@@ -643,12 +643,10 @@ impl GroupKeyPacker {
                     .get(&encoded_key)
                     .and_then(|id| old_slices.get(id))
                     .cloned();
-                if cached.is_none() && !self.legacy_int64 {
-                    return Err(OpError::storage_error(
-                        "cannot restore untyped non-Int64 group key checkpoint",
-                    ));
-                }
-                cached
+                Some(match cached {
+                    Some(slices) => slices,
+                    None => self.decode_legacy_key(&encoded_key)?,
+                })
             };
             if let Some(ref slices) = slices {
                 reverse_slices.insert(surrogate, slices.clone());
@@ -687,6 +685,101 @@ impl GroupKeyPacker {
         self.dirty.lock().unwrap().clear();
         *self.appended.lock().unwrap() = 0;
         Ok(())
+    }
+
+    fn decode_legacy_key(&self, mut key: &[u8]) -> Result<Vec<ArrayRef>, OpError> {
+        use arrow::array::*;
+        use arrow::datatypes::TimeUnit;
+
+        fn take<const N: usize>(key: &mut &[u8]) -> Result<[u8; N], OpError> {
+            if key.len() < N {
+                return Err(OpError::storage_error("truncated group key checkpoint"));
+            }
+            let (head, tail) = key.split_at(N);
+            *key = tail;
+            Ok(head.try_into().unwrap())
+        }
+        macro_rules! number {
+            ($primitive:ty, $array:ty) => {
+                Arc::new(<$array>::from(vec![<$primitive>::from_be_bytes(take(
+                    &mut key,
+                )?)])) as ArrayRef
+            };
+        }
+        let mut arrays = Vec::with_capacity(self.key_types.len());
+        for data_type in &self.key_types {
+            let data_type = data_type
+                .as_ref()
+                .ok_or_else(|| OpError::storage_error("unknown legacy group key type"))?;
+            let valid = take::<1>(&mut key)?[0];
+            if valid == 0 {
+                arrays.push(new_null_array(data_type, 1));
+                continue;
+            }
+            if valid != 1 {
+                return Err(OpError::storage_error("invalid group key validity"));
+            }
+            let array: ArrayRef = match data_type {
+                DataType::Int64 => number!(i64, Int64Array),
+                DataType::Int32 => number!(i32, Int32Array),
+                DataType::Int16 => number!(i16, Int16Array),
+                DataType::Int8 => number!(i8, Int8Array),
+                DataType::UInt64 => number!(u64, UInt64Array),
+                DataType::UInt32 => number!(u32, UInt32Array),
+                DataType::UInt16 => number!(u16, UInt16Array),
+                DataType::UInt8 => number!(u8, UInt8Array),
+                DataType::Float64 => Arc::new(Float64Array::from(vec![f64::from_bits(
+                    u64::from_be_bytes(take(&mut key)?),
+                )])),
+                DataType::Float32 => Arc::new(Float32Array::from(vec![f32::from_bits(
+                    u32::from_be_bytes(take(&mut key)?),
+                )])),
+                DataType::Date32 => number!(i32, Date32Array),
+                DataType::Boolean => match take::<1>(&mut key)?[0] {
+                    0 => Arc::new(BooleanArray::from(vec![false])),
+                    1 => Arc::new(BooleanArray::from(vec![true])),
+                    _ => return Err(OpError::storage_error("invalid group key boolean")),
+                },
+                DataType::Utf8 => {
+                    let len = u32::from_be_bytes(take(&mut key)?) as usize;
+                    if key.len() < len {
+                        return Err(OpError::storage_error("truncated group key string"));
+                    }
+                    let (bytes, rest) = key.split_at(len);
+                    key = rest;
+                    let value = std::str::from_utf8(bytes)
+                        .map_err(|_| OpError::storage_error("invalid group key string"))?;
+                    Arc::new(StringArray::from(vec![value]))
+                }
+                DataType::Decimal128(precision, scale) => Arc::new(
+                    Decimal128Array::from(vec![i128::from_be_bytes(take(&mut key)?)])
+                        .with_precision_and_scale(*precision, *scale)
+                        .map_err(OpError::arrow)?,
+                ),
+                DataType::Timestamp(TimeUnit::Second, tz) => Arc::new(
+                    TimestampSecondArray::from(vec![i64::from_be_bytes(take(&mut key)?)])
+                        .with_timezone_opt(tz.clone()),
+                ),
+                DataType::Timestamp(TimeUnit::Millisecond, tz) => Arc::new(
+                    TimestampMillisecondArray::from(vec![i64::from_be_bytes(take(&mut key)?)])
+                        .with_timezone_opt(tz.clone()),
+                ),
+                DataType::Timestamp(TimeUnit::Microsecond, tz) => Arc::new(
+                    TimestampMicrosecondArray::from(vec![i64::from_be_bytes(take(&mut key)?)])
+                        .with_timezone_opt(tz.clone()),
+                ),
+                DataType::Timestamp(TimeUnit::Nanosecond, tz) => Arc::new(
+                    TimestampNanosecondArray::from(vec![i64::from_be_bytes(take(&mut key)?)])
+                        .with_timezone_opt(tz.clone()),
+                ),
+                _ => return Err(OpError::storage_error("unsupported legacy group key type")),
+            };
+            arrays.push(array);
+        }
+        if !key.is_empty() {
+            return Err(OpError::storage_error("trailing group key bytes"));
+        }
+        Ok(arrays)
     }
 
     #[allow(dead_code)]
@@ -2001,6 +2094,92 @@ mod tests {
             assert_eq!(actual[0].to_data(), keys[0].slice(row, 1).to_data());
             assert_eq!(actual[1].to_data(), keys[1].slice(row, 1).to_data());
         }
+    }
+
+    #[tokio::test]
+    async fn group_key_packer_restores_legacy_composite_keys() {
+        let (_dir, db) = make_db().await;
+        let op_id = OperatorId(46);
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(arrow::array::Int32Array::from(vec![Some(-3), None])),
+            Arc::new(arrow::array::Float64Array::from(vec![1.5, -2.25])),
+            Arc::new(arrow::array::StringArray::from(vec!["alpha", "β"])),
+        ];
+        let mut batch = WriteBatch::new();
+        for row in 0..2 {
+            let mut key = GROUP_KEY_PACKER_PREFIX.to_vec();
+            key.extend_from_slice(&op_id.0.to_be_bytes());
+            for array in &arrays {
+                GroupKeyPacker::encode_array_row_key(array.as_ref(), row, &mut key);
+            }
+            batch.put(&key, &(row as i64).to_be_bytes());
+        }
+        db.write_batch(batch).await.unwrap();
+        let restored = GroupKeyPacker::new_with_key_types(vec![
+            Some(DataType::Int32),
+            Some(DataType::Float64),
+            Some(DataType::Utf8),
+        ]);
+        restored.restore_in_place(&db, op_id).await.unwrap();
+        for row in 0..2 {
+            let actual = restored.reverse_slices_lookup(row as i64).unwrap();
+            for (column, expected) in arrays.iter().enumerate() {
+                assert_eq!(actual[column].to_data(), expected.slice(row, 1).to_data());
+            }
+        }
+        assert_eq!(*restored.next_id.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn legacy_group_key_decoder_round_trips_supported_types() {
+        use arrow::array::*;
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![-1])),
+            Arc::new(Int16Array::from(vec![-23])),
+            Arc::new(Int32Array::from(vec![-456])),
+            Arc::new(Int64Array::from(vec![-789])),
+            Arc::new(UInt8Array::from(vec![1])),
+            Arc::new(UInt16Array::from(vec![23])),
+            Arc::new(UInt32Array::from(vec![456])),
+            Arc::new(UInt64Array::from(vec![789])),
+            Arc::new(Float32Array::from(vec![1.25])),
+            Arc::new(Float64Array::from(vec![-2.5])),
+            Arc::new(Date32Array::from(vec![123])),
+            Arc::new(BooleanArray::from(vec![true])),
+            Arc::new(StringArray::from(vec!["βeta"])),
+            Arc::new(
+                Decimal128Array::from(vec![-12345])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(TimestampSecondArray::from(vec![1]).with_timezone("UTC")),
+            Arc::new(TimestampMillisecondArray::from(vec![2])),
+            Arc::new(TimestampMicrosecondArray::from(vec![3])),
+            Arc::new(TimestampNanosecondArray::from(vec![4])),
+        ];
+        let packer = GroupKeyPacker::new_with_key_types(
+            arrays.iter().map(|a| Some(a.data_type().clone())).collect(),
+        );
+        let mut encoded = Vec::new();
+        for array in &arrays {
+            GroupKeyPacker::encode_array_row_key(array.as_ref(), 0, &mut encoded);
+        }
+        let decoded = packer.decode_legacy_key(&encoded).unwrap();
+        assert_eq!(
+            decoded.iter().map(|a| a.to_data()).collect::<Vec<_>>(),
+            arrays.iter().map(|a| a.to_data()).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            packer.decode_legacy_key(&encoded[..encoded.len() - 1]),
+            Err(OpError::Storage { source: rockstream_storage::StorageError::KeyEncoding(message), .. })
+                if message == "truncated group key checkpoint"
+        ));
+        encoded.push(0);
+        assert!(matches!(
+            packer.decode_legacy_key(&encoded),
+            Err(OpError::Storage { source: rockstream_storage::StorageError::KeyEncoding(message), .. })
+                if message == "trailing group key bytes"
+        ));
     }
 
     #[tokio::test]
