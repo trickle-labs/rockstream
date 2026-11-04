@@ -38,6 +38,11 @@ retain the complete input frontier in a versioned record; malformed records
 fail restoration without replacing live state. The remaining operator families
 still need examination before using restoration as a general rollback mechanism.
 
+Hopping-window recovery re-emitted already committed rows on the next update
+because its output cache was not restored. Recovery now reconstructs that
+cache and restores the input frontier; exact deltas are checked after both
+in-place restore and reload.
+
 The direct gRPC closed-inlet observation received exactly one ACK with fields
 `(exchange_id, src_shard, target_shard, epoch, seq, credit_grant) =
 (100, 0, 1, 1, 1, 2)` and then end-of-stream. Healthy direct delivery and the

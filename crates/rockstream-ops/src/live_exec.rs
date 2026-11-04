@@ -388,18 +388,14 @@ impl Stage {
     /// `GatewayHandler::recover_compiled_views` after a process restart —
     /// see `AggregateOp::restore_in_place` for why an in-place load is
     /// needed instead of just calling the existing `load_from_storage`
-    /// constructors). Covers exactly the operator families the v0.51.4
-    /// Durability Slices require (Aggregate, TumbleWindow, SessionWindow;
-    /// Join is restored separately by `JoinPipeline::restore`, keyed off
-    /// `JoinKind`, not `Stage`). `HopWindow`/`Window`/`TopK`/
-    /// `MultiAggregate` are out of this restore path's scope for now (not
-    /// named by the Durability Slices plan) and remain a no-op here, same
-    /// as the composite-key packers below.
+    /// constructors). Join is restored separately by `JoinPipeline::restore`.
+    /// Window and TopK restoration remain no-ops.
     async fn restore(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
             Stage::Aggregate(op) => op.restore_in_place(db).await,
             Stage::Distinct(op, id) => op.restore_in_place(db, *id).await,
             Stage::TumbleWindow(op, id) => op.restore_in_place(db, *id).await,
+            Stage::HopWindow(op, id) => op.restore_in_place(db, *id).await,
             Stage::SessionWindow(op, id) => op.restore_in_place(db, *id).await,
             // Same pairing note as `Stage::persist`'s `KeyPack` arm — the
             // `KeyUnpack` stage shares the same `Arc<GroupKeyPacker>`, so

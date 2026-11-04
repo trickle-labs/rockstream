@@ -723,6 +723,59 @@ impl HopWindowOp {
         self.state.lock().unwrap().state_bytes()
     }
 
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        let prefix = ShardKeyEncoder::tumble_window_op_prefix(op_id.0);
+        let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+        let watermark = db
+            .get(&ShardKeyEncoder::watermark_key(op_id.0))
+            .await
+            .map_err(OpError::storage)?;
+        let mut state = HopWindowState::new();
+        state.input_frontier = load_input_frontier(db, op_id).await?;
+        for (key, value) in entries {
+            if let Some((row, weight)) = decode_window_value(&value, self.n_input_cols) {
+                if key.len() < prefix.len() + 8 {
+                    continue;
+                }
+                let window =
+                    i64::from_be_bytes(key[prefix.len()..prefix.len() + 8].try_into().unwrap());
+                state
+                    .windows
+                    .entry(window)
+                    .or_default()
+                    .insert(key[prefix.len() + 8..].to_vec(), (row, weight));
+            }
+        }
+        if let Some(bytes) = watermark {
+            if bytes.len() >= 8 {
+                state.watermark = WatermarkState {
+                    watermark_ms: i64::from_be_bytes(bytes[..8].try_into().unwrap()),
+                };
+            }
+        }
+        let watermark = state
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(state.watermark.watermark_ms);
+        for (&window, rows) in &state.windows {
+            state.prev_output.insert(
+                window,
+                rows.iter()
+                    .filter(|(_, (_, weight))| *weight > 0)
+                    .map(|(key, (values, _))| (key.clone(), values.clone()))
+                    .collect(),
+            );
+            if watermark > window + self.window_size_ms {
+                state.finalized.insert(window);
+            }
+        }
+        let total = state.total_rows();
+        *self.state.lock().unwrap() = state;
+        self.fill_level.store(total, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn process_epoch(&self, delta: ArrowZSet, _epoch: u64) -> Result<ArrowZSet, OpError> {
         if delta.is_empty() && delta.frontier.is_none() {
             return Ok(ArrowZSet::empty(self.schema.clone()));
@@ -1518,6 +1571,7 @@ pub fn append_hop_window_state(
         }
         let wm_key = ShardKeyEncoder::watermark_key(oid);
         batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
+        append_input_frontier(&mut batch, op_id, &state.input_frontier)?;
         batch
     };
 
@@ -1552,40 +1606,7 @@ pub async fn load_hop_window_state(
         slide_ms,
         late_data_policy,
     );
-    let n_input_cols = op.n_input_cols;
-    let oid = op_id.0;
-    let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
-    let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
-    let prefix_len = prefix.len();
-    let wm_key = ShardKeyEncoder::watermark_key(oid);
-    let wm_bytes = db.get(&wm_key).await.ok().flatten();
-
-    let mut st = op.state.lock().unwrap();
-    for (key, value) in entries {
-        if let Some((row_vals, weight)) = decode_window_value(&value, n_input_cols) {
-            if key.len() < prefix_len + 8 {
-                continue;
-            }
-            let window_id =
-                i64::from_be_bytes(key[prefix_len..prefix_len + 8].try_into().unwrap_or([0; 8]));
-            let group_key = key[prefix_len + 8..].to_vec();
-            st.windows
-                .entry(window_id)
-                .or_default()
-                .insert(group_key, (row_vals, weight));
-        }
-    }
-
-    if let Some(bytes) = wm_bytes {
-        if bytes.len() >= 8 {
-            let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
-            st.watermark = WatermarkState { watermark_ms: wm };
-        }
-    }
-
-    let total = st.total_rows();
-    drop(st);
-    op.fill_level.store(total, Ordering::Relaxed);
+    op.restore_in_place(db, op_id).await?;
     Ok(op)
 }
 

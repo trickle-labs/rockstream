@@ -618,6 +618,53 @@ async fn hop_window_state_persists_across_restart() {
 }
 
 #[tokio::test]
+async fn hop_recovery_emits_only_new_rows() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(487);
+    let op = HopWindowOp::new(input_schema(), 0, 1000, 500, LateDataPolicy::Drop);
+    let frontier = rockstream_types::frontier::FreshnessToken::new(
+        std::collections::BTreeMap::from([(
+            rockstream_types::ids::SourceId(7),
+            rockstream_types::frontier::SourceProgress::new(12, Some(0)),
+        )]),
+        42,
+    );
+    op.push_input_frontier(frontier.clone()).unwrap();
+    op.process_epoch(make_input(&[(100, 10, 1)]), 1).unwrap();
+    persist_hop_window_state(&db, &op, id).await.unwrap();
+    op.process_epoch(make_input(&[(200, 20, 1)]), 2).unwrap();
+    op.push_input_frontier(rockstream_types::frontier::FreshnessToken::new(
+        Default::default(),
+        99,
+    ))
+    .unwrap();
+    op.restore_in_place(&db, id).await.unwrap();
+    assert_eq!(op.input_frontier(), Some(frontier.clone()));
+    let output = op.process_epoch(make_input(&[(200, 20, 1)]), 3).unwrap();
+    let mut rows = std::collections::HashMap::new();
+    accumulate(&mut rows, &output);
+    assert_eq!(
+        rows,
+        std::collections::HashMap::from([((-500, 200, 20), 1), ((0, 200, 20), 1)])
+    );
+    let recovered =
+        load_hop_window_state(&db, input_schema(), 0, 1000, 500, LateDataPolicy::Drop, id)
+            .await
+            .unwrap();
+    assert_eq!(recovered.input_frontier(), Some(frontier));
+    let output = recovered
+        .process_epoch(make_input(&[(200, 20, 1)]), 2)
+        .unwrap();
+    let mut rows = std::collections::HashMap::new();
+    accumulate(&mut rows, &output);
+    assert_eq!(
+        rows,
+        std::collections::HashMap::from([((-500, 200, 20), 1), ((0, 200, 20), 1)])
+    );
+}
+
+#[tokio::test]
 async fn session_window_state_persists_and_merges_across_restart() {
     let dir = TempDir::new().unwrap();
     let op_id = OperatorId(14);
