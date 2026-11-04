@@ -533,16 +533,6 @@ mod data_plane_tests {
     use rockstream_types::ids::OperatorId;
 
     #[test]
-    fn linux_memory_headroom_uses_available_memory() {
-        let meminfo = "MemTotal: 1000 kB\nMemFree: 100 kB\nMemAvailable: 250 kB\n";
-
-        assert_eq!(
-            parse_linux_memory_headroom(meminfo).unwrap(),
-            CapacityHeadroom::new(0.25)
-        );
-    }
-
-    #[test]
     fn runtime_rows_convert_exactly() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -1173,30 +1163,15 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
 
 #[cfg(target_os = "linux")]
 fn system_memory_headroom() -> io::Result<CapacityHeadroom> {
-    // shortcut: reports host headroom; read cgroup limits when workers are container-constrained.
-    parse_linux_memory_headroom(&std::fs::read_to_string("/proc/meminfo")?)
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_linux_memory_headroom(meminfo: &str) -> io::Result<CapacityHeadroom> {
-    fn kibibytes(meminfo: &str, field: &str) -> Option<u64> {
-        for line in meminfo.lines() {
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
-            };
-            if name == field {
-                return value.split_whitespace().next()?.parse().ok();
-            }
-        }
-        None
+    // ponytail: host-wide free pages ignore container quotas; use cgroup limits if constrained workers become supported.
+    let total_pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let available_pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
+    if total_pages <= 0 || available_pages < 0 {
+        return Err(io::Error::other("could not read physical memory headroom"));
     }
-
-    let total = kibibytes(meminfo, "MemTotal")
-        .filter(|total| *total > 0)
-        .ok_or_else(|| io::Error::other("could not read physical memory headroom"))?;
-    let available = kibibytes(meminfo, "MemAvailable")
-        .ok_or_else(|| io::Error::other("could not read physical memory headroom"))?;
-    Ok(CapacityHeadroom::new(available as f64 / total as f64))
+    Ok(CapacityHeadroom::new(
+        available_pages as f64 / total_pages as f64,
+    ))
 }
 
 #[cfg(target_os = "macos")]
