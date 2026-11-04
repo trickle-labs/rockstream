@@ -1510,6 +1510,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_inlet_acknowledges_undelivered_frame() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (_store, db) = shard_db("closed-inlet-observation").await;
+        let (registry, inlet_rx) = make_receiver_registry(db);
+        drop(inlet_rx);
+        let server = ShuffleServer::new(registry.clone());
+        let server_handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                        server,
+                    ),
+                )
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client =
+            crate::exchange::proto::shuffle_service_client::ShuffleServiceClient::new(channel);
+        let frame = ShuffleFrame {
+            exchange_id: 100,
+            src_shard: 0,
+            target_shard: 1,
+            epoch: 1,
+            seq: 1,
+            payload: serialize_zset(&ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], 1))
+                .unwrap()
+                .into(),
+            row_count: 2,
+        };
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(frame).await.unwrap();
+        drop(tx);
+        let mut request = Request::new(RxStream { rx });
+        request.metadata_mut().insert(
+            "protocol_version",
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        let mut response = client.shuffle_stream(request).await.unwrap().into_inner();
+        let ack = response.next().await.unwrap().unwrap();
+        assert_eq!(
+            (
+                ack.exchange_id,
+                ack.src_shard,
+                ack.target_shard,
+                ack.epoch,
+                ack.seq,
+                ack.credit_grant
+            ),
+            (100, 0, 1, 1, 1, 2)
+        );
+        assert!(response.next().await.is_none());
+        server_handle.abort();
+    }
+
+    #[tokio::test]
     async fn direct_grpc_fast_path_avoids_shuffle_wal_and_delivers_exact_rows() {
         let addr = {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

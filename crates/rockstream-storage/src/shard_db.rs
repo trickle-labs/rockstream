@@ -160,6 +160,7 @@ pub struct ShardDb {
     disk_cache_dir: Option<std::path::PathBuf>,
     cleanup_on_drop: bool,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
+    fail_view_output_once: Arc<std::sync::atomic::AtomicBool>,
     fail_flushes: Arc<std::sync::atomic::AtomicBool>,
     fail_scans: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -498,6 +499,7 @@ impl ShardDbBuilder {
             disk_cache_dir: self.disk_cache_dir,
             cleanup_on_drop: self.cleanup_on_drop,
             fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_view_output_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_flushes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_scans: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -774,6 +776,11 @@ impl ShardDb {
     /// INVARIANT-BY-CONSTRUCTION: M1-S6 — point deletes and tombstones in atomic
     /// write batches prevent state resurrection without relying on range deletions.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        if batch.ops.iter().any(|op| matches!(op, BatchOp::Put { key, .. } if key.first() == Some(&crate::keys::ShardPrefix::ViewOutput.as_byte())))
+            && self.fail_view_output_once.swap(false, Ordering::SeqCst)
+        {
+            return Err(StorageError::Unsupported("injected view output write failure".to_string()));
+        }
         if self.migration_pending || self.fail_writes.load(Ordering::SeqCst) {
             return Err(if self.migration_pending {
                 StorageError::MigrationInProgress
@@ -1187,6 +1194,11 @@ impl ShardDb {
     /// Inject write failures for testing.
     pub fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::SeqCst);
+    }
+
+    /// Inject one view-output write failure for testing.
+    pub fn fail_next_view_output_write(&self) {
+        self.fail_view_output_once.store(true, Ordering::SeqCst);
     }
 
     /// Inject prefix-scan failures for testing.

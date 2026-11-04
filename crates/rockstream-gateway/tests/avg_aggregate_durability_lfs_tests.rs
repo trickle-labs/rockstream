@@ -82,6 +82,73 @@ async fn read_avg_state(client: &tokio_postgres::Client, view: &str) -> HashMap<
     state
 }
 
+async fn read_pairs(client: &tokio_postgres::Client, relation: &str) -> Vec<(i64, i64)> {
+    let mut rows = client
+        .simple_query(&format!("SELECT * FROM {relation}"))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap().parse().unwrap(),
+                row.get(1).unwrap().parse().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
+}
+
+#[tokio::test]
+async fn view_output_failure_must_not_acknowledge_incomplete_commit() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) = start_gateway("view-failure", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM t")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "mv").await, vec![(1, 10)]);
+    let before = db.last_epoch().load(std::sync::atomic::Ordering::SeqCst);
+    client.simple_query("BEGIN").await.unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (2, 20)")
+        .await
+        .unwrap();
+    db.fail_next_view_output_write();
+    let result = client.simple_query("COMMIT").await;
+    let frontier = db.last_epoch().load(std::sync::atomic::Ordering::SeqCst);
+    let table = read_pairs(&client, "t").await;
+    let view = read_pairs(&client, "mv").await;
+    handle.abort();
+    let (port2, _handle2, _db2) = start_gateway("view-failure", store, catalog).await;
+    let client2 = connect_port(port2).await;
+    let reopened_table = read_pairs(&client2, "t").await;
+    let reopened_view = read_pairs(&client2, "mv").await;
+    client2
+        .simple_query("INSERT INTO t VALUES (3, 30)")
+        .await
+        .unwrap();
+    let final_table = read_pairs(&client2, "t").await;
+    let final_view = read_pairs(&client2, "mv").await;
+    assert!(
+        result.is_err() || (frontier > before && table == vec![(1, 10), (2, 20)] && view == table),
+        "commit={result:?}, frontier={before}->{frontier}, table={table:?}, view={view:?}, reopened table={reopened_table:?}, reopened view={reopened_view:?}, final table={final_table:?}, final view={final_view:?}"
+    );
+}
+
 #[tokio::test]
 async fn avg_aggregate_fractional_mean_persists_across_restart_lfs() {
     let dir = TempDir::new().unwrap();
