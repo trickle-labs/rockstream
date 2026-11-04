@@ -34,10 +34,15 @@ in one batch. Projection and aggregate write-failure tests now pass. A failed
 state restore previously let the next aggregate commit produce 50 instead of
 30; a recovery gate now rejects reads while the failed scan persists and
 restores state before the next commit. This is not yet release evidence:
-Window and TopK restoration remain unavailable, recovery after cancellation
+TopK restoration remains unavailable, recovery after cancellation
 and process restart needs full-path testing, and the source-path locking changes
 need their own tests. The distributed path and shuffle owning-epoch recovery
 are not established by these tests.
+
+Analytic-window checkpoints retained old output-cache rows after a rank change,
+causing stale retractions after reload. Point deletions and in-place restore now
+cover that boundary, including failed writes, concurrent snapshot acknowledgement,
+corrupt records, and a pgwire rollback/restart test.
 
 Window rollback tests found session restoration retained uncommitted rows.
 Tumble and session restores now replace the old state after a successful read.

@@ -378,6 +378,7 @@ impl Stage {
             Stage::Aggregate(op) => op.clear_dirty_keys(),
             Stage::Distinct(op, _) => op.ack_persisted_state(),
             Stage::SessionWindow(op, _) => op.ack_persisted_state(),
+            Stage::Window(op, _) => op.ack_persisted_state(),
             Stage::MultiAggregate(op) => op.ack_persisted_state(),
             _ => {}
         }
@@ -389,7 +390,7 @@ impl Stage {
     /// see `AggregateOp::restore_in_place` for why an in-place load is
     /// needed instead of just calling the existing `load_from_storage`
     /// constructors). Join is restored separately by `JoinPipeline::restore`.
-    /// Window and TopK restoration report an error until their state can be restored.
+    /// TopK restoration reports an error until its state can be restored.
     async fn restore(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
             Stage::Aggregate(op) => op.restore_in_place(db).await,
@@ -397,6 +398,7 @@ impl Stage {
             Stage::TumbleWindow(op, id) => op.restore_in_place(db, *id).await,
             Stage::HopWindow(op, id) => op.restore_in_place(db, *id).await,
             Stage::SessionWindow(op, id) => op.restore_in_place(db, *id).await,
+            Stage::Window(op, id) => op.restore_in_place(db, *id).await,
             // Same pairing note as `Stage::persist`'s `KeyPack` arm — the
             // `KeyUnpack` stage shares the same `Arc<GroupKeyPacker>`, so
             // restoring once via `KeyPack`'s id is sufficient.
@@ -405,9 +407,7 @@ impl Stage {
             Stage::Utf8ColumnPack(packer, _, id) => packer.restore_in_place(db, *id).await,
             Stage::MinMax(op, _) => op.restore_in_place(db).await,
             Stage::MultiAggregate(op) => Box::pin(op.restore_in_place(db)).await,
-            Stage::Window(_, _) | Stage::TopK(_, _) => Err(OpError::internal(
-                "window or top-k state recovery is unavailable",
-            )),
+            Stage::TopK(_, _) => Err(OpError::internal("top-k state recovery is unavailable")),
             _ => Ok(()),
         }
     }

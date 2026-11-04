@@ -100,6 +100,68 @@ async fn read_pairs(client: &tokio_postgres::Client, relation: &str) -> Vec<(i64
     rows
 }
 
+async fn read_triples(client: &tokio_postgres::Client, relation: &str) -> Vec<(i64, i64, i64)> {
+    let mut rows = client
+        .simple_query(&format!("SELECT * FROM {relation}"))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap().parse().unwrap(),
+                row.get(1).unwrap().parse().unwrap(),
+                row.get(2).unwrap().parse().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
+}
+
+#[tokio::test]
+async fn failed_atomic_commit_restores_window_before_next_commit() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let catalog = Arc::new(CatalogStubs::new());
+    let (port, handle, db) =
+        start_gateway("window-view-failure", store.clone(), catalog.clone()).await;
+    let client = connect_port(port).await;
+    client
+        .simple_query("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    client.simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, v, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM t").await.unwrap();
+    assert_eq!(read_triples(&client, "mv").await, vec![(1, 10, 1)]);
+    db.fail_next_view_output_write();
+    assert!(client
+        .simple_query("INSERT INTO t VALUES (2, 20)")
+        .await
+        .is_err());
+    assert_eq!(read_triples(&client, "mv").await, vec![(1, 10, 1)]);
+    client
+        .simple_query("INSERT INTO t VALUES (3, 30)")
+        .await
+        .unwrap();
+    assert_eq!(read_pairs(&client, "t").await, vec![(1, 10), (3, 30)]);
+    assert_eq!(
+        read_triples(&client, "mv").await,
+        vec![(1, 10, 1), (3, 30, 2)]
+    );
+    handle.abort();
+    let (port, _handle, _db) = start_gateway("window-view-failure", store, catalog).await;
+    let client = connect_port(port).await;
+    assert_eq!(
+        read_triples(&client, "mv").await,
+        vec![(1, 10, 1), (3, 30, 2)]
+    );
+}
+
 #[tokio::test]
 async fn view_output_failure_must_not_acknowledge_incomplete_commit() {
     let dir = TempDir::new().unwrap();
