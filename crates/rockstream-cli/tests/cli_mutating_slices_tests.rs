@@ -1036,7 +1036,17 @@ fn test_cli_bundle_audit_event_logged() {
         .generate_support_bundle(tmp.path(), Some("active_users"), None, None)
         .unwrap();
     let events = storage.audit_tail(tmp.path(), 10).unwrap();
-    assert!(events
-        .iter()
-        .any(|e| e.action == "support.bundle" && e.resource == "active_users"));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor, "admin");
+    assert_eq!(events[0].action, "support.bundle");
+    assert_eq!(events[0].resource, "selected");
+    assert_eq!(events[0].error_code, None);
+    assert_eq!(
+        events[0].detail.as_deref(),
+        Some("support bundle generated")
+    );
+    assert!(events[0].timestamp_ms > 0);
+    assert!(!serde_json::to_string(&events[0])
+        .unwrap()
+        .contains("active_users"));
 }

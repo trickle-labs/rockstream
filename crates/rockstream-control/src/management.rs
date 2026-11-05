@@ -708,7 +708,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 &request.idempotency_key,
                 request.protocol_version as u16,
                 &DrainWorkerDigest { worker_id },
-                uuid::Uuid::new_v4().to_string(),
+                request.idempotency_key.clone(),
                 crate::management_store::OperationKind::DrainWorker,
                 Utc::now().timestamp_millis(),
             )
@@ -765,7 +765,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                     shard_id,
                     target_node_id,
                 },
-                uuid::Uuid::new_v4().to_string(),
+                request.idempotency_key.clone(),
                 crate::management_store::OperationKind::MigrateShard,
                 Utc::now().timestamp_millis(),
             )
@@ -824,7 +824,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 &CreateBackupDigest {
                     destination: destination.to_owned(),
                 },
-                uuid::Uuid::new_v4().to_string(),
+                request.idempotency_key.clone(),
                 crate::management_store::OperationKind::CreateBackup,
                 Utc::now().timestamp_millis(),
             )

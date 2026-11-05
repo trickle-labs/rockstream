@@ -150,6 +150,8 @@ Inspect shard lease ownership and key ranges, and trigger shard migrations.
 - `rockstream shard list` — List all shards, lease tokens, owner workers, and active key ranges.
 - `rockstream shard migrate <shard_id> --to <worker_id> [--yes]` — Migrate a shard lease and state to another worker.
 
+Management mutations accept `--idempotency-key <UUID>`. For backup creation, set `--management` to select the management service. If the key is omitted, the CLI prints a generated key to stderr before submitting the request. If the response is lost, repeat the same command with that key, then reconcile with `rockstream admin operation show <UUID>`; the key is also the operation ID.
+
 ---
 
 ### `rockstream checkpoint`
@@ -168,9 +170,12 @@ and partial-restore failures return `RS-3614` with recovery steps; a concurrent 
 
 ### `rockstream support`
 
-Generate on-demand diagnostic support bundles.
+Generate on-demand diagnostic support bundles as local files. Bundles contain
+sanitized operational metadata only: diagnostic context values and the selected
+view name are omitted, and each bundle is limited to 10 MiB. This command does
+not download an actor-scoped artifact from a remote service.
 
-- `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Generate a diagnostic support bundle with secret redaction and bounded size.
+- `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Write a sanitized diagnostic bundle to a local path, subject to the 10 MiB limit.
 
 ---
 

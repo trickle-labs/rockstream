@@ -106,7 +106,11 @@ async fn connect_gateway(addr: SocketAddr) -> Client {
     }
 }
 
-async fn wait_for_management(management: SocketAddr, node: &mut RunningNode) {
+async fn wait_for_management(
+    management: SocketAddr,
+    node: &mut RunningNode,
+    expected_nodes: usize,
+) {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut last_error;
     loop {
@@ -117,7 +121,16 @@ async fn wait_for_management(management: SocketAddr, node: &mut RunningNode) {
                 })
                 .await
             {
-                Ok(_) => return,
+                Ok(response) => {
+                    let response = response.into_inner();
+                    if response.nodes.len() == expected_nodes {
+                        return;
+                    }
+                    last_error = format!(
+                        "expected {expected_nodes} registered workers, got {}",
+                        response.nodes.len()
+                    );
+                }
                 Err(error) => last_error = error.to_string(),
             },
             Err(error) => last_error = error.to_string(),
@@ -336,7 +349,11 @@ fn parse_topology_version(source_version: &str) -> u64 {
 }
 
 fn normalize_operation(mut operation: ManagementOperationInfo) -> ManagementOperationInfo {
-    assert!(uuid::Uuid::parse_str(&operation.operation_id).is_ok());
+    assert!(
+        uuid::Uuid::parse_str(&operation.operation_id).is_ok(),
+        "unexpected operation ID: {:?}",
+        operation.operation_id
+    );
     assert!(timestamp_is_utc_millis(&operation.started_at));
     assert!(timestamp_is_utc_millis(&operation.updated_at));
     operation.operation_id = "<uuid>".to_owned();
@@ -355,10 +372,15 @@ fn assert_operation_transcript(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stderr, b"");
     let transcript = String::from_utf8(output.stdout.clone()).expect("CLI JSON is UTF-8");
     let operation: ManagementOperationInfo =
         serde_json::from_slice(&output.stdout).expect("management operation JSON");
+    assert!(
+        output.stderr.is_empty()
+            || output.stderr == format!("Idempotency-Key: {}\n", operation.operation_id).as_bytes(),
+        "stderr must be empty or contain only the operation's client-visible idempotency key: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         transcript,
         format!("{}\n", serde_json::to_string_pretty(&operation).unwrap()),
@@ -597,6 +619,11 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
     let created = run_backup_create(binary, management_addr, &destination);
     let create_response =
         assert_operation_transcript(&created, &expected_operation("pending", "", ""));
+    assert_eq!(
+        created.stderr,
+        format!("Idempotency-Key: {}\n", create_response.operation_id).as_bytes(),
+        "the client must learn the retry key before a create response can be lost"
+    );
     let operation_id = create_response.operation_id.clone();
     assert!(uuid::Uuid::parse_str(&operation_id).is_ok());
 
@@ -784,7 +811,7 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
     let accepted_failure = submit_backup_request(
         management_addr,
         &invalid_destination,
-        "v066-release-process-backup-failure",
+        "52c0c598-56e5-47de-a191-e1a15f57e21b",
     )
     .await;
     assert_eq!(
@@ -816,7 +843,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     let root = TempDir::new().expect("create restart fixture");
     let storage = root.path().join("source-storage");
     let destination = root.path().join("backup");
-    let idempotency_key = "v066-backup-restart-idempotency-key";
+    let idempotency_key = "9e4f5d58-0b9f-4f9b-a8b8-50e021713ebb";
     let first_listen = free_addr();
     let first_management = free_addr();
     seed_backup_value(&storage, 32 * 1024 * 1024).await;
@@ -991,11 +1018,11 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
         Some(&shared_storage),
         Some(2),
     );
-    wait_for_management(first_management, &mut first_node).await;
-    wait_for_management(second_management, &mut second_node).await;
+    wait_for_management(first_management, &mut first_node, 1).await;
+    wait_for_management(second_management, &mut second_node, 1).await;
 
     let destination = root.path().join("backup");
-    let idempotency_key = "v066-cross-process-idempotency-key";
+    let idempotency_key = "8588bd32-b83a-4cb1-a4de-13c0c2e2cc19";
     let (first, second) = tokio::join!(
         submit_backup_request(first_management, &destination, idempotency_key),
         submit_backup_request(second_management, &destination, idempotency_key),
@@ -1047,12 +1074,20 @@ async fn release_management_backups_allocate_distinct_checkpoints_concurrently()
     seed_backup_value(&storage, 0).await;
     let management = free_addr();
     let mut node = start_embedded(binary, &storage, free_addr(), Some(management), None, None);
-    wait_for_management(management, &mut node).await;
+    wait_for_management(management, &mut node, 1).await;
     let first_destination = root.path().join("backup-one");
     let second_destination = root.path().join("backup-two");
     let (first, second) = tokio::join!(
-        submit_backup_request(management, &first_destination, "concurrent-backup-one"),
-        submit_backup_request(management, &second_destination, "concurrent-backup-two"),
+        submit_backup_request(
+            management,
+            &first_destination,
+            "7f3a4c19-6ef5-43ed-8861-8bf9ee64065f",
+        ),
+        submit_backup_request(
+            management,
+            &second_destination,
+            "a541d597-0e77-4ec5-9fe4-3d5dd7c42d4e",
+        ),
     );
     assert_ne!(first.operation_id, second.operation_id);
 

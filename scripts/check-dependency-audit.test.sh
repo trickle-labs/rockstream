@@ -47,10 +47,10 @@ if cargo audit --file "$FIXTURE/Cargo.lock" >"$audit_output" 2>&1; then
   cat "$audit_output" >&2
   fail "cargo audit accepted the known-vulnerable fixture"
 fi
-grep -Eq 'RUSTSEC-|vulnerabilit' "$audit_output" || {
+if ! grep -Eq 'RUSTSEC-|vulnerabilit' "$audit_output"; then
   cat "$audit_output" >&2
   fail "cargo audit did not report an advisory"
-}
+fi
 
 deny_output="$TMP_ROOT/deny.out"
 if cargo deny --manifest-path "$FIXTURE/Cargo.toml" --config "$DENY" check advisories >"$deny_output" 2>&1; then

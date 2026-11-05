@@ -783,6 +783,17 @@ The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
 `crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
 deletion until `DROP SINK` removes it.
 
+Issue #305 strengthens the file-backed audit append boundary in
+`crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
+JSONL event and calls `sync_all` on the file before returning success. On Unix,
+the first append per writer also syncs the containing directory, covering
+creation of the audit-log name. The round-trip test closes and reopens the log
+and compares the complete ordered events. This is an implementation-level file
+durability property, not a new M1–M7 transition. It does not make the audit
+append atomic with the protected mutation, prove recovery after abrupt process
+death, or ensure callers report append errors when they discard them; those
+remain outside this slice.
+
 Issue #276 qualifies the local filesystem object-store durability boundary below
 the M1–M7 coordination state machines. Runtime, migration, and validated-file
 store builders enable `LocalFileSystem::with_fsync(true)`, so successful local

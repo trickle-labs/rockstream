@@ -174,13 +174,20 @@ async fn public_tables(client: &tokio_postgres::Client) -> Vec<String> {
         .collect()
 }
 
-async fn table_columns(client: &tokio_postgres::Client) -> Vec<(String, String)> {
+async fn table_columns(client: &tokio_postgres::Client) -> Vec<Vec<Option<String>>> {
     client
-        .query("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'durable_rows'", &[])
+        .simple_query("SELECT * FROM information_schema.columns WHERE table_name = 'durable_rows'")
         .await
         .unwrap()
         .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|index| row.get(index).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
         .collect()
 }
 
@@ -214,9 +221,47 @@ async fn failed_drop_preserves_table_until_durable_deletion() {
     assert_eq!(
         columns,
         vec![
-            ("id".into(), "bigint".into()),
-            ("label".into(), "text".into())
+            vec![
+                Some("rockstream"),
+                Some("public"),
+                Some("durable_rows"),
+                Some("id"),
+                Some("1"),
+                Some("bigint"),
+                Some("pg_catalog"),
+                Some("int8"),
+                Some("YES"),
+                Some("NO"),
+                Some("64"),
+                Some("0"),
+                Some("2"),
+                None,
+                None
+            ],
+            vec![
+                Some("rockstream"),
+                Some("public"),
+                Some("durable_rows"),
+                Some("label"),
+                Some("2"),
+                Some("text"),
+                Some("pg_catalog"),
+                Some("text"),
+                Some("YES"),
+                Some("NO"),
+                None,
+                None,
+                None,
+                None,
+                None
+            ],
         ]
+        .into_iter()
+        .map(|row| row
+            .into_iter()
+            .map(|value| value.map(str::to_owned))
+            .collect::<Vec<_>>())
+        .collect::<Vec<_>>()
     );
     store.fail.store(true, Ordering::SeqCst);
     let result = client.simple_query("DROP TABLE durable_rows").await;
@@ -245,7 +290,10 @@ async fn failed_drop_preserves_table_until_durable_deletion() {
         .await
         .unwrap();
     assert_eq!(public_tables(&client).await, Vec::<String>::new());
-    assert_eq!(table_columns(&client).await, Vec::<(String, String)>::new());
+    assert_eq!(
+        table_columns(&client).await,
+        Vec::<Vec<Option<String>>>::new()
+    );
     assert_eq!(durable_table(object_store.clone()).await, None);
     drop(client);
     handle.abort();
@@ -253,7 +301,10 @@ async fn failed_drop_preserves_table_until_durable_deletion() {
     let (port, handle) = start_gateway(object_store.clone()).await;
     let client = connect(port).await;
     assert_eq!(public_tables(&client).await, Vec::<String>::new());
-    assert_eq!(table_columns(&client).await, Vec::<(String, String)>::new());
+    assert_eq!(
+        table_columns(&client).await,
+        Vec::<Vec<Option<String>>>::new()
+    );
     assert_eq!(durable_table(object_store).await, None);
     handle.abort();
 }

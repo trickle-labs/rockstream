@@ -4,6 +4,9 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
+use rockstream_control::management_store::{
+    IDEMPOTENCY_KEY_RETENTION_MS, TERMINAL_OPERATION_RETENTION_MS,
+};
 use rockstream_control::{
     ManagementOperationStore, OperationKind, OperationLifecycleError, OperationRecord,
     OperationStatus, OperationStoreError, OperationUpdate,
@@ -740,7 +743,7 @@ async fn operation_store_cleans_expired_terminal_records_before_acceptance() {
         .unwrap();
     seed_operation(backing.as_ref(), &expired).await;
     let store = ManagementOperationStore::new(backing);
-    let now = 7 * 24 * 60 * 60 * 1_000 + 1_003;
+    let now = TERMINAL_OPERATION_RETENTION_MS + 1_003;
     let accepted = store
         .accept("after_cleanup", OperationKind::DrainWorker, now)
         .await
@@ -1042,6 +1045,7 @@ async fn accepted_operation_and_idempotency_survive_lfs_process_restart() {
         .await
         .unwrap();
     let reopened = make_store();
+    assert_eq!(IDEMPOTENCY_KEY_RETENTION_MS, 90 * 24 * 60 * 60 * 1_000);
     let retry = reopened
         .accept_idempotent(
             "backup-2026-09-12",
@@ -1054,6 +1058,20 @@ async fn accepted_operation_and_idempotency_survive_lfs_process_restart() {
         .await
         .unwrap();
     assert_eq!(retry, accepted);
+    assert_eq!(
+        reopened
+            .accept_idempotent(
+                "backup-2026-09-12",
+                1,
+                &json!({"backup": "daily-12", "catalog_revision": 8}),
+                "op_at_retention_limit",
+                OperationKind::CreateBackup,
+                1_000 + IDEMPOTENCY_KEY_RETENTION_MS,
+            )
+            .await
+            .unwrap(),
+        accepted
+    );
     assert!(matches!(
         reopened
             .accept_idempotent(
@@ -1075,7 +1093,7 @@ async fn accepted_operation_and_idempotency_survive_lfs_process_restart() {
                 &json!({"backup": "daily-12", "catalog_revision": 8}),
                 "op_expired",
                 OperationKind::CreateBackup,
-                1_000 + 24 * 60 * 60 * 1_000 + 1,
+                1_000 + IDEMPOTENCY_KEY_RETENTION_MS + 1,
             )
             .await,
         Err(OperationStoreError::IdempotencyExpired { operation_id }) if operation_id == "op_backup"
@@ -1220,6 +1238,59 @@ async fn operation_store_rejects_terminal_transition() {
             "next_steps": []
         })
     );
+}
+
+#[tokio::test]
+async fn terminal_operation_results_remain_available_for_90_days() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ManagementOperationStore::new(Arc::new(
+        LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+    ));
+    assert_eq!(TERMINAL_OPERATION_RETENTION_MS, 90 * 24 * 60 * 60 * 1_000);
+    store
+        .accept("op_retained", OperationKind::CreateBackup, 1_000)
+        .await
+        .unwrap();
+    store
+        .transition(
+            "op_retained",
+            update(OperationStatus::Running, 2_000, None, None, None, &[]),
+        )
+        .await
+        .unwrap();
+    store
+        .transition(
+            "op_retained",
+            update(
+                OperationStatus::Succeeded,
+                3_000,
+                Some(100),
+                None,
+                None,
+                &[],
+            ),
+        )
+        .await
+        .unwrap();
+
+    store
+        .accept(
+            "op_at_retention_limit",
+            OperationKind::DrainWorker,
+            3_000 + TERMINAL_OPERATION_RETENTION_MS - 1,
+        )
+        .await
+        .unwrap();
+    assert!(store.get("op_retained").await.unwrap().is_some());
+    store
+        .accept(
+            "op_after_retention_limit",
+            OperationKind::DrainWorker,
+            3_000 + TERMINAL_OPERATION_RETENTION_MS + 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.get("op_retained").await.unwrap(), None);
 }
 
 #[tokio::test]
