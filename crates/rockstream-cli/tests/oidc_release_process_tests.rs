@@ -328,6 +328,7 @@ fn start_control_process(
             "start",
             "--role",
             "control",
+            "--daemon",
             "--storage",
             storage.to_str().unwrap(),
             "--listen",
@@ -1385,6 +1386,146 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
 }
 
 #[tokio::test]
+async fn expired_and_wrong_ca_worker_certificates_are_rejected_by_release_control_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_control_process(temp.path(), &storage, address, &pki);
+    wait_for_gateway(&mut process.0, address).await;
+
+    let audit_path = storage.join("audit.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let baseline = loop {
+        let events = FileAuditLog::open(&audit_path).unwrap().read_all().unwrap();
+        let denials = events
+            .iter()
+            .filter(|event| event.action == "security.internal_mtls_denied")
+            .cloned()
+            .collect::<Vec<_>>();
+        if !denials.is_empty() {
+            break (events, denials);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "release process did not audit its readiness probe"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    for (index, (name, tls)) in [
+        ("expired", pki.expired_worker_tls_config()),
+        ("wrong-ca", pki.untrusted_worker_tls_config()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match rockstream_runtime::start_worker_client_with_tls(
+            1,
+            &address.to_string(),
+            &temp.path().join(format!("worker-{name}")),
+            tls,
+        )
+        .await
+        {
+            Err(error) => assert!(
+                error.to_string().contains("RS-2411"),
+                "unexpected {name} certificate rejection: {error}"
+            ),
+            Ok((client, handle)) => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert_eq!(
+                    client.worker_id(),
+                    None,
+                    "release control process assigned a worker identity to the rejected {name} certificate"
+                );
+                handle.abort();
+            }
+        }
+        if let Some(status) = process.0.try_wait().unwrap() {
+            let mut stderr = String::new();
+            if let Some(pipe) = process.0.stderr.as_mut() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!("release control process exited after {name} certificate ({status}): {stderr}");
+        }
+
+        let expected_denials = baseline.1.len() + index + 1;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let events = FileAuditLog::open(&audit_path).unwrap().read_all().unwrap();
+            if events
+                .iter()
+                .filter(|event| event.action == "security.internal_mtls_denied")
+                .count()
+                == expected_denials
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "release process did not audit the rejected {name} certificate: {events:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let events = loop {
+        let events = FileAuditLog::open(&audit_path).unwrap().read_all().unwrap();
+        let denials = events
+            .iter()
+            .filter(|event| event.action == "security.internal_mtls_denied")
+            .count();
+        if denials == baseline.1.len() + 2 {
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "release process audit did not record both certificate denials: {events:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let denials = events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .collect::<Vec<_>>();
+    assert_eq!(denials.len(), baseline.1.len() + 2);
+    for denial in &denials[baseline.1.len()..] {
+        assert_eq!(denial.actor, "unknown");
+        assert!(denial.resource.starts_with("peer=127.0.0.1:"));
+        assert_eq!(denial.error_code.as_deref(), Some("RS-2411"));
+        assert!(denial
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("TLS handshake failed: ")
+                && detail.ends_with(", error_code=RS-2411")));
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.action == "worker.registered")
+            .count(),
+        baseline
+            .0
+            .iter()
+            .filter(|event| event.action == "worker.registered")
+            .count(),
+        "rejected certificates must not register a worker"
+    );
+
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let recovered = FileAuditLog::open(&audit_path).unwrap().read_all().unwrap();
+    let recovered_denials = recovered
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .collect::<Vec<_>>();
+    assert_eq!(recovered_denials.len(), denials.len());
+    assert_eq!(recovered_denials, denials);
+}
+
+#[tokio::test]
 async fn wrong_node_certificate_is_rejected_by_release_control_process() {
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("control-storage");
@@ -1438,4 +1579,5 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
         .expect("durable wrong-node identity rejection audit");
     assert_eq!(denial.actor, "worker:worker-999");
     assert!(denial.resource.starts_with("worker_id=worker-1, peer="));
+    assert_eq!(denial.error_code.as_deref(), Some("RS-2412"));
 }

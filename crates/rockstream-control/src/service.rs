@@ -2851,6 +2851,7 @@ async fn accept_and_handle(
                             "security.internal_mtls_denied",
                             format!("peer={peer}"),
                         )
+                        .with_error_code(rockstream_types::error_code::RS_2411.to_string())
                         .with_detail(format!(
                             "identity extraction failed: {e}, error_code=RS-2411"
                         ));
@@ -2894,6 +2895,7 @@ async fn accept_and_handle(
                     "security.internal_mtls_denied",
                     format!("peer={peer}"),
                 )
+                .with_error_code(code.to_string())
                 .with_detail(format!("TLS handshake failed: {e}, error_code={code}"));
                 append_required_security_audit(
                     ctx.audit.as_ref(),
@@ -3182,6 +3184,7 @@ async fn handle_connection_stream<R, W>(
                             "security.internal_mtls_denied",
                             format!("worker_id={}, peer={peer}", reg.worker_id),
                         )
+                        .with_error_code(rockstream_types::error_code::RS_2412.to_string())
                         .with_detail(format!(
                             "node identity mismatch: cert={}, requested_worker_id={}, error_code=RS-2412",
                             id.to_cn(),
