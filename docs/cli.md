@@ -186,9 +186,12 @@ and partial-restore failures return `RS-3614` with recovery steps; a concurrent 
 
 ### `rockstream support`
 
-Generate on-demand diagnostic support bundles.
+Generate on-demand diagnostic support bundles as local files. Bundles contain
+sanitized operational metadata only: diagnostic context values and the selected
+view name are omitted, and each bundle is limited to 10 MiB. This command does
+not download an actor-scoped artifact from a remote service.
 
-- `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Generate a diagnostic support bundle with secret redaction and bounded size.
+- `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Write a sanitized diagnostic bundle to a local path, subject to the 10 MiB limit.
 
 ---
 

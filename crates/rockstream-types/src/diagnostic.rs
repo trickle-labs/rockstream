@@ -16,7 +16,7 @@ pub const MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES: usize = 1_024;
 pub const MAX_DIAGNOSTIC_CONTEXT_BYTES: usize = 8 * 1_024;
 pub const MAX_DIAGNOSTIC_OCCURRENCES: usize = 256;
 pub const MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES: usize = 256;
-pub const MAX_DIAGNOSTIC_BUNDLE_BYTES: usize = 1_024 * 1_024;
+pub const MAX_DIAGNOSTIC_BUNDLE_BYTES: usize = 10 * 1_024 * 1_024;
 
 static CONTEXT_REJECTED: AtomicU64 = AtomicU64::new(0);
 static OCCURRENCES_EVICTED: AtomicU64 = AtomicU64::new(0);
@@ -122,6 +122,25 @@ impl DiagnosticOccurrence {
             Box::new(cause)
         });
         (redacted, redaction_count)
+    }
+
+    /// Keep only catalog metadata for a support artifact.
+    ///
+    /// Diagnostic context can contain SQL literals, business data, or raw
+    /// connector payloads, so support artifacts omit it instead of trying to
+    /// infer whether each arbitrary value is safe to export.
+    pub fn sanitized_for_support(&self) -> (Self, usize) {
+        fn clear_context(occurrence: &mut DiagnosticOccurrence) {
+            occurrence.context.clear();
+            occurrence.message = catalog_message(occurrence.code, &occurrence.context);
+            if let Some(cause) = occurrence.cause.as_deref_mut() {
+                clear_context(cause);
+            }
+        }
+
+        let (mut occurrence, redaction_count) = self.redacted_with_count();
+        clear_context(&mut occurrence);
+        (occurrence, redaction_count)
     }
 
     pub fn render_text(&self) -> String {

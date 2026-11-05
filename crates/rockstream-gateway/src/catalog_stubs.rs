@@ -1712,6 +1712,42 @@ impl CatalogStubs {
         removed
     }
 
+    /// Persist a table deletion before removing its SQL-visible definition.
+    pub async fn remove_table_durably(&self, name: &str) -> Result<bool, String> {
+        let _edit = self.table_edit_lock.lock().await;
+        if !self.inner.read().unwrap().tables.contains_key(name) {
+            return Ok(false);
+        }
+        let Some(store) = self.get_durable_store() else {
+            return Ok(self.remove_table(name));
+        };
+
+        use rockstream_storage::catalog::CatalogStore;
+        let revision = store
+            .get_revision()
+            .await
+            .checked_add(1)
+            .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+        let tid = rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
+            "table", name,
+        ));
+        let txn = rockstream_storage::catalog::CatalogTxn::new(
+            revision,
+            revision,
+            vec![rockstream_storage::catalog::CatalogMutation::DeleteTable(
+                tid,
+            )],
+        )
+        .map_err(|error| error.to_string())?;
+        let committed_revision = store
+            .commit_txn(txn)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.inner.write().unwrap().tables.remove(name);
+        self.set_revision(committed_revision);
+        Ok(true)
+    }
+
     /// Add a schema to the catalog (CREATE SCHEMA).
     pub fn add_schema(&self, name: &str) -> bool {
         let mut inner = self.inner.write().unwrap();
