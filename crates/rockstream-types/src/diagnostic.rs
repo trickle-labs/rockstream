@@ -16,7 +16,7 @@ pub const MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES: usize = 1_024;
 pub const MAX_DIAGNOSTIC_CONTEXT_BYTES: usize = 8 * 1_024;
 pub const MAX_DIAGNOSTIC_OCCURRENCES: usize = 256;
 pub const MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES: usize = 256;
-pub const MAX_DIAGNOSTIC_BUNDLE_BYTES: usize = 1_024 * 1_024;
+pub const MAX_DIAGNOSTIC_BUNDLE_BYTES: usize = 10 * 1_024 * 1_024;
 
 static CONTEXT_REJECTED: AtomicU64 = AtomicU64::new(0);
 static OCCURRENCES_EVICTED: AtomicU64 = AtomicU64::new(0);
@@ -98,12 +98,49 @@ impl DiagnosticOccurrence {
 
     /// Re-sanitize values before a renderer publishes them.
     pub fn redacted(&self) -> Self {
-        let context = sanitize_context(self.context.clone()).unwrap_or_default();
+        self.redacted_with_count().0
+    }
+
+    /// Return the sanitized occurrence and the number of redaction markers added.
+    pub fn redacted_with_count(&self) -> (Self, usize) {
+        let (context, mut redaction_count) = match sanitize_context(self.context.clone()) {
+            Ok(context) => (
+                context,
+                self.context
+                    .values()
+                    .map(|value| redact_secrets_with_count(value).1)
+                    .sum(),
+            ),
+            Err(_) => (BTreeMap::new(), 0),
+        };
         let mut redacted = self.clone();
         redacted.context = context.clone();
         redacted.message = catalog_message(self.code, &context);
-        redacted.cause = self.cause.as_ref().map(|cause| Box::new(cause.redacted()));
-        redacted
+        redacted.cause = self.cause.as_ref().map(|cause| {
+            let (cause, count) = cause.redacted_with_count();
+            redaction_count += count;
+            Box::new(cause)
+        });
+        (redacted, redaction_count)
+    }
+
+    /// Keep only catalog metadata for a support artifact.
+    ///
+    /// Diagnostic context can contain SQL literals, business data, or raw
+    /// connector payloads, so support artifacts omit it instead of trying to
+    /// infer whether each arbitrary value is safe to export.
+    pub fn sanitized_for_support(&self) -> (Self, usize) {
+        fn clear_context(occurrence: &mut DiagnosticOccurrence) {
+            occurrence.context.clear();
+            occurrence.message = catalog_message(occurrence.code, &occurrence.context);
+            if let Some(cause) = occurrence.cause.as_deref_mut() {
+                clear_context(cause);
+            }
+        }
+
+        let (mut occurrence, redaction_count) = self.redacted_with_count();
+        clear_context(&mut occurrence);
+        (occurrence, redaction_count)
     }
 
     pub fn render_text(&self) -> String {
@@ -220,16 +257,110 @@ pub fn diagnostic_metrics() -> DiagnosticMetrics {
 }
 
 pub fn redact_secrets(input: &str) -> String {
+    redact_secrets_with_count(input).0
+}
+
+/// Return the sanitized value and the number of redaction markers added.
+pub fn redact_secrets_with_count(input: &str) -> (String, usize) {
+    let trimmed = input.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) {
+            let count = redact_json_value(&mut value);
+            return (
+                serde_json::to_string(&value).expect("JSON values are serializable"),
+                count,
+            );
+        }
+    }
+
+    let redacted = redact_secrets_text(input);
+    let count = count_redaction_markers(input, &redacted);
+    (redacted, count)
+}
+
+fn redact_json_value(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(entries) => {
+            let mut count = 0;
+            for (key, value) in entries {
+                if is_sensitive_json_key(key) {
+                    if !matches!(value, serde_json::Value::String(value) if value == "[REDACTED]" || value == "[REDACTED_PRIVATE_KEY_MATERIAL]")
+                    {
+                        count += 1;
+                    }
+                    *value = serde_json::Value::String("[REDACTED]".to_string());
+                } else {
+                    count += redact_json_value(value);
+                }
+            }
+            count
+        }
+        serde_json::Value::Array(values) => values.iter_mut().map(redact_json_value).sum(),
+        serde_json::Value::String(value) => {
+            let redacted = redact_secrets_text(value);
+            let count = count_redaction_markers(value, &redacted);
+            *value = redacted;
+            count
+        }
+        _ => 0,
+    }
+}
+
+fn is_sensitive_json_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "authorization",
+        "private_key",
+        "private-key",
+        "privatekey",
+    ]
+    .iter()
+    .any(|sensitive| key.contains(sensitive))
+}
+
+fn redact_secrets_text(input: &str) -> String {
+    if input.contains("-----BEGIN") {
+        return "[REDACTED_PRIVATE_KEY_MATERIAL]".to_string();
+    }
     let mut output = input.to_string();
-    for key in ["password", "passwd", "secret", "token", "api_key", "apikey"] {
+    for key in [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "authorization",
+        "private_key",
+        "private-key",
+        "privatekey",
+        "private key",
+    ] {
         output = redact_assignment(&output, key);
     }
-    output = redact_bearer(&output);
+    output = redact_auth_scheme(&output, "bearer");
+    output = redact_auth_scheme(&output, "basic");
+    output = redact_auth_scheme(&output, "token");
     output = redact_url_credentials(&output);
-    if output.contains("-----BEGIN") {
-        "[REDACTED_PRIVATE_KEY_MATERIAL]".to_string()
+    output
+}
+
+fn count_redaction_markers(input: &str, redacted: &str) -> usize {
+    if input.contains("-----BEGIN") {
+        1
     } else {
-        output
+        redacted
+            .matches("[REDACTED]")
+            .count()
+            .saturating_sub(input.matches("[REDACTED]").count())
     }
 }
 
@@ -293,36 +424,121 @@ fn redact_assignment(input: &str, key: &str) -> String {
         };
         let start = offset + relative;
         let after_key = start + key.len();
-        let separator = output[after_key..].chars().next();
-        if !matches!(separator, Some('=') | Some(':')) {
+        let mut separator_start = after_key;
+        let mut quoted_key = false;
+        while let Some(character) = output[separator_start..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            separator_start += character.len_utf8();
+        }
+        if let Some(key_quote @ ('"' | '\'')) = output[separator_start..].chars().next() {
+            if output[..start].ends_with(key_quote) {
+                quoted_key = true;
+                separator_start += key_quote.len_utf8();
+                while let Some(character) = output[separator_start..].chars().next() {
+                    if !character.is_whitespace() {
+                        break;
+                    }
+                    separator_start += character.len_utf8();
+                }
+            }
+        }
+        let Some(separator) = output[separator_start..].chars().next() else {
+            offset = after_key;
+            continue;
+        };
+        if !matches!(separator, '=' | ':') {
             offset = after_key;
             continue;
         }
-        let value_start = after_key + 1;
-        let value_end = output[value_start..]
-            .find(|character: char| {
-                character.is_whitespace() || matches!(character, ',' | ';' | '&')
-            })
-            .map(|end| value_start + end)
-            .unwrap_or(output.len());
+        let mut value_start = separator_start + separator.len_utf8();
+        while let Some(character) = output[value_start..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            value_start += character.len_utf8();
+        }
+        let mut value_end = if let Some(quote @ ('"' | '\'')) = output[value_start..].chars().next()
+        {
+            let content_start = value_start + quote.len_utf8();
+            let mut escaped = false;
+            output[content_start..]
+                .char_indices()
+                .find_map(|(relative, character)| {
+                    if escaped {
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == quote {
+                        return Some(content_start + relative + character.len_utf8());
+                    }
+                    None
+                })
+                .unwrap_or(output.len())
+        } else {
+            output[value_start..]
+                .find(|character: char| {
+                    character.is_whitespace() || matches!(character, ',' | ';' | '&')
+                })
+                .map(|end| value_start + end)
+                .unwrap_or(output.len())
+        };
+        if key == "authorization" {
+            let value = output[value_start..].to_ascii_lowercase();
+            if ["bearer ", "basic ", "token "]
+                .iter()
+                .any(|scheme| value.starts_with(scheme))
+            {
+                offset = value_end;
+                continue;
+            }
+        }
+        if quoted_key {
+            if let Some(value_quote @ ('"' | '\'')) = output[value_start..].chars().next() {
+                let quote_len = value_quote.len_utf8();
+                if value_end >= value_start + 2 * quote_len
+                    && output[value_end - quote_len..value_end].starts_with(value_quote)
+                {
+                    value_start += quote_len;
+                    value_end -= quote_len;
+                }
+            }
+        }
         output.replace_range(value_start..value_end, "[REDACTED]");
         offset = value_start + "[REDACTED]".len();
     }
     output
 }
 
-fn redact_bearer(input: &str) -> String {
-    let lower = input.to_ascii_lowercase();
-    let Some(start) = lower.find("bearer ") else {
-        return input.to_string();
-    };
-    let value_start = start + "bearer ".len();
-    let value_end = input[value_start..]
-        .find(char::is_whitespace)
-        .map(|end| value_start + end)
-        .unwrap_or(input.len());
+fn redact_auth_scheme(input: &str, scheme: &str) -> String {
+    let marker = format!("{scheme} ");
     let mut output = input.to_string();
-    output.replace_range(value_start..value_end, "[REDACTED]");
+    let mut offset = 0;
+    loop {
+        let lower = output.to_ascii_lowercase();
+        let Some(relative) = lower[offset..].find(&marker) else {
+            break;
+        };
+        let start = offset + relative;
+        let mut value_start = start + marker.len();
+        while let Some(character) = output[value_start..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            value_start += character.len_utf8();
+        }
+        if matches!(output[value_start..].chars().next(), Some('=') | Some(':')) {
+            offset = value_start;
+            continue;
+        }
+        let value_end = output[value_start..]
+            .find(char::is_whitespace)
+            .map(|end| value_start + end)
+            .unwrap_or(output.len());
+        output.replace_range(value_start..value_end, "[REDACTED]");
+        offset = value_start + "[REDACTED]".len();
+    }
     output
 }
 
@@ -431,10 +647,87 @@ mod tests {
             redact_secrets(input),
             "password=[REDACTED] bearer [REDACTED] https://user:[REDACTED]@example.test/api"
         );
+        assert_eq!(
+            redact_secrets(r#"token = "fixture secret value" and api_key : 'fixture key'"#),
+            "token = [REDACTED] and api_key : [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets(
+                "private_key=fixture-key private-key=hyphen-key privatekey=camel-key private key=spaced-key authorization=fixture-auth"
+            ),
+            "private_key=[REDACTED] private-key=[REDACTED] privatekey=[REDACTED] private key=[REDACTED] authorization=[REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets(r#"'private-key':'fixture-key'"#),
+            r#"'private-key':'[REDACTED]'"#
+        );
+        assert_eq!(
+            redact_secrets(
+                "private_key=-----BEGIN PRIVATE KEY-----\nfixture key material\n-----END PRIVATE KEY-----"
+            ),
+            "[REDACTED_PRIVATE_KEY_MATERIAL]"
+        );
+        assert_eq!(
+            redact_secrets_with_count(
+                r#"{"token":"fixture-token","password": "fixture password"}"#
+            ),
+            (
+                r#"{"password":"[REDACTED]","token":"[REDACTED]"}"#.to_string(),
+                2
+            )
+        );
+        assert_eq!(
+            redact_secrets_with_count(
+                r#"{"token":{"first":"fixture-token","second":"fixture-secret"}}"#
+            ),
+            (r#"{"token":"[REDACTED]"}"#.to_string(), 1)
+        );
+        assert_eq!(
+            redact_secrets_with_count(
+                r#"{"Authorization":"Bearer fixture-token","private_key":"fixture-key"}"#
+            ),
+            (
+                r#"{"Authorization":"[REDACTED]","private_key":"[REDACTED]"}"#.to_string(),
+                2
+            )
+        );
+        assert_eq!(
+            redact_secrets("Authorization: Basic dXNlcjpwYXNz"),
+            "Authorization: Basic [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets("X-API-Key: fixture-api-key"),
+            "X-API-Key: [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets("Authorization: token fixture-token"),
+            "Authorization: token [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets_with_count("token=fixture-token password=fixture-password"),
+            ("token=[REDACTED] password=[REDACTED]".to_string(), 2)
+        );
         let value = "x".repeat(MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES + 10);
         assert_eq!(
             truncate_bytes(&value, MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES).len(),
             MAX_DIAGNOSTIC_CONTEXT_VALUE_BYTES
+        );
+    }
+
+    #[test]
+    fn occurrence_redaction_counts_secret_values_in_context() {
+        let mut occurrence =
+            DiagnosticOccurrence::new(RS_2018, correlation_id(), [], None, None).unwrap();
+        occurrence.context.insert(
+            "detail".to_string(),
+            "password=fixture-password".to_string(),
+        );
+
+        let (redacted, count) = occurrence.redacted_with_count();
+        assert_eq!(count, 1);
+        assert_eq!(
+            redacted.context.get("detail").map(String::as_str),
+            Some("password=[REDACTED]")
         );
     }
 }
