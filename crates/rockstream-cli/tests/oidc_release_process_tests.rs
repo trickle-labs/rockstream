@@ -120,15 +120,17 @@ fn scram_principal() -> SecurityPrincipal {
 
 fn mtls_principal(certificate: &rcgen::Certificate) -> SecurityPrincipal {
     let fingerprint = sha2::Sha256::digest(certificate.der().as_ref()).into();
+    mtls_principal_with_fingerprint(fingerprint)
+}
+
+fn mtls_principal_with_fingerprint(certificate_sha256: [u8; 32]) -> SecurityPrincipal {
     SecurityPrincipal {
         format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
         id: PrincipalId(1),
         display_name: "mTLS administrator".to_string(),
         enabled: true,
         revision: 1,
-        login_methods: vec![LoginMethod::Mtls {
-            certificate_sha256: fingerprint,
-        }],
+        login_methods: vec![LoginMethod::Mtls { certificate_sha256 }],
         preset_grants: vec![ScopedPresetGrant {
             preset: PermissionPreset::Administrator,
             scope: PolicyScope::Cluster,
@@ -316,12 +318,30 @@ fn start_gateway_process(
     RunningGateway(child)
 }
 
-fn start_control_process(
+async fn start_control_process(
     working_dir: &Path,
     storage: &Path,
     address: std::net::SocketAddr,
     pki: &rockstream_test_support::pki::TestPki,
 ) -> RunningGateway {
+    let mut certificate_pem =
+        std::io::BufReader::new(std::fs::File::open(&pki.cli_cert_path).unwrap());
+    let cli_certificate = rustls_pemfile::certs(&mut certificate_pem)
+        .next()
+        .expect("test PKI must include a CLI certificate")
+        .unwrap();
+    let principal =
+        mtls_principal_with_fingerprint(sha2::Sha256::digest(cli_certificate.as_ref()).into());
+    let security_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    DurableCatalogStore::new(security_store, "gateway")
+        .preprovision_first_administrator(principal, 1)
+        .await
+        .unwrap();
+
     let child = Command::new(env!("CARGO_BIN_EXE_rockstream"))
         .current_dir(working_dir)
         .env("RUST_LOG", "off")
@@ -1476,7 +1496,7 @@ async fn expired_and_wrong_ca_worker_certificates_are_rejected_by_release_contro
     let storage = temp.path().join("control-storage");
     let pki = rockstream_test_support::pki::TestPki::generate();
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut process = start_control_process(temp.path(), &storage, address, &pki);
+    let mut process = start_control_process(temp.path(), &storage, address, &pki).await;
     wait_for_gateway(&mut process.0, address).await;
 
     let audit_path = storage.join("audit.jsonl");
@@ -1618,7 +1638,7 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
     let worker_storage = temp.path().join("worker-storage");
     let pki = rockstream_test_support::pki::TestPki::generate();
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut process = start_control_process(temp.path(), &storage, address, &pki);
+    let mut process = start_control_process(temp.path(), &storage, address, &pki).await;
     wait_for_gateway(&mut process.0, address).await;
 
     let (client, worker_handle) = rockstream_runtime::start_worker_client_with_tls(
