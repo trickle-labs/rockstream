@@ -475,7 +475,7 @@ async fn management_start_recovers_running_operation_with_exact_phase() {
             next_steps: vec![
                 "Management restarted; reconcile this operation before retrying.".to_owned(),
             ],
-            source_version: "operation-record:2".to_owned(),
+            source_version: "operation-record:3".to_owned(),
         }
     );
     assert!(operation
@@ -557,7 +557,7 @@ async fn management_cancellation_obeys_the_safe_boundary() {
             phase: "cancelled_before_start".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:2".to_owned(),
+            source_version: "operation-record:3".to_owned(),
         }
     );
 
@@ -595,7 +595,7 @@ async fn management_cancellation_obeys_the_safe_boundary() {
             phase: "worker_handoff_started".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:2".to_owned(),
+            source_version: "operation-record:3".to_owned(),
         }
     );
     server.shutdown();
@@ -768,7 +768,7 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
     assert_eq!(completed.phase, "completed");
     assert!(completed.error_code.is_empty());
     assert!(completed.next_steps.is_empty());
-    assert_eq!(completed.source_version, "operation-record:2");
+    assert_eq!(completed.source_version, "operation-record:3");
     assert_eq!(
         shard_manager.get(ShardId(77)).unwrap().worker_id,
         WorkerId(2)
@@ -911,7 +911,7 @@ async fn management_migrate_moves_a_real_shard_once() {
     assert_eq!(completed.phase, "completed");
     assert_eq!(completed.error_code, "");
     assert_eq!(completed.next_steps, Vec::<String>::new());
-    assert_eq!(completed.source_version, "operation-record:2");
+    assert_eq!(completed.source_version, "operation-record:3");
     assert_eq!(shard_manager.get(ShardId(77)), Some(new_lease));
     control.shutdown();
 }

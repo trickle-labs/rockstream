@@ -319,6 +319,10 @@ impl ManagementOperationStore {
         }
     }
 
+    pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
+    }
+
     fn operation_path(&self, operation_id: &str) -> Result<Path, OperationStoreError> {
         if operation_id.is_empty() || operation_id.len() > MAX_OPERATION_ID_BYTES {
             return Err(OperationStoreError::InvalidOperationId);

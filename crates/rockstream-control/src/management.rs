@@ -262,6 +262,7 @@ impl ManagementService {
         operations: ManagementOperationStore,
         config: NodeConfig,
     ) -> Self {
+        let support_artifacts = SupportArtifactStore::new(operations.object_store());
         Self {
             catalog,
             shard_manager,
@@ -274,7 +275,7 @@ impl ManagementService {
             backup_waiters: None,
             security_catalog: None,
             request_gate: Arc::new(Semaphore::new(MAX_MANAGEMENT_REQUESTS)),
-            support_artifacts: SupportArtifactStore::default(),
+            support_artifacts,
             support_generation_gate: Arc::new(Semaphore::new(1)),
             support_download_gate: Arc::new(Semaphore::new(8)),
         }
@@ -374,6 +375,26 @@ impl ManagementService {
             ));
         }
 
+        match self.support_artifacts.initialize().await {
+            Ok(()) => {
+                self.support_artifacts
+                    .cleanup_expired(Utc::now().timestamp_millis().max(1) as u64)
+                    .await
+                    .map_err(|error| {
+                        io::Error::other(format!("management support artifact recovery: {error:?}"))
+                    })?;
+            }
+            Err(ArtifactStoreError::Unsupported) => {
+                self.support_artifacts.disable();
+                tracing::warn!("management support artifacts disabled: object store lacks atomic conditional writes");
+            }
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "management support artifact storage: {error:?}"
+                )));
+            }
+        }
+
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -468,20 +489,21 @@ impl ManagementService {
                 }
             }
         });
-        let artifacts = self.support_artifacts.clone();
-        let mut artifact_shutdown = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => artifacts.cleanup_expired(Instant::now()),
-                    _ = artifact_shutdown.recv() => {
-                        artifacts.clear();
-                        break;
+        if self.support_artifacts.is_available() {
+            let artifacts = self.support_artifacts.clone();
+            let mut artifact_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => if let Err(error) = artifacts.cleanup_expired(Utc::now().timestamp_millis().max(1) as u64).await {
+                            tracing::warn!(?error, "management support artifact cleanup failed");
+                        },
+                        _ = artifact_shutdown.recv() => break,
                     }
                 }
-            }
-        });
+            });
+        }
         for record in recover {
             self.reconcile(&record).await;
         }
@@ -765,6 +787,48 @@ impl ManagementService {
             ));
         }
         Ok(content)
+    }
+
+    async fn fail_support_artifact_generation(
+        &self,
+        request: &Request<v1::GenerateSupportArtifactRequest>,
+        principal_id: PrincipalId,
+        policy_revision: u64,
+        artifact: (&str, &PolicyScope),
+        operation: &OperationRecord,
+        phase: &str,
+    ) -> Result<(), Status> {
+        self.record_support_artifact_audit(
+            request,
+            principal_id,
+            policy_revision,
+            SupportArtifactAudit::operation(
+                artifact.0,
+                artifact.1,
+                SecurityAuditClass::AdminOperationCompletion,
+                SecurityAuditOutcome::Failure,
+                AuditField::Known("generating".to_owned()),
+                AuditField::Known(phase.to_owned()),
+            ),
+        )
+        .await?;
+        self.operations
+            .transition_if(
+                operation.operation_id(),
+                OperationStatus::Running,
+                operation.phase(),
+                crate::management_store::OperationUpdate {
+                    status: OperationStatus::Failed,
+                    updated_at_ms: Utc::now().timestamp_millis().max(1),
+                    progress: Some(100),
+                    phase: Some(phase.to_owned()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .map_err(store_error)?;
+        Ok(())
     }
 
     fn nodes(&self) -> (Vec<WorkerInfo>, String) {
@@ -1815,7 +1879,8 @@ impl v1::management_service_server::ManagementService for ManagementService {
         if accepted.status() == OperationStatus::Succeeded {
             let available = self
                 .support_artifacts
-                .metadata(&key, Instant::now())
+                .metadata(&key, Utc::now().timestamp_millis().max(1) as u64)
+                .await
                 .is_ok_and(|metadata| {
                     metadata.owner == principal_id
                         && metadata.scope == scope
@@ -1923,8 +1988,8 @@ impl v1::management_service_server::ManagementService for ManagementService {
             ),
         )
         .await?;
-        let now = Instant::now();
-        let existing = self.support_artifacts.metadata(&key, now);
+        let now_ms = Utc::now().timestamp_millis().max(1) as u64;
+        let existing = self.support_artifacts.metadata(&key, now_ms).await;
         match existing {
             Ok(metadata)
                 if metadata.owner == principal_id
@@ -1943,53 +2008,32 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 {
                     Ok(content) => content,
                     Err(status) => {
-                        self.record_support_artifact_audit(
+                        self.fail_support_artifact_generation(
                             &request,
                             principal_id,
                             policy_revision,
-                            SupportArtifactAudit::operation(
-                                &key,
-                                &scope,
-                                SecurityAuditClass::AdminOperationCompletion,
-                                SecurityAuditOutcome::Failure,
-                                AuditField::Known("generating".to_owned()),
-                                AuditField::Known("failed".to_owned()),
-                            ),
+                            (&key, &scope),
+                            &running,
+                            "generation_failed",
                         )
                         .await?;
-                        self.operations
-                            .transition_if(
-                                running.operation_id(),
-                                OperationStatus::Running,
-                                running.phase(),
-                                crate::management_store::OperationUpdate {
-                                    status: OperationStatus::Failed,
-                                    updated_at_ms: Utc::now().timestamp_millis().max(1),
-                                    progress: Some(100),
-                                    phase: Some("generation_failed".to_owned()),
-                                    error_code: None,
-                                    next_steps: Vec::new(),
-                                },
-                            )
-                            .await
-                            .map_err(store_error)?;
                         return Err(status);
                     }
                 };
-                let expiry_delta_ms =
-                    expires_at_ms.saturating_sub(Utc::now().timestamp_millis().max(1) as u64);
-                let expires_at = Instant::now() + Duration::from_millis(expiry_delta_ms);
-                if let Err(error) = self.support_artifacts.insert(
-                    key.clone(),
-                    principal_id,
-                    scope.clone(),
-                    Arc::from(content),
-                    ArtifactExpiry {
-                        monotonic: expires_at,
-                        unix_ms: expires_at_ms,
-                    },
-                    Instant::now(),
-                ) {
+                if let Err(error) = self
+                    .support_artifacts
+                    .insert(
+                        key.clone(),
+                        principal_id,
+                        scope.clone(),
+                        Arc::from(content),
+                        ArtifactExpiry {
+                            unix_ms: expires_at_ms,
+                        },
+                        Utc::now().timestamp_millis().max(1) as u64,
+                    )
+                    .await
+                {
                     let status = match error {
                         ArtifactStoreError::TooLarge | ArtifactStoreError::StorageFull => {
                             Status::resource_exhausted("support artifact storage budget is full")
@@ -2000,42 +2044,41 @@ impl v1::management_service_server::ManagementService for ManagementService {
                         ArtifactStoreError::NotFound | ArtifactStoreError::WrongOwner => {
                             Status::internal("support artifact store rejected the new artifact")
                         }
+                        ArtifactStoreError::StorageUnavailable => {
+                            Status::unavailable("support artifact storage is unavailable")
+                        }
+                        ArtifactStoreError::Unsupported => Status::unavailable(
+                            "support artifact storage requires atomic conditional writes",
+                        ),
                     };
-                    self.record_support_artifact_audit(
+                    self.fail_support_artifact_generation(
                         &request,
                         principal_id,
                         policy_revision,
-                        SupportArtifactAudit::operation(
-                            &key,
-                            &scope,
-                            SecurityAuditClass::AdminOperationCompletion,
-                            SecurityAuditOutcome::Failure,
-                            AuditField::Known("generating".to_owned()),
-                            AuditField::Known("failed".to_owned()),
-                        ),
+                        (&key, &scope),
+                        &running,
+                        "generation_failed",
                     )
                     .await?;
-                    self.operations
-                        .transition_if(
-                            running.operation_id(),
-                            OperationStatus::Running,
-                            running.phase(),
-                            crate::management_store::OperationUpdate {
-                                status: OperationStatus::Failed,
-                                updated_at_ms: Utc::now().timestamp_millis().max(1),
-                                progress: Some(100),
-                                phase: Some("generation_failed".to_owned()),
-                                error_code: None,
-                                next_steps: Vec::new(),
-                            },
-                        )
-                        .await
-                        .map_err(store_error)?;
                     return Err(status);
                 }
             }
-            Err(_) => {
-                return Err(Status::internal("support artifact store is unavailable"));
+            Err(error) => {
+                self.fail_support_artifact_generation(
+                    &request,
+                    principal_id,
+                    policy_revision,
+                    (&key, &scope),
+                    &running,
+                    "storage_unavailable",
+                )
+                .await?;
+                return Err(match error {
+                    ArtifactStoreError::Unsupported => Status::unavailable(
+                        "support artifact storage requires atomic conditional writes",
+                    ),
+                    _ => Status::unavailable("support artifact storage is unavailable"),
+                });
             }
         }
         if let Err(status) = self
@@ -2054,7 +2097,12 @@ impl v1::management_service_server::ManagementService for ManagementService {
             )
             .await
         {
-            self.support_artifacts.remove(&key, principal_id);
+            if let Err(error) = self.support_artifacts.remove(&key, principal_id).await {
+                tracing::error!(?error, artifact_id = %key, "failed to remove unaudited support artifact");
+                return Err(Status::unavailable(
+                    "support artifact cleanup is unavailable",
+                ));
+            }
             return Err(status);
         }
         self.operations
@@ -2107,7 +2155,8 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .await?;
         let metadata = match self
             .support_artifacts
-            .metadata(&artifact_id, Instant::now())
+            .metadata(&artifact_id, Utc::now().timestamp_millis().max(1) as u64)
+            .await
         {
             Ok(metadata) if metadata.owner == principal_id => metadata,
             Ok(_) | Err(ArtifactStoreError::NotFound) => {
@@ -2120,7 +2169,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 .await?;
                 return Err(Status::not_found("support artifact not found or expired"));
             }
-            Err(_) => return Err(Status::internal("support artifact store is unavailable")),
+            Err(_) => return Err(Status::unavailable("support artifact store is unavailable")),
         };
         let (downloaded_principal, policy_revision) = self
             .authorize(
@@ -2132,29 +2181,31 @@ impl v1::management_service_server::ManagementService for ManagementService {
         if downloaded_principal != principal_id || metadata.expires_at_ms == 0 {
             return Err(Status::not_found("support artifact not found or expired"));
         }
-        let (content, expires_at_ms, expires_at) =
-            match self
-                .support_artifacts
-                .download(&artifact_id, principal_id, Instant::now())
-            {
-                Ok((content, expires_at_ms, expires_at))
-                    if expires_at_ms == metadata.expires_at_ms =>
-                {
-                    (content, expires_at_ms, expires_at)
-                }
-                Ok(_) => return Err(Status::internal("support artifact expiry metadata changed")),
-                Err(ArtifactStoreError::WrongOwner | ArtifactStoreError::NotFound) => {
-                    self.record_support_artifact_audit(
-                        &request,
-                        principal_id,
-                        policy_revision,
-                        SupportArtifactAudit::download_denial(&artifact_id, &artifact_scope),
-                    )
-                    .await?;
-                    return Err(Status::not_found("support artifact not found or expired"));
-                }
-                Err(_) => return Err(Status::internal("support artifact store is unavailable")),
-            };
+        let (content, expires_at_ms, expires_at) = match self
+            .support_artifacts
+            .download(
+                &artifact_id,
+                principal_id,
+                Utc::now().timestamp_millis().max(1) as u64,
+            )
+            .await
+        {
+            Ok((content, expires_at_ms, expires_at)) if expires_at_ms == metadata.expires_at_ms => {
+                (content, expires_at_ms, expires_at)
+            }
+            Ok(_) => return Err(Status::internal("support artifact expiry metadata changed")),
+            Err(ArtifactStoreError::WrongOwner | ArtifactStoreError::NotFound) => {
+                self.record_support_artifact_audit(
+                    &request,
+                    principal_id,
+                    policy_revision,
+                    SupportArtifactAudit::download_denial(&artifact_id, &artifact_scope),
+                )
+                .await?;
+                return Err(Status::not_found("support artifact not found or expired"));
+            }
+            Err(_) => return Err(Status::unavailable("support artifact store is unavailable")),
+        };
         let download_permit = self
             .support_download_gate
             .clone()
@@ -2467,18 +2518,21 @@ mod tests {
             ]
         );
 
-        service.support_artifacts.clear();
-        let cleared_retry = <ManagementService as v1::management_service_server::ManagementService>::generate_support_artifact(
-            &service,
+        let restarted_service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            operations.clone(),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let retry_after_restart = <ManagementService as v1::management_service_server::ManagementService>::generate_support_artifact(
+            &restarted_service,
             request(),
         )
         .await
-        .unwrap_err();
-        assert_eq!(cleared_retry.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(
-            cleared_retry.message(),
-            "support artifact expired or was cleared; use a new idempotency key"
-        );
+        .unwrap()
+        .into_inner();
+        assert_eq!(first, retry_after_restart);
         let audit = security_catalog
             .list_security_audit_records()
             .await
@@ -2490,7 +2544,6 @@ mod tests {
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::AdminOperationCompletion,
                 SecurityAuditClass::AdminOperationStart,
-                SecurityAuditClass::AdminOperationCompletion,
             ]
         );
     }

@@ -1,39 +1,46 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use object_store::path::Path;
+use object_store::{
+    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion,
+};
 use rockstream_types::authorization::PolicyScope;
 use rockstream_types::ids::PrincipalId;
+use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_ARTIFACT_STORAGE_BYTES: usize = 100 * 1024 * 1024;
 pub(crate) const ARTIFACT_TTL: Duration = Duration::from_secs(10 * 60);
+const LEDGER_CAS_RETRIES: usize = 32;
+const LEDGER_FORMAT_VERSION: u16 = 1;
+
+#[derive(Clone)]
+pub(crate) struct SupportArtifactStore {
+    store: Arc<dyn ObjectStore>,
+    prefix: Path,
+    available: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ArtifactLedger {
+    format_version: u16,
+    artifacts: BTreeMap<String, LedgerArtifact>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+struct LedgerArtifact {
+    owner: PrincipalId,
+    scope: PolicyScope,
+    size: usize,
+    expires_at_ms: u64,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ArtifactExpiry {
-    pub monotonic: Instant,
     pub unix_ms: u64,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct SupportArtifactStore {
-    // shortcut: the aggregate cap is per service instance; use deployment-shared accounting before qualification.
-    inner: Arc<Mutex<Inner>>,
-}
-
-#[derive(Default)]
-struct Inner {
-    artifacts: HashMap<String, StoredArtifact>,
-    bytes_used: usize,
-}
-
-struct StoredArtifact {
-    owner: PrincipalId,
-    scope: PolicyScope,
-    content: Arc<[u8]>,
-    expires_at: Instant,
-    expires_at_ms: u64,
 }
 
 pub(crate) struct ArtifactMetadata {
@@ -49,133 +56,349 @@ pub(crate) enum ArtifactStoreError {
     Exists,
     NotFound,
     WrongOwner,
+    Unsupported,
+    StorageUnavailable,
 }
 
 impl SupportArtifactStore {
-    pub fn insert(
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            prefix: Path::from("control/support-artifacts"),
+            available: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub async fn initialize(&self) -> Result<(), ArtifactStoreError> {
+        match async {
+            self.mutate_ledger(|_| Ok(true)).await?;
+            self.mutate_ledger(|_| Ok(true)).await
+        }
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(ArtifactStoreError::Unsupported) => {
+                self.available.store(false, Ordering::Release);
+                Err(ArtifactStoreError::Unsupported)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn insert(
         &self,
         id: String,
         owner: PrincipalId,
         scope: PolicyScope,
         content: Arc<[u8]>,
         expiry: ArtifactExpiry,
-        now: Instant,
+        now_ms: u64,
     ) -> Result<(), ArtifactStoreError> {
+        self.ensure_available()?;
         if content.len() > MAX_ARTIFACT_BYTES {
             return Err(ArtifactStoreError::TooLarge);
         }
+        if expiry.unix_ms <= now_ms {
+            return Err(ArtifactStoreError::NotFound);
+        }
+        self.cleanup_expired(now_ms).await?;
 
-        let mut inner = self.inner.lock();
-        Self::remove_expired(&mut inner, now);
-        if inner.artifacts.contains_key(&id) {
-            return Err(ArtifactStoreError::Exists);
-        }
-        let Some(next_size) = inner.bytes_used.checked_add(content.len()) else {
-            return Err(ArtifactStoreError::StorageFull);
+        let entry = LedgerArtifact {
+            owner,
+            scope,
+            size: content.len(),
+            expires_at_ms: expiry.unix_ms,
         };
-        if next_size > MAX_ARTIFACT_STORAGE_BYTES {
-            return Err(ArtifactStoreError::StorageFull);
+        self.mutate_ledger(|ledger| {
+            if let Some(existing) = ledger.artifacts.get(&id) {
+                return if existing == &entry {
+                    Ok(false)
+                } else {
+                    Err(ArtifactStoreError::Exists)
+                };
+            }
+            let used = ledger
+                .artifacts
+                .values()
+                .try_fold(0usize, |total, item| total.checked_add(item.size));
+            let Some(next_size) = used.and_then(|used| used.checked_add(entry.size)) else {
+                return Err(ArtifactStoreError::StorageFull);
+            };
+            if next_size > MAX_ARTIFACT_STORAGE_BYTES {
+                return Err(ArtifactStoreError::StorageFull);
+            }
+            ledger.artifacts.insert(id.clone(), entry.clone());
+            Ok(true)
+        })
+        .await?;
+
+        let path = self.artifact_path(&id);
+        match self
+            .store
+            .put_opts(
+                &path,
+                content.as_ref().to_vec().into(),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(ObjectStoreError::AlreadyExists { .. }) => {
+                let result = self
+                    .store
+                    .get(&path)
+                    .await
+                    .map_err(|_| ArtifactStoreError::StorageUnavailable)?;
+                let existing = result
+                    .bytes()
+                    .await
+                    .map_err(|_| ArtifactStoreError::StorageUnavailable)?;
+                if existing.as_ref() == content.as_ref() {
+                    Ok(())
+                } else {
+                    Err(ArtifactStoreError::Exists)
+                }
+            }
+            Err(_) => Err(ArtifactStoreError::StorageUnavailable),
         }
-        inner.bytes_used = next_size;
-        inner.artifacts.insert(
-            id,
-            StoredArtifact {
-                owner,
-                scope,
-                content,
-                expires_at: expiry.monotonic,
-                expires_at_ms: expiry.unix_ms,
-            },
-        );
-        Ok(())
     }
 
-    pub fn metadata(&self, id: &str, now: Instant) -> Result<ArtifactMetadata, ArtifactStoreError> {
-        let mut inner = self.inner.lock();
-        Self::remove_expired(&mut inner, now);
-        inner
+    pub async fn metadata(
+        &self,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<ArtifactMetadata, ArtifactStoreError> {
+        self.ensure_available()?;
+        let (ledger, _) = self.read_ledger().await?;
+        let artifact = ledger
             .artifacts
             .get(id)
-            .filter(|artifact| artifact.expires_at > now)
-            .map(|artifact| ArtifactMetadata {
-                owner: artifact.owner,
-                scope: artifact.scope.clone(),
-                expires_at_ms: artifact.expires_at_ms,
-            })
-            .ok_or(ArtifactStoreError::NotFound)
+            .filter(|artifact| artifact.expires_at_ms > now_ms)
+            .ok_or(ArtifactStoreError::NotFound)?;
+        let meta = self
+            .store
+            .head(&self.artifact_path(id))
+            .await
+            .map_err(|error| match error {
+                ObjectStoreError::NotFound { .. } => ArtifactStoreError::NotFound,
+                _ => ArtifactStoreError::StorageUnavailable,
+            })?;
+        if meta.size != artifact.size as u64 {
+            return Err(ArtifactStoreError::StorageUnavailable);
+        }
+        Ok(ArtifactMetadata {
+            owner: artifact.owner,
+            scope: artifact.scope.clone(),
+            expires_at_ms: artifact.expires_at_ms,
+        })
     }
 
-    pub fn download(
+    pub async fn download(
         &self,
         id: &str,
         owner: PrincipalId,
-        now: Instant,
+        now_ms: u64,
     ) -> Result<(Arc<[u8]>, u64, Instant), ArtifactStoreError> {
-        let mut inner = self.inner.lock();
-        Self::remove_expired(&mut inner, now);
-        let artifact = inner
+        self.ensure_available()?;
+        let (ledger, _) = self.read_ledger().await?;
+        let artifact = ledger
             .artifacts
             .get(id)
+            .filter(|artifact| artifact.expires_at_ms > now_ms)
             .ok_or(ArtifactStoreError::NotFound)?;
-        if artifact.expires_at <= now {
-            return Err(ArtifactStoreError::NotFound);
-        }
         if artifact.owner != owner {
             return Err(ArtifactStoreError::WrongOwner);
         }
+        let result =
+            self.store
+                .get(&self.artifact_path(id))
+                .await
+                .map_err(|error| match error {
+                    ObjectStoreError::NotFound { .. } => ArtifactStoreError::NotFound,
+                    _ => ArtifactStoreError::StorageUnavailable,
+                })?;
+        let content = result
+            .bytes()
+            .await
+            .map_err(|_| ArtifactStoreError::StorageUnavailable)?;
+        if content.len() != artifact.size {
+            return Err(ArtifactStoreError::StorageUnavailable);
+        }
+        let remaining = artifact.expires_at_ms.saturating_sub(now_ms);
         Ok((
-            artifact.content.clone(),
+            Arc::from(content.to_vec()),
             artifact.expires_at_ms,
-            artifact.expires_at,
+            Instant::now() + Duration::from_millis(remaining),
         ))
     }
 
-    pub fn remove(&self, id: &str, owner: PrincipalId) {
-        let mut inner = self.inner.lock();
-        if inner
-            .artifacts
-            .get(id)
-            .is_some_and(|artifact| artifact.owner == owner)
-        {
-            if let Some(artifact) = inner.artifacts.remove(id) {
-                inner.bytes_used = inner.bytes_used.saturating_sub(artifact.content.len());
+    pub async fn remove(&self, id: &str, owner: PrincipalId) -> Result<(), ArtifactStoreError> {
+        self.ensure_available()?;
+        let (ledger, _) = self.read_ledger().await?;
+        let Some(artifact) = ledger.artifacts.get(id) else {
+            return Ok(());
+        };
+        if artifact.owner != owner {
+            return Ok(());
+        }
+        self.delete_artifact(id).await?;
+        self.mutate_ledger(|ledger| {
+            if ledger
+                .artifacts
+                .get(id)
+                .is_some_and(|current| current.owner == owner)
+            {
+                ledger.artifacts.remove(id);
+                Ok(true)
+            } else {
+                Ok(false)
             }
+        })
+        .await
+    }
+
+    pub async fn cleanup_expired(&self, now_ms: u64) -> Result<(), ArtifactStoreError> {
+        self.ensure_available()?;
+        let (ledger, _) = self.read_ledger().await?;
+        let expired: Vec<_> = ledger
+            .artifacts
+            .iter()
+            .filter(|(_, artifact)| artifact.expires_at_ms <= now_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if expired.is_empty() {
+            return Ok(());
+        }
+        for id in &expired {
+            self.delete_artifact(id).await?;
+        }
+        self.mutate_ledger(|ledger| {
+            let before = ledger.artifacts.len();
+            ledger
+                .artifacts
+                .retain(|_, artifact| artifact.expires_at_ms > now_ms);
+            Ok(ledger.artifacts.len() != before)
+        })
+        .await
+    }
+
+    async fn delete_artifact(&self, id: &str) -> Result<(), ArtifactStoreError> {
+        match self.store.delete(&self.artifact_path(id)).await {
+            Ok(()) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
+            Err(_) => Err(ArtifactStoreError::StorageUnavailable),
         }
     }
 
-    pub fn cleanup_expired(&self, now: Instant) {
-        Self::remove_expired(&mut self.inner.lock(), now);
+    pub fn disable(&self) {
+        self.available.store(false, Ordering::Release);
     }
 
-    pub fn clear(&self) {
-        *self.inner.lock() = Inner::default();
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
     }
 
-    fn remove_expired(inner: &mut Inner, now: Instant) {
-        inner.artifacts.retain(|_, artifact| {
-            artifact.expires_at > now || Arc::strong_count(&artifact.content) > 1
-        });
-        inner.bytes_used = inner
-            .artifacts
-            .values()
-            .map(|artifact| artifact.content.len())
-            .sum();
+    fn ensure_available(&self) -> Result<(), ArtifactStoreError> {
+        if self.available.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(ArtifactStoreError::Unsupported)
+        }
+    }
+
+    async fn read_ledger(
+        &self,
+    ) -> Result<(ArtifactLedger, Option<UpdateVersion>), ArtifactStoreError> {
+        match self.store.get(&self.ledger_path()).await {
+            Ok(result) => {
+                let version = UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                };
+                let bytes = result
+                    .bytes()
+                    .await
+                    .map_err(|_| ArtifactStoreError::StorageUnavailable)?;
+                let ledger: ArtifactLedger = serde_json::from_slice(&bytes)
+                    .map_err(|_| ArtifactStoreError::StorageUnavailable)?;
+                if ledger.format_version != LEDGER_FORMAT_VERSION {
+                    return Err(ArtifactStoreError::StorageUnavailable);
+                }
+                Ok((ledger, Some(version)))
+            }
+            Err(ObjectStoreError::NotFound { .. }) => Ok((
+                ArtifactLedger {
+                    format_version: LEDGER_FORMAT_VERSION,
+                    artifacts: BTreeMap::new(),
+                },
+                None,
+            )),
+            Err(_) => Err(ArtifactStoreError::StorageUnavailable),
+        }
+    }
+
+    async fn mutate_ledger<F>(&self, mutation: F) -> Result<(), ArtifactStoreError>
+    where
+        F: Fn(&mut ArtifactLedger) -> Result<bool, ArtifactStoreError>,
+    {
+        for _ in 0..LEDGER_CAS_RETRIES {
+            let (mut ledger, version) = self.read_ledger().await?;
+            let changed = mutation(&mut ledger)?;
+            if !changed {
+                return Ok(());
+            }
+            let bytes =
+                serde_json::to_vec(&ledger).map_err(|_| ArtifactStoreError::StorageUnavailable)?;
+            let mode = version.map_or(PutMode::Create, PutMode::Update);
+            match self
+                .store
+                .put_opts(
+                    &self.ledger_path(),
+                    bytes.into(),
+                    PutOptions {
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(ObjectStoreError::AlreadyExists { .. })
+                | Err(ObjectStoreError::Precondition { .. })
+                | Err(ObjectStoreError::NotFound { .. }) => continue,
+                Err(ObjectStoreError::NotImplemented { .. }) => {
+                    return Err(ArtifactStoreError::Unsupported)
+                }
+                Err(_) => return Err(ArtifactStoreError::StorageUnavailable),
+            }
+        }
+        Err(ArtifactStoreError::StorageUnavailable)
+    }
+
+    fn ledger_path(&self) -> Path {
+        self.prefix.clone().join("ledger.json")
+    }
+
+    fn artifact_path(&self, id: &str) -> Path {
+        self.prefix
+            .clone()
+            .join(format!("artifacts/{}.json", hex::encode(id.as_bytes())))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
 
-    fn artifact_expiry(monotonic: Instant, unix_ms: u64) -> ArtifactExpiry {
-        ArtifactExpiry { monotonic, unix_ms }
-    }
-
-    #[test]
-    fn artifact_bytes_are_actor_bound_and_expire_at_the_deadline() {
-        let store = SupportArtifactStore::default();
-        let now = Instant::now();
-        let expires_at = now + ARTIFACT_TTL;
+    #[tokio::test]
+    async fn artifacts_are_shared_actor_bound_and_expire_at_the_deadline() {
+        let object_store = Arc::new(InMemory::new());
+        let store = SupportArtifactStore::new(object_store.clone());
+        let other_service = SupportArtifactStore::new(object_store);
+        store.initialize().await.unwrap();
+        let now_ms = 1_000_000;
+        let expires_at_ms = now_ms + ARTIFACT_TTL.as_millis() as u64;
         let content: Arc<[u8]> = Arc::from(b"{\"safe\":\"complete artifact\"}".to_vec());
         store
             .insert(
@@ -183,104 +406,114 @@ mod tests {
                 PrincipalId(7),
                 PolicyScope::Cluster,
                 content.clone(),
-                artifact_expiry(expires_at, 600_000),
-                now,
+                ArtifactExpiry {
+                    unix_ms: expires_at_ms,
+                },
+                now_ms,
             )
+            .await
             .unwrap();
 
         assert_eq!(
-            store.download("opaque-id", PrincipalId(7), now).unwrap(),
-            (content.clone(), 600_000, expires_at)
+            other_service
+                .download("opaque-id", PrincipalId(7), now_ms)
+                .await
+                .unwrap()
+                .0,
+            content
         );
         assert_eq!(
-            store.download("opaque-id", PrincipalId(8), now),
+            other_service
+                .download("opaque-id", PrincipalId(8), now_ms)
+                .await,
             Err(ArtifactStoreError::WrongOwner)
         );
-        drop(content);
+        other_service.cleanup_expired(expires_at_ms).await.unwrap();
         assert_eq!(
-            store.download("opaque-id", PrincipalId(7), expires_at),
+            store
+                .download("opaque-id", PrincipalId(7), expires_at_ms)
+                .await,
             Err(ArtifactStoreError::NotFound)
         );
-        assert!(store.metadata("opaque-id", expires_at).is_err());
     }
 
-    #[test]
-    fn retained_artifacts_obey_per_item_and_aggregate_limits() {
-        let store = SupportArtifactStore::default();
-        let now = Instant::now();
-        let expiry = now + ARTIFACT_TTL;
+    #[tokio::test]
+    async fn concurrent_services_share_the_deployment_storage_budget() {
+        let object_store = Arc::new(InMemory::new());
+        let first = SupportArtifactStore::new(object_store.clone());
+        let second = SupportArtifactStore::new(object_store);
+        let now_ms = 1_000_000;
+        let expires_at_ms = now_ms + ARTIFACT_TTL.as_millis() as u64;
+        let content: Arc<[u8]> = Arc::from(vec![0; MAX_ARTIFACT_BYTES]);
 
-        for index in 0..MAX_ARTIFACT_STORAGE_BYTES / MAX_ARTIFACT_BYTES {
+        for index in 0..9 {
+            let store = if index % 2 == 0 { &first } else { &second };
             store
                 .insert(
-                    index.to_string(),
+                    format!("seed-{index}"),
                     PrincipalId(1),
                     PolicyScope::Cluster,
-                    Arc::from(vec![index as u8; MAX_ARTIFACT_BYTES]),
-                    artifact_expiry(expiry, 1),
-                    now,
+                    content.clone(),
+                    ArtifactExpiry {
+                        unix_ms: expires_at_ms,
+                    },
+                    now_ms,
                 )
+                .await
                 .unwrap();
         }
-        assert_eq!(
-            store.insert(
-                "overflow".to_owned(),
+        let expiry = ArtifactExpiry {
+            unix_ms: expires_at_ms,
+        };
+        let (left, right) = tokio::join!(
+            first.insert(
+                "race-left".to_owned(),
                 PrincipalId(1),
                 PolicyScope::Cluster,
-                Arc::from(vec![0; 1]),
-                artifact_expiry(expiry, 1),
-                now,
+                content.clone(),
+                expiry,
+                now_ms,
             ),
-            Err(ArtifactStoreError::StorageFull)
-        );
-        assert_eq!(
-            store.insert(
-                "oversized".to_owned(),
+            second.insert(
+                "race-right".to_owned(),
                 PrincipalId(1),
                 PolicyScope::Cluster,
-                Arc::from(vec![0; MAX_ARTIFACT_BYTES + 1]),
-                artifact_expiry(expiry, 1),
-                now,
+                content,
+                expiry,
+                now_ms,
             ),
-            Err(ArtifactStoreError::TooLarge)
         );
 
-        let (active_content, _, _) = store.download("0", PrincipalId(1), now).unwrap();
-        store.cleanup_expired(expiry);
-        for index in 0..MAX_ARTIFACT_STORAGE_BYTES / MAX_ARTIFACT_BYTES - 1 {
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert!(matches!(
+            left.err().or_else(|| right.err()),
+            Some(ArtifactStoreError::StorageFull)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_filesystem_without_compare_and_swap_disables_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalFileSystem::new_with_prefix(directory.path()).unwrap());
+        let store = SupportArtifactStore::new(object_store);
+
+        assert_eq!(
+            store.initialize().await,
+            Err(ArtifactStoreError::Unsupported)
+        );
+        assert!(!store.is_available());
+        assert_eq!(
             store
                 .insert(
-                    format!("replacement-{index}"),
+                    "opaque-id".to_owned(),
                     PrincipalId(1),
                     PolicyScope::Cluster,
-                    Arc::from(vec![0; MAX_ARTIFACT_BYTES]),
-                    artifact_expiry(expiry + ARTIFACT_TTL, 2),
-                    expiry,
+                    Arc::from(b"safe".to_vec()),
+                    ArtifactExpiry { unix_ms: 2_000_000 },
+                    1_000_000,
                 )
-                .unwrap();
-        }
-        assert_eq!(
-            store.insert(
-                "over-budget-with-active-download".to_owned(),
-                PrincipalId(1),
-                PolicyScope::Cluster,
-                Arc::from(vec![0; 1]),
-                artifact_expiry(expiry + ARTIFACT_TTL, 2),
-                expiry,
-            ),
-            Err(ArtifactStoreError::StorageFull)
+                .await,
+            Err(ArtifactStoreError::Unsupported)
         );
-        drop(active_content);
-        store.cleanup_expired(expiry);
-        store
-            .insert(
-                "after-cleanup".to_owned(),
-                PrincipalId(1),
-                PolicyScope::Cluster,
-                Arc::from(b"released capacity".to_vec()),
-                artifact_expiry(expiry + ARTIFACT_TTL, 2),
-                expiry,
-            )
-            .unwrap();
     }
 }
