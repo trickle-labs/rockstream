@@ -1119,7 +1119,14 @@ pub fn run_start_with_dev_transport(
                                 })?,
                         ) as Arc<dyn object_store::ObjectStore>
                     } else {
-                        store.clone()
+                        rockstream_storage::build_runtime_object_store(&opts.storage, "management")
+                            .map_err(|error| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open management store: {error}"),
+                                    "Check storage directory permissions or object-store credentials.",
+                                )
+                            })?
                     };
                     service = service.with_management(addr.clone(), management_store, node_config.clone());
                 }
@@ -1226,9 +1233,24 @@ pub fn run_start_with_dev_transport(
                 )));
             if opts.daemon {
                 if let Some(addr) = &node_config.control.management_addr {
+                    let management_store = if opts.control_shared_storage.is_some() {
+                        shared_object_store.clone()
+                    } else {
+                        rockstream_storage::build_runtime_object_store(
+                            &shared_store_dir,
+                            "management",
+                        )
+                        .map_err(|error| {
+                            CliError::new(
+                                RS_0003,
+                                format!("failed to open management store: {error}"),
+                                "Check storage directory permissions or object-store credentials.",
+                            )
+                        })?
+                    };
                     service = service.with_management(
                         addr.clone(),
-                        shared_object_store.clone(),
+                        management_store,
                         node_config.clone(),
                     );
                 }
