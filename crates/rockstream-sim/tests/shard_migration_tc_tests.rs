@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use rockstream_test_support::pki::TestPki;
 use rockstream_types::ids::WorkerId;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -36,12 +37,28 @@ struct TcCluster {
     control_addr: SocketAddr,
     management_addr: SocketAddr,
     network: String,
+    pki: TestPki,
+    _storage_dir: tempfile::TempDir,
     _shared_dir: tempfile::TempDir,
 }
 
 impl TcCluster {
     async fn boot(test_id: &str) -> Self {
         let network = format!("rs-m46-net-{test_id}");
+        let pki = TestPki::generate();
+        let storage_dir = tempfile::tempdir().unwrap();
+        management_worker::preprovision_management_catalog(storage_dir.path(), &pki).await;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(storage_dir.path(), std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            std::fs::set_permissions(
+                storage_dir.path().join("gateway-shard"),
+                std::fs::Permissions::from_mode(0o777),
+            )
+            .unwrap();
+        }
         let shared_dir = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         {
@@ -59,6 +76,9 @@ impl TcCluster {
             .with_exposed_port(ContainerPort::Tcp(8000))
             .with_exposed_port(ContainerPort::Tcp(9201))
             .with_cmd(vec![
+                "--internal-tls-ca-cert-path=/tmp/cluster-ca.pem".to_string(),
+                "--internal-tls-cert-path=/tmp/control.pem".to_string(),
+                "--internal-tls-key-path=/tmp/control-key.pem".to_string(),
                 "start".to_string(),
                 "--storage=/data".to_string(),
                 "--role=control".to_string(),
@@ -72,6 +92,22 @@ impl TcCluster {
             .with_mount(Mount::bind_mount(
                 shared_dir.path().to_str().unwrap().to_string(),
                 "/shared".to_string(),
+            ))
+            .with_mount(Mount::bind_mount(
+                storage_dir.path().to_str().unwrap().to_string(),
+                "/data".to_string(),
+            ))
+            .with_mount(Mount::bind_mount(
+                pki.ca_cert_path.to_str().unwrap().to_string(),
+                "/tmp/cluster-ca.pem".to_string(),
+            ))
+            .with_mount(Mount::bind_mount(
+                pki.control_cert_path.to_str().unwrap().to_string(),
+                "/tmp/control.pem".to_string(),
+            ))
+            .with_mount(Mount::bind_mount(
+                pki.control_key_path.to_str().unwrap().to_string(),
+                "/tmp/control-key.pem".to_string(),
             ))
             .start()
             .await
@@ -131,6 +167,8 @@ impl TcCluster {
             control_addr,
             management_addr,
             network,
+            pki,
+            _storage_dir: storage_dir,
             _shared_dir: shared_dir,
         }
     }
@@ -155,10 +193,10 @@ async fn live_migration_zero_loss_tc() {
         return;
     }
     let cluster = TcCluster::boot("live").await;
-    let mut donor = WorkerPeer::register(cluster.control_addr, 1).await;
-    let mut recipient = WorkerPeer::register(cluster.control_addr, 2).await;
+    let mut donor = WorkerPeer::register(cluster.control_addr, 1, &cluster.pki).await;
+    let mut recipient = WorkerPeer::register(cluster.control_addr, 2, &cluster.pki).await;
     assert_eq!(donor.request_shard(11).await.worker_id, WorkerId(1));
-    let accepted = run_drain_cli(cluster.management_addr, 1);
+    let accepted = run_drain_cli(cluster.management_addr, 1, &cluster.pki);
     let operation_id = accepted["operation_id"].as_str().unwrap().to_owned();
     donor.wait_for_drain().await;
     donor.acknowledge_drain().await;
@@ -166,8 +204,13 @@ async fn live_migration_zero_loss_tc() {
         recipient.acknowledge_recipient(11).await.worker_id,
         WorkerId(2)
     );
-    let completed =
-        wait_for_operation_state(cluster.management_addr, &operation_id, "succeeded").await;
+    let completed = wait_for_operation_state(
+        cluster.management_addr,
+        &operation_id,
+        "succeeded",
+        &cluster.pki,
+    )
+    .await;
     assert_eq!(completed["phase"], "completed");
     assert_eq!(completed["progress"], "100%");
     cluster.cleanup().await;
@@ -182,10 +225,10 @@ async fn donor_killed_mid_dual_writing_tc() {
         return;
     }
     let cluster = TcCluster::boot("dual").await;
-    let mut donor = WorkerPeer::register(cluster.control_addr, 1).await;
-    let _recipient = WorkerPeer::register(cluster.control_addr, 2).await;
+    let mut donor = WorkerPeer::register(cluster.control_addr, 1, &cluster.pki).await;
+    let _recipient = WorkerPeer::register(cluster.control_addr, 2, &cluster.pki).await;
     assert_eq!(donor.request_shard(21).await.worker_id, WorkerId(1));
-    let accepted = run_drain_cli(cluster.management_addr, 1);
+    let accepted = run_drain_cli(cluster.management_addr, 1, &cluster.pki);
     let operation_id = accepted["operation_id"].as_str().unwrap().to_owned();
     donor.wait_for_drain().await;
     let status = std::process::Command::new("docker")
@@ -194,7 +237,13 @@ async fn donor_killed_mid_dual_writing_tc() {
         .unwrap();
     assert!(status.success());
     drop(donor);
-    let pending = wait_for_operation_state(cluster.management_addr, &operation_id, "running").await;
+    let pending = wait_for_operation_state(
+        cluster.management_addr,
+        &operation_id,
+        "running",
+        &cluster.pki,
+    )
+    .await;
     assert_eq!(pending["state"], "running");
     assert_eq!(pending["phase"], "waiting_for_worker_flush_ack");
     cluster.cleanup().await;
@@ -209,17 +258,23 @@ async fn donor_killed_mid_cutover_tc() {
         return;
     }
     let cluster = TcCluster::boot("cut").await;
-    let mut donor = WorkerPeer::register(cluster.control_addr, 1).await;
-    let mut recipient = WorkerPeer::register(cluster.control_addr, 2).await;
+    let mut donor = WorkerPeer::register(cluster.control_addr, 1, &cluster.pki).await;
+    let mut recipient = WorkerPeer::register(cluster.control_addr, 2, &cluster.pki).await;
     assert_eq!(donor.request_shard(22).await.worker_id, WorkerId(1));
-    let accepted = run_drain_cli(cluster.management_addr, 1);
+    let accepted = run_drain_cli(cluster.management_addr, 1, &cluster.pki);
     let operation_id = accepted["operation_id"].as_str().unwrap().to_owned();
     donor.wait_for_drain().await;
     donor.acknowledge_drain().await;
     let (lease, transfer_id) = recipient.wait_for_assignment(22).await;
     assert_eq!(lease.worker_id, WorkerId(2));
     assert_eq!(
-        wait_for_operation_state(cluster.management_addr, &operation_id, "running").await["state"],
+        wait_for_operation_state(
+            cluster.management_addr,
+            &operation_id,
+            "running",
+            &cluster.pki,
+        )
+        .await["state"],
         "running"
     );
     let status = std::process::Command::new("docker")
@@ -229,8 +284,13 @@ async fn donor_killed_mid_cutover_tc() {
     assert!(status.success());
     drop(donor);
     recipient.acknowledge_assignment(&lease, transfer_id).await;
-    let completed =
-        wait_for_operation_state(cluster.management_addr, &operation_id, "succeeded").await;
+    let completed = wait_for_operation_state(
+        cluster.management_addr,
+        &operation_id,
+        "succeeded",
+        &cluster.pki,
+    )
+    .await;
     assert_eq!(completed["state"], "succeeded");
     assert_eq!(completed["phase"], "completed");
     cluster.cleanup().await;

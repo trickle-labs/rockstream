@@ -1070,6 +1070,31 @@ pub fn run_start_with_dev_transport(
                     rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
                 );
                 if let Some(addr) = &node_config.control.management_addr {
+                    let security_store = rockstream_storage::build_runtime_object_store(
+                        &opts.storage.join("shards/0"),
+                        "shards/0",
+                    )
+                    .map_err(|error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to open management security catalog: {error}"),
+                            "Check shared gateway storage and preprovisioned principals.",
+                        )
+                    })?;
+                    let security_catalog = Arc::new(
+                        rockstream_storage::catalog::DurableCatalogStore::recover(
+                            security_store,
+                            "db",
+                        )
+                        .await
+                        .map_err(|error| {
+                            CliError::new(
+                                RS_0003,
+                                format!("failed to recover management security catalog: {error}"),
+                                "Restore the durable gateway catalog before starting management.",
+                            )
+                        })?,
+                    );
                     let management_store = if let Some(shared_dir) = &opts.control_shared_storage {
                         fs::create_dir_all(shared_dir).map_err(|e| {
                             CliError::new(
@@ -1091,11 +1116,9 @@ pub fn run_start_with_dev_transport(
                     } else {
                         store.clone()
                     };
-                    service = service.with_management(
-                        addr.clone(),
-                        management_store,
-                        node_config.clone(),
-                    );
+                    service = service
+                        .with_security_catalog(security_catalog)
+                        .with_management(addr.clone(), management_store, node_config.clone());
                 }
             }
             let handle = service
@@ -1170,11 +1193,34 @@ pub fn run_start_with_dev_transport(
                 )));
             if opts.daemon {
                 if let Some(addr) = &node_config.control.management_addr {
-                    service = service.with_management(
-                        addr.clone(),
-                        shared_object_store.clone(),
-                        node_config.clone(),
+                    let security_store = rockstream_storage::build_runtime_object_store(
+                        &opts.storage.join("gateway-shard"),
+                        "gateway-shard",
+                    )
+                    .map_err(|error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to open management security catalog: {error}"),
+                            "Check shared gateway storage and preprovisioned principals.",
+                        )
+                    })?;
+                    let security_catalog = Arc::new(
+                        rockstream_storage::catalog::DurableCatalogStore::recover(
+                            security_store,
+                            "gateway",
+                        )
+                        .await
+                        .map_err(|error| {
+                            CliError::new(
+                                RS_0003,
+                                format!("failed to recover management security catalog: {error}"),
+                                "Restore the durable gateway catalog before starting management.",
+                            )
+                        })?,
                     );
+                    service = service
+                        .with_security_catalog(security_catalog)
+                        .with_management(addr.clone(), shared_object_store.clone(), node_config.clone());
                 }
             }
 

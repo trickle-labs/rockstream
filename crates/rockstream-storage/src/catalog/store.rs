@@ -45,6 +45,9 @@ const MAX_SECURITY_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CatalogStore: Send + Sync {
+    async fn refresh(&self) -> Result<(), CatalogError> {
+        Ok(())
+    }
     async fn commit_txn(&self, txn: CatalogTxn) -> Result<u64, CatalogError>;
     async fn get_revision(&self) -> u64;
     async fn allocate_id(&self) -> Result<u64, CatalogError>;
@@ -1246,6 +1249,18 @@ fn apply_mutation_to_state(
 
 #[async_trait]
 impl CatalogStore for DurableCatalogStore {
+    async fn refresh(&self) -> Result<(), CatalogError> {
+        let recovered = Self::recover(self.store.clone(), self.prefix.clone()).await?;
+        let recovered_state = recovered.state.read().await.clone();
+        self.id_allocator
+            .observe(recovered.id_allocator.high_water_mark());
+        let mut state = self.state.write().await;
+        if recovered_state.revision >= state.revision {
+            *state = recovered_state;
+        }
+        Ok(())
+    }
+
     async fn commit_txn(&self, txn: CatalogTxn) -> Result<u64, CatalogError> {
         let mut state = self.state.write().await;
 

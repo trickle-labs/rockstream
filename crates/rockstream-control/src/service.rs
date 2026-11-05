@@ -31,6 +31,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
+use rockstream_storage::catalog::CatalogStore;
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::data_plane::{
     DeploymentDescriptor, DeploymentRequest, RuntimeExchangeMessage, RuntimeRow, ShardOutput,
@@ -259,6 +260,7 @@ pub struct ControlServiceHandle {
     pub migration_recovery: Vec<MigrationStartupOutcome>,
     /// TLS certificate reloader (if internal mTLS is enabled).
     pub reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
+    management_reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
 }
 
 impl ControlServiceHandle {
@@ -276,6 +278,15 @@ impl ControlServiceHandle {
             r.reload(new_config)
         } else {
             Err("RS-2410: internal TLS is not enabled on this control service".to_string())
+        }
+    }
+
+    /// Reload a separately configured management listener certificate in place.
+    pub fn reload_management_tls(&self, new_config: InternalTlsConfig) -> Result<(), String> {
+        if let Some(reloader) = &self.management_reloader {
+            reloader.reload(new_config)
+        } else {
+            Err("RS-2410: management TLS is not enabled on this control service".to_owned())
         }
     }
 }
@@ -320,6 +331,7 @@ pub struct ControlService {
     drain_state: Arc<AsyncMutex<DrainState>>,
     /// Optional internal TLS configuration for control plane mTLS.
     internal_tls: Option<InternalTlsConfig>,
+    management_tls: Option<InternalTlsConfig>,
     /// Explicit loopback-only plaintext transport for local development.
     insecure_dev_mode: bool,
     secret_store: Arc<SecretStore>,
@@ -330,6 +342,7 @@ pub struct ControlService {
         Arc<dyn object_store::ObjectStore>,
         rockstream_types::config::NodeConfig,
     )>,
+    security_catalog: Option<Arc<dyn CatalogStore>>,
     backup_source: Option<BackupSource>,
 }
 
@@ -348,6 +361,7 @@ impl ControlService {
             migration_recovery_donors: BTreeMap::new(),
             drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
             internal_tls: None,
+            management_tls: None,
             insecure_dev_mode: false,
             secret_store: Arc::new(SecretStore::new(
                 None,
@@ -356,6 +370,7 @@ impl ControlService {
             worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
             data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),
             management: None,
+            security_catalog: None,
             backup_source: None,
         }
     }
@@ -419,6 +434,12 @@ impl ControlService {
         self
     }
 
+    /// Configure a separate mTLS identity for the management listener.
+    pub fn with_management_tls(mut self, config: InternalTlsConfig) -> Self {
+        self.management_tls = Some(config);
+        self
+    }
+
     /// Allow plaintext control traffic only when the listener binds to loopback.
     ///
     /// This is intended for local development and tests. Production callers
@@ -442,6 +463,12 @@ impl ControlService {
         config: rockstream_types::config::NodeConfig,
     ) -> Self {
         self.management = Some((bind_addr.into(), operation_store, config));
+        self
+    }
+
+    /// Attach the durable principals, policy revisions, and audit catalog used by management.
+    pub fn with_security_catalog(mut self, catalog: Arc<dyn CatalogStore>) -> Self {
+        self.security_catalog = Some(catalog);
         self
     }
 
@@ -510,6 +537,25 @@ impl ControlService {
                 );
                 None
             }
+        };
+        let management_reloader = match self.management_tls.as_ref() {
+            Some(config) => {
+                if !config.client_auth_required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RS-2405: management API requires client certificate authentication",
+                    ));
+                }
+                Some(Arc::new(
+                    crate::tls::TlsCertificateReloader::new(config.clone()).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("RS-2405: failed to initialize management mTLS: {error}"),
+                        )
+                    })?,
+                ))
+            }
+            None => reloader.clone(),
         };
 
         if self.raft.is_none() && self.shard_manager.is_empty() {
@@ -606,6 +652,12 @@ impl ControlService {
                 operations,
                 config.clone(),
             )
+            .with_security_catalog(self.security_catalog.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RS-2405: management API requires the durable security catalog",
+                )
+            })?)
             .with_drain_runtime(drain_runtime)
             .with_migration_runtime(migration_runtime);
             let management = if let Some((source, shared_store_id, local_worker_id)) = backup_source
@@ -630,7 +682,13 @@ impl ControlService {
             } else {
                 management
             };
-            Some(management.start(management_addr).await?)
+            let management_tls = management_reloader.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RS-2405: management API requires internal mTLS",
+                )
+            })?;
+            Some(management.start(management_addr, management_tls).await?)
         } else {
             None
         };
@@ -716,6 +774,7 @@ impl ControlService {
             management,
             migration_recovery,
             reloader: reloader_for_handle,
+            management_reloader,
         })
     }
 
