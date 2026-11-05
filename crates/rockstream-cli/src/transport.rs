@@ -2980,14 +2980,6 @@ impl StorageClient {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| storage_path.join(format!("support_bundle_{now_ms}.tar.gz")));
 
-        let event = AuditEvent::now(
-            self.identity.user.clone(),
-            "support.bundle",
-            view.as_deref().unwrap_or("all"),
-        )
-        .with_detail("support bundle generated");
-        append_audit_file(storage_path, &event);
-
         let mut diagnostic_occurrences = Vec::new();
         let mut diagnostic_redaction_counts = Vec::new();
         for occurrence in occurrences.iter().take(MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES) {
@@ -3068,10 +3060,37 @@ impl StorageClient {
                 )
             })?;
         }
-        fs::write(&out_path, &bytes).map_err(|error| {
+        let write_result = fs::write(&out_path, &bytes);
+        let generated = write_result.is_ok();
+        let event = AuditEvent::now(
+            self.identity.user.clone(),
+            "support.bundle",
+            view.as_deref().unwrap_or("all"),
+        )
+        .with_detail(if generated {
+            "support bundle generated"
+        } else {
+            "support bundle generation failed"
+        });
+        let event = if generated {
+            event
+        } else {
+            event.with_error_code(RS_0003.to_string())
+        };
+        if rockstream_control::audit::FileAuditLog::open(storage_path.join("audit.jsonl"))
+            .and_then(|audit| audit.append(&event))
+            .is_err()
+        {
+            return Err(CliError::new(
+                RS_0003,
+                "support bundle audit could not be persisted",
+                "Check durable audit storage before retrying.",
+            ));
+        }
+        write_result.map_err(|_| {
             CliError::new(
                 RS_0003,
-                format!("failed to write support bundle: {error}"),
+                "failed to write support bundle",
                 "Check that the output path is writable and retry.",
             )
         })?;
