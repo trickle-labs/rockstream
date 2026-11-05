@@ -121,6 +121,11 @@ fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZ
 #[derive(Debug, Default)]
 pub struct DistinctState {
     entries: HashMap<Vec<u8>, (i64, Vec<i64>)>,
+    deleted: HashMap<Vec<u8>, u64>,
+    appended_deletions: HashMap<Vec<u8>, u64>,
+    deletion_generation: u64,
+    deleted_bytes: u64,
+    appended_deletion_bytes: u64,
     state_bytes: u64,
 }
 
@@ -128,6 +133,11 @@ impl DistinctState {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            deleted: HashMap::new(),
+            appended_deletions: HashMap::new(),
+            deletion_generation: 0,
+            deleted_bytes: 0,
+            appended_deletion_bytes: 0,
             state_bytes: 0,
         }
     }
@@ -139,7 +149,7 @@ impl DistinctState {
 
     /// State bytes metric.
     pub fn state_bytes(&self) -> u64 {
-        self.state_bytes
+        self.state_bytes + self.deleted_bytes + self.appended_deletion_bytes
     }
 }
 
@@ -172,6 +182,26 @@ impl DistinctOp {
     /// State bytes metric.
     pub fn state_bytes(&self) -> u64 {
         self.state.lock().unwrap().state_bytes()
+    }
+
+    pub(crate) fn ack_persisted_state(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (key, generation) in std::mem::take(&mut state.appended_deletions) {
+            if state.deleted.get(&key) == Some(&generation) {
+                state.deleted.remove(&key);
+                state.deleted_bytes -= (key.len() + std::mem::size_of::<u64>()) as u64;
+            }
+        }
+        state.appended_deletion_bytes = 0;
+    }
+
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        let restored = load_distinct_state(db, self.schema.clone(), op_id).await?;
+        let state = restored.state.into_inner().unwrap();
+        self.fill_level
+            .store(state.entry_count(), Ordering::Relaxed);
+        *self.state.lock().unwrap() = state;
+        Ok(())
     }
 }
 
@@ -213,6 +243,12 @@ impl Operator for DistinctOp {
                 state.entries.insert(key, (new_w, row_vals.clone()));
             } else if !is_new {
                 state.entries.remove(&key);
+                state.deletion_generation = state.deletion_generation.wrapping_add(1);
+                let generation = state.deletion_generation;
+                let bytes = (key.len() + std::mem::size_of::<u64>()) as u64;
+                if state.deleted.insert(key, generation).is_none() {
+                    state.deleted_bytes += bytes;
+                }
                 state.state_bytes = state.state_bytes.saturating_sub(entry_bytes);
             }
 
@@ -531,8 +567,17 @@ pub fn append_distinct_state(
     target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
-        let state = op.state.lock().unwrap();
+        let mut state = op.state.lock().unwrap();
         let mut batch = WriteBatch::new();
+
+        state.appended_deletions = state.deleted.clone();
+        state.appended_deletion_bytes = state.deleted_bytes;
+        for row_bytes in state.deleted.keys() {
+            batch.delete(&ShardKeyEncoder::distinct_key(
+                op_id.0,
+                row_hash_u128(row_bytes),
+            ));
+        }
 
         for (row_bytes, (weight, vals)) in &state.entries {
             if *weight == 0 {
@@ -560,6 +605,7 @@ pub async fn persist_distinct_state(
     if !batch.is_empty() {
         db.write_batch(batch).await.map_err(OpError::storage)?;
     }
+    op.ack_persisted_state();
     Ok(())
 }
 
@@ -582,6 +628,7 @@ pub async fn load_distinct_state(
         if let Some((weight, vals)) = decode_distinct_value(&value_bytes) {
             if weight != 0 {
                 let row_bytes = row_key(&vals);
+                state.state_bytes += (row_bytes.len() + 8 + vals.len() * 8) as u64;
                 state.entries.insert(row_bytes, (weight, vals));
             }
         }

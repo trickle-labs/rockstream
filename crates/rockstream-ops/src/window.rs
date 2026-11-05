@@ -281,6 +281,9 @@ struct WindowState {
     arrangement: HashMap<Vec<u8>, PartMap>,
     /// Previous output cache: part_key_bytes → output entries
     prev_output: HashMap<Vec<u8>, OutputCache>,
+    deleted_output: HashMap<(Vec<u8>, u128), u64>,
+    appended_deletions: HashMap<(Vec<u8>, u128), u64>,
+    deletion_generation: u64,
 }
 
 impl WindowState {
@@ -288,6 +291,9 @@ impl WindowState {
         Self {
             arrangement: HashMap::new(),
             prev_output: HashMap::new(),
+            deleted_output: HashMap::new(),
+            appended_deletions: HashMap::new(),
+            deletion_generation: 0,
         }
     }
 
@@ -301,7 +307,14 @@ impl WindowState {
     }
 
     fn state_bytes(&self) -> u64 {
-        let mut bytes = 0u64;
+        let mut bytes = self
+            .deleted_output
+            .keys()
+            .chain(self.appended_deletions.keys())
+            .map(|(key, _)| {
+                (key.len() + std::mem::size_of::<u128>() + std::mem::size_of::<u64>()) as u64
+            })
+            .sum();
         for (pk, pmap) in &self.arrangement {
             bytes += pk.len() as u64;
             for (order_key, input_vals, _) in pmap.values() {
@@ -351,6 +364,35 @@ impl WindowOp {
 
     pub fn state_bytes(&self) -> u64 {
         self.state.lock().unwrap().state_bytes()
+    }
+
+    pub(crate) fn ack_persisted_state(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (key, generation) in std::mem::take(&mut state.appended_deletions) {
+            if state.deleted_output.get(&key) == Some(&generation) {
+                state.deleted_output.remove(&key);
+            }
+        }
+    }
+
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        let restored =
+            load_window_state(db, self.schema.clone(), self.window_exprs.clone(), op_id).await?;
+        let state = restored.state.into_inner().unwrap();
+        let total = state.total_rows();
+        let oversized = state
+            .arrangement
+            .iter()
+            .filter(|(_, rows)| {
+                rows.values().filter(|(_, _, weight)| *weight > 0).count()
+                    > WINDOW_PARTITION_THRESHOLD
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        *self.state.lock().unwrap() = state;
+        *self.oversized_partitions.lock().unwrap() = oversized;
+        self.fill_level.store(total, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Create an LFS-backed WindowOp.
@@ -440,10 +482,20 @@ impl WindowOp {
             }
 
             // Retract previous output for this partition.
-            if let Some(prev) = state.prev_output.get(part_key) {
+            let old_hashes = if let Some(prev) = state.prev_output.get(part_key) {
                 for (out_vals, nulls) in prev.values() {
                     all_output.push((out_vals.clone(), nulls.clone(), -1));
                 }
+                prev.keys().copied().collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for hash in old_hashes {
+                state.deletion_generation = state.deletion_generation.wrapping_add(1);
+                let generation = state.deletion_generation;
+                state
+                    .deleted_output
+                    .insert((part_key.clone(), hash), generation);
             }
 
             // Compute new output.
@@ -658,9 +710,15 @@ pub fn append_window_state(
     target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
-        let state = op.state.lock().unwrap();
+        let mut state = op.state.lock().unwrap();
         let mut batch = WriteBatch::new();
         let oid = op_id.0;
+        state.appended_deletions = state.deleted_output.clone();
+        for (part_key, hash) in state.deleted_output.keys() {
+            batch.delete(&ShardKeyEncoder::window_prev_output_key(
+                oid, part_key, *hash,
+            ));
+        }
 
         // Write arrangement entries (all weights, including zero/negative, for crash-replay).
         for (part_key, part_map) in &state.arrangement {
@@ -696,6 +754,7 @@ pub async fn persist_window_state(
     if !batch.is_empty() {
         db.write_batch(batch).await.map_err(OpError::storage)?;
     }
+    op.ack_persisted_state();
     Ok(())
 }
 
@@ -740,15 +799,25 @@ pub async fn load_window_state(
     // and part_key = key[11..key.len()-order_key_len-16].
     let prefix_len = arr_prefix.len(); // 1 + 2 + 8 = 11
     for (key, value) in arr_entries {
-        if let Some((order_key, input_vals, weight)) = decode_arr_value(&value, n_input_cols) {
+        {
+            let (order_key, input_vals, weight) = decode_arr_value(&value, n_input_cols)
+                .ok_or_else(|| OpError::storage_error("corrupt window arrangement record"))?;
             // key = arr_prefix + part_key + order_key + row_id(16)
             if key.len() < prefix_len + order_key.len() + 16 {
-                continue;
+                return Err(OpError::storage_error("corrupt window arrangement key"));
             }
             let part_key_end = key.len() - order_key.len() - 16;
             let part_key = key[prefix_len..part_key_end].to_vec();
             let row_id_bytes: [u8; 16] = key[key.len() - 16..].try_into().unwrap_or([0; 16]);
             let row_id = u128::from_be_bytes(row_id_bytes);
+            if row_id != row_hash(&input_vals)
+                || part_key != encode_cols(&op.partition_key_vals(&input_vals))
+                || order_key != encode_order_cols(&op.order_key_vals(&input_vals))
+                || key.as_ref()
+                    != ShardKeyEncoder::window_arr_key(oid, &part_key, &order_key, row_id)
+            {
+                return Err(OpError::storage_error("corrupt window arrangement key"));
+            }
             state
                 .arrangement
                 .entry(part_key)
@@ -758,15 +827,22 @@ pub async fn load_window_state(
     }
 
     for (key, value) in out_entries {
-        if let Some(out_vals) = decode_output_value(&value, n_output_cols) {
+        {
+            let out_vals = decode_output_value(&value, n_output_cols)
+                .ok_or_else(|| OpError::storage_error("corrupt window output record"))?;
             // key = [0x02][WN][op_id:8][part_key][row_hash:16]
             if key.len() < out_prefix_base.len() + 16 {
-                continue;
+                return Err(OpError::storage_error("corrupt window output key"));
             }
             let part_key_end = key.len() - 16;
             let part_key = key[out_prefix_base.len()..part_key_end].to_vec();
             let hash_bytes: [u8; 16] = key[key.len() - 16..].try_into().unwrap_or([0; 16]);
             let out_hash = u128::from_be_bytes(hash_bytes);
+            if out_hash != output_row_hash(&out_vals.0, &out_vals.1)
+                || part_key != encode_cols(&op.partition_key_vals(&out_vals.0))
+            {
+                return Err(OpError::storage_error("corrupt window output key"));
+            }
             state
                 .prev_output
                 .entry(part_key)

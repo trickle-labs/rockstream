@@ -799,6 +799,7 @@ impl AggregateOp {
             .clean_lru
             .lock()
             .expect("AggregateOp clean_lru mutex poisoned") = clean_lru;
+        self.clear_dirty_keys();
         Ok(())
     }
 

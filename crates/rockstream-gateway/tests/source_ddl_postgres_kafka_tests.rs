@@ -52,6 +52,24 @@ async fn read_order_total(client: &tokio_postgres::Client) -> Vec<String> {
         .collect()
 }
 
+async fn read_order_rows(client: &tokio_postgres::Client, relation: &str) -> Vec<(i64, i64)> {
+    let mut rows = client
+        .simple_query(&format!("SELECT id, amount FROM {relation}"))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap().parse::<i64>().unwrap(),
+                row.get(1).unwrap().parse::<i64>().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
+}
+
 #[tokio::test]
 async fn postgres_cdc_source_ddl_rejects_invalid_options_and_redacts_credentials() {
     let server = GatewayServer::with_catalog(
@@ -385,23 +403,36 @@ async fn kafka_source_backfill_and_live_updates_reach_pgwire() {
 
 #[tokio::test]
 async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
-    assert!(
-        rockstream_test_support::docker_available(),
-        "Docker is required for the PostgreSQL CDC source proof"
-    );
-    let postgres = GenericImage::new("postgres", "11-alpine")
-        .with_wait_for(WaitFor::message_on_stderr(
-            "database system is ready to accept connections",
-        ))
-        .with_env_var("POSTGRES_DB", "postgres")
-        .with_env_var("POSTGRES_USER", "postgres")
-        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_cmd(["postgres", "-c", "wal_level=logical"])
-        .start()
-        .await
-        .unwrap();
-    let host = postgres.get_host().await.unwrap();
-    let port = postgres.get_host_port_ipv4(5432).await.unwrap();
+    // The override must use an isolated cluster because this fixture creates database objects.
+    let external_port = std::env::var("ROCKSTREAM_TEST_PG_PORT")
+        .ok()
+        .map(|port| port.parse::<u16>().unwrap());
+    let postgres = if external_port.is_none() {
+        assert!(rockstream_test_support::docker_available(), "Docker or an isolated ROCKSTREAM_TEST_PG_PORT is required for the PostgreSQL CDC source proof");
+        Some(
+            GenericImage::new("postgres", "11-alpine")
+                .with_wait_for(WaitFor::message_on_stderr(
+                    "database system is ready to accept connections",
+                ))
+                .with_env_var("POSTGRES_DB", "postgres")
+                .with_env_var("POSTGRES_USER", "postgres")
+                .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+                .with_cmd(["postgres", "-c", "wal_level=logical"])
+                .start()
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let (host, port) = if let Some(postgres) = &postgres {
+        (
+            postgres.get_host().await.unwrap().to_string(),
+            postgres.get_host_port_ipv4(5432).await.unwrap(),
+        )
+    } else {
+        ("127.0.0.1".to_string(), external_port.unwrap())
+    };
     let (upstream, upstream_connection) = tokio_postgres::connect(
         &format!("host={host} port={port} user=postgres dbname=postgres"),
         NoTls,
@@ -456,10 +487,20 @@ async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
             "CREATE SOURCE orders TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='orders_pub', slot='gateway_orders_slot', table='orders') FORMAT pgoutput"
         ),
         "CREATE MATERIALIZED VIEW order_total AS SELECT SUM(amount) AS amount FROM orders",
+        "CREATE MATERIALIZED VIEW order_adjusted AS SELECT id, amount + 10 AS amount FROM orders",
+        "CREATE MATERIALIZED VIEW order_doubled AS SELECT id, amount * 2 AS amount FROM order_adjusted",
     ] {
         client.execute(sql, &[]).await.unwrap();
     }
     assert_eq!(read_order_total(&client).await, vec!["30".to_string()]);
+    assert_eq!(
+        read_order_rows(&client, "order_adjusted").await,
+        vec![(1, 20), (2, 30)]
+    );
+    assert_eq!(
+        read_order_rows(&client, "order_doubled").await,
+        vec![(1, 40), (2, 60)]
+    );
     upstream
         .batch_execute(
             "INSERT INTO orders VALUES (3, 5); UPDATE orders SET amount = 7 WHERE id = 1;",
@@ -471,16 +512,29 @@ async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
         if read_order_total(&client).await == vec!["32".to_string()] {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "PostgreSQL CDC worker did not apply live changes"
-        );
+        if Instant::now() >= deadline {
+            let status = client
+                .query("SHOW SOURCE STATUS FOR orders", &[])
+                .await
+                .unwrap();
+            panic!("PostgreSQL CDC worker did not apply live changes: status={:?}, reason={:?}, total={:?}, adjusted={:?}, doubled={:?}", status[0].get::<_, Option<String>>(3), status[0].get::<_, Option<String>>(4), read_order_total(&client).await, read_order_rows(&client, "order_adjusted").await, read_order_rows(&client, "order_doubled").await);
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert_eq!(
+        read_order_rows(&client, "order_adjusted").await,
+        vec![(1, 17), (2, 30), (3, 15)]
+    );
+    assert_eq!(
+        read_order_rows(&client, "order_doubled").await,
+        vec![(1, 34), (2, 60), (3, 30)]
+    );
 
     let persisted_table = catalog.get_table("orders").unwrap();
     let persisted_source = catalog.get_source("orders").unwrap();
     let persisted_view = catalog.get_view("order_total").unwrap();
+    let persisted_adjusted = catalog.get_view("order_adjusted").unwrap();
+    let persisted_doubled = catalog.get_view("order_doubled").unwrap();
     drop(client);
     handle.abort();
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -488,13 +542,15 @@ async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
     assert!(recovered_catalog.add_table(persisted_table));
     assert!(recovered_catalog.add_source(persisted_source));
     recovered_catalog.add_view_with_deps(persisted_view, vec!["orders".to_string()]);
+    recovered_catalog.add_view_with_deps(persisted_adjusted, vec!["orders".to_string()]);
+    recovered_catalog.add_view_with_deps(persisted_doubled, vec!["order_adjusted".to_string()]);
     let restarted = GatewayServer::with_shard_db(
         "127.0.0.1:0".parse().unwrap(),
-        recovered_catalog,
+        recovered_catalog.clone(),
         Arc::new(NoopViewReader),
-        shard_db,
+        shard_db.clone(),
     );
-    let (restarted_address, _restarted_handle) = restarted.serve_background().await.unwrap();
+    let (restarted_address, restarted_handle) = restarted.serve_background().await.unwrap();
     let (restarted_client, restarted_connection) = tokio_postgres::connect(
         &format!(
             "host=127.0.0.1 port={} user=test dbname=test",
@@ -526,6 +582,215 @@ async fn postgres_cdc_pgoutput_backfill_live_update_and_restart_reach_pgwire() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    shard_db.pause_next_view_output_write(entered.clone(), release.clone());
+    upstream
+        .execute("INSERT INTO orders VALUES (5, 13)", &[])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), entered.notified())
+        .await
+        .expect("source commit did not reach the atomic write");
+    let (local, local_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            restarted_address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = local_connection.await;
+    });
+    let started = Arc::new(tokio::sync::Notify::new());
+    let task_started = started.clone();
+    let mut local_commit = tokio::spawn(async move {
+        task_started.notify_one();
+        local
+            .execute("INSERT INTO orders VALUES (6, 17)", &[])
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut local_commit)
+            .await
+            .is_err(),
+        "local commit passed a paused source commit"
+    );
+    release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(15), local_commit)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        read_order_total(&restarted_client).await,
+        vec!["73".to_string()]
+    );
+    let expected = vec![(1, 7), (2, 20), (3, 5), (4, 11), (5, 13), (6, 17)];
+    assert_eq!(read_order_rows(&restarted_client, "orders").await, expected);
+    assert_eq!(
+        read_order_rows(&restarted_client, "order_adjusted").await,
+        vec![(1, 17), (2, 30), (3, 15), (4, 21), (5, 23), (6, 27)]
+    );
+    assert_eq!(
+        read_order_rows(&restarted_client, "order_doubled").await,
+        vec![(1, 34), (2, 60), (3, 30), (4, 42), (5, 46), (6, 54)]
+    );
+    drop(restarted_client);
+    restarted_handle.abort();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        recovered_catalog,
+        Arc::new(NoopViewReader),
+        shard_db.clone(),
+    );
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    assert_eq!(read_order_total(&client).await, vec!["73".to_string()]);
+    assert_eq!(read_order_rows(&client, "orders").await, expected);
+    assert_eq!(
+        read_order_rows(&client, "order_adjusted").await,
+        vec![(1, 17), (2, 30), (3, 15), (4, 21), (5, 23), (6, 27)]
+    );
+    assert_eq!(
+        read_order_rows(&client, "order_doubled").await,
+        vec![(1, 34), (2, 60), (3, 30), (4, 42), (5, 46), (6, 54)]
+    );
+    let frontier_before_failure = shard_db
+        .last_epoch()
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    shard_db.fail_next_view_output_write();
+    shard_db.pause_next_view_output_write(entered.clone(), release.clone());
+    upstream
+        .execute("INSERT INTO orders VALUES (7, 19)", &[])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), entered.notified())
+        .await
+        .expect("source retry test did not reach the injected write");
+    let recovery_entered = Arc::new(tokio::sync::Notify::new());
+    let recovery_release = Arc::new(tokio::sync::Notify::new());
+    shard_db.pause_next_scan_page(recovery_entered.clone(), recovery_release.clone());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(15), recovery_entered.notified())
+        .await
+        .expect("source recovery did not begin");
+    assert_eq!(
+        shard_db
+            .last_epoch()
+            .load(std::sync::atomic::Ordering::SeqCst),
+        frontier_before_failure
+    );
+    let (local, local_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = local_connection.await;
+    });
+    let started = Arc::new(tokio::sync::Notify::new());
+    let task_started = started.clone();
+    let mut local_commit = tokio::spawn(async move {
+        task_started.notify_one();
+        local
+            .execute("INSERT INTO orders VALUES (8, 23)", &[])
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut local_commit)
+            .await
+            .is_err(),
+        "local commit passed a paused source recovery"
+    );
+    recovery_release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(15), local_commit)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let blocked = loop {
+        let status = client
+            .query("SHOW SOURCE STATUS FOR orders", &[])
+            .await
+            .unwrap();
+        let actual = (
+            status[0].get::<_, Option<String>>(3),
+            status[0].get::<_, Option<String>>(9),
+        );
+        if actual.0.as_deref() == Some("BLOCKED") {
+            break actual;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "source did not report the failed write"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(blocked, (Some("BLOCKED".to_string()), Some("[RS-2026] query.query_time_execution_failed: query-time execution failed: source-backed backfill: RS-4001: source I/O error: RS-4001: source I/O error: RS-4010: durable source checkpoint operation failed: unsupported operation: injected view output write failure; next steps: keep the source paused, recover the highest committed checkpoint, then retry. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.".to_string())));
+    assert_eq!(read_order_total(&client).await, vec!["96".to_string()]);
+    assert_eq!(
+        read_order_rows(&client, "orders").await,
+        vec![(1, 7), (2, 20), (3, 5), (4, 11), (5, 13), (6, 17), (8, 23)]
+    );
+    assert_eq!(
+        read_order_rows(&client, "order_adjusted").await,
+        vec![
+            (1, 17),
+            (2, 30),
+            (3, 15),
+            (4, 21),
+            (5, 23),
+            (6, 27),
+            (8, 33)
+        ]
+    );
+    assert_eq!(
+        read_order_rows(&client, "order_doubled").await,
+        vec![
+            (1, 34),
+            (2, 60),
+            (3, 30),
+            (4, 42),
+            (5, 46),
+            (6, 54),
+            (8, 66)
+        ]
+    );
 }
 
 #[tokio::test]

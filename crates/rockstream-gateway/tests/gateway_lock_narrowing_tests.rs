@@ -401,6 +401,12 @@ async fn test_failed_commit_halts_frontier_and_acknowledgments() {
     // Restore writes
     shard_db.set_fail_writes(false);
 
+    assert_eq!(
+        shard_db.last_epoch().load(Ordering::SeqCst),
+        baseline_epoch,
+        "failed storage write must not publish its allocated epoch"
+    );
+
     // Verify uncommitted state is not present
     let state_after_failure = read_table_map(&client, "t_fail").await;
     assert_eq!(state_after_failure, HashMap::from([(1, 10)]));
