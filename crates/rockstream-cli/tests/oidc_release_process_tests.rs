@@ -29,6 +29,8 @@ use tokio::{
     net::TcpListener,
 };
 
+static RELEASE_PROCESS_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const TEST_JWKS: &str = r#"{"keys":[{"kty":"RSA","use":"sig","kid":"test-rsa","alg":"RS256","n":"uC5TZBsRzpdMEuqLcWOwt2Lpxpgm9ndeGckqfIDXk91vhkJkwZmnI6flKMl7Q76xTKPmElATzyjc0SCthFS9Y2LFuunjfWdz1mBqrldJy90LZ3Jc65o3ZHxq4XPZCcSF7ysbFhBYC85LApxCOwn2ibtmOAA2K_5G4ZuXZkavlqXfHE8ETbWBghh7pUlOqAfx915ge_2vTs0Z1CeBShizn4ZRvPnlSCzoVt4fOHIpE_mESnJ1hYtS3zz9b_8fILwIzo2vxJAn3FMxvzb5UJIUJGfaqQVcvjXEHYwjiLncIeMSYEWgCFYdBuQTjI1YqFmNMFZSFJqZNoeOgTvrZmKx8w","e":"AQAB"}]}"#;
 const EXPIRED_JWK: &str = r#"{"kty":"RSA","use":"sig","kid":"expired-rsa","alg":"RS256","n":"1EAvcvNNqEitQgm7G-0cS1NV6X0JM4UBR1CRc7Ye3thwDkiOp-OCm_K0eooIytTX8v6LBaphymD9rUBVWEpH23XZESlf2El9nXaa7wTYmBkISXSTky90WHGB91MPVk-OY3abfGnX1hIaW-gFawjaprCCbt3pwxKkQMDgC42Qu1WvUUAHlCtgbJp_j-zflKaZDS-HXDT5kfYLptmhoEN1p6EkQxgF6BARB00SokWf-XE8cJ6OOUDMPgrFe6I6zJjtl2ndGtvNEI-EmZKaq59sRAJ45C9nBz8MdQtkOGs5Bp_QF2KIddGmQ3HvykYZiuDvy94yqAAREpfaxQiZJai27w","e":"AQAB"}"#;
 const VALID_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QtcnNhIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwiYXVkIjoicm9ja3N0cmVhbSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwfQ.MS2GUK9CGRv3nRBI7cjJiTAq5Uq7_TKUbwbnghcxnl8uTaV3hC3k1GXN2knEZ3W2R7ZtVgsvG085Qizuf4u6O0jJS-txM2uqUJg4M2q59OzV0nmDKmZBwqF_w0h63Vy4aO5tFrNkY-1F9fsMQ_WVBr1_Sid4aBZrcdhn3xVCQEnm7MRfD4U_tDLEyDeBeOYegJl5WDZDIwA8vmdCteyj80aqsnndyntqgTvCzBfwLZQKKwzoKNAMubKk-4npFishD19Hvmgbp0hX-ITc7DMTrszIb18oKq3AJOuCHiZ9kNsM2mwP-DVPlbcV6jQqHHosrfXAE0O7DdcaQqUkwB5mBQ";
@@ -385,6 +387,7 @@ fn simple_query_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Vec
 
 #[tokio::test]
 async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("node-storage");
@@ -693,6 +696,7 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
 
 #[tokio::test]
 async fn scram_failures_run_in_release_process_and_audit_after_restart() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("node-storage");
@@ -840,6 +844,7 @@ async fn scram_failures_run_in_release_process_and_audit_after_restart() {
 
 #[tokio::test]
 async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_results() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     assert!(
         rockstream_test_support::docker_available(),
         "Docker is required for the PostgreSQL secret-rotation release proof"
@@ -1236,6 +1241,7 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
 
 #[tokio::test]
 async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_restart() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("node-storage");
@@ -1387,6 +1393,7 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
 
 #[tokio::test]
 async fn expired_and_wrong_ca_worker_certificates_are_rejected_by_release_control_process() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("control-storage");
     let pki = rockstream_test_support::pki::TestPki::generate();
@@ -1527,6 +1534,7 @@ async fn expired_and_wrong_ca_worker_certificates_are_rejected_by_release_contro
 
 #[tokio::test]
 async fn wrong_node_certificate_is_rejected_by_release_control_process() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("control-storage");
     let worker_storage = temp.path().join("worker-storage");
