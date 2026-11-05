@@ -139,7 +139,8 @@ Every certificate in the cluster embeds a verified `NodeIdentity` encoded in the
 - **Identity Enforcement**: During handshake, the receiver extracts the leaf certificate's CN/SAN. If a connecting node presents a valid certificate whose embedded role or ID does not match its advertised wire identity, the handshake is rejected immediately with error `RS-2412` (`IdentityMismatch`).
 - **CA Chain Validation**: Every peer must chain to a configured CA root. Untrusted, malformed, or expired certificates are rejected with `RS-2411` (`UntrustedCa` / `ExpiredCert`).
 - **Mandatory Authentication**: Unauthenticated/plaintext connections are refused with `RS-2410` (`InternalMtlsRequired`), except when the explicit loopback-only development option is enabled.
-- **Role Permissions**: Only authenticated nodes with `NodeRole::Worker` can receive shard leases; only `NodeRole::Cli` or `NodeRole::Control` can execute administrative operations.
+- **Role Permissions**: Node roles identify transport peers; they do not grant user or administrator permissions. Authenticated worker-ID claims are bound to the registered worker, and execution progress and fence checks are bound to the assigned shard. User-facing service operations still require the separate current actor policy.
+- **Worker Connection Binding**: On authenticated mTLS connections, messages carrying a worker ID must match both the certificate and the registered connection. A mismatch returns `RS-2401`, is durably audited, and has no protected effect; the authenticated connection remains available after the denial. Execution progress and write-fence checks also require the connection's worker to own the assigned shard or lease.
 
 ---
 

@@ -37,7 +37,7 @@ use rockstream_types::data_plane::{
     SourceDeltaRequest, WorkerExecutionStatus, WorkloadSnapshot,
 };
 use rockstream_types::error_code::{
-    RS_0001, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
+    RS_0001, RS_2401, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
 };
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
@@ -2791,6 +2791,47 @@ fn append_required_security_audit(
     }
 }
 
+fn claimed_worker_id(message: &WorkerMessage) -> Option<WorkerId> {
+    match message {
+        WorkerMessage::DeploymentReady { worker_id, .. }
+        | WorkerMessage::OperatorStatsReport { worker_id, .. }
+        | WorkerMessage::Heartbeat { worker_id, .. }
+        | WorkerMessage::Deregister { worker_id }
+        | WorkerMessage::RequestShard { worker_id, .. }
+        | WorkerMessage::DrainAck { worker_id, .. }
+        | WorkerMessage::ShardTransferAck { worker_id, .. }
+        | WorkerMessage::ShardCheckpointAck { worker_id, .. }
+        | WorkerMessage::LifecycleState { worker_id, .. }
+        | WorkerMessage::ShardLoadReport { worker_id, .. }
+        | WorkerMessage::RequestDrain { worker_id } => Some(*worker_id),
+        _ => None,
+    }
+}
+
+async fn deny_authenticated_worker_action(
+    sender: &mpsc::Sender<ControlMessage>,
+    audit: Option<&Arc<FileAuditLog>>,
+    identity: &NodeIdentity,
+    resource: String,
+    detail: String,
+) -> bool {
+    let event = AuditEvent::now(identity.to_cn(), "security.authorization_denied", resource)
+        .with_detail(detail);
+    if !append_required_security_audit(audit, &event, "worker identity claim denial") {
+        return false;
+    }
+    send_message(
+        sender,
+        &ControlMessage::OperationFailed {
+            code: RS_2401.to_string(),
+            message: "worker identity claim is not authorized for this connection".to_owned(),
+            next_steps: rockstream_types::error_code::next_steps(RS_2401).to_string(),
+        },
+    )
+    .await;
+    true
+}
+
 /// Accept a connection and perform TLS handshake if configured.
 async fn accept_and_handle(
     stream: TcpStream,
@@ -3101,6 +3142,31 @@ async fn handle_connection_stream<R, W>(
             }
         };
 
+        if let (Some(identity), Some(claimed_id)) = (&peer_identity, claimed_worker_id(&msg)) {
+            if identity.role != NodeRole::Worker
+                || !identity.matches_worker_id(claimed_id.0)
+                || connected_worker_id != Some(claimed_id)
+            {
+                let registered_id = connected_worker_id
+                    .map(|worker_id| worker_id.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                if !deny_authenticated_worker_action(
+                    &sender,
+                    audit.as_ref(),
+                    identity,
+                    claimed_id.to_string(),
+                    format!(
+                        "registered_worker_id={registered_id}, claimed_worker_id={claimed_id}, error_code={RS_2401}"
+                    ),
+                )
+                .await
+                {
+                    return;
+                }
+                continue;
+            }
+        }
+
         match msg {
             WorkerMessage::Register(reg) => {
                 if let Some(id) = &peer_identity {
@@ -3294,6 +3360,37 @@ async fn handle_connection_stream<R, W>(
                 input_rows,
                 output_rows,
             } => {
+                let assigned_worker = data_plane
+                    .lock()
+                    .await
+                    .deployments
+                    .get(&output.workload_id)
+                    .and_then(|deployment| deployment.descriptors.get(&output.shard_id))
+                    .map(|descriptor| descriptor.shard.worker_id);
+                if let (Some(identity), Some(assigned_worker)) = (&peer_identity, assigned_worker) {
+                    if identity.role != NodeRole::Worker
+                        || connected_worker_id != Some(assigned_worker)
+                        || !identity.matches_worker_id(assigned_worker.0)
+                    {
+                        let registered_id = connected_worker_id
+                            .map(|worker_id| worker_id.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        if !deny_authenticated_worker_action(
+                            &sender,
+                            audit.as_ref(),
+                            identity,
+                            format!("{}/{}", output.workload_id, output.shard_id),
+                            format!(
+                                "operation=execution_progress, registered_worker_id={registered_id}, assigned_worker_id={assigned_worker}, error_code={RS_2401}"
+                            ),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                }
                 let valid = data_plane
                     .lock()
                     .await
@@ -3642,11 +3739,43 @@ async fn handle_connection_stream<R, W>(
                             .await;
                     }
                 }
+                let connection_owns_shard = peer_identity.as_ref().is_none_or(|identity| {
+                    identity.role == NodeRole::Worker
+                        && connected_worker_id.is_some_and(|worker_id| {
+                            identity.matches_worker_id(worker_id.0)
+                                && shard_manager
+                                    .get(shard_id)
+                                    .is_some_and(|lease| lease.worker_id == worker_id)
+                        })
+                });
+                if !connection_owns_shard {
+                    if let Some(identity) = &peer_identity {
+                        let registered_id = connected_worker_id
+                            .map(|worker_id| worker_id.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        let event = AuditEvent::now(
+                            identity.to_cn(),
+                            "security.authorization_denied",
+                            shard_id.to_string(),
+                        )
+                        .with_detail(format!(
+                            "operation=fence_write, registered_worker_id={registered_id}, error_code={RS_2401}"
+                        ));
+                        if !append_required_security_audit(
+                            audit.as_ref(),
+                            &event,
+                            "fence check identity denial",
+                        ) {
+                            return;
+                        }
+                    }
+                }
                 // A partitioned former leader must never certify a stale
                 // lease. Only a live Raft quorum authority may fence writes.
-                let valid = raft
-                    .as_ref()
-                    .is_none_or(|node| node.require_leader().is_ok())
+                let valid = connection_owns_shard
+                    && raft
+                        .as_ref()
+                        .is_none_or(|node| node.require_leader().is_ok())
                     && shard_manager.is_valid_writer(shard_id, lease_token);
                 tracing::debug!(
                     %shard_id,
@@ -3822,10 +3951,11 @@ async fn handle_connection_stream<R, W>(
                 );
             }
             WorkerMessage::ResolveSecretToken { secret_name } => {
-                let Some(identity) = peer_identity
-                    .as_ref()
-                    .filter(|id| id.role == NodeRole::Worker)
-                else {
+                let Some(identity) = peer_identity.as_ref().filter(|id| {
+                    id.role == NodeRole::Worker
+                        && connected_worker_id
+                            .is_some_and(|worker_id| id.matches_worker_id(worker_id.0))
+                }) else {
                     let reply = ControlMessage::OperationFailed {
                         code: RS_2410.to_string(),
                         message:
