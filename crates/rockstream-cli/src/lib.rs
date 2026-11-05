@@ -16,6 +16,7 @@ use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::diagnostic::{
     global_diagnostic_journal, record_diagnostic, redact_secrets, DiagnosticOccurrence,
+    MAX_DIAGNOSTIC_BUNDLE_BYTES,
 };
 use rockstream_types::error_code::{
     next_steps, ErrorCode, RS_0001, RS_0002, RS_0003, RS_0005, RS_4017, RS_5001,
@@ -1991,7 +1992,7 @@ pub fn run_support_diagnose(
             "Run SHOW DIAGNOSTICS and retry with a retained correlation ID.",
         ));
     };
-    let occurrence = occurrence.redacted();
+    let occurrence = occurrence.sanitized_for_support().0;
     let bundle = storage.generate_support_bundle_with_diagnostics(
         storage_path,
         None,
@@ -2411,13 +2412,20 @@ fn write_support_bundle(
     };
 
     let bundle_path = storage.join(format!("support-bundle-{generated_at_ms}.json"));
-    let json = serde_json::to_string_pretty(&bundle).map_err(|e| {
+    let json = serde_json::to_vec_pretty(&bundle).map_err(|e| {
         CliError::new(
             RS_0003,
             format!("could not serialize support bundle: {e}"),
             "This is an internal error; please report it with the audit log.",
         )
     })?;
+    if json.len() > MAX_DIAGNOSTIC_BUNDLE_BYTES {
+        return Err(CliError::new(
+            RS_0003,
+            "support bundle exceeds the 10 MiB diagnostic bundle bound",
+            "Reduce retained audit history and retry the support bundle command.",
+        ));
+    }
     fs::write(&bundle_path, json).map_err(|e| {
         CliError::new(
             RS_0003,
@@ -2769,6 +2777,29 @@ mod tests {
             "RS-2405 control and worker roles require internal mTLS\n  next steps: Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development."
         );
         assert!(!storage.exists());
+    }
+
+    #[test]
+    fn startup_support_bundle_rejects_over_10_mib_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversized_resource = "x".repeat(MAX_DIAGNOSTIC_BUNDLE_BYTES + 1);
+        let events = [AuditEvent::now(
+            "operator",
+            "support.bundle",
+            oversized_resource,
+        )];
+
+        let error = write_support_bundle(dir.path(), "all", 1, &events).unwrap_err();
+
+        assert_eq!(
+            error.message,
+            "support bundle exceeds the 10 MiB diagnostic bundle bound"
+        );
+        let written_paths = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(written_paths, Vec::<PathBuf>::new());
     }
 
     #[test]
