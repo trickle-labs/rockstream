@@ -568,6 +568,11 @@ pub(crate) const VALID_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QtcnNhIi
 
 #[cfg(test)]
 pub(crate) async fn verifier_with_local_jwks() -> OidcVerifier {
+    verifier_with_local_jwks_for("https://issuer.example", "rockstream").await
+}
+
+#[cfg(test)]
+pub(crate) async fn verifier_with_local_jwks_for(issuer: &str, audience: &str) -> OidcVerifier {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -587,12 +592,7 @@ pub(crate) async fn verifier_with_local_jwks() -> OidcVerifier {
         stream.write_all(response.as_bytes()).await.unwrap();
         stream.write_all(body).await.unwrap();
     });
-    let config = OidcConfig::new(
-        "https://issuer.example",
-        "rockstream",
-        format!("http://{address}/jwks"),
-    )
-    .unwrap();
+    let config = OidcConfig::new(issuer, audience, format!("http://{address}/jwks")).unwrap();
     let verifier = OidcVerifier::new(config).await.unwrap();
     server.await.unwrap();
     verifier

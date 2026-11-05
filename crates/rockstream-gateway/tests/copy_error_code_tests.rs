@@ -86,6 +86,7 @@ async fn copy_malformed_variants_return_rs2021() {
         let conn_id = format!("copy-rs2021-conn-{i}");
         let responses = handler
             .copy_from_stdin_response(query, &conn_id)
+            .await
             .unwrap_or_else(|e| panic!("copy_from_stdin_response errored for {query:?}: {e:?}"));
 
         let response_count = responses.len();

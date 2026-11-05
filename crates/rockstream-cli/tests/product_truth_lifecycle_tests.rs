@@ -122,7 +122,7 @@ fn allocate_memory_pressure() -> Vec<u8> {
     const PAGE_SIZE: usize = 4096;
     let mut pattern = vec![0_u8; PAGE_SIZE];
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    for word in pattern.chunks_exact_mut(8) {
+    for word in pattern.as_chunks_mut::<8>().0 {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;

@@ -17,7 +17,6 @@ use arrow::record_batch::RecordBatch;
 use rockstream_types::arrow_batch::append_weight_column;
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
-use rockstream_types::secret::SecretToken;
 use rockstream_types::timestamp::Epoch;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::{Client, NoTls};
@@ -315,9 +314,7 @@ pub struct PostgresCdcSource {
     native_seen_messages: usize,
     native_xid: Option<u32>,
     secret_name: Option<String>,
-    pending_secret_token: Option<SecretToken>,
-    active_secret_token_id: Option<String>,
-    secret_rotations_applied: u64,
+    secret_version: u64,
     quad_lsn: QuadLsnProgress,
 }
 
@@ -342,6 +339,7 @@ struct PgOutputConnection {
     table: String,
     snapshot_lsn: Option<PgLsn>,
     relations: std::collections::HashMap<u32, PgOutputRelation>,
+    connection_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -386,9 +384,7 @@ impl PostgresCdcSource {
             native_seen_messages: 0,
             native_xid: None,
             secret_name: None,
-            pending_secret_token: None,
-            active_secret_token_id: None,
-            secret_rotations_applied: 0,
+            secret_version: 0,
             quad_lsn: QuadLsnProgress::new(),
         }
     }
@@ -405,33 +401,50 @@ impl PostgresCdcSource {
         self.secret_name = Some(secret_name.into());
     }
 
-    /// Queue one encrypted replacement token for the next epoch boundary.
-    pub fn set_secret_token(&mut self, token: SecretToken) -> Result<(), String> {
-        if self
-            .secret_name
-            .as_deref()
-            .is_some_and(|name| name != token.secret_name)
-        {
-            return Err("RS-5003: secret token does not match the connector binding".to_string());
+    pub fn bind_secret_version(&mut self, secret_name: impl Into<String>, version: u64) {
+        self.secret_name = Some(secret_name.into());
+        self.secret_version = version;
+    }
+
+    pub fn secret_binding(&self) -> (Option<&str>, u64) {
+        (self.secret_name.as_deref(), self.secret_version)
+    }
+
+    pub async fn rotate_pgoutput_secret_at_epoch(
+        &mut self,
+        secret_name: &str,
+        version: u64,
+        password: String,
+        has_checkpoint: bool,
+    ) -> Result<bool, SourceError> {
+        if self.secret_name.as_deref() != Some(secret_name) {
+            return Err(SourceError::Io(
+                "rotated secret does not match the PostgreSQL source binding".to_string(),
+            ));
         }
-        self.secret_name = Some(token.secret_name.clone());
-        self.pending_secret_token = Some(token);
-        Ok(())
-    }
-
-    pub fn apply_secret_token_at_epoch(&mut self) {
-        if let Some(token) = self.pending_secret_token.take() {
-            self.active_secret_token_id = Some(token.token_id);
-            self.secret_rotations_applied += 1;
+        if version < self.secret_version {
+            return Err(SourceError::Io(
+                "PostgreSQL source secret version moved backwards".to_string(),
+            ));
         }
-    }
-
-    pub fn active_secret_token_id(&self) -> Option<&str> {
-        self.active_secret_token_id.as_deref()
-    }
-
-    pub fn secret_rotations_applied(&self) -> u64 {
-        self.secret_rotations_applied
+        if version == self.secret_version {
+            return Ok(false);
+        }
+        if password.is_empty() {
+            return Err(SourceError::Io(
+                "rotated PostgreSQL source password is empty".to_string(),
+            ));
+        }
+        let config = self.pgoutput_config.as_mut().ok_or_else(|| {
+            SourceError::Io("PostgreSQL pgoutput configuration is unavailable".to_string())
+        })?;
+        config.password = Some(password);
+        self.secret_version = version;
+        if self.pgoutput.is_some() {
+            self.close_pgoutput_and_wait().await;
+            self.open_pgoutput(has_checkpoint).await?;
+        }
+        Ok(true)
     }
 
     pub const fn pipeline_restarts(&self) -> u64 {
@@ -505,35 +518,51 @@ impl PostgresCdcSource {
             .connect(NoTls)
             .await
             .map_err(|error| SourceError::Io(format!("connect PostgreSQL CDC source: {error}")))?;
-        tokio::spawn(async move {
+        let connection_task = tokio::spawn(async move {
             let _ = connection.await;
         });
-        let slot = client
+        let slot = match client
             .query_opt(
                 "SELECT plugin, database, active FROM pg_replication_slots WHERE slot_name = $1",
                 &[&config.slot],
             )
             .await
-            .map_err(|error| SourceError::Io(format!("inspect pgoutput slot: {error}")))?;
-        match slot {
+        {
+            Ok(slot) => slot,
+            Err(error) => {
+                drop(client);
+                connection_task.abort();
+                let _ = connection_task.await;
+                return Err(SourceError::Io(format!("inspect pgoutput slot: {error}")));
+            }
+        };
+        let slot_error = match slot {
             Some(row) => {
                 let plugin = row.get::<_, String>(0);
                 let database = row.get::<_, String>(1);
                 let active = row.get::<_, bool>(2);
                 if plugin != "pgoutput" || database != config.database || active {
-                    return Err(SourceError::Io(format!(
+                    Some(format!(
                         "RS-4013: pgoutput slot '{}' is incompatible or active elsewhere; next_steps: stop the existing owner and verify plugin/database",
                         config.slot
-                    )));
+                    ))
+                } else {
+                    None
                 }
             }
             None if has_checkpoint => {
-                return Err(SourceError::Io(format!(
+                Some(format!(
                     "RS-4011: checkpointed pgoutput slot '{}' is missing; next_steps: run the bounded resnapshot workflow",
                     config.slot
-                )));
+                ))
             }
-            None => {}
+            None => None,
+        };
+        if let Some(error) = slot_error {
+            drop(client);
+            connection_task.abort();
+            let _ = connection_task.await;
+            return Err(SourceError::Io(error));
         }
         self.pgoutput = Some(PgOutputConnection {
             client,
@@ -542,6 +571,7 @@ impl PostgresCdcSource {
             table: quote_relation(&config.table)?,
             snapshot_lsn: None,
             relations: std::collections::HashMap::new(),
+            connection_task,
         });
         Ok(())
     }
@@ -551,7 +581,24 @@ impl PostgresCdcSource {
     }
 
     pub fn close_pgoutput(&mut self) {
-        self.pgoutput = None;
+        if let Some(connection) = self.pgoutput.take() {
+            connection.connection_task.abort();
+        }
+        self.native_xid = None;
+        self.native_seen_messages = 0;
+    }
+
+    async fn close_pgoutput_and_wait(&mut self) {
+        if let Some(connection) = self.pgoutput.take() {
+            let PgOutputConnection {
+                client,
+                connection_task,
+                ..
+            } = connection;
+            drop(client);
+            connection_task.abort();
+            let _ = connection_task.await;
+        }
         self.native_xid = None;
         self.native_seen_messages = 0;
     }
@@ -1495,7 +1542,6 @@ impl SourceConnector for PostgresCdcSource {
         credits_available: usize,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
-        self.apply_secret_token_at_epoch();
         if self.pgoutput.is_none() && self.pgoutput_config.is_some() {
             self.open_pgoutput(false).await?;
         }
@@ -1594,7 +1640,6 @@ impl SourceConnector for PostgresCdcSource {
         epoch: Epoch,
         offset: OffsetToken,
     ) -> Result<(), SourceError> {
-        self.apply_secret_token_at_epoch();
         let lsn = PgLsn::from_offset_token(&offset)?;
         if self.pgoutput.is_none() && self.pgoutput_config.is_some() {
             return Err(SourceError::CommitOffsetFailed {
@@ -2506,6 +2551,55 @@ mod tests {
         assert_eq!(
             source.capture_snapshot_delta_fence(None).await.unwrap(),
             SnapshotDeltaFence::new(PgLsn(10).to_offset_token(), PgLsn(20).to_offset_token())
+        );
+    }
+
+    #[tokio::test]
+    async fn pgoutput_secret_rotation_updates_password_once_at_the_epoch_boundary() {
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut source = PostgresCdcSource::configured_pgoutput(
+            ConnectorId(9999),
+            schema,
+            PgOutputConfig {
+                host: "127.0.0.1".to_string(),
+                port: 5432,
+                database: "app".to_string(),
+                user: "app".to_string(),
+                password: Some("before".to_string()),
+                slot: "source_slot".to_string(),
+                publication: "source_pub".to_string(),
+                table: "public.orders".to_string(),
+            },
+        )
+        .unwrap();
+        source.bind_secret_version("pg", 1);
+
+        let rotated = source
+            .rotate_pgoutput_secret_at_epoch("pg", 2, "after".to_string(), false)
+            .await
+            .unwrap();
+        assert!(rotated);
+        assert_eq!(source.secret_binding(), (Some("pg"), 2));
+        assert_eq!(
+            source
+                .pgoutput_config
+                .as_ref()
+                .and_then(|config| config.password.as_deref()),
+            Some("after")
+        );
+
+        let repeated = source
+            .rotate_pgoutput_secret_at_epoch("pg", 2, "ignored".to_string(), false)
+            .await
+            .unwrap();
+        assert!(!repeated);
+        assert_eq!(
+            source
+                .pgoutput_config
+                .as_ref()
+                .and_then(|config| config.password.as_deref()),
+            Some("after")
         );
     }
 }

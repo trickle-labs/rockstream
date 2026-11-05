@@ -12,13 +12,15 @@
 
 #![cfg(feature = "testcontainers")]
 
+#[path = "common/security_policy.rs"]
+mod security_policy;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
 use rockstream_gateway::{
     catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable},
-    role_catalog::{create_role_entry, RoleCatalog},
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -100,16 +102,14 @@ async fn spawn_ref_gateway() -> (u16, String) {
         });
     }
 
-    let role_catalog = Arc::new(RoleCatalog::new());
-    role_catalog
-        .insert(create_role_entry("alice", "pencil"))
-        .expect("insert alice");
+    let role_catalog =
+        security_policy::role_catalog_with_authorized_builder(&catalog, "alice", "pencil").await;
 
     let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     let server =
         GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
 
-    // Grant PipelineOwner to alice so CREATE TABLE / INSERT / COPY pass ACL checks.
+    // Preserve the legacy ACL fixture alongside the durable Builder grant.
     use rockstream_types::acl::{AclEntry, Role};
     server.handler().acl_store.grant(AclEntry {
         principal: "alice".to_string(),

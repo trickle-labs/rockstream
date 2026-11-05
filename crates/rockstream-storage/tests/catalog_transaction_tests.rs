@@ -304,6 +304,73 @@ async fn test_drop_view_crash_after_commit_removes_view() {
 }
 
 #[tokio::test]
+async fn test_drop_view_clears_outgoing_dependencies_before_table_drop() {
+    let store = Arc::new(InMemory::new());
+    let catalog = DurableCatalogStore::new(store.clone(), "test");
+    let table = CatalogTable {
+        id: TableId(10),
+        name: "base".to_string(),
+        namespace_id: NamespaceId(1),
+        columns: vec![],
+        pk_cols: vec![],
+    };
+    let view = CatalogView {
+        id: ViewId(5),
+        name: "dependent".to_string(),
+        namespace_id: NamespaceId(1),
+        sql: "SELECT * FROM base".to_string(),
+        compiled_plan_id: None,
+        op_id: None,
+        columns: vec![],
+    };
+    let dependency = ViewDependency {
+        parent_id: view.id.0,
+        child_id: table.id.0,
+        dependency_kind: DependencyKind::Table,
+    };
+
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                1,
+                1,
+                vec![
+                    CatalogMutation::PutTable(table),
+                    CatalogMutation::PutView(view),
+                    CatalogMutation::PutViewDependency(dependency),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let error = catalog
+        .commit_txn(CatalogTxn::new(2, 2, vec![CatalogMutation::DeleteTable(TableId(10))]).unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        CatalogError::ReferencedObjectExists(format!(
+            "[RS-1002] cannot drop table {}: dependent views exist; next_steps: drop dependent views first",
+            TableId(10)
+        ))
+    );
+    assert_eq!(catalog.get_revision().await, 1);
+    catalog
+        .commit_txn(CatalogTxn::new(2, 3, vec![CatalogMutation::DeleteView(ViewId(5))]).unwrap())
+        .await
+        .unwrap();
+    catalog
+        .commit_txn(CatalogTxn::new(3, 4, vec![CatalogMutation::DeleteTable(TableId(10))]).unwrap())
+        .await
+        .unwrap();
+
+    let recovered = DurableCatalogStore::recover(store, "test").await.unwrap();
+    assert_eq!(recovered.list_view_dependencies().await.unwrap(), vec![]);
+    assert_eq!(recovered.get_table(TableId(10)).await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn test_create_index_crash_during_build_recovers_state() {
     let store = Arc::new(InMemory::new());
     let catalog = DurableCatalogStore::new(store.clone(), "test");

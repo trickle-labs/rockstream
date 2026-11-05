@@ -8,6 +8,7 @@ use rdkafka::{
     producer::{FutureProducer, FutureRecord},
     ClientConfig,
 };
+use rockstream_control::{kek::EnvKekProvider, SecretStore};
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
     view_reader::{ViewReadStrategy, ViewReader},
@@ -19,6 +20,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use testcontainers_modules::kafka::apache::{self, KAFKA_PORT};
 use tokio_postgres::NoTls;
+
+#[path = "common/security_policy.rs"]
+mod security_policy;
 
 struct NoopViewReader;
 
@@ -1482,26 +1486,30 @@ async fn test_kafka_source_ddl_complete_valid_options() {
 
 #[tokio::test]
 async fn test_kafka_source_ddl_dot_notation_aliases() {
-    let server = GatewayServer::with_catalog(
-        "127.0.0.1:0".parse().unwrap(),
-        Arc::new(CatalogStubs::new()),
-        Arc::new(NoopViewReader),
-    );
-    let (address, _handle) = server.serve_background().await.unwrap();
-    let (client, connection) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=test dbname=test",
-            address.port()
-        ),
-        NoTls,
+    let catalog = Arc::new(CatalogStubs::new());
+    let role_catalog = security_policy::role_catalog_with_builder_secret_use(
+        &catalog,
+        "test-builder",
+        "test-password",
+        "kafka_secret",
     )
-    .await
-    .unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    .await;
+    let secret_store = Arc::new(SecretStore::new(
+        None,
+        Arc::new(EnvKekProvider::from_passphrase("source-ddl-test-kek")),
+    ));
+    let server = GatewayServer::with_scram_auth(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+        role_catalog,
+    )
+    .with_secret_store(secret_store);
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let admin = security_policy::connect_test_admin(address.port()).await;
+    let client = security_policy::connect_test_builder(address.port()).await;
 
-    client
+    admin
         .execute(
             "CREATE SECRET kafka_secret (TYPE = 'sasl_plain', username = 'u', password = 'p');",
             &[],

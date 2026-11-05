@@ -16,9 +16,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::NoTls;
 
+#[path = "common/security_policy.rs"]
+mod security_policy;
+
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
-    role_catalog::{create_role_entry, RoleCatalog},
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -266,10 +268,8 @@ async fn connect_port(port: u16) -> tokio_postgres::Client {
 #[tokio::test]
 async fn test_golden_wire_startup_scram() {
     let catalog = Arc::new(CatalogStubs::new());
-    let role_catalog = Arc::new(RoleCatalog::new());
-    role_catalog
-        .insert(create_role_entry("alice", "pencil"))
-        .expect("insert alice");
+    let role_catalog =
+        security_policy::role_catalog_with_authorized_builder(&catalog, "alice", "pencil").await;
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server =
         GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);

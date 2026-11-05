@@ -217,7 +217,7 @@ pub struct StartOptions {
     pub role: String,
     /// Control service URL.
     pub control: Option<String>,
-    /// Authentication mode; `oidc` and `mtls` require configured gateway credentials.
+    /// Authentication mode; SCRAM requires a durable login, and OIDC/mTLS require configured gateway credentials.
     pub auth_mode: String,
     /// Worker locality metadata.
     pub worker_location: WorkerLocation,
@@ -401,12 +401,37 @@ fn validate_role(role: &str) -> Result<(), CliError> {
 /// # Errors
 ///
 /// Returns a [`CliError`] (RS-0003) if the storage cannot be initialised or
-/// the listen port is already in use, or RS-0002 for an unparseable address.
+/// the listen port is already in use, or RS-0002 for invalid authentication
+/// configuration or an unparseable address.
 pub async fn start_gateway(
     opts: &StartOptions,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
     start_gateway_with_catalog(opts, catalog).await
+}
+
+fn gateway_start_error(context: &str, bind_next_steps: &str, error: std::io::Error) -> CliError {
+    let message = error.to_string();
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        let next_steps = if message.starts_with("SCRAM requires") {
+            "Provision an enabled SCRAM login in the recovered durable catalog before starting the gateway."
+        } else {
+            "Configure the required gateway authentication and TLS prerequisites before starting."
+        };
+        CliError::new(
+            RS_0002,
+            format!("gateway startup rejected: {message}"),
+            next_steps,
+        )
+    } else if message.starts_with("SCRAM durable credential store") {
+        CliError::new(
+            RS_0003,
+            format!("gateway authentication storage unavailable: {message}"),
+            "Restore access to the durable credential store before starting the gateway.",
+        )
+    } else {
+        CliError::new(RS_0003, format!("{context}: {message}"), bind_next_steps)
+    }
 }
 
 pub async fn start_gateway_with_catalog(
@@ -488,26 +513,34 @@ pub async fn start_gateway_with_shard_and_catalog(
         .unwrap_or_else(|| rockstream_types::config::NodeConfig::from(&opts.config));
     validate_start_auth_modes(&opts.auth_mode, Some(&node_config))?;
     if catalog.get_durable_store().is_none() {
-        let durable_catalog =
+        let durable_catalog = Arc::new(
             rockstream_storage::catalog::DurableCatalogStore::recover(store.clone(), shard_path)
                 .await
-                .map(Arc::new)
                 .map_err(|error| {
                     CliError::new(
                         RS_0003,
-                        format!("gateway catalog recovery failed: {error}"),
-                        "Restore or repair durable catalog storage before starting the gateway.",
+                        format!("gateway durable catalog recovery failed: {error}"),
+                        "Check that the durable catalog is intact and storage is accessible.",
                     )
-                })?;
+                })?,
+        );
         catalog.set_durable_store(durable_catalog);
     }
     catalog.sync_from_durable_store().await.map_err(|error| {
         CliError::new(
             RS_0003,
-            format!("gateway catalog state could not be loaded: {error}"),
-            "Restore or repair durable catalog storage before starting the gateway.",
+            format!("gateway durable catalog projection failed: {error}"),
+            "Check that the durable catalog is intact and storage is accessible.",
         )
     })?;
+    let security_audit_catalog: Arc<dyn rockstream_storage::catalog::CatalogStore> =
+        catalog.get_durable_store().ok_or_else(|| {
+            CliError::new(
+                RS_0003,
+                "gateway security audit catalog is unavailable",
+                "Restore durable catalog access before starting the gateway.",
+            )
+        })?;
 
     // Flush to create the initial manifest so ShardReader can open on a fresh node.
     shard_db.flush().await.map_err(|e| {
@@ -535,7 +568,8 @@ pub async fn start_gateway_with_shard_and_catalog(
         });
 
     let mut topology_readers = vec![rockstream_gateway::QueryTimeShardReaderSpec::new(
-        shard_path, store,
+        shard_path,
+        store.clone(),
     )];
     for shard_dir in &opts.query_time_shard_dirs {
         let shard_store: Arc<dyn object_store::ObjectStore> = Arc::new(
@@ -567,7 +601,7 @@ pub async fn start_gateway_with_shard_and_catalog(
         )
     })?;
 
-    let auth_mode_str = opts.auth_mode.trim().to_lowercase();
+    let auth_mode_str = effective_start_auth_mode(&opts.auth_mode, &node_config);
     tracing::info!("Gateway server starting with auth mode: {}", auth_mode_str);
 
     let server = match auth_mode_str.as_str() {
@@ -645,6 +679,13 @@ pub async fn start_gateway_with_shard_and_catalog(
                 )
             })?
         }
+        "scram" => rockstream_gateway::GatewayServer::with_shard_db_and_scram_auth(
+            addr,
+            catalog,
+            view_reader,
+            shard_db,
+            Arc::new(rockstream_gateway::RoleCatalog::new()),
+        ),
         _ => {
             return Err(CliError::new(
                 RS_0002,
@@ -654,7 +695,33 @@ pub async fn start_gateway_with_shard_and_catalog(
         }
     };
 
+    let secret_store = rockstream_control::SecretStore::open_durable(
+        format!("{shard_path}-secrets"),
+        store,
+        Arc::new(rockstream_control::EnvKekProvider::from_env()),
+    )
+    .await
+    .map_err(|error| {
+        CliError::new(
+            RS_0003,
+            format!("gateway secret store failed to open: {error}"),
+            "Check that gateway storage is accessible and the configured key provider is available.",
+        )
+    })?;
+    let secret_store = secret_store.with_security_audit_catalog(security_audit_catalog);
+    secret_store
+        .flush_pending_security_audit_outbox()
+        .await
+        .map_err(|_| {
+            CliError::new(
+                RS_0003,
+                "gateway secret-rotation audit recovery failed",
+                "Restore durable catalog and secret-store access before starting the gateway.",
+            )
+        })?;
+    let secret_store = Arc::new(secret_store);
     let mut server = server
+        .with_secret_store(secret_store)
         .with_query_time_shard_topology_provider(topology_provider)
         .with_join_strategy(opts.config.execution.join_strategy);
     if opts.role == "gateway" {
@@ -679,20 +746,20 @@ pub async fn start_gateway_with_shard_and_catalog(
         let (pgwire_addr, _, pgwire_handle, _) = server
             .serve_background_with_webhook(webhook_addr)
             .await
-            .map_err(|e| {
-                CliError::new(
-                    RS_0003,
-                    format!("failed to bind gateway or webhook listener: {e}"),
+            .map_err(|error| {
+                gateway_start_error(
+                    "failed to bind gateway or webhook listener",
                     "Check that both --listen and --webhook-listen ports are available.",
+                    error,
                 )
             })?;
         Ok((pgwire_addr, pgwire_handle))
     } else {
         server.serve_background().await.map_err(|e| {
-            CliError::new(
-                RS_0003,
-                format!("failed to bind gateway on {listen}: {e}"),
+            gateway_start_error(
+                &format!("failed to bind gateway on {listen}"),
                 "Check that the port is not already in use.",
+                e,
             )
         })
     }
@@ -701,35 +768,47 @@ pub async fn start_gateway_with_shard_and_catalog(
 fn validate_auth_mode(auth_mode: &str) -> Result<(), CliError> {
     let mode = auth_mode.trim().to_lowercase();
     let (message, next_steps) = match mode.as_str() {
-        "off" | "oidc" | "mtls" => return Ok(()),
+        "off" | "scram" | "oidc" | "mtls" => return Ok(()),
         "" => (
             "authentication mode is empty".to_string(),
             "Set [auth].mode to `off` to explicitly disable client authentication.",
         ),
-        "scram" => (
-            "authentication mode `scram` is unavailable: durable principal integration is incomplete".to_string(),
-            "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
-        ),
         "md5" => (
-            "authentication mode `md5` is unavailable: MD5 is not a release authentication mode".to_string(),
+            "authentication mode `md5` is unavailable: MD5 is not a release authentication mode"
+                .to_string(),
             "Use a release-supported authentication mode.",
         ),
         _ => (
             format!("unknown auth mode `{auth_mode}`"),
-            "Pass a supported authentication mode: off, oidc, or mtls.",
+            "Pass a supported authentication mode: off, scram, oidc, or mtls.",
         ),
     };
     Err(CliError::new(RS_0002, message, next_steps))
+}
+
+fn effective_start_auth_mode(
+    auth_mode: &str,
+    node_config: &rockstream_types::config::NodeConfig,
+) -> String {
+    let configured = node_config.auth.mode.trim();
+    let requested = auth_mode.trim();
+    if requested.eq_ignore_ascii_case("off") && !configured.eq_ignore_ascii_case("off") {
+        configured.to_ascii_lowercase()
+    } else {
+        requested.to_ascii_lowercase()
+    }
 }
 
 fn validate_start_auth_modes(
     auth_mode: &str,
     node_config: Option<&rockstream_types::config::NodeConfig>,
 ) -> Result<(), CliError> {
-    validate_auth_mode(auth_mode)?;
+    let selected_mode = node_config
+        .map(|config| effective_start_auth_mode(auth_mode, config))
+        .unwrap_or_else(|| auth_mode.trim().to_ascii_lowercase());
+    validate_auth_mode(&selected_mode)?;
     if let Some(node_config) = node_config {
-        let selected = auth_mode.trim().to_ascii_lowercase();
-        match selected.as_str() {
+        match selected_mode.as_str() {
             "oidc"
                 if node_config
                     .auth
@@ -776,15 +855,12 @@ fn validate_start_auth_modes(
             }
             _ => {}
         }
-    } else if matches!(
-        auth_mode.trim().to_ascii_lowercase().as_str(),
-        "oidc" | "mtls"
-    ) {
+    } else if matches!(selected_mode.as_str(), "oidc" | "mtls") {
         return Err(CliError::new(
             RS_0002,
             format!(
                 "authentication mode `{}` requires node configuration",
-                auth_mode
+                selected_mode
             ),
             "Provide a node configuration with the required authentication settings.",
         ));
@@ -2995,58 +3071,55 @@ mod tests {
         let err = run_start(&opts).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "RS-0002 unknown auth mode `invalid`\n  next steps: Pass a supported authentication mode: off, oidc, or mtls."
+            "RS-0002 unknown auth mode `invalid`\n  next steps: Pass a supported authentication mode: off, scram, oidc, or mtls."
         );
+    }
+
+    #[test]
+    fn scram_is_a_supported_startup_mode() {
+        assert!(validate_start_auth_modes("scram", None).is_ok());
     }
 
     #[test]
     fn unavailable_auth_modes_fail_before_startup_side_effects() {
         let parent = tempfile::tempdir().unwrap();
-        for (mode, detail, next_steps) in [
-            (
-                "scram",
-                "durable principal integration is incomplete",
-                "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
-            ),
-            (
-                "md5",
-                "MD5 is not a release authentication mode",
-                "Use a release-supported authentication mode.",
-            ),
-        ] {
-            let storage = parent.path().join(mode);
-            let opts = StartOptions {
-                storage: storage.clone(),
-                role: "all".to_string(),
-                control: None,
-                worker_id: None,
-                auth_mode: mode.to_string(),
-                worker_location: WorkerLocation::default(),
-                worker_capabilities: WorkerCapabilities::default(),
-                config: RockstreamConfig::default(),
-                node_config: None,
-                metrics_addr: None,
-                listen_addr: None,
-                raft_peers: None,
-                raft_node_id: None,
-                raft_bind: None,
-                raft_bootstrap: false,
-                daemon: false,
-                control_bind: None,
-                control_shared_storage: None,
-                query_time_shard_dirs: Vec::new(),
-                shutdown_timeout_secs: None,
-            };
+        let (mode, detail, next_steps) = (
+            "md5",
+            "MD5 is not a release authentication mode",
+            "Use a release-supported authentication mode.",
+        );
+        let storage = parent.path().join(mode);
+        let opts = StartOptions {
+            storage: storage.clone(),
+            role: "all".to_string(),
+            control: None,
+            worker_id: None,
+            auth_mode: mode.to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
+            node_config: None,
+            metrics_addr: None,
+            listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
+        };
 
-            let err = run_start(&opts).unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                format!(
-                    "RS-0002 authentication mode `{mode}` is unavailable: {detail}\n  next steps: {next_steps}"
-                )
-            );
-            assert!(!storage.exists(), "{mode} created startup storage");
-        }
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "RS-0002 authentication mode `{mode}` is unavailable: {detail}\n  next steps: {next_steps}"
+            )
+        );
+        assert!(!storage.exists(), "{mode} created startup storage");
     }
 
     #[test]
@@ -3550,5 +3623,48 @@ mod tests {
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
         assert!(err.message.contains("raft-bind"));
+    }
+
+    #[tokio::test]
+    async fn gateway_startup_rejects_corrupt_durable_catalog() {
+        use object_store::{path::Path as ObjectPath, ObjectStoreExt as _};
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("gateway/catalog/snapshots/00000000000000000001.snap"),
+                b"not json".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder("gateway", store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let opts = StartOptions {
+            storage: storage.path().to_path_buf(),
+            listen_addr: Some("127.0.0.1:0".to_string()),
+            ..StartOptions::default()
+        };
+        let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+
+        let err = start_gateway_with_shard_and_catalog(
+            &opts,
+            shard_db,
+            store,
+            "gateway",
+            catalog.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "RS-0003 gateway durable catalog recovery failed: [RS-1003] malformed catalog snapshot: expected ident at line 1 column 2; next_steps: inspect snapshot file\n  next steps: Check that the durable catalog is intact and storage is accessible."
+        );
+        assert!(catalog.get_durable_store().is_none());
     }
 }

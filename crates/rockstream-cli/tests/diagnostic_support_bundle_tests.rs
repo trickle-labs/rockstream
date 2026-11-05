@@ -6,7 +6,7 @@ use rockstream_types::candidate_identity::CandidateIdentity;
 use rockstream_types::diagnostic::{
     global_diagnostic_journal, record_diagnostic, DiagnosticOccurrence,
 };
-use rockstream_types::error_code::RS_2018;
+use rockstream_types::error_code::{RS_0003, RS_2018};
 use serde_json::json;
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -137,6 +137,64 @@ fn support_diagnose_exact_bundle() {
             output_path.display()
         )
     );
+}
+
+#[test]
+fn failed_support_bundle_write_has_exact_failure_audit() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS);
+
+    let error = storage
+        .generate_support_bundle(temp.path(), None, None, Some(temp.path()))
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "{RS_0003} failed to write support bundle\n  next steps: Check that the output path is writable and retry."
+        )
+    );
+    let events = storage.audit_tail(temp.path(), 10).unwrap();
+    let expected_event = AuditEvent {
+        timestamp_ms: events[0].timestamp_ms,
+        actor: "admin".to_string(),
+        action: "support.bundle".to_string(),
+        resource: "all".to_string(),
+        error_code: Some(RS_0003.to_string()),
+        detail: Some("support bundle generation failed".to_string()),
+    };
+    assert_eq!(events, vec![expected_event]);
+}
+
+#[test]
+fn support_bundle_returns_error_when_its_audit_cannot_be_persisted() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("support.json");
+    std::fs::create_dir(temp.path().join("audit.jsonl")).unwrap();
+    let storage = StorageClient::new().with_support_bundle_time_ms(BUNDLE_TIME_MS);
+    let expected_bytes = serde_json::to_vec_pretty(&json!({
+        "generated_at_ms": BUNDLE_TIME_MS,
+        "candidate_identity": CandidateIdentity::current(),
+        "view": null,
+        "audit_events": [],
+        "diagnostic_occurrences": [],
+        "redaction": "secret values are never included; only metadata and audit events are exported"
+    }))
+    .unwrap();
+
+    let error = storage
+        .generate_support_bundle(temp.path(), None, None, Some(&output_path))
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "{RS_0003} support bundle audit could not be persisted\n  next steps: Check durable audit storage before retrying."
+        )
+    );
+    assert_eq!(std::fs::read(&output_path).unwrap(), expected_bytes);
 }
 
 #[test]
