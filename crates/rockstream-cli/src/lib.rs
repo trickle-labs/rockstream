@@ -3038,6 +3038,7 @@ pub fn run_config_print_effective(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rockstream_test_support::pki::TestPki;
 
     fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         run_start_with_dev_transport(opts, true)
@@ -3058,6 +3059,25 @@ mod tests {
             "RS-2405 control and worker roles require internal mTLS\n  next steps: Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development."
         );
         assert!(!storage.exists());
+    }
+
+    #[test]
+    fn control_mtls_start_recovers_security_catalog_without_management_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = TestPki::generate();
+        let mut config = RockstreamConfig::default();
+        config.internal_tls = pki.control_tls_config();
+        let opts = StartOptions {
+            storage: dir.path().to_path_buf(),
+            role: "control".to_string(),
+            control_bind: Some("127.0.0.1:0".to_string()),
+            config,
+            ..StartOptions::default()
+        };
+
+        let outcome = run_start(&opts).expect("mTLS control startup recovers its audit catalog");
+        assert_eq!(outcome.audit_path, dir.path().join("audit.jsonl"));
+        assert!(outcome.bundle_path.exists());
     }
 
     #[test]
