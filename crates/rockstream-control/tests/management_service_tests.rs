@@ -13,7 +13,8 @@ use rockstream_management_proto::v1::{
 };
 use rockstream_storage::catalog::CatalogStore;
 use rockstream_types::authorization::{
-    AuditField, AuditIdentity, PermissionPreset, SecurityAuditClass, SecurityAuditOutcome,
+    AuditCorrelation, AuditField, AuditIdentity, PermissionPreset, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::config::NodeConfig;
 use rockstream_types::ids::{ShardId, WorkerId};
@@ -229,15 +230,6 @@ async fn management_rejects_unmapped_node_certificate_before_application_session
     .unwrap();
     assert!(rejected.is_err());
 
-    let audit = auth.catalog.list_security_audit_records().await.unwrap();
-    assert!(audit.iter().any(|record| {
-        record.action == SecurityAuditClass::AuthenticationFailure
-            && matches!(
-                &record.actor,
-                AuditIdentity::Unverified(identity) if identity.starts_with("certificate:")
-            )
-    }));
-
     let mut valid_client = auth.client(server.addr).await;
     let nodes = valid_client
         .list_nodes(ListNodesRequest {
@@ -249,6 +241,45 @@ async fn management_rejects_unmapped_node_certificate_before_application_session
         .unwrap()
         .into_inner();
     assert!(nodes.nodes.is_empty());
+
+    let audit = auth.catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(
+        audit.iter().map(|record| record.action).collect::<Vec<_>>(),
+        vec![
+            SecurityAuditClass::GrantChange,
+            SecurityAuditClass::AuthenticationFailure,
+            SecurityAuditClass::AuthenticationSuccess,
+        ]
+    );
+    let failures: Vec<_> = audit
+        .iter()
+        .filter(|record| record.action == SecurityAuditClass::AuthenticationFailure)
+        .collect();
+    assert_eq!(failures.len(), 1);
+    let failure = failures[0];
+    assert!(failure.event_id.starts_with("management-authn-"));
+    assert!(failure.timestamp_ms > 0);
+    let mut actual = failure.clone();
+    actual.event_id = "management-authn-normalized".to_owned();
+    actual.timestamp_ms = 1;
+    assert_eq!(
+        actual,
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "management-authn-normalized".to_owned(),
+            timestamp_ms: 1,
+            actor: AuditIdentity::Unverified("worker:worker-999".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Unknown,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
     server.shutdown();
 }
 
