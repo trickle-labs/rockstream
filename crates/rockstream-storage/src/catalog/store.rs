@@ -1146,6 +1146,7 @@ fn apply_mutation_to_state(
             if let Some(v) = state.views.remove(id) {
                 state.views_by_name.remove(&v.name);
             }
+            state.view_dependencies.retain(|dep| dep.parent_id != id.0);
         }
         CatalogMutation::PutInlineView(iv) => {
             allocator.observe(iv.id.0);
@@ -1270,9 +1271,22 @@ impl CatalogStore for DurableCatalogStore {
         // 2a. Cycle detection in view dependencies
         let mut sim_deps = state.view_dependencies.clone();
         for m in &txn.mutations {
-            if let CatalogMutation::PutViewDependency(dep) = m {
-                sim_deps.retain(|d| !(d.parent_id == dep.parent_id && d.child_id == dep.child_id));
-                sim_deps.push(dep.clone());
+            match m {
+                CatalogMutation::PutViewDependency(dep) => {
+                    sim_deps
+                        .retain(|d| !(d.parent_id == dep.parent_id && d.child_id == dep.child_id));
+                    sim_deps.push(dep.clone());
+                }
+                CatalogMutation::DeleteView(view_id) => {
+                    sim_deps.retain(|dep| dep.parent_id != view_id.0);
+                }
+                CatalogMutation::DeleteViewDependency {
+                    parent_id,
+                    child_id,
+                } => {
+                    sim_deps.retain(|dep| dep.parent_id != *parent_id || dep.child_id != *child_id);
+                }
+                _ => {}
             }
         }
         if check_dependency_cycle(&sim_deps) {

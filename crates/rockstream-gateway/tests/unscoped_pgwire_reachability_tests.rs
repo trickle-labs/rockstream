@@ -57,26 +57,47 @@ async fn start_test_gateway_inner(authenticated: bool) -> (tokio_postgres::Clien
     let temp_dir = TempDir::new().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap());
     let shard_db = Arc::new(
-        ShardDb::builder("unscoped-reachability", store)
+        ShardDb::builder("unscoped-reachability", store.clone())
             .build()
             .await
             .unwrap(),
     );
 
     let catalog = Arc::new(CatalogStubs::new());
-
-    let secret_store = Arc::new(SecretStore::new(
-        None,
-        Arc::new(EnvKekProvider::from_passphrase("test-passphrase")),
-    ));
-
-    let server = if authenticated {
-        let role_catalog = security_policy::role_catalog_with_authorized_admin(
-            &catalog,
-            "test-builder",
-            "test-password",
+    let role_catalog = if authenticated {
+        Some(
+            security_policy::role_catalog_with_authorized_admin(
+                &catalog,
+                "test-builder",
+                "test-password",
+            )
+            .await,
         )
-        .await;
+    } else {
+        None
+    };
+    let secret_store = if role_catalog.is_some() {
+        let durable_catalog = catalog
+            .get_durable_store()
+            .expect("authorized test principal has a durable catalog");
+        Arc::new(
+            SecretStore::open_durable(
+                "unscoped-reachability-secrets",
+                store,
+                Arc::new(EnvKekProvider::from_passphrase("test-passphrase")),
+            )
+            .await
+            .unwrap()
+            .with_security_audit_catalog(durable_catalog),
+        )
+    } else {
+        Arc::new(SecretStore::new(
+            None,
+            Arc::new(EnvKekProvider::from_passphrase("test-passphrase")),
+        ))
+    };
+
+    let server = if let Some(role_catalog) = role_catalog {
         GatewayServer::with_shard_db_and_scram_auth(
             "127.0.0.1:0".parse().unwrap(),
             Arc::clone(&catalog),
