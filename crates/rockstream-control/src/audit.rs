@@ -61,6 +61,7 @@ impl FileAuditLog {
         writeln!(file, "{line}")?;
         file.sync_all()?;
         if !*directory_synced {
+            // Persist the filename as well as the event data on Unix.
             sync_parent_directory(&self.path)?;
             *directory_synced = true;
         }
@@ -130,6 +131,7 @@ mod tests {
         log.append(&e1).unwrap();
         log.append(&e2).unwrap();
         drop(log);
+
         let reopened = FileAuditLog::open(&log_path).unwrap();
         assert_eq!(reopened.read_all().unwrap(), vec![e1, e2]);
     }

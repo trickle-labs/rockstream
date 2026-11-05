@@ -42,6 +42,12 @@ fn selected_auth_mode(cli_mode: Option<AuthMode>, configured_mode: &str) -> Stri
     }
 }
 
+fn management_idempotency_key(idempotency_key: Option<uuid::Uuid>) -> uuid::Uuid {
+    let key = idempotency_key.unwrap_or_else(uuid::Uuid::new_v4);
+    eprintln!("Idempotency-Key: {key}");
+    key
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -87,8 +93,7 @@ fn main() -> ExitCode {
                     &format!("Are you sure you want to drain worker {worker_id}?"),
                     *yes,
                 )?;
-                let key = announce_idempotency_key(idempotency_key.as_deref());
-                client.drain_worker_with_idempotency_key(*worker_id, key)
+                client.drain_worker(*worker_id, management_idempotency_key(*idempotency_key))
             }),
             AdminCommand::Migrate {
                 shard_id,
@@ -96,8 +101,11 @@ fn main() -> ExitCode {
                 control: ref ctrl_addr,
                 idempotency_key,
             } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
-                let key = announce_idempotency_key(idempotency_key.as_deref());
-                client.migrate_shard_with_idempotency_key(*shard_id, *target_worker, key)
+                client.migrate_shard(
+                    *shard_id,
+                    *target_worker,
+                    management_idempotency_key(*idempotency_key),
+                )
             }),
             AdminCommand::Operation { command } => match command {
                 OperationCommand::List => {
@@ -158,8 +166,10 @@ fn main() -> ExitCode {
                 ) = (command, cli.management.as_deref())
                 {
                     return run_management(&cli, Some(addr), format, |client| {
-                        let key = announce_idempotency_key(idempotency_key.as_deref());
-                        client.create_backup_with_idempotency_key(destination, key)
+                        client.create_backup(
+                            destination,
+                            management_idempotency_key(*idempotency_key),
+                        )
                     });
                 }
                 let storage = StorageClient::with_identity(identity.clone());
@@ -559,8 +569,7 @@ fn main() -> ExitCode {
                     &format!("Are you sure you want to drain worker {worker_id}?"),
                     *yes,
                 )?;
-                let key = announce_idempotency_key(idempotency_key.as_deref());
-                client.drain_worker_with_idempotency_key(*worker_id, key)
+                client.drain_worker(*worker_id, management_idempotency_key(*idempotency_key))
             }),
         },
         Command::Shard { ref command } => match command {
@@ -571,15 +580,14 @@ fn main() -> ExitCode {
             ShardCommand::Migrate {
                 shard_id,
                 to,
-                idempotency_key,
                 yes,
+                idempotency_key,
             } => run_management(&cli, None, format, |client| {
                 rockstream_cli::prompt_confirmation(
                     &format!("Are you sure you want to migrate shard {shard_id} to worker {to}?"),
                     *yes,
                 )?;
-                let key = announce_idempotency_key(idempotency_key.as_deref());
-                client.migrate_shard_with_idempotency_key(*shard_id, *to, key)
+                client.migrate_shard(*shard_id, *to, management_idempotency_key(*idempotency_key))
             }),
         },
         Command::Checkpoint { command } => {
@@ -858,14 +866,6 @@ where
     .and_then(|mut client| request(&mut client))
     .map(|output| render_output(&output, format));
     handle_result(result, format)
-}
-
-fn announce_idempotency_key(supplied: Option<&str>) -> String {
-    let key = supplied
-        .map(str::to_owned)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    eprintln!("Idempotency-Key: {key}");
-    key
 }
 
 fn make_control_client(cli: &Cli, override_addr: Option<String>) -> RemoteTopologyClient {

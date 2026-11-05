@@ -29,7 +29,7 @@
                   {
                     "name": "idempotency_key",
                     "long": "idempotency-key",
-                    "help": "Caller-known key for retrying or looking up a management operation",
+                    "help": "Client-visible UUID for retrying or reconciling this operation",
                     "required": false,
                     "value_name": "IDEMPOTENCY_KEY"
                   }
@@ -357,7 +357,7 @@
               {
                 "name": "idempotency_key",
                 "long": "idempotency-key",
-                "help": "Caller-known key for retrying or looking up this operation",
+                "help": "Client-visible UUID for retrying or reconciling this operation",
                 "required": false,
                 "value_name": "IDEMPOTENCY_KEY"
               },
@@ -420,7 +420,7 @@
               {
                 "name": "idempotency_key",
                 "long": "idempotency-key",
-                "help": "Caller-known key for retrying or looking up this operation",
+                "help": "Client-visible UUID for retrying or reconciling this operation",
                 "required": false,
                 "value_name": "IDEMPOTENCY_KEY"
               },
@@ -1139,7 +1139,7 @@
                   {
                     "name": "idempotency_key",
                     "long": "idempotency-key",
-                    "help": "Caller-known key for retrying or looking up this operation",
+                    "help": "Client-visible UUID for retrying or reconciling this operation",
                     "required": false,
                     "value_name": "IDEMPOTENCY_KEY"
                   },
@@ -3321,7 +3321,7 @@
               {
                 "name": "idempotency_key",
                 "long": "idempotency-key",
-                "help": "Caller-known key for retrying or looking up this operation",
+                "help": "Client-visible UUID for retrying or reconciling this operation",
                 "required": false,
                 "value_name": "IDEMPOTENCY_KEY"
               },

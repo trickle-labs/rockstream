@@ -468,14 +468,10 @@ impl ManagementCliClient {
         })
     }
 
-    pub fn drain_worker(&mut self, worker_id: u64) -> Result<ManagementOperationInfo, CliError> {
-        self.drain_worker_with_idempotency_key(worker_id, uuid::Uuid::new_v4().to_string())
-    }
-
-    pub fn drain_worker_with_idempotency_key(
+    pub fn drain_worker(
         &mut self,
         worker_id: u64,
-        idempotency_key: impl Into<String>,
+        idempotency_key: uuid::Uuid,
     ) -> Result<ManagementOperationInfo, CliError> {
         let response = self
             .runtime
@@ -483,7 +479,7 @@ impl ManagementCliClient {
                 rockstream_management_proto::v1::DrainWorkerRequest {
                     protocol_version: 1,
                     worker_id: worker_id.to_string(),
-                    idempotency_key: idempotency_key.into(),
+                    idempotency_key: idempotency_key.to_string(),
                 },
             ))
             .map_err(|error| management_status_error("DrainWorker", error))?
@@ -497,19 +493,7 @@ impl ManagementCliClient {
         &mut self,
         shard_id: u64,
         target_node_id: u64,
-    ) -> Result<ManagementOperationInfo, CliError> {
-        self.migrate_shard_with_idempotency_key(
-            shard_id,
-            target_node_id,
-            uuid::Uuid::new_v4().to_string(),
-        )
-    }
-
-    pub fn migrate_shard_with_idempotency_key(
-        &mut self,
-        shard_id: u64,
-        target_node_id: u64,
-        idempotency_key: impl Into<String>,
+        idempotency_key: uuid::Uuid,
     ) -> Result<ManagementOperationInfo, CliError> {
         let response = self
             .runtime
@@ -518,7 +502,7 @@ impl ManagementCliClient {
                     protocol_version: 1,
                     shard_id: shard_id.to_string(),
                     target_node_id: target_node_id.to_string(),
-                    idempotency_key: idempotency_key.into(),
+                    idempotency_key: idempotency_key.to_string(),
                 },
             ))
             .map_err(|error| management_status_error("MigrateShard", error))?
@@ -531,14 +515,7 @@ impl ManagementCliClient {
     pub fn create_backup(
         &mut self,
         destination: &str,
-    ) -> Result<ManagementOperationInfo, CliError> {
-        self.create_backup_with_idempotency_key(destination, uuid::Uuid::new_v4().to_string())
-    }
-
-    pub fn create_backup_with_idempotency_key(
-        &mut self,
-        destination: &str,
-        idempotency_key: impl Into<String>,
+        idempotency_key: uuid::Uuid,
     ) -> Result<ManagementOperationInfo, CliError> {
         let response = self
             .runtime
@@ -546,7 +523,7 @@ impl ManagementCliClient {
                 rockstream_management_proto::v1::CreateBackupRequest {
                     protocol_version: 1,
                     destination: destination.to_owned(),
-                    idempotency_key: idempotency_key.into(),
+                    idempotency_key: idempotency_key.to_string(),
                 },
             ))
             .map_err(|error| management_status_error("CreateBackup", error))?

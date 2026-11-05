@@ -37,7 +37,7 @@ Options
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | destination | — | — | DESTINATION | yes | — | — | Destination directory or URI |
-| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Caller-known key for retrying or looking up a management operation |
+| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Client-visible UUID for retrying or reconciling this operation |
 
 Exit codes
 
@@ -188,7 +188,7 @@ Options
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | control | — | --control | CONTROL | no | — | — | Control service URL |
-| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Caller-known key for retrying or looking up this operation |
+| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Client-visible UUID for retrying or reconciling this operation |
 | worker_id | — | --worker-id | WORKER_ID | yes | — | — | Worker ID to drain |
 | yes | -y | --yes | YES | no | — | true, false | Automatically confirm execution without interactive prompt |
 
@@ -211,7 +211,7 @@ Options
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | control | — | --control | CONTROL | no | — | — | Control service URL |
-| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Caller-known key for retrying or looking up this operation |
+| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Client-visible UUID for retrying or reconciling this operation |
 | shard_id | — | --shard-id | SHARD_ID | yes | — | — | Shard ID to migrate |
 | target_worker | — | --target-worker | TARGET_WORKER | yes | — | — | Target worker ID |
 
@@ -567,7 +567,7 @@ Options
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | control | — | --control | CONTROL | no | — | — | Control-plane worker-facing TCP address |
-| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Caller-known key for retrying or looking up this operation |
+| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Client-visible UUID for retrying or reconciling this operation |
 | worker_id | — | — | WORKER_ID | yes | — | — | Worker ID to drain |
 | yes | — | --yes | YES | no | — | true, false | Confirm destructive action without interactive prompt |
 
@@ -1476,7 +1476,7 @@ Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Caller-known key for retrying or looking up this operation |
+| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Client-visible UUID for retrying or reconciling this operation |
 | shard_id | — | — | SHARD_ID | yes | — | — | Shard ID |
 | to | — | --to | TO | yes | — | — | Target worker ID |
 | yes | — | --yes | YES | no | — | true, false | Confirm destructive action without interactive prompt |

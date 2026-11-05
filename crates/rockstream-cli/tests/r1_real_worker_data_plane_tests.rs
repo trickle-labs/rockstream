@@ -1214,6 +1214,8 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
             "drain",
             "--worker-id",
             "602",
+            "--idempotency-key",
+            "b73a2d20-66d6-4d81-a395-7d5eb2f1b173",
             "--yes",
         ])
         .output()

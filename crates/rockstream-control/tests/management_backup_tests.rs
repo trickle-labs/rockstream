@@ -109,7 +109,17 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
     let mut client = ManagementServiceClient::connect(format!("http://{management_addr}"))
         .await
         .unwrap();
-    let idempotency_key = "backup-exact-key";
+    let idempotency_key = "00000000-0000-4000-8000-000000000314";
+    drop(
+        client
+            .create_backup(CreateBackupRequest {
+                protocol_version: 1,
+                destination: destination.path().display().to_string(),
+                idempotency_key: idempotency_key.to_owned(),
+            })
+            .await
+            .unwrap(),
+    );
     let backup_response = client
         .create_backup(CreateBackupRequest {
             protocol_version: 1,
@@ -124,7 +134,8 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
     assert_eq!(accepted_operation.kind, "create_backup");
     assert_eq!(accepted_operation.source_version, "operation-record:2");
     assert_eq!(accepted_operation.operation_id, idempotency_key);
-    let completed = await_succeeded(&mut client, &accepted_operation.operation_id).await;
+    assert!(!accepted_operation.operation_id.is_empty());
+    let completed = await_succeeded(&mut client, idempotency_key).await;
     assert_eq!(completed.operation_id, accepted_operation.operation_id);
     assert_eq!(completed.kind, "create_backup");
     assert_eq!(completed.state, "succeeded");
