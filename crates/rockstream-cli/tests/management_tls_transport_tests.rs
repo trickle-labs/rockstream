@@ -14,6 +14,7 @@ use rockstream_types::authorization::{
     SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
 use rockstream_types::config::NodeConfig;
+use rockstream_types::error_code::RS_0003;
 use rockstream_types::ids::PrincipalId;
 use sha2::Digest;
 
@@ -26,13 +27,25 @@ async fn management_cli_connects_to_mtls_service_and_reads_exact_status() {
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
     let certificate_sha256 = sha2::Sha256::digest(certs[0].as_ref()).into();
+    let worker_cert = pki.worker_certs.get(&1).unwrap().0.clone();
+    let worker_certs = rustls_pemfile::certs(&mut BufReader::new(
+        std::fs::File::open(worker_cert).unwrap(),
+    ))
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    let worker_certificate_sha256 = sha2::Sha256::digest(worker_certs[0].as_ref()).into();
     let principal = SecurityPrincipal {
         format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
         id: PrincipalId(1),
         display_name: "management CLI test administrator".to_owned(),
         enabled: true,
         revision: 1,
-        login_methods: vec![LoginMethod::Mtls { certificate_sha256 }],
+        login_methods: vec![
+            LoginMethod::Mtls { certificate_sha256 },
+            LoginMethod::Mtls {
+                certificate_sha256: worker_certificate_sha256,
+            },
+        ],
         preset_grants: [PermissionPreset::Administrator, PermissionPreset::Operator]
             .into_iter()
             .map(|preset| ScopedPresetGrant {
@@ -93,7 +106,7 @@ async fn management_cli_connects_to_mtls_service_and_reads_exact_status() {
         ManagementOperationStore::new(Arc::new(InMemory::new())),
         NodeConfig::default(),
     )
-    .with_security_catalog(catalog as Arc<dyn CatalogStore>);
+    .with_security_catalog(catalog.clone() as Arc<dyn CatalogStore>);
     let reloader = Arc::new(
         rockstream_control::tls::TlsCertificateReloader::new(pki.control_tls_config()).unwrap(),
     );
@@ -121,5 +134,39 @@ async fn management_cli_connects_to_mtls_service_and_reads_exact_status() {
         .observed_at
         .parse::<chrono::DateTime<chrono::FixedOffset>>()
         .is_ok());
+
+    let worker_addr = server.addr.to_string();
+    let worker_tls = pki.worker_tls_config(1);
+    let worker_attempt = tokio::task::spawn_blocking(move || {
+        ManagementCliClient::connect(&worker_addr, worker_tls)
+            .and_then(|mut client| client.cluster_status())
+    })
+    .await
+    .unwrap();
+    let worker_error =
+        worker_attempt.expect_err("a node certificate cannot authenticate as a client");
+    assert_eq!(worker_error.code, RS_0003);
+    let records = catalog.list_security_audit_records().await.unwrap();
+    let rejection = records
+        .iter()
+        .find(|record| {
+            record.action == SecurityAuditClass::AuthenticationFailure
+                && record.actor == AuditIdentity::Unverified("worker:worker-1".to_owned())
+        })
+        .expect("rejected node identity is audited as unverified");
+    assert_eq!(rejection.outcome, SecurityAuditOutcome::Failure);
+    assert_eq!(
+        rejection.target,
+        AuditField::Known("management-api".to_owned())
+    );
+    assert_eq!(rejection.format_version, SECURITY_AUDIT_FORMAT_VERSION);
+    assert!(rejection.event_id.starts_with("management-authn-"));
+    assert!(rejection.timestamp_ms > 0);
+    assert_eq!(rejection.scope, AuditField::NotApplicable);
+    assert_eq!(rejection.correlation, AuditCorrelation::Unknown);
+    assert_eq!(rejection.operation_id, AuditField::NotApplicable);
+    assert_eq!(rejection.policy_revision, AuditField::Unknown);
+    assert_eq!(rejection.before_state, AuditField::NotApplicable);
+    assert_eq!(rejection.after_state, AuditField::NotApplicable);
     server.shutdown();
 }

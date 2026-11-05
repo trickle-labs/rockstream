@@ -421,6 +421,36 @@ impl ManagementService {
             .refresh()
             .await
             .map_err(|error| format!("management security catalog refresh failed: {error}"))?;
+        let identity = match crate::tls::extract_peer_identity(stream) {
+            Ok(identity) => identity,
+            Err(_) => {
+                append_security_audit(
+                    catalog.as_ref(),
+                    authentication_audit(
+                        AuditIdentity::Unverified(format!(
+                            "certificate:{}",
+                            hex::encode(certificate_sha256)
+                        )),
+                        false,
+                        AuditField::Unknown,
+                    ),
+                )
+                .await?;
+                return Err("management client certificate identity is invalid".to_owned());
+            }
+        };
+        if identity.role != rockstream_types::identity::NodeRole::Cli {
+            append_security_audit(
+                catalog.as_ref(),
+                authentication_audit(
+                    AuditIdentity::Unverified(identity.to_cn()),
+                    false,
+                    AuditField::Unknown,
+                ),
+            )
+            .await?;
+            return Err("management requires a CLI certificate identity".to_owned());
+        }
         let principal = catalog
             .list_security_principals()
             .await
