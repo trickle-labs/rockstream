@@ -1,10 +1,15 @@
 //! v0.51.7 Slice 3 — CLI Auth Mode Routing & Fail-Closed Enforcement Tests.
 
+use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt};
 use rockstream_cli::{run_start, start_gateway, StartOptions};
-use rockstream_types::config::RockstreamConfig;
+use rockstream_gateway::catalog_stubs::CatalogStubs;
+use rockstream_storage::ShardDb;
+use rockstream_types::config::{NodeConfig, RockstreamConfig};
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use tokio_postgres::NoTls;
 
 fn normalize_correlation_id(stderr: Vec<u8>) -> String {
     let stderr = String::from_utf8(stderr).unwrap();
@@ -50,7 +55,7 @@ fn test_cli_invalid_auth_fails_startup() {
     let err = res.unwrap_err();
     assert_eq!(
         err.to_string(),
-        "RS-0002 unknown auth mode `invalid_super_auth`\n  next steps: Pass --auth=off; other authentication modes are currently unavailable."
+        "RS-0002 unknown auth mode `invalid_super_auth`\n  next steps: Pass a supported authentication mode: off, oidc, or mtls."
     );
 }
 
@@ -60,23 +65,13 @@ async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_
     for (mode, detail, next_steps) in [
         (
             "scram",
-            "no durable role store is configured",
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+            "durable principal integration is incomplete",
+            "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
         ),
         (
             "md5",
-            "no durable role store is configured",
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
-        ),
-        (
-            "oidc",
-            "issuer, audience, and JWKS verification are not configured",
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
-        ),
-        (
-            "mtls",
-            "the CLI does not configure a gateway TLS listener",
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+            "MD5 is not a release authentication mode",
+            "Use a release-supported authentication mode.",
         ),
     ] {
         let storage = tmp.path().join(mode);
@@ -92,8 +87,82 @@ async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_
     }
 }
 
+#[tokio::test]
+async fn explicit_off_auth_mode_overrides_configured_oidc_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut node_config = NodeConfig::default();
+    node_config.auth.mode = "oidc".to_string();
+    let mut opts = test_options(
+        tmp.path().join("gateway-storage"),
+        "off",
+        Some("127.0.0.1:0".to_string()),
+    );
+    opts.node_config = Some(node_config);
+
+    let (address, handle) = start_gateway(&opts).await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=unused dbname=test sslmode=disable",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .expect("explicit auth mode should control the listener");
+    let connection_handle = tokio::spawn(connection);
+    let rows = client.query("SELECT 1 AS value", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    drop(client);
+    connection_handle.abort();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_start_fails_closed_when_durable_catalog_recovery_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shard_path = "gateway";
+    let store = Arc::new(InMemory::new());
+    let snapshot_path = ObjectPath::from("gateway/catalog/snapshots/00000000000000000000.snap");
+    store
+        .put(&snapshot_path, b"{".to_vec().into())
+        .await
+        .unwrap();
+
+    let shard_db = Arc::new(
+        ShardDb::builder(shard_path, store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let options = test_options(
+        tmp.path().to_path_buf(),
+        "off",
+        Some("127.0.0.1:0".to_string()),
+    );
+    let error = rockstream_cli::start_gateway_with_shard_and_catalog(
+        &options,
+        shard_db,
+        store.clone(),
+        shard_path,
+        Arc::new(CatalogStubs::new()),
+    )
+    .await
+    .unwrap_err();
+
+    let catalog_error = rockstream_storage::catalog::CatalogSnapshot::decode(b"{")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "RS-0003 gateway catalog recovery failed: {catalog_error}\n  next steps: Restore or repair durable catalog storage before starting the gateway."
+        )
+    );
+}
+
 #[test]
-fn unavailable_auth_mode_fails_closed_in_cli_process_before_storage_or_listener_start() {
+fn oidc_missing_configuration_fails_before_storage_or_listener_start() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = tmp.path().join("gateway-storage");
     let output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
@@ -115,7 +184,7 @@ fn unavailable_auth_mode_fails_closed_in_cli_process_before_storage_or_listener_
     assert_eq!(output.stdout, b"");
     assert_eq!(
         normalize_correlation_id(output.stderr),
-        "[RS-0002] config.invalid: Configuration error (detail=authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured) (correlation_id=<correlation_id> context=detail=authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured) next_steps: Check configuration file and CLI flags.\n  next steps: This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.\n"
+        "[RS-0002] config.invalid: Configuration error (detail=OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url) (correlation_id=<correlation_id> context=detail=OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url) next_steps: Check configuration file and CLI flags.\n  next steps: Configure the issuer, audience, and JWKS endpoint before starting the gateway.\n"
     );
     assert!(
         !storage.exists(),

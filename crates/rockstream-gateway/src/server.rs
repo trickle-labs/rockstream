@@ -94,7 +94,7 @@ use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, Workloa
 
 use crate::auth::{
     scram_server_key, scram_server_signature, scram_stored_key, verify_client_proof, AuthMode,
-    JwtVerifier, Principal,
+    Principal,
 };
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
@@ -2131,8 +2131,8 @@ pub struct GatewayHandler {
     query_time_shard_topology_provider: Option<Arc<QueryTimeShardTopologyProvider>>,
     /// Authentication mode for this gateway instance.
     auth_mode: AuthMode,
-    /// Optional JWT verifier (populated when auth_mode == Oidc).
-    jwt_verifier: Option<Arc<JwtVerifier>>,
+    /// Configured RS256 verifier for OIDC-authenticated public connections.
+    oidc_verifier: Option<Arc<crate::auth::OidcVerifier>>,
     /// Role catalog for SCRAM/MD5 auth (always present; empty for Off/Oidc/Mtls).
     pub role_catalog: Arc<RoleCatalog>,
     /// ACL store for RBAC enforcement.
@@ -2274,7 +2274,7 @@ impl GatewayHandler {
         if self
             .acl_store
             .check(
-                principal.identity(),
+                &principal.authorization_identity(),
                 &namespace,
                 Some(&resource),
                 spec.minimum_role.clone(),
@@ -2348,7 +2348,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
-            jwt_verifier: None,
+            oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
@@ -2400,7 +2400,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
-            jwt_verifier: None,
+            oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
@@ -5493,7 +5493,8 @@ impl GatewayHandler {
                     let session = entry.value();
                     let pid = session.backend_pid;
                     let usename = match &session.principal {
-                        crate::auth::Principal::Jwt { sub } => sub.clone(),
+                        crate::auth::Principal::Jwt { sub }
+                        | crate::auth::Principal::Oidc { sub, .. } => sub.clone(),
                         _ => "postgres".to_string(),
                     };
                     let app_name = session.application_name.clone();
@@ -7832,7 +7833,7 @@ impl GatewayHandler {
         use rockstream_types::acl::Role;
         if !principal.is_system() {
             if let Err(e) = self.acl_store.check(
-                principal.identity(),
+                &principal.authorization_identity(),
                 &session_namespace,
                 Some(relation_name),
                 Role::Viewer,
@@ -7848,7 +7849,12 @@ impl GatewayHandler {
             if view_ns != &session_namespace && !principal.is_system() {
                 let is_admin = self
                     .acl_store
-                    .check(principal.identity(), &session_namespace, None, Role::Admin)
+                    .check(
+                        &principal.authorization_identity(),
+                        &session_namespace,
+                        None,
+                        Role::Admin,
+                    )
                     .is_ok();
                 if !is_admin {
                     return Some(vec![promote_response(Response::Error(Box::new(
@@ -12369,7 +12375,7 @@ impl GatewayHandler {
                 .map(|s| s.current_namespace.clone())
                 .unwrap_or_else(|| "public".to_string());
             if let Err(e) = self.acl_store.check(
-                principal.identity(),
+                &principal.authorization_identity(),
                 &session_namespace,
                 Some(&table),
                 Role::PipelineOwner,
@@ -12518,28 +12524,37 @@ impl StartupHandler for GatewayHandler {
                                     ),
                                 )));
                             }
-                            if let Some(verifier) = &self.jwt_verifier {
-                                match verifier.verify(token) {
-                                    Ok(claims) => {
-                                        client.metadata_mut().insert(
-                                            "_rs_principal".to_string(),
-                                            format!("jwt:{}", claims.sub),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        return Err(pgwire::error::PgWireError::UserError(
-                                            Box::new(pgwire::error::ErrorInfo::new(
-                                                "FATAL".to_string(),
-                                                "28000".to_string(),
-                                                format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
-                                            )),
-                                        ));
+                            let Some(verifier) = self.oidc_verifier.as_ref() else {
+                                return Err(pgwire::error::PgWireError::UserError(Box::new(
+                                    pgwire::error::ErrorInfo::new(
+                                        "FATAL".to_string(),
+                                        "28000".to_string(),
+                                        "[RS-2400] auth.unauthenticated: OIDC verifier is unavailable. next_steps: Configure a valid OIDC issuer, audience, and JWKS endpoint before startup".to_string(),
+                                    ),
+                                )));
+                            };
+                            let verified = verifier.verify(token).await;
+                            match verified {
+                                Ok(claims) => {
+                                    client.metadata_mut().insert(
+                                        "_rs_principal".to_string(),
+                                        format!("jwt:{}", claims.sub),
+                                    );
+                                    if let Some(issuer) = claims.issuer {
+                                        client
+                                            .metadata_mut()
+                                            .insert("_rs_oidc_issuer".to_string(), issuer);
                                     }
                                 }
-                            } else {
-                                client
-                                    .metadata_mut()
-                                    .insert("_rs_principal".to_string(), format!("jwt:{token}"));
+                                Err(e) => {
+                                    return Err(pgwire::error::PgWireError::UserError(
+                                        Box::new(pgwire::error::ErrorInfo::new(
+                                            "FATAL".to_string(),
+                                            "28000".to_string(),
+                                            format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
+                                        )),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -13012,11 +13027,19 @@ impl SimpleQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let oidc_issuer = client.metadata().get("_rs_oidc_issuer").cloned();
             let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
-                    Principal::Jwt {
-                        sub: sub.to_string(),
+                    if let Some(issuer) = oidc_issuer {
+                        Principal::Oidc {
+                            issuer,
+                            sub: sub.to_string(),
+                        }
+                    } else {
+                        Principal::Jwt {
+                            sub: sub.to_string(),
+                        }
                     }
                 } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
                     Principal::CertCn { cn: cn.to_string() }
@@ -13573,11 +13596,19 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let oidc_issuer = client.metadata().get("_rs_oidc_issuer").cloned();
             let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
-                    Principal::Jwt {
-                        sub: sub.to_string(),
+                    if let Some(issuer) = oidc_issuer {
+                        Principal::Oidc {
+                            issuer,
+                            sub: sub.to_string(),
+                        }
+                    } else {
+                        Principal::Jwt {
+                            sub: sub.to_string(),
+                        }
                     }
                 } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
                     Principal::CertCn { cn: cn.to_string() }
@@ -14088,6 +14119,18 @@ impl GatewayServer {
         }
     }
 
+    fn require_tls_for_auth(&self) -> std::io::Result<()> {
+        if matches!(self.handler.auth_mode, AuthMode::Oidc | AuthMode::Mtls)
+            && self.tls_acceptor.is_none()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "gateway OIDC and mTLS authentication require a configured TLS listener",
+            ));
+        }
+        Ok(())
+    }
+
     /// Attach the complete pinned shard-reader topology to a server created by
     /// any constructor, including the authentication-bearing constructors.
     /// Query-time execution keeps that topology intact rather than reverting to
@@ -14193,6 +14236,33 @@ impl GatewayServer {
         GatewayServer::from_handler(addr, handler)
     }
 
+    /// Create a shard-backed gateway with RS256 OIDC authentication.
+    pub fn with_shard_db_and_oidc_auth(
+        addr: std::net::SocketAddr,
+        catalog: Arc<CatalogStubs>,
+        view_reader: Arc<dyn ViewReader>,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+        verifier: Arc<crate::auth::OidcVerifier>,
+    ) -> Self {
+        let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
+        handler.auth_mode = AuthMode::Oidc;
+        handler.oidc_verifier = Some(verifier);
+        GatewayServer::from_handler(addr, handler)
+    }
+
+    /// Create a gateway with RS256 OIDC authentication and no shard-backed writes.
+    pub fn with_oidc_auth(
+        addr: std::net::SocketAddr,
+        catalog: Arc<CatalogStubs>,
+        view_reader: Arc<dyn ViewReader>,
+        verifier: Arc<crate::auth::OidcVerifier>,
+    ) -> Self {
+        let mut handler = GatewayHandler::new(catalog, view_reader);
+        handler.auth_mode = AuthMode::Oidc;
+        handler.oidc_verifier = Some(verifier);
+        GatewayServer::from_handler(addr, handler)
+    }
+
     /// Create a gateway with MD5 auth and a pre-populated RoleCatalog.
     pub fn with_md5_auth(
         addr: std::net::SocketAddr,
@@ -14231,20 +14301,6 @@ impl GatewayServer {
         let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
         handler.auth_mode = AuthMode::Md5;
         handler.role_catalog = role_catalog;
-        GatewayServer::from_handler(addr, handler)
-    }
-
-    /// Create a gateway with OIDC auth enabled (for auth integration tests).
-    pub fn with_shard_db_and_auth(
-        addr: std::net::SocketAddr,
-        catalog: Arc<CatalogStubs>,
-        view_reader: Arc<dyn ViewReader>,
-        shard_db: Arc<rockstream_storage::ShardDb>,
-        jwt_secret: &[u8],
-    ) -> Self {
-        let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
-        handler.auth_mode = AuthMode::Oidc;
-        handler.jwt_verifier = Some(Arc::new(JwtVerifier::with_hs256_key(jwt_secret.to_vec())));
         GatewayServer::from_handler(addr, handler)
     }
 
@@ -14353,6 +14409,7 @@ impl GatewayServer {
         tokio::task::JoinHandle<()>,
         tokio::task::JoinHandle<()>,
     )> {
+        self.require_tls_for_auth()?;
         let (webhook_addr, webhook_handle) = self.serve_webhook_background(webhook_addr).await?;
         let (pgwire_addr, pgwire_handle) = self.serve_background().await?;
         Ok((pgwire_addr, webhook_addr, pgwire_handle, webhook_handle))
@@ -14360,6 +14417,7 @@ impl GatewayServer {
 
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
+        self.require_tls_for_auth()?;
         if let Some(shard_db) = &self.handler.shard_db {
             self.handler
                 .catalog
@@ -14551,6 +14609,7 @@ impl GatewayServer {
     pub async fn serve_background(
         self,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        self.require_tls_for_auth()?;
         if let Some(shard_db) = &self.handler.shard_db {
             self.handler
                 .catalog
@@ -20453,6 +20512,169 @@ mod s4_tests {
         assert!(
             message.contains("snapshot_interval_epochs"),
             "expected option type message, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_public_pgwire_auth_verifies_tokens_before_session_creation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        fn startup_packet(token: &str) -> Vec<u8> {
+            let parameters = format!("user\0alice\0authorization\0Bearer {token}\0\0");
+            let length = (8 + parameters.len()) as i32;
+            let mut packet = Vec::with_capacity(length as usize);
+            packet.extend_from_slice(&length.to_be_bytes());
+            packet.extend_from_slice(&196_608i32.to_be_bytes());
+            packet.extend_from_slice(parameters.as_bytes());
+            packet
+        }
+
+        let catalog = Arc::new(CatalogStubs::new());
+        let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
+        let verifier = Arc::new(crate::auth::verifier_with_local_jwks().await);
+        let pki_dir = tempfile::tempdir().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem();
+        let mut server_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "localhost");
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+        let cert_path = pki_dir.path().join("server.pem");
+        let key_path = pki_dir.path().join("server-key.pem");
+        std::fs::write(&cert_path, server_cert.pem()).unwrap();
+        std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        let mut ca_reader = std::io::BufReader::new(ca_pem.as_bytes());
+        for cert in rustls_pemfile::certs(&mut ca_reader) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
+        let server = GatewayServer::with_oidc_auth(
+            "127.0.0.1:0".parse().unwrap(),
+            catalog,
+            reader,
+            verifier,
+        )
+        .with_tls(&cert_path, &key_path, None)
+        .unwrap();
+        let handler = server.handler().clone();
+        let (address, server_task) = server.serve_background().await.unwrap();
+
+        let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        tcp.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).await.unwrap();
+        let mut ssl_response = [0u8; 1];
+        tcp.read_exact(&mut ssl_response).await.unwrap();
+        assert_eq!(ssl_response[0], b'S');
+        let mut accepted = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        accepted
+            .write_all(&startup_packet(crate::auth::VALID_TOKEN))
+            .await
+            .unwrap();
+        let mut authentication_ok = [0u8; 9];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            accepted.read_exact(&mut authentication_ok),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(authentication_ok[0], b'R');
+        assert_eq!(
+            i32::from_be_bytes(authentication_ok[1..5].try_into().unwrap()),
+            8
+        );
+        assert_eq!(
+            i32::from_be_bytes(authentication_ok[5..9].try_into().unwrap()),
+            0
+        );
+        assert_eq!(handler.sessions.len(), 1);
+
+        let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        tcp.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).await.unwrap();
+        let mut ssl_response = [0u8; 1];
+        tcp.read_exact(&mut ssl_response).await.unwrap();
+        assert_eq!(ssl_response[0], b'S');
+        let mut rejected = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        rejected
+            .write_all(&startup_packet("bad-token"))
+            .await
+            .unwrap();
+        let mut error_header = [0u8; 5];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            rejected.read_exact(&mut error_header),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(error_header[0], b'E');
+        let response_len = i32::from_be_bytes(error_header[1..5].try_into().unwrap()) as usize;
+        let mut error_body = vec![0u8; response_len - 4];
+        tokio::time::timeout(Duration::from_secs(2), rejected.read_exact(&mut error_body))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut fields = std::collections::HashMap::new();
+        let mut remaining = error_body.as_slice();
+        while !remaining.is_empty() && remaining[0] != 0 {
+            let field = remaining[0];
+            remaining = &remaining[1..];
+            let end = remaining.iter().position(|byte| *byte == 0).unwrap();
+            fields.insert(field, String::from_utf8(remaining[..end].to_vec()).unwrap());
+            remaining = &remaining[end + 1..];
+        }
+        assert_eq!(fields.get(&b'S'), Some(&"FATAL".to_string()));
+        assert_eq!(fields.get(&b'C'), Some(&"28000".to_string()));
+        assert_eq!(
+            fields.get(&b'M'),
+            Some(&"[RS-2400] auth.unauthenticated: malformed JWT: expected 3 parts. next_steps: Provide valid credentials (Bearer token or mTLS certificate)".to_string())
+        );
+        assert_eq!(handler.sessions.len(), 1);
+
+        drop(accepted);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn oidc_gateway_refuses_to_bind_without_tls() {
+        let verifier = Arc::new(crate::auth::verifier_with_local_jwks().await);
+        let server = GatewayServer::with_oidc_auth(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(CatalogStubs::new()),
+            Arc::new(NoopViewReader),
+            verifier,
+        );
+        let error = server.serve_background().await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "gateway OIDC and mTLS authentication require a configured TLS listener"
         );
     }
 }

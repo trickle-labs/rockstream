@@ -5171,6 +5171,7 @@ dependencies = [
  "rdkafka",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "rockstream-connectors",
  "rockstream-control",
  "rockstream-diff",

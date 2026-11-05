@@ -266,7 +266,14 @@ const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
 ];
 const KNOWN_STORAGE_SECTION_KEYS: &[&str] = &["url", "temp_dir", "spill_dir", "tiering"];
 const KNOWN_METRICS_SECTION_KEYS: &[&str] = &["listen_addr", "enabled", "scrape_interval_secs"];
-const KNOWN_AUTH_SECTION_KEYS: &[&str] = &["mode", "secret_path", "admin_user"];
+const KNOWN_AUTH_SECTION_KEYS: &[&str] = &[
+    "mode",
+    "secret_path",
+    "admin_user",
+    "oidc_issuer",
+    "oidc_audience",
+    "oidc_jwks_url",
+];
 const KNOWN_LOGGING_SECTION_KEYS: &[&str] = &["level", "format"];
 const KNOWN_RUNTIME_SECTION_KEYS: &[&str] = &[
     "shutdown_timeout_secs",
@@ -1084,6 +1091,56 @@ pub fn validate_node_config_semantic_bounds(
                 node_cfg.auth.mode
             ),
             suggestion: Some("Set auth mode to off, scram, md5, oidc, or mtls".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+
+    if auth_mode_norm == "oidc"
+        && (node_cfg
+            .auth
+            .oidc_issuer
+            .as_deref()
+            .is_none_or(str::is_empty)
+            || node_cfg
+                .auth
+                .oidc_audience
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || node_cfg
+                .auth
+                .oidc_jwks_url
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || node_cfg.gateway.tls.cert_path.is_none()
+            || node_cfg.gateway.tls.key_path.is_none())
+    {
+        diagnostics.push(ConfigDiagnostic {
+            path: "auth".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "OIDC requires issuer, audience, JWKS URL, and gateway TLS certificate and key paths".to_string(),
+            suggestion: Some(
+                "Configure auth.oidc_issuer, auth.oidc_audience, auth.oidc_jwks_url, gateway.tls.cert_path, and gateway.tls.key_path".to_string(),
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    if auth_mode_norm == "mtls"
+        && (node_cfg.gateway.tls.cert_path.is_none()
+            || node_cfg.gateway.tls.key_path.is_none()
+            || node_cfg.gateway.tls.ca_cert_path.is_none())
+    {
+        diagnostics.push(ConfigDiagnostic {
+            path: "gateway.tls".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "mTLS requires gateway TLS certificate, key, and client CA paths".to_string(),
+            suggestion: Some(
+                "Configure gateway.tls.cert_path, key_path, and ca_cert_path".to_string(),
+            ),
             line: None,
             column: None,
         });

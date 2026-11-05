@@ -29,6 +29,8 @@ lru.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 base64 = "0.22"
+reqwest.workspace = true
+ring.workspace = true
 md5.workspace = true
 rockstream-control.workspace = true
 arrow.workspace = true
@@ -62,7 +64,6 @@ testcontainers-modules = { workspace = true, features = ["kafka", "minio"] }
 rdkafka.workspace = true
 rockstream-oracle = { workspace = true }
 datafusion = { workspace = true }
-reqwest = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

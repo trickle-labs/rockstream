@@ -217,7 +217,7 @@ pub struct StartOptions {
     pub role: String,
     /// Control service URL.
     pub control: Option<String>,
-    /// Authentication mode; only "off" is currently available.
+    /// Authentication mode; `oidc` and `mtls` require configured gateway credentials.
     pub auth_mode: String,
     /// Worker locality metadata.
     pub worker_location: WorkerLocation,
@@ -413,7 +413,11 @@ pub async fn start_gateway_with_catalog(
     opts: &StartOptions,
     catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
-    validate_start_auth_modes(&opts.auth_mode, opts.node_config.as_ref())?;
+    let node_config = opts
+        .node_config
+        .clone()
+        .unwrap_or_else(|| rockstream_types::config::NodeConfig::from(&opts.config));
+    validate_start_auth_modes(&opts.auth_mode, Some(&node_config))?;
     let gateway_shard_dir = opts.storage.join("gateway-shard");
     std::fs::create_dir_all(&gateway_shard_dir).map_err(|e| {
         CliError::new(
@@ -478,23 +482,32 @@ pub async fn start_gateway_with_shard_and_catalog(
     shard_path: &str,
     catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
-    validate_start_auth_modes(&opts.auth_mode, opts.node_config.as_ref())?;
+    let node_config = opts
+        .node_config
+        .clone()
+        .unwrap_or_else(|| rockstream_types::config::NodeConfig::from(&opts.config));
+    validate_start_auth_modes(&opts.auth_mode, Some(&node_config))?;
     if catalog.get_durable_store().is_none() {
-        let durable_catalog = match rockstream_storage::catalog::DurableCatalogStore::recover(
-            store.clone(),
-            shard_path,
-        )
-        .await
-        {
-            Ok(recovered) => Arc::new(recovered),
-            Err(_) => Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
-                store.clone(),
-                shard_path,
-            )),
-        };
+        let durable_catalog =
+            rockstream_storage::catalog::DurableCatalogStore::recover(store.clone(), shard_path)
+                .await
+                .map(Arc::new)
+                .map_err(|error| {
+                    CliError::new(
+                        RS_0003,
+                        format!("gateway catalog recovery failed: {error}"),
+                        "Restore or repair durable catalog storage before starting the gateway.",
+                    )
+                })?;
         catalog.set_durable_store(durable_catalog);
-        let _ = catalog.sync_from_durable_store().await;
     }
+    catalog.sync_from_durable_store().await.map_err(|error| {
+        CliError::new(
+            RS_0003,
+            format!("gateway catalog state could not be loaded: {error}"),
+            "Restore or repair durable catalog storage before starting the gateway.",
+        )
+    })?;
 
     // Flush to create the initial manifest so ShardReader can open on a fresh node.
     shard_db.flush().await.map_err(|e| {
@@ -557,8 +570,89 @@ pub async fn start_gateway_with_shard_and_catalog(
     let auth_mode_str = opts.auth_mode.trim().to_lowercase();
     tracing::info!("Gateway server starting with auth mode: {}", auth_mode_str);
 
-    let server =
-        rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db);
+    let server = match auth_mode_str.as_str() {
+        "off" => {
+            rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db)
+        }
+        "oidc" => {
+            let auth = &node_config.auth;
+            let oidc_config = rockstream_gateway::auth::OidcConfig::new(
+                auth.oidc_issuer.as_deref().unwrap_or_default(),
+                auth.oidc_audience.as_deref().unwrap_or_default(),
+                auth.oidc_jwks_url.as_deref().unwrap_or_default(),
+            )
+            .map_err(|error| {
+                CliError::new(
+                    RS_0002,
+                    format!("OIDC configuration is invalid: {error}"),
+                    "Configure a valid issuer, audience, and HTTPS or loopback JWKS URL.",
+                )
+            })?;
+            let verifier = rockstream_gateway::auth::OidcVerifier::new(oidc_config)
+                .await
+                .map(Arc::new)
+                .map_err(|error| {
+                    CliError::new(
+                        RS_0003,
+                        format!("OIDC verifier initialization failed: {error}"),
+                        "Restore access to the configured JWKS endpoint before starting the gateway.",
+                    )
+                })?;
+            let server = rockstream_gateway::GatewayServer::with_shard_db_and_oidc_auth(
+                addr,
+                catalog,
+                view_reader,
+                shard_db,
+                verifier,
+            );
+            let tls = &node_config.gateway.tls;
+            server
+                .with_tls(
+                    tls.cert_path
+                        .as_deref()
+                        .expect("validated OIDC gateway certificate"),
+                    tls.key_path.as_deref().expect("validated OIDC gateway key"),
+                    None,
+                )
+                .map_err(|error| {
+                    CliError::new(
+                        RS_0002,
+                        format!("OIDC gateway TLS configuration is invalid: {error}"),
+                        "Check the gateway TLS certificate and key files.",
+                    )
+                })?
+        }
+        "mtls" => {
+            let tls = &node_config.gateway.tls;
+            rockstream_gateway::GatewayServer::with_shard_db_and_mtls_auth(
+                addr,
+                catalog,
+                view_reader,
+                shard_db,
+            )
+            .with_tls(
+                tls.cert_path
+                    .as_deref()
+                    .expect("validated mTLS certificate"),
+                tls.key_path.as_deref().expect("validated mTLS key"),
+                tls.ca_cert_path.as_deref(),
+            )
+            .map_err(|error| {
+                CliError::new(
+                    RS_0002,
+                    format!("gateway mTLS configuration is invalid: {error}"),
+                    "Check the gateway certificate, key, and client CA files.",
+                )
+            })?
+        }
+        _ => {
+            return Err(CliError::new(
+                RS_0002,
+                format!("authentication mode `{auth_mode_str}` is unavailable"),
+                "Use a configured release authentication mode.",
+            ));
+        }
+    };
 
     let mut server = server
         .with_query_time_shard_topology_provider(topology_provider)
@@ -607,26 +701,22 @@ pub async fn start_gateway_with_shard_and_catalog(
 fn validate_auth_mode(auth_mode: &str) -> Result<(), CliError> {
     let mode = auth_mode.trim().to_lowercase();
     let (message, next_steps) = match mode.as_str() {
-        "off" => return Ok(()),
+        "off" | "oidc" | "mtls" => return Ok(()),
         "" => (
             "authentication mode is empty".to_string(),
             "Set [auth].mode to `off` to explicitly disable client authentication.",
         ),
-        "scram" | "md5" => (
-            format!("authentication mode `{mode}` is unavailable: no durable role store is configured"),
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+        "scram" => (
+            "authentication mode `scram` is unavailable: durable principal integration is incomplete".to_string(),
+            "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
         ),
-        "oidc" => (
-            "authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured".to_string(),
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
-        ),
-        "mtls" => (
-            "authentication mode `mtls` is unavailable: the CLI does not configure a gateway TLS listener".to_string(),
-            "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+        "md5" => (
+            "authentication mode `md5` is unavailable: MD5 is not a release authentication mode".to_string(),
+            "Use a release-supported authentication mode.",
         ),
         _ => (
             format!("unknown auth mode `{auth_mode}`"),
-            "Pass --auth=off; other authentication modes are currently unavailable.",
+            "Pass a supported authentication mode: off, oidc, or mtls.",
         ),
     };
     Err(CliError::new(RS_0002, message, next_steps))
@@ -638,7 +728,66 @@ fn validate_start_auth_modes(
 ) -> Result<(), CliError> {
     validate_auth_mode(auth_mode)?;
     if let Some(node_config) = node_config {
-        validate_auth_mode(&node_config.auth.mode)?;
+        let selected = auth_mode.trim().to_ascii_lowercase();
+        match selected.as_str() {
+            "oidc"
+                if node_config
+                    .auth
+                    .oidc_issuer
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                    || node_config
+                        .auth
+                        .oidc_audience
+                        .as_deref()
+                        .is_none_or(str::is_empty)
+                    || node_config
+                        .auth
+                        .oidc_jwks_url
+                        .as_deref()
+                        .is_none_or(str::is_empty) =>
+            {
+                return Err(CliError::new(
+                        RS_0002,
+                        "OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url",
+                        "Configure the issuer, audience, and JWKS endpoint before starting the gateway.",
+                    ));
+            }
+            "oidc"
+                if node_config.gateway.tls.cert_path.is_none()
+                    || node_config.gateway.tls.key_path.is_none() =>
+            {
+                return Err(CliError::new(
+                        RS_0002,
+                        "OIDC requires gateway TLS certificate and key paths",
+                        "Configure gateway.tls.cert_path and gateway.tls.key_path before starting the gateway.",
+                    ));
+            }
+            "mtls"
+                if node_config.gateway.tls.cert_path.is_none()
+                    || node_config.gateway.tls.key_path.is_none()
+                    || node_config.gateway.tls.ca_cert_path.is_none() =>
+            {
+                return Err(CliError::new(
+                    RS_0002,
+                    "mTLS requires gateway TLS certificate, key, and client CA paths",
+                    "Configure gateway.tls.cert_path, key_path, and ca_cert_path.",
+                ));
+            }
+            _ => {}
+        }
+    } else if matches!(
+        auth_mode.trim().to_ascii_lowercase().as_str(),
+        "oidc" | "mtls"
+    ) {
+        return Err(CliError::new(
+            RS_0002,
+            format!(
+                "authentication mode `{}` requires node configuration",
+                auth_mode
+            ),
+            "Provide a node configuration with the required authentication settings.",
+        ));
     }
     Ok(())
 }
@@ -2846,7 +2995,7 @@ mod tests {
         let err = run_start(&opts).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "RS-0002 unknown auth mode `invalid`\n  next steps: Pass --auth=off; other authentication modes are currently unavailable."
+            "RS-0002 unknown auth mode `invalid`\n  next steps: Pass a supported authentication mode: off, oidc, or mtls."
         );
     }
 
@@ -2856,23 +3005,13 @@ mod tests {
         for (mode, detail, next_steps) in [
             (
                 "scram",
-                "no durable role store is configured",
-                "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+                "durable principal integration is incomplete",
+                "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
             ),
             (
                 "md5",
-                "no durable role store is configured",
-                "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
-            ),
-            (
-                "oidc",
-                "issuer, audience, and JWKS verification are not configured",
-                "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
-            ),
-            (
-                "mtls",
-                "the CLI does not configure a gateway TLS listener",
-                "This mode is unavailable; use --auth=off only where unauthenticated access is acceptable.",
+                "MD5 is not a release authentication mode",
+                "Use a release-supported authentication mode.",
             ),
         ] {
             let storage = parent.path().join(mode);
@@ -2911,7 +3050,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_auth_mode_cannot_be_masked_by_off_in_start_options() {
+    fn selected_oidc_mode_requires_complete_config_before_startup_side_effects() {
         let parent = tempfile::tempdir().unwrap();
         let storage = parent.path().join("configured-auth");
         let mut node_config =
@@ -2919,6 +3058,7 @@ mod tests {
         node_config.auth.mode = "oidc".to_string();
         let opts = StartOptions {
             storage: storage.clone(),
+            auth_mode: "oidc".to_string(),
             node_config: Some(node_config),
             ..StartOptions::default()
         };
@@ -2926,9 +3066,42 @@ mod tests {
         let err = run_start(&opts).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "RS-0002 authentication mode `oidc` is unavailable: issuer, audience, and JWKS verification are not configured\n  next steps: This mode is unavailable; use --auth=off only where unauthenticated access is acceptable."
+            "RS-0002 OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url\n  next steps: Configure the issuer, audience, and JWKS endpoint before starting the gateway."
         );
         assert!(!storage.exists());
+    }
+
+    #[test]
+    fn oidc_and_mtls_accept_complete_release_configuration() {
+        let mut node_config = rockstream_types::config::NodeConfig::default();
+        node_config.auth.mode = "oidc".to_string();
+        node_config.auth.oidc_issuer = Some("https://issuer.example".to_string());
+        node_config.auth.oidc_audience = Some("rockstream".to_string());
+        node_config.auth.oidc_jwks_url = Some("https://issuer.example/jwks".to_string());
+        node_config.gateway.tls.cert_path = Some(PathBuf::from("gateway.pem"));
+        node_config.gateway.tls.key_path = Some(PathBuf::from("gateway-key.pem"));
+        assert!(validate_start_auth_modes("oidc", Some(&node_config)).is_ok());
+
+        node_config.auth.mode = "mtls".to_string();
+        node_config.gateway.tls.cert_path = Some(PathBuf::from("gateway.pem"));
+        node_config.gateway.tls.key_path = Some(PathBuf::from("gateway-key.pem"));
+        node_config.gateway.tls.ca_cert_path = Some(PathBuf::from("client-ca.pem"));
+        assert!(validate_start_auth_modes("mtls", Some(&node_config)).is_ok());
+    }
+
+    #[test]
+    fn oidc_requires_gateway_tls_before_startup_side_effects() {
+        let mut node_config = rockstream_types::config::NodeConfig::default();
+        node_config.auth.mode = "oidc".to_string();
+        node_config.auth.oidc_issuer = Some("https://issuer.example".to_string());
+        node_config.auth.oidc_audience = Some("rockstream".to_string());
+        node_config.auth.oidc_jwks_url = Some("https://issuer.example/jwks".to_string());
+
+        let err = validate_start_auth_modes("oidc", Some(&node_config)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RS-0002 OIDC requires gateway TLS certificate and key paths\n  next steps: Configure gateway.tls.cert_path and gateway.tls.key_path before starting the gateway."
+        );
     }
 
     #[test]
@@ -2940,6 +3113,7 @@ mod tests {
         node_config.auth.mode.clear();
         let opts = StartOptions {
             storage: storage.clone(),
+            auth_mode: String::new(),
             node_config: Some(node_config),
             ..StartOptions::default()
         };
