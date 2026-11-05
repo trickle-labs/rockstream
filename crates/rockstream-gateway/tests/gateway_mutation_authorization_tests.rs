@@ -575,14 +575,20 @@ async fn administrator_can_manage_secret_and_read_only_its_metadata() {
         .preprovision_first_administrator(principal, 1)
         .await
         .unwrap();
-    catalog.set_durable_store(durable);
+    catalog.set_durable_store(durable.clone());
 
-    let secret_store = Arc::new(SecretStore::new(
-        None,
-        Arc::new(EnvKekProvider::from_passphrase(
-            "secret-admin-policy-test-kek",
-        )),
-    ));
+    let secret_store = Arc::new(
+        SecretStore::open_durable(
+            "secret-administration-policy-test-secrets",
+            Arc::new(object_store::memory::InMemory::new()),
+            Arc::new(EnvKekProvider::from_passphrase(
+                "secret-admin-policy-test-kek",
+            )),
+        )
+        .await
+        .unwrap()
+        .with_security_audit_catalog(durable),
+    );
     let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader))
         .with_secret_store(secret_store.clone());
     handler
