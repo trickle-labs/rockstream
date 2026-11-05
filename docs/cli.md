@@ -150,6 +150,8 @@ Inspect shard lease ownership and key ranges, and trigger shard migrations.
 - `rockstream shard list` — List all shards, lease tokens, owner workers, and active key ranges.
 - `rockstream shard migrate <shard_id> --to <worker_id> [--yes]` — Migrate a shard lease and state to another worker.
 
+Management mutations accept `--idempotency-key <UUID>`. For backup creation, set `--management` to select the management service. If the key is omitted, the CLI prints a generated key to stderr before submitting the request. If the response is lost, repeat the same command with that key, then reconcile with `rockstream admin operation show <UUID>`; the key is also the operation ID.
+
 ---
 
 ### `rockstream checkpoint`

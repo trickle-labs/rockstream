@@ -25,6 +25,13 @@
                     "help": "Destination directory or URI",
                     "required": true,
                     "value_name": "DESTINATION"
+                  },
+                  {
+                    "name": "idempotency_key",
+                    "long": "idempotency-key",
+                    "help": "UUID reused to retry or reconcile this management backup operation",
+                    "required": false,
+                    "value_name": "IDEMPOTENCY_KEY"
                   }
                 ],
                 "exit_codes": [
@@ -348,6 +355,13 @@
                 "value_name": "CONTROL"
               },
               {
+                "name": "idempotency_key",
+                "long": "idempotency-key",
+                "help": "UUID reused to retry or reconcile this drain",
+                "required": false,
+                "value_name": "IDEMPOTENCY_KEY"
+              },
+              {
                 "name": "worker_id",
                 "long": "worker-id",
                 "help": "Worker ID to drain",
@@ -402,6 +416,13 @@
                 "help": "Control service URL",
                 "required": false,
                 "value_name": "CONTROL"
+              },
+              {
+                "name": "idempotency_key",
+                "long": "idempotency-key",
+                "help": "UUID reused to retry or reconcile this migration",
+                "required": false,
+                "value_name": "IDEMPOTENCY_KEY"
               },
               {
                 "name": "shard_id",
@@ -1114,6 +1135,13 @@
                     "help": "Control-plane worker-facing TCP address",
                     "required": false,
                     "value_name": "CONTROL"
+                  },
+                  {
+                    "name": "idempotency_key",
+                    "long": "idempotency-key",
+                    "help": "UUID reused to retry or reconcile this drain",
+                    "required": false,
+                    "value_name": "IDEMPOTENCY_KEY"
                   },
                   {
                     "name": "worker_id",
@@ -3290,6 +3318,13 @@
             "name": "migrate",
             "about": "Migrate a shard to another worker",
             "options": [
+              {
+                "name": "idempotency_key",
+                "long": "idempotency-key",
+                "help": "UUID reused to retry or reconcile this migration",
+                "required": false,
+                "value_name": "IDEMPOTENCY_KEY"
+              },
               {
                 "name": "shard_id",
                 "help": "Shard ID",
