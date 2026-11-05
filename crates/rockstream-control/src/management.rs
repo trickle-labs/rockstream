@@ -685,7 +685,7 @@ fn authentication_audit(
     }
 }
 
-async fn append_security_audit(
+pub(crate) async fn append_security_audit(
     store: &dyn CatalogStore,
     record: SecurityAuditRecord,
 ) -> Result<(), String> {

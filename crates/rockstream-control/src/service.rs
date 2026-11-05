@@ -32,13 +32,18 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use rockstream_storage::catalog::CatalogStore;
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::data_plane::{
     DeploymentDescriptor, DeploymentRequest, RuntimeExchangeMessage, RuntimeRow, ShardOutput,
     SourceDeltaRequest, WorkerExecutionStatus, WorkloadSnapshot,
 };
 use rockstream_types::error_code::{
-    RS_0001, RS_2401, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
+    RS_0001, RS_0003, RS_2401, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612,
+    RS_8004,
 };
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
@@ -712,6 +717,7 @@ impl ControlService {
             operation_store,
             drain_state: self.drain_state.clone(),
             secret_store: self.secret_store.clone(),
+            security_catalog: self.security_catalog.clone(),
             worker_senders: self.worker_senders.clone(),
             migration_waiters,
             backup_waiters,
@@ -807,6 +813,7 @@ struct ConnectionContext {
     operation_store: Option<ManagementOperationStore>,
     drain_state: Arc<AsyncMutex<DrainState>>,
     secret_store: Arc<SecretStore>,
+    security_catalog: Option<Arc<dyn CatalogStore>>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     migration_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
     backup_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
@@ -2850,6 +2857,47 @@ fn append_required_security_audit(
     }
 }
 
+async fn append_node_identity_rejection(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    identity: &NodeIdentity,
+    connected_worker_id: Option<WorkerId>,
+    claimed_worker_id: WorkerId,
+) -> bool {
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required node identity audit catalog is unavailable");
+        return false;
+    };
+    let actor = connected_worker_id.map_or_else(
+        || AuditIdentity::Unverified(identity.to_cn()),
+        |_| AuditIdentity::Verified(identity.to_cn()),
+    );
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let record = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("node-identity-rejection:{}", uuid::Uuid::new_v4()),
+        timestamp_ms: timestamp_ms.max(1),
+        actor,
+        target: AuditField::Unverified(claimed_worker_id.to_string()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::NodeIdentityRejection,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required node identity audit append failed");
+        return false;
+    }
+    true
+}
+
 fn claimed_worker_id(message: &WorkerMessage) -> Option<WorkerId> {
     match message {
         WorkerMessage::DeploymentReady { worker_id, .. }
@@ -3169,6 +3217,7 @@ async fn handle_connection_stream<R, W>(
         operation_store,
         drain_state,
         secret_store,
+        security_catalog,
         worker_senders,
         migration_waiters,
         backup_waiters,
@@ -3211,20 +3260,43 @@ async fn handle_connection_stream<R, W>(
                 let registered_id = connected_worker_id
                     .map(|worker_id| worker_id.to_string())
                     .unwrap_or_else(|| "unknown".to_owned());
-                if !deny_authenticated_worker_action(
-                    &sender,
-                    audit.as_ref(),
+                if append_node_identity_rejection(
+                    security_catalog.as_ref(),
                     identity,
-                    claimed_id.to_string(),
-                    format!(
-                        "registered_worker_id={registered_id}, claimed_worker_id={claimed_id}, error_code={RS_2401}"
-                    ),
+                    connected_worker_id,
+                    claimed_id,
                 )
                 .await
                 {
-                    return;
+                    let event = AuditEvent::now(
+                        identity.to_cn(),
+                        "security.authorization_denied",
+                        claimed_id.to_string(),
+                    )
+                    .with_error_code(RS_2401.to_string())
+                    .with_detail(format!(
+                        "registered_worker_id={registered_id}, claimed_worker_id={claimed_id}, error_code={RS_2401}"
+                    ));
+                    if append_required_security_audit(
+                        audit.as_ref(),
+                        &event,
+                        "worker node identity rejection",
+                    ) {
+                        send_message(
+                            &sender,
+                            &ControlMessage::OperationFailed {
+                                code: RS_2401.to_string(),
+                                message:
+                                    "worker identity claim is not authorized for this connection"
+                                        .to_owned(),
+                                next_steps: rockstream_types::error_code::next_steps(RS_2401)
+                                    .to_string(),
+                            },
+                        )
+                        .await;
+                    }
                 }
-                continue;
+                break;
             }
         }
 
@@ -3238,6 +3310,16 @@ async fn handle_connection_stream<R, W>(
                             registered_id = %reg.worker_id,
                             "control: worker mTLS identity mismatch rejected"
                         );
+                        if !append_node_identity_rejection(
+                            security_catalog.as_ref(),
+                            id,
+                            connected_worker_id,
+                            reg.worker_id,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         let event = AuditEvent::now(
                             id.to_cn(),
                             "security.internal_mtls_denied",
@@ -3249,11 +3331,13 @@ async fn handle_connection_stream<R, W>(
                             id.to_cn(),
                             reg.worker_id
                         ));
-                        append_required_security_audit(
+                        if !append_required_security_audit(
                             audit.as_ref(),
                             &event,
                             "worker node identity rejection",
-                        );
+                        ) {
+                            return;
+                        }
                         let reply = ControlMessage::OperationFailed {
                             code: RS_2412.to_string(),
                             message: format!(
