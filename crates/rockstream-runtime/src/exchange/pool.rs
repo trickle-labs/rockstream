@@ -3,7 +3,7 @@ use crate::exchange::shared_memory::SharedMemoryClient;
 use parking_lot::RwLock;
 use rockstream_types::compatibility::ProtocolVersion;
 use rockstream_types::config::ExchangeConfig;
-use rockstream_types::error_code::{RS_3004, RS_3006, RS_5003};
+use rockstream_types::error_code::{RS_2410, RS_3004, RS_3006, RS_5003};
 use rockstream_types::ids::WorkerId;
 use rockstream_types::topology::WorkerInfo;
 use std::collections::HashMap;
@@ -316,6 +316,32 @@ impl ShuffleClientPool {
             .as_ref()
             .map(|t| t.is_enabled())
             .unwrap_or(false);
+        if self.internal_tls.is_some() && !use_tls {
+            return Err(format!(
+                "RS-2410: worker shuffle TLS certificate and private key are required"
+            ));
+        }
+        if !use_tls {
+            if addr.starts_with("https://") {
+                return Err(format!(
+                    "{RS_2410}: TLS configuration is required for HTTPS peers"
+                ));
+            }
+            let authority = addr
+                .strip_prefix("http://")
+                .unwrap_or(&addr)
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            let is_loopback = authority
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|peer| peer.ip().is_loopback());
+            if !is_loopback {
+                return Err(format!(
+                    "{RS_2410}: plaintext worker shuffle is limited to loopback development"
+                ));
+            }
+        }
         if use_tls {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
@@ -347,6 +373,12 @@ impl ShuffleClientPool {
 
             if let Some(tls_cfg) = &self.internal_tls {
                 if tls_cfg.is_enabled() {
+                    if !tls_cfg.client_auth_required {
+                        return Err(format!(
+                            "RS-2410: worker shuffle requires mutual TLS client authentication"
+                        ));
+                    }
+                    tls_cfg.validate()?;
                     let cert_path = tls_cfg.cert_path.as_ref().unwrap();
                     let key_path = tls_cfg.key_path.as_ref().unwrap();
                     let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
@@ -365,7 +397,7 @@ impl ShuffleClientPool {
 
                     let mut client_tls = tonic::transport::ClientTlsConfig::new()
                         .identity(identity)
-                        .domain_name("localhost");
+                        .domain_name(format!("worker-{}", worker_id.0));
 
                     if let Some(ca_path) = &tls_cfg.ca_cert_path {
                         let ca_pem = std::fs::read_to_string(ca_path).map_err(|e| {

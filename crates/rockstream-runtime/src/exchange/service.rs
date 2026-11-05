@@ -16,6 +16,8 @@ use crate::exchange::serialization::deserialize_zset;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::compatibility::{ProtocolVersion, SupportedVersionRange};
 use rockstream_types::config::ExchangeConfig;
+use rockstream_types::error_code::{RS_2401, RS_2410};
+use rockstream_types::identity::{NodeIdentity, NodeRole};
 
 /// Holds the input channel and Schema metadata for a local exchange target.
 #[derive(Clone)]
@@ -200,51 +202,58 @@ impl ExchangeService {
         addr: std::net::SocketAddr,
     ) -> Result<tokio::task::JoinHandle<()>, String> {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_config = if let Some(tls_cfg) = &self.internal_tls {
+            if !tls_cfg.is_enabled() {
+                return Err(format!(
+                    "{RS_2410}: worker shuffle TLS certificate and private key are required"
+                ));
+            }
+            if !tls_cfg.client_auth_required {
+                return Err(format!("{RS_2410}: worker shuffle requires mutual TLS"));
+            }
+            tls_cfg.validate()?;
+            let cert_path = tls_cfg.cert_path.as_ref().unwrap();
+            let key_path = tls_cfg.key_path.as_ref().unwrap();
+            let cert_pem = std::fs::read_to_string(cert_path)
+                .map_err(|e| format!("failed to read TLS cert {}: {e}", cert_path.display()))?;
+            let key_pem = std::fs::read_to_string(key_path)
+                .map_err(|e| format!("failed to read TLS key {}: {e}", key_path.display()))?;
+            let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+            let mut server_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+            if let Some(ca_path) = &tls_cfg.ca_cert_path {
+                let ca_pem = std::fs::read_to_string(ca_path).map_err(|e| {
+                    format!("failed to read TLS CA cert {}: {e}", ca_path.display())
+                })?;
+                let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+                server_tls = server_tls.client_ca_root(ca_cert);
+            }
+            Some(server_tls)
+        } else {
+            None
+        };
+
+        if tls_config.is_none() && !addr.ip().is_loopback() {
+            return Err(format!(
+                "{RS_2410}: plaintext worker shuffle is limited to loopback development"
+            ));
+        }
         let server = ShuffleServer::new_with_tracker(
             self.registry.clone(),
             Some(self.task_tracker.clone()),
             Some(self.cancel_token.clone()),
         )
         .with_exchange_config(self.exchange_config.clone())
-        .with_supported_protocol_range(self.protocol_range);
+        .with_supported_protocol_range(self.protocol_range)
+        .with_required_worker_identity(tls_config.is_some());
         let cancel_token = self.cancel_token.clone();
 
-        let tls_config = if let Some(tls_cfg) = &self.internal_tls {
-            if tls_cfg.is_enabled() {
-                let cert_path = tls_cfg.cert_path.as_ref().unwrap();
-                let key_path = tls_cfg.key_path.as_ref().unwrap();
-                let cert_pem = std::fs::read_to_string(cert_path)
-                    .map_err(|e| format!("failed to read TLS cert {}: {e}", cert_path.display()))?;
-                let key_pem = std::fs::read_to_string(key_path)
-                    .map_err(|e| format!("failed to read TLS key {}: {e}", key_path.display()))?;
-                let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-                let mut server_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
-                if let Some(ca_path) = &tls_cfg.ca_cert_path {
-                    let ca_pem = std::fs::read_to_string(ca_path).map_err(|e| {
-                        format!("failed to read TLS CA cert {}: {e}", ca_path.display())
-                    })?;
-                    let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
-                    server_tls = server_tls.client_ca_root(ca_cert);
-                }
-                Some(server_tls)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
+        let mut builder = tonic::transport::Server::builder();
+        if let Some(tls) = tls_config {
+            builder = builder
+                .tls_config(tls)
+                .map_err(|e| format!("{RS_2410}: failed to configure worker shuffle TLS: {e}"))?;
+        }
         let handle = self.task_tracker.spawn(async move {
-            let mut builder = tonic::transport::Server::builder();
-            if let Some(tls) = tls_config {
-                match builder.tls_config(tls) {
-                    Ok(b) => builder = b,
-                    Err(e) => {
-                        tracing::error!(code = "RS-2411", error = %e, "failed to configure TLS on exchange server");
-                        return;
-                    }
-                }
-            }
             let _ = builder
                 .add_service(
                     crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
@@ -274,6 +283,7 @@ pub struct ShuffleServer {
     cancel_token: Option<CancellationToken>,
     exchange_config: ExchangeConfig,
     protocol_range: SupportedVersionRange,
+    require_worker_identity: bool,
 }
 
 impl ShuffleServer {
@@ -284,6 +294,7 @@ impl ShuffleServer {
             cancel_token: None,
             exchange_config: ExchangeConfig::default(),
             protocol_range: SupportedVersionRange::v1_through_v2(),
+            require_worker_identity: false,
         }
     }
 
@@ -298,6 +309,7 @@ impl ShuffleServer {
             cancel_token,
             exchange_config: ExchangeConfig::default(),
             protocol_range: SupportedVersionRange::v1_through_v2(),
+            require_worker_identity: false,
         }
     }
 
@@ -309,6 +321,37 @@ impl ShuffleServer {
     pub fn with_supported_protocol_range(mut self, protocol_range: SupportedVersionRange) -> Self {
         self.protocol_range = protocol_range;
         self
+    }
+
+    fn with_required_worker_identity(mut self, required: bool) -> Self {
+        self.require_worker_identity = required;
+        self
+    }
+
+    fn validate_worker_identity<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if !self.require_worker_identity {
+            return Ok(());
+        }
+        let certs = request.peer_certs().ok_or_else(|| {
+            Status::unauthenticated(format!("{RS_2410}: worker certificate required"))
+        })?;
+        let cert = certs.first().ok_or_else(|| {
+            Status::unauthenticated(format!("{RS_2410}: empty worker certificate chain"))
+        })?;
+        let identity =
+            NodeIdentity::from_certificate_der(cert.as_ref()).map_err(Status::unauthenticated)?;
+        if identity.role != NodeRole::Worker {
+            tracing::warn!(
+                action = "security.authorization_denied",
+                actor = %identity.to_cn(),
+                error_code = %RS_2401,
+                "non-worker identity denied on worker shuffle endpoint"
+            );
+            return Err(Status::permission_denied(format!(
+                "{RS_2401}: worker shuffle requires a worker node identity"
+            )));
+        }
+        Ok(())
     }
 
     /// Validate a request's protocol metadata before its frame stream is read.
@@ -362,6 +405,7 @@ impl ShuffleService for ShuffleServer {
         &self,
         request: Request<Streaming<ShuffleFrame>>,
     ) -> Result<Response<Self::ShuffleStreamStream>, Status> {
+        self.validate_worker_identity(&request)?;
         self.validate_protocol_version(request.metadata())?;
         let mut stream = request.into_inner();
         let registry = self.registry.clone();
@@ -469,6 +513,7 @@ impl ShuffleService for ShuffleServer {
         &self,
         request: Request<Streaming<crate::exchange::proto::ExchangeFrame>>,
     ) -> Result<Response<Self::ExchangeStreamStream>, Status> {
+        self.validate_worker_identity(&request)?;
         self.validate_protocol_version(request.metadata())?;
         let mut stream = request.into_inner();
         let (tx, rx) = mpsc::channel(64);

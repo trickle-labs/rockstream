@@ -121,7 +121,7 @@ The control-worker TCP listener used for registration, heartbeats, and shard lea
 
 For local development only, `--allow-insecure-internal-dev` explicitly permits plaintext control traffic when the control listener or worker target uses a literal loopback socket address. The option rejects non-loopback addresses and must not be used for production or release qualification.
 
-Worker shuffle and native management APIs are separate transport boundaries. Configuring TLS support for those components does not establish that authentication is required there; qualify them under their owning security work before relying on them in production.
+Worker shuffle and native management APIs are separate transport boundaries. A configured worker shuffle endpoint requires certificate, key, CA roots, and mutual TLS; plaintext servers and clients are limited to literal loopback addresses. Shuffle clients verify the advertised worker ID against the peer certificate's `worker-<id>` DNS name, and the server rejects RPCs from CA-verified certificates whose parsed node role is not `Worker` before reading frames. This is partial enforcement: the server does not yet bind the peer certificate to a registered worker ID or shard assignment, role denials are only transiently logged, and the rejected RPC does not close its underlying HTTP/2 connection. Keep worker shuffle qualification blocked until durable denial audit, connection rejection, and assignment binding are demonstrated. Native management remains a separate boundary and must be qualified under its owning security work before production use.
 
 ---
 
