@@ -328,6 +328,7 @@ impl ShuffleServer {
         self
     }
 
+    #[allow(clippy::result_large_err)]
     fn validate_worker_identity<T>(&self, request: &Request<T>) -> Result<(), Status> {
         if !self.require_worker_identity {
             return Ok(());

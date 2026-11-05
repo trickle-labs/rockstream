@@ -317,9 +317,9 @@ impl ShuffleClientPool {
             .map(|t| t.is_enabled())
             .unwrap_or(false);
         if self.internal_tls.is_some() && !use_tls {
-            return Err(format!(
-                "RS-2410: worker shuffle TLS certificate and private key are required"
-            ));
+            return Err(
+                "RS-2410: worker shuffle TLS certificate and private key are required".to_string(),
+            );
         }
         if !use_tls {
             if addr.starts_with("https://") {
@@ -374,9 +374,10 @@ impl ShuffleClientPool {
             if let Some(tls_cfg) = &self.internal_tls {
                 if tls_cfg.is_enabled() {
                     if !tls_cfg.client_auth_required {
-                        return Err(format!(
+                        return Err(
                             "RS-2410: worker shuffle requires mutual TLS client authentication"
-                        ));
+                                .to_string(),
+                        );
                     }
                     tls_cfg.validate()?;
                     let cert_path = tls_cfg.cert_path.as_ref().unwrap();
