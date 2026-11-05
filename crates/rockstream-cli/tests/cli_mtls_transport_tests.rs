@@ -6,8 +6,16 @@ use rockstream_cli::run_cluster_status;
 use rockstream_cli::transport::{ClientIdentity, ControlClient};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
+use rockstream_storage::catalog::DurableCatalogStore;
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::error_code::{RS_2410, RS_2411};
+
+fn security_audit_catalog() -> Arc<DurableCatalogStore> {
+    Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "cli-mtls-test",
+    ))
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cli_control_mtls_valid_cert_executes() {
@@ -21,6 +29,7 @@ async fn test_cli_control_mtls_valid_cert_executes() {
     let svc = ControlService::new(catalog)
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -64,6 +73,7 @@ async fn test_cli_control_mtls_missing_cert_refused() {
     let svc = ControlService::new(catalog)
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -107,6 +117,7 @@ async fn test_cli_control_mtls_invalid_cert_refused() {
     let svc = ControlService::new(catalog)
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();

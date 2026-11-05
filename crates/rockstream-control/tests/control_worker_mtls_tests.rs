@@ -106,6 +106,7 @@ async fn test_control_worker_mtls_valid_cert_admitted() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -145,6 +146,7 @@ async fn test_control_worker_mtls_missing_cert_rejected() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -190,6 +192,7 @@ async fn test_control_worker_mtls_expired_cert_rejected() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -228,6 +231,7 @@ async fn test_control_worker_mtls_untrusted_ca_rejected() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();

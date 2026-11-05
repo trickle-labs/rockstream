@@ -15,9 +15,35 @@ use rockstream_cli::transport::{ClientIdentity, ControlClient};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
 use rockstream_runtime::client::start_worker_client_with_tls;
+use rockstream_storage::catalog::DurableCatalogStore;
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::error_code::{RS_2410, RS_2411};
 use rockstream_types::ids::{ShardId, WorkerId};
+
+fn security_audit_catalog() -> Arc<DurableCatalogStore> {
+    Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "internal-mtls-test",
+    ))
+}
+
+#[tokio::test]
+async fn internal_mtls_requires_security_audit_catalog() {
+    let pki = TestPki::generate();
+    let service =
+        ControlService::new(TopologyCatalog::new()).with_internal_tls(pki.control_tls_config());
+
+    let error = service
+        .start("127.0.0.1:0")
+        .await
+        .err()
+        .expect("mTLS must fail startup without the security audit catalog");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "RS-2405: internal mTLS requires the durable security audit catalog"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_data() {
@@ -31,6 +57,7 @@ async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_dat
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -112,6 +139,7 @@ async fn test_certificate_rotation_preserves_streams_and_accepts_gen2_worker() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -229,6 +257,7 @@ async fn test_cli_control_mtls_transport_seam_and_refusal() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -287,6 +316,7 @@ async fn test_mtls_cluster_durability_lfs_and_minio() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();

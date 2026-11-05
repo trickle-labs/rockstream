@@ -434,6 +434,7 @@ impl ControlService {
     }
 
     /// Attach an [`InternalTlsConfig`] for internal mTLS mutual authentication.
+    /// Enabled mTLS also requires the durable security catalog before startup.
     pub fn with_internal_tls(mut self, config: InternalTlsConfig) -> Self {
         self.internal_tls = Some(config);
         self
@@ -471,7 +472,7 @@ impl ControlService {
         self
     }
 
-    /// Attach the durable principals, policy revisions, and audit catalog used by management.
+    /// Attach the durable principals, policy revisions, and audit catalog used by management and internal mTLS.
     pub fn with_security_catalog(mut self, catalog: Arc<dyn CatalogStore>) -> Self {
         self.security_catalog = Some(catalog);
         self
@@ -543,6 +544,12 @@ impl ControlService {
                 None
             }
         };
+        if reloader.is_some() && self.security_catalog.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RS-2405: internal mTLS requires the durable security audit catalog",
+            ));
+        }
         let management_reloader = match self.management_tls.as_ref() {
             Some(config) => {
                 if !config.client_auth_required {
