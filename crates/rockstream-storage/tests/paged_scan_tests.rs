@@ -78,7 +78,7 @@ async fn test_paged_scan_continuation_tokens() {
 
     let page_size = 50;
     let mut continuation: Option<Vec<u8>> = None;
-    let mut retrieved_rows = 0;
+    let mut retrieved_rows = Vec::new();
     let mut page_count = 0;
 
     loop {
@@ -87,7 +87,11 @@ async fn test_paged_scan_continuation_tokens() {
             .await
             .expect("scan page");
 
-        retrieved_rows += page.rows.len();
+        retrieved_rows.extend(
+            page.rows
+                .iter()
+                .map(|(key, value)| (key.to_vec(), value.to_vec())),
+        );
         page_count += 1;
 
         if page.is_last_page {
@@ -99,8 +103,61 @@ async fn test_paged_scan_continuation_tokens() {
         continuation = page.next_token.map(|b| b.to_vec());
     }
 
-    assert_eq!(retrieved_rows, total_rows);
+    let expected = (0..total_rows)
+        .map(|i| {
+            (
+                format!("token_test/{i:06}").into_bytes(),
+                format!("val_{i:06}").into_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retrieved_rows, expected);
     assert_eq!(page_count, 5);
+}
+
+#[tokio::test]
+async fn page_continuations_are_exclusive_and_scoped_to_the_prefix() {
+    let dir = tempdir().unwrap();
+    let db = open_test_shard_db(&dir).await;
+    let mut batch = WriteBatch::new();
+    for key in [b"p/".as_slice(), b"p/a", b"p/b", b"p/c", b"q/a"] {
+        batch.put(key, key);
+    }
+    db.write_batch(batch).await.unwrap();
+    for (token, expected) in [
+        (
+            b"o".as_slice(),
+            vec![
+                b"p/".to_vec(),
+                b"p/a".to_vec(),
+                b"p/b".to_vec(),
+                b"p/c".to_vec(),
+            ],
+        ),
+        (
+            b"p/".as_slice(),
+            vec![b"p/a".to_vec(), b"p/b".to_vec(), b"p/c".to_vec()],
+        ),
+        (b"p/b".as_slice(), vec![b"p/c".to_vec()]),
+        (b"q".as_slice(), vec![]),
+    ] {
+        let page = db
+            .scan_prefix_page(b"p/", Some(token), 10, 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.rows
+                .into_iter()
+                .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                .collect::<Vec<_>>(),
+            expected
+                .into_iter()
+                .map(|key| (key.clone(), key))
+                .collect::<Vec<_>>()
+        );
+        assert!(page.is_last_page);
+        assert_eq!(page.next_token, None);
+    }
 }
 
 #[tokio::test]

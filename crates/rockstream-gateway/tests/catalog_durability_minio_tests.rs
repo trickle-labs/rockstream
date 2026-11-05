@@ -5,7 +5,10 @@ use tokio_postgres::NoTls;
 
 use object_store::ObjectStore;
 use rockstream_gateway::{
-    catalog_stubs::{CatalogCheckpointEntry, CatalogNodeEntry, CatalogStubs, CatalogView},
+    catalog_stubs::{
+        CatalogCheckpointEntry, CatalogColumn, CatalogNodeEntry, CatalogStubs, CatalogTable,
+        CatalogView,
+    },
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -82,6 +85,13 @@ const MINIO_BUCKET: &str = "rockstream-catalog-durability-test";
 
 async fn run_catalog_durability_case(store: Arc<dyn ObjectStore>, shard_path: &str) {
     let catalog1 = Arc::new(CatalogStubs::new());
+    catalog1.add_table(CatalogTable::new(
+        "catalog_source",
+        vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    ));
     catalog1.add_node(CatalogNodeEntry {
         node_id: "node-minio-1".to_string(),
         worker_id: "worker-minio-200".to_string(),
@@ -94,8 +104,11 @@ async fn run_catalog_durability_case(store: Arc<dyn ObjectStore>, shard_path: &s
     });
     catalog1.add_view(CatalogView {
         name: "minio_view".to_string(),
-        sql: "SELECT 1".to_string(),
-        columns: vec![],
+        sql: "SELECT id FROM catalog_source".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
         namespace: "public".to_string(),
         op_id: Some(777),
     });
@@ -140,6 +153,13 @@ async fn run_catalog_durability_case(store: Arc<dyn ObjectStore>, shard_path: &s
 
     // Restart gateway with new instance
     let catalog2 = Arc::new(CatalogStubs::new());
+    catalog2.add_table(CatalogTable::new(
+        "catalog_source",
+        vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    ));
     catalog2.add_node(CatalogNodeEntry {
         node_id: "node-minio-1".to_string(),
         worker_id: "worker-minio-200".to_string(),
@@ -152,8 +172,11 @@ async fn run_catalog_durability_case(store: Arc<dyn ObjectStore>, shard_path: &s
     });
     catalog2.add_view(CatalogView {
         name: "minio_view".to_string(),
-        sql: "SELECT 1".to_string(),
-        columns: vec![],
+        sql: "SELECT id FROM catalog_source".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
         namespace: "public".to_string(),
         op_id: Some(777),
     });

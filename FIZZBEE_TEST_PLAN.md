@@ -708,6 +708,15 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #321 applies M1-S1 to the local SQL path by placing base rows,
+compiled-view output, operator checkpoints, and the shard frontier in one
+write batch. A failed or interrupted commit must restore in-memory operator
+state before later queries or writes proceed. The pgwire durability tests check
+failure, retry, and restart with exact base and view rows; cancellation tests
+exercise the recovery gate. M1 abstracts the batch and does not model compiled
+operators, gateway cancellation, source shuffle ownership, or management
+authentication. Those boundaries require separate qualification.
+
 Issue #303's #309 slice binds control-worker registration to the authenticated
 certificate identity. `control_worker_mtls_tests.rs` covers missing, expired,
 and untrusted certificates, identity mismatch, and role-only rejection; the

@@ -2178,6 +2178,7 @@ pub struct GatewayHandler {
     /// ponytail: shard-wide serialization is the correctness ceiling; split
     /// by dependency component only after measured contention.
     shard_commit_lock: Arc<tokio::sync::Mutex<()>>,
+    pending_view_recovery: Arc<Mutex<Vec<String>>>,
     pub secret_store: Arc<rockstream_control::SecretStore>,
     join_strategy: JoinStrategy,
     pub is_draining: Arc<std::sync::atomic::AtomicBool>,
@@ -2367,6 +2368,7 @@ impl GatewayHandler {
             pgoutput_coordinators: Arc::new(DashMap::new()),
             pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_view_recovery: Arc::new(Mutex::new(Vec::new())),
             secret_store,
             join_strategy: JoinStrategy::Auto,
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2418,6 +2420,7 @@ impl GatewayHandler {
             pgoutput_coordinators: Arc::new(DashMap::new()),
             pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_view_recovery: Arc::new(Mutex::new(Vec::new())),
             secret_store,
             join_strategy: JoinStrategy::Auto,
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2617,9 +2620,9 @@ impl GatewayHandler {
     /// pipeline addresses the same storage keys the prior process wrote to.
     /// A no-op for a gateway with no local `shard_db` (multi-shard
     /// `--role gateway`, which never populates `compiled_views` at all).
-    pub async fn recover_compiled_views(&self) {
+    pub async fn recover_compiled_views(&self) -> Result<(), GatewayError> {
         let Some(shard_db) = self.shard_db.clone() else {
-            return;
+            return Ok(());
         };
         for view in self.catalog.list_views() {
             let Some(op_id) = view.op_id else {
@@ -2635,7 +2638,12 @@ impl GatewayHandler {
                 .iter()
                 .all(|dep| self.catalog.get_table(dep).is_some());
             if !deps_are_base_tables {
-                continue;
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "cannot recover compiled view {}: missing base dependencies",
+                        view.name
+                    ),
+                });
             }
             let table_schemas: HashMap<String, SchemaRef> = compile_deps
                 .iter()
@@ -2653,24 +2661,14 @@ impl GatewayHandler {
                 .await
             {
                 Ok(compiled) => {
-                    if let Some(join) = &compiled.join {
-                        if let Err(e) = join.pipeline.restore(&shard_db).await {
-                            tracing::warn!(
-                                view = %view.name,
-                                error = %e,
-                                "recover_compiled_views: failed to restore persisted join \
-                                 arrangement state; recompiled pipeline will start from empty \
-                                 state"
-                            );
-                        }
-                    } else if let Err(e) = compiled.pipeline.restore(&shard_db).await {
-                        tracing::warn!(
-                            view = %view.name,
-                            error = %e,
-                            "recover_compiled_views: failed to restore persisted pipeline \
-                             arrangement state; recompiled pipeline will start from empty state"
-                        );
-                    }
+                    let result = if let Some(join) = &compiled.join {
+                        join.pipeline.restore(&shard_db).await
+                    } else {
+                        compiled.pipeline.restore(&shard_db).await
+                    };
+                    result.map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("cannot recover compiled view {}: {error}", view.name),
+                    })?;
                     self.compiled_views
                         .insert(view.name.clone(), Arc::new(compiled));
                     let sources = compile_deps
@@ -2746,16 +2744,13 @@ impl GatewayHandler {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        view = %view.name,
-                        error = %e,
-                        "recover_compiled_views: failed to recompile a previously-compiled \
-                         view; it will not receive live incremental refresh until CREATE VIEW \
-                         is re-issued"
-                    );
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("cannot recompile view {}: {e}", view.name),
+                    });
                 }
             }
         }
+        Ok(())
     }
 
     fn compiled_view_pk(&self, view_name: &str, column_count: usize) -> Vec<usize> {
@@ -2899,6 +2894,31 @@ impl GatewayHandler {
         ordered
     }
 
+    fn compiled_single_source(&self, view_name: &str) -> Result<Option<String>, GatewayError> {
+        let view = self.catalog.get_view(view_name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled view {view_name} is missing from the catalog"),
+            }
+        })?;
+        let sql = inline_view_dependencies(&view.sql, &self.catalog, MAX_VIEW_INLINE_DEPTH);
+        let sources = extract_sql_refs(&sql).into_iter().collect::<HashSet<_>>();
+        if sources
+            .iter()
+            .any(|name| self.catalog.get_table(name).is_none())
+        {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled view {view_name} has an unresolved base source"),
+            });
+        }
+        match sources.len() {
+            0 => Ok(None),
+            1 => Ok(sources.into_iter().next()),
+            _ => Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled single-input view {view_name} has multiple base sources"),
+            }),
+        }
+    }
+
     /// v0.51.4 Slice 0: refresh a compiled view from the commit's own
     /// row-level delta rather than a full-table rescan.
     ///
@@ -2916,6 +2936,7 @@ impl GatewayHandler {
         view_name: &str,
         ops: &[DmlOp],
         shard_db: &Arc<rockstream_storage::ShardDb>,
+        batch: &mut rockstream_storage::WriteBatch,
     ) -> Result<(), GatewayError> {
         let Some(compiled) = self.compiled_views.get(view_name) else {
             return Ok(());
@@ -2945,14 +2966,16 @@ impl GatewayHandler {
                     detail: format!("compiled join pipeline process({view_name}): {e}"),
                 })?;
             if !output.is_empty() {
-                compiled.sink.write_next_epoch(&output).await.map_err(|e| {
-                    GatewayError::QueryTimeExecutionFailed {
+                compiled
+                    .sink
+                    .append_next_epoch(batch, &output)
+                    .await
+                    .map_err(|e| GatewayError::QueryTimeExecutionFailed {
                         detail: format!("write compiled view_output({view_name}): {e}"),
-                    }
-                })?;
+                    })?;
             }
             join.pipeline
-                .persist(shard_db.as_ref())
+                .append_state(shard_db.as_ref(), batch)
                 .await
                 .map_err(|e| GatewayError::QueryTimeExecutionFailed {
                     detail: format!("persist compiled join pipeline state({view_name}): {e}"),
@@ -2960,11 +2983,9 @@ impl GatewayHandler {
             return Ok(());
         }
 
-        let deps = self.catalog.get_view_deps(view_name);
-        if deps.is_empty() {
+        let Some(source_name) = self.compiled_single_source(view_name)? else {
             return Ok(());
-        }
-        let source_name = deps[0].clone();
+        };
         let source_schema = query_time_relation_schema(&self.catalog, &source_name);
         let input = build_delta_zset_for_table(&source_name, ops, source_schema)?;
         if input.is_empty() {
@@ -2977,22 +2998,75 @@ impl GatewayHandler {
             }
         })?;
         if !output.is_empty() {
-            compiled.sink.write_next_epoch(&output).await.map_err(|e| {
-                GatewayError::QueryTimeExecutionFailed {
+            compiled
+                .sink
+                .append_next_epoch(batch, &output)
+                .await
+                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
                     detail: format!("write compiled view_output({view_name}): {e}"),
-                }
-            })?;
+                })?;
         }
         // Persist any stateful stage's arrangement (Aggregate/Distinct/
         // TumbleWindow/HopWindow/Window/TopK — v0.51.4 Slices 1-5). A no-op
         // for a stateless-only pipeline (Slice 0's q0-q2 shapes).
         compiled
             .pipeline
-            .persist(shard_db.as_ref())
+            .append_state(shard_db.as_ref(), batch)
             .await
             .map_err(|e| GatewayError::QueryTimeExecutionFailed {
                 detail: format!("persist compiled pipeline state({view_name}): {e}"),
             })?;
+        Ok(())
+    }
+
+    async fn rollback_compiled_views(
+        &self,
+        views: &[String],
+        shard_db: &rockstream_storage::ShardDb,
+    ) -> Result<(), GatewayError> {
+        for view_name in views {
+            let compiled = self.compiled_views.get(view_name).ok_or_else(|| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled view {view_name} unavailable during recovery"),
+                }
+            })?;
+            let result = if let Some(join) = &compiled.join {
+                join.pipeline.restore(shard_db).await
+            } else {
+                compiled.pipeline.restore(shard_db).await
+            };
+            result.map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("restore compiled view {view_name}: {error}"),
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn recover_pending_views_locked(&self) -> Result<(), GatewayError> {
+        let views = self.pending_view_recovery.lock().clone();
+        if !views.is_empty() {
+            let db =
+                self.shard_db
+                    .as_ref()
+                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                        detail: "local view recovery requires its shard".to_string(),
+                    })?;
+            self.rollback_compiled_views(&views, db).await?;
+            db.flush().await?;
+            db.get(&rockstream_storage::ShardKeyEncoder::frontier_key())
+                .await?;
+            self.pending_view_recovery.lock().clear();
+        }
+        Ok(())
+    }
+
+    async fn ensure_local_view_consistency(&self) -> PgWireResult<()> {
+        if !self.pending_view_recovery.lock().is_empty() {
+            let _guard = self.shard_commit_lock.lock().await;
+            self.recover_pending_views_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        }
         Ok(())
     }
 
@@ -3049,11 +3123,9 @@ impl GatewayHandler {
             return Ok(());
         }
 
-        let deps = self.catalog.get_view_deps(view_name);
-        if deps.is_empty() {
+        let Some(source_name) = self.compiled_single_source(view_name)? else {
             return Ok(());
-        }
-        let source_name = deps[0].clone();
+        };
         let input = self
             .full_table_zset(&source_name, shard_db.as_ref())
             .await?;
@@ -3472,6 +3544,7 @@ impl GatewayHandler {
         let _registry_guard = self.pgoutput_registry_lock.lock().await;
         {
             let _guard = self.shard_commit_lock.lock().await;
+            self.recover_pending_views_locked().await?;
             identity.register(shard_db).await?;
         }
         if let Some(coordinator) = self
@@ -3677,6 +3750,7 @@ impl GatewayHandler {
     ) -> Result<(), GatewayError> {
         let mut coordinator = coordinator.lock().await;
         let _guard = self.shard_commit_lock.lock().await;
+        self.recover_pending_views_locked().await?;
         let compiled = self
             .compiled_views
             .get(view_name)
@@ -3687,6 +3761,7 @@ impl GatewayHandler {
         let epoch = shard_db
             .try_next_epoch()
             .ok_or(GatewayError::CommitEpochExhausted)?;
+        *self.pending_view_recovery.lock() = vec![view_name.to_string()];
         let output = if self.catalog.backfill_has_cursor(view_name) {
             None
         } else {
@@ -3696,14 +3771,11 @@ impl GatewayHandler {
                     let right = self.full_table_zset(&join.right_source, shard_db).await?;
                     join.pipeline.process(left, right)
                 } else {
-                    let dependency = self
-                        .catalog
-                        .get_view_deps(view_name)
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                            detail: format!("compiled view '{view_name}' has no dependency"),
-                        })?;
+                    let dependency = self.compiled_single_source(view_name)?.ok_or_else(|| {
+                        GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("compiled view '{view_name}' has no base source"),
+                        }
+                    })?;
                     compiled
                         .pipeline
                         .process(self.full_table_zset(&dependency, shard_db).await?)
@@ -3759,6 +3831,7 @@ impl GatewayHandler {
         } else {
             compiled.pipeline.ack_persisted_state();
         }
+        self.pending_view_recovery.lock().clear();
         coordinator.attach_alias(source.name.clone());
         if let Some(output) = output {
             self.catalog.update_backfill_progress(
@@ -4297,6 +4370,7 @@ impl GatewayHandler {
     }
 
     async fn restore_compiled_pipeline_state(&self, shard_db: &rockstream_storage::ShardDb) {
+        let _guard = self.shard_commit_lock.lock().await;
         let compiled = self
             .compiled_views
             .iter()
@@ -4494,6 +4568,7 @@ impl GatewayHandler {
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
         let _guard = self.shard_commit_lock.lock().await;
+        self.recover_pending_views_locked().await?;
         let last_safe_lsn =
             rockstream_connectors::PgLsn::from_offset_token(coordinator.runtime.committed_offset())
                 .map_err(source_backfill_error)?;
@@ -4523,12 +4598,11 @@ impl GatewayHandler {
         envelope: BufferedPgOutputEnvelope,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
-        let epoch = {
-            let _guard = self.shard_commit_lock.lock().await;
-            shard_db
-                .try_next_epoch()
-                .ok_or(GatewayError::CommitEpochExhausted)?
-        };
+        let guard = self.shard_commit_lock.lock().await;
+        self.recover_pending_views_locked().await?;
+        let epoch = shard_db
+            .try_next_epoch()
+            .ok_or(GatewayError::CommitEpochExhausted)?;
         let staged_routes = envelope
             .route_updates
             .iter()
@@ -4604,6 +4678,7 @@ impl GatewayHandler {
             .collect::<Vec<_>>();
         coordinator.attached_view_count = active_views.len();
         coordinator.affected_view_count = affected.len();
+        *self.pending_view_recovery.lock() = affected.clone();
 
         let mut m3 = rockstream_storage::WriteBatch::new();
         append_dml_ops(&mut m3, &ops);
@@ -4641,21 +4716,19 @@ impl GatewayHandler {
                 });
                 join.pipeline.process(left, right)
             } else {
-                let deps = self.catalog.get_view_deps(view_name);
-                let schema = deps
-                    .first()
-                    .map(|dep| query_time_relation_schema(&self.catalog, dep))
-                    .unwrap_or_else(|| query_time_relation_schema(&self.catalog, view_name));
-                let inputs = deps
-                    .iter()
-                    .filter_map(|dep| deltas.get(dep).cloned())
-                    .collect::<Vec<_>>();
-                let input =
-                    rockstream_ops::join::concat_zsets(inputs, schema).map_err(|error| {
-                        GatewayError::QueryTimeExecutionFailed {
-                            detail: format!("combine compiled view input({view_name}): {error}"),
-                        }
-                    })?;
+                let source = self.compiled_single_source(view_name)?.ok_or_else(|| {
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("compiled view '{view_name}' has no base source"),
+                    }
+                })?;
+                let input = deltas.get(&source).cloned().unwrap_or_else(|| {
+                    ArrowZSet::empty(
+                        route_schemas
+                            .get(&source)
+                            .cloned()
+                            .unwrap_or_else(|| query_time_relation_schema(&self.catalog, &source)),
+                    )
+                });
                 compiled.pipeline.process(input)
             }
             .map_err(|error| GatewayError::QueryTimeExecutionFailed {
@@ -4720,14 +4793,11 @@ impl GatewayHandler {
                 detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
             }
         })?;
-        {
-            let _guard = self.shard_commit_lock.lock().await;
-            coordinator
-                .runtime
-                .commit_replayable_epoch(&lease, epoch, offset, &lifecycles, m3)
-                .await
-                .map_err(source_backfill_error)?;
-        }
+        coordinator
+            .runtime
+            .commit_replayable_epoch(&lease, epoch, offset, &lifecycles, m3)
+            .await
+            .map_err(source_backfill_error)?;
         for view_name in &affected {
             if let Some(compiled) = self.compiled_views.get(view_name) {
                 if let Some(join) = &compiled.join {
@@ -4737,6 +4807,8 @@ impl GatewayHandler {
                 }
             }
         }
+        self.pending_view_recovery.lock().clear();
+        drop(guard);
         coordinator.cleanup_committed(shard_db).await?;
         for route in &envelope.route_updates {
             let existing_columns = self
@@ -4940,6 +5012,7 @@ impl GatewayHandler {
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
         let _guard = self.shard_commit_lock.lock().await;
+        self.recover_pending_views_locked().await?;
         let epoch = shard_db
             .try_next_epoch()
             .ok_or(GatewayError::CommitEpochExhausted)?;
@@ -4956,6 +5029,7 @@ impl GatewayHandler {
             &ops,
             query_time_relation_schema(&self.catalog, &table.name),
         )?;
+        *self.pending_view_recovery.lock() = vec![view_name.to_string()];
         let output = if let Some(join) = &compiled.join {
             let left = if join.left_source == table.name {
                 input.clone()
@@ -5024,6 +5098,7 @@ impl GatewayHandler {
         } else {
             compiled.pipeline.ack_persisted_state();
         }
+        self.pending_view_recovery.lock().clear();
         self.catalog.update_backfill_progress(
             view_name,
             epoch.to_string(),
@@ -5139,6 +5214,7 @@ impl GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.ensure_local_view_consistency().await?;
         // Drain pending notifications and send them before processing the query.
         // This delivers notifications from other connections to this one.
         {
@@ -5608,6 +5684,11 @@ impl GatewayHandler {
         } else {
             None
         };
+        if local_snapshot_guard.is_some() {
+            self.recover_pending_views_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        }
         let start_epoch = match &request.start {
             SubscribeStart::NowWithSnapshot => self
                 .shard_db
@@ -5762,6 +5843,7 @@ impl GatewayHandler {
         query: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        self.ensure_local_view_consistency().await?;
         let q = query.trim();
         let ql = q.to_lowercase();
 
@@ -8288,6 +8370,16 @@ impl GatewayHandler {
                 None
             };
 
+            let source_deps = if is_materialized {
+                extract_sql_refs(&inline_view_dependencies(
+                    &select_sql,
+                    &self.catalog,
+                    MAX_VIEW_INLINE_DEPTH,
+                ))
+            } else {
+                Vec::new()
+            };
+
             // Register view in the catalog — only reached once compilation
             // (when attempted) has already succeeded.
             use crate::catalog_stubs::CatalogView;
@@ -8334,7 +8426,8 @@ impl GatewayHandler {
             // population step now — no redundant double-write through a
             // separately-materialized legacy pass.
             let bound_sources = if is_materialized {
-                deps.iter()
+                source_deps
+                    .iter()
                     .filter_map(|relation| {
                         self.catalog.get_source(relation).filter(|source| {
                             source.table_name.as_deref() == Some(relation.as_str())
@@ -10315,16 +10408,32 @@ impl GatewayHandler {
 
         let ops = entry.drain();
         drop(entry); // release DashMap entry guard before await
-                     // Serialize the entire local commit through materialized-view refresh,
-                     // durable flush and subscription publication. Releasing this guard
-                     // before flushing allowed a later epoch to publish out of order.
+        self.commit_local_ops(shard_db, ops, idempotency_key, Some(conn_id))
+            .await
+    }
+
+    async fn commit_local_ops(
+        &self,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+        ops: Vec<DmlOp>,
+        idempotency_key: Option<[u8; 16]>,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        // Serialize the entire local commit through materialized-view refresh,
+        // durable flush and subscription publication. Releasing this guard
+        // before flushing allowed a later epoch to publish out of order.
         let _commit_guard = self.shard_commit_lock.lock().await;
+        self.recover_pending_views_locked()
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let (epoch, ops, changes) = {
             let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
             if ops.is_empty() {
-                self.flush_pending_notifies(conn_id);
+                if let Some(conn_id) = conn_id {
+                    self.flush_pending_notifies(conn_id);
+                }
                 return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
                     "COMMIT",
                 )))]);
@@ -10353,12 +10462,48 @@ impl GatewayHandler {
                 &epoch.to_be_bytes(),
             );
 
-            shard_db.write_batch(batch).await.map_err(|e| {
-                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-            })?;
-            self.frontier_published_at_ms
-                .store(current_time_ms(), Ordering::SeqCst);
-
+            let views = if self.distributed_data_plane.is_none() {
+                let changed_tables = ops
+                    .iter()
+                    .map(|op| match op {
+                        DmlOp::Insert { table, .. }
+                        | DmlOp::Update { table, .. }
+                        | DmlOp::Delete { table, .. } => table.clone(),
+                    })
+                    .collect();
+                self.reachable_compiled_views(&changed_tables)
+            } else {
+                Vec::new()
+            };
+            *self.pending_view_recovery.lock() = views.clone();
+            for view in &views {
+                if let Err(error) = self
+                    .recompute_compiled_view(view, &ops, shard_db, &mut batch)
+                    .await
+                {
+                    self.recover_pending_views_locked()
+                        .await
+                        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                    return Err(PgWireError::ApiError(Box::new(error)));
+                }
+            }
+            if let Err(error) = shard_db.write_batch(batch).await {
+                self.recover_pending_views_locked()
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                return Err(PgWireError::ApiError(Box::new(
+                    crate::error::GatewayError::Storage(error),
+                )));
+            }
+            for view in &views {
+                if let Some(compiled) = self.compiled_views.get(view) {
+                    if let Some(join) = &compiled.join {
+                        join.pipeline.ack_persisted_state();
+                    } else {
+                        compiled.pipeline.ack_persisted_state();
+                    }
+                }
+            }
             // Publish a complete committed epoch per table under one registry
             // lock. Readers cannot poll half an UPDATE or half an epoch.
             let mut changes: std::collections::HashMap<
@@ -10469,19 +10614,6 @@ impl GatewayHandler {
                             })?;
                     }
                 }
-            } else {
-                for view_name in self.reachable_compiled_views(&changed_tables) {
-                    if let Err(error) = self
-                        .recompute_compiled_view(&view_name, &ops, shard_db)
-                        .await
-                    {
-                        tracing::warn!(
-                            view = %view_name,
-                            error = %error,
-                            "compiled view refresh failed after commit"
-                        );
-                    }
-                }
             }
             // Flush the WAL so that materialised view output is immediately
             // visible to the ShardReader (DbReader reads from SSTs, not the
@@ -10491,6 +10623,9 @@ impl GatewayHandler {
             shard_db.flush().await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
+            self.frontier_published_at_ms
+                .store(current_time_ms(), Ordering::SeqCst);
+            self.pending_view_recovery.lock().clear();
         }
 
         // Only successfully flushed commits may become visible in the
@@ -10516,7 +10651,7 @@ impl GatewayHandler {
             })
             .unwrap_or_default();
         if let Some(log) = &self.audit_log {
-            let actor = if let Some(s) = self.sessions.get(conn_id) {
+            let actor = if let Some(s) = conn_id.and_then(|id| self.sessions.get(id)) {
                 s.principal.actor()
             } else {
                 "system".to_string()
@@ -10529,12 +10664,14 @@ impl GatewayHandler {
         }
 
         // Update session's last_written_epoch with a FreshnessToken (S7).
-        if let Some(mut session) = self.sessions.get_mut(conn_id) {
+        if let Some(mut session) = conn_id.and_then(|id| self.sessions.get_mut(id)) {
             session.last_written_epoch = Some(FreshnessToken::new(table_name, epoch));
         }
 
         // Deliver transactional NOTIFYs buffered during this transaction.
-        self.flush_pending_notifies(conn_id);
+        if let Some(conn_id) = conn_id {
+            self.flush_pending_notifies(conn_id);
+        }
 
         Ok(vec![promote_response(Response::TransactionEnd(
             Tag::new("COMMIT").with_rows(affected),
@@ -12300,36 +12437,8 @@ impl GatewayHandler {
         let Some(shard_db) = &self.shard_db else {
             return Ok(rows.len()); // no storage — pretend success
         };
-        let _commit_guard = self.shard_commit_lock.lock().await;
-
-        let epoch = shard_db.try_next_epoch().ok_or_else(|| {
-            PgWireError::ApiError(Box::new(crate::error::GatewayError::CommitEpochExhausted))
-        })?;
-        let mut batch = rockstream_storage::WriteBatch::new();
-        for op in rows {
-            if let DmlOp::Insert {
-                table: op_table,
-                row_key,
-                values_tsv,
-                ..
-            } = op
-            {
-                let key = format!("view_output/{op_table}/{row_key}");
-                batch.put(key.as_bytes(), values_tsv.as_bytes());
-            }
-        }
-        // Advance shard frontier.
-        batch.put(
-            &rockstream_storage::ShardKeyEncoder::frontier_key(),
-            &epoch.to_be_bytes(),
-        );
-
-        shard_db
-            .write_batch(batch)
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
-        self.frontier_published_at_ms
-            .store(current_time_ms(), Ordering::SeqCst);
+        self.commit_local_ops(shard_db, rows.to_vec(), None, None)
+            .await?;
 
         // Audit: log the flush.
         if let Some(log) = &self.audit_log {
@@ -13478,6 +13587,7 @@ impl ExtendedQueryHandler for GatewayHandler {
             }
         }
 
+        self.ensure_local_view_consistency().await?;
         let query = portal.statement.statement.sql.as_str();
         let ql = query.trim().to_lowercase();
 
@@ -13538,6 +13648,7 @@ impl CopyHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.ensure_local_view_consistency().await?;
         let conn_id = client
             .metadata()
             .get("_rs_conn_id")
@@ -14257,7 +14368,10 @@ impl GatewayServer {
                 .map_err(std::io::Error::other)?;
         }
         self.handler.bind_server(&self.handler);
-        self.handler.recover_compiled_views().await;
+        self.handler
+            .recover_compiled_views()
+            .await
+            .map_err(std::io::Error::other)?;
         let factory = Arc::new(GatewayHandlerFactory {
             handler: self.handler.clone(),
         });
@@ -14445,7 +14559,10 @@ impl GatewayServer {
                 .map_err(std::io::Error::other)?;
         }
         self.handler.bind_server(&self.handler);
-        self.handler.recover_compiled_views().await;
+        self.handler
+            .recover_compiled_views()
+            .await
+            .map_err(std::io::Error::other)?;
         let factory = Arc::new(GatewayHandlerFactory {
             handler: self.handler.clone(),
         });

@@ -20,6 +20,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static ALLOW_LAW_OPERAND_FALLBACK: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "test-utils")]
+type TestPause =
+    Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
+#[cfg(feature = "test-utils")]
+type TestPrefixPause =
+    Arc<std::sync::Mutex<Option<(Vec<u8>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
+
 /// Max rows (groups) returned by a single shard's partial_query.
 /// Bound: MAX_PARTIAL_AGG_RESULT_ROWS; fill metric: partial_agg_result_rows gauge.
 pub const MAX_PARTIAL_AGG_RESULT_ROWS: usize = 1_000_000;
@@ -153,6 +160,7 @@ pub struct ShardDb {
     path: String,
     object_store: Arc<dyn ObjectStore>,
     last_epoch: Arc<std::sync::atomic::AtomicU64>,
+    allocated_epoch: Arc<std::sync::atomic::AtomicU64>,
     format_version: u8,
     migration_pending: bool,
     storage_context: Option<Arc<crate::storage_context::WorkerStorageContext>>,
@@ -160,6 +168,18 @@ pub struct ShardDb {
     disk_cache_dir: Option<std::path::PathBuf>,
     cleanup_on_drop: bool,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-utils")]
+    fail_view_output_once: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-utils")]
+    pause_view_output_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_after_view_write_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_flush_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_scan_page_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_after_put_prefix_once: TestPrefixPause,
     fail_flushes: Arc<std::sync::atomic::AtomicBool>,
     fail_scans: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -491,6 +511,7 @@ impl ShardDbBuilder {
             path: self.path,
             object_store: self.object_store,
             last_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
+            allocated_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
             format_version,
             migration_pending,
             storage_context: self.storage_context,
@@ -498,6 +519,18 @@ impl ShardDbBuilder {
             disk_cache_dir: self.disk_cache_dir,
             cleanup_on_drop: self.cleanup_on_drop,
             fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-utils")]
+            fail_view_output_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-utils")]
+            pause_view_output_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_after_view_write_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_flush_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_scan_page_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_after_put_prefix_once: Arc::new(std::sync::Mutex::new(None)),
             fail_flushes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_scans: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -646,17 +679,19 @@ impl ShardDb {
         Ok((results, false))
     }
 
-    /// Access the last epoch atomic (for epoch allocation in direct-write commits).
+    /// Access the last committed epoch.
     pub fn last_epoch(&self) -> &Arc<std::sync::atomic::AtomicU64> {
         &self.last_epoch
     }
 
     /// Allocate the next direct-write epoch without allowing atomic wraparound.
     pub fn try_next_epoch(&self) -> Option<u64> {
-        let mut current = self.last_epoch.load(Ordering::SeqCst);
+        let mut current = self.allocated_epoch.load(Ordering::SeqCst);
         loop {
-            let next = current.checked_add(1)?;
-            match self.last_epoch.compare_exchange_weak(
+            let next = current
+                .max(self.last_epoch.load(Ordering::SeqCst))
+                .checked_add(1)?;
+            match self.allocated_epoch.compare_exchange_weak(
                 current,
                 next,
                 Ordering::SeqCst,
@@ -700,6 +735,7 @@ impl ShardDb {
                         epoch >= old_epoch,
                         "M1-S2: committed_epoch read must be non-decreasing (got {epoch}, was {old_epoch})"
                     );
+                    self.allocated_epoch.fetch_max(epoch, Ordering::SeqCst);
                     self.last_epoch.store(epoch, Ordering::SeqCst);
                 }
             }
@@ -719,13 +755,17 @@ impl ShardDb {
                 new_epoch >= old_epoch,
                 "M1-S2: committed_epoch must be non-decreasing (got {new_epoch}, was {old_epoch})"
             );
-            self.last_epoch.store(new_epoch, Ordering::SeqCst);
         }
         self.db
             .put(self.physical_key(key), value)
             .await?
             .await_durable()
             .await?;
+        if key == ShardKeyEncoder::frontier_key() && value.len() == 8 {
+            let epoch = u64::from_be_bytes(value[..8].try_into().unwrap());
+            self.allocated_epoch.fetch_max(epoch, Ordering::SeqCst);
+            self.last_epoch.fetch_max(epoch, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -774,6 +814,36 @@ impl ShardDb {
     /// INVARIANT-BY-CONSTRUCTION: M1-S6 — point deletes and tombstones in atomic
     /// write batches prevent state resurrection without relying on range deletions.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        #[cfg(feature = "test-utils")]
+        let after_put_pause = {
+            let mut pause = self.pause_after_put_prefix_once.lock().unwrap();
+            if pause.as_ref().is_some_and(|(prefix, _, _)| {
+                batch
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, BatchOp::Put { key, .. } if key.starts_with(prefix)))
+            }) {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        #[cfg(feature = "test-utils")]
+        let has_view_output = batch.ops.iter().any(|op| matches!(op, BatchOp::Put { key, .. } if key.first() == Some(&crate::keys::ShardPrefix::ViewOutput.as_byte())));
+        #[cfg(feature = "test-utils")]
+        if has_view_output {
+            let pause = self.pause_view_output_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        #[cfg(feature = "test-utils")]
+        if has_view_output && self.fail_view_output_once.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::Unsupported(
+                "injected view output write failure".to_string(),
+            ));
+        }
         if self.migration_pending || self.fail_writes.load(Ordering::SeqCst) {
             return Err(if self.migration_pending {
                 StorageError::MigrationInProgress
@@ -782,6 +852,7 @@ impl ShardDb {
             });
         }
         let frontier_key = ShardKeyEncoder::frontier_key();
+        let mut written_frontier = None;
         for op in &batch.ops {
             if let BatchOp::Put { key, value } = op {
                 if key == &frontier_key && value.len() == 8 {
@@ -791,7 +862,7 @@ impl ShardDb {
                         new_epoch >= old_epoch,
                         "M1-S2: committed_epoch must be non-decreasing (got {new_epoch}, was {old_epoch})"
                     );
-                    self.last_epoch.store(new_epoch, Ordering::SeqCst);
+                    written_frontier = Some(new_epoch);
                 }
             }
         }
@@ -803,7 +874,25 @@ impl ShardDb {
                 BatchOp::Merge { key, value } => inner.merge(self.physical_key(&key), &value),
             }
         }
-        self.db.write(inner).await?.await_durable().await?;
+        let pending = self.db.write(inner).await?;
+        #[cfg(feature = "test-utils")]
+        if has_view_output {
+            let pause = self.pause_after_view_write_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        pending.await_durable().await?;
+        #[cfg(feature = "test-utils")]
+        if let Some((_, entered, release)) = after_put_pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if let Some(epoch) = written_frontier {
+            self.allocated_epoch.fetch_max(epoch, Ordering::SeqCst);
+            self.last_epoch.fetch_max(epoch, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -1097,6 +1186,11 @@ impl ShardDb {
         page_size: usize,
         max_buffer_bytes: usize,
     ) -> Result<ScanPage, StorageError> {
+        if self.fail_scans.load(Ordering::SeqCst) {
+            return Err(StorageError::Unsupported(
+                "injected storage scan failure".to_string(),
+            ));
+        }
         let strip_version_prefix = (self.format_version == 2 || self.format_version == 3)
             && prefix.first().copied() != Some(0x06);
         let physical_prefix = if strip_version_prefix {
@@ -1109,11 +1203,6 @@ impl ShardDb {
             prefix.to_vec()
         };
 
-        let mut iter = self.db.scan_prefix(&physical_prefix, ..).await?;
-        let mut rows = Vec::new();
-        let mut page_bytes = 0usize;
-        let mut is_last_page = true;
-
         let resume_after: Option<Vec<u8>> = continuation_token.map(|tok| {
             if strip_version_prefix {
                 if self.format_version == 3 {
@@ -1125,6 +1214,25 @@ impl ShardDb {
                 tok.to_vec()
             }
         });
+        let suffix = resume_after
+            .as_deref()
+            .and_then(|key| key.strip_prefix(physical_prefix.as_slice()));
+        let mut iter = if let Some(suffix) = suffix {
+            self.db
+                .scan_prefix(
+                    &physical_prefix,
+                    (
+                        std::ops::Bound::Excluded(suffix),
+                        std::ops::Bound::Unbounded,
+                    ),
+                )
+                .await?
+        } else {
+            self.db.scan_prefix(&physical_prefix, ..).await?
+        };
+        let mut rows = Vec::new();
+        let mut page_bytes = 0usize;
+        let mut is_last_page = true;
 
         while let Some(entry) = iter.next().await? {
             if let Some(ref resume) = resume_after {
@@ -1165,6 +1273,15 @@ impl ShardDb {
             None
         };
 
+        #[cfg(feature = "test-utils")]
+        {
+            let pause = self.pause_scan_page_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+
         Ok(ScanPage {
             rows,
             next_token,
@@ -1175,6 +1292,14 @@ impl ShardDb {
 
     /// Flush the WAL to durable storage.
     pub async fn flush(&self) -> Result<(), StorageError> {
+        #[cfg(feature = "test-utils")]
+        {
+            let pause = self.pause_flush_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
         if self.fail_flushes.load(Ordering::SeqCst) {
             return Err(StorageError::Unsupported(
                 "injected storage flush failure".to_string(),
@@ -1187,6 +1312,63 @@ impl ShardDb {
     /// Inject write failures for testing.
     pub fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::SeqCst);
+    }
+
+    /// Inject one view-output write failure for testing.
+    #[cfg(feature = "test-utils")]
+    pub fn fail_next_view_output_write(&self) {
+        self.fail_view_output_once.store(true, Ordering::SeqCst);
+    }
+
+    /// Pause the next view-output write for cancellation tests.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_view_output_write(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_view_output_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Pause the next flush for cancellation tests.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_flush(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_flush_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Pause the next paged scan for recovery tests.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_scan_page(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_scan_page_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Pause after the next durable put matching a prefix.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_after_next_put_with_prefix(
+        &self,
+        prefix: Vec<u8>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_after_put_prefix_once.lock().unwrap() = Some((prefix, entered, release));
+    }
+
+    /// Pause after the next view batch is accepted by storage.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_after_next_view_write(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_after_view_write_once.lock().unwrap() = Some((entered, release));
     }
 
     /// Inject prefix-scan failures for testing.

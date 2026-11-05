@@ -271,8 +271,12 @@ impl ViewSinkOp {
         self.db.write_batch(wb).await.map_err(OpError::storage)
     }
 
-    /// Convenience: write batch at the next auto-incremented epoch.
-    pub async fn write_next_epoch(&self, batch: &ArrowZSet) -> Result<Epoch, OpError> {
+    /// Append a batch at the next auto-incremented epoch to an atomic write.
+    pub async fn append_next_epoch(
+        &self,
+        target: &mut WriteBatch,
+        batch: &ArrowZSet,
+    ) -> Result<Epoch, OpError> {
         let persisted_next = match self
             .db
             .get(&view_output_epoch_key(self.op_id))
@@ -317,7 +321,22 @@ impl ViewSinkOp {
                 Err(actual) => current = actual,
             }
         };
-        self.write_epoch(batch, epoch).await?;
+        if !batch.is_empty() {
+            self.append_epoch(target, batch, epoch);
+        }
+        Ok(epoch)
+    }
+
+    /// Convenience: write batch at the next auto-incremented epoch.
+    pub async fn write_next_epoch(&self, batch: &ArrowZSet) -> Result<Epoch, OpError> {
+        let mut target = WriteBatch::new();
+        let epoch = self.append_next_epoch(&mut target, batch).await?;
+        if !target.is_empty() {
+            self.db
+                .write_batch(target)
+                .await
+                .map_err(OpError::storage)?;
+        }
         Ok(epoch)
     }
 }

@@ -243,6 +243,9 @@ struct SessionWindowState {
     partitions: HashMap<Vec<u8>, SessionPartitionState>,
     watermark: WatermarkState,
     input_frontier: Option<rockstream_types::frontier::FreshnessToken>,
+    deleted: HashMap<(i64, Vec<u8>), u64>,
+    appended_deletions: HashMap<(i64, Vec<u8>), u64>,
+    deletion_generation: u64,
 }
 
 impl SessionWindowState {
@@ -251,6 +254,9 @@ impl SessionWindowState {
             partitions: HashMap::new(),
             watermark: WatermarkState::new(),
             input_frontier: None,
+            deleted: HashMap::new(),
+            appended_deletions: HashMap::new(),
+            deletion_generation: 0,
         }
     }
 
@@ -262,7 +268,14 @@ impl SessionWindowState {
     }
 
     fn state_bytes(&self) -> u64 {
-        let mut bytes = 0u64;
+        let mut bytes = self
+            .deleted
+            .keys()
+            .chain(self.appended_deletions.keys())
+            .map(|(_, key)| {
+                (key.len() + std::mem::size_of::<i64>() + std::mem::size_of::<u64>()) as u64
+            })
+            .sum();
         for (pk, ppart) in &self.partitions {
             bytes += pk.len() as u64;
             for (gk, (vals, _)) in &ppart.rows {
@@ -361,9 +374,11 @@ impl TumbleWindowOp {
         let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
         let prefix_len = prefix.len();
         let wm_key = ShardKeyEncoder::watermark_key(oid);
-        let wm_bytes = db.get(&wm_key).await.ok().flatten();
+        let wm_bytes = db.get(&wm_key).await.map_err(OpError::storage)?;
+        let input_frontier = load_input_frontier(db, op_id).await?;
 
-        let mut st = self.state.lock().unwrap();
+        let mut st = TumbleWindowState::new();
+        st.input_frontier = input_frontier;
         for (key, value) in entries {
             if let Some((row_vals, weight)) = decode_tumble_window_value(&value, self.n_input_cols)
             {
@@ -397,7 +412,11 @@ impl TumbleWindowOp {
         // window is finalized iff the watermark has already passed its
         // close boundary — both are fully derivable from the just-loaded
         // `windows`/`watermark_ms`, so nothing needs its own persisted copy.
-        let watermark_ms = st.watermark.watermark_ms;
+        let watermark_ms = st
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(st.watermark.watermark_ms);
         let window_size_ms = self.window_size_ms;
         let window_ids: Vec<i64> = st.windows.keys().copied().collect();
         for window_id in window_ids {
@@ -417,7 +436,7 @@ impl TumbleWindowOp {
             }
         }
         let total = st.total_rows();
-        drop(st);
+        *self.state.lock().unwrap() = st;
         self.fill_level.store(total, Ordering::Relaxed);
         Ok(())
     }
@@ -704,6 +723,59 @@ impl HopWindowOp {
         self.state.lock().unwrap().state_bytes()
     }
 
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        let prefix = ShardKeyEncoder::tumble_window_op_prefix(op_id.0);
+        let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+        let watermark = db
+            .get(&ShardKeyEncoder::watermark_key(op_id.0))
+            .await
+            .map_err(OpError::storage)?;
+        let mut state = HopWindowState::new();
+        state.input_frontier = load_input_frontier(db, op_id).await?;
+        for (key, value) in entries {
+            if let Some((row, weight)) = decode_window_value(&value, self.n_input_cols) {
+                if key.len() < prefix.len() + 8 {
+                    continue;
+                }
+                let window =
+                    i64::from_be_bytes(key[prefix.len()..prefix.len() + 8].try_into().unwrap());
+                state
+                    .windows
+                    .entry(window)
+                    .or_default()
+                    .insert(key[prefix.len() + 8..].to_vec(), (row, weight));
+            }
+        }
+        if let Some(bytes) = watermark {
+            if bytes.len() >= 8 {
+                state.watermark = WatermarkState {
+                    watermark_ms: i64::from_be_bytes(bytes[..8].try_into().unwrap()),
+                };
+            }
+        }
+        let watermark = state
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(state.watermark.watermark_ms);
+        for (&window, rows) in &state.windows {
+            state.prev_output.insert(
+                window,
+                rows.iter()
+                    .filter(|(_, (_, weight))| *weight > 0)
+                    .map(|(key, (values, _))| (key.clone(), values.clone()))
+                    .collect(),
+            );
+            if watermark > window + self.window_size_ms {
+                state.finalized.insert(window);
+            }
+        }
+        let total = state.total_rows();
+        *self.state.lock().unwrap() = state;
+        self.fill_level.store(total, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn process_epoch(&self, delta: ArrowZSet, _epoch: u64) -> Result<ArrowZSet, OpError> {
         if delta.is_empty() && delta.frontier.is_none() {
             return Ok(ArrowZSet::empty(self.schema.clone()));
@@ -942,6 +1014,15 @@ impl SessionWindowOp {
         self.state.lock().unwrap().state_bytes()
     }
 
+    pub(crate) fn ack_persisted_state(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (key, generation) in std::mem::take(&mut state.appended_deletions) {
+            if state.deleted.get(&key) == Some(&generation) {
+                state.deleted.remove(&key);
+            }
+        }
+    }
+
     /// Load persisted state from `db` into this already-constructed
     /// instance in place — see `TumbleWindowOp::restore_in_place` for why.
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
@@ -949,9 +1030,11 @@ impl SessionWindowOp {
         let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
         let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
         let wm_key = ShardKeyEncoder::watermark_key(oid);
-        let wm_bytes = db.get(&wm_key).await.ok().flatten();
+        let wm_bytes = db.get(&wm_key).await.map_err(OpError::storage)?;
+        let input_frontier = load_input_frontier(db, op_id).await?;
 
-        let mut st = self.state.lock().unwrap();
+        let mut st = SessionWindowState::new();
+        st.input_frontier = input_frontier;
         for (_key, value) in entries {
             if let Some((row_vals, weight)) = decode_window_value(&value, self.n_input_cols) {
                 let partition_key = encode_partition_key(&row_vals, self.time_col);
@@ -989,7 +1072,7 @@ impl SessionWindowOp {
             }
         }
         let total = st.total_sessions();
-        drop(st);
+        *self.state.lock().unwrap() = st;
         self.fill_level.store(total, Ordering::Relaxed);
         Ok(())
     }
@@ -1057,6 +1140,9 @@ impl SessionWindowOp {
             entry.1 += weight;
             if entry.1 == 0 {
                 partition.rows.remove(&row_key);
+                next.deletion_generation = next.deletion_generation.wrapping_add(1);
+                next.deleted
+                    .insert((event_time_ms, row_key), next.deletion_generation);
             }
             dirty_partitions.insert(partition_key);
         }
@@ -1356,6 +1442,38 @@ fn encode_tumble_window_value(row_vals: &[Option<i64>], weight: i64) -> Vec<u8> 
     bytes
 }
 
+fn input_frontier_key(op_id: OperatorId) -> Vec<u8> {
+    let mut key = ShardKeyEncoder::watermark_key(op_id.0);
+    key.extend_from_slice(b"IF1");
+    key
+}
+
+fn append_input_frontier(
+    batch: &mut WriteBatch,
+    op_id: OperatorId,
+    frontier: &Option<rockstream_types::frontier::FreshnessToken>,
+) -> Result<(), OpError> {
+    let key = input_frontier_key(op_id);
+    if let Some(frontier) = frontier {
+        let value = serde_json::to_vec(frontier).map_err(|e| OpError::internal(e.to_string()))?;
+        batch.put(&key, &value);
+    } else {
+        batch.delete(&key);
+    }
+    Ok(())
+}
+
+async fn load_input_frontier(
+    db: &ShardDb,
+    op_id: OperatorId,
+) -> Result<Option<rockstream_types::frontier::FreshnessToken>, OpError> {
+    db.get(&input_frontier_key(op_id))
+        .await
+        .map_err(OpError::storage)?
+        .map(|value| serde_json::from_slice(&value).map_err(|e| OpError::internal(e.to_string())))
+        .transpose()
+}
+
 fn decode_tumble_window_value(
     bytes: &[u8],
     n_input_cols: usize,
@@ -1402,6 +1520,7 @@ pub fn append_tumble_window_state(
         // Write watermark.
         let wm_key = ShardKeyEncoder::watermark_key(oid);
         batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
+        append_input_frontier(&mut batch, op_id, &state.input_frontier)?;
         batch
     };
 
@@ -1452,6 +1571,7 @@ pub fn append_hop_window_state(
         }
         let wm_key = ShardKeyEncoder::watermark_key(oid);
         batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
+        append_input_frontier(&mut batch, op_id, &state.input_frontier)?;
         batch
     };
 
@@ -1486,40 +1606,7 @@ pub async fn load_hop_window_state(
         slide_ms,
         late_data_policy,
     );
-    let n_input_cols = op.n_input_cols;
-    let oid = op_id.0;
-    let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
-    let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
-    let prefix_len = prefix.len();
-    let wm_key = ShardKeyEncoder::watermark_key(oid);
-    let wm_bytes = db.get(&wm_key).await.ok().flatten();
-
-    let mut st = op.state.lock().unwrap();
-    for (key, value) in entries {
-        if let Some((row_vals, weight)) = decode_window_value(&value, n_input_cols) {
-            if key.len() < prefix_len + 8 {
-                continue;
-            }
-            let window_id =
-                i64::from_be_bytes(key[prefix_len..prefix_len + 8].try_into().unwrap_or([0; 8]));
-            let group_key = key[prefix_len + 8..].to_vec();
-            st.windows
-                .entry(window_id)
-                .or_default()
-                .insert(group_key, (row_vals, weight));
-        }
-    }
-
-    if let Some(bytes) = wm_bytes {
-        if bytes.len() >= 8 {
-            let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
-            st.watermark = WatermarkState { watermark_ms: wm };
-        }
-    }
-
-    let total = st.total_rows();
-    drop(st);
-    op.fill_level.store(total, Ordering::Relaxed);
+    op.restore_in_place(db, op_id).await?;
     Ok(op)
 }
 
@@ -1530,9 +1617,17 @@ pub fn append_session_window_state(
     target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
-        let state = op.state.lock().unwrap();
+        let mut state = op.state.lock().unwrap();
         let mut batch = WriteBatch::new();
         let oid = op_id.0;
+        state.appended_deletions = state.deleted.clone();
+        for (event_time, row_key) in state.deleted.keys() {
+            batch.delete(&ShardKeyEncoder::tumble_window_key(
+                oid,
+                *event_time,
+                row_key,
+            ));
+        }
         for partition in state.partitions.values() {
             for (row_key, (row_vals, weight)) in &partition.rows {
                 let event_time_ms = row_vals.get(op.time_col).copied().unwrap_or(0);
@@ -1543,6 +1638,7 @@ pub fn append_session_window_state(
         }
         let wm_key = ShardKeyEncoder::watermark_key(oid);
         batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
+        append_input_frontier(&mut batch, op_id, &state.input_frontier)?;
         batch
     };
     target.merge_from(batch);
@@ -1556,7 +1652,9 @@ pub async fn persist_session_window_state(
 ) -> Result<(), OpError> {
     let mut batch = WriteBatch::new();
     append_session_window_state(op, op_id, &mut batch)?;
-    db.write_batch(batch).await.map_err(OpError::storage)
+    db.write_batch(batch).await.map_err(OpError::storage)?;
+    op.ack_persisted_state();
+    Ok(())
 }
 
 /// Load SessionWindowOp state from a ShardDb using the shared TW keyspace.
@@ -1569,53 +1667,7 @@ pub async fn load_session_window_state(
     op_id: OperatorId,
 ) -> Result<SessionWindowOp, OpError> {
     let op = SessionWindowOp::new(input_schema, time_col, gap_ms, late_data_policy);
-    let n_input_cols = op.n_input_cols;
-    let oid = op_id.0;
-    let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
-    let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
-    let wm_key = ShardKeyEncoder::watermark_key(oid);
-    let wm_bytes = db.get(&wm_key).await.ok().flatten();
-
-    let mut st = op.state.lock().unwrap();
-    for (_key, value) in entries {
-        if let Some((row_vals, weight)) = decode_window_value(&value, n_input_cols) {
-            let partition_key = encode_partition_key(&row_vals, time_col);
-            let row_key = encode_row(&row_vals);
-            st.partitions
-                .entry(partition_key)
-                .or_default()
-                .rows
-                .insert(row_key, (row_vals, weight));
-        }
-    }
-    if let Some(bytes) = wm_bytes {
-        if bytes.len() >= 8 {
-            let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
-            st.watermark = WatermarkState { watermark_ms: wm };
-        }
-    }
-    for partition in st.partitions.values_mut() {
-        let live_rows = partition
-            .rows
-            .values()
-            .filter(|(_, weight)| *weight > 0)
-            .map(|(vals, _)| vals.clone())
-            .collect::<Vec<_>>();
-        let sessions = derive_sessions(&live_rows, time_col, gap_ms);
-        partition.live_session_count = sessions
-            .iter()
-            .map(|(start, end, _)| (*start, *end))
-            .collect::<HashSet<_>>()
-            .len();
-        for (session_start, session_end, row_vals) in sessions {
-            let mut tagged = vec![session_start, session_end];
-            tagged.extend_from_slice(&row_vals);
-            partition.prev_output.insert(encode_row(&row_vals), tagged);
-        }
-    }
-    let total = st.total_sessions();
-    drop(st);
-    op.fill_level.store(total, Ordering::Relaxed);
+    op.restore_in_place(db, op_id).await?;
     Ok(op)
 }
 

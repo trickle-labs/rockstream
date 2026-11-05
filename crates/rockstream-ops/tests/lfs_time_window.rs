@@ -20,6 +20,7 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
+use rockstream_ops::op::Operator;
 use rockstream_ops::time_window::{
     load_hop_window_state, load_session_window_state, load_tumble_window_state,
     persist_hop_window_state, persist_session_window_state, persist_tumble_window_state,
@@ -142,6 +143,181 @@ fn live_session_rows(
         .collect();
     rows.sort();
     rows
+}
+
+#[tokio::test]
+async fn window_restore_discards_uncommitted_rows() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let tumble = TumbleWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+    let tumble_id = OperatorId(481);
+    tumble
+        .process_epoch(make_input(&[(100, 10, 1)]), 1)
+        .unwrap();
+    persist_tumble_window_state(&db, &tumble, tumble_id)
+        .await
+        .unwrap();
+    tumble
+        .process_epoch(make_input(&[(200, 20, 1)]), 2)
+        .unwrap();
+    tumble.restore_in_place(&db, tumble_id).await.unwrap();
+    let output = tumble
+        .process_epoch(make_input(&[(200, 20, 1)]), 3)
+        .unwrap();
+    let mut rows = std::collections::HashMap::new();
+    accumulate(&mut rows, &output);
+    assert_eq!(rows, std::collections::HashMap::from([((0, 200, 20), 1)]));
+
+    let session = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+    let session_id = OperatorId(482);
+    session
+        .process_epoch(make_input(&[(100, 10, 1)]), 1)
+        .unwrap();
+    persist_session_window_state(&db, &session, session_id)
+        .await
+        .unwrap();
+    session
+        .process_epoch(make_input(&[(200, 20, 1)]), 2)
+        .unwrap();
+    db.set_fail_scans(true);
+    assert!(session.restore_in_place(&db, session_id).await.is_err());
+    db.set_fail_scans(false);
+    let unchanged = session
+        .process_epoch(make_input(&[(200, 20, 1)]), 3)
+        .unwrap();
+    assert_eq!(unchanged.weights, Vec::<i64>::new());
+    session.restore_in_place(&db, session_id).await.unwrap();
+    let output = session
+        .process_epoch(make_input(&[(200, 20, 1)]), 4)
+        .unwrap();
+    let mut rows = std::collections::HashMap::new();
+    accumulate_session(&mut rows, &output);
+    assert_eq!(
+        rows,
+        std::collections::HashMap::from([((200, 200, 200, 20), 1)])
+    );
+}
+
+#[tokio::test]
+async fn session_checkpoint_does_not_resurrect_deleted_rows() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(483);
+    let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+    op.process_epoch(make_input(&[(100, 10, 1)]), 1).unwrap();
+    persist_session_window_state(&db, &op, id).await.unwrap();
+    op.process_epoch(make_input(&[(100, 10, -1)]), 2).unwrap();
+    db.set_fail_writes(true);
+    assert!(persist_session_window_state(&db, &op, id).await.is_err());
+    db.set_fail_writes(false);
+    persist_session_window_state(&db, &op, id).await.unwrap();
+    let recovered =
+        load_session_window_state(&db, input_schema(), 0, 1000, LateDataPolicy::Drop, id)
+            .await
+            .unwrap();
+    let output = recovered
+        .process_epoch(make_input(&[(100, 10, 1)]), 3)
+        .unwrap();
+    let mut rows = std::collections::HashMap::new();
+    accumulate_session(&mut rows, &output);
+    assert_eq!(
+        rows,
+        std::collections::HashMap::from([((100, 100, 100, 10), 1)])
+    );
+}
+
+#[tokio::test]
+async fn window_restore_preserves_checkpointed_input_frontier() {
+    use rockstream_types::frontier::{FreshnessToken, SourceProgress};
+    use rockstream_types::ids::SourceId;
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let frontier = FreshnessToken::new(
+        std::collections::BTreeMap::from([(SourceId(7), SourceProgress::new(12, Some(150)))]),
+        42,
+    );
+    let tumble = TumbleWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+    tumble.push_input_frontier(frontier.clone()).unwrap();
+    persist_tumble_window_state(&db, &tumble, OperatorId(485))
+        .await
+        .unwrap();
+    tumble
+        .push_input_frontier(FreshnessToken::new(Default::default(), 99))
+        .unwrap();
+    tumble.restore_in_place(&db, OperatorId(485)).await.unwrap();
+    assert_eq!(tumble.input_frontier(), Some(frontier.clone()));
+
+    let session = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+    session.push_input_frontier(frontier.clone()).unwrap();
+    persist_session_window_state(&db, &session, OperatorId(486))
+        .await
+        .unwrap();
+    session
+        .push_input_frontier(FreshnessToken::new(Default::default(), 99))
+        .unwrap();
+    session
+        .restore_in_place(&db, OperatorId(486))
+        .await
+        .unwrap();
+    assert_eq!(session.input_frontier(), Some(frontier.clone()));
+    let reopened = load_session_window_state(
+        &db,
+        input_schema(),
+        0,
+        1000,
+        LateDataPolicy::Drop,
+        OperatorId(486),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.input_frontier(), Some(frontier.clone()));
+    let mut key = ShardKeyEncoder::watermark_key(486);
+    key.extend_from_slice(b"IF1");
+    db.put(&key, b"invalid").await.unwrap();
+    assert!(session
+        .restore_in_place(&db, OperatorId(486))
+        .await
+        .is_err());
+    assert_eq!(session.input_frontier(), Some(frontier));
+}
+
+#[tokio::test]
+async fn session_ack_preserves_deletions_after_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(484);
+    let op = Arc::new(SessionWindowOp::new(
+        input_schema(),
+        0,
+        1000,
+        LateDataPolicy::Drop,
+    ));
+    let pipeline = rockstream_ops::live_exec::StatefulPipeline::new().push(
+        rockstream_ops::live_exec::Stage::SessionWindow(op.clone(), id),
+    );
+    pipeline.process(make_input(&[(100, 10, 1)])).unwrap();
+    let mut snapshot = WriteBatch::new();
+    pipeline.append_state(&db, &mut snapshot).await.unwrap();
+    pipeline.process(make_input(&[(100, 10, -1)])).unwrap();
+    assert_eq!(op.state_bytes(), 40);
+    db.write_batch(snapshot).await.unwrap();
+    pipeline.ack_persisted_state();
+    assert_eq!(op.state_bytes(), 40);
+    persist_session_window_state(&db, &op, id).await.unwrap();
+    assert_eq!(op.state_bytes(), 8);
+    let recovered =
+        load_session_window_state(&db, input_schema(), 0, 1000, LateDataPolicy::Drop, id)
+            .await
+            .unwrap();
+    let output = recovered
+        .process_epoch(make_input(&[(100, 10, 1)]), 3)
+        .unwrap();
+    let mut rows = std::collections::HashMap::new();
+    accumulate_session(&mut rows, &output);
+    assert_eq!(
+        rows,
+        std::collections::HashMap::from([((100, 100, 100, 10), 1)])
+    );
 }
 
 async fn open_shard(dir: &TempDir) -> Arc<ShardDb> {
@@ -439,6 +615,53 @@ async fn hop_window_state_persists_across_restart() {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn hop_recovery_emits_only_new_rows() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(487);
+    let op = HopWindowOp::new(input_schema(), 0, 1000, 500, LateDataPolicy::Drop);
+    let frontier = rockstream_types::frontier::FreshnessToken::new(
+        std::collections::BTreeMap::from([(
+            rockstream_types::ids::SourceId(7),
+            rockstream_types::frontier::SourceProgress::new(12, Some(0)),
+        )]),
+        42,
+    );
+    op.push_input_frontier(frontier.clone()).unwrap();
+    op.process_epoch(make_input(&[(100, 10, 1)]), 1).unwrap();
+    persist_hop_window_state(&db, &op, id).await.unwrap();
+    op.process_epoch(make_input(&[(200, 20, 1)]), 2).unwrap();
+    op.push_input_frontier(rockstream_types::frontier::FreshnessToken::new(
+        Default::default(),
+        99,
+    ))
+    .unwrap();
+    op.restore_in_place(&db, id).await.unwrap();
+    assert_eq!(op.input_frontier(), Some(frontier.clone()));
+    let output = op.process_epoch(make_input(&[(200, 20, 1)]), 3).unwrap();
+    let mut rows = std::collections::HashMap::new();
+    accumulate(&mut rows, &output);
+    assert_eq!(
+        rows,
+        std::collections::HashMap::from([((-500, 200, 20), 1), ((0, 200, 20), 1)])
+    );
+    let recovered =
+        load_hop_window_state(&db, input_schema(), 0, 1000, 500, LateDataPolicy::Drop, id)
+            .await
+            .unwrap();
+    assert_eq!(recovered.input_frontier(), Some(frontier));
+    let output = recovered
+        .process_epoch(make_input(&[(200, 20, 1)]), 2)
+        .unwrap();
+    let mut rows = std::collections::HashMap::new();
+    accumulate(&mut rows, &output);
+    assert_eq!(
+        rows,
+        std::collections::HashMap::from([((-500, 200, 20), 1), ((0, 200, 20), 1)])
+    );
 }
 
 #[tokio::test]

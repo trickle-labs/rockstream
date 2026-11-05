@@ -112,11 +112,13 @@ const UTF8_PACKER_PREFIX: &[u8] = &[0x01, 0x55, 0x50];
 
 fn append_utf8_packer_state(
     dirty: &Mutex<Vec<(String, i64)>>,
+    appended: &Mutex<usize>,
     op_id: OperatorId,
     target: &mut WriteBatch,
 ) {
-    let mut dirty = dirty.lock().unwrap();
-    for (value, surrogate) in dirty.drain(..) {
+    let dirty = dirty.lock().unwrap();
+    *appended.lock().unwrap() = dirty.len();
+    for (value, surrogate) in dirty.iter() {
         let mut key = Vec::with_capacity(UTF8_PACKER_PREFIX.len() + 8 + value.len());
         key.extend_from_slice(UTF8_PACKER_PREFIX);
         key.extend_from_slice(&op_id.0.to_be_bytes());
@@ -131,29 +133,43 @@ async fn restore_utf8_packer_state(
     forward: &Mutex<HashMap<String, i64>>,
     reverse: &Mutex<HashMap<i64, String>>,
     next_id: &Mutex<i64>,
+    dirty: &Mutex<Vec<(String, i64)>>,
 ) -> Result<(), OpError> {
     let mut prefix = Vec::with_capacity(UTF8_PACKER_PREFIX.len() + 8);
     prefix.extend_from_slice(UTF8_PACKER_PREFIX);
     prefix.extend_from_slice(&op_id.0.to_be_bytes());
     let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
-    let mut forward = forward.lock().unwrap();
-    let mut reverse = reverse.lock().unwrap();
-    let mut max_id = -1;
+    let mut restored_forward = HashMap::new();
+    let mut restored_reverse = HashMap::new();
+    let mut max_id: i64 = -1;
     for (key, value) in entries {
         if value.len() != 8 {
-            continue;
+            return Err(OpError::storage_error("corrupt utf8 packer record"));
         }
-        let Ok(text) = std::str::from_utf8(&key[prefix.len()..]) else {
-            continue;
-        };
+        let text = std::str::from_utf8(&key[prefix.len()..])
+            .map_err(|_| OpError::storage_error("corrupt utf8 packer key"))?;
         let mut raw = [0; 8];
         raw.copy_from_slice(&value);
         let surrogate = i64::from_be_bytes(raw);
-        forward.insert(text.to_string(), surrogate);
-        reverse.insert(surrogate, text.to_string());
+        if surrogate < 0
+            || restored_reverse
+                .insert(surrogate, text.to_string())
+                .is_some()
+        {
+            return Err(OpError::storage_error(
+                "duplicate or invalid utf8 packer surrogate",
+            ));
+        }
+        restored_forward.insert(text.to_string(), surrogate);
         max_id = max_id.max(surrogate);
     }
-    *next_id.lock().unwrap() = max_id + 1;
+    let next = max_id
+        .checked_add(1)
+        .ok_or_else(|| OpError::storage_error("utf8 packer surrogate exhausted"))?;
+    *forward.lock().unwrap() = restored_forward;
+    *reverse.lock().unwrap() = restored_reverse;
+    *next_id.lock().unwrap() = next;
+    dirty.lock().unwrap().clear();
     Ok(())
 }
 
@@ -354,10 +370,7 @@ impl Stage {
             Stage::TopK(op, id) => {
                 crate::topk::append_topk_state_with_db(op, *id, target, Some(db))
             }
-            Stage::KeyPack(packer, id) => {
-                packer.append_state(*id, target);
-                Ok(())
-            }
+            Stage::KeyPack(packer, id) => packer.append_state(*id, target),
             Stage::KeyUnpack(_, _)
             | Stage::Utf8KeyUnpack(_, _)
             | Stage::Utf8ColumnUnpack(_, _, _) => Ok(()),
@@ -376,6 +389,12 @@ impl Stage {
     fn ack_persisted_state(&self) {
         match self {
             Stage::Aggregate(op) => op.clear_dirty_keys(),
+            Stage::Distinct(op, _) => op.ack_persisted_state(),
+            Stage::SessionWindow(op, _) => op.ack_persisted_state(),
+            Stage::Window(op, _) => op.ack_persisted_state(),
+            Stage::KeyPack(op, _) => op.ack_persisted_state(),
+            Stage::Utf8KeyPack(op, _) => op.ack_persisted_state(),
+            Stage::Utf8ColumnPack(op, _, _) => op.ack_persisted_state(),
             Stage::MultiAggregate(op) => op.ack_persisted_state(),
             _ => {}
         }
@@ -386,18 +405,15 @@ impl Stage {
     /// `GatewayHandler::recover_compiled_views` after a process restart —
     /// see `AggregateOp::restore_in_place` for why an in-place load is
     /// needed instead of just calling the existing `load_from_storage`
-    /// constructors). Covers exactly the operator families the v0.51.4
-    /// Durability Slices require (Aggregate, TumbleWindow, SessionWindow;
-    /// Join is restored separately by `JoinPipeline::restore`, keyed off
-    /// `JoinKind`, not `Stage`). `HopWindow`/`Window`/`TopK`/`Distinct`/
-    /// `MultiAggregate` are out of this restore path's scope for now (not
-    /// named by the Durability Slices plan) and remain a no-op here, same
-    /// as the composite-key packers below.
+    /// constructors). Join is restored separately by `JoinPipeline::restore`.
     async fn restore(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
             Stage::Aggregate(op) => op.restore_in_place(db).await,
+            Stage::Distinct(op, id) => op.restore_in_place(db, *id).await,
             Stage::TumbleWindow(op, id) => op.restore_in_place(db, *id).await,
+            Stage::HopWindow(op, id) => op.restore_in_place(db, *id).await,
             Stage::SessionWindow(op, id) => op.restore_in_place(db, *id).await,
+            Stage::Window(op, id) => op.restore_in_place(db, *id).await,
             // Same pairing note as `Stage::persist`'s `KeyPack` arm — the
             // `KeyUnpack` stage shares the same `Arc<GroupKeyPacker>`, so
             // restoring once via `KeyPack`'s id is sufficient.
@@ -406,6 +422,7 @@ impl Stage {
             Stage::Utf8ColumnPack(packer, _, id) => packer.restore_in_place(db, *id).await,
             Stage::MinMax(op, _) => op.restore_in_place(db).await,
             Stage::MultiAggregate(op) => Box::pin(op.restore_in_place(db)).await,
+            Stage::TopK(op, id) => op.restore_in_place(db, *id).await,
             _ => Ok(()),
         }
     }
@@ -429,22 +446,30 @@ impl Stage {
 /// hash — no collision risk regardless of the key columns' value domain).
 pub struct GroupKeyPacker {
     n_key_cols: usize,
+    key_types: Vec<Option<DataType>>,
     forward: Mutex<HashMap<Vec<u8>, i64>>,
     reverse: Mutex<HashMap<i64, Vec<i64>>>,
     reverse_slices: Mutex<HashMap<i64, Vec<ArrayRef>>>,
     next_id: Mutex<i64>,
     dirty: Mutex<Vec<(Vec<u8>, i64)>>,
+    appended: Mutex<usize>,
 }
 
 impl GroupKeyPacker {
     pub fn new(n_key_cols: usize) -> Self {
+        Self::new_with_key_types(vec![Some(DataType::Int64); n_key_cols])
+    }
+
+    pub(crate) fn new_with_key_types(key_types: Vec<Option<DataType>>) -> Self {
         GroupKeyPacker {
-            n_key_cols,
+            n_key_cols: key_types.len(),
+            key_types,
             forward: Mutex::new(HashMap::new()),
             reverse: Mutex::new(HashMap::new()),
             reverse_slices: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
             dirty: Mutex::new(Vec::new()),
+            appended: Mutex::new(0),
         }
     }
 
@@ -505,23 +530,62 @@ impl GroupKeyPacker {
     /// output rows instead of merging into the pre-restart group/session).
     pub async fn persist(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
         let mut batch = WriteBatch::new();
-        self.append_state(op_id, &mut batch);
+        self.append_state(op_id, &mut batch)?;
         if batch.is_empty() {
             return Ok(());
         }
-        db.write_batch(batch).await.map_err(OpError::storage)
+        db.write_batch(batch).await.map_err(OpError::storage)?;
+        self.ack_persisted_state();
+        Ok(())
     }
 
     /// Add dirty surrogate-key intern entries to a caller-owned M3 write.
-    pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
-        let mut dirty = self.dirty.lock().unwrap();
-        for (encoded_key, surrogate) in dirty.drain(..) {
+    pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) -> Result<(), OpError> {
+        let dirty = self.dirty.lock().unwrap().clone();
+        *self.appended.lock().unwrap() = dirty.len();
+        let reverse = self.reverse.lock().unwrap();
+        let slices = self.reverse_slices.lock().unwrap();
+        for (encoded_key, surrogate) in &dirty {
             let mut key = Vec::with_capacity(3 + 8 + encoded_key.len());
             key.extend_from_slice(GROUP_KEY_PACKER_PREFIX);
             key.extend_from_slice(&op_id.0.to_be_bytes());
-            key.extend_from_slice(&encoded_key);
-            target.put(&key, &surrogate.to_be_bytes());
+            key.extend_from_slice(encoded_key);
+            let arrays = slices
+                .get(surrogate)
+                .cloned()
+                .or_else(|| {
+                    reverse.get(surrogate).map(|vals| {
+                        vals.iter()
+                            .map(|v| Arc::new(Int64Array::from(vec![*v])) as ArrayRef)
+                            .collect()
+                    })
+                })
+                .ok_or_else(|| OpError::storage_error("missing group key values"))?;
+            let fields: Vec<_> = arrays
+                .iter()
+                .enumerate()
+                .map(|(i, a)| Field::new(format!("k{i}"), a.data_type().clone(), true))
+                .collect();
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                .map_err(OpError::arrow)?;
+            let mut value = surrogate.to_be_bytes().to_vec();
+            {
+                let mut writer =
+                    arrow::ipc::writer::StreamWriter::try_new(&mut value, &batch.schema())
+                        .map_err(OpError::arrow)?;
+                writer.write(&batch).map_err(OpError::arrow)?;
+                writer.finish().map_err(OpError::arrow)?;
+            }
+            target.put(&key, &value);
         }
+        Ok(())
+    }
+
+    fn ack_persisted_state(&self) {
+        let mut dirty = self.dirty.lock().unwrap();
+        let count = std::mem::take(&mut *self.appended.lock().unwrap());
+        let count = count.min(dirty.len());
+        dirty.drain(..count);
     }
 
     /// Load the persisted surrogate-key intern table from `db` into this
@@ -532,39 +596,189 @@ impl GroupKeyPacker {
         prefix.extend_from_slice(&op_id.0.to_be_bytes());
         let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
         let n = self.n_key_cols;
-        let mut forward = self.forward.lock().unwrap();
-        let mut reverse = self.reverse.lock().unwrap();
+        let mut forward = HashMap::new();
+        let mut reverse = HashMap::new();
+        let mut reverse_slices = HashMap::new();
+        let old_forward = self.forward.lock().unwrap();
+        let old_slices = self.reverse_slices.lock().unwrap();
         let mut max_id: i64 = -1;
         for (key, value) in entries {
-            let encoded_len = key.len().saturating_sub(prefix.len());
-            if key.len() <= prefix.len() || value.len() < 8 || encoded_len != n * 9 {
-                continue;
+            if key.len() <= prefix.len() || value.len() < 8 {
+                return Err(OpError::storage_error("corrupt group key packer record"));
             }
             let encoded_key = key[prefix.len()..].to_vec();
-            let surrogate = i64::from_be_bytes(value[0..8].try_into().unwrap_or([0; 8]));
-            let mut key_vals = Vec::with_capacity(n);
-            let mut valid = true;
-            for i in 0..n {
-                let start = i * 9;
-                if encoded_key[start] != 1 {
-                    valid = false;
-                    break;
-                }
-                key_vals.push(i64::from_be_bytes(
-                    encoded_key[start + 1..start + 9]
-                        .try_into()
-                        .unwrap_or([0; 8]),
+            let surrogate = i64::from_be_bytes(value[..8].try_into().unwrap());
+            if surrogate < 0
+                || reverse.contains_key(&surrogate)
+                || reverse_slices.contains_key(&surrogate)
+            {
+                return Err(OpError::storage_error(
+                    "duplicate or invalid group key surrogate",
                 ));
             }
-            if !valid {
-                continue;
+            let slices = if value.len() > 8 {
+                let mut reader = arrow::ipc::reader::StreamReader::try_new(
+                    std::io::Cursor::new(&value[8..]),
+                    None,
+                )
+                .map_err(OpError::arrow)?;
+                let batch = reader
+                    .next()
+                    .ok_or_else(|| OpError::storage_error("missing group key batch"))?
+                    .map_err(OpError::arrow)?;
+                if batch.num_rows() != 1 || batch.num_columns() != n || reader.next().is_some() {
+                    return Err(OpError::storage_error("invalid group key batch"));
+                }
+                let mut encoded = Vec::new();
+                for col in batch.columns() {
+                    Self::encode_array_row_key(col.as_ref(), 0, &mut encoded);
+                }
+                if encoded != encoded_key {
+                    return Err(OpError::storage_error("group key checkpoint mismatch"));
+                }
+                Some(batch.columns().to_vec())
+            } else {
+                let cached = old_forward
+                    .get(&encoded_key)
+                    .and_then(|id| old_slices.get(id))
+                    .cloned();
+                Some(match cached {
+                    Some(slices) => slices,
+                    None => self.decode_legacy_key(&encoded_key)?,
+                })
+            };
+            if let Some(ref slices) = slices {
+                reverse_slices.insert(surrogate, slices.clone());
+            }
+            let mut key_vals = Vec::with_capacity(n);
+            if encoded_key.len() == n * 9 {
+                for i in 0..n {
+                    let start = i * 9;
+                    if encoded_key[start] != 1 {
+                        break;
+                    }
+                    key_vals.push(i64::from_be_bytes(
+                        encoded_key[start + 1..start + 9].try_into().unwrap(),
+                    ));
+                }
+            }
+            if key_vals.len() == n {
+                reverse.insert(surrogate, key_vals);
+            } else if slices.is_none() {
+                return Err(OpError::storage_error(
+                    "cannot restore untyped group key checkpoint",
+                ));
             }
             forward.insert(encoded_key, surrogate);
-            reverse.insert(surrogate, key_vals);
             max_id = max_id.max(surrogate);
         }
-        *self.next_id.lock().unwrap() = max_id + 1;
+        drop(old_slices);
+        drop(old_forward);
+        let next = max_id
+            .checked_add(1)
+            .ok_or_else(|| OpError::storage_error("group key surrogate exhausted"))?;
+        *self.forward.lock().unwrap() = forward;
+        *self.reverse.lock().unwrap() = reverse;
+        *self.reverse_slices.lock().unwrap() = reverse_slices;
+        *self.next_id.lock().unwrap() = next;
+        self.dirty.lock().unwrap().clear();
+        *self.appended.lock().unwrap() = 0;
         Ok(())
+    }
+
+    fn decode_legacy_key(&self, mut key: &[u8]) -> Result<Vec<ArrayRef>, OpError> {
+        use arrow::array::*;
+        use arrow::datatypes::TimeUnit;
+
+        fn take<const N: usize>(key: &mut &[u8]) -> Result<[u8; N], OpError> {
+            if key.len() < N {
+                return Err(OpError::storage_error("truncated group key checkpoint"));
+            }
+            let (head, tail) = key.split_at(N);
+            *key = tail;
+            Ok(head.try_into().unwrap())
+        }
+        macro_rules! number {
+            ($primitive:ty, $array:ty) => {
+                Arc::new(<$array>::from(vec![<$primitive>::from_be_bytes(take(
+                    &mut key,
+                )?)])) as ArrayRef
+            };
+        }
+        let mut arrays = Vec::with_capacity(self.key_types.len());
+        for data_type in &self.key_types {
+            let data_type = data_type
+                .as_ref()
+                .ok_or_else(|| OpError::storage_error("unknown legacy group key type"))?;
+            let valid = take::<1>(&mut key)?[0];
+            if valid == 0 {
+                arrays.push(new_null_array(data_type, 1));
+                continue;
+            }
+            if valid != 1 {
+                return Err(OpError::storage_error("invalid group key validity"));
+            }
+            let array: ArrayRef = match data_type {
+                DataType::Int64 => number!(i64, Int64Array),
+                DataType::Int32 => number!(i32, Int32Array),
+                DataType::Int16 => number!(i16, Int16Array),
+                DataType::Int8 => number!(i8, Int8Array),
+                DataType::UInt64 => number!(u64, UInt64Array),
+                DataType::UInt32 => number!(u32, UInt32Array),
+                DataType::UInt16 => number!(u16, UInt16Array),
+                DataType::UInt8 => number!(u8, UInt8Array),
+                DataType::Float64 => Arc::new(Float64Array::from(vec![f64::from_bits(
+                    u64::from_be_bytes(take(&mut key)?),
+                )])),
+                DataType::Float32 => Arc::new(Float32Array::from(vec![f32::from_bits(
+                    u32::from_be_bytes(take(&mut key)?),
+                )])),
+                DataType::Date32 => number!(i32, Date32Array),
+                DataType::Boolean => match take::<1>(&mut key)?[0] {
+                    0 => Arc::new(BooleanArray::from(vec![false])),
+                    1 => Arc::new(BooleanArray::from(vec![true])),
+                    _ => return Err(OpError::storage_error("invalid group key boolean")),
+                },
+                DataType::Utf8 => {
+                    let len = u32::from_be_bytes(take(&mut key)?) as usize;
+                    if key.len() < len {
+                        return Err(OpError::storage_error("truncated group key string"));
+                    }
+                    let (bytes, rest) = key.split_at(len);
+                    key = rest;
+                    let value = std::str::from_utf8(bytes)
+                        .map_err(|_| OpError::storage_error("invalid group key string"))?;
+                    Arc::new(StringArray::from(vec![value]))
+                }
+                DataType::Decimal128(precision, scale) => Arc::new(
+                    Decimal128Array::from(vec![i128::from_be_bytes(take(&mut key)?)])
+                        .with_precision_and_scale(*precision, *scale)
+                        .map_err(OpError::arrow)?,
+                ),
+                DataType::Timestamp(TimeUnit::Second, tz) => Arc::new(
+                    TimestampSecondArray::from(vec![i64::from_be_bytes(take(&mut key)?)])
+                        .with_timezone_opt(tz.clone()),
+                ),
+                DataType::Timestamp(TimeUnit::Millisecond, tz) => Arc::new(
+                    TimestampMillisecondArray::from(vec![i64::from_be_bytes(take(&mut key)?)])
+                        .with_timezone_opt(tz.clone()),
+                ),
+                DataType::Timestamp(TimeUnit::Microsecond, tz) => Arc::new(
+                    TimestampMicrosecondArray::from(vec![i64::from_be_bytes(take(&mut key)?)])
+                        .with_timezone_opt(tz.clone()),
+                ),
+                DataType::Timestamp(TimeUnit::Nanosecond, tz) => Arc::new(
+                    TimestampNanosecondArray::from(vec![i64::from_be_bytes(take(&mut key)?)])
+                        .with_timezone_opt(tz.clone()),
+                ),
+                _ => return Err(OpError::storage_error("unsupported legacy group key type")),
+            };
+            arrays.push(array);
+        }
+        if !key.is_empty() {
+            return Err(OpError::storage_error("trailing group key bytes"));
+        }
+        Ok(arrays)
     }
 
     #[allow(dead_code)]
@@ -803,6 +1017,7 @@ pub struct Utf8KeyPacker {
     reverse: Mutex<HashMap<i64, String>>,
     next_id: Mutex<i64>,
     dirty: Mutex<Vec<(String, i64)>>,
+    appended: Mutex<usize>,
 }
 
 impl Utf8KeyPacker {
@@ -812,6 +1027,7 @@ impl Utf8KeyPacker {
             reverse: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
             dirty: Mutex::new(Vec::new()),
+            appended: Mutex::new(0),
         }
     }
 
@@ -826,15 +1042,32 @@ impl Utf8KeyPacker {
         if batch.is_empty() {
             return Ok(());
         }
-        db.write_batch(batch).await.map_err(OpError::storage)
+        db.write_batch(batch).await.map_err(OpError::storage)?;
+        self.ack_persisted_state();
+        Ok(())
     }
 
     pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
-        append_utf8_packer_state(&self.dirty, op_id, target);
+        append_utf8_packer_state(&self.dirty, &self.appended, op_id, target);
+    }
+
+    fn ack_persisted_state(&self) {
+        let mut dirty = self.dirty.lock().unwrap();
+        let count = std::mem::take(&mut *self.appended.lock().unwrap());
+        let count = count.min(dirty.len());
+        dirty.drain(..count);
     }
 
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
-        restore_utf8_packer_state(db, op_id, &self.forward, &self.reverse, &self.next_id).await
+        restore_utf8_packer_state(
+            db,
+            op_id,
+            &self.forward,
+            &self.reverse,
+            &self.next_id,
+            &self.dirty,
+        )
+        .await
     }
 
     fn surrogate_for(&self, key: &str) -> i64 {
@@ -963,6 +1196,7 @@ pub struct Utf8ColumnPacker {
     reverse: Mutex<HashMap<i64, String>>,
     next_id: Mutex<i64>,
     dirty: Mutex<Vec<(String, i64)>>,
+    appended: Mutex<usize>,
 }
 
 impl Utf8ColumnPacker {
@@ -972,6 +1206,7 @@ impl Utf8ColumnPacker {
             reverse: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
             dirty: Mutex::new(Vec::new()),
+            appended: Mutex::new(0),
         }
     }
 
@@ -981,15 +1216,32 @@ impl Utf8ColumnPacker {
         if batch.is_empty() {
             return Ok(());
         }
-        db.write_batch(batch).await.map_err(OpError::storage)
+        db.write_batch(batch).await.map_err(OpError::storage)?;
+        self.ack_persisted_state();
+        Ok(())
     }
 
     pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
-        append_utf8_packer_state(&self.dirty, op_id, target);
+        append_utf8_packer_state(&self.dirty, &self.appended, op_id, target);
+    }
+
+    fn ack_persisted_state(&self) {
+        let mut dirty = self.dirty.lock().unwrap();
+        let count = std::mem::take(&mut *self.appended.lock().unwrap());
+        let count = count.min(dirty.len());
+        dirty.drain(..count);
     }
 
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
-        restore_utf8_packer_state(db, op_id, &self.forward, &self.reverse, &self.next_id).await
+        restore_utf8_packer_state(
+            db,
+            op_id,
+            &self.forward,
+            &self.reverse,
+            &self.next_id,
+            &self.dirty,
+        )
+        .await
     }
 
     fn surrogate_for(&self, key: &str) -> i64 {
@@ -1807,6 +2059,147 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(keys.values().as_ref(), &[2, 0]);
+    }
+
+    #[tokio::test]
+    async fn group_key_packer_restores_typed_and_null_keys() {
+        let (_dir, db) = make_db().await;
+        let op_id = OperatorId(44);
+        let keys: Vec<ArrayRef> = vec![
+            Arc::new(arrow::array::Int32Array::from(vec![Some(3), None])),
+            Arc::new(arrow::array::Float64Array::from(vec![1.5, -2.25])),
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Float64, false),
+                Field::new("v", DataType::Int64, false),
+            ])),
+            vec![
+                keys[0].clone(),
+                keys[1].clone(),
+                Arc::new(Int64Array::from(vec![1, 1])),
+            ],
+        )
+        .unwrap();
+        let original = GroupKeyPacker::new(2);
+        original.pack(ArrowZSet::new(batch, vec![1, 1])).unwrap();
+        original.persist(&db, op_id).await.unwrap();
+
+        let restored = GroupKeyPacker::new(2);
+        restored.restore_in_place(&db, op_id).await.unwrap();
+        for row in 0..2 {
+            let actual = restored.reverse_slices_lookup(row as i64).unwrap();
+            assert_eq!(actual[0].to_data(), keys[0].slice(row, 1).to_data());
+            assert_eq!(actual[1].to_data(), keys[1].slice(row, 1).to_data());
+        }
+    }
+
+    #[tokio::test]
+    async fn group_key_packer_restores_legacy_composite_keys() {
+        let (_dir, db) = make_db().await;
+        let op_id = OperatorId(46);
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(arrow::array::Int32Array::from(vec![Some(-3), None])),
+            Arc::new(arrow::array::Float64Array::from(vec![1.5, -2.25])),
+            Arc::new(arrow::array::StringArray::from(vec!["alpha", "β"])),
+        ];
+        let mut batch = WriteBatch::new();
+        for row in 0..2 {
+            let mut key = GROUP_KEY_PACKER_PREFIX.to_vec();
+            key.extend_from_slice(&op_id.0.to_be_bytes());
+            for array in &arrays {
+                GroupKeyPacker::encode_array_row_key(array.as_ref(), row, &mut key);
+            }
+            batch.put(&key, &(row as i64).to_be_bytes());
+        }
+        db.write_batch(batch).await.unwrap();
+        let restored = GroupKeyPacker::new_with_key_types(vec![
+            Some(DataType::Int32),
+            Some(DataType::Float64),
+            Some(DataType::Utf8),
+        ]);
+        restored.restore_in_place(&db, op_id).await.unwrap();
+        for row in 0..2 {
+            let actual = restored.reverse_slices_lookup(row as i64).unwrap();
+            for (column, expected) in arrays.iter().enumerate() {
+                assert_eq!(actual[column].to_data(), expected.slice(row, 1).to_data());
+            }
+        }
+        assert_eq!(*restored.next_id.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn legacy_group_key_decoder_round_trips_supported_types() {
+        use arrow::array::*;
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![-1])),
+            Arc::new(Int16Array::from(vec![-23])),
+            Arc::new(Int32Array::from(vec![-456])),
+            Arc::new(Int64Array::from(vec![-789])),
+            Arc::new(UInt8Array::from(vec![1])),
+            Arc::new(UInt16Array::from(vec![23])),
+            Arc::new(UInt32Array::from(vec![456])),
+            Arc::new(UInt64Array::from(vec![789])),
+            Arc::new(Float32Array::from(vec![1.25])),
+            Arc::new(Float64Array::from(vec![-2.5])),
+            Arc::new(Date32Array::from(vec![123])),
+            Arc::new(BooleanArray::from(vec![true])),
+            Arc::new(StringArray::from(vec!["βeta"])),
+            Arc::new(
+                Decimal128Array::from(vec![-12345])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(TimestampSecondArray::from(vec![1]).with_timezone("UTC")),
+            Arc::new(TimestampMillisecondArray::from(vec![2])),
+            Arc::new(TimestampMicrosecondArray::from(vec![3])),
+            Arc::new(TimestampNanosecondArray::from(vec![4])),
+        ];
+        let packer = GroupKeyPacker::new_with_key_types(
+            arrays.iter().map(|a| Some(a.data_type().clone())).collect(),
+        );
+        let mut encoded = Vec::new();
+        for array in &arrays {
+            GroupKeyPacker::encode_array_row_key(array.as_ref(), 0, &mut encoded);
+        }
+        let decoded = packer.decode_legacy_key(&encoded).unwrap();
+        assert_eq!(
+            decoded.iter().map(|a| a.to_data()).collect::<Vec<_>>(),
+            arrays.iter().map(|a| a.to_data()).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            packer.decode_legacy_key(&encoded[..encoded.len() - 1]),
+            Err(OpError::Storage { source: rockstream_storage::StorageError::KeyEncoding(message), .. })
+                if message == "truncated group key checkpoint"
+        ));
+        encoded.push(0);
+        assert!(matches!(
+            packer.decode_legacy_key(&encoded),
+            Err(OpError::Storage { source: rockstream_storage::StorageError::KeyEncoding(message), .. })
+                if message == "trailing group key bytes"
+        ));
+    }
+
+    #[tokio::test]
+    async fn utf8_packer_ack_keeps_entries_added_after_snapshot() {
+        let (_dir, db) = make_db().await;
+        let op_id = OperatorId(45);
+        let packer = Utf8KeyPacker::new();
+        assert_eq!(packer.surrogate_for_key("a"), 0);
+        let mut batch = WriteBatch::new();
+        packer.append_state(op_id, &mut batch);
+        assert_eq!(packer.surrogate_for_key("b"), 1);
+        db.write_batch(batch).await.unwrap();
+        packer.ack_persisted_state();
+        packer.persist(&db, op_id).await.unwrap();
+
+        let restored = Utf8KeyPacker::new();
+        restored.restore_in_place(&db, op_id).await.unwrap();
+        assert_eq!(
+            (restored.forward_lookup("a"), restored.forward_lookup("b")),
+            (Some(0), Some(1))
+        );
     }
 
     #[tokio::test]

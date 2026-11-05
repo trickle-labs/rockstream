@@ -50,6 +50,49 @@ fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
     ArrowZSet::new(data, weights)
 }
 
+#[tokio::test]
+async fn restore_discards_dirty_keys_from_abandoned_attempt() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard_db(&dir).await;
+    let id = OperatorId(481);
+    let op = AggregateOp::new(id).with_db(db.clone());
+    op.process_delta(make_kv_batch(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
+    persist_agg_state(&db, &op).await.unwrap();
+    let prefix = rockstream_storage::ShardKeyEncoder::operator_prefix(
+        rockstream_storage::ShardPrefix::OpState,
+        id.0,
+    );
+    let expected = [(1_i64, 10_i64), (2, 20)]
+        .into_iter()
+        .map(|(key, sum)| {
+            (
+                rockstream_storage::ShardKeyEncoder::encode(
+                    rockstream_storage::ShardPrefix::OpState,
+                    id.0,
+                    &key.to_be_bytes(),
+                ),
+                [sum.to_be_bytes(), 1_i64.to_be_bytes()].concat(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let records = || async {
+        db.scan_prefix(&prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(records().await, expected);
+    op.process_delta(make_kv_batch(&[(1, 5, 1)])).unwrap();
+    op.set_memory_limit(24);
+    op.restore_in_place(&db).await.unwrap();
+    assert_eq!(op.in_memory_groups(), 1);
+    persist_agg_state(&db, &op).await.unwrap();
+    assert_eq!(records().await, expected);
+}
+
 // ─── Test 1: AggregateOp state persists across close/reopen ──────────────────
 
 /// Proof: AggregateOp writes its arrangement to the `op_state` namespace and

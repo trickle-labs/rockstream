@@ -72,6 +72,91 @@ fn extract_output(batch: &ArrowZSet) -> Vec<(i64, i64, i64)> {
     rows
 }
 
+#[tokio::test]
+async fn minmax_checkpoint_restores_all_pages_and_deletions() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard_db(&dir).await;
+    let id = OperatorId(481);
+    let op = MinMaxOp::new(id, MinMaxKind::Min);
+    let rows = (0..1025).map(|key| (key, 10, 1)).collect::<Vec<_>>();
+    op.process_delta(make_kv_batch(&rows)).unwrap();
+    persist_minmax_state(&db, &op).await.unwrap();
+    op.process_delta(make_kv_batch(&[(0, 10, -1), (1024, 10, -1)]))
+        .unwrap();
+    persist_minmax_state(&db, &op).await.unwrap();
+
+    let expected_multiset = (1_i64..1024)
+        .map(|key| {
+            (
+                rockstream_storage::ShardKeyEncoder::minmax_multiset_key(
+                    id.0,
+                    key,
+                    rockstream_storage::minmax_sort_key(10, false),
+                ),
+                1_i64.to_be_bytes().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let actual_multiset = db
+        .scan_prefix(&rockstream_storage::ShardKeyEncoder::minmax_operator_prefix(id.0))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, value)| (key.to_vec(), value.to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual_multiset, expected_multiset);
+    let expected_extrema = (1_i64..1024)
+        .map(|key| {
+            (
+                rockstream_storage::ShardKeyEncoder::minmax_extremum_key(id.0, key),
+                10_i64.to_be_bytes().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let actual_extrema = db
+        .scan_prefix(&rockstream_storage::ShardKeyEncoder::minmax_extremum_op_prefix(id.0))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, value)| (key.to_vec(), value.to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual_extrema, expected_extrema);
+    let recovered = MinMaxOp::load_from_storage(&db, id, MinMaxKind::Min)
+        .await
+        .unwrap();
+    let output = recovered
+        .process_delta(make_kv_batch(&[(0, 5, 1), (512, 5, 1), (1024, 5, 1)]))
+        .unwrap();
+    assert_eq!(
+        extract_output(&output),
+        vec![(0, 5, 1), (512, 5, 1), (512, 10, -1), (1024, 5, 1)]
+    );
+}
+
+#[tokio::test]
+async fn corrupt_minmax_checkpoint_does_not_replace_live_state() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard_db(&dir).await;
+    let id = OperatorId(482);
+    let op = MinMaxOp::new(id, MinMaxKind::Min);
+    op.process_delta(make_kv_batch(&[(1, 10, 1)])).unwrap();
+    persist_minmax_state(&db, &op).await.unwrap();
+    let prefix = rockstream_storage::ShardKeyEncoder::minmax_operator_prefix(id.0);
+    let records = db.scan_prefix(&prefix).await.unwrap();
+    db.put(&records[0].0, b"invalid").await.unwrap();
+    assert!(matches!(op.restore_in_place(&db).await,
+        Err(rockstream_ops::OpError::Storage { source: rockstream_storage::StorageError::KeyEncoding(ref message), .. })
+            if message == "corrupt minmax multiset record"));
+    db.put(&records[0].0, &records[0].1).await.unwrap();
+    let key = rockstream_storage::ShardKeyEncoder::minmax_extremum_key(id.0, 1);
+    db.put(&key, &99_i64.to_be_bytes()).await.unwrap();
+    assert!(matches!(op.restore_in_place(&db).await,
+        Err(rockstream_ops::OpError::Storage { source: rockstream_storage::StorageError::KeyEncoding(ref message), .. })
+            if message == "inconsistent minmax checkpoint"));
+    let output = op.process_delta(make_kv_batch(&[(1, 5, 1)])).unwrap();
+    assert_eq!(extract_output(&output), vec![(1, 5, 1), (1, 10, -1)]);
+}
+
 // ─── Test 1: State persists across close/reopen ───────────────────────────────
 
 /// Proof: MinMaxOp writes its arrangement to op_state/op_index and the state

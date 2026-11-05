@@ -105,6 +105,101 @@ async fn open_shard(dir: &TempDir) -> Arc<ShardDb> {
     Arc::new(ShardDb::builder("shard", store).build().await.unwrap())
 }
 
+fn signed_window_rows(zset: &ArrowZSet) -> Vec<(i64, i64, i64, i64)> {
+    let columns = (0..3)
+        .map(|index| {
+            zset.data
+                .column(index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut rows = (0..zset.num_rows())
+        .map(|index| {
+            (
+                columns[0].value(index),
+                columns[1].value(index),
+                columns[2].value(index),
+                zset.weights[index],
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
+}
+
+#[tokio::test]
+async fn window_checkpoint_does_not_restore_removed_output() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(481);
+    let op = WindowOp::new(kv_rn_schema(), vec![rn_expr()]);
+    op.process_epoch(make_input(&[(1, 10, 1), (2, 20, 1)]), 1)
+        .unwrap();
+    persist_window_state(&db, &op, id).await.unwrap();
+    op.process_epoch(make_input(&[(1, 10, -1)]), 2).unwrap();
+    db.set_fail_writes(true);
+    assert!(persist_window_state(&db, &op, id).await.is_err());
+    db.set_fail_writes(false);
+    persist_window_state(&db, &op, id).await.unwrap();
+    let recovered = load_window_state(&db, kv_rn_schema(), vec![rn_expr()], id)
+        .await
+        .unwrap();
+    let output = recovered
+        .process_epoch(make_input(&[(3, 30, 1)]), 3)
+        .unwrap();
+    assert_eq!(signed_window_rows(&output), vec![(3, 30, 2, 1)]);
+
+    op.process_epoch(make_input(&[(3, 30, 1)]), 3).unwrap();
+    op.restore_in_place(&db, id).await.unwrap();
+    let output = op.process_epoch(make_input(&[(3, 30, 1)]), 4).unwrap();
+    assert_eq!(signed_window_rows(&output), vec![(3, 30, 2, 1)]);
+}
+
+#[tokio::test]
+async fn window_ack_preserves_deletions_after_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(482);
+    let op = Arc::new(WindowOp::new(kv_rn_schema(), vec![rn_expr()]));
+    let pipeline = rockstream_ops::live_exec::StatefulPipeline::new()
+        .push(rockstream_ops::live_exec::Stage::Window(op.clone(), id));
+    pipeline
+        .process(make_input(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
+    let mut snapshot = WriteBatch::new();
+    pipeline.append_state(&db, &mut snapshot).await.unwrap();
+    pipeline.process(make_input(&[(1, 10, -1)])).unwrap();
+    db.write_batch(snapshot).await.unwrap();
+    pipeline.ack_persisted_state();
+    persist_window_state(&db, &op, id).await.unwrap();
+    let recovered = load_window_state(&db, kv_rn_schema(), vec![rn_expr()], id)
+        .await
+        .unwrap();
+    let output = recovered
+        .process_epoch(make_input(&[(3, 30, 1)]), 3)
+        .unwrap();
+    assert_eq!(signed_window_rows(&output), vec![(3, 30, 2, 1)]);
+}
+
+#[tokio::test]
+async fn corrupt_window_checkpoint_does_not_replace_live_state() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(483);
+    let op = WindowOp::new(kv_rn_schema(), vec![rn_expr()]);
+    op.process_epoch(make_input(&[(1, 10, 1)]), 1).unwrap();
+    persist_window_state(&db, &op, id).await.unwrap();
+    let prefix = rockstream_storage::ShardKeyEncoder::window_arr_op_prefix(id.0);
+    let records = db.scan_prefix(&prefix).await.unwrap();
+    assert_eq!(records.len(), 1);
+    db.put(&records[0].0, b"invalid").await.unwrap();
+    assert!(op.restore_in_place(&db, id).await.is_err());
+    let output = op.process_epoch(make_input(&[(1, 10, 1)]), 2).unwrap();
+    assert_eq!(signed_window_rows(&output), Vec::new());
+}
+
 /// Compute expected (v, row_number) for a set of v-values.
 fn expected_rn(v_values: &[i64]) -> Vec<(i64, i64)> {
     let mut sorted = v_values.to_vec();
