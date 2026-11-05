@@ -30,6 +30,7 @@ use super::{
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, PermissionPreset, PolicyScope, SecurityAuditClass,
     SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
+    SECURITY_AUDIT_MAX_PAGE_ROWS,
 };
 use rockstream_types::ids::{
     CompiledPlanId, DatabaseId, IndexId, NamespaceId, PrincipalId, SinkId, SourceId, TableId,
@@ -91,6 +92,14 @@ pub trait CatalogStore: Send + Sync {
     ) -> Result<Option<SecurityPrincipal>, CatalogError>;
     async fn list_security_principals(&self) -> Result<Vec<SecurityPrincipal>, CatalogError>;
     async fn list_security_audit_records(&self) -> Result<Vec<SecurityAuditRecord>, CatalogError>;
+    async fn list_security_audit_page(
+        &self,
+        expected_policy: (PrincipalId, u64),
+        from_ms: Option<u64>,
+        to_ms: Option<u64>,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<Vec<SecurityAuditRecord>, CatalogError>;
 
     async fn get_compiled_plan(
         &self,
@@ -119,6 +128,7 @@ struct CatalogInnerState {
     roles: HashMap<PrincipalId, CatalogRoleEntry>,
     security_principals: HashMap<PrincipalId, SecurityPrincipal>,
     security_audit_records: Vec<SecurityAuditRecord>,
+    security_audit_order: Vec<usize>,
     security_audit_bytes: u64,
     security_audit_oldest_timestamp_ms: Option<u64>,
     compiled_plans: HashMap<CompiledPlanId, CompiledPlanRecord>,
@@ -684,6 +694,13 @@ fn ensure_security_audit_budget_bytes(bytes: u64, max_bytes: u64) -> Result<(), 
 
 fn rebuild_security_audit_index(state: &mut CatalogInnerState) -> Result<(), CatalogError> {
     state.security_audit_bytes = encoded_security_audit_bytes(&state.security_audit_records)?;
+    state.security_audit_order = (0..state.security_audit_records.len()).collect();
+    state.security_audit_order.sort_unstable_by(|left, right| {
+        let left = &state.security_audit_records[*left];
+        let right = &state.security_audit_records[*right];
+        (left.timestamp_ms, left.event_id.as_str())
+            .cmp(&(right.timestamp_ms, right.event_id.as_str()))
+    });
     state.security_audit_oldest_timestamp_ms = state
         .security_audit_records
         .iter()
@@ -741,7 +758,16 @@ fn append_security_audit_record_to_state(
                 oldest.min(record.timestamp_ms)
             }),
     );
+    let record_index = state.security_audit_records.len();
+    let insert_at = state.security_audit_order.binary_search_by(|index| {
+        let existing = &state.security_audit_records[*index];
+        (existing.timestamp_ms, existing.event_id.as_str())
+            .cmp(&(record.timestamp_ms, record.event_id.as_str()))
+    });
     state.security_audit_records.push(record.clone());
+    state
+        .security_audit_order
+        .insert(insert_at.unwrap_or_else(|index| index), record_index);
     Ok(())
 }
 
@@ -1537,6 +1563,60 @@ impl CatalogStore for DurableCatalogStore {
             .collect())
     }
 
+    async fn list_security_audit_page(
+        &self,
+        expected_policy: (PrincipalId, u64),
+        from_ms: Option<u64>,
+        to_ms: Option<u64>,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<Vec<SecurityAuditRecord>, CatalogError> {
+        if from_ms.zip(to_ms).is_some_and(|(from, to)| from > to)
+            || after
+                .as_ref()
+                .is_some_and(|(_, event_id)| event_id.is_empty())
+            || limit == 0
+            || limit > SECURITY_AUDIT_MAX_PAGE_ROWS
+        {
+            return Err(invalid_security_policy(
+                "security audit page request is malformed",
+            ));
+        }
+        let cutoff_ms = security_audit_cutoff_ms(current_time_ms()?);
+        let state = self.state.read().await;
+        if state
+            .security_principals
+            .get(&expected_policy.0)
+            .is_none_or(|principal| !principal.enabled || principal.revision != expected_policy.1)
+        {
+            return Err(CatalogError::OptimisticConflict(
+                "[RS-2008] transaction.optimistic_conflict: security policy changed while reading audit history; retry against current policy".into(),
+            ));
+        }
+        let records = &state.security_audit_records;
+        let order = &state.security_audit_order;
+        let first_timestamp = cutoff_ms.max(from_ms.unwrap_or_default());
+        let by_time = order.partition_point(|index| records[*index].timestamp_ms < first_timestamp);
+        let by_cursor = after.as_ref().map_or(0, |(timestamp_ms, event_id)| {
+            order.partition_point(|index| {
+                let record = &records[*index];
+                (record.timestamp_ms, record.event_id.as_str())
+                    <= (*timestamp_ms, event_id.as_str())
+            })
+        });
+        let start = by_time.max(by_cursor);
+        let end = to_ms.map_or(order.len(), |to_ms| {
+            order.partition_point(|index| records[*index].timestamp_ms <= to_ms)
+        });
+        Ok(order
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .take(limit)
+            .map(|index| records[*index].clone())
+            .collect())
+    }
+
     async fn get_compiled_plan(
         &self,
         id: CompiledPlanId,
@@ -1605,6 +1685,9 @@ fn check_dependency_cycle(deps: &[ViewDependency]) -> bool {
 #[cfg(test)]
 mod security_audit_budget_tests {
     use super::*;
+    use rockstream_types::authorization::{
+        LoginMethod, ScopedPresetGrant, SECURITY_PRINCIPAL_FORMAT_VERSION,
+    };
 
     fn audit_record(event_id: &str, timestamp_ms: u64) -> SecurityAuditRecord {
         SecurityAuditRecord {
@@ -1714,6 +1797,94 @@ mod security_audit_budget_tests {
             recovered.list_security_audit_records().await.unwrap(),
             vec![current]
         );
+    }
+
+    #[tokio::test]
+    async fn audit_pages_use_time_order_and_an_exclusive_event_cursor() {
+        let now_ms = current_time_ms().unwrap() + 60_000;
+        let first = audit_record("a", now_ms + 1);
+        let second = audit_record("b", now_ms + 2);
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let catalog = DurableCatalogStore::new(object_store.clone(), "audit-page");
+        let principal = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(1),
+            display_name: "audit administrator".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::Oidc {
+                issuer: "https://issuer.example".to_string(),
+                subject: "admin".to_string(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: Vec::new(),
+        };
+        catalog
+            .preprovision_first_administrator(principal.clone(), 1)
+            .await
+            .unwrap();
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    2,
+                    2,
+                    vec![
+                        CatalogMutation::AppendSecurityAudit(second.clone()),
+                        CatalogMutation::AppendSecurityAudit(first.clone()),
+                    ],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let recovered = DurableCatalogStore::recover(object_store, "audit-page")
+            .await
+            .unwrap();
+        let page = recovered
+            .list_security_audit_page(
+                (principal.id, principal.revision),
+                Some(now_ms + 1),
+                Some(now_ms + 2),
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page, vec![first.clone()]);
+        let next_page = recovered
+            .list_security_audit_page(
+                (principal.id, principal.revision),
+                Some(now_ms + 1),
+                Some(now_ms + 2),
+                Some((first.timestamp_ms, first.event_id.clone())),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_page, vec![second]);
+        recovered
+            .state
+            .write()
+            .await
+            .security_principals
+            .get_mut(&principal.id)
+            .unwrap()
+            .revision = 2;
+        assert!(matches!(
+            recovered
+                .list_security_audit_page(
+                    (principal.id, principal.revision),
+                    Some(now_ms + 1),
+                    Some(now_ms + 2),
+                    None,
+                    1,
+                )
+                .await,
+            Err(CatalogError::OptimisticConflict(_))
+        ));
     }
 
     #[tokio::test]

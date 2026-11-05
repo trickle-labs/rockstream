@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64_URL_SAFE;
+use base64::Engine as _;
 use futures::StreamExt;
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::kek::EnvKekProvider;
@@ -231,6 +233,72 @@ fn set_viewer(handler: &GatewayHandler, conn_id: &str) {
     session.principal = Principal::Jwt {
         sub: "viewer".to_string(),
     };
+}
+
+fn audit_page_event(event_id: &str, timestamp_ms: u64) -> SecurityAuditRecord {
+    SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: event_id.to_string(),
+        timestamp_ms,
+        actor: AuditIdentity::Verified("actor-1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Observed("client-1".to_string()),
+        operation_id: AuditField::Known("17".to_string()),
+        policy_revision: AuditField::Known(2),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known("revision=2;policy=test".to_string()),
+    }
+}
+
+async fn collect_query_rows(
+    handler: &GatewayHandler,
+    sql: &str,
+    conn_id: &str,
+) -> Vec<Vec<Option<String>>> {
+    let responses = handler
+        .dispatch_async_with_conn(sql, Some(conn_id))
+        .await
+        .unwrap();
+    let mut responses = responses.into_iter();
+    let Some(pgwire::api::results::Response::Query(query)) = responses.next() else {
+        panic!("expected one query response for {sql}");
+    };
+    assert!(
+        responses.next().is_none(),
+        "expected exactly one query response"
+    );
+    assert_eq!(
+        query
+            .row_schema()
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>(),
+        vec![
+            "format_version",
+            "event_id",
+            "timestamp_ms",
+            "actor",
+            "target",
+            "scope",
+            "action",
+            "outcome",
+            "correlation",
+            "operation_id",
+            "policy_revision",
+            "before_state",
+            "after_state",
+            "cursor",
+        ]
+    );
+    let mut rows = query.data_rows();
+    let mut collected = Vec::new();
+    while let Some(row) = rows.next().await {
+        collected.push(decode_pgwire_row(&row.unwrap()));
+    }
+    collected
 }
 
 #[tokio::test]
@@ -1210,6 +1278,243 @@ async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() 
     }
     assert!(durable.list_sinks().await.unwrap().is_empty());
     assert!(durable.list_sources().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn show_security_audit_returns_stable_pages_and_denies_operator_only_access() {
+    let issuer = "https://issuer.example";
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "security-audit-history",
+    ));
+    let administrator = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "Audit administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: issuer.to_string(),
+            subject: "admin".to_string(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    durable
+        .preprovision_first_administrator(administrator, 201)
+        .await
+        .unwrap();
+    let base_ms = current_timestamp_ms() + 60_000;
+    let event_a = audit_page_event("a", base_ms + 1);
+    let event_z = audit_page_event("z", base_ms + 1);
+    let event_b = audit_page_event("b", base_ms + 2);
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                3,
+                203,
+                vec![
+                    CatalogMutation::AppendSecurityAudit(event_z.clone()),
+                    CatalogMutation::AppendSecurityAudit(event_a.clone()),
+                    CatalogMutation::AppendSecurityAudit(event_b.clone()),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let operator = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Audit operator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: issuer.to_string(),
+            subject: "operator".to_string(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Operator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    let operator_policy = serde_json::to_string(&(
+        operator.enabled,
+        &operator.preset_grants,
+        &operator.scoped_grants,
+    ))
+    .unwrap();
+    let operator_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "operator-grant".to_string(),
+        timestamp_ms: base_ms + 10,
+        actor: AuditIdentity::Verified("principal:1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known("204".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={operator_policy}")),
+    };
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                4,
+                204,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: operator.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: operator_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.set_durable_store(durable.clone());
+    let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader));
+    handler
+        .sessions
+        .entry("audit-admin".to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: issuer.to_string(),
+        sub: "admin".to_string(),
+    };
+    let expected_row = |event_id: &str, timestamp_ms: u64| {
+        vec![
+            Some("1".to_string()),
+            Some(event_id.to_string()),
+            Some(timestamp_ms.to_string()),
+            Some("verified:actor-1".to_string()),
+            Some("known:principal:2".to_string()),
+            Some("known:cluster".to_string()),
+            Some("grant_change".to_string()),
+            Some("success".to_string()),
+            Some("observed:client-1".to_string()),
+            Some("known:17".to_string()),
+            Some("known:2".to_string()),
+            Some("not_applicable".to_string()),
+            Some("known:revision=2;policy=test".to_string()),
+            Some(format!(
+                "{timestamp_ms}:{}",
+                B64_URL_SAFE.encode(event_id.as_bytes())
+            )),
+        ]
+    };
+    let page_one = collect_query_rows(
+        &handler,
+        &format!(
+            "SHOW SECURITY AUDIT FROM {base_ms} TO {} LIMIT 1",
+            base_ms + 2
+        ),
+        "audit-admin",
+    )
+    .await;
+    assert_eq!(page_one, vec![expected_row("a", base_ms + 1)]);
+    let page_two = collect_query_rows(
+        &handler,
+        &format!(
+            "SHOW SECURITY AUDIT FROM {base_ms} TO {} AFTER {}:{} LIMIT 1",
+            base_ms + 2,
+            event_a.timestamp_ms,
+            B64_URL_SAFE.encode(event_a.event_id.as_bytes())
+        ),
+        "audit-admin",
+    )
+    .await;
+    assert_eq!(page_two, vec![expected_row("z", base_ms + 1)]);
+    let page_three = collect_query_rows(
+        &handler,
+        &format!(
+            "SHOW SECURITY AUDIT FROM {base_ms} TO {} AFTER {}:{} LIMIT 1",
+            base_ms + 2,
+            event_z.timestamp_ms,
+            B64_URL_SAFE.encode(event_z.event_id.as_bytes())
+        ),
+        "audit-admin",
+    )
+    .await;
+    assert_eq!(page_three, vec![expected_row("b", base_ms + 2)]);
+
+    let invalid = handler
+        .dispatch_async_with_conn("SHOW SECURITY AUDIT LIMIT 501", Some("audit-admin"))
+        .await
+        .unwrap();
+    let pgwire::api::results::Response::Error(error) = &invalid[0] else {
+        panic!("page limits above 500 must be rejected");
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "42601");
+    assert_eq!(
+        error.message,
+        "[RS-1012] sql.parse_error: invalid SHOW SECURITY AUDIT query. next_steps: Check SQL syntax; see docs/language-features.md for the supported SQL subset."
+    );
+
+    handler
+        .sessions
+        .entry("audit-operator".to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: issuer.to_string(),
+        sub: "operator".to_string(),
+    };
+    let denied = handler
+        .dispatch_async_with_conn(
+            &format!(
+                "SHOW SECURITY AUDIT FROM {base_ms} TO {} LIMIT 1",
+                base_ms + 2
+            ),
+            Some("audit-operator"),
+        )
+        .await
+        .unwrap();
+    let pgwire::api::results::Response::Error(error) = &denied[0] else {
+        panic!("operator-only access must be denied");
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "42501");
+    assert_eq!(
+        error.message,
+        "[RS-2401] auth.permission_denied: principal 'operator' is not authorized for action 'SecurityAuditRead' on the requested security audit range. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert!(handler.sessions.contains_key("audit-operator"));
+    assert_eq!(
+        durable
+            .get_security_principal(PrincipalId(2))
+            .await
+            .unwrap(),
+        Some(operator)
+    );
+    let audit = durable.list_security_audit_records().await.unwrap();
+    let denied_event = audit
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+        .expect("the denied read is durably audited");
+    assert_eq!(
+        denied_event.actor,
+        AuditIdentity::Verified(format!("oidc:{}:{}:8:operator", issuer.len(), issuer))
+    );
+    assert_eq!(
+        denied_event.target,
+        AuditField::Known("security_audit".to_string())
+    );
+    assert_eq!(denied_event.outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(
+        denied_event.correlation,
+        AuditCorrelation::Observed("audit-operator".to_string())
+    );
 }
 
 #[cfg(feature = "testcontainers")]

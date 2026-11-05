@@ -8,6 +8,22 @@ Support bundles contain sanitized metadata and audit events only. Secret
 payloads are envelope-encrypted in the catalog and are not included in CLI
 output, `SHOW SECRETS`, errors, or generated support bundles.
 
+## Security audit history
+
+Connect to the PGWire endpoint as an authorized principal and run:
+
+```sql
+SHOW SECURITY AUDIT FROM 1798761600000 TO 1798848000000 LIMIT 100;
+```
+
+The optional inclusive time bounds use epoch milliseconds. Results are ordered
+by `(timestamp_ms, event_id)` and include a `cursor` column. Continue with
+`AFTER <cursor>` using the last row's cursor; `AFTER` is exclusive. The default
+page size is 100 rows and the maximum is 500. The current `security.audit.read`
+grant is checked on every request. See [security](security.md#audit-trail) for
+retention, storage-full behavior, and how live pagination handles concurrent
+history growth.
+
 RockStream ships as a **single binary** named `rockstream`. Every node role is a
 flag on this one binary — there is no separate server, worker, or gateway
 executable. `main` is always runnable through it.

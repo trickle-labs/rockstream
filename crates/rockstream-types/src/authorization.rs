@@ -9,6 +9,8 @@ use crate::ids::PrincipalId;
 
 pub const SECURITY_PRINCIPAL_FORMAT_VERSION: u16 = 1;
 pub const SECURITY_AUDIT_FORMAT_VERSION: u16 = 1;
+pub const SECURITY_AUDIT_DEFAULT_PAGE_ROWS: usize = 100;
+pub const SECURITY_AUDIT_MAX_PAGE_ROWS: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

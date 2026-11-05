@@ -66,7 +66,7 @@ use pgwire::messages::startup::{BackendKeyData, ParameterStatus};
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
-use base64::engine::general_purpose::STANDARD as B64_STANDARD;
+use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD as B64_URL_SAFE};
 use base64::Engine as _;
 use rockstream_connectors::{
     BackfillCursor, BackfillLifecycle, BackfillPhase, CdcOperation, KafkaSource, OffsetToken,
@@ -80,7 +80,7 @@ use rockstream_sql::SqlFrontend;
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PolicyScope, ResourceKind,
     SecurityAction, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
-    SecurityPrincipal,
+    SecurityPrincipal, SECURITY_AUDIT_DEFAULT_PAGE_ROWS, SECURITY_AUDIT_MAX_PAGE_ROWS,
 };
 use rockstream_types::config::{JoinStrategy, ScatterPruningConfig};
 use rockstream_types::data_plane::{
@@ -2720,6 +2720,120 @@ impl GatewayHandler {
             .ok_or_else(|| {
                 "[RS-0003] secret namespace is absent from the durable catalog".to_string()
             })
+    }
+
+    async fn handle_show_security_audit(
+        &self,
+        query: SecurityAuditQuery,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let principal = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .map(|session| session.principal.clone())
+        });
+        let scope = PolicyScope::AuditRange {
+            from_ms: query.from_ms,
+            to_ms: query.to_ms,
+        };
+        let matching_principal = match principal.as_ref() {
+            Some(authenticated) if !authenticated.is_system() => self
+                .security_principal_for_login(authenticated)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        let policy_revision = matching_principal
+            .as_ref()
+            .map(|security_principal| security_principal.revision);
+        let authorized = matching_principal
+            .as_ref()
+            .is_some_and(|security_principal| {
+                rockstream_control::authorization::allows(
+                    security_principal,
+                    SecurityAction::SecurityAuditRead,
+                    &scope,
+                )
+            });
+        if !authorized {
+            let audit_recorded = self
+                .append_authorization_denial(
+                    principal.as_ref(),
+                    conn_id,
+                    Some(&scope),
+                    Some("security_audit"),
+                    policy_revision,
+                )
+                .await
+                .is_ok();
+            if !audit_recorded {
+                if let Some(id) = conn_id {
+                    self.sessions.remove(id);
+                }
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_string(),
+                    "42501".to_string(),
+                    format!(
+                        "[RS-2401] auth.permission_denied: principal '{}' is not authorized for action 'SecurityAuditRead' on the requested security audit range. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated.",
+                        principal.as_ref().map_or("unknown", Principal::identity)
+                    ),
+                ))));
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "42501".to_string(),
+                format!(
+                    "[RS-2401] auth.permission_denied: principal '{}' is not authorized for action 'SecurityAuditRead' on the requested security audit range. next_steps: Request an authorized scoped grant, then retry.",
+                    principal.as_ref().map_or("unknown", Principal::identity)
+                ),
+            )))]);
+        }
+
+        let Some(store) = self.catalog.get_durable_store() else {
+            return Ok(vec![security_audit_storage_error_response()]);
+        };
+        let Some(authorized_principal) = matching_principal.as_ref() else {
+            return Ok(vec![security_audit_policy_changed_response()]);
+        };
+        let records = match store
+            .list_security_audit_page(
+                (authorized_principal.id, authorized_principal.revision),
+                query.from_ms,
+                query.to_ms,
+                query.after,
+                query.limit,
+            )
+            .await
+        {
+            Ok(records) => records,
+            Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_)) => {
+                return Ok(vec![security_audit_policy_changed_response()]);
+            }
+            Err(_) => return Ok(vec![security_audit_storage_error_response()]),
+        };
+        let rows = records.into_iter().map(security_audit_record_row).collect();
+        Ok(vec![catalog_resp_to_response(CatalogResponse::Rows {
+            columns: vec![
+                "format_version".to_string(),
+                "event_id".to_string(),
+                "timestamp_ms".to_string(),
+                "actor".to_string(),
+                "target".to_string(),
+                "scope".to_string(),
+                "action".to_string(),
+                "outcome".to_string(),
+                "correlation".to_string(),
+                "operation_id".to_string(),
+                "policy_revision".to_string(),
+                "before_state".to_string(),
+                "after_state".to_string(),
+                "cursor".to_string(),
+            ],
+            rows,
+        })])
     }
 
     async fn authorize_secret_metadata_read_for_connection(
@@ -6746,6 +6860,15 @@ impl GatewayHandler {
                 .handle_drop_secret(q, &namespace)
                 .await
                 .map(|responses| responses.into_iter().map(promote_response).collect());
+        }
+
+        let audit_query_text = ql.trim_end_matches(';').trim();
+        if audit_query_text.starts_with("show security audit") {
+            let query = match parse_security_audit_query(q) {
+                Ok(query) => query,
+                Err(()) => return Ok(vec![security_audit_syntax_error_response()]),
+            };
+            return self.handle_show_security_audit(query, conn_id).await;
         }
 
         if ql.trim_end_matches(';') == "show secrets" || ql.trim_end_matches(';') == "show secret" {
@@ -16508,6 +16631,173 @@ fn cleanup_connection_state(handler: &GatewayHandler, conn_id: &str) {
 }
 
 // ── Query helpers ─────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct SecurityAuditQuery {
+    from_ms: Option<u64>,
+    to_ms: Option<u64>,
+    after: Option<(u64, String)>,
+    limit: usize,
+}
+
+fn parse_security_audit_query(query: &str) -> Result<SecurityAuditQuery, ()> {
+    let statement = query.trim().trim_end_matches(';').trim();
+    let mut tokens = statement.split_whitespace();
+    if !tokens
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("show"))
+        || !tokens
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("security"))
+        || !tokens
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("audit"))
+    {
+        return Err(());
+    }
+    let mut from_ms = None;
+    let mut to_ms = None;
+    let mut after = None;
+    let mut limit = None;
+    let mut last_option = 0;
+    while let Some(option) = tokens.next() {
+        let (order, value) = match option.to_ascii_lowercase().as_str() {
+            "from" if last_option < 1 => (1, tokens.next().ok_or(())?),
+            "to" if last_option < 2 => (2, tokens.next().ok_or(())?),
+            "after" if last_option < 3 => (3, tokens.next().ok_or(())?),
+            "limit" if last_option < 4 => (4, tokens.next().ok_or(())?),
+            _ => return Err(()),
+        };
+        last_option = order;
+        match order {
+            1 => from_ms = Some(value.parse().map_err(|_| ())?),
+            2 => to_ms = Some(value.parse().map_err(|_| ())?),
+            3 => {
+                let (timestamp_ms, event_id_hex) = value.split_once(':').ok_or(())?;
+                let timestamp_ms = timestamp_ms.parse().map_err(|_| ())?;
+                let event_id =
+                    String::from_utf8(B64_URL_SAFE.decode(event_id_hex).map_err(|_| ())?)
+                        .map_err(|_| ())?;
+                if event_id.is_empty() {
+                    return Err(());
+                }
+                after = Some((timestamp_ms, event_id));
+            }
+            4 => {
+                let rows = value.parse().map_err(|_| ())?;
+                if rows == 0 || rows > SECURITY_AUDIT_MAX_PAGE_ROWS {
+                    return Err(());
+                }
+                limit = Some(rows);
+            }
+            _ => return Err(()),
+        }
+    }
+    if from_ms.zip(to_ms).is_some_and(|(from, to)| from > to) {
+        return Err(());
+    }
+    Ok(SecurityAuditQuery {
+        from_ms,
+        to_ms,
+        after,
+        limit: limit.unwrap_or(SECURITY_AUDIT_DEFAULT_PAGE_ROWS),
+    })
+}
+
+fn audit_identity_text(identity: &AuditIdentity) -> String {
+    match identity {
+        AuditIdentity::Verified(value) => format!("verified:{value}"),
+        AuditIdentity::Unverified(value) => format!("unverified:{value}"),
+        AuditIdentity::Unknown => "unknown".to_string(),
+        AuditIdentity::NotApplicable => "not_applicable".to_string(),
+    }
+}
+
+fn audit_field_text<T: std::fmt::Display>(field: &AuditField<T>) -> String {
+    match field {
+        AuditField::Known(value) => format!("known:{value}"),
+        AuditField::Unverified(value) => format!("unverified:{value}"),
+        AuditField::Unknown => "unknown".to_string(),
+        AuditField::NotApplicable => "not_applicable".to_string(),
+    }
+}
+
+fn audit_correlation_text(correlation: &AuditCorrelation) -> String {
+    match correlation {
+        AuditCorrelation::Observed(value) => format!("observed:{value}"),
+        AuditCorrelation::Unknown => "unknown".to_string(),
+        AuditCorrelation::NotApplicable => "not_applicable".to_string(),
+    }
+}
+
+fn audit_action_text(action: SecurityAuditClass) -> &'static str {
+    match action {
+        SecurityAuditClass::AuthenticationSuccess => "authentication_success",
+        SecurityAuditClass::AuthenticationFailure => "authentication_failure",
+        SecurityAuditClass::AuthorizationDenial => "authorization_denial",
+        SecurityAuditClass::GrantChange => "grant_change",
+        SecurityAuditClass::SecretRotation => "secret_rotation",
+        SecurityAuditClass::NodeIdentityRejection => "node_identity_rejection",
+        SecurityAuditClass::AdminOperationStart => "admin_operation_start",
+        SecurityAuditClass::AdminOperationCompletion => "admin_operation_completion",
+    }
+}
+
+fn audit_outcome_text(outcome: SecurityAuditOutcome) -> &'static str {
+    match outcome {
+        SecurityAuditOutcome::Success => "success",
+        SecurityAuditOutcome::Denied => "denied",
+        SecurityAuditOutcome::Failure => "failure",
+    }
+}
+
+fn security_audit_record_row(record: SecurityAuditRecord) -> Vec<Option<String>> {
+    let cursor = format!(
+        "{}:{}",
+        record.timestamp_ms,
+        B64_URL_SAFE.encode(record.event_id.as_bytes())
+    );
+    vec![
+        Some(record.format_version.to_string()),
+        Some(record.event_id),
+        Some(record.timestamp_ms.to_string()),
+        Some(audit_identity_text(&record.actor)),
+        Some(audit_field_text(&record.target)),
+        Some(audit_field_text(&record.scope)),
+        Some(audit_action_text(record.action).to_string()),
+        Some(audit_outcome_text(record.outcome).to_string()),
+        Some(audit_correlation_text(&record.correlation)),
+        Some(audit_field_text(&record.operation_id)),
+        Some(audit_field_text(&record.policy_revision)),
+        Some(audit_field_text(&record.before_state)),
+        Some(audit_field_text(&record.after_state)),
+        Some(cursor),
+    ]
+}
+
+fn security_audit_syntax_error_response() -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "42601".to_string(),
+        "[RS-1012] sql.parse_error: invalid SHOW SECURITY AUDIT query. next_steps: Check SQL syntax; see docs/language-features.md for the supported SQL subset.".to_string(),
+    )))
+}
+
+fn security_audit_storage_error_response() -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "53100".to_string(),
+        "[RS-0003] storage.unavailable: durable security audit history is unavailable. next_steps: Verify storage directory permissions and disk space.".to_string(),
+    )))
+}
+
+fn security_audit_policy_changed_response() -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "40001".to_string(),
+        "[RS-2008] transaction.optimistic_conflict: security policy changed while reading audit history. next_steps: Retry the query against current policy.".to_string(),
+    )))
+}
 
 /// Compute the first 16 bytes of SHA-256 of `data`.
 /// Used as a deterministic 128-bit key hash for idempotency tracking.

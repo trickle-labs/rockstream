@@ -196,6 +196,29 @@ certificate identity as the actor and rejects the connection before topology
 registration. If the required audit log is unavailable or an append fails, the
 connection is rejected and the server reports the audit failure.
 
+`SHOW SECURITY AUDIT` reads the authoritative durable catalog history, separate
+from the JSONL operational audit log above. Retain records for 90 days under the
+1 GiB deployment-wide cap; do not evict unexpired records to make room. If a
+required append is full or unavailable, reject the related mutation and expose
+degraded health. Stop admitting new authenticated sessions when their
+authentication event cannot be stored, and close an existing session when its
+required denial event cannot be stored.
+
+Authenticated PGWire clients with the current `security.audit.read` permission
+can read retained security records with `SHOW SECURITY AUDIT [FROM
+<timestamp_ms>] [TO <timestamp_ms>] [AFTER <cursor>] [LIMIT <rows>]`. Time bounds
+are inclusive epoch milliseconds. Rows are ordered by timestamp and event ID;
+the cursor returned on each row is `<timestamp_ms>:<unpadded base64url UTF-8 event_id>`
+and `AFTER` excludes that row. Pages default to 100 rows and are limited to 500.
+The gateway checks the requested time-range grant on every page and durably
+audits denials while preserving an authenticated session. The result includes
+explicit verified, unverified, unknown, and not-applicable field states.
+Pages use live keyset ordering rather than a multi-request snapshot. Records
+committed during pagination may appear when their key sorts after the cursor;
+restart from the first page to include records that sort at or before it. If
+the policy revision changes between authorization and page read, return a
+retryable conflict without disclosing records.
+
 ## First administrator preprovisioning
 
 Trusted offline deployment tooling must create the first interactive administrator before application listeners open. Use `DurableCatalogStore::preprovision_first_administrator` against the deployment's durable catalog with a unique operation ID that remains stable across retries. The principal and its grant-change audit event commit together; the audit actor is `unknown` because bootstrap has no authenticated application session. The operation rejects a nonempty security catalog, and a retry verifies the committed principal and audit record. It is not a public network operation. Catalog mutations also reject removal, disablement, or downgrade of the last active administrator.
