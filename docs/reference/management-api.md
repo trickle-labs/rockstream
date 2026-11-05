@@ -2,13 +2,13 @@
 
 The management API exposes typed status reads and long-running administrative operations. The protocol source is [`management.proto`](../../crates/rockstream-management-proto/proto/management/v1/management.proto).
 
-**Qualification status:** v0.66 is signed off. `CreateBackup` runs only when the server has an attached shard store. Server-side authorization and health telemetry are absent; health therefore remains `unknown`.
+**Qualification status:** v0.66 is signed off. The v0.73 support-artifact API is implemented but has not completed release qualification. `CreateBackup` runs only when the server has an attached shard store. Health telemetry remains unavailable, so health is `unknown`.
 
 ## Endpoint and protocol
 
 `control.management_addr` selects the server address. Its default is `127.0.0.1:9201`. The CLI uses that address unless you pass `--management`.
 
-The service uses tonic over HTTP/2 without TLS or request authorization. Bind it to a trusted local interface. The current server does not authenticate remote callers.
+The service uses tonic over HTTP/2 with mutual TLS. The server maps the verified client certificate fingerprint to an enabled principal in the durable security catalog and checks that principal's current scoped grants on each request. Management calls fail closed if the security catalog or required audit storage is unavailable. CLI callers must provide the CA certificate, client certificate, and private key.
 
 The protocol version is `1`. Every request carries `protocol_version`. The server returns `FAILED_PRECONDITION` for an unsupported version.
 
@@ -30,6 +30,8 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 | `MigrateShard` | Persists an idempotent request, flushes and closes the donor shard, transfers its lease, and waits for the recipient to open it. Before donor handoff, the v0.66 executor rejects a shard with a registered active workload deployment. |
 | `CreateBackup` | Persists an idempotent operation, requests a durable checkpoint from every shard owner, exports checkpoint-pinned shard data and control state while excluding the audit and management-operation logs and live worker topology, and reports success only after validating its terminal marker. Workers rebuild their topology records when they register. The method appears in capabilities only when a backup source store is attached. |
 | `CancelOperation` | Cancels a pending operation or a migration before lease transfer. During donor handoff, the executor waits for the worker acknowledgement and reopens the donor before returning to its caller. It returns `FAILED_PRECONDITION` after lease transfer starts. |
+| `GenerateSupportArtifact` | Creates a sanitized cluster- or node-scoped support artifact and binds its opaque UUID to the authenticated principal, scope, and client idempotency key. |
+| `DownloadSupportArtifact` | Streams an artifact to its creating principal when current download and source-scope grants still allow access. The UUID is opaque and never names a server filesystem path. |
 
 The control service attaches drain and migration executors. It attaches the backup executor only when it can read the authoritative shard store. Embedded `--role all` supports one local worker. Multi-worker backups require every shard owner to use the same configured shared object store.
 
@@ -50,7 +52,13 @@ rockstream --output json --management 127.0.0.1:9201 shard show 0
 rockstream --output json --management 127.0.0.1:9201 config summary
 rockstream --output json --management 127.0.0.1:9201 admin operation list
 rockstream --output json --management 127.0.0.1:9201 admin operation show <operation-id>
+rockstream --management 127.0.0.1:9201 support artifact create --idempotency-key <client-generated-uuid>
+rockstream --management 127.0.0.1:9201 support artifact download <opaque-id> --out support.json
 ```
+
+Keep the client-generated UUID before sending the create request and reuse it for retries. If it is omitted, the CLI prints a generated UUID to stderr before the request. The response returns the same opaque ID. Artifacts contain only sanitized operational metadata: no business rows, SQL literals, connector payloads, secret values, keys, or tokens. Each artifact is at most 10 MiB, remains downloadable for at most 10 minutes, and is bound to its creator and source scope. The current in-memory store retains at most 100 MiB per management service instance and rejects generation when that budget is full. Deployment-wide aggregation across multiple service instances remains unqualified. Expired artifacts are removed within one second; shutdown or restart clears all in-memory artifacts. After such a clear, replaying the same key reports that the artifact is unavailable; use a new key to request a new artifact.
+
+If the create response is lost, retry `support artifact create` with the same UUID or use the authorized `admin operation show <uuid>` lookup. The operation UUID is known before the mutation starts, and an unavailable or expired artifact is never silently regenerated under the old key.
 
 `CreateBackup` accepts a local path, a `file://` path, or an `s3://bucket/prefix` destination. It requires an idle cluster with no active workload deployments or source writes. The operation record stores the destination and checkpoint phase. The server stores its checkpoint manifest in the source store and writes the export under `checkpoint-exports/management-<operation_id>`. A missing worker or temporary storage error leaves the operation waiting. An invalid destination or checkpoint integrity error leaves it failed.
 
@@ -76,7 +84,7 @@ A successful `DrainWorker` result requires a matching recipient-open acknowledge
 
 `page_size=0` selects the default of 50. The maximum page size is 100. Page tokens are decimal offsets; malformed or out-of-range tokens return `INVALID_ARGUMENT`.
 
-The server admits at most 64 concurrent management requests and 64 ACK waiters for each attached migration or backup executor. It limits gRPC messages to 1 MiB. The operation store retains at most 1,000 active records and 10,000 total records. Terminal records remain for seven days. Idempotency keys remain bound for 24 hours. Each operation accepts at most 64 state transitions.
+The server admits at most 64 concurrent management requests and 64 ACK waiters for each attached migration or backup executor. It limits gRPC messages to 1 MiB and support-artifact chunks to 64 KiB. The operation store retains at most 1,000 active records and 10,000 total records. Terminal records and idempotency keys remain bound for 90 days. Each operation accepts at most 64 state transitions.
 
 ## Idempotency and cancellation
 

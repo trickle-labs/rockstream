@@ -773,6 +773,11 @@ pub enum CheckpointCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum SupportCommand {
+    /// Generate or download an actor-bound management support artifact.
+    Artifact {
+        #[command(subcommand)]
+        command: SupportArtifactCommand,
+    },
     /// Generate on-demand diagnostic support bundle.
     Bundle {
         /// Optional view name filter.
@@ -796,6 +801,27 @@ pub enum SupportCommand {
         /// Output file path for the support bundle.
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SupportArtifactCommand {
+    /// Generate a sanitized artifact through the authenticated management API.
+    Create {
+        /// Optional node scope; omit to capture cluster metadata.
+        #[arg(long)]
+        node_id: Option<u64>,
+        /// Client-generated identity used to retry or reconcile this request.
+        #[arg(long)]
+        idempotency_key: Option<uuid::Uuid>,
+    },
+    /// Download an artifact returned by `support artifact create`.
+    Download {
+        /// Opaque artifact UUID returned by the management API.
+        opaque_id: uuid::Uuid,
+        /// Local destination for the downloaded bytes.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 

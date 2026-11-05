@@ -41,6 +41,7 @@ pub mod service;
 pub mod shard;
 pub mod shard_stats;
 pub mod skew;
+mod support_artifact;
 pub mod tls;
 pub mod topology;
 
