@@ -533,6 +533,14 @@ mod data_plane_tests {
     use rockstream_types::ids::OperatorId;
 
     #[test]
+    fn linux_memory_headroom_uses_memavailable() {
+        assert_eq!(
+            linux_memory_headroom("MemTotal: 2000 kB\nMemAvailable: 500 kB\n"),
+            Some(CapacityHeadroom::new(0.25))
+        );
+    }
+
+    #[test]
     fn runtime_rows_convert_exactly() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -1163,7 +1171,12 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
 
 #[cfg(target_os = "linux")]
 fn system_memory_headroom() -> io::Result<CapacityHeadroom> {
-    // ponytail: host-wide free pages ignore container quotas; use cgroup limits if constrained workers become supported.
+    // ponytail: host-wide MemAvailable ignores container quotas; use cgroup limits if constrained workers become supported.
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(headroom) = linux_memory_headroom(&meminfo) {
+            return Ok(headroom);
+        }
+    }
     let total_pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
     let available_pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
     if total_pages <= 0 || available_pages < 0 {
@@ -1172,6 +1185,20 @@ fn system_memory_headroom() -> io::Result<CapacityHeadroom> {
     Ok(CapacityHeadroom::new(
         available_pages as f64 / total_pages as f64,
     ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_memory_headroom(meminfo: &str) -> Option<CapacityHeadroom> {
+    let parse_kib = |key: &str| {
+        meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let total = parse_kib("MemTotal:")?;
+    let available = parse_kib("MemAvailable:")?;
+    (total > 0).then(|| CapacityHeadroom::new(available as f64 / total as f64))
 }
 
 #[cfg(target_os = "macos")]
