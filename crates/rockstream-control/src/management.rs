@@ -12,7 +12,8 @@ use rockstream_management_proto::{ensure_protocol_version, v1};
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, PermissionPreset, PolicyScope, SecurityAction,
-    SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+    SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
+    SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::config::NodeConfig;
 use rockstream_types::diagnostic::redact_secrets;
@@ -41,6 +42,22 @@ use crate::topology::TopologyCatalog;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGEMENT_REQUESTS: usize = 64;
+
+fn has_management_admin(principals: &[SecurityPrincipal]) -> bool {
+    principals.iter().any(|principal| {
+        principal.enabled
+            && principal.preset_grants.iter().any(|grant| {
+                grant.preset == PermissionPreset::Administrator
+                    && grant.scope == PolicyScope::Cluster
+            })
+            && principal.login_methods.iter().any(|method| {
+                matches!(
+                    method,
+                    rockstream_types::authorization::LoginMethod::Mtls { .. }
+                )
+            })
+    })
+}
 
 #[derive(Serialize)]
 struct DrainWorkerDigest {
@@ -267,26 +284,10 @@ impl ManagementService {
             .list_security_principals()
             .await
             .map_err(|error| io::Error::other(format!("management security catalog: {error}")))?;
-        let has_admin = principals.iter().any(|principal| {
-            principal.enabled
-                && principal.preset_grants.iter().any(|grant| {
-                    grant.preset == PermissionPreset::Administrator
-                        && grant.scope == PolicyScope::Cluster
-                })
-        });
-        let has_mtls_principal = principals.iter().any(|principal| {
-            principal.enabled
-                && principal.login_methods.iter().any(|method| {
-                    matches!(
-                        method,
-                        rockstream_types::authorization::LoginMethod::Mtls { .. }
-                    )
-                })
-        });
-        if !has_admin || !has_mtls_principal {
+        if !has_management_admin(&principals) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "RS-2405: management API requires a preprovisioned administrator and mTLS principal",
+                "RS-2405: management API requires a preprovisioned mTLS administrator",
             ));
         }
 
@@ -1427,7 +1428,54 @@ impl v1::management_service_server::ManagementService for ManagementService {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use rockstream_types::authorization::{
+        LoginMethod, ScopedPresetGrant, SECURITY_PRINCIPAL_FORMAT_VERSION,
+    };
     use rockstream_types::topology::WorkerMessage;
+
+    #[test]
+    fn management_admin_requires_mtls_and_admin_grant_on_same_principal() {
+        let principal = |id, login_method, preset| SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(id),
+            display_name: format!("principal-{id}"),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![login_method],
+            preset_grants: vec![ScopedPresetGrant {
+                preset,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: Vec::new(),
+        };
+        let split = [
+            principal(
+                1,
+                LoginMethod::Mtls {
+                    certificate_sha256: [1; 32],
+                },
+                PermissionPreset::Operator,
+            ),
+            principal(
+                2,
+                LoginMethod::Oidc {
+                    issuer: "https://issuer.example".to_owned(),
+                    subject: "admin".to_owned(),
+                },
+                PermissionPreset::Administrator,
+            ),
+        ];
+        let mtls_admin = [principal(
+            3,
+            LoginMethod::Mtls {
+                certificate_sha256: [3; 32],
+            },
+            PermissionPreset::Administrator,
+        )];
+
+        assert_eq!(has_management_admin(&split), false);
+        assert_eq!(has_management_admin(&mtls_admin), true);
+    }
 
     #[test]
     fn unavailable_required_audit_closes_authenticated_session() {
