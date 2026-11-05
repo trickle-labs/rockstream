@@ -695,6 +695,84 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
 }
 
 #[tokio::test]
+async fn release_process_rejects_scram_with_empty_durable_credentials_before_listening() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("empty-scram-storage");
+
+    let mut tls_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    tls_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let tls_cert = tls_params.self_signed(&tls_key).unwrap();
+    let cert_path = temp.path().join("gateway.pem");
+    let key_path = temp.path().join("gateway-key.pem");
+    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
+    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
+
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            break status;
+        }
+        if tokio::net::TcpStream::connect(address).await.is_ok() || Instant::now() >= deadline {
+            process.0.kill().unwrap();
+            let status = process.0.wait().unwrap();
+            let mut stderr = String::new();
+            process
+                .0
+                .stderr
+                .as_mut()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "release process opened a listener or failed to reject empty SCRAM credentials ({status}): {stderr}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let mut stderr = String::new();
+    process
+        .0
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "unexpected release process status: {stderr}"
+    );
+    let correlation_id = stderr
+        .split("correlation_id=")
+        .nth(1)
+        .and_then(|value| value.split_whitespace().next())
+        .expect("startup diagnostic correlation id");
+    let normalized = stderr.replace(correlation_id, "<correlation_id>");
+    assert_eq!(
+        normalized.trim_end(),
+        "[RS-0002] config.invalid: Configuration error (detail=gateway startup rejected: SCRAM requires an available durable catalog with an enabled SCRAM login) (correlation_id=<correlation_id> context=detail=gateway startup rejected: SCRAM requires an available durable catalog with an enabled SCRAM login) next_steps: Check configuration file and CLI flags.\n  next steps: Provision an enabled SCRAM login in the recovered durable catalog before starting the gateway."
+    );
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
 async fn scram_failures_run_in_release_process_and_audit_after_restart() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

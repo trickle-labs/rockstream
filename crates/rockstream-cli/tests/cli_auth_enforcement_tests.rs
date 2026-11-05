@@ -90,7 +90,7 @@ async fn scram_mode_fails_closed_without_enabled_login() {
     let error = start_gateway(&opts).await.unwrap_err();
     assert_eq!(
         error.to_string(),
-        "RS-0003 failed to bind gateway on 127.0.0.1:0: SCRAM requires an available durable catalog with an enabled SCRAM login\n  next steps: Check that the port is not already in use."
+        "RS-0002 gateway startup rejected: SCRAM requires an available durable catalog with an enabled SCRAM login\n  next steps: Provision an enabled SCRAM login in the recovered durable catalog before starting the gateway."
     );
 }
 

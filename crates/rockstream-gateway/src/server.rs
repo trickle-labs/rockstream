@@ -2562,17 +2562,20 @@ impl GatewayHandler {
             .await
     }
 
-    async fn validate_scram_startup(&self) -> Result<(), String> {
+    async fn validate_scram_startup(&self) -> Result<(), std::io::Error> {
         use rockstream_storage::catalog::CatalogStore;
 
         if self.auth_mode != AuthMode::Scram {
             return Ok(());
         }
         let store = self.catalog.get_durable_store().ok_or_else(|| {
-            "SCRAM requires an available durable catalog with an enabled SCRAM login".to_string()
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SCRAM requires an available durable catalog with an enabled SCRAM login",
+            )
         })?;
         let principals = store.list_security_principals().await.map_err(|_| {
-            "SCRAM requires an available durable catalog with an enabled SCRAM login".to_string()
+            std::io::Error::other("SCRAM durable credential store is unavailable or unrecoverable")
         })?;
         if principals.iter().any(|principal| {
             principal.enabled
@@ -2583,10 +2586,10 @@ impl GatewayHandler {
         }) {
             Ok(())
         } else {
-            Err(
-                "SCRAM requires an available durable catalog with an enabled SCRAM login"
-                    .to_string(),
-            )
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SCRAM requires an available durable catalog with an enabled SCRAM login",
+            ))
         }
     }
 
@@ -16178,10 +16181,7 @@ impl GatewayServer {
         &self,
         addr: std::net::SocketAddr,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
-        self.handler
-            .validate_scram_startup()
-            .await
-            .map_err(std::io::Error::other)?;
+        self.handler.validate_scram_startup().await?;
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let handler = self.handler.clone();
@@ -16226,10 +16226,7 @@ impl GatewayServer {
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
         self.require_tls_for_auth()?;
-        self.handler
-            .validate_scram_startup()
-            .await
-            .map_err(std::io::Error::other)?;
+        self.handler.validate_scram_startup().await?;
         if let Some(shard_db) = &self.handler.shard_db {
             self.handler
                 .catalog
@@ -16432,10 +16429,7 @@ impl GatewayServer {
         self,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
         self.require_tls_for_auth()?;
-        self.handler
-            .validate_scram_startup()
-            .await
-            .map_err(std::io::Error::other)?;
+        self.handler.validate_scram_startup().await?;
         if let Some(shard_db) = &self.handler.shard_db {
             self.handler
                 .catalog

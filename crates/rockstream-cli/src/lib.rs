@@ -401,12 +401,37 @@ fn validate_role(role: &str) -> Result<(), CliError> {
 /// # Errors
 ///
 /// Returns a [`CliError`] (RS-0003) if the storage cannot be initialised or
-/// the listen port is already in use, or RS-0002 for an unparseable address.
+/// the listen port is already in use, or RS-0002 for invalid authentication
+/// configuration or an unparseable address.
 pub async fn start_gateway(
     opts: &StartOptions,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
     start_gateway_with_catalog(opts, catalog).await
+}
+
+fn gateway_start_error(context: &str, bind_next_steps: &str, error: std::io::Error) -> CliError {
+    let message = error.to_string();
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        let next_steps = if message.starts_with("SCRAM requires") {
+            "Provision an enabled SCRAM login in the recovered durable catalog before starting the gateway."
+        } else {
+            "Configure the required gateway authentication and TLS prerequisites before starting."
+        };
+        CliError::new(
+            RS_0002,
+            format!("gateway startup rejected: {message}"),
+            next_steps,
+        )
+    } else if message.starts_with("SCRAM durable credential store") {
+        CliError::new(
+            RS_0003,
+            format!("gateway authentication storage unavailable: {message}"),
+            "Restore access to the durable credential store before starting the gateway.",
+        )
+    } else {
+        CliError::new(RS_0003, format!("{context}: {message}"), bind_next_steps)
+    }
 }
 
 pub async fn start_gateway_with_catalog(
@@ -721,20 +746,20 @@ pub async fn start_gateway_with_shard_and_catalog(
         let (pgwire_addr, _, pgwire_handle, _) = server
             .serve_background_with_webhook(webhook_addr)
             .await
-            .map_err(|e| {
-                CliError::new(
-                    RS_0003,
-                    format!("failed to bind gateway or webhook listener: {e}"),
+            .map_err(|error| {
+                gateway_start_error(
+                    "failed to bind gateway or webhook listener",
                     "Check that both --listen and --webhook-listen ports are available.",
+                    error,
                 )
             })?;
         Ok((pgwire_addr, pgwire_handle))
     } else {
         server.serve_background().await.map_err(|e| {
-            CliError::new(
-                RS_0003,
-                format!("failed to bind gateway on {listen}: {e}"),
+            gateway_start_error(
+                &format!("failed to bind gateway on {listen}"),
                 "Check that the port is not already in use.",
+                e,
             )
         })
     }
