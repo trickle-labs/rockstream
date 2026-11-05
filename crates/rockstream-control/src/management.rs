@@ -2313,8 +2313,8 @@ mod tests {
             PermissionPreset::Administrator,
         )];
 
-        assert_eq!(has_management_admin(&split), false);
-        assert_eq!(has_management_admin(&mtls_admin), true);
+        assert!(!has_management_admin(&split));
+        assert!(has_management_admin(&mtls_admin));
     }
 
     #[test]

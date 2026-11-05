@@ -113,6 +113,7 @@ impl ManagementAuth {
         Self { pki, catalog }
     }
 
+    #[allow(dead_code)]
     pub fn reloader(&self) -> Arc<rockstream_control::tls::TlsCertificateReloader> {
         Arc::new(
             rockstream_control::tls::TlsCertificateReloader::new(self.pki.control_tls_config())
@@ -136,6 +137,7 @@ impl ManagementAuth {
             .with_security_catalog(self.catalog.clone() as Arc<dyn CatalogStore>)
     }
 
+    #[allow(dead_code)]
     pub async fn start_management(&self, service: ManagementService) -> ManagementServiceHandle {
         service
             .with_security_catalog(self.catalog.clone() as Arc<dyn CatalogStore>)
