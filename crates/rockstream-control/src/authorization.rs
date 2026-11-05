@@ -253,6 +253,25 @@ mod tests {
                 node_id: "worker-1".to_string()
             }
         ));
+        assert!(allows(
+            &policy,
+            SecurityAction::SupportGenerate,
+            &PolicyScope::Cluster
+        ));
+        assert!(allows(
+            &policy,
+            SecurityAction::SupportGenerate,
+            &PolicyScope::Node {
+                node_id: "worker-1".to_string()
+            }
+        ));
+        assert!(!allows(
+            &policy,
+            SecurityAction::SupportDownload,
+            &PolicyScope::Artifact {
+                opaque_id: "artifact-uuid".to_string()
+            }
+        ));
         assert!(!allows(
             &policy,
             SecurityAction::DataRead,
@@ -305,6 +324,43 @@ mod tests {
                 scope: Box::new(PolicyScope::Namespace {
                     namespace: "sales".to_string(),
                 }),
+            }
+        ));
+    }
+
+    #[test]
+    fn operator_artifact_download_requires_the_exact_opaque_scope() {
+        let policy = principal(
+            vec![ScopedPresetGrant {
+                preset: PermissionPreset::Operator,
+                scope: PolicyScope::Artifact {
+                    opaque_id: "artifact-uuid".to_string(),
+                },
+            }],
+            vec![],
+        );
+
+        assert!(allows(
+            &policy,
+            SecurityAction::SupportDownload,
+            &PolicyScope::Artifact {
+                opaque_id: "artifact-uuid".to_string()
+            }
+        ));
+        assert!(!allows(
+            &policy,
+            SecurityAction::SupportDownload,
+            &PolicyScope::Artifact {
+                opaque_id: "another-artifact".to_string()
+            }
+        ));
+        assert!(!allows(
+            &policy,
+            SecurityAction::DataRead,
+            &PolicyScope::Resource {
+                namespace: "sales".to_string(),
+                kind: rockstream_types::authorization::ResourceKind::Table,
+                name: "orders".to_string(),
             }
         ));
     }
