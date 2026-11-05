@@ -3077,6 +3077,7 @@ impl StorageClient {
         } else {
             event.with_error_code(RS_0003.to_string())
         };
+        // shortcut: the local file and audit log are not atomic; use an artifact store before remote downloads.
         if rockstream_control::audit::FileAuditLog::open(storage_path.join("audit.jsonl"))
             .and_then(|audit| audit.append(&event))
             .is_err()

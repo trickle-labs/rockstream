@@ -190,6 +190,9 @@ Generate on-demand diagnostic support bundles as local files. Bundles contain
 sanitized operational metadata only: diagnostic context values and the selected
 view name are omitted, and each bundle is limited to 10 MiB. This command does
 not download an actor-scoped artifact from a remote service.
+Generation outcomes are durably recorded in the local `audit.jsonl`; an audit
+failure returns an error, though a bundle written just before that failure can
+remain at the requested local path.
 
 - `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Write a sanitized diagnostic bundle to a local path, subject to the 10 MiB limit.
 
