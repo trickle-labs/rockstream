@@ -9,8 +9,9 @@ use std::{
 use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_management_proto::v1::{
-    management_service_client::ManagementServiceClient, DownloadSupportArtifactRequest,
-    GenerateSupportArtifactRequest,
+    management_service_client::ManagementServiceClient, CreateBackupRequest,
+    DownloadSupportArtifactRequest, GenerateSupportArtifactRequest, GetClusterStatusRequest,
+    ListOperationsRequest,
 };
 use rockstream_storage::catalog::{
     CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn,
@@ -152,6 +153,31 @@ fn mtls_support_admin_with_fingerprint(certificate_sha256: [u8; 32]) -> Security
         scope: PolicyScope::Cluster,
     });
     principal
+}
+
+fn mtls_operator_with_fingerprint(certificate_sha256: [u8; 32]) -> SecurityPrincipal {
+    SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "mTLS operator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Mtls { certificate_sha256 }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Operator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    }
+}
+
+fn certificate_sha256(path: &Path) -> [u8; 32] {
+    let mut certificate_pem = BufReader::new(std::fs::File::open(path).unwrap());
+    let certificate = rustls_pemfile::certs(&mut certificate_pem)
+        .next()
+        .expect("test PKI must include a client certificate")
+        .unwrap();
+    sha2::Sha256::digest(certificate.as_ref()).into()
 }
 
 fn mtls_client_config(
@@ -342,12 +368,31 @@ async fn start_control_process(
     minio: Option<(u16, &str)>,
     support_operator: bool,
 ) -> RunningGateway {
-    let mut certificate_pem = BufReader::new(std::fs::File::open(&pki.cli_cert_path).unwrap());
-    let cli_certificate = rustls_pemfile::certs(&mut certificate_pem)
-        .next()
-        .expect("test PKI must include a CLI certificate")
-        .unwrap();
-    let fingerprint = sha2::Sha256::digest(cli_certificate.as_ref()).into();
+    start_control_process_with_operator(
+        working_dir,
+        storage,
+        address,
+        management_address,
+        pki,
+        minio,
+        support_operator,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_control_process_with_operator(
+    working_dir: &Path,
+    storage: &Path,
+    address: std::net::SocketAddr,
+    management_address: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    minio: Option<(u16, &str)>,
+    support_operator: bool,
+    operator: Option<SecurityPrincipal>,
+) -> RunningGateway {
+    let fingerprint = certificate_sha256(&pki.cli_cert_path);
     let principal = if support_operator {
         mtls_support_admin_with_fingerprint(fingerprint)
     } else {
@@ -365,10 +410,56 @@ async fn start_control_process(
         )
         .unwrap()
     };
-    DurableCatalogStore::new(security_store, "gateway")
+    let durable = DurableCatalogStore::new(security_store, "gateway");
+    durable
         .preprovision_first_administrator(principal, 1)
         .await
         .unwrap();
+    if let Some(operator) = operator {
+        let policy = serde_json::to_string(&(
+            operator.enabled,
+            &operator.preset_grants,
+            &operator.scoped_grants,
+        ))
+        .unwrap();
+        let audit = SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "release-operator-grant".to_owned(),
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known(format!("principal:{}", operator.id.0)),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::Known("2".to_owned()),
+            policy_revision: AuditField::Known(operator.revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(format!(
+                "revision={};policy={policy}",
+                operator.revision
+            )),
+        };
+        durable
+            .commit_txn(
+                CatalogTxn::new(
+                    2,
+                    2,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: operator,
+                        expected_revision: None,
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit,
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
 
     let control_address = address.to_string();
     let management_address = management_address.to_string();
@@ -426,13 +517,22 @@ async fn management_client(
     address: std::net::SocketAddr,
     pki: &rockstream_test_support::pki::TestPki,
 ) -> Result<ManagementServiceClient<tonic::transport::Channel>, String> {
+    management_client_with_identity(address, pki, &pki.cli_cert_path, &pki.cli_key_path).await
+}
+
+async fn management_client_with_identity(
+    address: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<ManagementServiceClient<tonic::transport::Channel>, String> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(
             std::fs::read(&pki.ca_cert_path).unwrap(),
         ))
         .identity(Identity::from_pem(
-            std::fs::read(&pki.cli_cert_path).unwrap(),
-            std::fs::read(&pki.cli_key_path).unwrap(),
+            std::fs::read(cert_path).unwrap(),
+            std::fs::read(key_path).unwrap(),
         ));
     let channel = Endpoint::from_shared(format!("https://{address}"))
         .map_err(|error| error.to_string())?
@@ -1839,6 +1939,152 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
     assert_eq!(denial.actor, "worker:worker-999");
     assert!(denial.resource.starts_with("worker_id=worker-1, peer="));
     assert_eq!(denial.error_code.as_deref(), Some("RS-2412"));
+}
+
+#[tokio::test]
+async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creation() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-operator-policy";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for the operator-only artifact release proof");
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let operator = mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        false,
+        Some(operator),
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+
+    let _admin = wait_for_management_client(management_address, &pki).await;
+    let mut client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        client
+            .get_cluster_status(GetClusterStatusRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
+    let artifact = client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: idempotency_key.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(artifact.opaque_id, idempotency_key);
+    let generated_at_ms = artifact.expires_at_ms - 600_000;
+    let expected_content = format!(
+        "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":1,\"node\":null}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let (content, expires_at_ms) =
+        download_support_artifact(&mut client, &artifact.opaque_id).await;
+    assert_eq!(String::from_utf8(content).unwrap(), expected_content);
+    assert_eq!(expires_at_ms, artifact.expires_at_ms);
+
+    let operations_request = ListOperationsRequest {
+        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        page_size: 100,
+        page_token: String::new(),
+    };
+    let before_denial = client
+        .list_operations(operations_request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let backup_destination = temp.path().join("operator-only-backup");
+    let denied_key = uuid::Uuid::new_v4().to_string();
+    let denial = client
+        .create_backup(CreateBackupRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            destination: backup_destination.to_string_lossy().into_owned(),
+            idempotency_key: denied_key.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(denial.message(), "management action is not authorized");
+    let after_denial = client
+        .list_operations(operations_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(after_denial.operations, before_denial.operations);
+    assert_eq!(after_denial.next_page_token, before_denial.next_page_token);
+    assert!(!after_denial
+        .operations
+        .iter()
+        .any(|operation| operation.operation_id == denied_key));
+    assert!(!backup_destination.exists());
+
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "gateway-shard",
+    ));
+    let catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    catalog.refresh().await.unwrap();
+    let audits = catalog.list_security_audit_records().await.unwrap();
+    let denials = audits
+        .iter()
+        .filter(|record| {
+            record.action == SecurityAuditClass::AuthorizationDenial
+                && record.target == AuditField::Known("BackupCreate".to_owned())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(denials.len(), 1);
+    let denial = denials[0];
+    assert_eq!(
+        denial.actor,
+        AuditIdentity::Verified("principal:2".to_owned())
+    );
+    assert_eq!(
+        denial.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::BackupDestination {
+                destination: backup_destination.to_string_lossy().into_owned(),
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(denial.outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(denial.correlation, AuditCorrelation::Unknown);
+    assert_eq!(denial.operation_id, AuditField::NotApplicable);
+    assert_eq!(denial.policy_revision, AuditField::Known(1));
+    assert_eq!(denial.before_state, AuditField::NotApplicable);
+    assert_eq!(denial.after_state, AuditField::NotApplicable);
 }
 
 #[tokio::test]
