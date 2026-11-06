@@ -413,6 +413,22 @@ mod tests {
             )
             .await
             .unwrap();
+        let retained_content: Arc<[u8]> =
+            Arc::from(b"{\"safe\":\"other actor artifact\"}".to_vec());
+        let retained_expiry_ms = expires_at_ms + 60_000;
+        store
+            .insert(
+                "retained-id".to_owned(),
+                PrincipalId(8),
+                PolicyScope::Cluster,
+                retained_content.clone(),
+                ArtifactExpiry {
+                    unix_ms: retained_expiry_ms,
+                },
+                now_ms,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
             other_service
@@ -428,12 +444,50 @@ mod tests {
                 .await,
             Err(ArtifactStoreError::WrongOwner)
         );
-        other_service.cleanup_expired(expires_at_ms).await.unwrap();
+        let restarted_service = SupportArtifactStore::new(Arc::clone(&store.store));
+        restarted_service.initialize().await.unwrap();
+        restarted_service
+            .cleanup_expired(expires_at_ms)
+            .await
+            .unwrap();
         assert_eq!(
-            store
+            restarted_service
                 .download("opaque-id", PrincipalId(7), expires_at_ms)
                 .await,
             Err(ArtifactStoreError::NotFound)
+        );
+        assert!(matches!(
+            restarted_service
+                .store
+                .get(&restarted_service.artifact_path("opaque-id"))
+                .await,
+            Err(ObjectStoreError::NotFound { .. })
+        ));
+        assert_eq!(
+            restarted_service
+                .download("retained-id", PrincipalId(8), expires_at_ms)
+                .await
+                .unwrap()
+                .0,
+            retained_content
+        );
+        assert_eq!(
+            restarted_service
+                .download("retained-id", PrincipalId(7), expires_at_ms)
+                .await,
+            Err(ArtifactStoreError::WrongOwner)
+        );
+        assert_eq!(
+            restarted_service.read_ledger().await.unwrap().0.artifacts,
+            BTreeMap::from([(
+                "retained-id".to_owned(),
+                LedgerArtifact {
+                    owner: PrincipalId(8),
+                    scope: PolicyScope::Cluster,
+                    size: retained_content.len(),
+                    expires_at_ms: retained_expiry_ms,
+                },
+            )])
         );
     }
 
