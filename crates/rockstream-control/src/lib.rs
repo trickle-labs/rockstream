@@ -24,6 +24,7 @@ pub mod checkpoint;
 pub mod checkpoint_export;
 pub mod checkpoint_store;
 pub mod config_deriver;
+pub mod delegation;
 pub mod freshness;
 pub mod frontier;
 pub mod kek;

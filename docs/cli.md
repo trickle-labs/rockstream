@@ -92,6 +92,12 @@ Starts a RockStream node.
 | `--control-shared-storage <dir>` | no | — | Directory for state shared across control nodes in this node's Raft group. |
 | `--query-time-shard-dir <dir>` | no | — | Root directory of a non-local shard included in every query-time scatter read. |
 
+For a connected authenticated gateway, configure `node.deployment_id` and
+`auth.actor_assertion_signing_key_path`; configure the same deployment ID and
+matching `auth.actor_assertion_public_key_path` on control. The gateway also
+requires internal mTLS. See [security configuration](security.md) for key
+distribution and assertion behavior.
+
 ---
 
 ### `rockstream view`
