@@ -629,6 +629,14 @@ impl ManagementService {
         action: SecurityAction,
         scope: PolicyScope,
     ) -> Result<(PrincipalId, u64), Status> {
+        self.authorize_actions(request, &[(action, scope)]).await
+    }
+
+    async fn authorize_actions<T>(
+        &self,
+        request: &Request<T>,
+        requirements: &[(SecurityAction, PolicyScope)],
+    ) -> Result<(PrincipalId, u64), Status> {
         let catalog = self
             .security_catalog
             .as_ref()
@@ -673,36 +681,38 @@ impl ManagementService {
                 "management identity is no longer enabled",
             ));
         };
-        if !crate::authorization::allows(&principal, action, &scope) {
-            let scope = serde_json::to_string(&scope)
-                .map(|scope| redact_secrets(&scope))
-                .unwrap_or_else(|_| "unknown".to_owned());
-            let record = SecurityAuditRecord {
-                format_version: SECURITY_AUDIT_FORMAT_VERSION,
-                event_id: format!("management-denial-{}", uuid::Uuid::new_v4()),
-                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
-                actor: AuditIdentity::Verified(format!("principal:{}", principal.id.0)),
-                target: AuditField::Known(format!("{action:?}")),
-                scope: AuditField::Known(scope),
-                action: SecurityAuditClass::AuthorizationDenial,
-                outcome: SecurityAuditOutcome::Denied,
-                correlation: AuditCorrelation::Unknown,
-                operation_id: AuditField::NotApplicable,
-                policy_revision: AuditField::Known(principal.revision),
-                before_state: AuditField::NotApplicable,
-                after_state: AuditField::NotApplicable,
-            };
-            append_security_audit(catalog.as_ref(), record)
-                .await
-                .map_err(|_| {
-                    required_audit_unavailable(
-                        request,
-                        "management authorization audit is unavailable",
-                    )
-                })?;
-            return Err(Status::permission_denied(
-                "management action is not authorized",
-            ));
+        for (action, scope) in requirements {
+            if !crate::authorization::allows(&principal, *action, scope) {
+                let scope = serde_json::to_string(scope)
+                    .map(|scope| redact_secrets(&scope))
+                    .unwrap_or_else(|_| "unknown".to_owned());
+                let record = SecurityAuditRecord {
+                    format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                    event_id: format!("management-denial-{}", uuid::Uuid::new_v4()),
+                    timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                    actor: AuditIdentity::Verified(format!("principal:{}", principal.id.0)),
+                    target: AuditField::Known(format!("{action:?}")),
+                    scope: AuditField::Known(scope),
+                    action: SecurityAuditClass::AuthorizationDenial,
+                    outcome: SecurityAuditOutcome::Denied,
+                    correlation: AuditCorrelation::Unknown,
+                    operation_id: AuditField::NotApplicable,
+                    policy_revision: AuditField::Known(principal.revision),
+                    before_state: AuditField::NotApplicable,
+                    after_state: AuditField::NotApplicable,
+                };
+                append_security_audit(catalog.as_ref(), record)
+                    .await
+                    .map_err(|_| {
+                        required_audit_unavailable(
+                            request,
+                            "management authorization audit is unavailable",
+                        )
+                    })?;
+                return Err(Status::permission_denied(
+                    "management action is not authorized",
+                ));
+            }
         }
         Ok((principal.id, principal.revision))
     }
@@ -2172,10 +2182,12 @@ impl v1::management_service_server::ManagementService for ManagementService {
             Err(_) => return Err(Status::unavailable("support artifact store is unavailable")),
         };
         let (downloaded_principal, policy_revision) = self
-            .authorize(
+            .authorize_actions(
                 &request,
-                SecurityAction::SupportGenerate,
-                metadata.scope.clone(),
+                &[
+                    (SecurityAction::SupportDownload, artifact_scope.clone()),
+                    (SecurityAction::SupportGenerate, metadata.scope.clone()),
+                ],
             )
             .await?;
         if downloaded_principal != principal_id || metadata.expires_at_ms == 0 {
@@ -2227,6 +2239,14 @@ impl v1::management_service_server::ManagementService for ManagementService {
             },
         )
         .await?;
+        let peer = request
+            .extensions()
+            .get::<ManagementConnectionInfo>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("management mTLS identity is required"))?;
+        let stream_service = self.clone();
+        let stream_artifact_scope = artifact_scope.clone();
+        let stream_source_scope = metadata.scope.clone();
         let stream = futures::stream::unfold(
             (
                 content,
@@ -2235,28 +2255,60 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 expires_at_ms,
                 expires_at,
             ),
-            |(content, offset, permit, expires_at_ms, expires_at)| async move {
-                let offset = offset?;
-                if Instant::now() >= expires_at {
-                    return Some((
-                        Err(Status::not_found("support artifact not found or expired")),
-                        (content, None, permit, expires_at_ms, expires_at),
-                    ));
+            move |(content, offset, permit, expires_at_ms, expires_at)| {
+                let service = stream_service.clone();
+                let peer = peer.clone();
+                let artifact_scope = stream_artifact_scope.clone();
+                let source_scope = stream_source_scope.clone();
+                async move {
+                    let offset = offset?;
+                    if Instant::now() >= expires_at {
+                        return Some((
+                            Err(Status::not_found("support artifact not found or expired")),
+                            (content, None, permit, expires_at_ms, expires_at),
+                        ));
+                    }
+                    let mut authorization_request = Request::new(());
+                    authorization_request.extensions_mut().insert(peer);
+                    let authorization = service
+                        .authorize_actions(
+                            &authorization_request,
+                            &[
+                                (SecurityAction::SupportDownload, artifact_scope),
+                                (SecurityAction::SupportGenerate, source_scope),
+                            ],
+                        )
+                        .await
+                        .and_then(|(authorized_principal, _)| {
+                            if authorized_principal != principal_id {
+                                Err(Status::unauthenticated(
+                                    "management identity is no longer enabled",
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        });
+                    if let Err(status) = authorization {
+                        return Some((
+                            Err(status),
+                            (content, None, permit, expires_at_ms, expires_at),
+                        ));
+                    }
+                    if offset >= content.len() {
+                        return None;
+                    }
+                    let end = offset.saturating_add(64 * 1024).min(content.len());
+                    let chunk = v1::DownloadSupportArtifactChunk {
+                        content: content[offset..end].to_vec(),
+                        offset: offset as u64,
+                        final_chunk: end == content.len(),
+                        expires_at_ms,
+                    };
+                    Some((
+                        Ok(chunk),
+                        (content, Some(end), permit, expires_at_ms, expires_at),
+                    ))
                 }
-                if offset >= content.len() {
-                    return None;
-                }
-                let end = offset.saturating_add(64 * 1024).min(content.len());
-                let chunk = v1::DownloadSupportArtifactChunk {
-                    content: content[offset..end].to_vec(),
-                    offset: offset as u64,
-                    final_chunk: end == content.len(),
-                    expires_at_ms,
-                };
-                Some((
-                    Ok(chunk),
-                    (content, Some(end), permit, expires_at_ms, expires_at),
-                ))
             },
         );
         Ok(Response::new(Box::pin(stream)))
@@ -2546,6 +2598,163 @@ mod tests {
                 SecurityAuditClass::AdminOperationStart,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn support_artifact_download_rechecks_policy_between_chunks() {
+        let security_catalog = test_security_catalog().await;
+        let service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let artifact_id = uuid::Uuid::new_v4().to_string();
+        let scope = PolicyScope::Cluster;
+        let now_ms = Utc::now().timestamp_millis().max(1) as u64;
+        let expires_at_ms = now_ms + ARTIFACT_TTL.as_millis() as u64;
+        let content = vec![0x5a; 128 * 1024];
+        service
+            .support_artifacts
+            .insert(
+                artifact_id.clone(),
+                PrincipalId(1),
+                scope.clone(),
+                Arc::from(content.clone()),
+                ArtifactExpiry {
+                    unix_ms: expires_at_ms,
+                },
+                now_ms,
+            )
+            .await
+            .unwrap();
+
+        let mut stream = <ManagementService as v1::management_service_server::ManagementService>::download_support_artifact(
+            &service,
+            authenticated_request(v1::DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: artifact_id.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let first_chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(first_chunk.offset, 0);
+        assert_eq!(first_chunk.expires_at_ms, expires_at_ms);
+        assert!(!first_chunk.final_chunk);
+        assert_eq!(first_chunk.content.as_slice(), &content[..64 * 1024]);
+
+        let mut principal = security_catalog
+            .get_security_principal(PrincipalId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let prior_revision = principal.revision;
+        let prior_policy = serde_json::to_string(&(
+            principal.enabled,
+            &principal.preset_grants,
+            &principal.scoped_grants,
+        ))
+        .unwrap();
+        principal
+            .preset_grants
+            .retain(|grant| grant.preset != PermissionPreset::Operator);
+        principal.revision += 1;
+        let next_revision = security_catalog.get_revision().await + 1;
+        let changed_at_ms = Utc::now().timestamp_millis().max(1) as u64;
+        let grant_audit = SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("support-artifact-grant-revocation-{artifact_id}"),
+            timestamp_ms: changed_at_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:1".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::Known(next_revision.to_string()),
+            policy_revision: AuditField::Known(principal.revision),
+            before_state: AuditField::Known(format!(
+                "revision={prior_revision};policy={prior_policy}"
+            )),
+            after_state: AuditField::Known(format!(
+                "revision={};policy={}",
+                principal.revision,
+                serde_json::to_string(&(
+                    principal.enabled,
+                    &principal.preset_grants,
+                    &principal.scoped_grants
+                ))
+                .unwrap()
+            )),
+        };
+        security_catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    next_revision,
+                    next_revision,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal,
+                        expected_revision: Some(prior_revision),
+                        grantor_revision: Some((PrincipalId(1), prior_revision)),
+                        audit: grant_audit,
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let denial = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(denial.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denial.message(), "management action is not authorized");
+        assert!(stream.next().await.is_none());
+
+        let audits = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .map(|record| record.action)
+                .collect::<Vec<_>>(),
+            vec![
+                SecurityAuditClass::GrantChange,
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::GrantChange,
+                SecurityAuditClass::AuthorizationDenial,
+            ]
+        );
+        let denied = audits.last().unwrap();
+        assert_eq!(
+            denied.actor,
+            AuditIdentity::Verified("principal:1".to_owned())
+        );
+        assert_eq!(
+            denied.target,
+            AuditField::Known("SupportDownload".to_owned())
+        );
+        assert_eq!(
+            denied.scope,
+            AuditField::Known(
+                serde_json::to_string(&PolicyScope::Artifact {
+                    opaque_id: artifact_id,
+                })
+                .unwrap()
+            )
+        );
+        assert_eq!(denied.outcome, SecurityAuditOutcome::Denied);
+        assert_eq!(
+            denied.policy_revision,
+            AuditField::Known(prior_revision + 1)
+        );
+        assert_eq!(denied.correlation, AuditCorrelation::Unknown);
+        assert_eq!(denied.operation_id, AuditField::NotApplicable);
+        assert_eq!(denied.before_state, AuditField::NotApplicable);
+        assert_eq!(denied.after_state, AuditField::NotApplicable);
     }
 
     #[tokio::test]
