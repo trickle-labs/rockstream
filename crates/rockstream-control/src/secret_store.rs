@@ -32,6 +32,8 @@ const SECURITY_AUDIT_OUTBOX_PREFIX: &[u8] = b"security-audit-outbox/";
 pub const MAX_SECRETS_PER_NAMESPACE: usize = 100_000;
 /// Maximum number of in-memory secrets retained by a process without SlateDB.
 pub const MAX_IN_MEMORY_SECRETS: usize = 1_000_000;
+/// Maximum lifetime for a worker credential before current policy must be checked again.
+pub const MAX_WORKER_SECRET_TOKEN_TTL_SECS: u64 = 60;
 /// Maximum number of source/sink references retained for one secret.
 pub const MAX_SECRET_REFERENCES: usize = 10_000;
 /// Maximum number of source/sink references retained by one process.
@@ -1117,14 +1119,21 @@ impl SecretStore {
     pub async fn issue_worker_token(
         &self,
         namespace_id: u128,
+        workload_id: rockstream_types::ids::WorkloadId,
         secret_name: &str,
         worker_identity: &str,
         ttl_secs: u64,
         actor: &str,
     ) -> Result<SecretToken, SecretStoreError> {
+        if workload_id.0 == 0 {
+            return Err(SecretStoreError::TokenInvalid {
+                code: RS_2423,
+                message: "worker token requires a valid workload identity".to_owned(),
+            });
+        }
         let secret = self.get_secret(namespace_id, secret_name).await?;
 
-        let node_key = SecretToken::worker_key(worker_identity);
+        let node_key = SecretToken::workload_key(worker_identity, workload_id);
 
         let serialized_payload = serde_json::to_vec(&secret.payload)
             .map_err(|e| SecretStoreError::encryption_failed(format!("serialize failed: {e}")))?;
@@ -1136,14 +1145,16 @@ impl SecretStore {
         let token_id = uuid::Uuid::new_v4().to_string();
 
         let token = SecretToken {
+            format_version: SecretToken::FORMAT_VERSION,
             token_id,
+            workload_id,
             secret_name: secret_name.to_string(),
             secret_type: secret.secret_type,
             worker_identity: worker_identity.to_string(),
             encrypted_payload,
             nonce,
             issued_at: now,
-            expires_at: now + ttl_secs,
+            expires_at: now + ttl_secs.min(MAX_WORKER_SECRET_TOKEN_TTL_SECS),
         };
 
         self.record_audit(

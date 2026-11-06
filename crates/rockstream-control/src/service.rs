@@ -46,7 +46,7 @@ use rockstream_types::error_code::{
     RS_3611, RS_3612, RS_8004,
 };
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
-use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
+use rockstream_types::ids::{PrincipalId, ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardRevokeReason;
 use rockstream_types::rendezvous::{fnv1a_64, rendezvous_hash};
 use rockstream_types::topology::{
@@ -128,10 +128,6 @@ fn error_code_for_secret_error(error: &SecretStoreError) -> String {
     secret_error_code(error).to_string()
 }
 
-fn secret_error_next_steps(error: &SecretStoreError) -> String {
-    rockstream_types::error_code::next_steps(secret_error_code(error)).to_string()
-}
-
 #[derive(Debug, Clone)]
 struct DrainTask {
     donor_worker_id: WorkerId,
@@ -178,10 +174,30 @@ struct DataPlaneState {
 
 struct DeploymentState {
     request: DeploymentRequest,
+    actor_principal_id: Option<PrincipalId>,
     descriptors: HashMap<ShardId, DeploymentDescriptor>,
     workers: HashMap<WorkerId, WorkerExecutionStatus>,
     ready_shards: HashSet<ShardId>,
     ready_waiter: Option<mpsc::Sender<ControlMessage>>,
+}
+
+struct AuthorizedWorkerSecret {
+    namespace_id: u128,
+    scope: PolicyScope,
+    actor_principal_id: Option<PrincipalId>,
+    policy_revision: AuditField<u64>,
+}
+
+#[derive(Debug)]
+enum WorkerSecretAuthorizationError {
+    Denied(&'static str),
+    DeniedForActor {
+        message: &'static str,
+        actor: PrincipalId,
+        scope: PolicyScope,
+        policy_revision: AuditField<u64>,
+    },
+    Unavailable(&'static str),
 }
 
 struct SourceWaiter {
@@ -2156,12 +2172,32 @@ fn stable_route(value: &str, shard_count: usize) -> usize {
 
 async fn deploy_workload(
     request: DeploymentRequest,
+    actor_principal_id: Option<PrincipalId>,
+    secret_catalog: Option<&Arc<dyn CatalogStore>>,
     sender: &mpsc::Sender<ControlMessage>,
     catalog: &TopologyCatalog,
     shard_manager: &ShardManager,
     worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     data_plane: &Arc<AsyncMutex<DataPlaneState>>,
 ) {
+    let secret_names = match secret_catalog {
+        Some(catalog) => match secret_names_for_deployment(Some(catalog), &request.schemas).await {
+            Ok(secret_names) => secret_names,
+            Err(error) => {
+                send_message(
+                    sender,
+                    &ControlMessage::OperationFailed {
+                        code: RS_0003.to_string(),
+                        message: format!("workload secret metadata is unavailable: {error:?}"),
+                        next_steps: rockstream_types::error_code::next_steps(RS_0003).to_string(),
+                    },
+                )
+                .await;
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
     let healthy = catalog.healthy_workers();
     let workers = PlacementAlgorithm::assign_n(&healthy, healthy.len());
     if workers.is_empty() {
@@ -2180,6 +2216,7 @@ async fn deploy_workload(
     }
 
     let mut descriptors = HashMap::new();
+    let workload_id = request.workload_id;
     for (index, worker_id) in workers.into_iter().enumerate() {
         let shard_id = ShardId(
             request
@@ -2200,15 +2237,20 @@ async fn deploy_workload(
     }
 
     data_plane.lock().await.deployments.insert(
-        request.workload_id,
+        workload_id,
         DeploymentState {
             request,
+            actor_principal_id,
             descriptors: descriptors.clone(),
             workers: HashMap::new(),
             ready_shards: HashSet::new(),
             ready_waiter: Some(sender.clone()),
         },
     );
+    let assigned_workers: HashSet<_> = descriptors
+        .values()
+        .map(|descriptor| descriptor.shard.worker_id)
+        .collect();
     for descriptor in descriptors.into_values() {
         if let Some(target) = senders.get(&descriptor.shard.worker_id) {
             send_message(
@@ -2220,6 +2262,20 @@ async fn deploy_workload(
             )
             .await;
             send_message(target, &ControlMessage::Deploy { descriptor }).await;
+        }
+    }
+    for worker_id in assigned_workers {
+        if let Some(target) = senders.get(&worker_id) {
+            for secret_name in &secret_names {
+                send_message(
+                    target,
+                    &ControlMessage::SecretRefreshRequired {
+                        workload_id,
+                        secret_name: secret_name.clone(),
+                    },
+                )
+                .await;
+            }
         }
     }
 }
@@ -3116,6 +3172,7 @@ async fn authorize_gateway_actor_assertion(
     assertion: Option<&str>,
     request: &WorkerMessage,
     data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    authorized_actor: &mut Option<PrincipalId>,
 ) -> bool {
     let target = AuditField::Known("gateway_data_plane".to_owned());
     let Some(assertion) = assertion else {
@@ -3274,7 +3331,7 @@ async fn authorize_gateway_actor_assertion(
         )
         .await;
     }
-    append_gateway_delegation_audit(
+    let audited = append_gateway_delegation_audit(
         Some(catalog_store),
         AuditIdentity::Verified(principal.id.to_string()),
         AuditField::Known(format!("{expected_action:?}")),
@@ -3283,7 +3340,220 @@ async fn authorize_gateway_actor_assertion(
         SecurityAuditOutcome::Success,
         AuditField::Known(principal.revision),
     )
-    .await
+    .await;
+    if audited && matches!(request, WorkerMessage::DeployWorkload(_)) {
+        *authorized_actor = Some(principal.id);
+    }
+    audited
+}
+
+async fn authorize_worker_secret_request(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_id: WorkerId,
+    workload_id: WorkloadId,
+    secret_name: &str,
+) -> Result<AuthorizedWorkerSecret, WorkerSecretAuthorizationError> {
+    let Some(catalog) = catalog else {
+        return Err(WorkerSecretAuthorizationError::Unavailable(
+            "durable secret authorization catalog is unavailable",
+        ));
+    };
+    let (request, actor_principal_id) = {
+        let state = data_plane.lock().await;
+        let Some(deployment) = state.deployments.get(&workload_id) else {
+            return Err(WorkerSecretAuthorizationError::Denied(
+                "workload is not active",
+            ));
+        };
+        if !deployment
+            .descriptors
+            .values()
+            .any(|descriptor| descriptor.shard.worker_id == worker_id)
+        {
+            return Err(WorkerSecretAuthorizationError::Denied(
+                "worker is not assigned to this workload",
+            ));
+        }
+        (deployment.request.clone(), deployment.actor_principal_id)
+    };
+    let sources = catalog.list_sources().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
+    })?;
+    let mut matches = Vec::new();
+    for source in sources {
+        if !source.table_name.as_ref().is_some_and(|table| {
+            request
+                .schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(table))
+        }) {
+            continue;
+        }
+        let Some(reference) = source.options.get("secret") else {
+            continue;
+        };
+        if rockstream_types::secret::secret_name_from_reference(reference) != Some(secret_name) {
+            continue;
+        }
+        let (Some(namespace), Some(consumer)) = (source.secret_namespace, source.secret_consumer)
+        else {
+            return Err(WorkerSecretAuthorizationError::Denied(
+                "source secret scope is incomplete",
+            ));
+        };
+        matches.push((namespace, consumer));
+    }
+    let Some((namespace, consumer_id)) = matches.first().cloned() else {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "secret is not referenced by this workload",
+        ));
+    };
+    if matches.iter().any(|(other_namespace, other_consumer)| {
+        other_namespace != &namespace || *other_consumer != consumer_id
+    }) {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "secret name is ambiguous within this workload",
+        ));
+    }
+    let scope = PolicyScope::Secret {
+        namespace: namespace.clone(),
+        name: secret_name.to_owned(),
+        consumer: Some(consumer_id),
+    };
+    let namespace_id = catalog
+        .get_namespace_by_name(&namespace)
+        .await
+        .map_err(|_| {
+            WorkerSecretAuthorizationError::Unavailable("durable namespace catalog is unavailable")
+        })?
+        .map(|namespace| u128::from(namespace.id.0))
+        .ok_or(WorkerSecretAuthorizationError::Denied(
+            "secret namespace is no longer present",
+        ))?;
+    let principals = catalog.list_security_principals().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable principal catalog is unavailable")
+    })?;
+    let Some(consumer) = principals
+        .iter()
+        .find(|principal| principal.id == consumer_id && principal.enabled)
+    else {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "source consumer is no longer enabled",
+        ));
+    };
+    if !crate::authorization::allows(consumer, SecurityAction::SecretUse, &scope) {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "source consumer is no longer authorized for secret use",
+        ));
+    }
+    let mut policy_revision = AuditField::NotApplicable;
+    if let Some(actor_id) = actor_principal_id {
+        let Some(actor) = principals
+            .iter()
+            .find(|principal| principal.id == actor_id && principal.enabled)
+        else {
+            return Err(WorkerSecretAuthorizationError::DeniedForActor {
+                message: "delegated actor is no longer enabled",
+                actor: actor_id,
+                scope,
+                policy_revision: AuditField::NotApplicable,
+            });
+        };
+        if !crate::authorization::allows(actor, SecurityAction::SecretUse, &scope) {
+            return Err(WorkerSecretAuthorizationError::DeniedForActor {
+                message: "delegated actor is no longer authorized for secret use",
+                actor: actor_id,
+                scope,
+                policy_revision: AuditField::Known(actor.revision),
+            });
+        }
+        policy_revision = AuditField::Known(actor.revision);
+    }
+    Ok(AuthorizedWorkerSecret {
+        namespace_id,
+        scope,
+        actor_principal_id,
+        policy_revision,
+    })
+}
+
+async fn workloads_for_secret_rotation(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_id: WorkerId,
+    secret_name: &str,
+) -> Result<Vec<WorkloadId>, WorkerSecretAuthorizationError> {
+    let Some(catalog) = catalog else {
+        return Err(WorkerSecretAuthorizationError::Unavailable(
+            "durable source catalog is unavailable",
+        ));
+    };
+    let sources = catalog.list_sources().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
+    })?;
+    let source_tables: HashSet<_> = sources
+        .into_iter()
+        .filter(|source| {
+            source.options.get("secret").and_then(|reference| {
+                rockstream_types::secret::secret_name_from_reference(reference)
+            }) == Some(secret_name)
+        })
+        .filter_map(|source| source.table_name.map(|name| name.to_lowercase()))
+        .collect();
+    let state = data_plane.lock().await;
+    Ok(state
+        .deployments
+        .iter()
+        .filter(|(_, deployment)| {
+            deployment
+                .descriptors
+                .values()
+                .any(|descriptor| descriptor.shard.worker_id == worker_id)
+                && deployment
+                    .request
+                    .schemas
+                    .iter()
+                    .any(|schema| source_tables.contains(&schema.relation.to_lowercase()))
+        })
+        .map(|(workload_id, _)| *workload_id)
+        .collect())
+}
+
+async fn secret_names_for_deployment(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    schemas: &[rockstream_types::data_plane::DeploymentSchema],
+) -> Result<Vec<String>, WorkerSecretAuthorizationError> {
+    let Some(catalog) = catalog else {
+        return Err(WorkerSecretAuthorizationError::Unavailable(
+            "durable source catalog is unavailable",
+        ));
+    };
+    let sources = catalog.list_sources().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
+    })?;
+    let mut secret_names = HashSet::new();
+    for source in sources {
+        if !source.table_name.as_ref().is_some_and(|table| {
+            schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(table))
+        }) {
+            continue;
+        }
+        if let Some(reference) = source.options.get("secret") {
+            let Some(secret_name) = rockstream_types::secret::secret_name_from_reference(reference)
+            else {
+                return Err(WorkerSecretAuthorizationError::Denied(
+                    "source secret reference is invalid",
+                ));
+            };
+            secret_names.insert(secret_name.to_owned());
+        }
+    }
+    let mut secret_names: Vec<_> = secret_names.into_iter().collect();
+    secret_names.sort();
+    Ok(secret_names)
 }
 
 fn claimed_worker_id(message: &WorkerMessage) -> Option<WorkerId> {
@@ -3733,6 +4003,7 @@ async fn handle_connection_stream<R, W>(
             }
         }
 
+        let mut delegated_actor = None;
         if is_gateway_data_plane_message(&msg) {
             if !allow_gateway_data_plane_peer(
                 &sender,
@@ -3753,6 +4024,7 @@ async fn handle_connection_stream<R, W>(
                     actor_assertion.as_deref(),
                     &msg,
                     &data_plane,
+                    &mut delegated_actor,
                 )
                 .await
                 {
@@ -3909,6 +4181,8 @@ async fn handle_connection_stream<R, W>(
             WorkerMessage::DeployWorkload(request) => {
                 deploy_workload(
                     request,
+                    delegated_actor,
+                    security_catalog.as_ref(),
                     &sender,
                     &catalog,
                     &shard_manager,
@@ -4585,33 +4859,204 @@ async fn handle_connection_stream<R, W>(
                 );
             }
             WorkerMessage::ResolveSecretToken { secret_name } => {
+                let actor = peer_identity
+                    .as_ref()
+                    .map_or(AuditIdentity::Unknown, |identity| {
+                        AuditIdentity::Verified(identity.to_cn())
+                    });
+                let audited = append_gateway_delegation_audit(
+                    security_catalog.as_ref(),
+                    actor,
+                    AuditField::Known(secret_name),
+                    AuditField::Unknown,
+                    SecurityAuditClass::AuthorizationDenial,
+                    SecurityAuditOutcome::Denied,
+                    AuditField::NotApplicable,
+                )
+                .await;
+                let code = if audited { RS_2401 } else { RS_0003 };
+                send_message(
+                    &sender,
+                    &ControlMessage::OperationFailed {
+                        code: code.to_string(),
+                        message: "unscoped worker secret requests are disabled".to_owned(),
+                        next_steps: rockstream_types::error_code::next_steps(code).to_string(),
+                    },
+                )
+                .await;
+            }
+            WorkerMessage::ResolveWorkloadSecretToken {
+                workload_id,
+                secret_name,
+            } => {
                 let Some(identity) = peer_identity.as_ref().filter(|id| {
                     id.role == NodeRole::Worker
                         && connected_worker_id
                             .is_some_and(|worker_id| id.matches_worker_id(worker_id.0))
                 }) else {
-                    let reply = ControlMessage::OperationFailed {
-                        code: RS_2410.to_string(),
-                        message:
-                            "secret token requests require an authenticated worker certificate"
-                                .to_string(),
-                        next_steps: rockstream_types::error_code::next_steps(RS_2410).to_string(),
-                    };
-                    send_message(&sender, &reply).await;
+                    let actor = peer_identity
+                        .as_ref()
+                        .map_or(AuditIdentity::Unknown, |identity| {
+                            AuditIdentity::Verified(identity.to_cn())
+                        });
+                    let audited = append_gateway_delegation_audit(
+                        security_catalog.as_ref(),
+                        actor,
+                        AuditField::Known(secret_name),
+                        AuditField::Known(format!("workload:{}", workload_id.0)),
+                        SecurityAuditClass::AuthenticationFailure,
+                        SecurityAuditOutcome::Denied,
+                        AuditField::NotApplicable,
+                    )
+                    .await;
+                    let code = if audited { RS_2410 } else { RS_0003 };
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: code.to_string(),
+                            message:
+                                "secret token requests require the assigned worker certificate"
+                                    .to_string(),
+                            next_steps: rockstream_types::error_code::next_steps(code).to_string(),
+                        },
+                    )
+                    .await;
                     continue;
                 };
+                let Some(worker_id) = connected_worker_id else {
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: RS_2410.to_string(),
+                            message: "worker registration is not complete".to_owned(),
+                            next_steps: rockstream_types::error_code::next_steps(RS_2410)
+                                .to_string(),
+                        },
+                    )
+                    .await;
+                    continue;
+                };
+                let authorized = match authorize_worker_secret_request(
+                    security_catalog.as_ref(),
+                    &data_plane,
+                    worker_id,
+                    workload_id,
+                    &secret_name,
+                )
+                .await
+                {
+                    Ok(authorized) => authorized,
+                    Err(error) => {
+                        let (code, message, action, retry, audit_actor, audit_scope, revision) =
+                            match error {
+                                WorkerSecretAuthorizationError::Denied(message) => (
+                                    RS_2401,
+                                    message,
+                                    SecurityAuditClass::AuthorizationDenial,
+                                    false,
+                                    AuditIdentity::Verified(identity.to_cn()),
+                                    AuditField::Known(format!("workload:{}", workload_id.0)),
+                                    AuditField::NotApplicable,
+                                ),
+                                WorkerSecretAuthorizationError::DeniedForActor {
+                                    message,
+                                    actor,
+                                    scope,
+                                    policy_revision,
+                                } => (
+                                    RS_2401,
+                                    message,
+                                    SecurityAuditClass::AuthorizationDenial,
+                                    false,
+                                    AuditIdentity::Verified(actor.to_string()),
+                                    AuditField::Known(format!("{scope:?}")),
+                                    policy_revision,
+                                ),
+                                WorkerSecretAuthorizationError::Unavailable(message) => (
+                                    RS_0003,
+                                    message,
+                                    SecurityAuditClass::AuthenticationFailure,
+                                    true,
+                                    AuditIdentity::Verified(identity.to_cn()),
+                                    AuditField::Known(format!("workload:{}", workload_id.0)),
+                                    AuditField::NotApplicable,
+                                ),
+                            };
+                        let audited = append_gateway_delegation_audit(
+                            security_catalog.as_ref(),
+                            audit_actor,
+                            AuditField::Known(secret_name.clone()),
+                            audit_scope,
+                            action,
+                            SecurityAuditOutcome::Denied,
+                            revision,
+                        )
+                        .await;
+                        let code = if audited { code } else { RS_0003 };
+                        send_message(
+                            &sender,
+                            &ControlMessage::SecretTokenRejected {
+                                workload_id,
+                                secret_name: secret_name.clone(),
+                                code: code.to_string(),
+                                message: message.to_owned(),
+                                retry: retry || !audited,
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 match secret_store
-                    .issue_worker_token(0, &secret_name, &identity.node_id, 300, &identity.to_cn())
+                    .issue_worker_token(
+                        authorized.namespace_id,
+                        workload_id,
+                        &secret_name,
+                        &identity.node_id,
+                        300,
+                        &identity.to_cn(),
+                    )
                     .await
                 {
                     Ok(token) => {
-                        send_message(&sender, &ControlMessage::SecretTokenIssued { token }).await
+                        let actor = authorized.actor_principal_id.map_or_else(
+                            || AuditIdentity::Verified(identity.to_cn()),
+                            |principal| AuditIdentity::Verified(principal.to_string()),
+                        );
+                        if append_gateway_delegation_audit(
+                            security_catalog.as_ref(),
+                            actor,
+                            AuditField::Known(secret_name.clone()),
+                            AuditField::Known(format!("{:?}", authorized.scope)),
+                            SecurityAuditClass::AuthenticationSuccess,
+                            SecurityAuditOutcome::Success,
+                            authorized.policy_revision,
+                        )
+                        .await
+                        {
+                            send_message(&sender, &ControlMessage::SecretTokenIssued { token })
+                                .await;
+                        } else {
+                            send_message(
+                                &sender,
+                                &ControlMessage::SecretTokenRejected {
+                                    workload_id,
+                                    secret_name: secret_name.clone(),
+                                    code: RS_0003.to_string(),
+                                    message: "secret authorization audit is unavailable".into(),
+                                    retry: true,
+                                },
+                            )
+                            .await;
+                        }
                     }
                     Err(error) => {
-                        let reply = ControlMessage::OperationFailed {
+                        let reply = ControlMessage::SecretTokenRejected {
+                            workload_id,
+                            secret_name: secret_name.clone(),
                             code: error_code_for_secret_error(&error),
                             message: error.to_string(),
-                            next_steps: secret_error_next_steps(&error),
+                            retry: true,
                         };
                         send_message(&sender, &reply).await;
                     }
@@ -4842,7 +5287,35 @@ async fn handle_connection_stream<R, W>(
                 current.clone()
             };
             if let Some(rotation) = rotation {
-                send_message(&sender, &ControlMessage::SecretRotated { rotation }).await;
+                if let Some(worker_id) = connected_worker_id {
+                    match workloads_for_secret_rotation(
+                        security_catalog.as_ref(),
+                        &data_plane,
+                        worker_id,
+                        &rotation.secret_name,
+                    )
+                    .await
+                    {
+                        Ok(workloads) => {
+                            for workload_id in workloads {
+                                send_message(
+                                    &sender,
+                                    &ControlMessage::SecretRefreshRequired {
+                                        workload_id,
+                                        secret_name: rotation.secret_name.clone(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        Err(error) => tracing::error!(
+                            worker_id = %worker_id,
+                            secret_name = %rotation.secret_name,
+                            ?error,
+                            "secret rotation could not be scoped to active workloads"
+                        ),
+                    }
+                }
             }
         }
     }

@@ -214,6 +214,7 @@ fn validate_internal_transport(
 
 fn load_actor_assertion_signer(
     node_config: &rockstream_types::config::NodeConfig,
+    internal_tls_key_path: Option<&std::path::Path>,
 ) -> Result<rockstream_control::delegation::ActorAssertionSigner, CliError> {
     let deployment_id = node_config
         .node
@@ -238,17 +239,31 @@ fn load_actor_assertion_signer(
                 "Set auth.actor_assertion_signing_key_path to the deployment-managed private key.",
             )
         })?;
-    rockstream_control::delegation::ActorAssertionSigner::from_pkcs8_pem(
-        key_path,
-        deployment_id,
-    )
-    .map_err(|error| {
-        CliError::new(
+    let signer =
+        rockstream_control::delegation::ActorAssertionSigner::from_pkcs8_pem(key_path, deployment_id)
+            .map_err(|error| {
+                CliError::new(
+                    rockstream_types::error_code::RS_2400,
+                    format!("gateway actor assertion signing key is invalid: {error}"),
+                    "Configure a supported RSA PKCS#8 or PKCS#1 private key and matching public JWK on control.",
+                )
+            })?;
+    let tls_key_paths = [
+        node_config.gateway.tls.key_path.as_deref(),
+        internal_tls_key_path,
+    ];
+    if tls_key_paths
+        .into_iter()
+        .flatten()
+        .any(|tls_path| signer.uses_same_key_as(tls_path).unwrap_or(false))
+    {
+        return Err(CliError::new(
             rockstream_types::error_code::RS_2400,
-            format!("gateway actor assertion signing key is invalid: {error}"),
-            "Configure a supported RSA PKCS#8 or PKCS#1 private key and matching public JWK on control.",
-        )
-    })
+            "gateway actor assertion signing key must not reuse a TLS key pair",
+            "Configure a dedicated deployment-managed RS256 private key.",
+        ));
+    }
+    Ok(signer)
 }
 
 fn load_actor_assertion_verifier(
@@ -733,7 +748,10 @@ async fn start_gateway_with_shard_and_catalog_and_dev_transport(
         && opts.control.is_some()
         && effective_start_auth_mode(&opts.auth_mode, &node_config) != "off"
     {
-        Some(load_actor_assertion_signer(&node_config)?)
+        Some(load_actor_assertion_signer(
+            &node_config,
+            opts.config.internal_tls.key_path.as_deref(),
+        )?)
     } else {
         None
     };
@@ -3512,6 +3530,47 @@ mod tests {
         node_config.gateway.tls.key_path = Some(PathBuf::from("gateway-key.pem"));
         node_config.gateway.tls.ca_cert_path = Some(PathBuf::from("client-ca.pem"));
         assert!(validate_start_auth_modes("mtls", Some(&node_config)).is_ok());
+    }
+
+    #[test]
+    fn actor_assertion_signing_key_is_required_and_separate_from_tls() {
+        let mut node_config = rockstream_types::config::NodeConfig::default();
+        node_config.node.deployment_id = Some("deployment-a".to_owned());
+        let missing = match load_actor_assertion_signer(&node_config, None) {
+            Ok(_) => panic!("missing actor assertion signing key was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            missing.to_string(),
+            "RS-2400 gateway actor assertions require a dedicated RS256 signing key\n  next steps: Set auth.actor_assertion_signing_key_path to the deployment-managed private key."
+        );
+
+        let signing_key = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rockstream-control/tests/fixtures/actor-assertion-test-key.pem");
+        node_config.auth.actor_assertion_signing_key_path = Some(signing_key.clone());
+        assert!(load_actor_assertion_signer(&node_config, None).is_ok());
+
+        let tls_dir = tempfile::tempdir().unwrap();
+        let gateway_key = tls_dir.path().join("gateway-key.pem");
+        std::fs::copy(&signing_key, &gateway_key).unwrap();
+        node_config.gateway.tls.key_path = Some(gateway_key);
+        let reused = match load_actor_assertion_signer(&node_config, None) {
+            Ok(_) => panic!("TLS key reuse was accepted for actor assertion signing"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            reused.to_string(),
+            "RS-2400 gateway actor assertion signing key must not reuse a TLS key pair\n  next steps: Configure a dedicated deployment-managed RS256 private key."
+        );
+
+        node_config.gateway.tls.key_path = None;
+        let internal_key = tls_dir.path().join("internal-key.pem");
+        std::fs::copy(&signing_key, &internal_key).unwrap();
+        let reused = match load_actor_assertion_signer(&node_config, Some(&internal_key)) {
+            Ok(_) => panic!("internal TLS key reuse was accepted for actor assertion signing"),
+            Err(error) => error,
+        };
+        assert_eq!(reused.to_string(), "RS-2400 gateway actor assertion signing key must not reuse a TLS key pair\n  next steps: Configure a dedicated deployment-managed RS256 private key.");
     }
 
     #[test]
