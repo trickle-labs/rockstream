@@ -48,13 +48,19 @@ rockstream [--json] [--control <url>] [--storage-dir <dir>] [--identity-user <na
 | `--control <url>` | — | Control service URL for cluster and shard inspection. |
 | `--storage-dir <dir>` | `.` | Local storage directory for reading checkpoints and audit logs. |
 | `--identity-user <name>` | `rockstream` | Principal presented to control-plane and catalog mutations. |
-| `--identity-role <role>` | `viewer` | RBAC role presented to mutations: `viewer`, `pipeline-owner`, or `admin`. |
+| `--identity-role <role>` | `viewer` | Compatibility role request for legacy interfaces; it does not establish management API authority. |
 | `--tls-ca-cert-path <path>` | — | Path to CA root certificate bundle for internal mTLS. |
 | `--tls-cert-path <path>` | — | Path to client/node X.509 certificate for internal mTLS. |
 | `--tls-key-path <path>` | — | Path to client/node private key for internal mTLS. |
 | `--internal-tls-ca-cert-path <path>` | — | Alias for `--tls-ca-cert-path`. |
 | `--internal-tls-cert-path <path>` | — | Alias for `--tls-cert-path`. |
 | `--internal-tls-key-path <path>` | — | Alias for `--tls-key-path`. |
+
+Management API commands require `--tls-ca-cert-path`, `--tls-cert-path`, and
+`--tls-key-path` (or their `--internal-tls-*` aliases). The server maps the
+client certificate fingerprint to an enabled principal in the durable security
+catalog and checks that principal's current grants for each action. The
+`--identity-user` and `--identity-role` values do not grant management access.
 
 ---
 
@@ -85,6 +91,12 @@ Starts a RockStream node.
 | `--control-bind <addr>` | no | `127.0.0.1:8000` | Overrides the address the control-plane's worker-facing `ControlService` TCP listener binds to. |
 | `--control-shared-storage <dir>` | no | — | Directory for state shared across control nodes in this node's Raft group. |
 | `--query-time-shard-dir <dir>` | no | — | Root directory of a non-local shard included in every query-time scatter read. |
+
+For a connected authenticated gateway, configure `node.deployment_id` and
+`auth.actor_assertion_signing_key_path`; configure the same deployment ID and
+matching `auth.actor_assertion_public_key_path` on control. The gateway also
+requires internal mTLS. See [security configuration](security.md) for key
+distribution and assertion behavior.
 
 ---
 

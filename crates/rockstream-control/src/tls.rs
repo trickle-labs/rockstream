@@ -54,10 +54,11 @@ pub fn build_server_tls_acceptor(config: &InternalTlsConfig) -> Result<TlsAccept
             .map_err(|e| format!("RS-2411: failed to build client cert verifier: {e}"))?
     };
 
-    let server_config = ServerConfig::builder()
+    let mut server_config = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
         .map_err(|e| format!("RS-2411: failed to build TLS server config: {e}"))?;
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
@@ -168,10 +169,11 @@ impl TlsCertificateReloader {
                 .map_err(|e| format!("RS-2411: failed to build client cert verifier: {e}"))?
         };
 
-        let server_config = ServerConfig::builder()
+        let mut server_config = ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)
             .map_err(|e| format!("RS-2411: failed to build TLS server config: {e}"))?;
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
 
         let new_acceptor = TlsAcceptor::from(Arc::new(server_config));
         *self.acceptor.write().unwrap() = new_acceptor;

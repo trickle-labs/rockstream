@@ -6,11 +6,15 @@ use rockstream_control::{
     ShardManager, TopologyCatalog,
 };
 use rockstream_management_proto::v1::{
-    management_service_client::ManagementServiceClient, CancelOperationRequest,
-    CreateBackupRequest, DrainWorkerRequest, GetCapabilitiesRequest, GetClusterStatusRequest,
-    GetConfigSummaryRequest, GetHealthRequest, GetNodeRequest, GetOperationRequest,
-    GetShardRequest, ListNodesRequest, ListOperationsRequest, ListShardsRequest,
-    MigrateShardRequest, Operation,
+    CancelOperationRequest, CreateBackupRequest, DrainWorkerRequest, GetCapabilitiesRequest,
+    GetClusterStatusRequest, GetConfigSummaryRequest, GetHealthRequest, GetNodeRequest,
+    GetOperationRequest, GetShardRequest, ListNodesRequest, ListOperationsRequest,
+    ListShardsRequest, MigrateShardRequest, Operation,
+};
+use rockstream_storage::catalog::CatalogStore;
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, PermissionPreset, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::config::NodeConfig;
 use rockstream_types::ids::{ShardId, WorkerId};
@@ -20,6 +24,10 @@ use rockstream_types::topology::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+
+#[path = "common/management_auth.rs"]
+mod management_auth;
+use management_auth::ManagementAuth;
 
 async fn register_worker(addr: std::net::SocketAddr, worker_id: u64) -> TcpStream {
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -69,6 +77,7 @@ async fn read_until(
 
 #[tokio::test]
 async fn management_reads_return_exact_authoritative_empty_state() {
+    let auth = ManagementAuth::new(&[]).await;
     let catalog = TopologyCatalog::new();
     let service = ManagementService::new(
         catalog,
@@ -76,9 +85,8 @@ async fn management_reads_return_exact_authoritative_empty_state() {
         ManagementOperationStore::new(Arc::new(InMemory::new())),
         NodeConfig::default(),
     );
-    let server = service.start("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", server.addr);
-    let mut client = ManagementServiceClient::connect(endpoint).await.unwrap();
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
 
     let nodes = client
         .list_nodes(ListNodesRequest {
@@ -130,16 +138,162 @@ async fn management_reads_return_exact_authoritative_empty_state() {
 }
 
 #[tokio::test]
-async fn management_rejects_incompatible_versions_before_reading_state() {
+async fn management_denial_is_audited_without_tearing_down_session_or_mutating_state() {
+    let auth = ManagementAuth::with_presets(
+        &[],
+        &[PermissionPreset::Administrator, PermissionPreset::Operator],
+    )
+    .await;
+    let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        operations.clone(),
+        NodeConfig::default(),
+    );
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
+
+    let error = client
+        .create_backup(CreateBackupRequest {
+            protocol_version: 1,
+            destination: "file:///tmp/unauthorized-backup".to_owned(),
+            idempotency_key: "unauthorized-backup".to_owned(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    let (records, next_page_token) = operations.list(50, "").await.unwrap();
+    assert!(records.is_empty());
+    assert!(next_page_token.is_empty());
+
+    let nodes = client
+        .list_nodes(ListNodesRequest {
+            protocol_version: 1,
+            page_size: 0,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(nodes.protocol_version, 1);
+    assert_eq!(nodes.source_version, "topology:0");
+    assert!(nodes.nodes.is_empty());
+    assert!(nodes.next_page_token.is_empty());
+    assert!(nodes
+        .observed_at
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .is_ok());
+
+    let audit = auth.catalog.list_security_audit_records().await.unwrap();
+    let denial = audit
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+        .unwrap();
+    assert_eq!(
+        denial.actor,
+        rockstream_types::authorization::AuditIdentity::Verified("principal:1".to_owned())
+    );
+    assert_eq!(denial.target, AuditField::Known("BackupCreate".to_owned()));
+    assert_eq!(denial.outcome, SecurityAuditOutcome::Denied);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn management_rejects_unmapped_node_certificate_before_application_session() {
+    let auth = ManagementAuth::new(&[]).await;
     let service = ManagementService::new(
         TopologyCatalog::new(),
         ShardManager::new(),
         ManagementOperationStore::new(Arc::new(InMemory::new())),
         NodeConfig::default(),
     );
-    let server = service.start("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", server.addr);
-    let mut client = ManagementServiceClient::connect(endpoint).await.unwrap();
+    let server = auth.start_management(service).await;
+
+    let mut node_client = auth
+        .try_client_with_identity(
+            server.addr,
+            &auth.pki.mismatched_cert_path,
+            &auth.pki.mismatched_key_path,
+        )
+        .await
+        .unwrap();
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        node_client.list_nodes(ListNodesRequest {
+            protocol_version: 1,
+            page_size: 0,
+            page_token: String::new(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(rejected.is_err());
+
+    let mut valid_client = auth.client(server.addr).await;
+    let nodes = valid_client
+        .list_nodes(ListNodesRequest {
+            protocol_version: 1,
+            page_size: 0,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(nodes.nodes.is_empty());
+
+    let audit = auth.catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(
+        audit.iter().map(|record| record.action).collect::<Vec<_>>(),
+        vec![
+            SecurityAuditClass::GrantChange,
+            SecurityAuditClass::AuthenticationFailure,
+            SecurityAuditClass::AuthenticationSuccess,
+        ]
+    );
+    let failures: Vec<_> = audit
+        .iter()
+        .filter(|record| record.action == SecurityAuditClass::AuthenticationFailure)
+        .collect();
+    assert_eq!(failures.len(), 1);
+    let failure = failures[0];
+    assert!(failure.event_id.starts_with("management-authn-"));
+    assert!(failure.timestamp_ms > 0);
+    let mut actual = failure.clone();
+    actual.event_id = "management-authn-normalized".to_owned();
+    actual.timestamp_ms = 1;
+    assert_eq!(
+        actual,
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "management-authn-normalized".to_owned(),
+            timestamp_ms: 1,
+            actor: AuditIdentity::Unverified("worker:worker-999".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Unknown,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn management_rejects_incompatible_versions_before_reading_state() {
+    let auth = ManagementAuth::new(&[]).await;
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        ManagementOperationStore::new(Arc::new(InMemory::new())),
+        NodeConfig::default(),
+    );
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
     macro_rules! assert_incompatible {
         ($method:ident, $request:expr) => {{
             let error = client.$method($request).await.unwrap_err();
@@ -261,6 +415,7 @@ async fn management_rejects_incompatible_versions_before_reading_state() {
 
 #[tokio::test]
 async fn management_start_recovers_running_operation_with_exact_phase() {
+    let auth = ManagementAuth::new(&[]).await;
     let store = Arc::new(InMemory::new());
     let operations = ManagementOperationStore::new(store);
     operations
@@ -294,10 +449,8 @@ async fn management_start_recovers_running_operation_with_exact_phase() {
         operations,
         NodeConfig::default(),
     );
-    let server = service.start("127.0.0.1:0").await.unwrap();
-    let mut client = ManagementServiceClient::connect(format!("http://{}", server.addr))
-        .await
-        .unwrap();
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
     let operation = client
         .get_operation(GetOperationRequest {
             protocol_version: 1,
@@ -334,6 +487,7 @@ async fn management_start_recovers_running_operation_with_exact_phase() {
 
 #[tokio::test]
 async fn management_cancellation_obeys_the_safe_boundary() {
+    let auth = ManagementAuth::new(&[]).await;
     let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
     operations
         .accept_idempotent(
@@ -377,10 +531,8 @@ async fn management_cancellation_obeys_the_safe_boundary() {
         operations.clone(),
         NodeConfig::default(),
     );
-    let server = service.start("127.0.0.1:0").await.unwrap();
-    let mut client = ManagementServiceClient::connect(format!("http://{}", server.addr))
-        .await
-        .unwrap();
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
 
     let cancelled = client
         .cancel_operation(CancelOperationRequest {
@@ -451,19 +603,22 @@ async fn management_cancellation_obeys_the_safe_boundary() {
 
 #[tokio::test]
 async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
+    let auth = ManagementAuth::new(&[]).await;
     let catalog = TopologyCatalog::new();
     let shard_manager = ShardManager::new();
     let operations = Arc::new(InMemory::new());
     let management_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let management_addr = management_listener.local_addr().unwrap();
     drop(management_listener);
-    let service = rockstream_control::ControlService::new(catalog.clone())
-        .with_shard_manager(shard_manager.clone())
-        .with_management(
-            management_addr.to_string(),
-            operations,
-            NodeConfig::default(),
-        );
+    let service = auth.protect_control(
+        rockstream_control::ControlService::new(catalog.clone())
+            .with_shard_manager(shard_manager.clone())
+            .with_management(
+                management_addr.to_string(),
+                operations,
+                NodeConfig::default(),
+            ),
+    );
     let control = service
         .with_insecure_dev_mode()
         .start("127.0.0.1:0")
@@ -472,9 +627,7 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
     let mut donor = register_worker(control.addr, 1).await;
     let mut recipient = register_worker(control.addr, 2).await;
     shard_manager.acquire(ShardId(77), WorkerId(1)).unwrap();
-    let mut client = ManagementServiceClient::connect(format!("http://{management_addr}"))
-        .await
-        .unwrap();
+    let mut client = auth.client(management_addr).await;
     let request = DrainWorkerRequest {
         protocol_version: 1,
         worker_id: "1".to_owned(),
@@ -625,19 +778,22 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
 
 #[tokio::test]
 async fn management_migrate_moves_a_real_shard_once() {
+    let auth = ManagementAuth::new(&[]).await;
     let catalog = TopologyCatalog::new();
     let shard_manager = ShardManager::new();
     let operations = Arc::new(InMemory::new());
     let management_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let management_addr = management_listener.local_addr().unwrap();
     drop(management_listener);
-    let service = rockstream_control::ControlService::new(catalog)
-        .with_shard_manager(shard_manager.clone())
-        .with_management(
-            management_addr.to_string(),
-            operations,
-            NodeConfig::default(),
-        );
+    let service = auth.protect_control(
+        rockstream_control::ControlService::new(catalog)
+            .with_shard_manager(shard_manager.clone())
+            .with_management(
+                management_addr.to_string(),
+                operations,
+                NodeConfig::default(),
+            ),
+    );
     let control = service
         .with_insecure_dev_mode()
         .start("127.0.0.1:0")
@@ -646,9 +802,7 @@ async fn management_migrate_moves_a_real_shard_once() {
     let mut donor = register_worker(control.addr, 11).await;
     let mut recipient = register_worker(control.addr, 12).await;
     let old_lease = shard_manager.acquire(ShardId(77), WorkerId(11)).unwrap();
-    let mut client = ManagementServiceClient::connect(format!("http://{management_addr}"))
-        .await
-        .unwrap();
+    let mut client = auth.client(management_addr).await;
     let request = MigrateShardRequest {
         protocol_version: 1,
         shard_id: "77".to_owned(),

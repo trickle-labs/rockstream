@@ -1,17 +1,31 @@
 #![allow(clippy::result_large_err)]
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use chrono::{SecondsFormat, Utc};
 use rockstream_management_proto::{ensure_protocol_version, v1};
+use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, PermissionPreset, PolicyScope, SecurityAction,
+    SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
+    SECURITY_AUDIT_FORMAT_VERSION,
+};
 use rockstream_types::config::NodeConfig;
 use rockstream_types::diagnostic::redact_secrets;
-use rockstream_types::ids::{ShardId, WorkerId};
+use rockstream_types::ids::{PrincipalId, ShardId, WorkerId};
 use rockstream_types::topology::WorkerInfo;
 use serde::Serialize;
-use tokio::net::TcpListener;
-use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio_rustls::server::TlsStream;
+use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status};
 
 use crate::management_store::{
@@ -28,6 +42,22 @@ use crate::topology::TopologyCatalog;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGEMENT_REQUESTS: usize = 64;
+
+fn has_management_admin(principals: &[SecurityPrincipal]) -> bool {
+    principals.iter().any(|principal| {
+        principal.enabled
+            && principal.preset_grants.iter().any(|grant| {
+                grant.preset == PermissionPreset::Administrator
+                    && grant.scope == PolicyScope::Cluster
+            })
+            && principal.login_methods.iter().any(|method| {
+                matches!(
+                    method,
+                    rockstream_types::authorization::LoginMethod::Mtls { .. }
+                )
+            })
+    })
+}
 
 #[derive(Serialize)]
 struct DrainWorkerDigest {
@@ -56,7 +86,93 @@ pub struct ManagementService {
     backup_runtime: Option<ManagementBackupRuntime>,
     migration_waiters: Option<ManagementAckWaiters>,
     backup_waiters: Option<ManagementAckWaiters>,
+    security_catalog: Option<Arc<dyn CatalogStore>>,
     request_gate: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct ManagementConnectionInfo {
+    certificate_sha256: [u8; 32],
+    principal_id: PrincipalId,
+    closed: Arc<AtomicBool>,
+}
+
+impl ManagementConnectionInfo {
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+struct ManagementTlsStream {
+    stream: TlsStream<TcpStream>,
+    info: ManagementConnectionInfo,
+}
+
+impl Connected for ManagementTlsStream {
+    type ConnectInfo = ManagementConnectionInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.info.clone()
+    }
+}
+
+impl AsyncRead for ManagementTlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.info.is_closed() {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.stream).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for ManagementTlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.info.is_closed() {
+            return Poll::Ready(Err(management_session_closed()));
+        }
+        Pin::new(&mut this.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.info.is_closed() {
+            return Poll::Ready(Err(management_session_closed()));
+        }
+        Pin::new(&mut this.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.info.is_closed() {
+            return Poll::Ready(Err(management_session_closed()));
+        }
+        Pin::new(&mut this.stream).poll_shutdown(context)
+    }
+}
+
+fn management_session_closed() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "management session closed")
+}
+
+fn required_audit_unavailable<T>(request: &Request<T>, message: &'static str) -> Status {
+    if let Some(peer) = request.extensions().get::<ManagementConnectionInfo>() {
+        peer.close();
+    }
+    Status::unavailable(message)
 }
 
 impl ManagementService {
@@ -76,8 +192,14 @@ impl ManagementService {
             backup_runtime: None,
             migration_waiters: None,
             backup_waiters: None,
+            security_catalog: None,
             request_gate: Arc::new(Semaphore::new(MAX_MANAGEMENT_REQUESTS)),
         }
+    }
+
+    pub fn with_security_catalog(mut self, catalog: Arc<dyn CatalogStore>) -> Self {
+        self.security_catalog = Some(catalog);
+        self
     }
 
     pub(crate) fn with_drain_runtime(mut self, runtime: ManagementDrainRuntime) -> Self {
@@ -97,7 +219,11 @@ impl ManagementService {
         self
     }
 
-    pub async fn start(&self, bind_addr: &str) -> std::io::Result<ManagementServiceHandle> {
+    pub async fn start(
+        &self,
+        bind_addr: &str,
+        reloader: Arc<crate::tls::TlsCertificateReloader>,
+    ) -> std::io::Result<ManagementServiceHandle> {
         let mut recover = self
             .operations
             .nonterminal()
@@ -144,13 +270,87 @@ impl ManagementService {
                         | crate::management_store::OperationStatus::Waiting
                 )
         });
+        let security_catalog = self.security_catalog.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RS-2405: management API requires the durable security catalog",
+            )
+        })?;
+        security_catalog
+            .refresh()
+            .await
+            .map_err(|error| io::Error::other(format!("management security catalog: {error}")))?;
+        let principals = security_catalog
+            .list_security_principals()
+            .await
+            .map_err(|error| io::Error::other(format!("management security catalog: {error}")))?;
+        if !has_management_admin(&principals) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RS-2405: management API requires a preprovisioned mTLS administrator",
+            ));
+        }
+
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, _) = broadcast::channel(1);
-        let mut shutdown_rx = shutdown_tx.subscribe();
-        let incoming = futures::stream::unfold(listener, |listener| async move {
-            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        let (incoming_tx, incoming_rx) =
+            mpsc::channel::<Result<ManagementTlsStream, io::Error>>(MAX_MANAGEMENT_REQUESTS);
+        let mut accept_shutdown = shutdown_tx.subscribe();
+        let accept_service = self.clone();
+        let handshake_gate = Arc::new(Semaphore::new(MAX_MANAGEMENT_REQUESTS));
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = accept_shutdown.recv() => break,
+                };
+                let (stream, peer_addr) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(%error, "management listener accept failed");
+                        continue;
+                    }
+                };
+                let permit = match handshake_gate.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
+                let service = accept_service.clone();
+                let reloader = reloader.clone();
+                let incoming_tx = incoming_tx.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let handshake = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        reloader.current_acceptor().accept(stream),
+                    )
+                    .await;
+                    match handshake {
+                        Ok(Ok(stream)) => match service.authenticate_tls_peer(&stream).await {
+                            Ok(info) => {
+                                let _ = incoming_tx
+                                    .send(Ok(ManagementTlsStream { stream, info }))
+                                    .await;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, %peer_addr, "management client identity rejected")
+                            }
+                        },
+                        Ok(Err(_)) | Err(_) => {
+                            if let Err(error) = service.record_authentication_failure().await {
+                                tracing::error!(%error, %peer_addr, "management authentication audit failed");
+                            }
+                            tracing::warn!(%peer_addr, "management mTLS handshake rejected");
+                        }
+                    }
+                });
+            }
         });
+        let incoming = futures::stream::unfold(incoming_rx, |mut receiver| async move {
+            receiver.recv().await.map(|stream| (stream, receiver))
+        });
+        let mut shutdown_rx = shutdown_tx.subscribe();
         let service = self.clone();
         tokio::spawn(async move {
             let api = v1::management_service_server::ManagementServiceServer::new(service)
@@ -200,6 +400,192 @@ impl ManagementService {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("management request limit of 64 reached"))
+    }
+
+    async fn authenticate_tls_peer(
+        &self,
+        stream: &TlsStream<TcpStream>,
+    ) -> Result<ManagementConnectionInfo, String> {
+        let certificate = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .ok_or_else(|| "management mTLS peer certificate is missing".to_owned())?;
+        let certificate_sha256: [u8; 32] = Sha256::digest(certificate.as_ref()).into();
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| "management security catalog is unavailable".to_owned())?;
+        catalog
+            .refresh()
+            .await
+            .map_err(|error| format!("management security catalog refresh failed: {error}"))?;
+        let identity = match crate::tls::extract_peer_identity(stream) {
+            Ok(identity) => identity,
+            Err(_) => {
+                append_security_audit(
+                    catalog.as_ref(),
+                    authentication_audit(
+                        AuditIdentity::Unverified(format!(
+                            "certificate:{}",
+                            hex::encode(certificate_sha256)
+                        )),
+                        false,
+                        AuditField::Unknown,
+                    ),
+                )
+                .await?;
+                return Err("management client certificate identity is invalid".to_owned());
+            }
+        };
+        if identity.role != rockstream_types::identity::NodeRole::Cli {
+            append_security_audit(
+                catalog.as_ref(),
+                authentication_audit(
+                    AuditIdentity::Unverified(identity.to_cn()),
+                    false,
+                    AuditField::Unknown,
+                ),
+            )
+            .await?;
+            return Err("management requires a CLI certificate identity".to_owned());
+        }
+        let principal = catalog
+            .list_security_principals()
+            .await
+            .map_err(|error| format!("management security catalog read failed: {error}"))?
+            .into_iter()
+            .find(|principal| {
+                principal.enabled
+                    && principal.login_methods.iter().any(|method| {
+                        matches!(method, rockstream_types::authorization::LoginMethod::Mtls { certificate_sha256: registered } if registered == &certificate_sha256)
+                    })
+            });
+        let Some(principal) = principal else {
+            let record = authentication_audit(
+                AuditIdentity::Unverified(format!(
+                    "certificate:{}",
+                    hex::encode(certificate_sha256)
+                )),
+                false,
+                AuditField::Unknown,
+            );
+            append_security_audit(catalog.as_ref(), record).await?;
+            return Err(
+                "management client certificate is not mapped to an enabled principal".into(),
+            );
+        };
+        append_security_audit(
+            catalog.as_ref(),
+            authentication_audit(
+                AuditIdentity::Verified(format!("principal:{}", principal.id.0)),
+                true,
+                AuditField::Known(principal.revision),
+            ),
+        )
+        .await?;
+        Ok(ManagementConnectionInfo {
+            certificate_sha256,
+            principal_id: principal.id,
+            closed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    async fn record_authentication_failure(&self) -> Result<(), String> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| "management security catalog is unavailable".to_owned())?;
+        append_security_audit(
+            catalog.as_ref(),
+            authentication_audit(AuditIdentity::Unknown, false, AuditField::Unknown),
+        )
+        .await
+    }
+
+    async fn authorize<T>(
+        &self,
+        request: &Request<T>,
+        action: SecurityAction,
+        scope: PolicyScope,
+    ) -> Result<(), Status> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let Some(peer) = request.extensions().get::<ManagementConnectionInfo>() else {
+            self.record_authentication_failure().await.map_err(|_| {
+                Status::unavailable("management authentication audit is unavailable")
+            })?;
+            return Err(Status::unauthenticated(
+                "management mTLS identity is required",
+            ));
+        };
+        catalog
+            .refresh()
+            .await
+            .map_err(|_| Status::unavailable("management security policy is unavailable"))?;
+        let principal = catalog
+            .get_security_principal(peer.principal_id)
+            .await
+            .map_err(|_| Status::unavailable("management security policy is unavailable"))?;
+        let principal = principal.filter(|principal| {
+            principal.enabled
+                && principal.login_methods.iter().any(|method| {
+                    matches!(method, rockstream_types::authorization::LoginMethod::Mtls { certificate_sha256 } if certificate_sha256 == &peer.certificate_sha256)
+                })
+        });
+        let Some(principal) = principal else {
+            let record = authentication_audit(
+                AuditIdentity::Unverified(format!("principal:{}", peer.principal_id.0)),
+                false,
+                AuditField::Unknown,
+            );
+            append_security_audit(catalog.as_ref(), record)
+                .await
+                .map_err(|_| {
+                    required_audit_unavailable(
+                        request,
+                        "management authentication audit is unavailable",
+                    )
+                })?;
+            return Err(Status::unauthenticated(
+                "management identity is no longer enabled",
+            ));
+        };
+        if !crate::authorization::allows(&principal, action, &scope) {
+            let scope = serde_json::to_string(&scope)
+                .map(|scope| redact_secrets(&scope))
+                .unwrap_or_else(|_| "unknown".to_owned());
+            let record = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("management-denial-{}", uuid::Uuid::new_v4()),
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", principal.id.0)),
+                target: AuditField::Known(format!("{action:?}")),
+                scope: AuditField::Known(scope),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(principal.revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            };
+            append_security_audit(catalog.as_ref(), record)
+                .await
+                .map_err(|_| {
+                    required_audit_unavailable(
+                        request,
+                        "management authorization audit is unavailable",
+                    )
+                })?;
+            return Err(Status::permission_denied(
+                "management action is not authorized",
+            ));
+        }
+        Ok(())
     }
 
     fn nodes(&self) -> (Vec<WorkerInfo>, String) {
@@ -297,6 +683,69 @@ impl ManagementService {
             }
         }
     }
+}
+
+fn authentication_audit(
+    actor: AuditIdentity,
+    success: bool,
+    policy_revision: AuditField<u64>,
+) -> SecurityAuditRecord {
+    SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("management-authn-{}", uuid::Uuid::new_v4()),
+        timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+        actor,
+        target: AuditField::Known("management-api".to_owned()),
+        scope: AuditField::NotApplicable,
+        action: if success {
+            SecurityAuditClass::AuthenticationSuccess
+        } else {
+            SecurityAuditClass::AuthenticationFailure
+        },
+        outcome: if success {
+            SecurityAuditOutcome::Success
+        } else {
+            SecurityAuditOutcome::Failure
+        },
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    }
+}
+
+pub(crate) async fn append_security_audit(
+    store: &dyn CatalogStore,
+    record: SecurityAuditRecord,
+) -> Result<(), String> {
+    for attempt in 0..2 {
+        store
+            .refresh()
+            .await
+            .map_err(|error| format!("management security audit refresh failed: {error}"))?;
+        let revision = store
+            .get_revision()
+            .await
+            .checked_add(1)
+            .ok_or_else(|| "management security catalog revision exhausted".to_owned())?;
+        let transaction = CatalogTxn::new(
+            revision,
+            rand::random::<u64>().max(1),
+            vec![CatalogMutation::AppendSecurityAudit(record.clone())],
+        )
+        .map_err(|error| format!("management security audit transaction failed: {error}"))?;
+        match store.commit_txn(transaction).await {
+            Ok(_) => return Ok(()),
+            Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
+                if attempt == 0 =>
+            {
+                continue;
+            }
+            Err(error) => return Err(format!("management security audit commit failed: {error}")),
+        }
+    }
+    Err("management security audit retry was exhausted".to_owned())
 }
 
 pub struct ManagementServiceHandle {
@@ -412,7 +861,13 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::GetClusterStatusRequest>,
     ) -> Result<Response<v1::GetClusterStatusResponse>, Status> {
         let _permit = self.acquire_request()?;
-        Self::ensure_version(request.into_inner().protocol_version)?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::ClusterObserve,
+            PolicyScope::Cluster,
+        )
+        .await?;
         let (workers, source_version) = self.nodes();
         let mut nodes = workers
             .into_iter()
@@ -462,8 +917,14 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::ListNodesRequest>,
     ) -> Result<Response<v1::ListNodesResponse>, Status> {
         let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::ClusterObserve,
+            PolicyScope::Cluster,
+        )
+        .await?;
         let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
         let size = page_size(request.page_size)?;
         let (workers, source_version) = self.nodes();
         let mut nodes = workers
@@ -486,12 +947,20 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::GetNodeRequest>,
     ) -> Result<Response<v1::GetNodeResponse>, Status> {
         let _permit = self.acquire_request()?;
-        let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
         let worker_id = request
+            .get_ref()
             .node_id
             .parse::<u64>()
             .map_err(|_| Status::invalid_argument("node_id must be an unsigned integer"))?;
+        self.authorize(
+            &request,
+            SecurityAction::ClusterObserve,
+            PolicyScope::Node {
+                node_id: worker_id.to_string(),
+            },
+        )
+        .await?;
         let (source, source_version) = self.nodes();
         let worker = source
             .into_iter()
@@ -510,8 +979,14 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::ListShardsRequest>,
     ) -> Result<Response<v1::ListShardsResponse>, Status> {
         let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::ClusterObserve,
+            PolicyScope::Cluster,
+        )
+        .await?;
         let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
         let size = page_size(request.page_size)?;
         let snapshot = self.shard_manager.snapshot();
         let source_version = format!("lease:{}:{}", snapshot.leader_epoch, snapshot.next_token);
@@ -545,12 +1020,20 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::GetShardRequest>,
     ) -> Result<Response<v1::GetShardResponse>, Status> {
         let _permit = self.acquire_request()?;
-        let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
         let shard_id = request
+            .get_ref()
             .shard_id
             .parse::<u64>()
             .map_err(|_| Status::invalid_argument("shard_id must be an unsigned integer"))?;
+        self.authorize(
+            &request,
+            SecurityAction::ClusterObserve,
+            PolicyScope::Shard {
+                shard_id: shard_id.to_string(),
+            },
+        )
+        .await?;
         let lease = self
             .shard_manager
             .get(ShardId(shard_id))
@@ -577,8 +1060,14 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::ListOperationsRequest>,
     ) -> Result<Response<v1::ListOperationsResponse>, Status> {
         let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::OperationHistoryRead,
+            PolicyScope::Cluster,
+        )
+        .await?;
         let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
         let size = page_size(request.page_size)?;
         let (items, next_page_token) = self
             .operations
@@ -599,8 +1088,16 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::GetOperationRequest>,
     ) -> Result<Response<v1::GetOperationResponse>, Status> {
         let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::OperationHistoryRead,
+            PolicyScope::Operation {
+                operation_id: request.get_ref().operation_id.clone(),
+            },
+        )
+        .await?;
         let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
         let record = self
             .operations
             .get(&request.operation_id)
@@ -622,7 +1119,13 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::GetConfigSummaryRequest>,
     ) -> Result<Response<v1::GetConfigSummaryResponse>, Status> {
         let _permit = self.acquire_request()?;
-        Self::ensure_version(request.into_inner().protocol_version)?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::DiagnosticsRead,
+            PolicyScope::Cluster,
+        )
+        .await?;
         let redacted = toml::Value::try_from(self.config.as_ref()).map_err(|error| {
             Status::internal(format!("effective config serialization failed: {error}"))
         })?;
@@ -641,7 +1144,13 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::GetCapabilitiesRequest>,
     ) -> Result<Response<v1::GetCapabilitiesResponse>, Status> {
         let _permit = self.acquire_request()?;
-        Self::ensure_version(request.into_inner().protocol_version)?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::ClusterObserve,
+            PolicyScope::Cluster,
+        )
+        .await?;
         let mut capabilities = vec![
             "GetClusterStatus".to_owned(),
             "ListNodes".to_owned(),
@@ -677,7 +1186,13 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::GetHealthRequest>,
     ) -> Result<Response<v1::GetHealthResponse>, Status> {
         let _permit = self.acquire_request()?;
-        Self::ensure_version(request.into_inner().protocol_version)?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::DiagnosticsRead,
+            PolicyScope::Cluster,
+        )
+        .await?;
         Ok(Response::new(v1::GetHealthResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -692,16 +1207,25 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::DrainWorkerRequest>,
     ) -> Result<Response<v1::DrainWorkerResponse>, Status> {
         let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        let worker_id = request
+            .get_ref()
+            .worker_id
+            .parse::<u64>()
+            .map_err(|_| Status::invalid_argument("worker_id must be an unsigned integer"))?;
+        self.authorize(
+            &request,
+            SecurityAction::NodeDrain,
+            PolicyScope::Node {
+                node_id: worker_id.to_string(),
+            },
+        )
+        .await?;
         let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
         let runtime = self
             .drain_runtime
             .as_ref()
             .ok_or_else(|| Status::unavailable("DrainWorker executor is not attached"))?;
-        let worker_id = request
-            .worker_id
-            .parse::<u64>()
-            .map_err(|_| Status::invalid_argument("worker_id must be an unsigned integer"))?;
         let accepted = self
             .operations
             .accept_idempotent(
@@ -734,12 +1258,21 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::MigrateShardRequest>,
     ) -> Result<Response<v1::MigrateShardResponse>, Status> {
         let _permit = self.acquire_request()?;
-        let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
         let shard_id = request
+            .get_ref()
             .shard_id
             .parse::<u64>()
             .map_err(|_| Status::invalid_argument("shard_id must be an unsigned integer"))?;
+        self.authorize(
+            &request,
+            SecurityAction::ShardMigrate,
+            PolicyScope::Shard {
+                shard_id: shard_id.to_string(),
+            },
+        )
+        .await?;
+        let request = request.into_inner();
         let target_node_id = request
             .target_node_id
             .parse::<u64>()
@@ -795,13 +1328,8 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::CreateBackupRequest>,
     ) -> Result<Response<v1::CreateBackupResponse>, Status> {
         let _permit = self.acquire_request()?;
-        let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
-        let runtime = self
-            .backup_runtime
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("CreateBackup executor is not attached"))?;
-        let destination = request.destination.trim();
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        let destination = request.get_ref().destination.trim().to_owned();
         if destination.is_empty()
             || destination.chars().any(char::is_control)
             || destination
@@ -816,13 +1344,26 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 "destination must be a local path, file:// path, or s3://bucket/prefix",
             ));
         }
+        self.authorize(
+            &request,
+            SecurityAction::BackupCreate,
+            PolicyScope::BackupDestination {
+                destination: destination.clone(),
+            },
+        )
+        .await?;
+        let request = request.into_inner();
+        let runtime = self
+            .backup_runtime
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("CreateBackup executor is not attached"))?;
         let accepted = self
             .operations
             .accept_idempotent(
                 &request.idempotency_key,
                 request.protocol_version as u16,
                 &CreateBackupDigest {
-                    destination: destination.to_owned(),
+                    destination: destination.clone(),
                 },
                 request.idempotency_key.clone(),
                 crate::management_store::OperationKind::CreateBackup,
@@ -847,8 +1388,16 @@ impl v1::management_service_server::ManagementService for ManagementService {
         request: Request<v1::CancelOperationRequest>,
     ) -> Result<Response<v1::CancelOperationResponse>, Status> {
         let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::OperationCancel,
+            PolicyScope::Operation {
+                operation_id: request.get_ref().operation_id.clone(),
+            },
+        )
+        .await?;
         let request = request.into_inner();
-        Self::ensure_version(request.protocol_version)?;
         let record = self
             .operations
             .get(&request.operation_id)
@@ -909,16 +1458,154 @@ impl v1::management_service_server::ManagementService for ManagementService {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use rockstream_types::authorization::{
+        LoginMethod, ScopedPresetGrant, SECURITY_PRINCIPAL_FORMAT_VERSION,
+    };
     use rockstream_types::topology::WorkerMessage;
+
+    #[test]
+    fn management_admin_requires_mtls_and_admin_grant_on_same_principal() {
+        let principal = |id, login_method, preset| SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(id),
+            display_name: format!("principal-{id}"),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![login_method],
+            preset_grants: vec![ScopedPresetGrant {
+                preset,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: Vec::new(),
+        };
+        let split = [
+            principal(
+                1,
+                LoginMethod::Mtls {
+                    certificate_sha256: [1; 32],
+                },
+                PermissionPreset::Operator,
+            ),
+            principal(
+                2,
+                LoginMethod::Oidc {
+                    issuer: "https://issuer.example".to_owned(),
+                    subject: "admin".to_owned(),
+                },
+                PermissionPreset::Administrator,
+            ),
+        ];
+        let mtls_admin = [principal(
+            3,
+            LoginMethod::Mtls {
+                certificate_sha256: [3; 32],
+            },
+            PermissionPreset::Administrator,
+        )];
+
+        assert_eq!(has_management_admin(&split), false);
+        assert_eq!(has_management_admin(&mtls_admin), true);
+    }
+
+    #[test]
+    fn unavailable_required_audit_closes_authenticated_session() {
+        let peer = ManagementConnectionInfo {
+            certificate_sha256: [7; 32],
+            principal_id: PrincipalId(1),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+        let mut request = Request::new(());
+        request.extensions_mut().insert(peer.clone());
+
+        let status = required_audit_unavailable(&request, "audit unavailable");
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "audit unavailable");
+        assert!(peer.is_closed());
+    }
+
+    async fn test_security_catalog() -> Arc<dyn CatalogStore> {
+        let catalog = Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
+            Arc::new(InMemory::new()),
+            "management-test",
+        ));
+        let principal = rockstream_types::authorization::SecurityPrincipal {
+            format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(1),
+            display_name: "management-test-operator".to_owned(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![rockstream_types::authorization::LoginMethod::Mtls {
+                certificate_sha256: [7; 32],
+            }],
+            preset_grants: vec![
+                rockstream_types::authorization::ScopedPresetGrant {
+                    preset: PermissionPreset::Administrator,
+                    scope: PolicyScope::Cluster,
+                },
+                rockstream_types::authorization::ScopedPresetGrant {
+                    preset: PermissionPreset::Operator,
+                    scope: PolicyScope::Cluster,
+                },
+            ],
+            scoped_grants: Vec::new(),
+        };
+        let audit = SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "management-test-bootstrap".to_owned(),
+            timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Known("principal:1".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::Known("1".to_owned()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(format!(
+                "revision={};policy={}",
+                principal.revision,
+                serde_json::to_string(&(
+                    principal.enabled,
+                    &principal.preset_grants,
+                    &principal.scoped_grants
+                ))
+                .unwrap()
+            )),
+        };
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    1,
+                    1,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal,
+                        expected_revision: None,
+                        grantor_revision: None,
+                        audit,
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        catalog
+    }
 
     async fn cluster_status(
         service: &ManagementService,
     ) -> Result<v1::GetClusterStatusResponse, Status> {
+        let mut request = Request::new(v1::GetClusterStatusRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        });
+        request.extensions_mut().insert(ManagementConnectionInfo {
+            certificate_sha256: [7; 32],
+            principal_id: PrincipalId(1),
+            closed: Arc::new(AtomicBool::new(false)),
+        });
         <ManagementService as v1::management_service_server::ManagementService>::get_cluster_status(
-            service,
-            Request::new(v1::GetClusterStatusRequest {
-                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            }),
+            service, request,
         )
         .await
         .map(Response::into_inner)
@@ -931,7 +1618,8 @@ mod tests {
             ShardManager::new(),
             ManagementOperationStore::new(Arc::new(InMemory::new())),
             NodeConfig::default(),
-        );
+        )
+        .with_security_catalog(test_security_catalog().await);
         let migration_waiters: ManagementAckWaiters =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let backup_waiters: ManagementAckWaiters =

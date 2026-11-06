@@ -144,7 +144,9 @@ fn validate_internal_transport(
     opts: &StartOptions,
     allow_insecure_internal_dev: bool,
 ) -> Result<(), CliError> {
-    if !matches!(opts.role.as_str(), "all" | "control" | "worker") {
+    if !matches!(opts.role.as_str(), "all" | "control" | "worker")
+        && !(opts.role == "gateway" && opts.control.is_some())
+    {
         return Ok(());
     }
 
@@ -180,7 +182,7 @@ fn validate_internal_transport(
     if !allow_insecure_internal_dev {
         return Err(CliError::new(
             rockstream_types::error_code::RS_2405,
-            "control and worker roles require internal mTLS",
+            "control, worker, and connected gateway roles require internal mTLS",
             "Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development.",
         ));
     }
@@ -189,6 +191,7 @@ fn validate_internal_transport(
         "all" => "127.0.0.1:0",
         "control" => opts.control_bind.as_deref().unwrap_or("127.0.0.1:8000"),
         "worker" => opts.control.as_deref().unwrap_or("127.0.0.1:8000"),
+        "gateway" => opts.control.as_deref().unwrap_or("127.0.0.1:8000"),
         _ => unreachable!("role was restricted above"),
     };
     let addr = addr
@@ -206,6 +209,99 @@ fn validate_internal_transport(
         ));
     }
     Ok(())
+}
+
+fn load_actor_assertion_signer(
+    node_config: &rockstream_types::config::NodeConfig,
+    internal_tls_key_path: Option<&std::path::Path>,
+) -> Result<rockstream_control::delegation::ActorAssertionSigner, CliError> {
+    let deployment_id = node_config
+        .node
+        .deployment_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CliError::new(
+                rockstream_types::error_code::RS_2400,
+                "gateway actor assertions require node.deployment_id",
+                "Set the same deployment ID on the gateway and control service.",
+            )
+        })?;
+    let key_path = node_config
+        .auth
+        .actor_assertion_signing_key_path
+        .as_deref()
+        .ok_or_else(|| {
+            CliError::new(
+                rockstream_types::error_code::RS_2400,
+                "gateway actor assertions require a dedicated RS256 signing key",
+                "Set auth.actor_assertion_signing_key_path to the deployment-managed private key.",
+            )
+        })?;
+    let signer =
+        rockstream_control::delegation::ActorAssertionSigner::from_pkcs8_pem(key_path, deployment_id)
+            .map_err(|error| {
+                CliError::new(
+                    rockstream_types::error_code::RS_2400,
+                    format!("gateway actor assertion signing key is invalid: {error}"),
+                    "Configure a supported RSA PKCS#8 or PKCS#1 private key and matching public JWK on control.",
+                )
+            })?;
+    let tls_key_paths = [
+        node_config.gateway.tls.key_path.as_deref(),
+        internal_tls_key_path,
+    ];
+    if tls_key_paths
+        .into_iter()
+        .flatten()
+        .any(|tls_path| signer.uses_same_key_as(tls_path).unwrap_or(false))
+    {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_2400,
+            "gateway actor assertion signing key must not reuse a TLS key pair",
+            "Configure a dedicated deployment-managed RS256 private key.",
+        ));
+    }
+    Ok(signer)
+}
+
+fn load_actor_assertion_verifier(
+    node_config: &rockstream_types::config::NodeConfig,
+) -> Result<Option<rockstream_control::delegation::ActorAssertionVerifier>, CliError> {
+    let Some(key_path) = node_config.auth.actor_assertion_public_key_path.as_deref() else {
+        return Ok(None);
+    };
+    let deployment_id = node_config
+        .node
+        .deployment_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CliError::new(
+                rockstream_types::error_code::RS_2400,
+                "control actor assertion verification requires node.deployment_id",
+                "Set the same deployment ID on the gateway and control service.",
+            )
+        })?;
+    rockstream_control::delegation::ActorAssertionVerifier::from_jwk_file(key_path, deployment_id)
+        .map(Some)
+        .map_err(|error| {
+            CliError::new(
+                rockstream_types::error_code::RS_2400,
+                format!("control actor assertion verification key is invalid: {error}"),
+                "Configure the matching RSA RS256 public JWK and deployment ID.",
+            )
+        })
+}
+
+fn configure_control_actor_assertions(
+    service: rockstream_control::ControlService,
+    node_config: &rockstream_types::config::NodeConfig,
+) -> Result<rockstream_control::ControlService, CliError> {
+    Ok(match load_actor_assertion_verifier(node_config)? {
+        Some(verifier) => service.with_actor_assertion_verifier(verifier),
+        None => service,
+    })
 }
 
 /// Options for `rockstream start`.
@@ -407,7 +503,7 @@ pub async fn start_gateway(
     opts: &StartOptions,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
-    start_gateway_with_catalog(opts, catalog).await
+    start_gateway_with_catalog_and_dev_transport(opts, catalog, false).await
 }
 
 fn gateway_start_error(context: &str, bind_next_steps: &str, error: std::io::Error) -> CliError {
@@ -438,11 +534,30 @@ pub async fn start_gateway_with_catalog(
     opts: &StartOptions,
     catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    start_gateway_with_catalog_and_dev_transport(opts, catalog, false).await
+}
+
+async fn start_gateway_with_dev_transport(
+    opts: &StartOptions,
+    allow_insecure_internal_dev: bool,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    start_gateway_with_catalog_and_dev_transport(opts, catalog, allow_insecure_internal_dev).await
+}
+
+async fn start_gateway_with_catalog_and_dev_transport(
+    opts: &StartOptions,
+    catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
+    allow_insecure_internal_dev: bool,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let node_config = opts
         .node_config
         .clone()
         .unwrap_or_else(|| rockstream_types::config::NodeConfig::from(&opts.config));
     validate_start_auth_modes(&opts.auth_mode, Some(&node_config))?;
+    if opts.control.is_some() {
+        validate_internal_transport(opts, allow_insecure_internal_dev)?;
+    }
     let gateway_shard_dir = opts.storage.join("gateway-shard");
     std::fs::create_dir_all(&gateway_shard_dir).map_err(|e| {
         CliError::new(
@@ -476,7 +591,15 @@ pub async fn start_gateway_with_catalog(
         })?;
     let shard_db = Arc::new(shard_db);
 
-    start_gateway_with_shard_and_catalog(opts, shard_db, store, "gateway", catalog).await
+    start_gateway_with_shard_and_catalog_and_dev_transport(
+        opts,
+        shard_db,
+        store,
+        "gateway",
+        catalog,
+        allow_insecure_internal_dev,
+    )
+    .await
 }
 
 /// Start the PostgreSQL wire gateway against an **already-open** shard
@@ -507,11 +630,36 @@ pub async fn start_gateway_with_shard_and_catalog(
     shard_path: &str,
     catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    start_gateway_with_shard_and_catalog_and_dev_transport(
+        opts, shard_db, store, shard_path, catalog, false,
+    )
+    .await
+}
+
+async fn start_gateway_with_shard_and_catalog_and_dev_transport(
+    opts: &StartOptions,
+    shard_db: Arc<rockstream_storage::ShardDb>,
+    store: Arc<dyn object_store::ObjectStore>,
+    shard_path: &str,
+    catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
+    allow_insecure_internal_dev: bool,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let node_config = opts
         .node_config
         .clone()
         .unwrap_or_else(|| rockstream_types::config::NodeConfig::from(&opts.config));
     validate_start_auth_modes(&opts.auth_mode, Some(&node_config))?;
+    let actor_assertion_signer = if opts.role == "gateway"
+        && opts.control.is_some()
+        && effective_start_auth_mode(&opts.auth_mode, &node_config) != "off"
+    {
+        Some(load_actor_assertion_signer(
+            &node_config,
+            opts.config.internal_tls.key_path.as_deref(),
+        )?)
+    } else {
+        None
+    };
     if catalog.get_durable_store().is_none() {
         let durable_catalog = Arc::new(
             rockstream_storage::catalog::DurableCatalogStore::recover(store.clone(), shard_path)
@@ -604,7 +752,7 @@ pub async fn start_gateway_with_shard_and_catalog(
     let auth_mode_str = effective_start_auth_mode(&opts.auth_mode, &node_config);
     tracing::info!("Gateway server starting with auth mode: {}", auth_mode_str);
 
-    let server = match auth_mode_str.as_str() {
+    let mut server = match auth_mode_str.as_str() {
         "off" => {
             rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db)
         }
@@ -694,6 +842,9 @@ pub async fn start_gateway_with_shard_and_catalog(
             ));
         }
     };
+    if let Some(signer) = actor_assertion_signer {
+        server = server.with_actor_assertion_signer(signer);
+    }
 
     let secret_store = rockstream_control::SecretStore::open_durable(
         format!("{shard_path}-secrets"),
@@ -726,8 +877,28 @@ pub async fn start_gateway_with_shard_and_catalog(
         .with_join_strategy(opts.config.execution.join_strategy);
     if opts.role == "gateway" {
         if let Some(control) = &opts.control {
+            let client = rockstream_runtime::data_plane::DataPlaneClient::new(control);
+            let client = if opts.config.internal_tls.is_enabled() {
+                client
+                    .with_internal_tls(&opts.config.internal_tls)
+                    .map_err(|error| {
+                        CliError::new(
+                            rockstream_types::error_code::RS_2405,
+                            format!("gateway internal mTLS setup failed: {error}"),
+                            "Check the gateway's internal certificate, private key, and trust roots.",
+                        )
+                    })?
+            } else if allow_insecure_internal_dev {
+                client.with_insecure_internal_dev()
+            } else {
+                return Err(CliError::new(
+                    rockstream_types::error_code::RS_2405,
+                    "gateway data-plane client requires internal mTLS",
+                    "Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development.",
+                ));
+            };
             server = server.with_distributed_data_plane(
-                rockstream_runtime::data_plane::DataPlaneClient::new(control),
+                client,
                 opts.storage
                     .join("distributed-shards")
                     .to_string_lossy()
@@ -866,6 +1037,42 @@ fn validate_start_auth_modes(
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+type InternalTlsReloadSignal = tokio::signal::unix::Signal;
+
+#[cfg(not(unix))]
+type InternalTlsReloadSignal = ();
+
+async fn wait_for_signal_or_tls_reload(
+    coordinator: &ShutdownCoordinator,
+    control: Option<&rockstream_control::ControlServiceHandle>,
+    tls: &rockstream_types::identity::InternalTlsConfig,
+    mut reload_signal: Option<&mut InternalTlsReloadSignal>,
+) {
+    #[cfg(unix)]
+    if tls.reload_enabled {
+        if let (Some(signal), Some(control)) = (reload_signal.take(), control) {
+            let shutdown = coordinator.wait_for_signal_or_trigger();
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    _ = signal.recv() => match control.reload_tls(tls.clone()) {
+                        Ok(()) => tracing::info!("internal TLS credentials reloaded after SIGHUP"),
+                        Err(error) => tracing::error!(%error, "internal TLS reload after SIGHUP failed"),
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = (control, tls, reload_signal);
+
+    coordinator.wait_for_signal_or_trigger().await;
 }
 
 /// Run `rockstream start`.
@@ -1020,6 +1227,29 @@ pub fn run_start_with_dev_transport(
             .unwrap_or(opts.config.cluster.shutdown_timeout_secs);
         let coordinator = ShutdownCoordinator::new(tracker.clone(), Duration::from_secs(timeout_secs));
 
+        #[cfg(unix)]
+        let mut tls_reload_signal = if matches!(opts.role.as_str(), "control" | "all")
+            && opts.config.internal_tls.is_enabled()
+            && opts.config.internal_tls.reload_enabled
+        {
+            Some(
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).map_err(
+                    |error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to register internal TLS reload signal: {error}"),
+                            "Verify the process can register SIGHUP for certificate reloads.",
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+
+        #[cfg(not(unix))]
+        let mut tls_reload_signal = None;
+
         let mut metrics_handle = None;
         if let Some(metrics_addr) = &opts.metrics_addr {
             let mh = metrics_server::start_management_server(metrics_addr, tracker.clone())
@@ -1051,13 +1281,44 @@ pub fn run_start_with_dev_transport(
         if opts.role == "all" {
             let catalog = rockstream_control::TopologyCatalog::new();
             let manager = rockstream_control::ShardManager::new();
-            let mut service = rockstream_control::ControlService::new(catalog.clone())
+            let service = rockstream_control::ControlService::new(catalog.clone())
                 .with_shard_manager(manager.clone())
                 .with_audit(audit_log.clone());
+            let mut service = configure_control_actor_assertions(service, &node_config)?;
             if opts.config.internal_tls.is_enabled() {
                 service = service.with_internal_tls(opts.config.internal_tls.clone());
             } else if allow_insecure_internal_dev {
                 service = service.with_insecure_dev_mode();
+            }
+            if opts.config.internal_tls.is_enabled()
+                || (opts.listen_addr.is_some() && node_config.control.management_addr.is_some())
+            {
+                let security_store = rockstream_storage::build_runtime_object_store(
+                    &opts.storage.join("shards/0"),
+                    "shards/0",
+                )
+                .map_err(|error| {
+                    CliError::new(
+                        RS_0003,
+                        format!("failed to open control security catalog: {error}"),
+                        "Check durable storage permissions and restore the security catalog.",
+                    )
+                })?;
+                let security_catalog = Arc::new(
+                    rockstream_storage::catalog::DurableCatalogStore::recover(
+                        security_store,
+                        "db",
+                    )
+                    .await
+                    .map_err(|error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to recover control security catalog: {error}"),
+                            "Restore the durable security catalog before starting control.",
+                        )
+                    })?,
+                );
+                service = service.with_security_catalog(security_catalog);
             }
             if opts.listen_addr.is_some() {
                 let store: Arc<dyn object_store::ObjectStore> = Arc::new(
@@ -1091,11 +1352,7 @@ pub fn run_start_with_dev_transport(
                     } else {
                         store.clone()
                     };
-                    service = service.with_management(
-                        addr.clone(),
-                        management_store,
-                        node_config.clone(),
-                    );
+                    service = service.with_management(addr.clone(), management_store, node_config.clone());
                 }
             }
             let handle = service
@@ -1114,14 +1371,45 @@ pub fn run_start_with_dev_transport(
             let catalog = rockstream_control::TopologyCatalog::new();
             let manager = rockstream_control::ShardManager::new();
             let frontier = Arc::new(rockstream_control::FrontierAggregator::new());
-            let mut service = rockstream_control::ControlService::new(catalog)
+            let service = rockstream_control::ControlService::new(catalog)
                 .with_shard_manager(manager.clone())
                 .with_frontier(frontier)
                 .with_audit(audit_log.clone());
+            let mut service = configure_control_actor_assertions(service, &node_config)?;
             if opts.config.internal_tls.is_enabled() {
                 service = service.with_internal_tls(opts.config.internal_tls.clone());
             } else if allow_insecure_internal_dev {
                 service = service.with_insecure_dev_mode();
+            }
+            if opts.config.internal_tls.is_enabled()
+                || (opts.daemon && node_config.control.management_addr.is_some())
+            {
+                let security_store = rockstream_storage::build_runtime_object_store(
+                    &opts.storage.join("gateway-shard"),
+                    "gateway-shard",
+                )
+                .map_err(|error| {
+                    CliError::new(
+                        RS_0003,
+                        format!("failed to open control security catalog: {error}"),
+                        "Check durable storage permissions and restore the security catalog.",
+                    )
+                })?;
+                let security_catalog = Arc::new(
+                    rockstream_storage::catalog::DurableCatalogStore::recover(
+                        security_store,
+                        "gateway",
+                    )
+                    .await
+                    .map_err(|error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to recover control security catalog: {error}"),
+                            "Restore the durable security catalog before starting control.",
+                        )
+                    })?,
+                );
+                service = service.with_security_catalog(security_catalog);
             }
 
             // v0.45.2 M7 S4/S5: state that must be visible to whichever
@@ -1386,7 +1674,7 @@ pub fn run_start_with_dev_transport(
             let gateway_result = if let Some((shard_db, store)) = shared_gateway_shard.take() {
                 start_gateway_with_shard(opts, shard_db, store, "db").await
             } else {
-                start_gateway(opts).await
+                start_gateway_with_dev_transport(opts, allow_insecure_internal_dev).await
             };
             match gateway_result {
                 Ok((local_addr, gw_handle)) => {
@@ -1408,7 +1696,13 @@ pub fn run_start_with_dev_transport(
                     if let Some(sleep_ms) = e2e_sleep {
                         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                     } else {
-                        coordinator.wait_for_signal_or_trigger().await;
+                        wait_for_signal_or_tls_reload(
+                            &coordinator,
+                            control_handle.as_ref(),
+                            &opts.config.internal_tls,
+                            tls_reload_signal.as_mut(),
+                        )
+                        .await;
                     }
 
                     tracing::info!("shutdown signal received — stopping gateway");
@@ -1453,7 +1747,13 @@ pub fn run_start_with_dev_transport(
                         role = %opts.role,
                         "node running in daemon mode — blocking until shutdown signal"
                     );
-                    coordinator.wait_for_signal_or_trigger().await;
+                    wait_for_signal_or_tls_reload(
+                        &coordinator,
+                        control_handle.as_ref(),
+                        &opts.config.internal_tls,
+                        tls_reload_signal.as_mut(),
+                    )
+                    .await;
                     tracing::info!("shutdown signal received — stopping daemon");
                 }
             } else {
@@ -2982,6 +3282,7 @@ pub fn run_config_print_effective(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rockstream_test_support::pki::TestPki;
 
     fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         run_start_with_dev_transport(opts, true)
@@ -3002,6 +3303,27 @@ mod tests {
             "RS-2405 control and worker roles require internal mTLS\n  next steps: Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development."
         );
         assert!(!storage.exists());
+    }
+
+    #[test]
+    fn control_mtls_start_recovers_security_catalog_without_management_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = TestPki::generate();
+        let config = RockstreamConfig {
+            internal_tls: pki.control_tls_config(),
+            ..RockstreamConfig::default()
+        };
+        let opts = StartOptions {
+            storage: dir.path().to_path_buf(),
+            role: "control".to_string(),
+            control_bind: Some("127.0.0.1:0".to_string()),
+            config,
+            ..StartOptions::default()
+        };
+
+        let outcome = run_start(&opts).expect("mTLS control startup recovers its audit catalog");
+        assert_eq!(outcome.audit_path, dir.path().join("audit.jsonl"));
+        assert!(outcome.bundle_path.exists());
     }
 
     #[test]
@@ -3160,6 +3482,47 @@ mod tests {
         node_config.gateway.tls.key_path = Some(PathBuf::from("gateway-key.pem"));
         node_config.gateway.tls.ca_cert_path = Some(PathBuf::from("client-ca.pem"));
         assert!(validate_start_auth_modes("mtls", Some(&node_config)).is_ok());
+    }
+
+    #[test]
+    fn actor_assertion_signing_key_is_required_and_separate_from_tls() {
+        let mut node_config = rockstream_types::config::NodeConfig::default();
+        node_config.node.deployment_id = Some("deployment-a".to_owned());
+        let missing = match load_actor_assertion_signer(&node_config, None) {
+            Ok(_) => panic!("missing actor assertion signing key was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            missing.to_string(),
+            "RS-2400 gateway actor assertions require a dedicated RS256 signing key\n  next steps: Set auth.actor_assertion_signing_key_path to the deployment-managed private key."
+        );
+
+        let signing_key = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rockstream-control/tests/fixtures/actor-assertion-test-key.pem");
+        node_config.auth.actor_assertion_signing_key_path = Some(signing_key.clone());
+        assert!(load_actor_assertion_signer(&node_config, None).is_ok());
+
+        let tls_dir = tempfile::tempdir().unwrap();
+        let gateway_key = tls_dir.path().join("gateway-key.pem");
+        std::fs::copy(&signing_key, &gateway_key).unwrap();
+        node_config.gateway.tls.key_path = Some(gateway_key);
+        let reused = match load_actor_assertion_signer(&node_config, None) {
+            Ok(_) => panic!("TLS key reuse was accepted for actor assertion signing"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            reused.to_string(),
+            "RS-2400 gateway actor assertion signing key must not reuse a TLS key pair\n  next steps: Configure a dedicated deployment-managed RS256 private key."
+        );
+
+        node_config.gateway.tls.key_path = None;
+        let internal_key = tls_dir.path().join("internal-key.pem");
+        std::fs::copy(&signing_key, &internal_key).unwrap();
+        let reused = match load_actor_assertion_signer(&node_config, Some(&internal_key)) {
+            Ok(_) => panic!("internal TLS key reuse was accepted for actor assertion signing"),
+            Err(error) => error,
+        };
+        assert_eq!(reused.to_string(), "RS-2400 gateway actor assertion signing key must not reuse a TLS key pair\n  next steps: Configure a dedicated deployment-managed RS256 private key.");
     }
 
     #[test]

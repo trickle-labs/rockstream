@@ -858,12 +858,20 @@ fn run_management<T>(
 where
     T: serde::Serialize + Formattable,
 {
-    let result = ManagementCliClient::connect(
-        override_addr
-            .or(cli.management.as_deref())
-            .unwrap_or("127.0.0.1:9201"),
-    )
-    .and_then(|mut client| request(&mut client))
+    let result = match tls_config(cli) {
+        Some(tls) => ManagementCliClient::connect(
+            override_addr
+                .or(cli.management.as_deref())
+                .unwrap_or("127.0.0.1:9201"),
+            tls,
+        )
+        .and_then(|mut client| request(&mut client)),
+        None => Err(rockstream_cli::CliError::new(
+            rockstream_types::error_code::RS_2410,
+            "management API requires client mTLS credentials",
+            "Configure --tls-cert-path, --tls-key-path, and --tls-ca-cert-path for the management client.",
+        )),
+    }
     .map(|output| render_output(&output, format));
     handle_result(result, format)
 }
