@@ -201,6 +201,13 @@ that plaintext received the TLS fatal decode-error alert and that the client
 refused both missing CA trust and an explicit plaintext URL. It does not
 eliminate the unsequenced audit race or establish the whole #303 release-endpoint
 matrix.
+The [real-worker test patch](issue-321-real-worker-reproducer.patch) applies
+with `rtk git apply --unidiff-zero` to the tested draft commit and expects the
+clean-source image tagged
+`rockstream-321-qual:d698bdfc88c1`. Run its selected test with
+`rtk cargo test -p rockstream-sim --test issue_321_real_process management_denial_and_drain_with_real_release_workers -- --exact`;
+Docker and the fixture's MinIO image are required. The patch is a qualification
+fixture, not a catalog repair or an assertion that the unsequenced race passes.
 An unauthenticated TLS handshake and a plaintext HTTP/2 preface were rejected;
 the latter received the TLS fatal decode-error alert `15 03 03 00 02 02 32`.
 When the test waited for each authentication-failure audit record before the
