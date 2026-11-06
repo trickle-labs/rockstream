@@ -185,7 +185,22 @@ that later commit changes CLI TLS reload code and tests, not the catalog store
 or management service. A separate unsequenced test on its clean-source release
 image `sha256:130672615eb2ec76df148ce95ab791e67d02a83f0287c488513e8640e3709813`
 reproduced the same catalog failure described below; it did not establish
-the serialized positive behavior for that later commit.
+the serialized positive behavior for that later commit. A subsequent temporary
+test used that image for a real control process and two real worker containers,
+with shard 77 initially assigned to worker 601 and backed by MinIO. Two
+unauthenticated gRPC attempts, for status and drain, each returned
+`Unknown error: transport error`; the test waited for each failure audit before
+the next attempt. A mapped principal without grants was denied both calls.
+The complete shard and operation lists, and node fields other than changing
+headroom and topology version, matched before and after rejection. Denial audit
+records matched exactly after normalizing generated IDs and timestamps. An
+authorized drain moved shard 77 to worker 602, completed at 100%, and the
+seeded key retained its exact value after the workers stopped and storage was
+reopened. The test passed twice. An extended run also passed after checking
+that plaintext received the TLS fatal decode-error alert and that the client
+refused both missing CA trust and an explicit plaintext URL. It does not
+eliminate the unsequenced audit race or establish the whole #303 release-endpoint
+matrix.
 An unauthenticated TLS handshake and a plaintext HTTP/2 preface were rejected;
 the latter received the TLS fatal decode-error alert `15 03 03 00 02 02 32`.
 When the test waited for each authentication-failure audit record before the
