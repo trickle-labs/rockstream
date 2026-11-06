@@ -383,9 +383,22 @@ pub enum ControlMessage {
     },
     /// Short-lived secret token encrypted for this worker identity.
     SecretTokenIssued { token: crate::secret::SecretToken },
+    /// A workload-scoped token refresh failed; revoke the cached token before any further use.
+    SecretTokenRejected {
+        workload_id: crate::ids::WorkloadId,
+        secret_name: String,
+        code: String,
+        message: String,
+        retry: bool,
+    },
     /// A secret changed and workers should request a fresh token at an epoch boundary.
     SecretRotated {
         rotation: crate::secret::SecretRotation,
+    },
+    /// A workload needs a fresh token for one referenced secret.
+    SecretRefreshRequired {
+        workload_id: crate::ids::WorkloadId,
+        secret_name: String,
     },
     /// Published by the control plane after all workers have reported their
     /// pressure samples; consumers (HPA adapters) read this gauge (v0.47).
@@ -927,6 +940,11 @@ pub enum WorkerMessage {
     },
     /// Request a short-lived token for a catalog secret.
     ResolveSecretToken {
+        secret_name: String,
+    },
+    /// Request a short-lived token for a secret referenced by one active workload.
+    ResolveWorkloadSecretToken {
+        workload_id: crate::ids::WorkloadId,
         secret_name: String,
     },
 }
