@@ -796,9 +796,17 @@ impl ClusterWorkerPressure {
 }
 
 /// A message sent from a worker to the control plane.
+pub const DATA_PLANE_DELEGATION_VERSION: u16 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerMessage {
+    /// Actor-authorized gateway request over the internal data-plane transport.
+    DelegatedDataPlane {
+        version: u16,
+        actor_assertion: String,
+        request: Box<WorkerMessage>,
+    },
     /// Initial registration request.
     Register(WorkerRegistration),
     DeployWorkload(crate::data_plane::DeploymentRequest),

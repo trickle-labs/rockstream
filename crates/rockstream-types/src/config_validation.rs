@@ -239,7 +239,7 @@ const KNOWN_NODE_CONFIG_ROOT_KEYS: &[&str] = &[
     "runtime",
 ];
 
-const KNOWN_NODE_SECTION_KEYS: &[&str] = &["role", "host_id", "availability_zone"];
+const KNOWN_NODE_SECTION_KEYS: &[&str] = &["role", "deployment_id", "host_id", "availability_zone"];
 const KNOWN_GATEWAY_SECTION_KEYS: &[&str] = &[
     "listen_addr",
     "max_connections",
@@ -273,6 +273,8 @@ const KNOWN_AUTH_SECTION_KEYS: &[&str] = &[
     "oidc_issuer",
     "oidc_audience",
     "oidc_jwks_url",
+    "actor_assertion_signing_key_path",
+    "actor_assertion_public_key_path",
 ];
 const KNOWN_LOGGING_SECTION_KEYS: &[&str] = &["level", "format"];
 const KNOWN_RUNTIME_SECTION_KEYS: &[&str] = &[
@@ -1140,6 +1142,32 @@ pub fn validate_node_config_semantic_bounds(
             message: "mTLS requires gateway TLS certificate, key, and client CA paths".to_string(),
             suggestion: Some(
                 "Configure gateway.tls.cert_path, key_path, and ca_cert_path".to_string(),
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    let assertion_keys_configured = node_cfg.auth.actor_assertion_signing_key_path.is_some()
+        || node_cfg.auth.actor_assertion_public_key_path.is_some();
+    let deployment_id_missing = node_cfg
+        .node
+        .deployment_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty());
+    if (assertion_keys_configured && deployment_id_missing)
+        || (node_cfg.control.url.is_some()
+            && matches!(node_cfg.node.role.trim(), "gateway" | "all")
+            && auth_mode_norm != "off"
+            && (node_cfg.auth.actor_assertion_signing_key_path.is_none() || deployment_id_missing))
+    {
+        diagnostics.push(ConfigDiagnostic {
+            path: "auth.actor_assertion_signing_key_path".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "cross-process gateway delegation requires a dedicated RS256 signing key and deployment ID".to_string(),
+            suggestion: Some(
+                "Configure node.deployment_id and auth.actor_assertion_signing_key_path; distribute the matching public JWK to control".to_string(),
             ),
             line: None,
             column: None,

@@ -13,18 +13,191 @@ use rockstream_cli::output::OutputFormat;
 use rockstream_cli::run_cluster_status;
 use rockstream_cli::transport::{ClientIdentity, ControlClient};
 use rockstream_control::audit::FileAuditLog;
+use rockstream_control::delegation::{
+    request_digest, ActorAssertionSigner, ActorAssertionVerifier,
+};
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
 use rockstream_runtime::client::start_worker_client_with_tls;
-use rockstream_storage::catalog::DurableCatalogStore;
+use rockstream_runtime::data_plane::DataPlaneClient;
+use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
 use rockstream_test_support::pki::TestPki;
-use rockstream_types::error_code::{RS_2410, RS_2411};
-use rockstream_types::ids::{ShardId, WorkerId};
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
+    ResourceKind, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
+    SECURITY_PRINCIPAL_FORMAT_VERSION,
+};
+use rockstream_types::error_code::{RS_2400, RS_2410, RS_2411, RS_2412};
+use rockstream_types::ids::{OperatorId, PrincipalId, ShardId, WorkerId, WorkloadId};
+use rockstream_types::{config::JoinStrategy, data_plane::DeploymentRequest};
+
+#[path = "common/management_auth.rs"]
+mod management_auth;
 
 fn security_audit_catalog() -> Arc<DurableCatalogStore> {
     Arc::new(DurableCatalogStore::new(
         Arc::new(object_store::memory::InMemory::new()),
         "internal-mtls-test",
     ))
+}
+
+fn delegated_view_request() -> DeploymentRequest {
+    DeploymentRequest {
+        version: rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION,
+        workload_id: WorkloadId(42),
+        namespace: "public".to_owned(),
+        workload_name: "delegated_view".to_owned(),
+        plan_json: "{}".to_owned(),
+        join_strategy: JoinStrategy::Auto,
+        schemas: Vec::new(),
+        frontier: 0,
+        storage_root: "/tmp/test-delegated-view".to_owned(),
+        sink_operator_id: OperatorId(43),
+        output_columns: Vec::new(),
+        primary_key: Vec::new(),
+        merge_key_columns: Vec::new(),
+        routing_columns: Default::default(),
+    }
+}
+
+fn sign_delegated_view_request(principal_id: PrincipalId, request: &DeploymentRequest) -> String {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let signer = ActorAssertionSigner::from_pkcs8_pem(
+        &fixtures.join("actor-assertion-test-key.pem"),
+        "test-deployment",
+    )
+    .unwrap();
+    let worker_request = rockstream_types::topology::WorkerMessage::DeployWorkload(request.clone());
+    signer
+        .issue(
+            principal_id,
+            1,
+            SecurityAction::ViewAuthor,
+            PolicyScope::Resource {
+                namespace: request.namespace.clone(),
+                kind: ResourceKind::View,
+                name: request.workload_name.clone(),
+            },
+            request_digest(&worker_request).unwrap(),
+        )
+        .unwrap()
+}
+
+fn security_policy_state(principal: &SecurityPrincipal) -> String {
+    format!(
+        "revision={};policy={}",
+        principal.revision,
+        serde_json::to_string(&(
+            principal.enabled,
+            &principal.preset_grants,
+            &principal.scoped_grants,
+        ))
+        .unwrap()
+    )
+}
+
+async fn provision_view_author(auth: &management_auth::ManagementAuth) {
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Scoped view author".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Mtls {
+            certificate_sha256: [2; 32],
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Builder,
+            scope: PolicyScope::Resource {
+                namespace: "public".to_owned(),
+                kind: ResourceKind::View,
+                name: "delegated_view".to_owned(),
+            },
+        }],
+        scoped_grants: Vec::new(),
+    };
+    let after_state = security_policy_state(&principal);
+    let audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "delegation-test-principal".to_owned(),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("2".to_owned()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(after_state),
+    };
+    auth.catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal,
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn revoke_view_author(auth: &management_auth::ManagementAuth) {
+    let mut principal = auth
+        .catalog
+        .get_security_principal(PrincipalId(2))
+        .await
+        .unwrap()
+        .unwrap();
+    let before_state = security_policy_state(&principal);
+    principal.revision = 2;
+    principal.preset_grants.clear();
+    let after_state = security_policy_state(&principal);
+    let audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "delegation-test-revoke".to_owned(),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("3".to_owned()),
+        policy_revision: AuditField::Known(2),
+        before_state: AuditField::Known(before_state),
+        after_state: AuditField::Known(after_state),
+    };
+    auth.catalog
+        .commit_txn(
+            CatalogTxn::new(
+                auth.catalog.get_revision().await + 1,
+                3,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal,
+                    expected_revision: Some(1),
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -43,6 +216,179 @@ async fn internal_mtls_requires_security_audit_catalog() {
         error.to_string(),
         "RS-2405: internal mTLS requires the durable security audit catalog"
     );
+}
+
+#[tokio::test]
+async fn gateway_data_plane_requires_actor_assertion_and_audits_wrong_role() {
+    let pki = TestPki::generate();
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(&audit_dir.path().join("audit.jsonl")).unwrap());
+    let security_catalog = security_audit_catalog();
+    let service = ControlService::new(TopologyCatalog::new())
+        .with_audit(audit)
+        .with_security_catalog(security_catalog.clone())
+        .with_internal_tls(pki.control_tls_config());
+    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let control_addr = handle.addr.to_string();
+
+    let gateway = rockstream_runtime::data_plane::DataPlaneClient::new(&control_addr)
+        .with_internal_tls(&pki.gateway_tls_config())
+        .unwrap();
+    let missing_assertion = gateway.read_workload(WorkloadId(1)).await.unwrap_err();
+    assert_eq!(
+        missing_assertion.to_string(),
+        format!(
+            "{RS_2400}: a valid user actor assertion is required for gateway data-plane requests"
+        )
+    );
+
+    let wrong_role = rockstream_runtime::data_plane::DataPlaneClient::new(&control_addr)
+        .with_internal_tls(&pki.cli_tls_config())
+        .unwrap()
+        .read_workload(WorkloadId(1))
+        .await
+        .unwrap_err();
+    let records = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    let missing_assertion = records
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::AuthenticationFailure)
+        .expect("missing actor assertion is durably audited");
+    assert_eq!(
+        missing_assertion.actor,
+        AuditIdentity::Unverified("gateway:gateway-1".to_owned())
+    );
+    assert_eq!(
+        missing_assertion.outcome,
+        rockstream_types::authorization::SecurityAuditOutcome::Denied
+    );
+    let rejection = records
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::NodeIdentityRejection)
+        .expect("wrong gateway role is durably audited");
+    assert_eq!(
+        wrong_role.to_string(),
+        format!("{RS_2412}: certificate identity is not authorized for the gateway data plane"),
+    );
+
+    assert_eq!(
+        rejection.actor,
+        AuditIdentity::Unverified("cli:admin".to_owned())
+    );
+    assert_eq!(
+        rejection.outcome,
+        rockstream_types::authorization::SecurityAuditOutcome::Denied
+    );
+}
+
+#[tokio::test]
+async fn gateway_actor_assertion_intersects_current_durable_policy() {
+    let auth = management_auth::ManagementAuth::new(&[]).await;
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let verifier = ActorAssertionVerifier::from_jwk_file(
+        &fixtures.join("actor-assertion-test-public.jwk"),
+        "test-deployment",
+    )
+    .unwrap();
+    let request = delegated_view_request();
+    let assertion = sign_delegated_view_request(PrincipalId(1), &request);
+
+    let service = ControlService::new(TopologyCatalog::new())
+        .with_security_catalog(auth.catalog.clone())
+        .with_internal_tls(auth.pki.control_tls_config())
+        .with_actor_assertion_verifier(verifier);
+    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let gateway = DataPlaneClient::new(handle.addr.to_string())
+        .with_internal_tls(&auth.pki.gateway_tls_config())
+        .unwrap();
+    let error = gateway
+        .deploy_delegated(request, &assertion)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "RS-2401: asserted user actor is no longer authorized for this operation and scope"
+    );
+
+    let records = auth.catalog.list_security_audit_records().await.unwrap();
+    let denied = records
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+        .expect("current durable actor policy denied the assertion");
+    assert_eq!(
+        denied.actor,
+        AuditIdentity::Verified("principal-1".to_owned())
+    );
+    assert_eq!(denied.target, AuditField::Known("ViewAuthor".to_owned()));
+    assert_eq!(denied.policy_revision, AuditField::Known(1));
+    assert_eq!(denied.outcome, SecurityAuditOutcome::Denied);
+}
+
+#[tokio::test]
+async fn gateway_actor_assertion_allows_independent_scoped_grant() {
+    let auth = management_auth::ManagementAuth::new(&[]).await;
+    provision_view_author(&auth).await;
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let verifier = ActorAssertionVerifier::from_jwk_file(
+        &fixtures.join("actor-assertion-test-public.jwk"),
+        "test-deployment",
+    )
+    .unwrap();
+    let request = delegated_view_request();
+    let assertion = sign_delegated_view_request(PrincipalId(2), &request);
+
+    let service = ControlService::new(TopologyCatalog::new())
+        .with_security_catalog(auth.catalog.clone())
+        .with_internal_tls(auth.pki.control_tls_config())
+        .with_actor_assertion_verifier(verifier);
+    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let gateway = DataPlaneClient::new(handle.addr.to_string())
+        .with_internal_tls(&auth.pki.gateway_tls_config())
+        .unwrap();
+    let error = gateway
+        .deploy_delegated(request.clone(), &assertion)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "RS-0001: no healthy workers available");
+    revoke_view_author(&auth).await;
+    let revoked = gateway
+        .deploy_delegated(request, &assertion)
+        .await
+        .unwrap_err();
+    let records = auth.catalog.list_security_audit_records().await.unwrap();
+    let denied = records
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+        .expect("revoked actor policy denial is durably audited");
+    assert_eq!(denied.policy_revision, AuditField::Known(2));
+    assert_eq!(
+        revoked.to_string(),
+        "RS-2401: asserted user actor is no longer authorized for this operation and scope"
+    );
+
+    let accepted = records
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::AuthenticationSuccess)
+        .expect("current scoped grant accepted the assertion");
+    assert_eq!(
+        accepted.actor,
+        AuditIdentity::Verified("principal-2".to_owned())
+    );
+    assert_eq!(accepted.target, AuditField::Known("ViewAuthor".to_owned()));
+    assert_eq!(accepted.policy_revision, AuditField::Known(1));
+    assert_eq!(accepted.outcome, SecurityAuditOutcome::Success);
+    let denied = records
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+        .expect("revoked actor policy denied the still-valid assertion");
+    assert_eq!(
+        denied.actor,
+        AuditIdentity::Verified("principal-2".to_owned())
+    );
+    assert_eq!(denied.policy_revision, AuditField::Known(2));
+    assert_eq!(denied.outcome, SecurityAuditOutcome::Denied);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

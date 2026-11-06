@@ -71,11 +71,9 @@ Only retire the previous key after successful recovery and durable rotation.
 Use one shared `SecretStore` for a catalog; independent instances must not mutate
 that catalog during rotation. Rotation stages memory proportional to the catalog.
 
-Workers receive short-lived tokens over authenticated mTLS. The worker token
-request path still lacks the required signed actor assertion and current actor
-policy check, so delegated worker secret resolution remains unqualified.
-Decrypted payloads remain in worker process memory and are refreshed at the
-next epoch after an `ALTER SECRET`; they are never written to worker storage.
+Workers receive short-lived tokens over authenticated mTLS. Decrypted payloads
+remain in worker process memory and are refreshed at the next epoch after an
+`ALTER SECRET`; they are never written to worker storage.
 
 Connector SQL continues to accept `secret = '<name>'`; newly persisted source
 and sink metadata uses the canonical `secret://<name>` reference. A role preset
@@ -120,6 +118,12 @@ Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographica
 The control-worker TCP listener used for registration, heartbeats, and shard leases requires internal mTLS and a durable security catalog for node-identity rejection audit. Control and embedded `all` roles must recover that catalog before opening the listener. Control, worker, and embedded `all` roles need a certificate, matching private key, trusted CA roots, and `client_auth_required = true`; invalid or incomplete TLS material, or an unavailable control security catalog, fails startup before the listener opens.
 
 For local development only, `--allow-insecure-internal-dev` explicitly permits plaintext control traffic when the control listener or worker target uses a literal loopback socket address. The option rejects non-loopback addresses and must not be used for production or release qualification.
+
+When a gateway connects to `--control`, its cross-process SQL data-plane client uses internal mTLS and presents a CA-verified `Gateway` node identity. For authenticated gateway configurations, each deploy, source-delta, workload-read, and operator-stats request carries a short-lived RS256 actor assertion. The gateway signs it with the dedicated deployment-managed private key at `auth.actor_assertion_signing_key_path`; control verifies it with the matching RSA public JWK at `auth.actor_assertion_public_key_path`. Both nodes require the same `node.deployment_id`. The assertion audience is exactly `rockstream-control:<deployment_id>`, and its lifetime is 60 seconds. Control verifies the gateway certificate role, signature, deployment, request digest, action and scope, then checks the actor's current durable grants. Effective authority is the intersection of the asserted allowance and those current grants. Missing keys, invalid assertions, disabled actors, and revoked grants are rejected and audited before the data-plane request is dispatched. The signing private key must not be the internal TLS key.
+
+The explicit loopback plaintext development mode continues to permit bare data-plane messages for local development. It does not establish a verified node identity and cannot carry actor assertions; signed delegation requires internal mTLS. This gateway data-plane assertion path does not cover worker secret-token delegation: that path still lacks the required actor assertion and current actor-policy check, so delegated worker secret resolution remains unqualified.
+
+Configure the values in the node configuration file or with `ROCKSTREAM_NODE_DEPLOYMENT_ID`, `ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH` on the gateway, and `ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH` on control. The public JWK must contain one RSA signing key with `kty=RSA`, `alg=RS256`, and `use=sig`; distribute it through the deployment's trusted configuration channel.
 
 Worker shuffle and native management APIs are separate transport boundaries. A configured worker shuffle endpoint requires certificate, key, CA roots, and mutual TLS; plaintext servers and clients are limited to literal loopback addresses. Shuffle clients verify the advertised worker ID against the peer certificate's `worker-<id>` DNS name, and the server rejects RPCs from CA-verified certificates whose parsed node role is not `Worker` before reading frames. This is partial enforcement: the server does not yet bind the peer certificate to a registered worker ID or shard assignment, role denials are only transiently logged, and the rejected RPC does not close its underlying HTTP/2 connection. Keep worker shuffle qualification blocked until durable denial audit, connection rejection, and assignment binding are demonstrated.
 
