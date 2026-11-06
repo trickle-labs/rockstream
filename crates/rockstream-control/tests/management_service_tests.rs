@@ -203,7 +203,7 @@ async fn management_denial_is_audited_without_tearing_down_session_or_mutating_s
 
 #[tokio::test]
 async fn management_principal_listing_pages_grants_without_exposing_login_credentials() {
-    let auth = ManagementAuth::new(&[]).await;
+    let auth = ManagementAuth::with_presets(&[], &[PermissionPreset::Administrator]).await;
     let principal = SecurityPrincipal {
         format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
         id: PrincipalId(2),
@@ -217,12 +217,20 @@ async fn management_principal_listing_pages_grants_without_exposing_login_creden
             stored_key: vec![0x22; 32],
             server_key: vec![0x33; 32],
         }],
-        preset_grants: vec![ScopedPresetGrant {
-            preset: PermissionPreset::DataReader,
-            scope: PolicyScope::Namespace {
-                namespace: "sales".to_owned(),
+        preset_grants: vec![
+            ScopedPresetGrant {
+                preset: PermissionPreset::DataReader,
+                scope: PolicyScope::Namespace {
+                    namespace: "sales".to_owned(),
+                },
             },
-        }],
+            ScopedPresetGrant {
+                preset: PermissionPreset::Builder,
+                scope: PolicyScope::Namespace {
+                    namespace: "sales".to_owned(),
+                },
+            },
+        ],
         scoped_grants: vec![ScopedActionGrant {
             action: SecurityAction::SecretUse,
             scope: PolicyScope::Secret {
@@ -298,17 +306,23 @@ async fn management_principal_listing_pages_grants_without_exposing_login_creden
                 display_name: "Management test administrator".to_owned(),
                 enabled: true,
                 revision: 1,
-                preset_grants: vec![
-                    rockstream_management_proto::v1::SecurityPresetGrant {
-                        preset: "administrator".to_owned(),
-                        scope_json: "\"cluster\"".to_owned(),
-                    },
-                    rockstream_management_proto::v1::SecurityPresetGrant {
-                        preset: "operator".to_owned(),
-                        scope_json: "\"cluster\"".to_owned(),
-                    },
-                ],
+                preset_grants: vec![rockstream_management_proto::v1::SecurityPresetGrant {
+                    preset: "administrator".to_owned(),
+                    scope_json: "\"cluster\"".to_owned(),
+                }],
                 scoped_grants: Vec::new(),
+                effective_permissions: vec![
+                    management_action("principal_manage", "\"cluster\""),
+                    management_action("grant_manage", "\"cluster\""),
+                    management_action("auth_config_manage", "\"cluster\""),
+                    management_action("secret_metadata_read", "\"cluster\""),
+                    management_action("secret_manage", "\"cluster\""),
+                    management_action("secret_rotate", "\"cluster\""),
+                    management_action("security_audit_read", "\"cluster\""),
+                    management_action("schema_drop", "\"cluster\""),
+                    management_action("namespace_create", "\"cluster\""),
+                    management_action("index_manage", "\"cluster\""),
+                ],
             }],
             next_page_token: "1".to_owned(),
         }
@@ -332,16 +346,65 @@ async fn management_principal_listing_pages_grants_without_exposing_login_creden
                 display_name: "SCRAM reader".to_owned(),
                 enabled: true,
                 revision: 1,
-                preset_grants: vec![rockstream_management_proto::v1::SecurityPresetGrant {
-                    preset: "data_reader".to_owned(),
-                    scope_json:
-                        "{\"namespace\":{\"namespace\":\"sales\"}}".to_owned(),
-                }],
+                preset_grants: vec![
+                    rockstream_management_proto::v1::SecurityPresetGrant {
+                        preset: "data_reader".to_owned(),
+                        scope_json:
+                            "{\"namespace\":{\"namespace\":\"sales\"}}".to_owned(),
+                    },
+                    rockstream_management_proto::v1::SecurityPresetGrant {
+                        preset: "builder".to_owned(),
+                        scope_json:
+                            "{\"namespace\":{\"namespace\":\"sales\"}}".to_owned(),
+                    },
+                ],
                 scoped_grants: vec![rockstream_management_proto::v1::SecurityActionGrant {
                     action: "secret_use".to_owned(),
                     scope_json: "{\"secret\":{\"namespace\":\"sales\",\"name\":\"warehouse\",\"consumer\":2}}"
                         .to_owned(),
                 }],
+                effective_permissions: vec![
+                    management_action(
+                        "metadata_inspect",
+                        "{\"namespace\":{\"namespace\":\"sales\"}}",
+                    ),
+                    management_action(
+                        "data_read",
+                        "{\"namespace\":{\"namespace\":\"sales\"}}",
+                    ),
+                    management_action(
+                        "data_subscribe",
+                        "{\"namespace\":{\"namespace\":\"sales\"}}",
+                    ),
+                    management_action(
+                        "data_write",
+                        "{\"namespace\":{\"namespace\":\"sales\"}}",
+                    ),
+                    management_action(
+                        "view_author",
+                        "{\"namespace\":{\"namespace\":\"sales\"}}",
+                    ),
+                    management_action(
+                        "table_create",
+                        "{\"namespace\":{\"namespace\":\"sales\"}}",
+                    ),
+                    management_action(
+                        "source_lifecycle",
+                        "{\"namespace\":{\"namespace\":\"sales\"}}",
+                    ),
+                    management_action(
+                        "workload_change",
+                        "{\"namespace\":{\"namespace\":\"sales\"}}",
+                    ),
+                    management_action(
+                        "schema_create",
+                        "{\"namespace\":{\"namespace\":\"sales\"}}",
+                    ),
+                    management_action(
+                        "secret_use",
+                        "{\"secret\":{\"namespace\":\"sales\",\"name\":\"warehouse\",\"consumer\":2}}",
+                    ),
+                ],
             }],
             next_page_token: String::new(),
         }
@@ -351,6 +414,16 @@ async fn management_principal_listing_pages_grants_without_exposing_login_creden
     assert!(!response_text.contains("stored_key"));
     assert!(!response_text.contains("server_key"));
     server.shutdown();
+}
+
+fn management_action(
+    action: &str,
+    scope_json: &str,
+) -> rockstream_management_proto::v1::SecurityActionGrant {
+    rockstream_management_proto::v1::SecurityActionGrant {
+        action: action.to_owned(),
+        scope_json: scope_json.to_owned(),
+    }
 }
 
 #[tokio::test]

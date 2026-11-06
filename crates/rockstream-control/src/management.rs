@@ -765,6 +765,11 @@ fn timestamp(epoch_ms: i64) -> String {
         .unwrap_or_else(|| format!("unix-ms:{epoch_ms}"))
 }
 
+fn encode_policy<T: Serialize>(value: &T) -> Result<String, Status> {
+    serde_json::to_string(value)
+        .map_err(|_| Status::internal("failed to encode security policy metadata"))
+}
+
 fn page_size(requested: u32) -> Result<usize, Status> {
     let size = if requested == 0 {
         DEFAULT_PAGE_SIZE
@@ -969,18 +974,37 @@ impl v1::management_service_server::ManagementService for ManagementService {
         let principals = principals
             .into_iter()
             .map(|principal| {
+                let mut effective = Vec::new();
+                for grant in &principal.preset_grants {
+                    for action in grant.preset.actions() {
+                        let permission = (*action, grant.scope.clone());
+                        if !effective.contains(&permission) {
+                            effective.push(permission);
+                        }
+                    }
+                }
+                for grant in &principal.scoped_grants {
+                    let permission = (grant.action, grant.scope.clone());
+                    if !effective.contains(&permission) {
+                        effective.push(permission);
+                    }
+                }
+                let effective_permissions = effective
+                    .into_iter()
+                    .map(|(action, scope)| {
+                        Ok(v1::SecurityActionGrant {
+                            action: encode_policy(&action)?.trim_matches('"').to_owned(),
+                            scope_json: encode_policy(&scope)?,
+                        })
+                    })
+                    .collect::<Result<_, Status>>()?;
                 let preset_grants = principal
                     .preset_grants
                     .into_iter()
                     .map(|grant| {
                         Ok(v1::SecurityPresetGrant {
-                            preset: serde_json::to_string(&grant.preset)
-                                .map_err(|_| Status::internal("failed to encode security preset"))?
-                                .trim_matches('"')
-                                .to_owned(),
-                            scope_json: serde_json::to_string(&grant.scope).map_err(|_| {
-                                Status::internal("failed to encode security grant scope")
-                            })?,
+                            preset: encode_policy(&grant.preset)?.trim_matches('"').to_owned(),
+                            scope_json: encode_policy(&grant.scope)?,
                         })
                     })
                     .collect::<Result<_, Status>>()?;
@@ -989,13 +1013,8 @@ impl v1::management_service_server::ManagementService for ManagementService {
                     .into_iter()
                     .map(|grant| {
                         Ok(v1::SecurityActionGrant {
-                            action: serde_json::to_string(&grant.action)
-                                .map_err(|_| Status::internal("failed to encode security action"))?
-                                .trim_matches('"')
-                                .to_owned(),
-                            scope_json: serde_json::to_string(&grant.scope).map_err(|_| {
-                                Status::internal("failed to encode security grant scope")
-                            })?,
+                            action: encode_policy(&grant.action)?.trim_matches('"').to_owned(),
+                            scope_json: encode_policy(&grant.scope)?,
                         })
                     })
                     .collect::<Result<_, Status>>()?;
@@ -1006,6 +1025,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                     revision: principal.revision,
                     preset_grants,
                     scoped_grants,
+                    effective_permissions,
                 })
             })
             .collect::<Result<_, Status>>()?;

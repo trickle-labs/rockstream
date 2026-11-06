@@ -147,6 +147,7 @@ message SecurityPrincipal {
   uint64 revision = 4;
   repeated SecurityPresetGrant preset_grants = 5;
   repeated SecurityActionGrant scoped_grants = 6;
+  repeated SecurityActionGrant effective_permissions = 7;
 }
 message SecurityPresetGrant {
   string preset = 1;
