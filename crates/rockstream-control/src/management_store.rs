@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-pub const MANAGEMENT_OPERATION_RECORD_VERSION: u16 = 2;
+pub const MANAGEMENT_OPERATION_RECORD_VERSION: u16 = 3;
 pub const IDEMPOTENCY_KEY_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 pub const TERMINAL_OPERATION_RETENTION_MS: i64 = IDEMPOTENCY_KEY_RETENTION_MS;
 pub const MAX_ACTIVE_OPERATIONS: usize = 1_000;
@@ -19,6 +19,7 @@ const MAX_OPERATION_ID_BYTES: usize = 128;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const IDEMPOTENCY_RECORD_VERSION: u16 = 1;
 const LEGACY_OPERATION_RECORD_VERSION: u16 = 1;
+const PREVIOUS_OPERATION_RECORD_VERSION: u16 = 2;
 const MAX_OPERATION_TRANSITIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub enum OperationKind {
     DrainWorker,
     MigrateShard,
     CreateBackup,
+    SecurityPrincipalGrants,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +78,8 @@ pub struct OperationRecord {
     next_steps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
 }
 
 /// Durable binding of one client idempotency key to one accepted operation.
@@ -128,6 +132,7 @@ impl OperationRecord {
             error_code: None,
             next_steps: Vec::new(),
             request,
+            result: None,
         }
     }
 
@@ -173,6 +178,10 @@ impl OperationRecord {
 
     pub fn request(&self) -> Option<&serde_json::Value> {
         self.request.as_ref()
+    }
+
+    pub fn result(&self) -> Option<&serde_json::Value> {
+        self.result.as_ref()
     }
 
     pub fn apply_update(&mut self, update: OperationUpdate) -> Result<(), OperationLifecycleError> {
@@ -285,7 +294,7 @@ fn decode_operation_record(bytes: &[u8]) -> Result<OperationRecord, OperationSto
     let mut record: OperationRecord = serde_json::from_slice(bytes)
         .map_err(|error| OperationStoreError::CorruptRecord(error.to_string()))?;
     match record.record_version {
-        LEGACY_OPERATION_RECORD_VERSION => {
+        LEGACY_OPERATION_RECORD_VERSION | PREVIOUS_OPERATION_RECORD_VERSION => {
             record.record_version = MANAGEMENT_OPERATION_RECORD_VERSION;
         }
         MANAGEMENT_OPERATION_RECORD_VERSION => {}
@@ -683,7 +692,17 @@ impl ManagementOperationStore {
         operation_id: &str,
         update: OperationUpdate,
     ) -> Result<OperationRecord, OperationStoreError> {
-        self.write_transition(operation_id, None, None, update)
+        self.write_transition(operation_id, None, None, update, None)
+            .await
+    }
+
+    pub async fn transition_with_result(
+        &self,
+        operation_id: &str,
+        update: OperationUpdate,
+        result: serde_json::Value,
+    ) -> Result<OperationRecord, OperationStoreError> {
+        self.write_transition(operation_id, None, None, update, Some(result))
             .await
     }
 
@@ -694,8 +713,32 @@ impl ManagementOperationStore {
         expected_phase: Option<&str>,
         update: OperationUpdate,
     ) -> Result<OperationRecord, OperationStoreError> {
-        self.write_transition(operation_id, Some(expected_status), expected_phase, update)
-            .await
+        self.write_transition(
+            operation_id,
+            Some(expected_status),
+            expected_phase,
+            update,
+            None,
+        )
+        .await
+    }
+
+    pub async fn transition_if_with_result(
+        &self,
+        operation_id: &str,
+        expected_status: OperationStatus,
+        expected_phase: Option<&str>,
+        update: OperationUpdate,
+        result: serde_json::Value,
+    ) -> Result<OperationRecord, OperationStoreError> {
+        self.write_transition(
+            operation_id,
+            Some(expected_status),
+            expected_phase,
+            update,
+            Some(result),
+        )
+        .await
     }
 
     async fn write_transition(
@@ -704,6 +747,7 @@ impl ManagementOperationStore {
         expected_status: Option<OperationStatus>,
         expected_phase: Option<&str>,
         update: OperationUpdate,
+        result: Option<serde_json::Value>,
     ) -> Result<OperationRecord, OperationStoreError> {
         let _guard = self.write_lock.lock().await;
         let (mut record, previous_bytes) = self
@@ -718,6 +762,9 @@ impl ManagementOperationStore {
             }
         }
         record.apply_update(update)?;
+        if let Some(result) = result {
+            record.result = Some(result);
+        }
         let payload = serde_json::to_vec(&record)
             .map_err(|error| OperationStoreError::Serialization(error.to_string()))?;
         if payload == previous_bytes {

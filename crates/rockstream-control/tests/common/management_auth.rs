@@ -22,6 +22,8 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 pub struct ManagementAuth {
     pub pki: TestPki,
     pub catalog: Arc<DurableCatalogStore>,
+    #[allow(dead_code)]
+    pub store: Arc<InMemory>,
 }
 
 impl ManagementAuth {
@@ -43,8 +45,9 @@ impl ManagementAuth {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
         let certificate_sha256: [u8; 32] = Sha256::digest(certificates[0].as_ref()).into();
+        let store = Arc::new(InMemory::new());
         let catalog = Arc::new(DurableCatalogStore::new(
-            Arc::new(InMemory::new()),
+            store.clone(),
             "management-security",
         ));
         let principal = SecurityPrincipal {
@@ -110,9 +113,14 @@ impl ManagementAuth {
             )
             .await
             .unwrap();
-        Self { pki, catalog }
+        Self {
+            pki,
+            catalog,
+            store,
+        }
     }
 
+    #[allow(dead_code)]
     pub fn reloader(&self) -> Arc<rockstream_control::tls::TlsCertificateReloader> {
         Arc::new(
             rockstream_control::tls::TlsCertificateReloader::new(self.pki.control_tls_config())
@@ -136,6 +144,7 @@ impl ManagementAuth {
             .with_security_catalog(self.catalog.clone() as Arc<dyn CatalogStore>)
     }
 
+    #[allow(dead_code)]
     pub async fn start_management(&self, service: ManagementService) -> ManagementServiceHandle {
         service
             .with_security_catalog(self.catalog.clone() as Arc<dyn CatalogStore>)

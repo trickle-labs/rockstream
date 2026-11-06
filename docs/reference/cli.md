@@ -1440,6 +1440,44 @@ Exit codes
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
+## `rockstream security`
+
+Offline security administration against the durable catalog
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0002, RS-0003, RS-0005 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0002, RS-0003, RS-0005 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0002, RS-0003, RS-0005 |
+
+Error codes: `RS-0002`, `RS-0003`, `RS-0005`
+
+### `rockstream security preprovision-admin`
+
+Preprovision the first administrator before opening application listeners
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| layout | — | --layout | LAYOUT | yes | — | all, gateway | Select `all` for `--role all`, or `gateway` for `--role gateway`/`control` |
+| operation_id | — | --operation-id | OPERATION_ID | yes | — | — | Stable catalog operation ID to reuse if this command must be retried |
+| principal_file | — | --principal-file | PRINCIPAL_FILE | yes | — | — | JSON-serialized SecurityPrincipal containing an enabled interactive cluster administrator |
+| storage | — | --storage | STORAGE | yes | — | — | Node storage directory used by `start --storage` for this deployment |
+| yes | — | --yes | YES | no | — | true, false | Confirm the deployment is stopped and the selected durable store is correct |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0002, RS-0003, RS-0005 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0002, RS-0003, RS-0005 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0002, RS-0003, RS-0005 |
+
+Error codes: `RS-0002`, `RS-0003`, `RS-0005`
+
 ## `rockstream shard`
 
 Shard inspection commands

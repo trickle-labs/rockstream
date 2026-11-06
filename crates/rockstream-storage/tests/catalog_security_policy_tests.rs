@@ -160,6 +160,39 @@ async fn security_principal_and_correlated_audit_survive_log_snapshot_and_restar
     );
 }
 
+#[test]
+fn client_correlated_grant_mutation_uses_catalog_format_three() {
+    let operation_id = "550e8400-e29b-41d4-a716-446655440000";
+    let previous = admin(1, 1);
+    let mut updated = admin(2, 2);
+    updated.display_name = "updated administrator".into();
+    let mut audit = grant_audit(
+        "grant-operation-format-three",
+        102,
+        AuditIdentity::Verified("principal:1".into()),
+        &updated,
+        Some(policy_state(&admin(2, 1))),
+        Some(policy_state(&updated)),
+    );
+    audit.correlation = AuditCorrelation::Observed(operation_id.into());
+    audit.operation_id = AuditField::Known(operation_id.into());
+    let txn = CatalogTxn::new(
+        2,
+        102,
+        vec![CatalogMutation::PutSecurityPrincipalForOperation {
+            principal: updated,
+            expected_revision: Some(1),
+            grantor_revision: Some((previous.id, previous.revision)),
+            operation_id: operation_id.into(),
+            audit,
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(txn.format_version, 3);
+    assert_eq!(CatalogTxn::decode(&txn.encode().unwrap()).unwrap(), txn);
+}
+
 #[tokio::test]
 async fn expired_security_audit_append_is_rejected_without_a_catalog_effect() {
     let object_store = Arc::new(InMemory::new());
@@ -432,7 +465,7 @@ async fn stale_policy_change_and_last_admin_lockout_have_no_durable_effect() {
 }
 
 #[tokio::test]
-async fn ordinary_principal_cannot_self_grant_administrator_authority() {
+async fn operator_cannot_self_grant_administrator_or_data_authority() {
     let object_store = Arc::new(InMemory::new());
     let catalog = DurableCatalogStore::new(object_store, "security");
     let administrator = admin(1, 1);
@@ -454,14 +487,21 @@ async fn ordinary_principal_cannot_self_grant_administrator_authority() {
         .await
         .unwrap();
 
-    let ordinary = principal(2, 1, vec![]);
-    let ordinary_audit = grant_audit(
+    let operator = principal(
+        2,
+        1,
+        vec![ScopedPresetGrant {
+            preset: PermissionPreset::Operator,
+            scope: PolicyScope::Cluster,
+        }],
+    );
+    let operator_audit = grant_audit(
         "event-2",
         102,
         AuditIdentity::Verified("principal:1".into()),
-        &ordinary,
+        &operator,
         None,
-        Some(policy_state(&ordinary)),
+        Some(policy_state(&operator)),
     );
     catalog
         .commit_txn(
@@ -469,10 +509,10 @@ async fn ordinary_principal_cannot_self_grant_administrator_authority() {
                 2,
                 102,
                 vec![CatalogMutation::PutSecurityPrincipal {
-                    principal: ordinary.clone(),
+                    principal: operator.clone(),
                     expected_revision: None,
                     grantor_revision: Some((PrincipalId(1), 1)),
-                    audit: ordinary_audit,
+                    audit: operator_audit,
                 }],
             )
             .unwrap(),
@@ -486,7 +526,7 @@ async fn ordinary_principal_cannot_self_grant_administrator_authority() {
         103,
         AuditIdentity::Verified("principal:2".into()),
         &elevated,
-        Some(policy_state(&ordinary)),
+        Some(policy_state(&operator)),
         Some(policy_state(&elevated)),
     );
     let error = catalog
@@ -512,12 +552,358 @@ async fn ordinary_principal_cannot_self_grant_administrator_authority() {
             .get_security_principal(PrincipalId(2))
             .await
             .unwrap(),
-        Some(ordinary)
+        Some(operator.clone())
     );
     assert_eq!(
         catalog.list_security_audit_records().await.unwrap().len(),
         2
     );
+
+    let mut data_elevated = operator.clone();
+    data_elevated.revision = 2;
+    data_elevated.preset_grants.push(ScopedPresetGrant {
+        preset: PermissionPreset::DataReader,
+        scope: PolicyScope::Namespace {
+            namespace: "sales".to_owned(),
+        },
+    });
+    let data_grant_error = catalog
+        .commit_txn(
+            CatalogTxn::new(
+                3,
+                104,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: data_elevated.clone(),
+                    expected_revision: Some(1),
+                    grantor_revision: Some((PrincipalId(2), 1)),
+                    audit: grant_audit(
+                        "event-4",
+                        104,
+                        AuditIdentity::Verified("principal:2".into()),
+                        &data_elevated,
+                        Some(policy_state(&operator)),
+                        Some(policy_state(&data_elevated)),
+                    ),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        data_grant_error,
+        CatalogError::InvalidSecurityPolicy(message)
+            if message == "grantor lacks current principal and grant management authority"
+    ));
+    assert_eq!(catalog.get_revision().await, 2);
+    assert_eq!(
+        catalog
+            .get_security_principal(PrincipalId(2))
+            .await
+            .unwrap(),
+        Some(operator)
+    );
+    assert_eq!(
+        catalog.list_security_audit_records().await.unwrap().len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn administrator_cannot_self_grant_but_can_self_revoke_with_another_admin() {
+    let catalog = DurableCatalogStore::new(Arc::new(InMemory::new()), "admin-self-grant");
+    let administrator = admin(1, 1);
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                1,
+                101,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: administrator.clone(),
+                    expected_revision: None,
+                    grantor_revision: None,
+                    audit: bootstrap_audit("admin-self-grant-bootstrap", 101, &administrator),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let second_admin = admin(2, 1);
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                102,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: second_admin.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit(
+                        "admin-self-grant-second-admin",
+                        102,
+                        AuditIdentity::Verified("principal:1".into()),
+                        &second_admin,
+                        None,
+                        Some(policy_state(&second_admin)),
+                    ),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut expanded = administrator.clone();
+    expanded.revision = 2;
+    expanded.preset_grants.push(ScopedPresetGrant {
+        preset: PermissionPreset::DataReader,
+        scope: PolicyScope::Namespace {
+            namespace: "sales".to_owned(),
+        },
+    });
+    let error = catalog
+        .commit_txn(
+            CatalogTxn::new(
+                3,
+                103,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: expanded.clone(),
+                    expected_revision: Some(1),
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit(
+                        "admin-self-grant-data",
+                        103,
+                        AuditIdentity::Verified("principal:1".into()),
+                        &expanded,
+                        Some(policy_state(&administrator)),
+                        Some(policy_state(&expanded)),
+                    ),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CatalogError::InvalidSecurityPolicy(message)
+            if message == "grantor cannot increase its own authority"
+    ));
+    assert_eq!(catalog.get_revision().await, 2);
+    assert_eq!(
+        catalog
+            .get_security_principal(PrincipalId(1))
+            .await
+            .unwrap(),
+        Some(administrator.clone())
+    );
+    assert_eq!(
+        catalog
+            .get_security_principal(PrincipalId(2))
+            .await
+            .unwrap(),
+        Some(second_admin.clone())
+    );
+    assert_eq!(
+        catalog.list_security_audit_records().await.unwrap().len(),
+        2
+    );
+
+    let mut self_revoked = administrator.clone();
+    self_revoked.revision = 2;
+    self_revoked.preset_grants.clear();
+    assert_eq!(
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    3,
+                    104,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: self_revoked.clone(),
+                        expected_revision: Some(1),
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit: grant_audit(
+                            "admin-self-revoke-authority",
+                            104,
+                            AuditIdentity::Verified("principal:1".into()),
+                            &self_revoked,
+                            Some(policy_state(&administrator)),
+                            Some(policy_state(&self_revoked)),
+                        ),
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        catalog
+            .get_security_principal(PrincipalId(1))
+            .await
+            .unwrap(),
+        Some(self_revoked)
+    );
+    assert_eq!(
+        catalog
+            .get_security_principal(PrincipalId(2))
+            .await
+            .unwrap(),
+        Some(second_admin)
+    );
+    assert_eq!(
+        catalog.list_security_audit_records().await.unwrap().len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn concurrent_last_admin_revocations_commit_only_one_policy_revision() {
+    let object_store = Arc::new(InMemory::new());
+    let catalog = DurableCatalogStore::new(object_store.clone(), "admin-race");
+    let first_admin = admin(1, 1);
+    let second_admin = admin(2, 1);
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                1,
+                201,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: first_admin.clone(),
+                    expected_revision: None,
+                    grantor_revision: None,
+                    audit: bootstrap_audit("admin-race-bootstrap", 201, &first_admin),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                202,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: second_admin.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit(
+                        "admin-race-second-admin",
+                        202,
+                        AuditIdentity::Verified("principal:1".into()),
+                        &second_admin,
+                        None,
+                        Some(policy_state(&second_admin)),
+                    ),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let first_process = DurableCatalogStore::recover(object_store.clone(), "admin-race")
+        .await
+        .unwrap();
+    let second_process = DurableCatalogStore::recover(object_store.clone(), "admin-race")
+        .await
+        .unwrap();
+    let mut first_revocation = first_admin.clone();
+    first_revocation.revision = 2;
+    first_revocation.preset_grants.clear();
+    let mut second_revocation = second_admin.clone();
+    second_revocation.revision = 2;
+    second_revocation.preset_grants.clear();
+    let first_txn = CatalogTxn::new(
+        3,
+        203,
+        vec![CatalogMutation::PutSecurityPrincipal {
+            principal: first_revocation.clone(),
+            expected_revision: Some(1),
+            grantor_revision: Some((PrincipalId(2), 1)),
+            audit: grant_audit(
+                "admin-race-revoke-first",
+                203,
+                AuditIdentity::Verified("principal:2".into()),
+                &first_revocation,
+                Some(policy_state(&first_admin)),
+                Some(policy_state(&first_revocation)),
+            ),
+        }],
+    )
+    .unwrap();
+    let second_txn = CatalogTxn::new(
+        3,
+        204,
+        vec![CatalogMutation::PutSecurityPrincipal {
+            principal: second_revocation.clone(),
+            expected_revision: Some(1),
+            grantor_revision: Some((PrincipalId(1), 1)),
+            audit: grant_audit(
+                "admin-race-revoke-second",
+                204,
+                AuditIdentity::Verified("principal:1".into()),
+                &second_revocation,
+                Some(policy_state(&second_admin)),
+                Some(policy_state(&second_revocation)),
+            ),
+        }],
+    )
+    .unwrap();
+
+    let (first_result, second_result) = tokio::join!(
+        first_process.commit_txn(first_txn),
+        second_process.commit_txn(second_txn)
+    );
+    assert_ne!(first_result.is_ok(), second_result.is_ok());
+    assert!(matches!(
+        first_result.as_ref().err().or(second_result.as_ref().err()),
+        Some(CatalogError::OptimisticConflict(_))
+    ));
+
+    let recovered = DurableCatalogStore::recover(object_store, "admin-race")
+        .await
+        .unwrap();
+    assert_eq!(recovered.get_revision().await, 3);
+    let stored_first = recovered
+        .get_security_principal(PrincipalId(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let stored_second = recovered
+        .get_security_principal(PrincipalId(2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        stored_first.preset_grants.is_empty(),
+        stored_second.preset_grants.is_empty()
+    );
+    let winning_event = if first_result.is_ok() {
+        "admin-race-revoke-first"
+    } else {
+        "admin-race-revoke-second"
+    };
+    let mut event_ids: Vec<_> = recovered
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.event_id)
+        .collect();
+    event_ids.sort();
+    let mut expected_event_ids = vec![
+        "admin-race-bootstrap".to_string(),
+        "admin-race-second-admin".to_string(),
+        winning_event.to_string(),
+    ];
+    expected_event_ids.sort();
+    assert_eq!(event_ids, expected_event_ids);
 }
 
 #[tokio::test]
