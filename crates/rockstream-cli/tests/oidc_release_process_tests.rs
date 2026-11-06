@@ -495,6 +495,16 @@ async fn download_support_artifact(
     )
 }
 
+fn support_artifact_object_path(id: &str) -> object_store::path::Path {
+    let encoded_id = id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    object_store::path::Path::from("control/support-artifacts")
+        .join(format!("artifacts/{encoded_id}.json"))
+}
+
 fn parse_error_fields(payload: &[u8]) -> std::collections::BTreeMap<u8, String> {
     let mut fields = std::collections::BTreeMap::new();
     let mut cursor = 0;
@@ -1886,17 +1896,8 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
 
     let expired_id = uuid::Uuid::new_v4().to_string();
     let expired_content = b"{\"format_version\":1,\"safe\":\"expired fixture\"}";
-    let artifact_path = |id: &str| {
-        object_store::path::Path::from("control/support-artifacts").join(format!(
-            "artifacts/{}.json",
-            id.as_bytes()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        ))
-    };
-    let expired_blob_path = artifact_path(&expired_id);
-    let first_blob_path = artifact_path(&first.opaque_id);
+    let expired_blob_path = support_artifact_object_path(&expired_id);
+    let first_blob_path = support_artifact_object_path(&first.opaque_id);
     let management_store = object_store::prefix::PrefixStore::new(
         rockstream_test_support::minio::minio_object_store(minio_port, bucket),
         "management",
@@ -2196,4 +2197,196 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     for (index, (actual, expected)) in actual_audit.iter().zip(&expected_audit).enumerate() {
         assert_eq!(actual, expected, "audit record {index}");
     }
+}
+
+#[tokio::test]
+async fn support_artifact_generation_rejects_full_deployment_budget() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-support-budget";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO must be available for the support-artifact budget proof");
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_control_process(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+    let mut client = wait_for_management_client(management_address, &pki).await;
+
+    let management_store = object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "management",
+    );
+    let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
+    let ledger_bytes = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+    let expiry_ms = chrono::Utc::now().timestamp_millis().max(1) as u64 + 600_000;
+    let mut expected_ids = (0..10)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect::<Vec<_>>();
+    expected_ids.sort();
+    for id in &expected_ids {
+        ledger["artifacts"][id] = serde_json::json!({
+            "owner": PrincipalId(1),
+            "scope": PolicyScope::Cluster,
+            "size": 10 * 1024 * 1024,
+            "expires_at_ms": expiry_ms,
+        });
+    }
+    management_store
+        .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
+        .await
+        .unwrap();
+
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
+    let error = client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: idempotency_key.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(error.message(), "support artifact storage budget is full");
+
+    let recovered_ledger = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let actual_ids = serde_json::from_slice::<serde_json::Value>(&recovered_ledger).unwrap()
+        ["artifacts"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(actual_ids, expected_ids);
+    assert!(matches!(
+        management_store
+            .get(&support_artifact_object_path(&idempotency_key))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    let fingerprint = {
+        let mut certificate_pem =
+            std::io::BufReader::new(std::fs::File::open(&pki.cli_cert_path).unwrap());
+        let certificate = rustls_pemfile::certs(&mut certificate_pem)
+            .next()
+            .unwrap()
+            .unwrap();
+        sha2::Sha256::digest(certificate.as_ref()).into()
+    };
+    let principal = mtls_support_admin_with_fingerprint(fingerprint);
+    let policy = serde_json::to_string(&(
+        principal.enabled,
+        &principal.preset_grants,
+        &principal.scoped_grants,
+    ))
+    .unwrap();
+    let bootstrap_state = format!("revision={};policy={policy}", principal.revision);
+    let cluster_scope = serde_json::to_string(&PolicyScope::Cluster).unwrap();
+    let expected_audit = vec![
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "first-admin-bootstrap:1".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Known("principal:1".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::Known("1".to_owned()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(bootstrap_state),
+        },
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "management-authn".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        },
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "support-artifact".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known(format!("support-artifact:{idempotency_key}")),
+            scope: AuditField::Known(cluster_scope.clone()),
+            action: SecurityAuditClass::AdminOperationStart,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(idempotency_key.clone()),
+            operation_id: AuditField::Known(idempotency_key.clone()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::Known("pending".to_owned()),
+            after_state: AuditField::Known("generating".to_owned()),
+        },
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "support-artifact".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known(format!("support-artifact:{idempotency_key}")),
+            scope: AuditField::Known(cluster_scope),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Observed(idempotency_key.clone()),
+            operation_id: AuditField::Known(idempotency_key.clone()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::Known("generating".to_owned()),
+            after_state: AuditField::Known("generation_failed".to_owned()),
+        },
+    ];
+    let security_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::prefix::PrefixStore::new(
+            rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+            "gateway-shard",
+        ));
+    let recovered = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let mut actual_audit = recovered.list_security_audit_records().await.unwrap();
+    for record in &mut actual_audit {
+        record.timestamp_ms = 0;
+        if record.event_id.starts_with("support-artifact-") {
+            record.event_id = "support-artifact".to_owned();
+        } else if record.event_id.starts_with("management-authn-") {
+            record.event_id = "management-authn".to_owned();
+        }
+    }
+    assert_eq!(actual_audit, expected_audit);
 }
