@@ -125,6 +125,8 @@ Worker shuffle and native management APIs are separate transport boundaries. A c
 
 The native management API requires mTLS and a durable security catalog. Only certificates with a parsed `Cli` node identity are eligible for principal mapping; worker and control-node certificates are rejected and audited even when their fingerprints are listed as login methods. A verified CLI certificate is mapped by SHA-256 fingerprint to an enabled principal; the node role, CLI role flag, and headers do not grant application authority. Each RPC evaluates the principal's current persisted grants for the requested action and scope. A failed handshake, wrong-role certificate, or unmapped certificate establishes no management session. An authorization denial is audited and rejects that operation while preserving the authenticated session. Startup fails when the security catalog is unavailable or has no enabled administrator and mTLS principal. This implementation and its component tests do not constitute the assembled v0.73 qualification sign-off; missing release evidence remains blocking.
 
+Principals with cluster-scoped `principal.manage` may list durable principal metadata and preset/scoped grants through the paginated Management API. Responses omit login methods and credential material.
+
 ---
 
 ## Identity Verification & Certificate Schema

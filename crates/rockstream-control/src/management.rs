@@ -942,6 +942,80 @@ impl v1::management_service_server::ManagementService for ManagementService {
         }))
     }
 
+    async fn list_security_principals(
+        &self,
+        request: Request<v1::ListSecurityPrincipalsRequest>,
+    ) -> Result<Response<v1::ListSecurityPrincipalsResponse>, Status> {
+        let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        self.authorize(
+            &request,
+            SecurityAction::PrincipalManage,
+            PolicyScope::Cluster,
+        )
+        .await?;
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let request = request.into_inner();
+        let size = page_size(request.page_size)?;
+        let mut principals = catalog
+            .list_security_principals()
+            .await
+            .map_err(|_| Status::unavailable("management security policy is unavailable"))?;
+        principals.sort_by_key(|principal| principal.id);
+        let (principals, next_page_token) = page(principals, size, &request.page_token)?;
+        let principals = principals
+            .into_iter()
+            .map(|principal| {
+                let preset_grants = principal
+                    .preset_grants
+                    .into_iter()
+                    .map(|grant| {
+                        Ok(v1::SecurityPresetGrant {
+                            preset: serde_json::to_string(&grant.preset)
+                                .map_err(|_| Status::internal("failed to encode security preset"))?
+                                .trim_matches('"')
+                                .to_owned(),
+                            scope_json: serde_json::to_string(&grant.scope).map_err(|_| {
+                                Status::internal("failed to encode security grant scope")
+                            })?,
+                        })
+                    })
+                    .collect::<Result<_, Status>>()?;
+                let scoped_grants = principal
+                    .scoped_grants
+                    .into_iter()
+                    .map(|grant| {
+                        Ok(v1::SecurityActionGrant {
+                            action: serde_json::to_string(&grant.action)
+                                .map_err(|_| Status::internal("failed to encode security action"))?
+                                .trim_matches('"')
+                                .to_owned(),
+                            scope_json: serde_json::to_string(&grant.scope).map_err(|_| {
+                                Status::internal("failed to encode security grant scope")
+                            })?,
+                        })
+                    })
+                    .collect::<Result<_, Status>>()?;
+                Ok(v1::SecurityPrincipal {
+                    principal_id: principal.id.0,
+                    display_name: principal.display_name,
+                    enabled: principal.enabled,
+                    revision: principal.revision,
+                    preset_grants,
+                    scoped_grants,
+                })
+            })
+            .collect::<Result<_, Status>>()?;
+        Ok(Response::new(v1::ListSecurityPrincipalsResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principals,
+            next_page_token,
+        }))
+    }
+
     async fn get_node(
         &self,
         request: Request<v1::GetNodeRequest>,
@@ -1532,7 +1606,7 @@ mod tests {
         let principal = rockstream_types::authorization::SecurityPrincipal {
             format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
             id: PrincipalId(1),
-            display_name: "management-test-operator".to_owned(),
+            display_name: "management-test-administrator".to_owned(),
             enabled: true,
             revision: 1,
             login_methods: vec![rockstream_types::authorization::LoginMethod::Mtls {
@@ -1584,6 +1658,60 @@ mod tests {
                         expected_revision: None,
                         grantor_revision: None,
                         audit,
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let operator = SecurityPrincipal {
+            format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(2),
+            display_name: "management-test-operator-only".to_owned(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![rockstream_types::authorization::LoginMethod::Mtls {
+                certificate_sha256: [8; 32],
+            }],
+            preset_grants: vec![rockstream_types::authorization::ScopedPresetGrant {
+                preset: PermissionPreset::Operator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: Vec::new(),
+        };
+        let operator_audit = SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "management-test-operator-grant".to_owned(),
+            timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:2".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::Known("2".to_owned()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(format!(
+                "revision=1;policy={}",
+                serde_json::to_string(&(
+                    operator.enabled,
+                    &operator.preset_grants,
+                    &operator.scoped_grants
+                ))
+                .unwrap()
+            )),
+        };
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    2,
+                    2,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: operator,
+                        expected_revision: None,
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit: operator_audit,
                     }],
                 )
                 .unwrap(),
@@ -1666,5 +1794,68 @@ mod tests {
         drop(permits);
         let after_recovery = cluster_status(&service).await.unwrap();
         assert_eq!(after_recovery.request_fill, 1);
+    }
+
+    #[tokio::test]
+    async fn operator_cannot_list_security_principals_and_denial_keeps_session_open() {
+        let security_catalog = test_security_catalog().await;
+        let service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let peer = ManagementConnectionInfo {
+            certificate_sha256: [8; 32],
+            principal_id: PrincipalId(2),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+        let mut request = Request::new(v1::ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 0,
+            page_token: String::new(),
+        });
+        request.extensions_mut().insert(peer.clone());
+
+        let error = <ManagementService as v1::management_service_server::ManagementService>::list_security_principals(
+            &service, request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(error.message(), "management action is not authorized");
+        assert!(!peer.is_closed());
+
+        let records = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        let denial = records
+            .iter()
+            .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+            .unwrap();
+        assert_eq!(
+            &SecurityAuditRecord {
+                event_id: String::new(),
+                timestamp_ms: 0,
+                ..denial.clone()
+            },
+            &SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: String::new(),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:2".to_owned()),
+                target: AuditField::Known("PrincipalManage".to_owned()),
+                scope: AuditField::Known("\"cluster\"".to_owned()),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
     }
 }

@@ -9,15 +9,17 @@ use rockstream_management_proto::v1::{
     CancelOperationRequest, CreateBackupRequest, DrainWorkerRequest, GetCapabilitiesRequest,
     GetClusterStatusRequest, GetConfigSummaryRequest, GetHealthRequest, GetNodeRequest,
     GetOperationRequest, GetShardRequest, ListNodesRequest, ListOperationsRequest,
-    ListShardsRequest, MigrateShardRequest, Operation,
+    ListSecurityPrincipalsRequest, ListShardsRequest, MigrateShardRequest, Operation,
 };
-use rockstream_storage::catalog::CatalogStore;
+use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
 use rockstream_types::authorization::{
-    AuditCorrelation, AuditField, AuditIdentity, PermissionPreset, SecurityAuditClass,
-    SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+    AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
+    ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
+    SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
 use rockstream_types::config::NodeConfig;
-use rockstream_types::ids::{ShardId, WorkerId};
+use rockstream_types::ids::{PrincipalId, ShardId, WorkerId};
 use rockstream_types::topology::{
     CapacityHeadroom, ControlMessage, NodeRole, WorkerCapabilities, WorkerMessage,
     WorkerRegistration,
@@ -196,6 +198,158 @@ async fn management_denial_is_audited_without_tearing_down_session_or_mutating_s
     );
     assert_eq!(denial.target, AuditField::Known("BackupCreate".to_owned()));
     assert_eq!(denial.outcome, SecurityAuditOutcome::Denied);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn management_principal_listing_pages_grants_without_exposing_login_credentials() {
+    let auth = ManagementAuth::new(&[]).await;
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "SCRAM reader".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "private-scram-user".to_owned(),
+            salt: vec![0x11; 16],
+            iterations: 4096,
+            stored_key: vec![0x22; 32],
+            server_key: vec![0x33; 32],
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::DataReader,
+            scope: PolicyScope::Namespace {
+                namespace: "sales".to_owned(),
+            },
+        }],
+        scoped_grants: vec![ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: PolicyScope::Secret {
+                namespace: "sales".to_owned(),
+                name: "warehouse".to_owned(),
+                consumer: Some(PrincipalId(2)),
+            },
+        }],
+    };
+    let audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "management-test-second-principal".to_owned(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis().max(1) as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known("2".to_owned()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!(
+            "revision=1;policy={}",
+            serde_json::to_string(&(
+                principal.enabled,
+                &principal.preset_grants,
+                &principal.scoped_grants
+            ))
+            .unwrap()
+        )),
+    };
+    auth.catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal,
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        ManagementOperationStore::new(Arc::new(InMemory::new())),
+        NodeConfig::default(),
+    );
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
+    let first_page = client
+        .list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: 1,
+            page_size: 1,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        first_page,
+        rockstream_management_proto::v1::ListSecurityPrincipalsResponse {
+            protocol_version: 1,
+            principals: vec![rockstream_management_proto::v1::SecurityPrincipal {
+                principal_id: 1,
+                display_name: "Management test administrator".to_owned(),
+                enabled: true,
+                revision: 1,
+                preset_grants: vec![
+                    rockstream_management_proto::v1::SecurityPresetGrant {
+                        preset: "administrator".to_owned(),
+                        scope_json: "\"cluster\"".to_owned(),
+                    },
+                    rockstream_management_proto::v1::SecurityPresetGrant {
+                        preset: "operator".to_owned(),
+                        scope_json: "\"cluster\"".to_owned(),
+                    },
+                ],
+                scoped_grants: Vec::new(),
+            }],
+            next_page_token: "1".to_owned(),
+        }
+    );
+
+    let second_page = client
+        .list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: 1,
+            page_size: 1,
+            page_token: first_page.next_page_token,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        second_page,
+        rockstream_management_proto::v1::ListSecurityPrincipalsResponse {
+            protocol_version: 1,
+            principals: vec![rockstream_management_proto::v1::SecurityPrincipal {
+                principal_id: 2,
+                display_name: "SCRAM reader".to_owned(),
+                enabled: true,
+                revision: 1,
+                preset_grants: vec![rockstream_management_proto::v1::SecurityPresetGrant {
+                    preset: "data_reader".to_owned(),
+                    scope_json:
+                        "{\"namespace\":{\"namespace\":\"sales\"}}".to_owned(),
+                }],
+                scoped_grants: vec![rockstream_management_proto::v1::SecurityActionGrant {
+                    action: "secret_use".to_owned(),
+                    scope_json: "{\"secret\":{\"namespace\":\"sales\",\"name\":\"warehouse\",\"consumer\":2}}"
+                        .to_owned(),
+                }],
+            }],
+            next_page_token: String::new(),
+        }
+    );
+    let response_text = format!("{second_page:?}");
+    assert!(!response_text.contains("private-scram-user"));
+    assert!(!response_text.contains("stored_key"));
+    assert!(!response_text.contains("server_key"));
     server.shutdown();
 }
 

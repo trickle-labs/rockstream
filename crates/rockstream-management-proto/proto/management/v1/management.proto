@@ -9,6 +9,7 @@ service ManagementService {
   rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
   rpc GetShard(GetShardRequest) returns (GetShardResponse);
   rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
+  rpc ListSecurityPrincipals(ListSecurityPrincipalsRequest) returns (ListSecurityPrincipalsResponse);
   rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
   rpc GetConfigSummary(GetConfigSummaryRequest) returns (GetConfigSummaryResponse);
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
@@ -127,6 +128,33 @@ message Operation {
   string error_code = 8;
   repeated string next_steps = 9;
   string source_version = 10;
+}
+
+message ListSecurityPrincipalsRequest {
+  uint32 protocol_version = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+message ListSecurityPrincipalsResponse {
+  uint32 protocol_version = 1;
+  repeated SecurityPrincipal principals = 2;
+  string next_page_token = 3;
+}
+message SecurityPrincipal {
+  uint64 principal_id = 1;
+  string display_name = 2;
+  bool enabled = 3;
+  uint64 revision = 4;
+  repeated SecurityPresetGrant preset_grants = 5;
+  repeated SecurityActionGrant scoped_grants = 6;
+}
+message SecurityPresetGrant {
+  string preset = 1;
+  string scope_json = 2;
+}
+message SecurityActionGrant {
+  string action = 1;
+  string scope_json = 2;
 }
 
 message GetConfigSummaryRequest { uint32 protocol_version = 1; }
