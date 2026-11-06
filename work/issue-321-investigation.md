@@ -170,5 +170,60 @@ search found `WorkerStreamMultiplexer::send_frame` callers in tests,
 simulations and benchmarks, but no production caller; the owning recovery
 observation remains inconclusive.
 
-Management authentication remains owned by open issue #303. No authenticated
-release-process path was qualified in this investigation.
+Management authentication remains owned by open issue #303. A separate
+qualification used the unmerged management candidate at commit
+`66e9ff6ea0e64800609ae5c6076afb1dfda87a2d`, a release image built from that
+revision, and an isolated control process with two simulated worker peers.
+The `linux/amd64` image ID was
+`sha256:cc9bf1b13bdd8c58f2651afff9cfd1009e4bf33ea608a9706fc2eb664a6f4b57`.
+The temporary test checkout added a second CLI certificate and a grantless
+durable principal to the existing drain fixture; those test-only changes were
+not part of the image. The management endpoint used an ephemeral loopback host
+port mapped to the control container's port 9201.
+The draft subsequently advanced to `d698bdfc88c1f4f4434e6e4254b3885e0dc3e6e7`;
+that later commit changes CLI TLS reload code and tests, not the catalog store
+or management service, but has not been qualified by this experiment.
+An unauthenticated TLS handshake and a plaintext HTTP/2 preface were rejected;
+the latter received the TLS fatal decode-error alert `15 03 03 00 02 02 32`.
+When the test waited for each authentication-failure audit record before the
+next attempt, an authenticated principal with no grants was denied both a
+cluster-status read and a worker drain. The complete observable status and
+operation list were unchanged, the donor's original shard lease still fenced
+successfully, and the denial audit records matched the actor, actions, scopes,
+outcomes, and policy revision. An authorized drain then completed and moved
+the shard to the recipient. This serialized experiment passed; its simulated
+peers do not prove real worker lifecycle or full release qualification.
+
+Without that audit sequencing, the same two rejected handshakes were followed
+by an administrator request failing twice in separate runs. The control log
+reported incomplete catalog history: expected revision 4, found revision 3.
+An independent in-memory storage reproducer on both the candidate and current
+main `9cae51408ad42252c793a165a18e6eaed43352d6` committed two different
+transactions at revision 1 and then received `RS-1003` on recovery, for both
+one catalog instance and two instances sharing a store. The diagnostic test
+asserts the observed defect; it is not a passing regression for a repair.
+Another main-branch reproducer committed table 1 at revision 1, snapshotted and
+compacted that revision, and then committed table 2 from a stale catalog instance
+at revision 1. Both calls returned success. Recovery returned exactly table 1
+and no table 2: the stale acknowledged mutation was omitted because replay skips
+logs already covered by the snapshot. A separate test repeated this outcome
+with a filesystem object store and two OS processes: the second process opened
+its catalog before the first committed and compacted the snapshot, then its
+stale revision-1 commit returned success but was absent after recovery. These
+are diagnostic tests, not release-process evidence of this particular loss.
+Regression checks requiring rejection of stale writes fail on main both before
+and after compaction. Cross-process fencing, compaction, crash recovery, and
+compatibility of a fix remain open.
+The workspace's `object_store` 0.14 local filesystem backend returns
+`NotImplemented` for conditional `PutMode::Update`; a local test verified
+that the old object remains unchanged. A portable fix cannot assume that
+conditional update is available on every supported store.
+On current main, `CatalogStubs::persist_mutations` also discards errors from
+`commit_txn` in its synchronous and spawned paths. It is called by multiple
+gateway catalog mutations. Adding a new conflict error solely in the store
+would therefore be insufficient: those paths must propagate or safely resolve
+the failure before reporting the affected mutation as successful.
+The pgwire `CREATE VIEW` path calls `add_view_with_deps`, which publishes the
+view in the in-memory catalog before invoking that error-discarding persistence
+path; by contrast, durable `CREATE TABLE` uses `add_table_durably`. These are
+source observations; no injected-failure result for view creation was run here.
