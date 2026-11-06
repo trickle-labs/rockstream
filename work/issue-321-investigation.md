@@ -200,12 +200,13 @@ peers do not prove real worker lifecycle or full release qualification.
 Without that audit sequencing, the same two rejected handshakes were followed
 by an administrator request failing twice in separate runs. The control log
 reported incomplete catalog history: expected revision 4, found revision 3.
-An independent in-memory storage reproducer on both the candidate and current
-main `9cae51408ad42252c793a165a18e6eaed43352d6` committed two different
+An independent in-memory storage reproducer committed two different
 transactions at revision 1 and then received `RS-1003` on recovery, for both
-one catalog instance and two instances sharing a store. The diagnostic test
-asserts the observed defect; it is not a passing regression for a repair.
-Another main-branch reproducer committed table 1 at revision 1, snapshotted and
+one catalog instance and two instances sharing a store. Its temporary candidate
+and main checkouts shared a Cargo target directory, so exact main-branch binary
+attribution requires an isolated rebuild. The diagnostic test asserts the
+observed defect; it is not a passing regression for a repair.
+Another diagnostic committed table 1 at revision 1, snapshotted and
 compacted that revision, and then committed table 2 from a stale catalog instance
 at revision 1. Both calls returned success. Recovery returned exactly table 1
 and no table 2: the stale acknowledged mutation was omitted because replay skips
@@ -214,9 +215,9 @@ with a filesystem object store and two OS processes: the second process opened
 its catalog before the first committed and compacted the snapshot, then its
 stale revision-1 commit returned success but was absent after recovery. These
 are diagnostic tests, not release-process evidence of this particular loss.
-Regression checks requiring rejection of stale writes fail on main both before
-and after compaction. Cross-process fencing, compaction, crash recovery, and
-compatibility of a fix remain open.
+Regression checks requiring rejection of stale writes failed in the shared
+build directory both before and after compaction. Cross-process fencing,
+compaction, crash recovery, and compatibility of a fix remain open.
 The workspace's `object_store` 0.14 local filesystem backend returns
 `NotImplemented` for conditional `PutMode::Update`; a local test verified
 that the old object remains unchanged. A portable fix cannot assume that
@@ -228,5 +229,13 @@ would therefore be insufficient: those paths must propagate or safely resolve
 the failure before reporting the affected mutation as successful.
 The pgwire `CREATE VIEW` path calls `add_view_with_deps`, which publishes the
 view in the in-memory catalog before invoking that error-discarding persistence
-path; by contrast, durable `CREATE TABLE` uses `add_table_durably`. These are
-source observations; no injected-failure result for view creation was run here.
+path; by contrast, durable `CREATE TABLE` uses `add_table_durably`. A pgwire
+test in the shared build directory injected a catalog-log write failure after successfully creating a
+base table. `CREATE VIEW uncommitted_view AS SELECT id FROM durable_rows`
+returned `CommandComplete(0)` and `pg_views` contained exactly
+`uncommitted_view`; after restarting the gateway, `pg_views` was empty. The
+injected catalog append failed exactly once. This is a separate view-creation
+failure observation, not proof about the requested DML rollback paths. Source
+inspection also shows that view compilation may publish a local directory entry
+or deploy a distributed plan before catalog registration; a complete repair
+must handle those effects, not just return the catalog error.
