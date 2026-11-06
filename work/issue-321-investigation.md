@@ -182,7 +182,10 @@ not part of the image. The management endpoint used an ephemeral loopback host
 port mapped to the control container's port 9201.
 The draft subsequently advanced to `d698bdfc88c1f4f4434e6e4254b3885e0dc3e6e7`;
 that later commit changes CLI TLS reload code and tests, not the catalog store
-or management service, but has not been qualified by this experiment.
+or management service. A separate unsequenced test on its clean-source release
+image `sha256:130672615eb2ec76df148ce95ab791e67d02a83f0287c488513e8640e3709813`
+reproduced the same catalog failure described below; it did not establish
+the serialized positive behavior for that later commit.
 An unauthenticated TLS handshake and a plaintext HTTP/2 preface were rejected;
 the latter received the TLS fatal decode-error alert `15 03 03 00 02 02 32`.
 When the test waited for each authentication-failure audit record before the
