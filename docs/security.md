@@ -127,6 +127,8 @@ The native management API requires mTLS and a durable security catalog. Only cer
 
 Principals with cluster-scoped `principal.manage` may list durable principal metadata, preset/scoped grants, and their effective action/scope pairs through the paginated Management API. Responses omit login methods and credential material.
 
+A grantor cannot add grants to its own principal. Catalog mutations also reject changes that would remove the last active administrator.
+
 ---
 
 ## Identity Verification & Certificate Schema

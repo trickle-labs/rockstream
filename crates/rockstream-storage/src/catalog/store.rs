@@ -918,6 +918,15 @@ fn validate_security_mutations(
                             ));
                         }
                         validate_grantor(state, *grantor_revision, audit)?;
+                        if grantor_revision
+                            .as_ref()
+                            .is_some_and(|(grantor_id, _)| *grantor_id == principal.id)
+                            && !self_update_adds_no_grants(old, principal)
+                        {
+                            return Err(invalid_security_policy(
+                                "grantor cannot increase its own authority",
+                            ));
+                        }
                     }
                     (Some(old), None) => {
                         return Err(security_revision_conflict(principal.id, 0, old.revision));
@@ -1060,6 +1069,17 @@ fn validate_grantor(
         ));
     }
     Ok(())
+}
+
+fn self_update_adds_no_grants(current: &SecurityPrincipal, updated: &SecurityPrincipal) -> bool {
+    updated
+        .preset_grants
+        .iter()
+        .all(|grant| current.preset_grants.contains(grant))
+        && updated
+            .scoped_grants
+            .iter()
+            .all(|grant| current.scoped_grants.contains(grant))
 }
 
 fn is_active_administrator(principal: &SecurityPrincipal) -> bool {
