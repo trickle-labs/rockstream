@@ -11,15 +11,15 @@ use chrono::{SecondsFormat, Utc};
 use rockstream_management_proto::{ensure_protocol_version, v1};
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
 use rockstream_types::authorization::{
-    AuditCorrelation, AuditField, AuditIdentity, PermissionPreset, PolicyScope, SecurityAction,
-    SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
-    SECURITY_AUDIT_FORMAT_VERSION,
+    AuditCorrelation, AuditField, AuditIdentity, PermissionPreset, PolicyScope, ScopedActionGrant,
+    ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::config::NodeConfig;
 use rockstream_types::diagnostic::redact_secrets;
 use rockstream_types::ids::{PrincipalId, ShardId, WorkerId};
 use rockstream_types::topology::WorkerInfo;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -73,6 +73,27 @@ struct MigrateShardDigest {
 #[derive(Serialize)]
 struct CreateBackupDigest {
     destination: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SecurityPrincipalGrantChange {
+    deployment_id: String,
+    principal_id: u64,
+    expected_revision: u64,
+    grantor_id: u64,
+    grantor_revision: u64,
+    certificate_sha256: String,
+    preset_grants: Vec<ScopedPresetGrant>,
+    scoped_grants: Vec<ScopedActionGrant>,
+}
+
+#[derive(Debug, Serialize)]
+struct SecurityPrincipalGrantResult {
+    principal_id: u64,
+    revision: u64,
+    preset_grants: Vec<ScopedPresetGrant>,
+    scoped_grants: Vec<ScopedActionGrant>,
+    effective_permissions: Vec<ScopedActionGrant>,
 }
 
 #[derive(Clone)]
@@ -229,6 +250,15 @@ impl ManagementService {
             .nonterminal()
             .await
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let deployment_id = self.deployment_fingerprint();
+        recover.retain(|record| {
+            record.kind() != crate::management_store::OperationKind::SecurityPrincipalGrants
+                || record
+                    .request()
+                    .and_then(|request| request.get("deployment_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(deployment_id.as_str())
+        });
         let mut recovery_conflicts = std::collections::HashSet::new();
         for record in &mut recover {
             if record.status() == crate::management_store::OperationStatus::Running {
@@ -289,6 +319,19 @@ impl ManagementService {
                 io::ErrorKind::InvalidInput,
                 "RS-2405: management API requires a preprovisioned mTLS administrator",
             ));
+        }
+        for record in recover.iter().filter(|record| {
+            record.kind() == crate::management_store::OperationKind::SecurityPrincipalGrants
+        }) {
+            let recovered = self
+                .process_security_principal_grants(record)
+                .await
+                .map_err(|error| io::Error::other(format!("security grant recovery: {error}")))?;
+            if !recovered.status().is_terminal() {
+                return Err(io::Error::other(
+                    "security grant recovery is waiting for durable audit; management listener remains closed",
+                ));
+            }
         }
 
         let listener = TcpListener::bind(bind_addr).await?;
@@ -385,7 +428,9 @@ impl ManagementService {
                 }
             }
         });
-        for record in recover {
+        for record in recover.into_iter().filter(|record| {
+            record.kind() != crate::management_store::OperationKind::SecurityPrincipalGrants
+        }) {
             self.reconcile(&record).await;
         }
         Ok(ManagementServiceHandle { addr, shutdown_tx })
@@ -393,6 +438,19 @@ impl ManagementService {
 
     fn ensure_version(version: u32) -> Result<(), Status> {
         ensure_protocol_version(version)
+    }
+
+    fn deployment_fingerprint(&self) -> String {
+        let catalog_namespace = self
+            .security_catalog
+            .as_ref()
+            .map(|catalog| catalog.deployment_namespace())
+            .unwrap_or_else(|| "unavailable".to_owned());
+        let context = format!(
+            "{:?}|{:?}|{catalog_namespace}",
+            self.config.storage.url, self.config.control.shared_storage,
+        );
+        hex::encode(Sha256::digest(context.as_bytes()))
     }
 
     fn acquire_request(&self) -> Result<OwnedSemaphorePermit, Status> {
@@ -510,6 +568,50 @@ impl ManagementService {
         action: SecurityAction,
         scope: PolicyScope,
     ) -> Result<(), Status> {
+        let principal = self.current_principal(request).await?;
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+
+        if !crate::authorization::allows(&principal, action, &scope) {
+            let scope = serde_json::to_string(&scope)
+                .map(|scope| redact_secrets(&scope))
+                .unwrap_or_else(|_| "unknown".to_owned());
+            let record = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("management-denial-{}", uuid::Uuid::new_v4()),
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", principal.id.0)),
+                target: AuditField::Known(format!("{action:?}")),
+                scope: AuditField::Known(scope),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(principal.revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            };
+            append_security_audit(catalog.as_ref(), record)
+                .await
+                .map_err(|_| {
+                    required_audit_unavailable(
+                        request,
+                        "management authorization audit is unavailable",
+                    )
+                })?;
+            return Err(Status::permission_denied(
+                "management action is not authorized",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn current_principal<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<SecurityPrincipal, Status> {
         let catalog = self
             .security_catalog
             .as_ref()
@@ -554,38 +656,7 @@ impl ManagementService {
                 "management identity is no longer enabled",
             ));
         };
-        if !crate::authorization::allows(&principal, action, &scope) {
-            let scope = serde_json::to_string(&scope)
-                .map(|scope| redact_secrets(&scope))
-                .unwrap_or_else(|_| "unknown".to_owned());
-            let record = SecurityAuditRecord {
-                format_version: SECURITY_AUDIT_FORMAT_VERSION,
-                event_id: format!("management-denial-{}", uuid::Uuid::new_v4()),
-                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
-                actor: AuditIdentity::Verified(format!("principal:{}", principal.id.0)),
-                target: AuditField::Known(format!("{action:?}")),
-                scope: AuditField::Known(scope),
-                action: SecurityAuditClass::AuthorizationDenial,
-                outcome: SecurityAuditOutcome::Denied,
-                correlation: AuditCorrelation::Unknown,
-                operation_id: AuditField::NotApplicable,
-                policy_revision: AuditField::Known(principal.revision),
-                before_state: AuditField::NotApplicable,
-                after_state: AuditField::NotApplicable,
-            };
-            append_security_audit(catalog.as_ref(), record)
-                .await
-                .map_err(|_| {
-                    required_audit_unavailable(
-                        request,
-                        "management authorization audit is unavailable",
-                    )
-                })?;
-            return Err(Status::permission_denied(
-                "management action is not authorized",
-            ));
-        }
-        Ok(())
+        Ok(principal)
     }
 
     fn nodes(&self) -> (Vec<WorkerInfo>, String) {
@@ -614,11 +685,14 @@ impl ManagementService {
         }
     }
 
-    fn operation(record: OperationRecord) -> v1::Operation {
+    fn operation(record: OperationRecord, include_result: bool) -> v1::Operation {
         let kind = match record.kind() {
             crate::management_store::OperationKind::DrainWorker => "drain_worker",
             crate::management_store::OperationKind::MigrateShard => "migrate_shard",
             crate::management_store::OperationKind::CreateBackup => "create_backup",
+            crate::management_store::OperationKind::SecurityPrincipalGrants => {
+                "security_principal_grants"
+            }
         };
         v1::Operation {
             operation_id: record.operation_id().to_owned(),
@@ -634,6 +708,14 @@ impl ManagementService {
             error_code: record.error_code().unwrap_or_default().to_owned(),
             next_steps: record.next_steps().to_vec(),
             source_version: format!("operation-record:{}", record.record_version()),
+            result_json: if include_result {
+                record
+                    .result()
+                    .and_then(|result| serde_json::to_string(result).ok())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
         }
     }
 
@@ -681,7 +763,384 @@ impl ManagementService {
                     runtime.schedule(record.operation_id().to_owned()).await;
                 }
             }
+            crate::management_store::OperationKind::SecurityPrincipalGrants => {
+                if let Err(error) = self.process_security_principal_grants(record).await {
+                    tracing::error!(operation_id = record.operation_id(), %error, "security grant operation reconciliation failed");
+                }
+            }
         }
+    }
+
+    async fn process_security_principal_grants(
+        &self,
+        record: &OperationRecord,
+    ) -> Result<OperationRecord, String> {
+        if record.status().is_terminal() {
+            return Ok(record.clone());
+        }
+        let change: SecurityPrincipalGrantChange = serde_json::from_value(
+            record
+                .request()
+                .cloned()
+                .ok_or_else(|| "security grant operation request is missing".to_owned())?,
+        )
+        .map_err(|error| format!("security grant operation request is corrupt: {error}"))?;
+        if change.deployment_id != self.deployment_fingerprint() {
+            return Ok(record.clone());
+        }
+        let running = if matches!(
+            record.status(),
+            OperationStatus::Pending | OperationStatus::Waiting
+        ) {
+            match self
+                .operations
+                .transition_if(
+                    record.operation_id(),
+                    record.status(),
+                    record.phase(),
+                    crate::management_store::OperationUpdate {
+                        status: OperationStatus::Running,
+                        updated_at_ms: Utc::now().timestamp_millis(),
+                        progress: Some(50),
+                        phase: Some("applying_security_policy".to_owned()),
+                        error_code: None,
+                        next_steps: Vec::new(),
+                    },
+                )
+                .await
+            {
+                Ok(running) => running,
+                Err(OperationStoreError::TransitionConflict(_)) => {
+                    return self
+                        .operations
+                        .get(record.operation_id())
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "security grant operation disappeared".to_owned());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        } else {
+            return Ok(record.clone());
+        };
+
+        match self
+            .apply_security_principal_grants(record.operation_id(), &change)
+            .await
+        {
+            Ok(result) => self
+                .operations
+                .transition_if_with_result(
+                    running.operation_id(),
+                    OperationStatus::Running,
+                    running.phase(),
+                    crate::management_store::OperationUpdate {
+                        status: OperationStatus::Succeeded,
+                        updated_at_ms: Utc::now().timestamp_millis(),
+                        progress: Some(100),
+                        phase: Some("security_policy_committed".to_owned()),
+                        error_code: None,
+                        next_steps: Vec::new(),
+                    },
+                    result,
+                )
+                .await
+                .map_err(|error| error.to_string()),
+            Err(reason) => {
+                if let Err(audit_error) = self
+                    .append_security_operation_failure(record.operation_id(), &change)
+                    .await
+                {
+                    return self
+                        .operations
+                        .transition_if(
+                            running.operation_id(),
+                            OperationStatus::Running,
+                            running.phase(),
+                            crate::management_store::OperationUpdate {
+                                status: OperationStatus::Waiting,
+                                updated_at_ms: Utc::now().timestamp_millis(),
+                                progress: running.progress(),
+                                phase: Some("waiting_for_security_audit".to_owned()),
+                                error_code: None,
+                                next_steps: vec![format!(
+                                    "Security audit is unavailable; retry reconciliation: {audit_error}"
+                                )],
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                }
+                let result = serde_json::json!({"status": "failed", "reason": reason});
+                self.operations
+                    .transition_if_with_result(
+                        running.operation_id(),
+                        OperationStatus::Running,
+                        running.phase(),
+                        crate::management_store::OperationUpdate {
+                            status: OperationStatus::Failed,
+                            updated_at_ms: Utc::now().timestamp_millis(),
+                            progress: Some(100),
+                            phase: Some("security_policy_rejected".to_owned()),
+                            error_code: None,
+                            next_steps: vec![
+                                "Review current authority and principal revisions before submitting a new mutation."
+                                    .to_owned(),
+                            ],
+                        },
+                        result,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    async fn apply_security_principal_grants(
+        &self,
+        operation_id: &str,
+        change: &SecurityPrincipalGrantChange,
+    ) -> Result<serde_json::Value, String> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| "management security catalog is unavailable".to_owned())?;
+        let expected_new_revision = change
+            .expected_revision
+            .checked_add(1)
+            .ok_or_else(|| "security principal revision is exhausted".to_owned())?;
+        let event_id = format!("management-security-grants:{operation_id}");
+        catalog.refresh().await.map_err(|error| error.to_string())?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            if record.action != SecurityAuditClass::GrantChange
+                || record.outcome != SecurityAuditOutcome::Success
+                || record.actor
+                    != AuditIdentity::Verified(format!("principal:{}", change.grantor_id))
+                || record.operation_id != AuditField::Known(operation_id.to_owned())
+                || record.target != AuditField::Known(format!("principal:{}", change.principal_id))
+                || record.policy_revision != AuditField::Known(expected_new_revision)
+            {
+                return Err("security grant operation audit identity does not match".to_owned());
+            }
+            return security_principal_grant_result(change, expected_new_revision);
+        }
+
+        let grantor_id = PrincipalId(change.grantor_id);
+        let target_id = PrincipalId(change.principal_id);
+        let certificate = hex::decode(&change.certificate_sha256)
+            .map_err(|_| "security grant operation certificate identity is malformed".to_owned())?;
+        let certificate: [u8; 32] = certificate
+            .try_into()
+            .map_err(|_| "security grant operation certificate identity is malformed".to_owned())?;
+        self.ensure_security_operation_started(operation_id, change)
+            .await?;
+        for attempt in 0..2 {
+            catalog.refresh().await.map_err(|error| error.to_string())?;
+            let grantor = catalog
+                .get_security_principal(grantor_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "granting principal is unavailable".to_owned())?;
+            if grantor.revision != change.grantor_revision
+                || !has_management_admin(std::slice::from_ref(&grantor))
+                || !grantor.login_methods.iter().any(|method| {
+                    matches!(method, rockstream_types::authorization::LoginMethod::Mtls { certificate_sha256 } if certificate_sha256 == &certificate)
+                })
+                || !crate::authorization::allows(
+                    &grantor,
+                    SecurityAction::GrantManage,
+                    &PolicyScope::Cluster,
+                )
+            {
+                return Err("grantor authority or reviewed revision is no longer current".into());
+            }
+            let mut target = catalog
+                .get_security_principal(target_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "security principal was not found".to_owned())?;
+            if target.revision != change.expected_revision {
+                return Err(format!(
+                    "security principal revision changed from {} to {}; review the current grants",
+                    change.expected_revision, target.revision
+                ));
+            }
+            let before_state = security_principal_policy_state(&target)?;
+            target.revision = expected_new_revision;
+            target.preset_grants = change.preset_grants.clone();
+            target.scoped_grants = change.scoped_grants.clone();
+            target.validate().map_err(|error| error.to_string())?;
+            let mut principals = catalog
+                .list_security_principals()
+                .await
+                .map_err(|error| error.to_string())?;
+            let changed_target = principals
+                .iter_mut()
+                .find(|principal| principal.id == target_id)
+                .ok_or_else(|| "security principal was not found".to_owned())?;
+            *changed_target = target.clone();
+            if !has_management_admin(&principals) {
+                return Err(
+                    "grant mutation would remove the last mTLS management administrator".into(),
+                );
+            }
+            let after_state = security_principal_policy_state(&target)?;
+            let timestamp_ms = Utc::now().timestamp_millis().max(1) as u64;
+            let audit = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: event_id.clone(),
+                timestamp_ms,
+                actor: AuditIdentity::Verified(format!("principal:{}", grantor_id.0)),
+                target: AuditField::Known(format!("principal:{}", target_id.0)),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::GrantChange,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(operation_id.to_owned()),
+                policy_revision: AuditField::Known(target.revision),
+                before_state: AuditField::Known(before_state.clone()),
+                after_state: AuditField::Known(after_state.clone()),
+            };
+            let completion = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("management-security-grants-completion:{operation_id}"),
+                timestamp_ms,
+                actor: audit.actor.clone(),
+                target: audit.target.clone(),
+                scope: audit.scope.clone(),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: audit.correlation.clone(),
+                operation_id: audit.operation_id.clone(),
+                policy_revision: audit.policy_revision.clone(),
+                before_state: audit.before_state.clone(),
+                after_state: audit.after_state.clone(),
+            };
+            let revision = catalog
+                .get_revision()
+                .await
+                .checked_add(1)
+                .ok_or_else(|| "security catalog revision is exhausted".to_owned())?;
+            let txn = CatalogTxn::new(
+                revision,
+                rand::random::<u64>().max(1),
+                vec![
+                    CatalogMutation::PutSecurityPrincipalForOperation {
+                        principal: target,
+                        expected_revision: Some(change.expected_revision),
+                        grantor_revision: Some((grantor_id, change.grantor_revision)),
+                        operation_id: operation_id.to_owned(),
+                        audit,
+                    },
+                    CatalogMutation::AppendSecurityAudit(completion),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            match catalog.commit_txn(txn).await {
+                Ok(_) => return security_principal_grant_result(change, expected_new_revision),
+                Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
+                    if attempt == 0 => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("security grant mutation conflicted with another catalog update".to_owned())
+    }
+
+    async fn ensure_security_operation_started(
+        &self,
+        operation_id: &str,
+        change: &SecurityPrincipalGrantChange,
+    ) -> Result<(), String> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| "management security catalog is unavailable".to_owned())?;
+        let event_id = format!("management-security-grants-start:{operation_id}");
+        catalog.refresh().await.map_err(|error| error.to_string())?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            if record.action == SecurityAuditClass::AdminOperationStart
+                && record.outcome == SecurityAuditOutcome::Success
+                && record.actor
+                    == AuditIdentity::Verified(format!("principal:{}", change.grantor_id))
+                && record.target == AuditField::Known(format!("principal:{}", change.principal_id))
+                && record.operation_id == AuditField::Known(operation_id.to_owned())
+            {
+                return Ok(());
+            }
+            return Err("security operation start audit identity does not match".to_owned());
+        }
+        append_security_audit(
+            catalog.as_ref(),
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id,
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", change.grantor_id)),
+                target: AuditField::Known(format!("principal:{}", change.principal_id)),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationStart,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(operation_id.to_owned()),
+                policy_revision: AuditField::Known(change.grantor_revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            },
+        )
+        .await
+    }
+
+    async fn append_security_operation_failure(
+        &self,
+        operation_id: &str,
+        change: &SecurityPrincipalGrantChange,
+    ) -> Result<(), String> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| "management security catalog is unavailable".to_owned())?;
+        let event_id = format!("management-security-grants-completion:{operation_id}");
+        catalog.refresh().await.map_err(|error| error.to_string())?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            if record.action == SecurityAuditClass::AdminOperationCompletion
+                && record.outcome == SecurityAuditOutcome::Failure
+                && record.operation_id == AuditField::Known(operation_id.to_owned())
+            {
+                return Ok(());
+            }
+            return Err("security operation completion audit identity does not match".to_owned());
+        }
+        append_security_audit(
+            catalog.as_ref(),
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id,
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", change.grantor_id)),
+                target: AuditField::Known(format!("principal:{}", change.principal_id)),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Failure,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(operation_id.to_owned()),
+                policy_revision: AuditField::Known(change.grantor_revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            },
+        )
+        .await
     }
 }
 
@@ -768,6 +1227,55 @@ fn timestamp(epoch_ms: i64) -> String {
 fn encode_policy<T: Serialize>(value: &T) -> Result<String, Status> {
     serde_json::to_string(value)
         .map_err(|_| Status::internal("failed to encode security policy metadata"))
+}
+
+fn security_principal_policy_state(principal: &SecurityPrincipal) -> Result<String, String> {
+    let policy = serde_json::to_string(&(
+        principal.enabled,
+        &principal.preset_grants,
+        &principal.scoped_grants,
+    ))
+    .map_err(|error| error.to_string())?;
+    Ok(format!("revision={};policy={policy}", principal.revision))
+}
+
+fn security_principal_grant_result(
+    change: &SecurityPrincipalGrantChange,
+    revision: u64,
+) -> Result<serde_json::Value, String> {
+    let mut effective_permissions = Vec::new();
+    for grant in &change.preset_grants {
+        for action in grant.preset.actions() {
+            let permission = ScopedActionGrant {
+                action: *action,
+                scope: grant.scope.clone(),
+            };
+            if !effective_permissions.contains(&permission) {
+                effective_permissions.push(permission);
+            }
+        }
+    }
+    for grant in &change.scoped_grants {
+        if !effective_permissions.contains(grant) {
+            effective_permissions.push(grant.clone());
+        }
+    }
+    let result = serde_json::to_value(SecurityPrincipalGrantResult {
+        principal_id: change.principal_id,
+        revision,
+        preset_grants: change.preset_grants.clone(),
+        scoped_grants: change.scoped_grants.clone(),
+        effective_permissions,
+    })
+    .map_err(|error| error.to_string())?;
+    if serde_json::to_vec(&result)
+        .map_err(|error| error.to_string())?
+        .len()
+        > MAX_MESSAGE_BYTES.saturating_sub(1024)
+    {
+        return Err("security grant result exceeds the management message limit".to_owned());
+    }
+    Ok(result)
 }
 
 fn page_size(requested: u32) -> Result<usize, Status> {
@@ -1036,6 +1544,96 @@ impl v1::management_service_server::ManagementService for ManagementService {
         }))
     }
 
+    async fn set_security_principal_grants(
+        &self,
+        request: Request<v1::SetSecurityPrincipalGrantsRequest>,
+    ) -> Result<Response<v1::SetSecurityPrincipalGrantsResponse>, Status> {
+        let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        let body = request.get_ref();
+        let operation_id = uuid::Uuid::parse_str(&body.idempotency_key)
+            .map(|value| value.to_string())
+            .ok()
+            .filter(|value| value == &body.idempotency_key)
+            .ok_or_else(|| Status::invalid_argument("idempotency_key must be a canonical UUID"))?;
+        if body.principal_id == 0
+            || body.expected_revision == 0
+            || body.expected_grantor_revision == 0
+        {
+            return Err(Status::invalid_argument(
+                "principal and reviewed policy revisions must be nonzero",
+            ));
+        }
+        self.authorize(&request, SecurityAction::GrantManage, PolicyScope::Cluster)
+            .await?;
+        let peer = request
+            .extensions()
+            .get::<ManagementConnectionInfo>()
+            .ok_or_else(|| Status::unauthenticated("management mTLS identity is required"))?;
+        let preset_grants = body
+            .preset_grants
+            .iter()
+            .map(|grant| {
+                Ok(ScopedPresetGrant {
+                    preset: serde_json::from_value(serde_json::Value::String(grant.preset.clone()))
+                        .map_err(|_| Status::invalid_argument("preset grant is invalid"))?,
+                    scope: serde_json::from_str(&grant.scope_json)
+                        .map_err(|_| Status::invalid_argument("preset grant scope is invalid"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let scoped_grants = body
+            .scoped_grants
+            .iter()
+            .map(|grant| {
+                Ok(ScopedActionGrant {
+                    action: serde_json::from_value(serde_json::Value::String(grant.action.clone()))
+                        .map_err(|_| Status::invalid_argument("scoped grant action is invalid"))?,
+                    scope: serde_json::from_str(&grant.scope_json)
+                        .map_err(|_| Status::invalid_argument("scoped grant scope is invalid"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let change = SecurityPrincipalGrantChange {
+            deployment_id: self.deployment_fingerprint(),
+            principal_id: body.principal_id,
+            expected_revision: body.expected_revision,
+            grantor_id: peer.principal_id.0,
+            grantor_revision: body.expected_grantor_revision,
+            certificate_sha256: hex::encode(peer.certificate_sha256),
+            preset_grants,
+            scoped_grants,
+        };
+        let accepted = self
+            .operations
+            .accept_idempotent(
+                &operation_id,
+                body.protocol_version as u16,
+                &change,
+                operation_id.clone(),
+                crate::management_store::OperationKind::SecurityPrincipalGrants,
+                Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(store_error)?;
+        let accepted = if matches!(
+            accepted.status(),
+            OperationStatus::Pending | OperationStatus::Waiting
+        ) {
+            self.process_security_principal_grants(&accepted)
+                .await
+                .map_err(|_| {
+                    Status::unavailable("security grant operation could not be reconciled")
+                })?
+        } else {
+            accepted
+        };
+        Ok(Response::new(v1::SetSecurityPrincipalGrantsResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation: Some(Self::operation(accepted, true)),
+        }))
+    }
+
     async fn get_node(
         &self,
         request: Request<v1::GetNodeRequest>,
@@ -1168,11 +1766,26 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .list(size, &request.page_token)
             .await
             .map_err(store_error)?;
+        let deployment_id = self.deployment_fingerprint();
+        let items = items
+            .into_iter()
+            .filter(|record| {
+                record.kind() != crate::management_store::OperationKind::SecurityPrincipalGrants
+                    || record
+                        .request()
+                        .and_then(|request| request.get("deployment_id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(deployment_id.as_str())
+            })
+            .collect::<Vec<_>>();
         Ok(Response::new(v1::ListOperationsResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             source_version: "management-operation-records:v1".to_owned(),
-            operations: items.into_iter().map(Self::operation).collect(),
+            operations: items
+                .into_iter()
+                .map(|item| Self::operation(item, false))
+                .collect(),
             next_page_token,
         }))
     }
@@ -1183,28 +1796,46 @@ impl v1::management_service_server::ManagementService for ManagementService {
     ) -> Result<Response<v1::GetOperationResponse>, Status> {
         let _permit = self.acquire_request()?;
         Self::ensure_version(request.get_ref().protocol_version)?;
-        self.authorize(
-            &request,
-            SecurityAction::OperationHistoryRead,
-            PolicyScope::Operation {
-                operation_id: request.get_ref().operation_id.clone(),
-            },
-        )
-        .await?;
-        let request = request.into_inner();
         let record = self
             .operations
-            .get(&request.operation_id)
+            .get(&request.get_ref().operation_id)
             .await
             .map_err(store_error)?
             .ok_or_else(|| {
-                Status::not_found(format!("operation {} not found", request.operation_id))
+                Status::not_found(format!(
+                    "operation {} not found",
+                    request.get_ref().operation_id
+                ))
             })?;
+        if record.kind() == crate::management_store::OperationKind::SecurityPrincipalGrants {
+            let change: SecurityPrincipalGrantChange = record
+                .request()
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or_else(|| Status::not_found("operation was not found"))?;
+            if change.deployment_id != self.deployment_fingerprint() {
+                return Err(Status::not_found("operation was not found"));
+            }
+            let caller = self.current_principal(&request).await?;
+            if caller.id.0 != change.grantor_id {
+                self.authorize(&request, SecurityAction::GrantManage, PolicyScope::Cluster)
+                    .await?;
+            }
+        } else {
+            self.authorize(
+                &request,
+                SecurityAction::OperationHistoryRead,
+                PolicyScope::Operation {
+                    operation_id: request.get_ref().operation_id.clone(),
+                },
+            )
+            .await?;
+        }
         Ok(Response::new(v1::GetOperationResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             source_version: "management-operation-records:v1".to_owned(),
-            operation: Some(Self::operation(record)),
+            operation: Some(Self::operation(record, true)),
         }))
     }
 
@@ -1252,6 +1883,8 @@ impl v1::management_service_server::ManagementService for ManagementService {
             "ListShards".to_owned(),
             "GetShard".to_owned(),
             "ListOperations".to_owned(),
+            "ListSecurityPrincipals".to_owned(),
+            "SetSecurityPrincipalGrants".to_owned(),
             "GetOperation".to_owned(),
             "GetConfigSummary".to_owned(),
             "GetCapabilities".to_owned(),
@@ -1343,7 +1976,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         }
         Ok(Response::new(v1::DrainWorkerResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            operation: Some(Self::operation(accepted)),
+            operation: Some(Self::operation(accepted, false)),
         }))
     }
 
@@ -1413,7 +2046,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         }
         Ok(Response::new(v1::MigrateShardResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            operation: Some(Self::operation(accepted)),
+            operation: Some(Self::operation(accepted, false)),
         }))
     }
 
@@ -1473,7 +2106,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
         }
         Ok(Response::new(v1::CreateBackupResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            operation: Some(Self::operation(accepted)),
+            operation: Some(Self::operation(accepted, false)),
         }))
     }
 
@@ -1543,7 +2176,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .map_err(store_error)?;
         Ok(Response::new(v1::CancelOperationResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            operation: Some(Self::operation(record)),
+            operation: Some(Self::operation(record, false)),
         }))
     }
 }
@@ -1597,8 +2230,8 @@ mod tests {
             PermissionPreset::Administrator,
         )];
 
-        assert_eq!(has_management_admin(&split), false);
-        assert_eq!(has_management_admin(&mtls_admin), true);
+        assert!(!has_management_admin(&split));
+        assert!(has_management_admin(&mtls_admin));
     }
 
     #[test]

@@ -127,6 +127,8 @@ The native management API requires mTLS and a durable security catalog. Only cer
 
 Principals with cluster-scoped `principal.manage` may list durable principal metadata, preset/scoped grants, and their effective action/scope pairs through the paginated Management API. Responses omit login methods and credential material.
 
+`SetSecurityPrincipalGrants` replaces grants on an existing principal. It requires a canonical client-generated UUID, the target revision and grantor revision the caller reviewed, and current `grant.manage` authority. The UUID is the operation ID and is bound to the authenticated principal, deployment context, target, revisions, and requested grants. The catalog commits the grant change and its audit record atomically; the durable operation stores the complete safe result. Retry with the same UUID after a lost response, then use the authorized `GetOperation` RPC to reconcile. Do not retry as a new operation. Operation listings omit grant results; the original grantor or a current grant manager may read the result.
+
 A grantor cannot add grants to its own principal. Catalog mutations also reject changes that would remove the last active administrator.
 
 ---

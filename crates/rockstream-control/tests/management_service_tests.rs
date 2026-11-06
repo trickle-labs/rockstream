@@ -10,8 +10,9 @@ use rockstream_management_proto::v1::{
     GetClusterStatusRequest, GetConfigSummaryRequest, GetHealthRequest, GetNodeRequest,
     GetOperationRequest, GetShardRequest, ListNodesRequest, ListOperationsRequest,
     ListSecurityPrincipalsRequest, ListShardsRequest, MigrateShardRequest, Operation,
+    SetSecurityPrincipalGrantsRequest,
 };
-use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
+use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
     ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
@@ -416,6 +417,456 @@ async fn management_principal_listing_pages_grants_without_exposing_login_creden
     server.shutdown();
 }
 
+#[tokio::test]
+async fn management_grant_mutation_is_idempotent_and_audits_the_complete_result() {
+    let auth = ManagementAuth::with_presets(
+        &[],
+        &[PermissionPreset::Administrator, PermissionPreset::Operator],
+    )
+    .await;
+    let target = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "SCRAM target".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "private-user".to_owned(),
+            salt: vec![0x11; 16],
+            iterations: 4096,
+            stored_key: vec![0x22; 32],
+            server_key: vec![0x33; 32],
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::DataReader,
+            scope: PolicyScope::Namespace {
+                namespace: "sales".to_owned(),
+            },
+        }],
+        scoped_grants: Vec::new(),
+    };
+    let initial_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "management-grant-mutation-target".to_owned(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis().max(1) as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known("2".to_owned()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!(
+            "revision=1;policy={}",
+            serde_json::to_string(&(target.enabled, &target.preset_grants, &target.scoped_grants))
+                .unwrap()
+        )),
+    };
+    auth.catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: target.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: initial_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let operation_store = Arc::new(InMemory::new());
+    let operations = ManagementOperationStore::new(operation_store.clone());
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        operations.clone(),
+        NodeConfig::default(),
+    );
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
+    let operation_id = "00000000-0000-4000-8000-000000000123";
+    let request = SetSecurityPrincipalGrantsRequest {
+        protocol_version: 1,
+        principal_id: 2,
+        expected_revision: 1,
+        expected_grantor_revision: 1,
+        idempotency_key: operation_id.to_owned(),
+        preset_grants: vec![rockstream_management_proto::v1::SecurityPresetGrant {
+            preset: "data_reader".to_owned(),
+            scope_json: "{\"namespace\":{\"namespace\":\"sales\"}}".to_owned(),
+        }],
+        scoped_grants: vec![management_action(
+            "secret_use",
+            "{\"secret\":{\"namespace\":\"sales\",\"name\":\"warehouse\",\"consumer\":2}}",
+        )],
+    };
+    let first = client
+        .set_security_principal_grants(request.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(first.operation_id, operation_id);
+    assert_eq!(first.kind, "security_principal_grants");
+    assert_eq!(first.state, "succeeded");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&first.result_json).unwrap(),
+        serde_json::json!({
+            "principal_id": 2,
+            "revision": 2,
+            "preset_grants": [{
+                "preset": "data_reader",
+                "scope": {"namespace": {"namespace": "sales"}}
+            }],
+            "scoped_grants": [{
+                "action": "secret_use",
+                "scope": {"secret": {
+                    "namespace": "sales",
+                    "name": "warehouse",
+                    "consumer": 2
+                }}
+            }],
+            "effective_permissions": [
+                {"action": "metadata_inspect", "scope": {"namespace": {"namespace": "sales"}}},
+                {"action": "data_read", "scope": {"namespace": {"namespace": "sales"}}},
+                {"action": "data_subscribe", "scope": {"namespace": {"namespace": "sales"}}},
+                {"action": "secret_use", "scope": {"secret": {
+                    "namespace": "sales",
+                    "name": "warehouse",
+                    "consumer": 2
+                }}}
+            ]
+        })
+    );
+    assert!(!first.result_json.contains("private-user"));
+    assert!(!first.result_json.contains("stored_key"));
+    let retry = client
+        .set_security_principal_grants(request.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(retry, first);
+    let recovered_operation = ManagementOperationStore::new(operation_store)
+        .get(operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recovered_operation.result(),
+        Some(&serde_json::from_str(&first.result_json).unwrap())
+    );
+    let recovered_catalog = DurableCatalogStore::recover(auth.store.clone(), "management-security")
+        .await
+        .unwrap();
+    let recovered_principal = recovered_catalog
+        .get_security_principal(PrincipalId(2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_principal.revision, 2);
+    assert_eq!(recovered_principal.preset_grants, target.preset_grants);
+    assert_eq!(recovered_principal.scoped_grants.len(), 1);
+    let looked_up = client
+        .get_operation(GetOperationRequest {
+            protocol_version: 1,
+            operation_id: operation_id.to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(looked_up.result_json, first.result_json);
+
+    let mut conflicting = request;
+    conflicting.scoped_grants.clear();
+    let conflict = client
+        .set_security_principal_grants(conflicting)
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+    assert_eq!(
+        auth.catalog
+            .get_security_principal(PrincipalId(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        2
+    );
+    let records = auth.catalog.list_security_audit_records().await.unwrap();
+    let audit = records
+        .iter()
+        .find(|record| record.event_id == format!("management-security-grants:{operation_id}"))
+        .unwrap();
+    assert_eq!(
+        audit.actor,
+        AuditIdentity::Verified("principal:1".to_owned())
+    );
+    assert_eq!(audit.target, AuditField::Known("principal:2".to_owned()));
+    assert_eq!(audit.scope, AuditField::Known("cluster".to_owned()));
+    assert_eq!(audit.action, SecurityAuditClass::GrantChange);
+    assert_eq!(audit.outcome, SecurityAuditOutcome::Success);
+    assert_eq!(
+        audit.correlation,
+        AuditCorrelation::Observed(operation_id.to_owned())
+    );
+    assert_eq!(
+        audit.operation_id,
+        AuditField::Known(operation_id.to_owned())
+    );
+    assert_eq!(audit.policy_revision, AuditField::Known(2));
+    assert_eq!(
+        audit.before_state,
+        AuditField::Known(format!(
+            "revision=1;policy={}",
+            serde_json::to_string(&(target.enabled, &target.preset_grants, &target.scoped_grants))
+                .unwrap()
+        ))
+    );
+    assert!(
+        matches!(&audit.after_state, AuditField::Known(value) if value.starts_with("revision=2;policy="))
+    );
+    let started = records
+        .iter()
+        .find(|record| {
+            record.event_id == format!("management-security-grants-start:{operation_id}")
+        })
+        .unwrap();
+    assert_eq!(
+        started.actor,
+        AuditIdentity::Verified("principal:1".to_owned())
+    );
+    assert_eq!(started.target, AuditField::Known("principal:2".to_owned()));
+    assert_eq!(started.scope, AuditField::Known("cluster".to_owned()));
+    assert_eq!(started.action, SecurityAuditClass::AdminOperationStart);
+    assert_eq!(started.outcome, SecurityAuditOutcome::Success);
+    assert_eq!(
+        started.correlation,
+        AuditCorrelation::Observed(operation_id.to_owned())
+    );
+    assert_eq!(
+        started.operation_id,
+        AuditField::Known(operation_id.to_owned())
+    );
+    assert_eq!(started.policy_revision, AuditField::Known(1));
+    assert_eq!(started.before_state, AuditField::NotApplicable);
+    assert_eq!(started.after_state, AuditField::NotApplicable);
+    let completion = records
+        .iter()
+        .find(|record| {
+            record.event_id == format!("management-security-grants-completion:{operation_id}")
+        })
+        .unwrap();
+    assert_eq!(
+        completion.actor,
+        AuditIdentity::Verified("principal:1".to_owned())
+    );
+    assert_eq!(
+        completion.target,
+        AuditField::Known("principal:2".to_owned())
+    );
+    assert_eq!(completion.scope, AuditField::Known("cluster".to_owned()));
+    assert_eq!(
+        completion.action,
+        SecurityAuditClass::AdminOperationCompletion
+    );
+    assert_eq!(completion.outcome, SecurityAuditOutcome::Success);
+    assert_eq!(
+        completion.correlation,
+        AuditCorrelation::Observed(operation_id.to_owned())
+    );
+    assert_eq!(
+        completion.operation_id,
+        AuditField::Known(operation_id.to_owned())
+    );
+    assert_eq!(completion.policy_revision, AuditField::Known(2));
+    assert_eq!(completion.before_state, audit.before_state);
+    assert_eq!(completion.after_state, audit.after_state);
+    let (listed, _) = operations.list(10, "").await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        client
+            .list_operations(ListOperationsRequest {
+                protocol_version: 1,
+                page_size: 10,
+                page_token: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .operations[0]
+            .result_json,
+        ""
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn grantor_can_reconcile_its_self_revocation_without_removing_last_admin() {
+    let auth = ManagementAuth::with_presets(
+        &[],
+        &[PermissionPreset::Administrator, PermissionPreset::Operator],
+    )
+    .await;
+    let second_admin = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Second administrator".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Mtls {
+            certificate_sha256: [8; 32],
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: Vec::new(),
+    };
+    let initial_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "management-self-revoke-second-admin".to_owned(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis().max(1) as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known("2".to_owned()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!(
+            "revision=1;policy={}",
+            serde_json::to_string(&(
+                second_admin.enabled,
+                &second_admin.preset_grants,
+                &second_admin.scoped_grants
+            ))
+            .unwrap()
+        )),
+    };
+    auth.catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: second_admin,
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: initial_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        ManagementOperationStore::new(Arc::new(InMemory::new())),
+        NodeConfig::default(),
+    );
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
+    let operation_id = "00000000-0000-4000-8000-000000000124";
+    let mutation = SetSecurityPrincipalGrantsRequest {
+        protocol_version: 1,
+        principal_id: 1,
+        expected_revision: 1,
+        expected_grantor_revision: 1,
+        idempotency_key: operation_id.to_owned(),
+        preset_grants: vec![rockstream_management_proto::v1::SecurityPresetGrant {
+            preset: "operator".to_owned(),
+            scope_json: "\"cluster\"".to_owned(),
+        }],
+        scoped_grants: Vec::new(),
+    };
+    let operation = client
+        .set_security_principal_grants(mutation)
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(operation.state, "succeeded");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&operation.result_json).unwrap(),
+        serde_json::json!({
+            "principal_id": 1,
+            "revision": 2,
+            "preset_grants": [{"preset": "operator", "scope": "cluster"}],
+            "scoped_grants": [],
+            "effective_permissions": [
+                {"action": "cluster_observe", "scope": "cluster"},
+                {"action": "node_drain", "scope": "cluster"},
+                {"action": "shard_migrate", "scope": "cluster"},
+                {"action": "operation_cancel", "scope": "cluster"},
+                {"action": "operation_history_read", "scope": "cluster"},
+                {"action": "diagnostics_read", "scope": "cluster"},
+                {"action": "support_generate", "scope": "cluster"},
+                {"action": "support_download", "scope": "cluster"}
+            ]
+        })
+    );
+    assert_eq!(
+        auth.catalog
+            .get_security_principal(PrincipalId(1))
+            .await
+            .unwrap()
+            .unwrap()
+            .preset_grants,
+        vec![ScopedPresetGrant {
+            preset: PermissionPreset::Operator,
+            scope: PolicyScope::Cluster,
+        }]
+    );
+
+    let listing = client
+        .list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: 1,
+            page_size: 10,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(listing.code(), tonic::Code::PermissionDenied);
+    let reconciled = client
+        .get_operation(GetOperationRequest {
+            protocol_version: 1,
+            operation_id: operation_id.to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(reconciled.result_json, operation.result_json);
+    assert_eq!(
+        auth.catalog
+            .get_security_principal(PrincipalId(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        1
+    );
+    server.shutdown();
+}
+
 fn management_action(
     action: &str,
     scope_json: &str,
@@ -702,7 +1153,8 @@ async fn management_start_recovers_running_operation_with_exact_phase() {
             next_steps: vec![
                 "Management restarted; reconcile this operation before retrying.".to_owned(),
             ],
-            source_version: "operation-record:2".to_owned(),
+            source_version: "operation-record:3".to_owned(),
+            result_json: String::new(),
         }
     );
     assert!(operation
@@ -784,7 +1236,8 @@ async fn management_cancellation_obeys_the_safe_boundary() {
             phase: "cancelled_before_start".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:2".to_owned(),
+            source_version: "operation-record:3".to_owned(),
+            result_json: String::new(),
         }
     );
 
@@ -822,7 +1275,8 @@ async fn management_cancellation_obeys_the_safe_boundary() {
             phase: "worker_handoff_started".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:2".to_owned(),
+            source_version: "operation-record:3".to_owned(),
+            result_json: String::new(),
         }
     );
     server.shutdown();
@@ -995,7 +1449,7 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
     assert_eq!(completed.phase, "completed");
     assert!(completed.error_code.is_empty());
     assert!(completed.next_steps.is_empty());
-    assert_eq!(completed.source_version, "operation-record:2");
+    assert_eq!(completed.source_version, "operation-record:3");
     assert_eq!(
         shard_manager.get(ShardId(77)).unwrap().worker_id,
         WorkerId(2)
@@ -1138,7 +1592,7 @@ async fn management_migrate_moves_a_real_shard_once() {
     assert_eq!(completed.phase, "completed");
     assert_eq!(completed.error_code, "");
     assert_eq!(completed.next_steps, Vec::<String>::new());
-    assert_eq!(completed.source_version, "operation-record:2");
+    assert_eq!(completed.source_version, "operation-record:3");
     assert_eq!(shard_manager.get(ShardId(77)), Some(new_lease));
     control.shutdown();
 }
