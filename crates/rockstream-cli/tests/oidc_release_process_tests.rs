@@ -1897,6 +1897,9 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     let expired_id = uuid::Uuid::new_v4().to_string();
     let expired_content = b"{\"format_version\":1,\"safe\":\"expired fixture\"}";
     let expired_blob_path = support_artifact_object_path(&expired_id);
+    let foreign_id = uuid::Uuid::new_v4().to_string();
+    let foreign_content = b"{\"format_version\":1,\"safe\":\"foreign fixture\"}";
+    let foreign_blob_path = support_artifact_object_path(&foreign_id);
     let first_blob_path = support_artifact_object_path(&first.opaque_id);
     let management_store = object_store::prefix::PrefixStore::new(
         rockstream_test_support::minio::minio_object_store(minio_port, bucket),
@@ -1949,8 +1952,19 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         "size": expired_content.len(),
         "expires_at_ms": expired_at_ms,
     });
+    ledger["artifacts"][&foreign_id] = serde_json::json!({
+        "owner": PrincipalId(2),
+        "scope": PolicyScope::Cluster,
+        "size": foreign_content.len(),
+        "expires_at_ms": first.expires_at_ms,
+    });
     management_store
-        .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
+        .put(&foreign_blob_path, foreign_content.to_vec().into())
+        .await
+        .unwrap();
+    let ledger_with_foreign_artifact = serde_json::to_vec(&ledger).unwrap();
+    management_store
+        .put(&ledger_path, ledger_with_foreign_artifact.clone().into())
         .await
         .unwrap();
     assert_eq!(
@@ -1963,6 +1977,40 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             .unwrap()
             .as_ref(),
         expired_content
+    );
+    let foreign_denial = client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: foreign_id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(foreign_denial.code(), tonic::Code::NotFound);
+    assert_eq!(
+        foreign_denial.message(),
+        "support artifact not found or expired"
+    );
+    assert_eq!(
+        management_store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        ledger_with_foreign_artifact
+    );
+    assert_eq!(
+        management_store
+            .get(&foreign_blob_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        foreign_content
     );
     process.0.kill().unwrap();
     process.0.wait().unwrap();
@@ -2009,7 +2057,20 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         .keys()
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(recovered_ids, vec![idempotency_key.clone()]);
+    let mut expected_recovered_ids = vec![idempotency_key.clone(), foreign_id.clone()];
+    expected_recovered_ids.sort();
+    assert_eq!(recovered_ids, expected_recovered_ids);
+    assert_eq!(
+        management_store
+            .get(&foreign_blob_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        foreign_content
+    );
     match management_store.get(&expired_blob_path).await {
         Err(object_store::Error::NotFound { .. }) => {}
         Err(error) => panic!("expired artifact lookup failed unexpectedly: {error:?}"),
@@ -2119,6 +2180,26 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             scope: AuditField::Known(artifact_scope.clone()),
             action: SecurityAuditClass::AdminOperationStart,
             outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        },
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "support-artifact".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known(format!("support-artifact:{foreign_id}")),
+            scope: AuditField::Known(
+                serde_json::to_string(&PolicyScope::Artifact {
+                    opaque_id: foreign_id.clone(),
+                })
+                .unwrap(),
+            ),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
             correlation: AuditCorrelation::Unknown,
             operation_id: AuditField::NotApplicable,
             policy_revision: AuditField::Known(1),
