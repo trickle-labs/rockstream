@@ -1,0 +1,625 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 0be56f7b..43c4b943 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5383,0 +5384 @@ dependencies = [
++ "rockstream-management-proto",
+diff --git a/crates/rockstream-sim/Cargo.toml b/crates/rockstream-sim/Cargo.toml
+index 1137b299..60d04262 100644
+--- a/crates/rockstream-sim/Cargo.toml
++++ b/crates/rockstream-sim/Cargo.toml
+@@ -29,0 +30 @@ rockstream-control = { workspace = true }
++rockstream-management-proto = { workspace = true }
+diff --git a/crates/rockstream-sim/tests/common/management_worker.rs b/crates/rockstream-sim/tests/common/management_worker.rs
+index bd648c6f..24eab4bc 100644
+--- a/crates/rockstream-sim/tests/common/management_worker.rs
++++ b/crates/rockstream-sim/tests/common/management_worker.rs
+@@ -164,0 +165,56 @@ pub async fn preprovision_management_catalog(storage_dir: &std::path::Path, pki:
++pub async fn preprovision_limited_identity(storage_dir: &std::path::Path, pki: &TestPki) {
++    use rockstream_storage::catalog::{
++        CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
++    };
++    use rockstream_types::ids::PrincipalId;
++    use sha2::{Digest, Sha256};
++    let store = std::sync::Arc::new(
++        object_store::local::LocalFileSystem::new_with_prefix(storage_dir.join("gateway-shard"))
++            .unwrap(),
++    );
++    let catalog = DurableCatalogStore::recover(store, "gateway")
++        .await
++        .unwrap();
++    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
++        std::fs::File::open(&pki.limited_cli_cert_path).unwrap(),
++    ))
++    .collect::<Result<Vec<_>, _>>()
++    .unwrap();
++    let mut principal = catalog.list_security_principals().await.unwrap().remove(0);
++    principal.id = PrincipalId(2);
++    principal.display_name = "management test limited".to_owned();
++    principal.login_methods = vec![LoginMethod::Mtls {
++        certificate_sha256: Sha256::digest(certs[0].as_ref()).into(),
++    }];
++    principal.preset_grants.clear();
++    let mut audit = catalog
++        .list_security_audit_records()
++        .await
++        .unwrap()
++        .remove(0);
++    audit.event_id = "management-test-limited-bootstrap".to_owned();
++    audit.actor = AuditIdentity::Verified("principal:1".to_owned());
++    audit.target = AuditField::Known("principal:2".to_owned());
++    audit.operation_id = AuditField::Known("2".to_owned());
++    audit.after_state = AuditField::Known(format!(
++        "revision=1;policy={}",
++        serde_json::to_string(&(true, &principal.preset_grants, &principal.scoped_grants)).unwrap()
++    ));
++    catalog
++        .commit_txn(
++            CatalogTxn::new(
++                2,
++                2,
++                vec![CatalogMutation::PutSecurityPrincipal {
++                    principal,
++                    expected_revision: None,
++                    grantor_revision: Some((PrincipalId(1), 1)),
++                    audit,
++                }],
++            )
++            .unwrap(),
++        )
++        .await
++        .unwrap();
++}
++
+diff --git a/crates/rockstream-test-support/src/pki.rs b/crates/rockstream-test-support/src/pki.rs
+index 1ed53327..a279b781 100644
+--- a/crates/rockstream-test-support/src/pki.rs
++++ b/crates/rockstream-test-support/src/pki.rs
+@@ -24,0 +25,2 @@ pub struct TestPki {
++    pub limited_cli_cert_path: PathBuf,
++    pub limited_cli_key_path: PathBuf,
+@@ -90,0 +93,8 @@ impl TestPki {
++        let (limited_cert, limited_key) = make_leaf(
++            &ca_cert,
++            &ca_key,
++            &NodeIdentity::cli("limited").to_cn(),
++            vec!["localhost".to_string(), "127.0.0.1".to_string()],
++        );
++        let limited_cli_cert_path = write_file(dir.path(), "limited-cli.pem", &limited_cert);
++        let limited_cli_key_path = write_file(dir.path(), "limited-cli-key.pem", &limited_key);
+@@ -152,0 +163,2 @@ impl TestPki {
++            limited_cli_cert_path,
++            limited_cli_key_path,
+diff --git a/crates/rockstream-sim/tests/issue_321_real_process.rs b/crates/rockstream-sim/tests/issue_321_real_process.rs
+new file mode 100644
+index 00000000..345d01ad
+--- /dev/null
++++ b/crates/rockstream-sim/tests/issue_321_real_process.rs
+@@ -0,0 +1,527 @@
++use std::{net::SocketAddr, sync::Arc, time::Duration};
++
++use object_store::{local::LocalFileSystem, prefix::PrefixStore, ObjectStore};
++use rockstream_cli::transport::ManagementCliClient;
++use rockstream_control::{ShardManager, ShardPersistentStore};
++use rockstream_storage::ShardDb;
++use rockstream_test_support::{
++    minio::{minio_object_store, start_minio, MINIO_PASS, MINIO_USER},
++    pki::TestPki,
++};
++use rockstream_types::ids::{ShardId, WorkerId};
++use testcontainers::{
++    core::{ContainerPort, Host, Mount, WaitFor},
++    runners::AsyncRunner,
++    ContainerAsync, GenericImage, ImageExt,
++};
++
++#[path = "common/management_worker.rs"]
++mod management_worker;
++
++const IMAGE: &str = "rockstream-321-qual";
++const TAG: &str = "d698bdfc88c1";
++
++fn stable_nodes(
++    mut nodes: Vec<rockstream_cli::output::ManagementNodeInfo>,
++) -> Vec<rockstream_cli::output::ManagementNodeInfo> {
++    for node in &mut nodes {
++        node.capacity_headroom = 0.0;
++        node.source_version.clear();
++    }
++    nodes
++}
++
++async fn call_without_certificate(addr: SocketAddr, ca: Vec<u8>, drain: bool) -> String {
++    use rockstream_management_proto::v1::{
++        management_service_client::ManagementServiceClient, DrainWorkerRequest,
++        GetClusterStatusRequest,
++    };
++    let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{addr}"))
++        .unwrap()
++        .tls_config(
++            tonic::transport::ClientTlsConfig::new()
++                .ca_certificate(tonic::transport::Certificate::from_pem(ca)),
++        )
++        .unwrap();
++    let channel = match endpoint.connect().await {
++        Ok(channel) => channel,
++        Err(error) => return format!("connect: {error}"),
++    };
++    let mut client = ManagementServiceClient::new(channel);
++    let error = if drain {
++        client
++            .drain_worker(DrainWorkerRequest {
++                protocol_version: 1,
++                worker_id: "601".into(),
++                idempotency_key: "fd10bf3d-9792-439c-b529-9dc532bcd8b7".into(),
++            })
++            .await
++            .unwrap_err()
++    } else {
++        client
++            .get_cluster_status(GetClusterStatusRequest {
++                protocol_version: 1,
++            })
++            .await
++            .unwrap_err()
++    };
++    format!("rpc: {}: {}", error.code(), error.message())
++}
++
++async fn wait_for_auth_failure_count(storage: &std::path::Path, expected: usize) {
++    use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
++    use rockstream_types::authorization::SecurityAuditClass;
++    let store = Arc::new(LocalFileSystem::new_with_prefix(storage.join("gateway-shard")).unwrap());
++    tokio::time::timeout(Duration::from_secs(10), async {
++        loop {
++            if let Ok(catalog) = DurableCatalogStore::recover(store.clone(), "gateway").await {
++                if catalog
++                    .list_security_audit_records()
++                    .await
++                    .unwrap()
++                    .iter()
++                    .filter(|record| record.action == SecurityAuditClass::AuthenticationFailure)
++                    .count()
++                    == expected
++                {
++                    return;
++                }
++            }
++            tokio::time::sleep(Duration::from_millis(25)).await;
++        }
++    })
++    .await
++    .expect("authentication rejection was not durably audited");
++}
++
++async fn start_worker(
++    name: &str,
++    control_port: u16,
++    id: u64,
++    minio_port: u16,
++    pki: &TestPki,
++) -> ContainerAsync<GenericImage> {
++    let (cert, key) = pki.worker_certs.get(&id).unwrap();
++    GenericImage::new(IMAGE, TAG)
++        .with_wait_for(WaitFor::seconds(2))
++        .with_host("control", Host::HostGateway)
++        .with_cmd(vec![
++            "--internal-tls-ca-cert-path=/tmp/cluster-ca.pem".into(),
++            "--internal-tls-cert-path=/tmp/worker.pem".into(),
++            "--internal-tls-key-path=/tmp/worker-key.pem".into(),
++            "start".into(),
++            "--role=worker".into(),
++            "--storage=/data".into(),
++            format!("--control=control:{control_port}"),
++            format!("--worker-id={id}"),
++        ])
++        .with_env_var(
++            "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
++            format!("http://host.docker.internal:{minio_port}"),
++        )
++        .with_env_var("ROCKSTREAM_OBJECT_STORE_BUCKET", "issue321")
++        .with_env_var("ROCKSTREAM_OBJECT_STORE_REGION", "us-east-1")
++        .with_env_var("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY", MINIO_USER)
++        .with_env_var("ROCKSTREAM_OBJECT_STORE_SECRET_KEY", MINIO_PASS)
++        .with_mount(Mount::bind_mount(
++            pki.ca_cert_path.to_string_lossy().to_string(),
++            "/tmp/cluster-ca.pem",
++        ))
++        .with_mount(Mount::bind_mount(
++            cert.to_string_lossy().to_string(),
++            "/tmp/worker.pem",
++        ))
++        .with_mount(Mount::bind_mount(
++            key.to_string_lossy().to_string(),
++            "/tmp/worker-key.pem",
++        ))
++        .with_container_name(name)
++        .start()
++        .await
++        .unwrap()
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn management_denial_and_drain_with_real_release_workers() {
++    let image = std::process::Command::new("docker")
++        .args(["image", "inspect", &format!("{IMAGE}:{TAG}")])
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::null())
++        .status()
++        .unwrap();
++    assert!(image.success(), "exact release image is required");
++    let root = tempfile::tempdir().unwrap();
++    let control_dir = root.path().join("control");
++    let shared_dir = root.path().join("shared");
++    std::fs::create_dir_all(&control_dir).unwrap();
++    std::fs::create_dir_all(&shared_dir).unwrap();
++    let pki = TestPki::generate_with_worker_ids([601, 602]);
++    management_worker::preprovision_management_catalog(&control_dir, &pki).await;
++    management_worker::preprovision_limited_identity(&control_dir, &pki).await;
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        for path in [
++            root.path(),
++            control_dir.as_path(),
++            shared_dir.as_path(),
++            control_dir.join("gateway-shard").as_path(),
++        ] {
++            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)).unwrap();
++        }
++    }
++    let (_minio, minio_port) = start_minio("issue321").await.expect("MinIO is required");
++    let manager = ShardManager::new();
++    let old_lease = manager.acquire(ShardId(77), WorkerId(601)).unwrap();
++    let control_store: Arc<dyn ObjectStore> =
++        Arc::new(LocalFileSystem::new_with_prefix(&shared_dir).unwrap());
++    let snapshot = manager.snapshot();
++    ShardPersistentStore::new(control_store)
++        .save(&snapshot)
++        .await;
++    let expected_shard_version = format!("lease:{}:{}", snapshot.leader_epoch, snapshot.next_token);
++    let shard_store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
++        minio_object_store(minio_port, "issue321"),
++        "shards/77",
++    ));
++    let db = ShardDb::builder("db", shard_store).build().await.unwrap();
++    db.put(b"issue321-key", b"retained").await.unwrap();
++    db.flush().await.unwrap();
++    db.close().await.unwrap();
++
++    let run = format!(
++        "rs321-real-{}-{}",
++        std::process::id(),
++        std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap()
++            .as_nanos()
++    );
++    let control = GenericImage::new(IMAGE, TAG)
++        .with_wait_for(WaitFor::message_on_stdout("control service listening"))
++        .with_exposed_port(ContainerPort::Tcp(8000))
++        .with_exposed_port(ContainerPort::Tcp(9201))
++        .with_cmd(vec![
++            "--internal-tls-ca-cert-path=/tmp/cluster-ca.pem",
++            "--internal-tls-cert-path=/tmp/control.pem",
++            "--internal-tls-key-path=/tmp/control-key.pem",
++            "start",
++            "--storage=/data",
++            "--role=control",
++            "--daemon",
++            "--control-bind=0.0.0.0:8000",
++            "--management-addr=0.0.0.0:9201",
++            "--control-shared-storage=/shared",
++        ])
++        .with_mount(Mount::bind_mount(
++            control_dir.to_string_lossy().to_string(),
++            "/data",
++        ))
++        .with_mount(Mount::bind_mount(
++            shared_dir.to_string_lossy().to_string(),
++            "/shared",
++        ))
++        .with_mount(Mount::bind_mount(
++            pki.ca_cert_path.to_string_lossy().to_string(),
++            "/tmp/cluster-ca.pem",
++        ))
++        .with_mount(Mount::bind_mount(
++            pki.control_cert_path.to_string_lossy().to_string(),
++            "/tmp/control.pem",
++        ))
++        .with_mount(Mount::bind_mount(
++            pki.control_key_path.to_string_lossy().to_string(),
++            "/tmp/control-key.pem",
++        ))
++        .with_container_name(format!("{run}-control"))
++        .start()
++        .await
++        .unwrap();
++    let control_port = control.get_host_port_ipv4(8000).await.unwrap();
++    let management_port = control.get_host_port_ipv4(9201).await.unwrap();
++    let worker1 = start_worker(
++        &format!("{run}-worker-601"),
++        control_port,
++        601,
++        minio_port,
++        &pki,
++    )
++    .await;
++    let worker2 = start_worker(
++        &format!("{run}-worker-602"),
++        control_port,
++        602,
++        minio_port,
++        &pki,
++    )
++    .await;
++    let addr: SocketAddr = format!("127.0.0.1:{management_port}").parse().unwrap();
++    let admin_tls = pki.cli_tls_config();
++    let mut limited_tls = admin_tls.clone();
++    limited_tls.cert_path = Some(pki.limited_cli_cert_path.clone());
++    limited_tls.key_path = Some(pki.limited_cli_key_path.clone());
++    let snapshot_tls = admin_tls.clone();
++    let initial = tokio::task::spawn_blocking(move || {
++        let mut client = ManagementCliClient::connect(&addr.to_string(), snapshot_tls).unwrap();
++        let deadline = std::time::Instant::now() + Duration::from_secs(20);
++        let nodes = loop {
++            let nodes = client.list_nodes().unwrap().nodes;
++            if nodes.iter().map(|node| node.node_id).collect::<Vec<_>>() == vec![601, 602] {
++                break nodes;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "workers did not register: {nodes:?}"
++            );
++            std::thread::sleep(Duration::from_millis(50));
++        };
++        (
++            stable_nodes(nodes),
++            client.list_shards().unwrap().shards,
++            client.list_operations().unwrap().operations,
++        )
++    })
++    .await
++    .unwrap();
++    let ca = std::fs::read(&pki.ca_cert_path).unwrap();
++    let no_certificate_read = call_without_certificate(addr, ca.clone(), false).await;
++    wait_for_auth_failure_count(&control_dir, 1).await;
++    let no_certificate_drain = call_without_certificate(addr, ca, true).await;
++    wait_for_auth_failure_count(&control_dir, 2).await;
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    let mut plaintext = tokio::net::TcpStream::connect(addr).await.unwrap();
++    plaintext
++        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
++        .await
++        .unwrap();
++    let mut alert = [0u8; 7];
++    tokio::time::timeout(Duration::from_secs(5), plaintext.read_exact(&mut alert))
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(alert, [21, 3, 3, 0, 2, 2, 50]);
++    wait_for_auth_failure_count(&control_dir, 3).await;
++    let validation_tls = admin_tls.clone();
++    tokio::task::spawn_blocking(move || {
++        let mut no_trust = validation_tls.clone();
++        no_trust.ca_cert_path = None;
++        assert_eq!(ManagementCliClient::connect(&addr.to_string(), no_trust).err().unwrap().message,
++            "management TLS configuration failed: RS-2410: client_auth_required is true but ca_cert_path is not set");
++        assert_eq!(ManagementCliClient::connect(&format!("http://{addr}"), validation_tls).err().unwrap().message,
++            "management TLS configuration failed: management API refuses plaintext HTTP");
++    }).await.unwrap();
++    let unchanged_tls = admin_tls.clone();
++    let unchanged = tokio::task::spawn_blocking(move || {
++        let mut client = ManagementCliClient::connect(&addr.to_string(), unchanged_tls).unwrap();
++        (
++            stable_nodes(client.list_nodes().unwrap().nodes),
++            client.list_shards().unwrap().shards,
++            client.list_operations().unwrap().operations,
++        )
++    })
++    .await
++    .unwrap();
++    assert_eq!(initial, unchanged);
++    assert_eq!(
++        (no_certificate_read.as_str(), no_certificate_drain.as_str()),
++        (
++            "rpc: Unknown error: transport error",
++            "rpc: Unknown error: transport error"
++        )
++    );
++
++    let result = tokio::task::spawn_blocking(move || {
++        let mut admin = ManagementCliClient::connect(&addr.to_string(), admin_tls).unwrap();
++        let deadline = std::time::Instant::now() + Duration::from_secs(20);
++        let before_nodes = loop {
++            let nodes = admin.list_nodes().unwrap().nodes;
++            if nodes.iter().map(|node| node.node_id).collect::<Vec<_>>() == vec![601, 602] {
++                break nodes;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "workers did not register: {nodes:?}"
++            );
++            std::thread::sleep(Duration::from_millis(50));
++        };
++        let before_shards = admin.list_shards().unwrap().shards;
++        assert_eq!(
++            before_shards,
++            vec![rockstream_cli::output::ManagementShardInfo {
++                shard_id: 77,
++                owner_node_id: 601,
++                state: "leased".into(),
++                lease_token: old_lease.lease_token.0,
++                key_range: None,
++                source_version: expected_shard_version,
++            }]
++        );
++        let before_ops = admin.list_operations().unwrap().operations;
++        assert_eq!(before_ops, vec![]);
++        let mut limited = ManagementCliClient::connect(&addr.to_string(), limited_tls).unwrap();
++        let read_error = limited.cluster_status().unwrap_err().message;
++        let drain_error = limited
++            .drain_worker(601, "c61fa3bb-d734-4a81-a5e4-719d8f707d5f".parse().unwrap())
++            .unwrap_err()
++            .message;
++        assert_eq!(
++            stable_nodes(before_nodes),
++            stable_nodes(admin.list_nodes().unwrap().nodes)
++        );
++        assert_eq!(before_shards, admin.list_shards().unwrap().shards);
++        assert_eq!(before_ops, admin.list_operations().unwrap().operations);
++        let accepted = admin
++            .drain_worker(601, "6e20e0a7-300a-49c2-9c71-7c21e1022919".parse().unwrap())
++            .unwrap();
++        let deadline = std::time::Instant::now() + Duration::from_secs(30);
++        let completed = loop {
++            let op = admin.get_operation(&accepted.operation_id).unwrap();
++            if op.state == "succeeded" || op.state == "failed" {
++                break op;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "drain did not finish: {op:?}"
++            );
++            std::thread::sleep(Duration::from_millis(50));
++        };
++        let after_shards = admin.list_shards().unwrap().shards;
++        (read_error, drain_error, completed, after_shards)
++    })
++    .await
++    .unwrap();
++    let denied = tonic::Code::PermissionDenied.to_string();
++    assert_eq!(
++        result.0,
++        format!(
++            "management GetClusterStatus failed: {denied}: management action is not authorized"
++        )
++    );
++    assert_eq!(
++        result.1,
++        format!("management DrainWorker failed: {denied}: management action is not authorized")
++    );
++    let mut operation = result.2;
++    assert!(operation.started_at.ends_with('Z'));
++    assert!(operation.updated_at >= operation.started_at);
++    operation.started_at.clear();
++    operation.updated_at.clear();
++    assert_eq!(
++        operation,
++        rockstream_cli::output::ManagementOperationInfo {
++            operation_id: "6e20e0a7-300a-49c2-9c71-7c21e1022919".into(),
++            kind: "drain_worker".into(),
++            state: "succeeded".into(),
++            started_at: String::new(),
++            updated_at: String::new(),
++            progress: "100%".into(),
++            phase: "completed".into(),
++            error_code: String::new(),
++            next_steps: vec![],
++            source_version: "operation-record:2".into(),
++        }
++    );
++    assert_eq!(
++        result.3,
++        vec![rockstream_cli::output::ManagementShardInfo {
++            shard_id: 77,
++            owner_node_id: 602,
++            state: "leased".into(),
++            lease_token: 2,
++            key_range: None,
++            source_version: "lease:0:3".into(),
++        }]
++    );
++    use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
++    use rockstream_types::authorization::{
++        AuditCorrelation, AuditField, AuditIdentity, PolicyScope, SecurityAuditClass,
++        SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
++    };
++    let security_store =
++        Arc::new(LocalFileSystem::new_with_prefix(control_dir.join("gateway-shard")).unwrap());
++    let audit = DurableCatalogStore::recover(security_store, "gateway")
++        .await
++        .unwrap()
++        .list_security_audit_records()
++        .await
++        .unwrap();
++    let actual: Vec<_> = audit
++        .iter()
++        .filter(|record| record.action == SecurityAuditClass::AuthorizationDenial)
++        .cloned()
++        .map(|mut record| {
++            assert!(record.event_id.starts_with("management-denial-"));
++            assert!(record.timestamp_ms > 0);
++            record.event_id.clear();
++            record.timestamp_ms = 0;
++            record
++        })
++        .collect();
++    let expected = |action: &str, scope: PolicyScope| SecurityAuditRecord {
++        format_version: SECURITY_AUDIT_FORMAT_VERSION,
++        event_id: String::new(),
++        timestamp_ms: 0,
++        actor: AuditIdentity::Verified("principal:2".into()),
++        target: AuditField::Known(action.into()),
++        scope: AuditField::Known(serde_json::to_string(&scope).unwrap()),
++        action: SecurityAuditClass::AuthorizationDenial,
++        outcome: SecurityAuditOutcome::Denied,
++        correlation: AuditCorrelation::Unknown,
++        operation_id: AuditField::NotApplicable,
++        policy_revision: AuditField::Known(1),
++        before_state: AuditField::NotApplicable,
++        after_state: AuditField::NotApplicable,
++    };
++    assert_eq!(
++        actual,
++        vec![
++            expected("ClusterObserve", PolicyScope::Cluster),
++            expected(
++                "NodeDrain",
++                PolicyScope::Node {
++                    node_id: "601".into()
++                }
++            )
++        ]
++    );
++    let failures: Vec<_> = audit
++        .into_iter()
++        .filter(|record| record.action == SecurityAuditClass::AuthenticationFailure)
++        .map(|mut record| {
++            assert!(record.event_id.starts_with("management-authn-"));
++            assert!(record.timestamp_ms > 0);
++            record.event_id.clear();
++            record.timestamp_ms = 0;
++            record
++        })
++        .collect();
++    let failure = SecurityAuditRecord {
++        format_version: SECURITY_AUDIT_FORMAT_VERSION,
++        event_id: String::new(),
++        timestamp_ms: 0,
++        actor: AuditIdentity::Unknown,
++        target: AuditField::Known("management-api".into()),
++        scope: AuditField::NotApplicable,
++        action: SecurityAuditClass::AuthenticationFailure,
++        outcome: SecurityAuditOutcome::Failure,
++        correlation: AuditCorrelation::Unknown,
++        operation_id: AuditField::NotApplicable,
++        policy_revision: AuditField::Unknown,
++        before_state: AuditField::NotApplicable,
++        after_state: AuditField::NotApplicable,
++    };
++    assert_eq!(failures, vec![failure.clone(), failure.clone(), failure]);
++    let _ = worker1.rm().await;
++    let _ = worker2.rm().await;
++    let _ = control.rm().await;
++    let shard_store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
++        minio_object_store(minio_port, "issue321"),
++        "shards/77",
++    ));
++    let db = ShardDb::builder("db", shard_store).build().await.unwrap();
++    assert_eq!(
++        db.get(b"issue321-key").await.unwrap().unwrap().as_ref(),
++        b"retained"
++    );
++    db.close().await.unwrap();
++}
