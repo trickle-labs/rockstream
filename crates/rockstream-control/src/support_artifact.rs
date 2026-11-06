@@ -546,6 +546,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_processes_share_the_minio_storage_budget() {
+        assert!(rockstream_test_support::docker_available());
+        let bucket = "rockstream-support-artifact-process-race";
+        let (_minio, port) = rockstream_test_support::minio::start_minio(bucket)
+            .await
+            .expect("MinIO is required for cross-process artifact budget coverage");
+        let directory = tempfile::tempdir().unwrap();
+        let first_id = uuid::Uuid::new_v4().to_string();
+        let second_id = uuid::Uuid::new_v4().to_string();
+        let first_result_path = directory.path().join("first-result");
+        let second_result_path = directory.path().join("second-result");
+        let first_ready_path = directory.path().join("first-ready");
+        let second_ready_path = directory.path().join("second-ready");
+        let start_path = directory.path().join("start");
+        let now_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
+        let expires_at_ms = now_ms + ARTIFACT_TTL.as_millis() as u64;
+        let filler_id = uuid::Uuid::new_v4().to_string();
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert(
+            filler_id.clone(),
+            LedgerArtifact {
+                owner: PrincipalId(1),
+                scope: PolicyScope::Cluster,
+                size: MAX_ARTIFACT_STORAGE_BYTES - 1,
+                expires_at_ms,
+            },
+        );
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+            rockstream_test_support::minio::minio_object_store(port, bucket),
+            "management",
+        ));
+        let ledger_path = Path::from("control/support-artifacts/ledger.json");
+        store
+            .put(
+                &ledger_path,
+                serde_json::to_vec(&ArtifactLedger {
+                    format_version: LEDGER_FORMAT_VERSION,
+                    artifacts,
+                })
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let child_test = "support_artifact::tests::support_artifact_budget_insert_child";
+        let spawn_child =
+            |id: &str, result_path: &std::path::Path, ready_path: &std::path::Path| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", child_test])
+                    .env("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_PORT", port.to_string())
+                    .env("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_BUCKET", bucket)
+                    .env("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_ID", id)
+                    .env(
+                        "ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_EXPIRY",
+                        expires_at_ms.to_string(),
+                    )
+                    .env("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_RESULT", result_path)
+                    .env("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_READY", ready_path)
+                    .env("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_START", &start_path)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+        let mut first = spawn_child(&first_id, &first_result_path, &first_ready_path);
+        let mut second = spawn_child(&second_id, &second_result_path, &second_ready_path);
+        let ready = tokio::time::timeout(Duration::from_secs(10), async {
+            while !first_ready_path.exists() || !second_ready_path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        if ready.is_err() {
+            let _ = first.kill();
+            let _ = second.kill();
+            panic!("artifact child processes did not reach the start barrier");
+        }
+        std::fs::write(&start_path, "start").unwrap();
+        let output = first.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "first artifact child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = second.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "second artifact child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let first_result = std::fs::read_to_string(first_result_path).unwrap();
+        let second_result = std::fs::read_to_string(second_result_path).unwrap();
+        assert_eq!(
+            usize::from(first_result == "inserted") + usize::from(second_result == "inserted"),
+            1
+        );
+        assert_eq!(
+            usize::from(first_result == "storage_full")
+                + usize::from(second_result == "storage_full"),
+            1
+        );
+        let (winner_id, loser_id) = if first_result == "inserted" {
+            (&first_id, &second_id)
+        } else {
+            (&second_id, &first_id)
+        };
+        let recovered = store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let ledger: ArtifactLedger = serde_json::from_slice(&recovered).unwrap();
+        let mut actual_ids = ledger.artifacts.keys().cloned().collect::<Vec<_>>();
+        actual_ids.sort();
+        let mut expected_ids = vec![filler_id, winner_id.clone()];
+        expected_ids.sort();
+        assert_eq!(actual_ids, expected_ids);
+        assert_eq!(
+            ledger
+                .artifacts
+                .values()
+                .map(|artifact| artifact.size)
+                .sum::<usize>(),
+            MAX_ARTIFACT_STORAGE_BYTES
+        );
+        assert_eq!(
+            store
+                .get(&SupportArtifactStore::new(store.clone()).artifact_path(winner_id))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"x"
+        );
+        assert!(matches!(
+            store
+                .get(&SupportArtifactStore::new(store.clone()).artifact_path(loser_id))
+                .await,
+            Err(ObjectStoreError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn support_artifact_budget_insert_child() {
+        let (
+            Ok(port),
+            Ok(bucket),
+            Ok(id),
+            Ok(expiry),
+            Ok(result_path),
+            Ok(ready_path),
+            Ok(start_path),
+        ) = (
+            std::env::var("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_PORT"),
+            std::env::var("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_BUCKET"),
+            std::env::var("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_ID"),
+            std::env::var("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_EXPIRY"),
+            std::env::var("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_RESULT"),
+            std::env::var("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_READY"),
+            std::env::var("ROCKSTREAM_SUPPORT_ARTIFACT_CHILD_START"),
+        )
+        else {
+            return;
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+            rockstream_test_support::minio::minio_object_store(port.parse().unwrap(), &bucket),
+            "management",
+        ));
+        let artifact_store = SupportArtifactStore::new(store);
+        artifact_store.initialize().await.unwrap();
+        std::fs::write(ready_path, "ready").unwrap();
+        while !std::path::Path::new(&start_path).exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
+        let result = artifact_store
+            .insert(
+                id,
+                PrincipalId(1),
+                PolicyScope::Cluster,
+                Arc::from(b"x".to_vec()),
+                ArtifactExpiry {
+                    unix_ms: expiry.parse().unwrap(),
+                },
+                now_ms,
+            )
+            .await;
+        let result = match result {
+            Ok(()) => "inserted",
+            Err(ArtifactStoreError::StorageFull) => "storage_full",
+            Err(error) => panic!("unexpected cross-process insert result: {error:?}"),
+        };
+        std::fs::write(result_path, result).unwrap();
+    }
+
+    #[tokio::test]
     async fn local_filesystem_without_compare_and_swap_disables_artifacts() {
         let directory = tempfile::tempdir().unwrap();
         let object_store = Arc::new(LocalFileSystem::new_with_prefix(directory.path()).unwrap());
