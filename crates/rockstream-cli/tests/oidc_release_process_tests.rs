@@ -1941,17 +1941,6 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         .await
         .unwrap();
     let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
-    let expired_at_ms = generated_at_ms.saturating_sub(60_000);
-    management_store
-        .put(&expired_blob_path, expired_content.to_vec().into())
-        .await
-        .unwrap();
-    ledger["artifacts"][&expired_id] = serde_json::json!({
-        "owner": PrincipalId(1),
-        "scope": PolicyScope::Cluster,
-        "size": expired_content.len(),
-        "expires_at_ms": expired_at_ms,
-    });
     ledger["artifacts"][&foreign_id] = serde_json::json!({
         "owner": PrincipalId(2),
         "scope": PolicyScope::Cluster,
@@ -1967,17 +1956,6 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         .put(&ledger_path, ledger_with_foreign_artifact.clone().into())
         .await
         .unwrap();
-    assert_eq!(
-        management_store
-            .get(&expired_blob_path)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap()
-            .as_ref(),
-        expired_content
-    );
     let foreign_denial = client
         .download_support_artifact(DownloadSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -2014,6 +1992,43 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     );
     process.0.kill().unwrap();
     process.0.wait().unwrap();
+    // Seed expiry only after stopping the cleaner so startup recovery owns this fixture.
+    let expired_at_ms = generated_at_ms.saturating_sub(60_000);
+    let mut ledger: serde_json::Value = serde_json::from_slice(
+        &management_store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    management_store
+        .put(&expired_blob_path, expired_content.to_vec().into())
+        .await
+        .unwrap();
+    ledger["artifacts"][&expired_id] = serde_json::json!({
+        "owner": PrincipalId(1),
+        "scope": PolicyScope::Cluster,
+        "size": expired_content.len(),
+        "expires_at_ms": expired_at_ms,
+    });
+    management_store
+        .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
+        .await
+        .unwrap();
+    assert_eq!(
+        management_store
+            .get(&expired_blob_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        expired_content
+    );
     let mut restarted = start_control_process(
         temp.path(),
         &storage,
