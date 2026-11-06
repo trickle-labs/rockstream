@@ -213,12 +213,20 @@ async fn test_secrets_lifecycle_slatedb_persistence() {
 
     // Issue worker token
     let token = store
-        .issue_worker_token(ns, "kafka_source_secret", "worker_node_1", 300, "root")
+        .issue_worker_token(
+            ns,
+            rockstream_types::ids::WorkloadId(7),
+            "kafka_source_secret",
+            "worker_node_1",
+            300,
+            "root",
+        )
         .await
         .unwrap();
     assert_eq!(token.secret_name, "kafka_source_secret");
     assert_eq!(token.worker_identity, "worker_node_1");
-    assert!(!token.is_expired(token.issued_at + 100));
+    assert!(!token.is_expired(token.issued_at + 59));
+    assert!(token.is_expired(token.issued_at + 60));
 
     // Point-delete one secret
     store

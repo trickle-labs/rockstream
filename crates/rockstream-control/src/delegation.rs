@@ -82,6 +82,22 @@ impl ActorAssertionSigner {
         })
     }
 
+    pub fn uses_same_key_as(&self, path: &Path) -> Result<bool, String> {
+        let key = crate::tls::load_key(path)?;
+        let key_pair = match &key {
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key) => {
+                RsaKeyPair::from_pkcs8(key.secret_pkcs8_der())
+            }
+            rustls::pki_types::PrivateKeyDer::Pkcs1(key) => {
+                RsaKeyPair::from_der(key.secret_pkcs1_der())
+            }
+            rustls::pki_types::PrivateKeyDer::Sec1(_) => return Ok(false),
+            _ => return Ok(false),
+        }
+        .map_err(|_| "TLS RSA private key is invalid".to_owned())?;
+        Ok(self.key_pair.public().as_ref() == key_pair.public().as_ref())
+    }
+
     pub fn issue(
         &self,
         principal_id: PrincipalId,
