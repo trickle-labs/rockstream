@@ -160,6 +160,39 @@ async fn security_principal_and_correlated_audit_survive_log_snapshot_and_restar
     );
 }
 
+#[test]
+fn client_correlated_grant_mutation_uses_catalog_format_three() {
+    let operation_id = "550e8400-e29b-41d4-a716-446655440000";
+    let previous = admin(1, 1);
+    let mut updated = admin(2, 2);
+    updated.display_name = "updated administrator".into();
+    let mut audit = grant_audit(
+        "grant-operation-format-three",
+        102,
+        AuditIdentity::Verified("principal:1".into()),
+        &updated,
+        Some(policy_state(&admin(2, 1))),
+        Some(policy_state(&updated)),
+    );
+    audit.correlation = AuditCorrelation::Observed(operation_id.into());
+    audit.operation_id = AuditField::Known(operation_id.into());
+    let txn = CatalogTxn::new(
+        2,
+        102,
+        vec![CatalogMutation::PutSecurityPrincipalForOperation {
+            principal: updated,
+            expected_revision: Some(1),
+            grantor_revision: Some((previous.id, previous.revision)),
+            operation_id: operation_id.into(),
+            audit,
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(txn.format_version, 3);
+    assert_eq!(CatalogTxn::decode(&txn.encode().unwrap()).unwrap(), txn);
+}
+
 #[tokio::test]
 async fn expired_security_audit_append_is_rejected_without_a_catalog_effect() {
     let object_store = Arc::new(InMemory::new());
