@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, DownloadSupportArtifactRequest,
@@ -1883,6 +1884,85 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     assert_eq!(String::from_utf8(downloaded).unwrap(), expected_content);
     assert_eq!(download_expiry, first.expires_at_ms);
 
+    let expired_id = uuid::Uuid::new_v4().to_string();
+    let expired_content = b"{\"format_version\":1,\"safe\":\"expired fixture\"}";
+    let artifact_path = |id: &str| {
+        object_store::path::Path::from("control/support-artifacts").join(format!(
+            "artifacts/{}.json",
+            id.as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ))
+    };
+    let expired_blob_path = artifact_path(&expired_id);
+    let first_blob_path = artifact_path(&first.opaque_id);
+    let management_store = object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "management",
+    );
+    let stored_artifacts = management_store
+        .list_with_delimiter(Some(&object_store::path::Path::from(
+            "control/support-artifacts",
+        )))
+        .await
+        .unwrap()
+        .objects
+        .into_iter()
+        .map(|meta| meta.location.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        stored_artifacts
+            .iter()
+            .any(|path| path == &first_blob_path.to_string()),
+        "support artifact object paths: {stored_artifacts:?}"
+    );
+    assert_eq!(
+        management_store
+            .get(&first_blob_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        expected_content.as_bytes()
+    );
+    let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
+    let ledger_bytes = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+    let expired_at_ms = generated_at_ms.saturating_sub(60_000);
+    management_store
+        .put(&expired_blob_path, expired_content.to_vec().into())
+        .await
+        .unwrap();
+    ledger["artifacts"][&expired_id] = serde_json::json!({
+        "owner": PrincipalId(1),
+        "scope": PolicyScope::Cluster,
+        "size": expired_content.len(),
+        "expires_at_ms": expired_at_ms,
+    });
+    management_store
+        .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
+        .await
+        .unwrap();
+    assert_eq!(
+        management_store
+            .get(&expired_blob_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        expired_content
+    );
     process.0.kill().unwrap();
     process.0.wait().unwrap();
     let mut restarted = start_control_process(
@@ -1914,6 +1994,37 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         expected_content
     );
     assert_eq!(recovered_expiry, first.expires_at_ms);
+    let recovered_ledger = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let recovered_ids = serde_json::from_slice::<serde_json::Value>(&recovered_ledger).unwrap()
+        ["artifacts"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(recovered_ids, vec![idempotency_key.clone()]);
+    match management_store.get(&expired_blob_path).await {
+        Err(object_store::Error::NotFound { .. }) => {}
+        Err(error) => panic!("expired artifact lookup failed unexpectedly: {error:?}"),
+        Ok(_) => panic!("expired artifact bytes remained after startup cleanup"),
+    }
+    assert_eq!(
+        client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: expired_id.clone(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
 
     let fingerprint = {
         let mut certificate_pem =
@@ -2043,6 +2154,26 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             before_state: AuditField::NotApplicable,
             after_state: AuditField::NotApplicable,
         },
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "support-artifact".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known(format!("support-artifact:{expired_id}")),
+            scope: AuditField::Known(
+                serde_json::to_string(&PolicyScope::Artifact {
+                    opaque_id: expired_id.clone(),
+                })
+                .unwrap(),
+            ),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        },
     ];
     let security_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::prefix::PrefixStore::new(
@@ -2061,5 +2192,8 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             record.event_id = "management-authn".to_owned();
         }
     }
-    assert_eq!(actual_audit, expected_audit);
+    assert_eq!(actual_audit.len(), expected_audit.len());
+    for (index, (actual, expected)) in actual_audit.iter().zip(&expected_audit).enumerate() {
+        assert_eq!(actual, expected, "audit record {index}");
+    }
 }
