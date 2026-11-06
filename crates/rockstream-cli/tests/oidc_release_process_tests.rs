@@ -1,5 +1,5 @@
 use std::{
-    io::Read,
+    io::{BufReader, Read},
     path::Path,
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -23,7 +23,7 @@ use rockstream_types::{
         SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
         SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
     },
-    ids::{DatabaseId, NamespaceId, PrincipalId},
+    ids::{DatabaseId, NamespaceId, PrincipalId, ShardId, WorkerId},
 };
 use sha2::Digest;
 use testcontainers::core::{ContainerPort, WaitFor};
@@ -342,8 +342,7 @@ async fn start_control_process(
     minio: Option<(u16, &str)>,
     support_operator: bool,
 ) -> RunningGateway {
-    let mut certificate_pem =
-        std::io::BufReader::new(std::fs::File::open(&pki.cli_cert_path).unwrap());
+    let mut certificate_pem = BufReader::new(std::fs::File::open(&pki.cli_cert_path).unwrap());
     let cli_certificate = rustls_pemfile::certs(&mut certificate_pem)
         .next()
         .expect("test PKI must include a CLI certificate")
@@ -354,7 +353,7 @@ async fn start_control_process(
     } else {
         mtls_principal_with_fingerprint(fingerprint)
     };
-    let security_store: Arc<dyn object_store::ObjectStore> = if let Some((port, bucket)) = minio {
+    let security_store: Arc<dyn ObjectStore> = if let Some((port, bucket)) = minio {
         Arc::new(object_store::prefix::PrefixStore::new(
             rockstream_test_support::minio::minio_object_store(port, bucket),
             "gateway-shard",
@@ -2485,4 +2484,148 @@ async fn support_artifact_generation_rejects_full_deployment_budget() {
         }
     }
     assert_eq!(actual_audit, expected_audit);
+}
+
+#[cfg(unix)]
+async fn wait_for_release_worker_lease(
+    client: &rockstream_runtime::WorkerClientHandle,
+    shard_id: ShardId,
+) -> rockstream_types::lease::ShardLease {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(lease) = client
+                .leases()
+                .into_iter()
+                .find(|lease| lease.shard_id == shard_id)
+            {
+                return lease;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("release worker did not receive lease for {shard_id:?}"))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn in_flight_internal_mtls_rotation_preserves_release_worker_stream() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_control_process(
+        temp.path(),
+        &storage,
+        address,
+        management_address,
+        &pki,
+        None,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, address).await;
+    let process_id = process.0.id();
+
+    let old_worker_storage = temp.path().join("worker-gen1");
+    let (old_worker, old_worker_task) = rockstream_runtime::start_worker_client_with_tls(
+        1,
+        &address.to_string(),
+        &old_worker_storage,
+        pki.worker_tls_config(1),
+    )
+    .await
+    .expect("Gen1 worker should connect to the release control process");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while old_worker.worker_id() != Some(WorkerId(1)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("control did not register the Gen1 worker");
+    let first_shard = ShardId(101);
+    old_worker.request_shard(first_shard).await.unwrap();
+    let first_lease = wait_for_release_worker_lease(&old_worker, first_shard).await;
+
+    let audit_path = storage.join("audit.jsonl");
+    let denials_before = FileAuditLog::open(&audit_path)
+        .unwrap()
+        .read_all()
+        .unwrap()
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .count();
+
+    let (_, gen2_control_tls, _) = pki.generate_gen2_pki();
+    std::fs::copy(
+        gen2_control_tls.cert_path.as_ref().unwrap(),
+        &pki.control_cert_path,
+    )
+    .unwrap();
+    std::fs::copy(
+        gen2_control_tls.key_path.as_ref().unwrap(),
+        &pki.control_key_path,
+    )
+    .unwrap();
+    std::fs::copy(
+        gen2_control_tls.ca_cert_path.as_ref().unwrap(),
+        &pki.ca_cert_path,
+    )
+    .unwrap();
+    assert_eq!(unsafe { libc::kill(process_id as i32, libc::SIGHUP) }, 0);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(process.0.try_wait().unwrap().is_none());
+    assert_eq!(old_worker.worker_id(), Some(WorkerId(1)));
+    assert!(!old_worker_task.is_finished());
+    let second_shard = ShardId(102);
+    old_worker.request_shard(second_shard).await.unwrap();
+    let second_lease = wait_for_release_worker_lease(&old_worker, second_shard).await;
+    assert!(old_worker.leases().contains(&first_lease));
+    assert!(old_worker.leases().contains(&second_lease));
+
+    let new_worker_storage = temp.path().join("worker-gen2");
+    let (new_worker, new_worker_task) = rockstream_runtime::start_worker_client_with_tls(
+        2,
+        &address.to_string(),
+        &new_worker_storage,
+        pki.gen2_worker_tls_config(2),
+    )
+    .await
+    .expect("dual-generation trust should admit a Gen2 worker after reload");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while new_worker.worker_id() != Some(WorkerId(2)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("control did not register the Gen2 worker");
+    let gen2_shard = ShardId(201);
+    new_worker.request_shard(gen2_shard).await.unwrap();
+    let gen2_lease = wait_for_release_worker_lease(&new_worker, gen2_shard).await;
+    assert_eq!(gen2_lease.worker_id, WorkerId(2));
+    assert!(process.0.try_wait().unwrap().is_none());
+
+    let events = FileAuditLog::open(&audit_path).unwrap().read_all().unwrap();
+    let registered = events
+        .iter()
+        .filter(|event| event.action == "worker.registered")
+        .map(|event| event.resource.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(registered, ["worker-1", "worker-2"]);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.action == "security.internal_mtls_denied")
+            .count(),
+        denials_before,
+        "valid old and new workers must not be rejected during rollover"
+    );
+
+    old_worker_task.abort();
+    new_worker_task.abort();
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
 }

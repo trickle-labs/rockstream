@@ -868,6 +868,42 @@ fn validate_start_auth_modes(
     Ok(())
 }
 
+#[cfg(unix)]
+type InternalTlsReloadSignal = tokio::signal::unix::Signal;
+
+#[cfg(not(unix))]
+type InternalTlsReloadSignal = ();
+
+async fn wait_for_signal_or_tls_reload(
+    coordinator: &ShutdownCoordinator,
+    control: Option<&rockstream_control::ControlServiceHandle>,
+    tls: &rockstream_types::identity::InternalTlsConfig,
+    mut reload_signal: Option<&mut InternalTlsReloadSignal>,
+) {
+    #[cfg(unix)]
+    if tls.reload_enabled {
+        if let (Some(signal), Some(control)) = (reload_signal.take(), control) {
+            let shutdown = coordinator.wait_for_signal_or_trigger();
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    _ = signal.recv() => match control.reload_tls(tls.clone()) {
+                        Ok(()) => tracing::info!("internal TLS credentials reloaded after SIGHUP"),
+                        Err(error) => tracing::error!(%error, "internal TLS reload after SIGHUP failed"),
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = (control, tls, reload_signal);
+
+    coordinator.wait_for_signal_or_trigger().await;
+}
+
 /// Run `rockstream start`.
 ///
 /// For the `gateway` and `all` roles with a configured listen address this
@@ -1019,6 +1055,29 @@ pub fn run_start_with_dev_transport(
             .shutdown_timeout_secs
             .unwrap_or(opts.config.cluster.shutdown_timeout_secs);
         let coordinator = ShutdownCoordinator::new(tracker.clone(), Duration::from_secs(timeout_secs));
+
+        #[cfg(unix)]
+        let mut tls_reload_signal = if matches!(opts.role.as_str(), "control" | "all")
+            && opts.config.internal_tls.is_enabled()
+            && opts.config.internal_tls.reload_enabled
+        {
+            Some(
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).map_err(
+                    |error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to register internal TLS reload signal: {error}"),
+                            "Verify the process can register SIGHUP for certificate reloads.",
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+
+        #[cfg(not(unix))]
+        let mut tls_reload_signal = None;
 
         let mut metrics_handle = None;
         if let Some(metrics_addr) = &opts.metrics_addr {
@@ -1486,7 +1545,13 @@ pub fn run_start_with_dev_transport(
                     if let Some(sleep_ms) = e2e_sleep {
                         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                     } else {
-                        coordinator.wait_for_signal_or_trigger().await;
+                        wait_for_signal_or_tls_reload(
+                            &coordinator,
+                            control_handle.as_ref(),
+                            &opts.config.internal_tls,
+                            tls_reload_signal.as_mut(),
+                        )
+                        .await;
                     }
 
                     tracing::info!("shutdown signal received — stopping gateway");
@@ -1531,7 +1596,13 @@ pub fn run_start_with_dev_transport(
                         role = %opts.role,
                         "node running in daemon mode — blocking until shutdown signal"
                     );
-                    coordinator.wait_for_signal_or_trigger().await;
+                    wait_for_signal_or_tls_reload(
+                        &coordinator,
+                        control_handle.as_ref(),
+                        &opts.config.internal_tls,
+                        tls_reload_signal.as_mut(),
+                    )
+                    .await;
                     tracing::info!("shutdown signal received — stopping daemon");
                 }
             } else {
@@ -3087,8 +3158,10 @@ mod tests {
     fn control_mtls_start_recovers_security_catalog_without_management_api() {
         let dir = tempfile::tempdir().unwrap();
         let pki = TestPki::generate();
-        let mut config = RockstreamConfig::default();
-        config.internal_tls = pki.control_tls_config();
+        let config = RockstreamConfig {
+            internal_tls: pki.control_tls_config(),
+            ..RockstreamConfig::default()
+        };
         let opts = StartOptions {
             storage: dir.path().to_path_buf(),
             role: "control".to_string(),

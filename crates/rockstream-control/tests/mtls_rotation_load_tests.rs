@@ -3,10 +3,38 @@ use std::time::Duration;
 
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
-use rockstream_runtime::client::start_worker_client_with_tls;
+use rockstream_runtime::client::{start_worker_client_with_tls, WorkerClientHandle};
 use rockstream_storage::catalog::DurableCatalogStore;
 use rockstream_test_support::pki::TestPki;
-use rockstream_types::ids::WorkerId;
+use rockstream_types::{
+    ids::{ShardId, WorkerId},
+    lease::ShardLease,
+};
+
+async fn wait_for_worker_lease(
+    client: &WorkerClientHandle,
+    manager: &ShardManager,
+    shard_id: ShardId,
+) -> ShardLease {
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(lease) = manager.get(shard_id) {
+                if client.leases().contains(&lease) {
+                    return lease;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    result.unwrap_or_else(|_| {
+        panic!(
+            "worker did not receive lease {shard_id:?}; control={:?}; worker={:?}",
+            manager.get(shard_id),
+            client.leases()
+        )
+    })
+}
 
 fn security_audit_catalog() -> Arc<DurableCatalogStore> {
     Arc::new(DurableCatalogStore::new(
@@ -84,7 +112,7 @@ async fn test_mtls_rotation_control_under_load_zero_loss() {
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
     let svc = ControlService::new(catalog.clone())
-        .with_shard_manager(manager)
+        .with_shard_manager(manager.clone())
         .with_audit(audit.clone())
         .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
@@ -112,19 +140,28 @@ async fn test_mtls_rotation_control_under_load_zero_loss() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(catalog.len(), 3);
 
-    // Sustained traffic load simulation: workers actively heartbeat and request shards
+    for (index, client) in clients.iter().enumerate() {
+        let shard_id = ShardId(index as u64 + 1);
+        client.request_shard(shard_id.clone()).await.unwrap();
+        wait_for_worker_lease(client, &manager, shard_id).await;
+    }
+
+    // Keep real lease requests flowing on the existing TLS streams through reload.
     let mut traffic_tasks = Vec::new();
-    for client in &clients {
+    for (index, client) in clients.iter().enumerate() {
         let c = client.clone();
         traffic_tasks.push(tokio::spawn(async move {
-            for i in 1..=20 {
-                let _ = c.request_shard(rockstream_types::ids::ShardId(i)).await;
+            let worker_id = index as u64 + 1;
+            for i in 1..=3 {
+                c.request_shard(ShardId(worker_id * 100 + i)).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }));
     }
 
-    // In-flight certificate rotation while traffic is actively streaming
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Keep both CA generations trusted while the control listener switches identity.
     let (ca2_path, ctrl2_cfg, _w2_cfg) = pki.generate_gen2_pki();
     handle
         .reloader
@@ -135,18 +172,61 @@ async fn test_mtls_rotation_control_under_load_zero_loss() {
     handle.reload_tls(ctrl2_cfg).unwrap();
 
     for task in traffic_tasks {
-        let _ = task.await;
+        task.await.unwrap();
+    }
+    for (index, client) in clients.iter().enumerate() {
+        for i in 1..=3 {
+            wait_for_worker_lease(client, &manager, ShardId((index as u64 + 1) * 100 + i)).await;
+        }
     }
 
-    // Assert zero epoch loss, zero pipeline restarts, zero spuriously refused connections
-    assert_eq!(catalog.len(), 3);
-    for client in &clients {
-        assert!(client.worker_id().is_some());
+    let (gen2_client, gen2_handle) = start_worker_client_with_tls(
+        4,
+        &control_url,
+        storage_dir.path(),
+        pki.gen2_worker_tls_config(4),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gen2_client.worker_id() != Some(WorkerId(4)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dual-generation CA trust did not admit the new-generation worker");
+
+    // Existing Gen1 streams must still carry requests and receive committed leases.
+    for (index, client) in clients.iter().enumerate() {
+        let shard_id = ShardId(500 + index as u64);
+        client.request_shard(shard_id.clone()).await.unwrap();
+        wait_for_worker_lease(client, &manager, shard_id).await;
     }
+    let gen2_shard = ShardId(504);
+    gen2_client.request_shard(gen2_shard.clone()).await.unwrap();
+    wait_for_worker_lease(&gen2_client, &manager, gen2_shard).await;
+
+    assert_eq!(catalog.len(), 4);
+    for (index, client) in clients.iter().enumerate() {
+        let worker_id = WorkerId(index as u64 + 1);
+        assert_eq!(client.worker_id(), Some(worker_id));
+        let mut expected = manager
+            .leases()
+            .into_iter()
+            .filter(|lease| lease.worker_id == worker_id)
+            .collect::<Vec<_>>();
+        expected.sort_by_key(|lease| lease.shard_id.0);
+        let mut actual = client.leases();
+        actual.sort_by_key(|lease| lease.shard_id.0);
+        assert_eq!(actual, expected, "Gen1 worker {worker_id} lost leases");
+    }
+    assert_eq!(gen2_client.worker_id(), Some(WorkerId(4)));
+    assert_eq!(gen2_client.leases(), vec![manager.get(gen2_shard).unwrap()]);
 
     for h in handles {
         h.abort();
     }
+    gen2_handle.abort();
     handle.shutdown();
 }
 

@@ -169,7 +169,12 @@ RockStream features **zero-downtime in-flight certificate rotation** via `TlsCer
    Concatenate old and new CA certificates into `cluster-ca-bundle.pem` and distribute across the cluster.
 
 3. **Reload Certificates In-Flight**:
-   Control nodes and workers detect updated certificate files on disk or reload credentials via the control API / `ControlServiceHandle::reload_tls`.
+   On Unix, send `SIGHUP` to a control process after replacing its configured
+   certificate, key, and dual-CA bundle. The process reloads listener
+   credentials without restarting; existing connections remain open. Embedded
+   services can use `ControlServiceHandle::reload_tls`. Control nodes and
+   workers may also detect updated certificate files on disk or reload
+   credentials through the control API.
 
 4. **Retire Old CA (Post-Grace Window)**:
    Once all nodes have transitioned to Generation 2 leaf certificates, remove Generation 1 CA from the trust bundle.
