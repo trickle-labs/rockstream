@@ -33,8 +33,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use rockstream_storage::catalog::CatalogStore;
 use rockstream_types::authorization::{
-    AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
-    SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+    AuditCorrelation, AuditField, AuditIdentity, PolicyScope, SecurityAction, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::data_plane::{
@@ -42,8 +42,8 @@ use rockstream_types::data_plane::{
     SourceDeltaRequest, WorkerExecutionStatus, WorkloadSnapshot,
 };
 use rockstream_types::error_code::{
-    RS_0001, RS_0003, RS_2401, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612,
-    RS_8004,
+    ErrorCode, RS_0001, RS_0003, RS_2400, RS_2401, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610,
+    RS_3611, RS_3612, RS_8004,
 };
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
@@ -348,6 +348,7 @@ pub struct ControlService {
         rockstream_types::config::NodeConfig,
     )>,
     security_catalog: Option<Arc<dyn CatalogStore>>,
+    actor_assertion_verifier: Option<Arc<crate::delegation::ActorAssertionVerifier>>,
     backup_source: Option<BackupSource>,
 }
 
@@ -376,6 +377,7 @@ impl ControlService {
             data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),
             management: None,
             security_catalog: None,
+            actor_assertion_verifier: None,
             backup_source: None,
         }
     }
@@ -475,6 +477,15 @@ impl ControlService {
     /// Attach the durable principals, policy revisions, and audit catalog used by management and internal mTLS.
     pub fn with_security_catalog(mut self, catalog: Arc<dyn CatalogStore>) -> Self {
         self.security_catalog = Some(catalog);
+        self
+    }
+
+    /// Trust the deployment-managed RS256 key used by gateway actor assertions.
+    pub fn with_actor_assertion_verifier(
+        mut self,
+        verifier: crate::delegation::ActorAssertionVerifier,
+    ) -> Self {
+        self.actor_assertion_verifier = Some(Arc::new(verifier));
         self
     }
 
@@ -725,6 +736,7 @@ impl ControlService {
             drain_state: self.drain_state.clone(),
             secret_store: self.secret_store.clone(),
             security_catalog: self.security_catalog.clone(),
+            actor_assertion_verifier: self.actor_assertion_verifier.clone(),
             worker_senders: self.worker_senders.clone(),
             migration_waiters,
             backup_waiters,
@@ -821,6 +833,7 @@ struct ConnectionContext {
     drain_state: Arc<AsyncMutex<DrainState>>,
     secret_store: Arc<SecretStore>,
     security_catalog: Option<Arc<dyn CatalogStore>>,
+    actor_assertion_verifier: Option<Arc<crate::delegation::ActorAssertionVerifier>>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     migration_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
     backup_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
@@ -2905,6 +2918,374 @@ async fn append_node_identity_rejection(
     true
 }
 
+async fn allow_gateway_data_plane_peer(
+    sender: &mpsc::Sender<ControlMessage>,
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    identity: Option<&NodeIdentity>,
+    operation: &str,
+) -> bool {
+    let Some(identity) = identity else {
+        // The listener permits no identity only in explicitly enabled loopback development mode.
+        return true;
+    };
+    if identity.role == NodeRole::Gateway {
+        return true;
+    }
+
+    let timestamp_ms = now_ms().max(1);
+    let record = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("node-identity-rejection:{}", uuid::Uuid::new_v4()),
+        timestamp_ms,
+        actor: AuditIdentity::Unverified(identity.to_cn()),
+        target: AuditField::Known(operation.to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::NodeIdentityRejection,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required node identity audit catalog is unavailable");
+        return false;
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required node identity audit append failed");
+        return false;
+    }
+    send_message(
+        sender,
+        &ControlMessage::OperationFailed {
+            code: RS_2412.to_string(),
+            message: "certificate identity is not authorized for the gateway data plane".to_owned(),
+            next_steps: rockstream_types::error_code::next_steps(RS_2412).to_string(),
+        },
+    )
+    .await;
+    false
+}
+
+fn is_gateway_data_plane_message(message: &WorkerMessage) -> bool {
+    matches!(
+        message,
+        WorkerMessage::DeployWorkload(_)
+            | WorkerMessage::SubmitSourceDelta(_)
+            | WorkerMessage::ReadOperatorStats { .. }
+            | WorkerMessage::ReadWorkload { .. }
+    )
+}
+
+async fn gateway_data_plane_scope(
+    request: &WorkerMessage,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+) -> Option<(SecurityAction, PolicyScope)> {
+    use rockstream_types::authorization::ResourceKind;
+
+    match request {
+        WorkerMessage::DeployWorkload(deployment) => Some((
+            SecurityAction::ViewAuthor,
+            PolicyScope::Resource {
+                namespace: deployment.namespace.clone(),
+                kind: ResourceKind::View,
+                name: deployment.workload_name.clone(),
+            },
+        )),
+        WorkerMessage::SubmitSourceDelta(delta) => {
+            let state = data_plane.lock().await;
+            let deployment = state.deployments.get(&delta.workload_id)?;
+            if !deployment
+                .request
+                .schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(&delta.source))
+            {
+                return None;
+            }
+            Some((
+                SecurityAction::DataWrite,
+                PolicyScope::Resource {
+                    namespace: deployment.request.namespace.clone(),
+                    kind: ResourceKind::Table,
+                    name: delta.source.clone(),
+                },
+            ))
+        }
+        WorkerMessage::ReadWorkload { workload_id }
+        | WorkerMessage::ReadOperatorStats { workload_id, .. } => {
+            let state = data_plane.lock().await;
+            let deployment = state.deployments.get(workload_id)?;
+            Some((
+                SecurityAction::DataRead,
+                PolicyScope::Resource {
+                    namespace: deployment.request.namespace.clone(),
+                    kind: ResourceKind::View,
+                    name: deployment.request.workload_name.clone(),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+async fn append_gateway_delegation_audit(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    actor: AuditIdentity,
+    target: AuditField<String>,
+    scope: AuditField<String>,
+    action: SecurityAuditClass,
+    outcome: SecurityAuditOutcome,
+    policy_revision: AuditField<u64>,
+) -> bool {
+    let record = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("gateway-delegation:{}", uuid::Uuid::new_v4()),
+        timestamp_ms: now_ms().max(1),
+        actor,
+        target,
+        scope,
+        action,
+        outcome,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required gateway delegation audit catalog is unavailable");
+        return false;
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required gateway delegation audit append failed");
+        return false;
+    }
+    true
+}
+
+async fn reject_gateway_actor_assertion(
+    sender: &mpsc::Sender<ControlMessage>,
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    identity: &NodeIdentity,
+    code: ErrorCode,
+    message: &str,
+    target: AuditField<String>,
+    scope: AuditField<String>,
+    action: SecurityAuditClass,
+    actor: AuditIdentity,
+    policy_revision: AuditField<u64>,
+) -> bool {
+    if !append_gateway_delegation_audit(
+        catalog,
+        actor,
+        target,
+        scope,
+        action,
+        SecurityAuditOutcome::Denied,
+        policy_revision,
+    )
+    .await
+    {
+        return false;
+    }
+    let next_steps = if code == RS_2400 {
+        rockstream_types::error_code::next_steps(RS_2400)
+    } else {
+        rockstream_types::error_code::next_steps(RS_2401)
+    };
+    tracing::warn!(peer = %identity.to_cn(), %code, "gateway actor assertion rejected");
+    send_message(
+        sender,
+        &ControlMessage::OperationFailed {
+            code: code.to_string(),
+            message: message.to_owned(),
+            next_steps: next_steps.to_string(),
+        },
+    )
+    .await;
+    false
+}
+
+async fn authorize_gateway_actor_assertion(
+    sender: &mpsc::Sender<ControlMessage>,
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    verifier: Option<&crate::delegation::ActorAssertionVerifier>,
+    identity: &NodeIdentity,
+    assertion: Option<&str>,
+    request: &WorkerMessage,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+) -> bool {
+    let target = AuditField::Known("gateway_data_plane".to_owned());
+    let Some(assertion) = assertion else {
+        return reject_gateway_actor_assertion(
+            sender,
+            catalog,
+            identity,
+            RS_2400,
+            "a valid user actor assertion is required for gateway data-plane requests",
+            target,
+            AuditField::Unknown,
+            SecurityAuditClass::AuthenticationFailure,
+            AuditIdentity::Unverified(identity.to_cn()),
+            AuditField::NotApplicable,
+        )
+        .await;
+    };
+    let Some(verifier) = verifier else {
+        return reject_gateway_actor_assertion(
+            sender,
+            catalog,
+            identity,
+            RS_2400,
+            "gateway actor assertion verification is not configured",
+            target,
+            AuditField::Unknown,
+            SecurityAuditClass::AuthenticationFailure,
+            AuditIdentity::Unverified(identity.to_cn()),
+            AuditField::NotApplicable,
+        )
+        .await;
+    };
+    let expected = gateway_data_plane_scope(request, data_plane).await;
+    let digest = match crate::delegation::request_digest(request) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return reject_gateway_actor_assertion(
+                sender,
+                catalog,
+                identity,
+                RS_2400,
+                "gateway actor assertion could not be bound to this request",
+                target,
+                AuditField::Unknown,
+                SecurityAuditClass::AuthenticationFailure,
+                AuditIdentity::Unverified(identity.to_cn()),
+                AuditField::NotApplicable,
+            )
+            .await;
+        }
+    };
+    let now = now_ms().max(1) / 1_000;
+    let claims = match verifier.verify(assertion, digest, now) {
+        Ok(claims) => claims,
+        Err(_) => {
+            return reject_gateway_actor_assertion(
+                sender,
+                catalog,
+                identity,
+                RS_2400,
+                "gateway actor assertion is invalid, expired, or bound to another deployment/request",
+                target,
+                AuditField::Unknown,
+                SecurityAuditClass::AuthenticationFailure,
+                AuditIdentity::Unverified(identity.to_cn()),
+                AuditField::NotApplicable,
+            )
+            .await;
+        }
+    };
+    let (expected_action, expected_scope) = match expected {
+        Some(expected) => expected,
+        None => {
+            return reject_gateway_actor_assertion(
+                sender,
+                catalog,
+                identity,
+                RS_2401,
+                "gateway actor assertion does not identify an active scoped workload request",
+                target,
+                AuditField::Known(format!("{:?}", claims.scope())),
+                SecurityAuditClass::AuthorizationDenial,
+                AuditIdentity::Verified(claims.principal_id().to_string()),
+                AuditField::NotApplicable,
+            )
+            .await;
+        }
+    };
+    if claims.action() != expected_action || claims.scope() != &expected_scope {
+        return reject_gateway_actor_assertion(
+            sender,
+            catalog,
+            identity,
+            RS_2401,
+            "gateway actor assertion allowance does not match the requested operation and scope",
+            AuditField::Known(format!("{expected_action:?}")),
+            AuditField::Known(format!("{expected_scope:?}")),
+            SecurityAuditClass::AuthorizationDenial,
+            AuditIdentity::Verified(claims.principal_id().to_string()),
+            AuditField::Known(claims.policy_revision()),
+        )
+        .await;
+    }
+    let Some(catalog_store) = catalog else {
+        tracing::error!(code = %RS_0003, "durable actor policy is unavailable");
+        return false;
+    };
+    let principals = match catalog_store.list_security_principals().await {
+        Ok(principals) => principals,
+        Err(_) => {
+            return reject_gateway_actor_assertion(
+                sender,
+                Some(catalog_store),
+                identity,
+                RS_2400,
+                "durable actor policy is unavailable",
+                AuditField::Unknown,
+                AuditField::Unknown,
+                SecurityAuditClass::AuthenticationFailure,
+                AuditIdentity::Verified(claims.principal_id().to_string()),
+                AuditField::NotApplicable,
+            )
+            .await;
+        }
+    };
+    let Some(principal) = principals
+        .into_iter()
+        .find(|principal| principal.id == claims.principal_id() && principal.enabled)
+    else {
+        return reject_gateway_actor_assertion(
+            sender,
+            Some(catalog_store),
+            identity,
+            RS_2400,
+            "asserted user actor is no longer enabled",
+            AuditField::Unknown,
+            AuditField::Unknown,
+            SecurityAuditClass::AuthenticationFailure,
+            AuditIdentity::Verified(claims.principal_id().to_string()),
+            AuditField::NotApplicable,
+        )
+        .await;
+    };
+    if !crate::authorization::allows(&principal, expected_action, &expected_scope) {
+        return reject_gateway_actor_assertion(
+            sender,
+            Some(catalog_store),
+            identity,
+            RS_2401,
+            "asserted user actor is no longer authorized for this operation and scope",
+            AuditField::Known(format!("{expected_action:?}")),
+            AuditField::Known(format!("{expected_scope:?}")),
+            SecurityAuditClass::AuthorizationDenial,
+            AuditIdentity::Verified(principal.id.to_string()),
+            AuditField::Known(principal.revision),
+        )
+        .await;
+    }
+    append_gateway_delegation_audit(
+        Some(catalog_store),
+        AuditIdentity::Verified(principal.id.to_string()),
+        AuditField::Known(format!("{expected_action:?}")),
+        AuditField::Known(format!("{expected_scope:?}")),
+        SecurityAuditClass::AuthenticationSuccess,
+        SecurityAuditOutcome::Success,
+        AuditField::Known(principal.revision),
+    )
+    .await
+}
+
 fn claimed_worker_id(message: &WorkerMessage) -> Option<WorkerId> {
     match message {
         WorkerMessage::DeploymentReady { worker_id, .. }
@@ -3225,6 +3606,7 @@ async fn handle_connection_stream<R, W>(
         drain_state,
         secret_store,
         security_catalog,
+        actor_assertion_verifier,
         worker_senders,
         migration_waiters,
         backup_waiters,
@@ -3242,6 +3624,7 @@ async fn handle_connection_stream<R, W>(
                 break;
             }
         }
+        let _ = writer.shutdown().await;
     });
     let mut lines = BufReader::new(reader).lines();
     let mut connected_worker_id: Option<rockstream_types::ids::WorkerId> = None;
@@ -3257,6 +3640,49 @@ async fn handle_connection_stream<R, W>(
                 tracing::warn!(%peer, error = %e, "control: invalid message");
                 continue;
             }
+        };
+
+        let (msg, actor_assertion) = match msg {
+            WorkerMessage::DelegatedDataPlane {
+                version,
+                actor_assertion,
+                request,
+            } if version == rockstream_types::topology::DATA_PLANE_DELEGATION_VERSION
+                && is_gateway_data_plane_message(&request) =>
+            {
+                (*request, Some(actor_assertion))
+            }
+            WorkerMessage::DelegatedDataPlane { .. } => {
+                let actor = peer_identity
+                    .as_ref()
+                    .map_or(AuditIdentity::Unknown, |identity| {
+                        AuditIdentity::Unverified(identity.to_cn())
+                    });
+                if !append_gateway_delegation_audit(
+                    security_catalog.as_ref(),
+                    actor,
+                    AuditField::Known("gateway_data_plane".to_owned()),
+                    AuditField::Unknown,
+                    SecurityAuditClass::AuthenticationFailure,
+                    SecurityAuditOutcome::Denied,
+                    AuditField::NotApplicable,
+                )
+                .await
+                {
+                    break;
+                }
+                send_message(
+                    &sender,
+                    &ControlMessage::OperationFailed {
+                        code: RS_2400.to_string(),
+                        message: "gateway data-plane delegation envelope is invalid".to_owned(),
+                        next_steps: rockstream_types::error_code::next_steps(RS_2400).to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
+            request => (request, None),
         };
 
         if let (Some(identity), Some(claimed_id)) = (&peer_identity, claimed_worker_id(&msg)) {
@@ -3307,7 +3733,62 @@ async fn handle_connection_stream<R, W>(
             }
         }
 
+        if is_gateway_data_plane_message(&msg) {
+            if !allow_gateway_data_plane_peer(
+                &sender,
+                security_catalog.as_ref(),
+                peer_identity.as_ref(),
+                "gateway_data_plane",
+            )
+            .await
+            {
+                break;
+            }
+            if let Some(identity) = peer_identity.as_ref() {
+                if !authorize_gateway_actor_assertion(
+                    &sender,
+                    security_catalog.as_ref(),
+                    actor_assertion_verifier.as_deref(),
+                    identity,
+                    actor_assertion.as_deref(),
+                    &msg,
+                    &data_plane,
+                )
+                .await
+                {
+                    break;
+                }
+            } else if actor_assertion.is_some() {
+                if !append_gateway_delegation_audit(
+                    security_catalog.as_ref(),
+                    AuditIdentity::Unknown,
+                    AuditField::Known("gateway_data_plane".to_owned()),
+                    AuditField::Unknown,
+                    SecurityAuditClass::AuthenticationFailure,
+                    SecurityAuditOutcome::Denied,
+                    AuditField::NotApplicable,
+                )
+                .await
+                {
+                    break;
+                }
+                send_message(
+                    &sender,
+                    &ControlMessage::OperationFailed {
+                        code: RS_2400.to_string(),
+                        message:
+                            "gateway actor assertions require an authenticated node connection"
+                                .to_owned(),
+                        next_steps: rockstream_types::error_code::next_steps(RS_2400).to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
+        }
+
         match msg {
+            WorkerMessage::DelegatedDataPlane { .. } => break,
             WorkerMessage::Register(reg) => {
                 if let Some(id) = &peer_identity {
                     if id.role != NodeRole::Worker || !id.matches_worker_id(reg.worker_id.0) {
