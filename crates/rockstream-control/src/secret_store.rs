@@ -331,21 +331,27 @@ impl SecretStore {
         catalog: &dyn CatalogStore,
         record: &SecurityAuditRecord,
     ) -> Result<(), SecretStoreError> {
-        for attempt in 0..2 {
+        let transaction_id = rand::random::<u64>().max(1);
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            catalog
+                .refresh()
+                .await
+                .map_err(|error| SecretStoreError::storage(error.to_string()))?;
             let revision =
                 catalog.get_revision().await.checked_add(1).ok_or_else(|| {
                     SecretStoreError::storage("durable catalog revision exhausted")
                 })?;
             let transaction = CatalogTxn::new(
                 revision,
-                rand::random::<u64>().max(1),
+                transaction_id,
                 vec![CatalogMutation::AppendSecurityAudit(record.clone())],
             )
             .map_err(|error| SecretStoreError::storage(error.to_string()))?;
             match catalog.commit_txn(transaction).await {
                 Ok(_) => return Ok(()),
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                    if attempt == 0 =>
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
                     continue;
                 }

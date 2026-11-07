@@ -2497,7 +2497,8 @@ impl GatewayHandler {
             after_state: AuditField::NotApplicable,
         };
         let operation_id = rand::random::<u64>().max(1);
-        for attempt in 0..2 {
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            store.refresh().await.map_err(|error| error.to_string())?;
             let revision = store
                 .get_revision()
                 .await
@@ -2512,7 +2513,8 @@ impl GatewayHandler {
             match store.commit_txn(transaction).await {
                 Ok(_) => return Ok(()),
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                    if attempt == 0 =>
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
                     continue;
                 }
@@ -3170,7 +3172,8 @@ impl GatewayHandler {
             after_state: AuditField::NotApplicable,
         };
         let operation_id = rand::random::<u64>().max(1);
-        for attempt in 0..2 {
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            store.refresh().await.map_err(|error| error.to_string())?;
             let revision = store
                 .get_revision()
                 .await
@@ -3185,7 +3188,8 @@ impl GatewayHandler {
             match store.commit_txn(transaction).await {
                 Ok(_) => return Ok(()),
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                    if attempt == 0 =>
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
                     continue;
                 }

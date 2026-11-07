@@ -1079,7 +1079,8 @@ pub(crate) async fn append_security_audit(
     store: &dyn CatalogStore,
     record: SecurityAuditRecord,
 ) -> Result<(), String> {
-    for attempt in 0..2 {
+    let transaction_id = rand::random::<u64>().max(1);
+    for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
         store
             .refresh()
             .await
@@ -1091,14 +1092,14 @@ pub(crate) async fn append_security_audit(
             .ok_or_else(|| "management security catalog revision exhausted".to_owned())?;
         let transaction = CatalogTxn::new(
             revision,
-            rand::random::<u64>().max(1),
+            transaction_id,
             vec![CatalogMutation::AppendSecurityAudit(record.clone())],
         )
         .map_err(|error| format!("management security audit transaction failed: {error}"))?;
         match store.commit_txn(transaction).await {
             Ok(_) => return Ok(()),
             Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                if attempt == 0 =>
+                if attempt + 1 < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
             {
                 continue;
             }

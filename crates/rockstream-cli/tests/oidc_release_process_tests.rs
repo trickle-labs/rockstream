@@ -2838,30 +2838,36 @@ async fn support_artifact_budget_is_shared_between_release_processes() {
         rockstream_management_proto::PROTOCOL_VERSION
     );
 
-    let winner_id = uuid::Uuid::new_v4().to_string();
-    let winner = second_client
-        .generate_support_artifact(GenerateSupportArtifactRequest {
+    let first_attempt_id = uuid::Uuid::new_v4().to_string();
+    let second_attempt_id = uuid::Uuid::new_v4().to_string();
+    let (first_attempt, second_attempt) = tokio::join!(
+        first_client.generate_support_artifact(GenerateSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             node_id: String::new(),
-            idempotency_key: winner_id.clone(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
+            idempotency_key: first_attempt_id.clone(),
+        }),
+        second_client.generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: second_attempt_id.clone(),
+        }),
+    );
+    let (winner_id, winner, loser_id, loser_error) = match (first_attempt, second_attempt) {
+        (Ok(winner), Err(error)) if error.code() == tonic::Code::ResourceExhausted => {
+            (first_attempt_id, winner.into_inner(), second_attempt_id, error)
+        }
+        (Err(error), Ok(winner)) if error.code() == tonic::Code::ResourceExhausted => {
+            (second_attempt_id, winner.into_inner(), first_attempt_id, error)
+        }
+        (first, second) => panic!(
+            "expected one successful artifact and one quota rejection; first={first:?}, second={second:?}"
+        ),
+    };
     assert_eq!(
         winner.protocol_version,
         rockstream_management_proto::PROTOCOL_VERSION
     );
     assert_eq!(winner.opaque_id, winner_id);
-    let loser_id = uuid::Uuid::new_v4().to_string();
-    let loser_error = first_client
-        .generate_support_artifact(GenerateSupportArtifactRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            node_id: String::new(),
-            idempotency_key: loser_id.clone(),
-        })
-        .await
-        .unwrap_err();
     assert_eq!(loser_error.code(), tonic::Code::ResourceExhausted);
     assert_eq!(
         loser_error.message(),
@@ -2872,13 +2878,17 @@ async fn support_artifact_budget_is_shared_between_release_processes() {
         download_support_artifact(&mut first_client, &winner_id).await;
     assert_eq!(downloaded_expiry_ms, winner.expires_at_ms);
     let generated_at_ms = winner.expires_at_ms - 600_000;
-    let expected_content = format!(
-        "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":2,\"node\":null}}",
-        env!("CARGO_PKG_VERSION")
-    );
-    assert_eq!(
-        String::from_utf8(downloaded.clone()).unwrap(),
-        expected_content
+    // The concurrent loser may be recorded before or after the winner's snapshot.
+    let expected_contents = [(1, 2), (1, 3), (2, 3)].map(|(active, retained)| {
+        format!(
+            "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":{active},\"retained_operations\":{retained},\"node\":null}}",
+            env!("CARGO_PKG_VERSION")
+        )
+    });
+    let actual_content = String::from_utf8(downloaded.clone()).unwrap();
+    assert!(
+        expected_contents.contains(&actual_content),
+        "unexpected complete artifact: {actual_content}"
     );
     let stored_winner = management_store
         .get(&support_artifact_object_path(&winner_id))

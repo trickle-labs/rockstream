@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -40,6 +40,7 @@ use rockstream_types::workload::WorkloadDef;
 
 const SECURITY_AUDIT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_SECURITY_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
+pub const SECURITY_AUDIT_APPEND_ATTEMPTS: usize = 8;
 
 /// Abstract interface for catalog operations.
 #[allow(clippy::double_must_use)]
@@ -145,6 +146,49 @@ pub struct DurableCatalogStore {
     id_allocator: IdAllocator,
 }
 
+async fn persist_catalog_log(
+    store: &dyn ObjectStore,
+    path: &ObjectPath,
+    bytes: &[u8],
+) -> Result<(), CatalogError> {
+    match store
+        .put_opts(path, bytes.to_vec().into(), PutMode::Create.into())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let existing = store
+                .get(path)
+                .await
+                .map_err(|error| {
+                    CatalogError::Storage(format!(
+                        "[RS-0003] failed to read catalog log {}: {error}",
+                        path.as_ref()
+                    ))
+                })?
+                .bytes()
+                .await
+                .map_err(|error| {
+                    CatalogError::Storage(format!(
+                        "[RS-0003] failed to read catalog log {}: {error}",
+                        path.as_ref()
+                    ))
+                })?;
+            if existing.as_ref() == bytes {
+                Ok(())
+            } else {
+                Err(CatalogError::OptimisticConflict(format!(
+                    "catalog revision log {} already contains a different transaction",
+                    path.as_ref()
+                )))
+            }
+        }
+        Err(error) => Err(CatalogError::Storage(format!(
+            "[RS-0003] failed to write catalog log: {error}"
+        ))),
+    }
+}
+
 impl std::fmt::Debug for DurableCatalogStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DurableCatalogStore")
@@ -181,11 +225,8 @@ impl DurableCatalogStore {
         ObjectPath::from(p.trim_start_matches('/'))
     }
 
-    fn log_path(&self, revision: u64, operation_id: u64) -> ObjectPath {
-        let p = format!(
-            "{}/catalog/log/{:020}_{:020}.log",
-            self.prefix, revision, operation_id
-        );
+    fn log_path(&self, revision: u64) -> ObjectPath {
+        let p = format!("{}/catalog/log/{:020}.log", self.prefix, revision);
         ObjectPath::from(p.trim_start_matches('/'))
     }
 
@@ -468,7 +509,7 @@ impl DurableCatalogStore {
         let log_prefix = format!("{}/catalog/log/", prefix);
         let log_prefix_path = ObjectPath::from(log_prefix.trim_start_matches('/'));
 
-        let mut log_files: Vec<(u64, u64, ObjectPath)> = Vec::new();
+        let mut log_files: Vec<(u64, Option<u64>, ObjectPath)> = Vec::new();
         let mut log_stream = store.list(Some(&log_prefix_path));
         while let Some(item) = log_stream.next().await {
             let meta =
@@ -477,30 +518,38 @@ impl DurableCatalogStore {
             let filename = location.as_ref().split('/').next_back().unwrap_or_default();
             if filename.ends_with(".log") {
                 let parts: Vec<&str> = filename.trim_end_matches(".log").split('_').collect();
-                if parts.len() == 2 {
-                    if let (Ok(rev), Ok(op_id)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>())
-                    {
-                        if rev > start_revision {
-                            log_files.push((rev, op_id, location));
-                        }
+                let entry = match parts.as_slice() {
+                    [revision] => revision
+                        .parse::<u64>()
+                        .ok()
+                        .map(|revision| (revision, None)),
+                    [revision, operation_id] => revision
+                        .parse::<u64>()
+                        .ok()
+                        .zip(operation_id.parse::<u64>().ok())
+                        .map(|(revision, operation_id)| (revision, Some(operation_id))),
+                    _ => None,
+                };
+                if let Some((revision, operation_id)) = entry {
+                    if revision > start_revision {
+                        log_files.push((revision, operation_id, location));
                     }
                 }
             }
         }
 
-        log_files.sort_by_key(|(rev, op_id, _)| (*rev, *op_id));
+        log_files.sort_by_key(|(revision, operation_id, _)| {
+            (
+                *revision,
+                operation_id.is_some(),
+                operation_id.unwrap_or_default(),
+            )
+        });
 
         let mut total_buffer_bytes = 0;
         let mut expected_revision = start_revision;
-        for (rev, op_id, path) in log_files {
-            if rev != expected_revision.saturating_add(1) {
-                return Err(CatalogError::DecodeError(format!(
-                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
-                    expected_revision.saturating_add(1),
-                    rev
-                )));
-            }
-
+        let mut last_replayed_log: Option<(u64, u64, Vec<u8>)> = None;
+        for (revision, operation_id, path) in log_files {
             let res = store.get(&path).await.map_err(|e| {
                 CatalogError::Storage(format!(
                     "[RS-0003] failed to read log file {}: {e}",
@@ -522,19 +571,40 @@ impl DurableCatalogStore {
             // A bad record must not turn a complete listing into a partial
             // catalog. Preserve the original error and every stored object.
             let txn = CatalogTxn::decode(&bytes)?;
-            if txn.revision != rev || txn.operation_id != op_id {
+            if txn.revision != revision
+                || operation_id.is_some_and(|operation_id| txn.operation_id != operation_id)
+            {
                 return Err(CatalogError::DecodeError(format!(
                     "[RS-1003] catalog log {} has mismatched revision or operation ID; next_steps: inspect catalog log files",
                     path.as_ref()
                 )));
             }
-            expected_revision = rev;
-
+            if revision == expected_revision
+                && last_replayed_log.as_ref().is_some_and(
+                    |(last_revision, last_operation_id, last_bytes)| {
+                        *last_revision == revision
+                            && *last_operation_id == txn.operation_id
+                            && last_bytes.as_slice() == bytes.as_ref()
+                    },
+                )
+            {
+                continue;
+            }
+            if revision != expected_revision.saturating_add(1) {
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
+                    expected_revision.saturating_add(1),
+                    revision
+                )));
+            }
             if recovered_state
                 .committed_operations
                 .contains(&txn.operation_id)
             {
-                continue;
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] duplicate catalog operation {} at revision {}; next_steps: inspect catalog log files",
+                    txn.operation_id, revision
+                )));
             }
 
             validate_security_mutations(&recovered_state, &txn)?;
@@ -547,6 +617,8 @@ impl DurableCatalogStore {
                 .committed_operations
                 .insert(txn.operation_id);
             recovered_state.revision = txn.revision;
+            expected_revision = revision;
+            last_replayed_log = Some((revision, txn.operation_id, bytes.to_vec()));
         }
 
         // An unreadable newer snapshot cannot be ignored if the remaining
@@ -1268,6 +1340,15 @@ impl CatalogStore for DurableCatalogStore {
         if state.committed_operations.contains(&txn.operation_id) {
             return Ok(state.revision);
         }
+        let next_revision = state.revision.checked_add(1).ok_or_else(|| {
+            CatalogError::OptimisticConflict("catalog revision is exhausted".to_owned())
+        })?;
+        if txn.revision != next_revision {
+            return Err(CatalogError::OptimisticConflict(format!(
+                "catalog revision {} is stale; current revision is {}",
+                txn.revision, state.revision
+            )));
+        }
 
         validate_security_mutations(&state, &txn)?;
         let audit_cutoff_ms = if txn
@@ -1403,10 +1484,8 @@ impl CatalogStore for DurableCatalogStore {
 
         // 3. Durably persist transaction log
         let bytes = txn.encode()?;
-        let path = self.log_path(txn.revision, txn.operation_id);
-        self.store.put(&path, bytes.into()).await.map_err(|e| {
-            CatalogError::Storage(format!("[RS-0003] failed to write catalog log: {e}"))
-        })?;
+        let path = self.log_path(txn.revision);
+        persist_catalog_log(self.store.as_ref(), &path, &bytes).await?;
 
         // 4. Apply all mutations to in-memory state
         if audit_cutoff_ms > 0 {
