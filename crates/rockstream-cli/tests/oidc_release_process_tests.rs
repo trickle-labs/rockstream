@@ -3265,7 +3265,7 @@ async fn support_artifact_budget_is_shared_between_release_processes() {
         assert_eq!(operation.progress, "100%");
         assert!(operation.error_code.is_empty());
         assert!(operation.next_steps.is_empty());
-        assert_eq!(operation.source_version, "operation-record:3");
+        assert_eq!(operation.source_version, "operation-record:4");
     }
 
     first_process.0.kill().unwrap();

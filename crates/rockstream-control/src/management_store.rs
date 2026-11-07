@@ -4,12 +4,13 @@ use std::sync::Arc;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
+use rockstream_types::authorization::SecurityAuditRecord;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-pub const MANAGEMENT_OPERATION_RECORD_VERSION: u16 = 3;
+pub const MANAGEMENT_OPERATION_RECORD_VERSION: u16 = 4;
 pub const IDEMPOTENCY_KEY_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 pub const TERMINAL_OPERATION_RETENTION_MS: i64 = IDEMPOTENCY_KEY_RETENTION_MS;
 pub const MAX_ACTIVE_OPERATIONS: usize = 1_000;
@@ -20,6 +21,7 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const IDEMPOTENCY_RECORD_VERSION: u16 = 1;
 const LEGACY_OPERATION_RECORD_VERSION: u16 = 1;
 const PREVIOUS_OPERATION_RECORD_VERSION: u16 = 2;
+const PREVIOUS_AUDIT_OUTBOX_VERSION: u16 = 3;
 const MAX_OPERATION_TRANSITIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +80,8 @@ pub struct OperationRecord {
     next_steps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_audit: Option<SecurityAuditRecord>,
 }
 
 /// Durable binding of one client idempotency key to one accepted operation.
@@ -130,6 +134,7 @@ impl OperationRecord {
             error_code: None,
             next_steps: Vec::new(),
             request,
+            pending_audit: None,
         }
     }
 
@@ -143,6 +148,10 @@ impl OperationRecord {
 
     pub fn kind(&self) -> OperationKind {
         self.kind
+    }
+
+    pub fn pending_audit(&self) -> Option<&SecurityAuditRecord> {
+        self.pending_audit.as_ref()
     }
 
     pub fn status(&self) -> OperationStatus {
@@ -287,7 +296,9 @@ fn decode_operation_record(bytes: &[u8]) -> Result<OperationRecord, OperationSto
     let mut record: OperationRecord = serde_json::from_slice(bytes)
         .map_err(|error| OperationStoreError::CorruptRecord(error.to_string()))?;
     match record.record_version {
-        LEGACY_OPERATION_RECORD_VERSION | PREVIOUS_OPERATION_RECORD_VERSION => {
+        LEGACY_OPERATION_RECORD_VERSION
+        | PREVIOUS_OPERATION_RECORD_VERSION
+        | PREVIOUS_AUDIT_OUTBOX_VERSION => {
             record.record_version = MANAGEMENT_OPERATION_RECORD_VERSION;
         }
         MANAGEMENT_OPERATION_RECORD_VERSION => {}
@@ -689,7 +700,7 @@ impl ManagementOperationStore {
         operation_id: &str,
         update: OperationUpdate,
     ) -> Result<OperationRecord, OperationStoreError> {
-        self.write_transition(operation_id, None, None, update)
+        self.write_transition(operation_id, None, None, update, None)
             .await
     }
 
@@ -700,8 +711,81 @@ impl ManagementOperationStore {
         expected_phase: Option<&str>,
         update: OperationUpdate,
     ) -> Result<OperationRecord, OperationStoreError> {
-        self.write_transition(operation_id, Some(expected_status), expected_phase, update)
+        self.write_transition(
+            operation_id,
+            Some(expected_status),
+            expected_phase,
+            update,
+            None,
+        )
+        .await
+    }
+
+    pub async fn transition_if_with_audit(
+        &self,
+        operation_id: &str,
+        expected_status: OperationStatus,
+        expected_phase: Option<&str>,
+        update: OperationUpdate,
+        audit: SecurityAuditRecord,
+    ) -> Result<OperationRecord, OperationStoreError> {
+        self.write_transition(
+            operation_id,
+            Some(expected_status),
+            expected_phase,
+            update,
+            Some(audit),
+        )
+        .await
+    }
+
+    pub async fn pending_audit_records(&self) -> Result<Vec<OperationRecord>, OperationStoreError> {
+        Ok(self
+            .load_all()
+            .await?
+            .into_iter()
+            .filter(|record| record.pending_audit().is_some())
+            .collect())
+    }
+
+    pub async fn clear_pending_audit(
+        &self,
+        operation_id: &str,
+        event_id: &str,
+    ) -> Result<OperationRecord, OperationStoreError> {
+        let _guard = self.write_lock.lock().await;
+        let (mut record, previous_bytes) = self
+            .read_state(operation_id)
+            .await?
+            .ok_or_else(|| OperationStoreError::NotFound(operation_id.to_owned()))?;
+        match record.pending_audit() {
+            Some(audit) if audit.event_id == event_id => record.pending_audit = None,
+            None => return Ok(record),
+            Some(_) => {
+                return Err(OperationStoreError::TransitionConflict(
+                    operation_id.to_owned(),
+                ));
+            }
+        }
+        let payload = serde_json::to_vec(&record)
+            .map_err(|error| OperationStoreError::Serialization(error.to_string()))?;
+        self.store
+            .put_opts(
+                &self.transition_path(operation_id, &previous_bytes)?,
+                payload.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
             .await
+            .map_err(|error| match error {
+                object_store::Error::AlreadyExists { .. } => {
+                    OperationStoreError::TransitionConflict(operation_id.to_owned())
+                }
+                error => OperationStoreError::Storage(error.to_string()),
+            })?;
+        Ok(record)
     }
 
     async fn write_transition(
@@ -710,6 +794,7 @@ impl ManagementOperationStore {
         expected_status: Option<OperationStatus>,
         expected_phase: Option<&str>,
         update: OperationUpdate,
+        pending_audit: Option<SecurityAuditRecord>,
     ) -> Result<OperationRecord, OperationStoreError> {
         let _guard = self.write_lock.lock().await;
         let (mut record, previous_bytes) = self
@@ -724,6 +809,14 @@ impl ManagementOperationStore {
             }
         }
         record.apply_update(update)?;
+        if let Some(audit) = pending_audit {
+            if record.pending_audit.is_some() {
+                return Err(OperationStoreError::TransitionConflict(
+                    operation_id.to_owned(),
+                ));
+            }
+            record.pending_audit = Some(audit);
+        }
         let payload = serde_json::to_vec(&record)
             .map_err(|error| OperationStoreError::Serialization(error.to_string()))?;
         if payload == previous_bytes {
@@ -866,5 +959,57 @@ impl ManagementOperationStore {
             )));
         }
         Ok(Some(record))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rockstream_types::authorization::{
+        AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
+        SECURITY_AUDIT_FORMAT_VERSION,
+    };
+
+    #[test]
+    fn operation_record_v3_migrates_without_a_pending_audit() {
+        let mut legacy = serde_json::to_value(OperationRecord::accepted(
+            "legacy-operation",
+            OperationKind::DrainWorker,
+            1_000,
+        ))
+        .unwrap();
+        legacy["record_version"] = serde_json::json!(PREVIOUS_AUDIT_OUTBOX_VERSION);
+        let decoded = decode_operation_record(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        assert_eq!(
+            decoded.record_version(),
+            MANAGEMENT_OPERATION_RECORD_VERSION
+        );
+        assert!(decoded.pending_audit().is_none());
+    }
+
+    #[test]
+    fn operation_record_v4_round_trips_pending_audit() {
+        let operation_id = "cancelled-operation";
+        let mut record = OperationRecord::accepted(operation_id, OperationKind::DrainWorker, 1_000);
+        record.pending_audit = Some(SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "cancel-event".to_owned(),
+            timestamp_ms: 2_000,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known(format!("operation:{operation_id}")),
+            scope: AuditField::Known("operation".to_owned()),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+            operation_id: AuditField::Known(operation_id.to_owned()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::Known("pending".to_owned()),
+            after_state: AuditField::Known("cancelled_before_start".to_owned()),
+        });
+
+        let decoded = decode_operation_record(&serde_json::to_vec(&record).unwrap()).unwrap();
+
+        assert_eq!(decoded, record);
     }
 }

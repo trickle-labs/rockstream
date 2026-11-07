@@ -286,6 +286,41 @@ impl ManagementService {
         self
     }
 
+    async fn flush_operation_audit(
+        &self,
+        record: OperationRecord,
+    ) -> Result<OperationRecord, String> {
+        let Some(audit) = record.pending_audit().cloned() else {
+            return Ok(record);
+        };
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| "management security catalog is unavailable".to_owned())?;
+        append_security_audit(catalog.as_ref(), audit.clone()).await?;
+        self.operations
+            .clear_pending_audit(record.operation_id(), &audit.event_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.operations
+            .get(record.operation_id())
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "audited operation disappeared".to_owned())
+    }
+
+    async fn flush_pending_operation_audits(&self) -> Result<(), String> {
+        for record in self
+            .operations
+            .pending_audit_records()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            self.flush_operation_audit(record).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn with_drain_runtime(mut self, runtime: ManagementDrainRuntime) -> Self {
         self.drain_runtime = Some(runtime);
         self
@@ -374,6 +409,11 @@ impl ManagementService {
                 "RS-2405: management API requires a preprovisioned mTLS administrator",
             ));
         }
+        self.flush_pending_operation_audits()
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("management operation audit recovery: {error}"))
+            })?;
 
         match self.support_artifacts.initialize().await {
             Ok(()) => {
@@ -1431,18 +1471,23 @@ impl v1::management_service_server::ManagementService for ManagementService {
             PolicyScope::Cluster,
         )
         .await?;
-        let request = request.into_inner();
-        let size = page_size(request.page_size)?;
+        let size = page_size(request.get_ref().page_size)?;
         let (items, next_page_token) = self
             .operations
-            .list(size, &request.page_token)
+            .list(size, &request.get_ref().page_token)
             .await
             .map_err(store_error)?;
+        let mut reconciled = Vec::with_capacity(items.len());
+        for item in items {
+            reconciled.push(self.flush_operation_audit(item).await.map_err(|_| {
+                required_audit_unavailable(&request, "management operation audit is unavailable")
+            })?);
+        }
         Ok(Response::new(v1::ListOperationsResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             source_version: "management-operation-records:v1".to_owned(),
-            operations: items.into_iter().map(Self::operation).collect(),
+            operations: reconciled.into_iter().map(Self::operation).collect(),
             next_page_token,
         }))
     }
@@ -1461,15 +1506,16 @@ impl v1::management_service_server::ManagementService for ManagementService {
             },
         )
         .await?;
-        let request = request.into_inner();
+        let operation_id = request.get_ref().operation_id.clone();
         let record = self
             .operations
-            .get(&request.operation_id)
+            .get(&operation_id)
             .await
             .map_err(store_error)?
-            .ok_or_else(|| {
-                Status::not_found(format!("operation {} not found", request.operation_id))
-            })?;
+            .ok_or_else(|| Status::not_found(format!("operation {operation_id} not found")))?;
+        let record = self.flush_operation_audit(record).await.map_err(|_| {
+            required_audit_unavailable(&request, "management operation audit is unavailable")
+        })?;
         Ok(Response::new(v1::GetOperationResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -1766,7 +1812,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 operation_scope.clone(),
             )
             .await?;
-        let catalog = self.security_catalog.as_ref().ok_or_else(|| {
+        self.security_catalog.as_ref().ok_or_else(|| {
             required_audit_unavailable(&request, "management security catalog is unavailable")
         })?;
         let record = self
@@ -1799,45 +1845,43 @@ impl v1::management_service_server::ManagementService for ManagementService {
         } else {
             "cancelled_before_lease_transfer"
         };
+        let cancelled_at_ms = Utc::now().timestamp_millis().max(1);
+        let scope = serde_json::to_string(&operation_scope)
+            .map_err(|_| Status::internal("management operation scope serialization failed"))?;
+        let audit = SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-operation-cancel:{operation_id}"),
+            timestamp_ms: cancelled_at_ms as u64,
+            actor: AuditIdentity::Verified(format!("principal:{}", principal_id.0)),
+            target: AuditField::Known(format!("operation:{operation_id}")),
+            scope: AuditField::Known(scope),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(operation_id.clone()),
+            operation_id: AuditField::Known(operation_id),
+            policy_revision: AuditField::Known(policy_revision),
+            before_state: AuditField::Known(format!("{:?}", status).to_lowercase()),
+            after_state: AuditField::Known(phase.to_owned()),
+        };
         let record = self
             .operations
-            .transition_if(
+            .transition_if_with_audit(
                 record.operation_id(),
                 status,
                 record.phase(),
                 crate::management_store::OperationUpdate {
                     status: OperationStatus::Cancelled,
-                    updated_at_ms: Utc::now().timestamp_millis(),
+                    updated_at_ms: cancelled_at_ms,
                     progress: record.progress(),
                     phase: Some(phase.to_owned()),
                     error_code: None,
                     next_steps: Vec::new(),
                 },
+                audit,
             )
             .await
             .map_err(store_error)?;
-        let scope = serde_json::to_string(&operation_scope)
-            .map_err(|_| Status::internal("management operation scope serialization failed"))?;
-        append_security_audit(
-            catalog.as_ref(),
-            SecurityAuditRecord {
-                format_version: SECURITY_AUDIT_FORMAT_VERSION,
-                event_id: format!("management-operation-cancel:{operation_id}"),
-                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
-                actor: AuditIdentity::Verified(format!("principal:{}", principal_id.0)),
-                target: AuditField::Known(format!("operation:{operation_id}")),
-                scope: AuditField::Known(scope),
-                action: SecurityAuditClass::AdminOperationCompletion,
-                outcome: SecurityAuditOutcome::Success,
-                correlation: AuditCorrelation::Observed(operation_id.clone()),
-                operation_id: AuditField::Known(operation_id),
-                policy_revision: AuditField::Known(policy_revision),
-                before_state: AuditField::Known(format!("{:?}", status).to_lowercase()),
-                after_state: AuditField::Known(phase.to_owned()),
-            },
-        )
-        .await
-        .map_err(|_| {
+        let record = self.flush_operation_audit(record).await.map_err(|_| {
             required_audit_unavailable(&request, "management operation audit is unavailable")
         })?;
         Ok(Response::new(v1::CancelOperationResponse {
