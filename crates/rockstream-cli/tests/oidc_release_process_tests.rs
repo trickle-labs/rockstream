@@ -2103,6 +2103,99 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
 }
 
 #[tokio::test]
+async fn operator_with_explicit_backup_scope_can_create_backup_over_release_management_api() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-scoped-backup";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for scoped-backup release qualification");
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let backup_destination = temp.path().join("scoped-backup");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut operator =
+        mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
+    operator.scoped_grants.push(ScopedActionGrant {
+        action: SecurityAction::BackupCreate,
+        scope: PolicyScope::BackupDestination {
+            destination: backup_destination.to_string_lossy().into_owned(),
+        },
+    });
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        false,
+        Some(operator),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+    let _admin = wait_for_management_client(management_address, &pki).await;
+    let mut client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
+    let accepted = client
+        .create_backup(CreateBackupRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            destination: backup_destination.to_string_lossy().into_owned(),
+            idempotency_key: idempotency_key.clone(),
+        })
+        .await
+        .expect("separate destination-scoped grant authorizes backup creation")
+        .into_inner()
+        .operation
+        .expect("backup operation response");
+    assert_eq!(accepted.operation_id, idempotency_key);
+    assert_eq!(accepted.kind, "create_backup");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let completed = loop {
+        let operation = client
+            .get_operation(GetOperationRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                operation_id: idempotency_key.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .operation
+            .expect("accepted backup operation remains queryable");
+        if operation.state == "succeeded" {
+            break operation;
+        }
+        assert_ne!(
+            operation.state, "failed",
+            "backup operation failed: {operation:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "backup did not complete: {operation:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(completed.progress, "100%");
+    assert_eq!(completed.phase, "completed");
+
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+}
+
+#[tokio::test]
 async fn operator_can_cancel_pending_support_artifact_over_release_management_api() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
