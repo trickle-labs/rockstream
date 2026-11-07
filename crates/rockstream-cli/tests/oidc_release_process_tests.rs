@@ -2151,6 +2151,79 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     assert_eq!(String::from_utf8(downloaded).unwrap(), expected_content);
     assert_eq!(download_expiry, first.expires_at_ms);
 
+    let management_store = object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "management",
+    );
+    let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
+    let pressure_id = uuid::Uuid::new_v4().to_string();
+    let pressure_blob_path = support_artifact_object_path(&pressure_id);
+    let pressure_payload = vec![0u8; 10 * 1024 * 1024];
+    let ledger_bytes = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+    ledger["artifacts"][&pressure_id] = serde_json::json!({
+        "owner": PrincipalId(1),
+        "scope": PolicyScope::Cluster,
+        "size": pressure_payload.len(),
+        "expires_at_ms": first.expires_at_ms,
+    });
+    management_store
+        .put(&pressure_blob_path, pressure_payload.into())
+        .await
+        .unwrap();
+    management_store
+        .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
+        .await
+        .unwrap();
+
+    let download_request = || DownloadSupportArtifactRequest {
+        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        opaque_id: pressure_id.clone(),
+    };
+    let mut open_downloads = Vec::new();
+    for _ in 0..8 {
+        open_downloads.push(
+            client
+                .download_support_artifact(download_request())
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+    }
+    let over_limit = match client.download_support_artifact(download_request()).await {
+        Ok(_) => panic!("ninth concurrent support-artifact download was admitted"),
+        Err(error) => error,
+    };
+    assert_eq!(over_limit.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        over_limit.message(),
+        "support artifact download limit reached"
+    );
+    drop(open_downloads);
+    management_store.delete(&pressure_blob_path).await.unwrap();
+    let ledger_bytes = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+    ledger["artifacts"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&pressure_id);
+    management_store
+        .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
+        .await
+        .unwrap();
+
     let expired_id = uuid::Uuid::new_v4().to_string();
     let expired_content = b"{\"format_version\":1,\"safe\":\"expired fixture\"}";
     let expired_blob_path = support_artifact_object_path(&expired_id);
@@ -2158,10 +2231,6 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     let foreign_content = b"{\"format_version\":1,\"safe\":\"foreign fixture\"}";
     let foreign_blob_path = support_artifact_object_path(&foreign_id);
     let first_blob_path = support_artifact_object_path(&first.opaque_id);
-    let management_store = object_store::prefix::PrefixStore::new(
-        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
-        "management",
-    );
     let stored_artifacts = management_store
         .list_with_delimiter(Some(&object_store::path::Path::from(
             "control/support-artifacts",
@@ -2189,7 +2258,6 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             .as_ref(),
         expected_content.as_bytes()
     );
-    let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
     let ledger_bytes = management_store
         .get(&ledger_path)
         .await
@@ -2382,7 +2450,11 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         opaque_id: idempotency_key.clone(),
     })
     .unwrap();
-    let expected_audit = vec![
+    let pressure_scope = serde_json::to_string(&PolicyScope::Artifact {
+        opaque_id: pressure_id.clone(),
+    })
+    .unwrap();
+    let mut expected_audit = vec![
         SecurityAuditRecord {
             format_version: SECURITY_AUDIT_FORMAT_VERSION,
             event_id: "first-admin-bootstrap:1".to_owned(),
@@ -2529,6 +2601,25 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             after_state: AuditField::NotApplicable,
         },
     ];
+    expected_audit.splice(
+        5..5,
+        std::iter::repeat(SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "support-artifact".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known(format!("support-artifact:{pressure_id}")),
+            scope: AuditField::Known(pressure_scope),
+            action: SecurityAuditClass::AdminOperationStart,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        })
+        .take(8),
+    );
     let security_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::prefix::PrefixStore::new(
             rockstream_test_support::minio::minio_object_store(minio_port, bucket),

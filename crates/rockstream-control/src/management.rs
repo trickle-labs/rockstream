@@ -2194,6 +2194,11 @@ impl v1::management_service_server::ManagementService for ManagementService {
         if downloaded_principal != principal_id || metadata.expires_at_ms == 0 {
             return Err(Status::not_found("support artifact not found or expired"));
         }
+        let download_permit = self
+            .support_download_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("support artifact download limit reached"))?;
         let (content, expires_at_ms, expires_at) = match self
             .support_artifacts
             .download(
@@ -2219,11 +2224,6 @@ impl v1::management_service_server::ManagementService for ManagementService {
             }
             Err(_) => return Err(Status::unavailable("support artifact store is unavailable")),
         };
-        let download_permit = self
-            .support_download_gate
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("support artifact download limit reached"))?;
         self.record_support_artifact_audit(
             &request,
             principal_id,
@@ -2568,6 +2568,75 @@ mod tests {
             operations.get(&key).await.unwrap().unwrap().status(),
             OperationStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn support_artifact_download_limit_covers_open_streams() {
+        let security_catalog = test_security_catalog().await;
+        let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
+        let service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            operations,
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog);
+        let key = uuid::Uuid::new_v4().to_string();
+        let generated = <ManagementService as v1::management_service_server::ManagementService>::generate_support_artifact(
+            &service,
+            authenticated_request(v1::GenerateSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                node_id: String::new(),
+                idempotency_key: key.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(generated.opaque_id, key);
+
+        let download = || {
+            authenticated_request(v1::DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: key.clone(),
+            })
+        };
+        let mut streams = Vec::new();
+        for _ in 0..8 {
+            streams.push(
+                <ManagementService as v1::management_service_server::ManagementService>::download_support_artifact(
+                    &service,
+                    download(),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let rejected = match <ManagementService as v1::management_service_server::ManagementService>::download_support_artifact(
+            &service,
+            download(),
+        )
+        .await
+        {
+            Ok(_) => panic!("ninth concurrent support-artifact download was admitted"),
+            Err(error) => error,
+        };
+        assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            rejected.message(),
+            "support artifact download limit reached"
+        );
+
+        drop(streams.pop());
+        streams.push(
+            <ManagementService as v1::management_service_server::ManagementService>::download_support_artifact(
+                &service,
+                download(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(streams.len(), 8);
     }
 
     #[tokio::test]
