@@ -24,6 +24,8 @@ pub struct TestPki {
     pub worker_certs: HashMap<u64, (PathBuf, PathBuf)>,
     pub cli_cert_path: PathBuf,
     pub cli_key_path: PathBuf,
+    pub secondary_cli_cert_path: PathBuf,
+    pub secondary_cli_key_path: PathBuf,
     pub untrusted_ca_cert_path: PathBuf,
     pub untrusted_cert_path: PathBuf,
     pub untrusted_key_path: PathBuf,
@@ -100,6 +102,17 @@ impl TestPki {
         let cli_cert_path = write_file(dir.path(), "cli.pem", &cli_cert_pem);
         let cli_key_path = write_file(dir.path(), "cli-key.pem", &cli_key_pem);
 
+        let (secondary_cli_cert_pem, secondary_cli_key_pem) = make_leaf(
+            &ca_cert,
+            &ca_key,
+            &NodeIdentity::cli("operator").to_cn(),
+            vec!["localhost".to_string(), "127.0.0.1".to_string()],
+        );
+        let secondary_cli_cert_path =
+            write_file(dir.path(), "secondary-cli.pem", &secondary_cli_cert_pem);
+        let secondary_cli_key_path =
+            write_file(dir.path(), "secondary-cli-key.pem", &secondary_cli_key_pem);
+
         // Untrusted CA and leaf
         let (untrusted_ca, untrusted_ca_key) = make_ca("Rogue Untrusted CA");
         let untrusted_ca_pem = untrusted_ca.pem();
@@ -163,6 +176,8 @@ impl TestPki {
             worker_certs,
             cli_cert_path,
             cli_key_path,
+            secondary_cli_cert_path,
+            secondary_cli_key_path,
             untrusted_ca_cert_path,
             untrusted_cert_path,
             untrusted_key_path,

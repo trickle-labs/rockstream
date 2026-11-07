@@ -200,15 +200,17 @@ and partial-restore failures return `RS-3614` with recovery steps; a concurrent 
 
 ### `rockstream support`
 
-Generate on-demand diagnostic support bundles as local files. Bundles contain
-sanitized operational metadata only: diagnostic context values and the selected
-view name are omitted, and each bundle is limited to 10 MiB. This command does
-not download an actor-scoped artifact from a remote service.
+Generate on-demand diagnostic support bundles. Local bundles contain sanitized
+operational metadata only: diagnostic context values and the selected view name
+are omitted, and each bundle is limited to 10 MiB. The authenticated management
+API also creates actor- and scope-bound artifacts with opaque IDs.
 Generation outcomes are durably recorded in the local `audit.jsonl`; an audit
 failure returns an error, though a bundle written just before that failure can
 remain at the requested local path.
 
 - `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Write a sanitized diagnostic bundle to a local path, subject to the 10 MiB limit.
+- `rockstream --management <addr> support artifact create [--node-id <id>] [--idempotency-key <uuid>]` — Create a sanitized cluster- or node-scoped artifact through the authenticated management API. The client prints its idempotency UUID before sending the request; reuse that UUID to retry or reconcile.
+- `rockstream --management <addr> support artifact download <opaque-id> --out <path>` — Download the artifact to a local file while it remains available.
 
 ---
 

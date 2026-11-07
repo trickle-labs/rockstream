@@ -611,35 +611,62 @@ fn main() -> ExitCode {
             };
             handle_result(res, format)
         }
-        Command::Support { command } => {
-            let storage = StorageClient::with_identity(identity.clone());
-            let storage_path = cli
-                .storage_dir
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let res = match command {
-                SupportCommand::Bundle { view, since, out } => run_support_bundle(
+        Command::Support { command } => match command {
+            SupportCommand::Artifact { command } => match command {
+                SupportArtifactCommand::Create {
+                    node_id,
+                    idempotency_key,
+                } => {
+                    let key = management_idempotency_key(idempotency_key);
+                    run_management(&cli, None, format, |client| {
+                        client.generate_support_artifact(node_id, key)
+                    })
+                }
+                SupportArtifactCommand::Download { opaque_id, out } => {
+                    run_management(&cli, None, format, |client| {
+                        client.download_support_artifact(opaque_id, &out)
+                    })
+                }
+            },
+            SupportCommand::Bundle { view, since, out } => {
+                let storage = StorageClient::with_identity(identity.clone());
+                let storage_path = cli
+                    .storage_dir
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                handle_result(
+                    run_support_bundle(
+                        format,
+                        &storage,
+                        &storage_path,
+                        view.as_deref(),
+                        since.as_deref(),
+                        out.as_deref(),
+                    ),
                     format,
-                    &storage,
-                    &storage_path,
-                    view.as_deref(),
-                    since.as_deref(),
-                    out.as_deref(),
-                ),
-                SupportCommand::Diagnose {
-                    code,
-                    correlation_id,
-                    out,
-                } => rockstream_cli::run_support_diagnose(
+                )
+            }
+            SupportCommand::Diagnose {
+                code,
+                correlation_id,
+                out,
+            } => {
+                let storage = StorageClient::with_identity(identity.clone());
+                let storage_path = cli
+                    .storage_dir
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                handle_result(
+                    rockstream_cli::run_support_diagnose(
+                        format,
+                        &storage,
+                        &storage_path,
+                        code.as_deref(),
+                        correlation_id.as_deref(),
+                        out.as_deref(),
+                    ),
                     format,
-                    &storage,
-                    &storage_path,
-                    code.as_deref(),
-                    correlation_id.as_deref(),
-                    out.as_deref(),
-                ),
-            };
-            handle_result(res, format)
-        }
+                )
+            }
+        },
         Command::Resource { command } => {
             let identity = identity.clone();
             let catalog = make_catalog_client(&cli, identity);

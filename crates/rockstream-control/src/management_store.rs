@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-pub const MANAGEMENT_OPERATION_RECORD_VERSION: u16 = 2;
+pub const MANAGEMENT_OPERATION_RECORD_VERSION: u16 = 3;
 pub const IDEMPOTENCY_KEY_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 pub const TERMINAL_OPERATION_RETENTION_MS: i64 = IDEMPOTENCY_KEY_RETENTION_MS;
 pub const MAX_ACTIVE_OPERATIONS: usize = 1_000;
@@ -19,6 +19,7 @@ const MAX_OPERATION_ID_BYTES: usize = 128;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const IDEMPOTENCY_RECORD_VERSION: u16 = 1;
 const LEGACY_OPERATION_RECORD_VERSION: u16 = 1;
+const PREVIOUS_OPERATION_RECORD_VERSION: u16 = 2;
 const MAX_OPERATION_TRANSITIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub enum OperationKind {
     DrainWorker,
     MigrateShard,
     CreateBackup,
+    GenerateSupportArtifact,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,7 +287,7 @@ fn decode_operation_record(bytes: &[u8]) -> Result<OperationRecord, OperationSto
     let mut record: OperationRecord = serde_json::from_slice(bytes)
         .map_err(|error| OperationStoreError::CorruptRecord(error.to_string()))?;
     match record.record_version {
-        LEGACY_OPERATION_RECORD_VERSION => {
+        LEGACY_OPERATION_RECORD_VERSION | PREVIOUS_OPERATION_RECORD_VERSION => {
             record.record_version = MANAGEMENT_OPERATION_RECORD_VERSION;
         }
         MANAGEMENT_OPERATION_RECORD_VERSION => {}
@@ -315,6 +317,10 @@ impl ManagementOperationStore {
             prefix: Path::from("control/management-operations"),
             write_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
     }
 
     fn operation_path(&self, operation_id: &str) -> Result<Path, OperationStoreError> {
