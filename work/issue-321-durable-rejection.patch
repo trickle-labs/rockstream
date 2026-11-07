@@ -2,10 +2,7 @@ diff --git a/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs b/cr
 index 03d9a7ae..4e9671c8 100644
 --- a/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs
 +++ b/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs
-@@ -515,6 +515,83 @@ async fn exercise_durable_catch_up_survives_restart(
-     assert!(inlet_rx2.try_recv().is_err());
- }
- 
+@@ -517,0 +518,77 @@ async fn exercise_durable_catch_up_survives_restart(
 +#[tokio::test]
 +async fn issue_321_durable_catch_up_closed_inlet_observation() {
 +    let dir = tempfile::tempdir().unwrap();
@@ -83,6 +80,3 @@ index 03d9a7ae..4e9671c8 100644
 +    );
 +}
 +
- #[tokio::test]
- async fn durable_shuffle_catch_up_survives_lfs_restart_with_fast_path_elision_enabled() {
-     let dir = tempfile::tempdir().unwrap();
