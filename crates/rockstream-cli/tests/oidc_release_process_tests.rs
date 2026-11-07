@@ -2603,22 +2603,24 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     ];
     expected_audit.splice(
         5..5,
-        std::iter::repeat(SecurityAuditRecord {
-            format_version: SECURITY_AUDIT_FORMAT_VERSION,
-            event_id: "support-artifact".to_owned(),
-            timestamp_ms: 0,
-            actor: AuditIdentity::Verified("principal:1".to_owned()),
-            target: AuditField::Known(format!("support-artifact:{pressure_id}")),
-            scope: AuditField::Known(pressure_scope),
-            action: SecurityAuditClass::AdminOperationStart,
-            outcome: SecurityAuditOutcome::Success,
-            correlation: AuditCorrelation::Unknown,
-            operation_id: AuditField::NotApplicable,
-            policy_revision: AuditField::Known(1),
-            before_state: AuditField::NotApplicable,
-            after_state: AuditField::NotApplicable,
-        })
-        .take(8),
+        std::iter::repeat_n(
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: "support-artifact".to_owned(),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known(format!("support-artifact:{pressure_id}")),
+                scope: AuditField::Known(pressure_scope),
+                action: SecurityAuditClass::AdminOperationStart,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            },
+            8,
+        ),
     );
     let security_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::prefix::PrefixStore::new(
