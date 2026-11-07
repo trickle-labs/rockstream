@@ -1,0 +1,88 @@
+diff --git a/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs b/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs
+index 03d9a7ae..4e9671c8 100644
+--- a/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs
++++ b/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs
+@@ -515,6 +515,83 @@ async fn exercise_durable_catch_up_survives_restart(
+     assert!(inlet_rx2.try_recv().is_err());
+ }
+ 
++#[tokio::test]
++async fn issue_321_durable_catch_up_closed_inlet_observation() {
++    let dir = tempfile::tempdir().unwrap();
++    let store: Arc<dyn ObjectStore> =
++        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
++    let target = reopen_db("rejected-dst", store.clone()).await;
++    let (registry, inlet_rx) = make_receiver_registry(target.clone());
++    drop(inlet_rx);
++
++    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
++    let mut writer = rockstream_runtime::exchange::durable::DurableShuffleWriter::new();
++    writer.add_frame(0, 1, 1, &payload).unwrap();
++    writer
++        .finish(
++            store.as_ref(),
++            &object_store::path::Path::from("shuffle/100/1/811/812"),
++        )
++        .await
++        .unwrap();
++    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
++    let key = rockstream_runtime::exchange::persistence::inbox_key(100, 0, 1, 1);
++    assert_eq!(
++        rockstream_runtime::exchange::persistence::committed_frontier(&target)
++            .await
++            .unwrap(),
++        0
++    );
++
++    assert_eq!(
++        mux.catch_up_durable(
++            100,
++            1,
++            WorkerId(811),
++            WorkerId(812),
++            &registry,
++            store.as_ref()
++        )
++        .await,
++        Ok(())
++    );
++    assert_eq!(
++        target.get(&key).await.unwrap().as_deref(),
++        Some(payload.as_ref())
++    );
++    target.close().await.unwrap();
++
++    let reopened = reopen_db("rejected-dst", store.clone()).await;
++    assert_eq!(
++        rockstream_runtime::exchange::persistence::committed_frontier(&reopened)
++            .await
++            .unwrap(),
++        0
++    );
++    let (registry, mut inlet_rx) = make_receiver_registry(reopened.clone());
++    assert_eq!(
++        mux.catch_up_durable(
++            100,
++            1,
++            WorkerId(811),
++            WorkerId(812),
++            &registry,
++            store.as_ref()
++        )
++        .await,
++        Ok(())
++    );
++    assert!(
++        tokio::time::timeout(std::time::Duration::from_millis(150), inlet_rx.recv())
++            .await
++            .is_err()
++    );
++    assert_eq!(
++        reopened.get(&key).await.unwrap().as_deref(),
++        Some(payload.as_ref())
++    );
++}
++
+ #[tokio::test]
+ async fn durable_shuffle_catch_up_survives_lfs_restart_with_fast_path_elision_enabled() {
+     let dir = tempfile::tempdir().unwrap();
