@@ -24,6 +24,7 @@ pub struct ManagementAuth {
     pub catalog: Arc<DurableCatalogStore>,
 }
 
+#[allow(dead_code)]
 impl ManagementAuth {
     pub async fn new(backup_destinations: &[String]) -> Self {
         Self::with_presets(
