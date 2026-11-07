@@ -2485,6 +2485,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_support_artifact_cancellation_prevents_generation() {
+        let security_catalog = test_security_catalog().await;
+        let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
+        let key = uuid::Uuid::new_v4().to_string();
+        let accepted_at_ms = Utc::now().timestamp_millis().max(1);
+        let accepted = operations
+            .accept_idempotent(
+                &key,
+                rockstream_management_proto::PROTOCOL_VERSION as u16,
+                &SupportArtifactDigest {
+                    principal_id: 1,
+                    node_id: None,
+                },
+                key.clone(),
+                crate::management_store::OperationKind::GenerateSupportArtifact,
+                accepted_at_ms,
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), OperationStatus::Pending);
+        let service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            operations.clone(),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog);
+
+        let cancelled = <ManagementService as v1::management_service_server::ManagementService>::cancel_operation(
+            &service,
+            authenticated_request(v1::CancelOperationRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                operation_id: key.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+        let updated_at = cancelled.updated_at.clone();
+        assert_eq!(
+            cancelled,
+            v1::Operation {
+                operation_id: key.clone(),
+                kind: "generate_support_artifact".to_owned(),
+                state: "cancelled".to_owned(),
+                started_at: timestamp(accepted.started_at_ms()),
+                updated_at,
+                progress: String::new(),
+                phase: "cancelled_before_start".to_owned(),
+                error_code: String::new(),
+                next_steps: Vec::new(),
+                source_version: format!("operation-record:{}", accepted.record_version()),
+            }
+        );
+
+        let retry = <ManagementService as v1::management_service_server::ManagementService>::generate_support_artifact(
+            &service,
+            authenticated_request(v1::GenerateSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                node_id: String::new(),
+                idempotency_key: key.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(retry.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            retry.message(),
+            "support artifact operation is already terminal"
+        );
+        assert!(matches!(
+            service
+                .support_artifacts
+                .metadata(&key, Utc::now().timestamp_millis().max(1) as u64)
+                .await,
+            Err(ArtifactStoreError::NotFound)
+        ));
+        assert_eq!(
+            operations.get(&key).await.unwrap().unwrap().status(),
+            OperationStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
     async fn support_artifact_api_retries_and_streams_exact_sanitized_bytes() {
         let security_catalog = test_security_catalog().await;
         let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
