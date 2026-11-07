@@ -412,12 +412,19 @@ async fn start_control_process_with_operator(
         )
         .unwrap()
     };
-    let durable = DurableCatalogStore::new(security_store, "gateway");
+    let durable = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
     if provision_first_admin {
-        durable
-            .preprovision_first_administrator(principal, 1)
-            .await
-            .unwrap();
+        match durable.get_security_principal(principal.id).await.unwrap() {
+            Some(existing) => assert_eq!(existing, principal),
+            None => {
+                durable
+                    .preprovision_first_administrator(principal, 1)
+                    .await
+                    .unwrap();
+            }
+        }
     }
     if let Some(operator) = operator {
         let policy = serde_json::to_string(&(
