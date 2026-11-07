@@ -8,10 +8,13 @@ use std::{
 
 use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_control::audit::FileAuditLog;
+use rockstream_control::management_store::{
+    ManagementOperationStore, OperationKind, OperationStatus,
+};
 use rockstream_management_proto::v1::{
-    management_service_client::ManagementServiceClient, CreateBackupRequest,
-    DownloadSupportArtifactRequest, GenerateSupportArtifactRequest, GetClusterStatusRequest,
-    ListOperationsRequest,
+    management_service_client::ManagementServiceClient, CancelOperationRequest,
+    CreateBackupRequest, DownloadSupportArtifactRequest, GenerateSupportArtifactRequest,
+    GetClusterStatusRequest, GetOperationRequest, ListOperationsRequest,
 };
 use rockstream_storage::catalog::{
     CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn,
@@ -2097,6 +2100,108 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     assert_eq!(denial.policy_revision, AuditField::Known(1));
     assert_eq!(denial.before_state, AuditField::NotApplicable);
     assert_eq!(denial.after_state, AuditField::NotApplicable);
+}
+
+#[tokio::test]
+async fn operator_can_cancel_pending_support_artifact_over_release_management_api() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-support-cancellation";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for support-artifact cancellation qualification");
+    let management_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "management",
+    ));
+    let operations = ManagementOperationStore::new(Arc::clone(&management_store));
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let pending = operations
+        .accept_idempotent(
+            &operation_id,
+            rockstream_management_proto::PROTOCOL_VERSION as u16,
+            &serde_json::json!({ "principal_id": 2, "node_id": null }),
+            operation_id.clone(),
+            OperationKind::GenerateSupportArtifact,
+            chrono::Utc::now().timestamp_millis().max(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), OperationStatus::Pending);
+
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let operator = mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        false,
+        Some(operator),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+    let _admin = wait_for_management_client(management_address, &pki).await;
+    let mut client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+
+    let cancelled = client
+        .cancel_operation(CancelOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(cancelled.operation_id, operation_id);
+    assert_eq!(cancelled.kind, "generate_support_artifact");
+    assert_eq!(cancelled.state, "cancelled");
+    assert_eq!(cancelled.phase, "cancelled_before_start");
+    let recovered = client
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: cancelled.operation_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(recovered, cancelled);
+
+    let retry = client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: operation_id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(retry.code(), tonic::Code::FailedPrecondition);
+    assert!(matches!(
+        management_store
+            .get(&support_artifact_object_path(&operation_id))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
 }
 
 #[tokio::test]
