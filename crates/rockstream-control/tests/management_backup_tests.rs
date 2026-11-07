@@ -308,7 +308,7 @@ async fn create_backup_reconciles_persisted_exporting_record_from_manifest() {
         .unwrap();
 
     let management_addr = management_addr().await;
-    let auth = ManagementAuth::new(&[destination_text.clone()]).await;
+    let auth = ManagementAuth::new(std::slice::from_ref(&destination_text)).await;
     let service = auth.protect_control(
         ControlService::new(TopologyCatalog::new())
             .with_single_worker_local_backup_source_store(source.clone(), WorkerId(1))

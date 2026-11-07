@@ -142,7 +142,7 @@ async fn test_mtls_rotation_control_under_load_zero_loss() {
 
     for (index, client) in clients.iter().enumerate() {
         let shard_id = ShardId(index as u64 + 1);
-        client.request_shard(shard_id.clone()).await.unwrap();
+        client.request_shard(shard_id).await.unwrap();
         wait_for_worker_lease(client, &manager, shard_id).await;
     }
 
@@ -199,11 +199,11 @@ async fn test_mtls_rotation_control_under_load_zero_loss() {
     // Existing Gen1 streams must still carry requests and receive committed leases.
     for (index, client) in clients.iter().enumerate() {
         let shard_id = ShardId(500 + index as u64);
-        client.request_shard(shard_id.clone()).await.unwrap();
+        client.request_shard(shard_id).await.unwrap();
         wait_for_worker_lease(client, &manager, shard_id).await;
     }
     let gen2_shard = ShardId(504);
-    gen2_client.request_shard(gen2_shard.clone()).await.unwrap();
+    gen2_client.request_shard(gen2_shard).await.unwrap();
     wait_for_worker_lease(&gen2_client, &manager, gen2_shard).await;
 
     assert_eq!(catalog.len(), 4);
