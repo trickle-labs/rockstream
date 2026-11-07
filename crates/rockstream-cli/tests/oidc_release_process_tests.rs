@@ -2115,6 +2115,13 @@ async fn operator_can_cancel_pending_support_artifact_over_release_management_ap
         rockstream_test_support::minio::minio_object_store(minio_port, bucket),
         "management",
     ));
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "gateway-shard",
+    ));
+    let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
     let operations = ManagementOperationStore::new(Arc::clone(&management_store));
     let operation_id = uuid::Uuid::new_v4().to_string();
     let pending = operations
@@ -2136,6 +2143,7 @@ async fn operator_can_cancel_pending_support_artifact_over_release_management_ap
     let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let operator = mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
+    let operator_revision = operator.revision;
     let mut process = start_control_process_with_operator(
         temp.path(),
         &storage,
@@ -2173,6 +2181,38 @@ async fn operator_can_cancel_pending_support_artifact_over_release_management_ap
     assert_eq!(cancelled.kind, "generate_support_artifact");
     assert_eq!(cancelled.state, "cancelled");
     assert_eq!(cancelled.phase, "cancelled_before_start");
+    security_catalog.refresh().await.unwrap();
+    let audit = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    let cancellation = audit
+        .iter()
+        .find(|record| record.event_id == format!("management-operation-cancel:{operation_id}"))
+        .unwrap();
+    assert_eq!(
+        cancellation,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-operation-cancel:{operation_id}"),
+            timestamp_ms: cancellation.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:2".to_owned()),
+            target: AuditField::Known(format!("operation:{operation_id}")),
+            scope: AuditField::Known(
+                serde_json::to_string(&PolicyScope::Operation {
+                    operation_id: operation_id.clone(),
+                })
+                .unwrap(),
+            ),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(operation_id.clone()),
+            operation_id: AuditField::Known(operation_id.clone()),
+            policy_revision: AuditField::Known(operator_revision),
+            before_state: AuditField::Known("pending".to_owned()),
+            after_state: AuditField::Known("cancelled_before_start".to_owned()),
+        }
+    );
     let recovered = client
         .get_operation(GetOperationRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
