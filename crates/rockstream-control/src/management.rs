@@ -938,7 +938,7 @@ impl ManagementService {
             .map_err(|_| "security grant operation certificate identity is malformed".to_owned())?;
         self.ensure_security_operation_started(operation_id, change)
             .await?;
-        for attempt in 0..2 {
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
             catalog.refresh().await.map_err(|error| error.to_string())?;
             let grantor = catalog
                 .get_security_principal(grantor_id)
@@ -1043,7 +1043,8 @@ impl ManagementService {
             match catalog.commit_txn(txn).await {
                 Ok(_) => return security_principal_grant_result(change, expected_new_revision),
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                    if attempt == 0 => {}
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS => {}
                 Err(error) => return Err(error.to_string()),
             }
         }
@@ -1178,7 +1179,7 @@ pub(crate) async fn append_security_audit(
     store: &dyn CatalogStore,
     record: SecurityAuditRecord,
 ) -> Result<(), String> {
-    for attempt in 0..2 {
+    for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
         store
             .refresh()
             .await
@@ -1197,7 +1198,7 @@ pub(crate) async fn append_security_audit(
         match store.commit_txn(transaction).await {
             Ok(_) => return Ok(()),
             Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                if attempt == 0 =>
+                if attempt + 1 < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
             {
                 continue;
             }

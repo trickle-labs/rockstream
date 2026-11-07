@@ -41,6 +41,8 @@ use rockstream_types::workload::WorkloadDef;
 const SECURITY_AUDIT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_SECURITY_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
 
+pub const SECURITY_AUDIT_APPEND_ATTEMPTS: usize = 8;
+
 /// Abstract interface for catalog operations.
 #[allow(clippy::double_must_use)]
 #[async_trait]

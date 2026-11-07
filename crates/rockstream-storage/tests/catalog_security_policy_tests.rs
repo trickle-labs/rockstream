@@ -12,6 +12,11 @@ use rockstream_types::ids::PrincipalId;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+#[test]
+fn security_audit_append_attempts_use_the_selected_profile() {
+    assert_eq!(SECURITY_AUDIT_APPEND_ATTEMPTS, 8);
+}
+
 fn principal(id: u64, revision: u64, presets: Vec<ScopedPresetGrant>) -> SecurityPrincipal {
     SecurityPrincipal {
         format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
