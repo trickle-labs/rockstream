@@ -2119,7 +2119,7 @@ async fn operator_can_cancel_pending_support_artifact_over_release_management_ap
         rockstream_test_support::minio::minio_object_store(minio_port, bucket),
         "gateway-shard",
     ));
-    let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
+    let security_catalog = DurableCatalogStore::recover(Arc::clone(&security_store), "gateway")
         .await
         .unwrap();
     let operations = ManagementOperationStore::new(Arc::clone(&management_store));
@@ -2213,6 +2213,36 @@ async fn operator_can_cancel_pending_support_artifact_over_release_management_ap
             after_state: AuditField::Known("cancelled_before_start".to_owned()),
         }
     );
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    process = start_control_process(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+    let _admin = wait_for_management_client(management_address, &pki).await;
+    let mut client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let recovered_security_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let recovered_audit = recovered_security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    assert!(recovered_audit.contains(cancellation));
     let recovered = client
         .get_operation(GetOperationRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
