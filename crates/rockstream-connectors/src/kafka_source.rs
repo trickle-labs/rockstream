@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
@@ -10,7 +11,6 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
-use rockstream_types::secret::SecretToken;
 use rockstream_types::timestamp::{Epoch, EventTimeWatermark};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -304,8 +304,7 @@ pub struct KafkaSource {
     last_polled: Option<OffsetToken>,
     last_committed: Option<(Epoch, OffsetToken)>,
     secret_name: Option<String>,
-    pending_secret_token: Option<SecretToken>,
-    active_secret_token_id: Option<String>,
+    secret_version: u64,
     secret_rotations_applied: u64,
     assignment_generation: u64,
     assigned_partitions: BTreeSet<i32>,
@@ -324,6 +323,65 @@ impl KafkaSource {
         bootstrap_servers: &str,
         topic: &str,
         group_id: &str,
+    ) -> Result<Self, SourceError> {
+        Self::connect_inner(
+            connector_id,
+            schema,
+            bootstrap_servers,
+            topic,
+            group_id,
+            None,
+        )
+    }
+
+    /// Connect with PLAIN credentials over an explicitly selected Kafka transport.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_with_sasl_plain(
+        connector_id: ConnectorId,
+        schema: SchemaRef,
+        bootstrap_servers: &str,
+        topic: &str,
+        group_id: &str,
+        security_protocol: &str,
+        secret_name: &str,
+        secret_version: u64,
+        username: &str,
+        password: &str,
+    ) -> Result<Self, SourceError> {
+        if !matches!(security_protocol, "SASL_SSL" | "SASL_PLAINTEXT") {
+            return Err(SourceError::Io(
+                "Kafka secret sources require security.protocol SASL_SSL or SASL_PLAINTEXT"
+                    .to_string(),
+            ));
+        }
+        if secret_name.is_empty() || username.is_empty() || password.is_empty() {
+            return Err(SourceError::Io(
+                "Kafka SASL secret requires a name, username, and password".to_string(),
+            ));
+        }
+        Self::connect_inner(
+            connector_id,
+            schema,
+            bootstrap_servers,
+            topic,
+            group_id,
+            Some((
+                security_protocol,
+                username,
+                password,
+                secret_name,
+                secret_version,
+            )),
+        )
+    }
+
+    fn connect_inner(
+        connector_id: ConnectorId,
+        schema: SchemaRef,
+        bootstrap_servers: &str,
+        topic: &str,
+        group_id: &str,
+        sasl: Option<(&str, &str, &str, &str, u64)>,
     ) -> Result<Self, SourceError> {
         if bootstrap_servers.is_empty() || topic.is_empty() || group_id.is_empty() {
             return Err(SourceError::Io(
@@ -347,7 +405,8 @@ impl KafkaSource {
             None
         };
         let config = || {
-            ClientConfig::new()
+            let mut config = ClientConfig::new();
+            config
                 .set("bootstrap.servers", bootstrap_servers)
                 .set("group.id", group_id)
                 .set("enable.auto.commit", "false")
@@ -356,8 +415,15 @@ impl KafkaSource {
                 .set(
                     "queued.max.messages.kbytes",
                     KAFKA_SOURCE_BUFFER_LIMIT.to_string(),
-                )
-                .create::<StreamConsumer>()
+                );
+            if let Some((security_protocol, username, password, _, _)) = sasl {
+                config
+                    .set("security.protocol", security_protocol)
+                    .set("sasl.mechanisms", "PLAIN")
+                    .set("sasl.username", username)
+                    .set("sasl.password", password);
+            }
+            config.create::<StreamConsumer>()
         };
         let consumer = if let Some(runtime) = &runtime {
             let _guard = runtime.enter();
@@ -365,9 +431,18 @@ impl KafkaSource {
         } else {
             config()
         }
-        .map_err(|error| SourceError::Io(format!(
-            "Kafka consumer creation failed: {error}. Next steps: verify broker connectivity and consumer configuration"
-        )))?;
+        .map_err(|error| {
+            if sasl.is_some() {
+                SourceError::Io(
+                    "Kafka SASL consumer creation failed; verify broker transport and credentials"
+                        .to_string(),
+                )
+            } else {
+                SourceError::Io(format!(
+                    "Kafka consumer creation failed: {error}. Next steps: verify broker connectivity and consumer configuration"
+                ))
+            }
+        })?;
         consumer.subscribe(&[topic]).map_err(|error| {
             SourceError::Io(format!(
                 "Kafka subscription failed: {error}. Next steps: verify that topic {topic:?} exists and is authorized"
@@ -385,9 +460,8 @@ impl KafkaSource {
             last_poll_fill_level: 0,
             last_polled: None,
             last_committed: None,
-            secret_name: None,
-            pending_secret_token: None,
-            active_secret_token_id: None,
+            secret_name: sasl.map(|(_, _, _, name, _)| name.to_string()),
+            secret_version: sasl.map_or(0, |(_, _, _, _, version)| version),
             secret_rotations_applied: 0,
             assignment_generation: 0,
             assigned_partitions: BTreeSet::new(),
@@ -409,35 +483,49 @@ impl KafkaSource {
         self.last_poll_fill_level
     }
 
-    /// Bind this connector to a catalog secret without retaining plaintext credentials.
-    pub fn bind_secret(&mut self, secret_name: impl Into<String>) {
-        self.secret_name = Some(secret_name.into());
+    pub fn secret_binding(&self) -> (Option<&str>, u64) {
+        (self.secret_name.as_deref(), self.secret_version)
     }
 
-    /// Queue one encrypted replacement token for the next epoch boundary.
-    pub fn set_secret_token(&mut self, token: SecretToken) -> Result<(), String> {
-        if self
-            .secret_name
-            .as_deref()
-            .is_some_and(|name| name != token.secret_name)
-        {
-            return Err("RS-5003: secret token does not match the connector binding".to_string());
+    /// Update credentials used for the client's next broker authentication.
+    pub fn rotate_sasl_plain_credentials(
+        &mut self,
+        secret_name: &str,
+        version: u64,
+        username: &str,
+        password: &str,
+    ) -> Result<bool, String> {
+        if self.secret_name.as_deref() != Some(secret_name) {
+            return Err("rotated secret does not match the Kafka source binding".to_string());
         }
-        self.secret_name = Some(token.secret_name.clone());
-        self.pending_secret_token = Some(token);
-        Ok(())
-    }
-
-    /// Apply a pending token at the epoch boundary; the live client is never restarted.
-    pub fn apply_secret_token_at_epoch(&mut self) {
-        if let Some(token) = self.pending_secret_token.take() {
-            self.active_secret_token_id = Some(token.token_id);
-            self.secret_rotations_applied += 1;
+        if version < self.secret_version {
+            return Err("Kafka source secret version moved backwards".to_string());
         }
-    }
-
-    pub fn active_secret_token_id(&self) -> Option<&str> {
-        self.active_secret_token_id.as_deref()
+        if version == self.secret_version {
+            return Ok(false);
+        }
+        if username.is_empty() || password.is_empty() {
+            return Err("Kafka SASL secret requires a username and password".to_string());
+        }
+        let username = CString::new(username)
+            .map_err(|_| "Kafka SASL username contains an invalid NUL byte".to_string())?;
+        let password = CString::new(password)
+            .map_err(|_| "Kafka SASL password contains an invalid NUL byte".to_string())?;
+        let error = unsafe {
+            rdkafka::bindings::rd_kafka_sasl_set_credentials(
+                self.consumer.client().native_ptr(),
+                username.as_ptr(),
+                password.as_ptr(),
+            )
+        };
+        if !error.is_null() {
+            let code = unsafe { rdkafka::bindings::rd_kafka_error_code(error) };
+            unsafe { rdkafka::bindings::rd_kafka_error_destroy(error) };
+            return Err(format!("Kafka SASL credential update failed ({code:?})"));
+        }
+        self.secret_version = version;
+        self.secret_rotations_applied += 1;
+        Ok(true)
     }
 
     pub fn secret_rotations_applied(&self) -> u64 {
@@ -711,7 +799,6 @@ impl SourceConnector for KafkaSource {
         credits_available: usize,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
-        self.apply_secret_token_at_epoch();
         self.last_poll_fill_level = usize::from(self.pending_record.is_some());
         if self.paused || credits_available == 0 || max_bytes == 0 {
             return Ok(PollDeltaResult {
@@ -820,7 +907,6 @@ impl SourceConnector for KafkaSource {
         epoch: Epoch,
         offset: OffsetToken,
     ) -> Result<(), SourceError> {
-        self.apply_secret_token_at_epoch();
         let offsets: BTreeMap<u64, u64> =
             serde_json::from_slice(offset.as_bytes()).map_err(|e| {
                 SourceError::CommitOffsetFailed {

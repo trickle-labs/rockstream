@@ -16,9 +16,13 @@ The gateway pgoutput source checks the durable secret version before a source
 transaction and after its committed epoch. If it changes during the transaction,
 the worker commits the complete result and slot checkpoint, then opens a new
 upstream connection with the authorized replacement while keeping the source
-worker alive. Kafka source/sink rotation remains unqualified; the experimental
-sink is not configured by SQL `CREATE SINK` and has no supported full-Core
-qualification route.
+worker alive. A Kafka source uses an explicit SASL transport and PLAIN credentials;
+at the next committed epoch it updates librdkafka's credentials without replacing
+the consumer. Existing broker connections keep their current authentication until
+they authenticate again. Kafka source rotation still needs release-process
+qualification across views and partitions. Kafka sink rotation remains
+unqualified; the experimental sink is not configured by SQL `CREATE SINK` and
+has no supported full-Core qualification route.
 
 RockStream supports exactly three external connector boundaries: PostgreSQL
 CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,
@@ -121,6 +125,7 @@ Apache Kafka 2.8+ or Redpanda 23+ cluster with topic partitions and consumer gro
 - `enable.auto.commit = false` (RockStream strictly commits offsets via durable SlateDB epochs)
 - `auto.offset.reset = earliest` (or `latest`)
 - Multiple partitions supported with dynamic group rebalance
+- For a `sasl_plain` secret, set `security_protocol` to `SASL_SSL` or `SASL_PLAINTEXT`; prefer `SASL_SSL` to protect credentials in transit.
 
 ### Canonical Source DDL Contract
 
@@ -131,6 +136,8 @@ CREATE SOURCE events_source TYPE kafka (
     endpoint = 'kafka:9092',
     topic = 'events',
     group_id = 'rockstream_group',
+    security_protocol = 'SASL_SSL',
+    secret = 'kafka_auth',
     offset_policy = 'earliest',
     schema_policy = 'strict',
     poll_max_records = 1000,
