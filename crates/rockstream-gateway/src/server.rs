@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1201,6 +1201,8 @@ const FALLBACK_QUERY_MAX_ROWS: usize = 10_000;
 const FALLBACK_QUERY_MAX_ARRAY_BYTES: usize = 8 * 1024 * 1024;
 const FALLBACK_QUERY_MAX_WALL_MS: u64 = 5_000;
 const FALLBACK_QUERY_MAX_CONCURRENT: usize = 16;
+// Refresh external policy well inside the frozen 60-second revocation bound.
+const SECURITY_POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 static FALLBACK_QUERY_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(FALLBACK_QUERY_MAX_CONCURRENT);
 static NEXT_DISTRIBUTED_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -2133,6 +2135,8 @@ pub struct GatewayHandler {
     query_time_shard_topology_provider: Option<Arc<QueryTimeShardTopologyProvider>>,
     /// Authentication mode for this gateway instance.
     auth_mode: AuthMode,
+    /// Throttles full durable-catalog refreshes while keeping revocation bounded.
+    security_policy_refreshed_at: tokio::sync::Mutex<Option<Instant>>,
     /// Configured RS256 verifier for OIDC-authenticated public connections.
     oidc_verifier: Option<Arc<crate::auth::OidcVerifier>>,
     /// Legacy RoleCatalog for MD5 compatibility; SCRAM credentials come from durable principals.
@@ -2596,6 +2600,24 @@ impl GatewayHandler {
         }
     }
 
+    async fn refresh_security_policy_if_stale(
+        &self,
+        store: &rockstream_storage::catalog::DurableCatalogStore,
+    ) -> Result<(), String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let mut refreshed_at = self.security_policy_refreshed_at.lock().await;
+        if refreshed_at.is_none_or(|instant| instant.elapsed() >= SECURITY_POLICY_REFRESH_INTERVAL)
+        {
+            store
+                .refresh()
+                .await
+                .map_err(|_| "durable security catalog is unavailable".to_string())?;
+            *refreshed_at = Some(Instant::now());
+        }
+        Ok(())
+    }
+
     async fn security_principal_for_login(
         &self,
         authenticated: &Principal,
@@ -2606,6 +2628,8 @@ impl GatewayHandler {
             .catalog
             .get_durable_store()
             .ok_or_else(|| "durable security catalog is unavailable".to_string())?;
+        self.refresh_security_policy_if_stale(store.as_ref())
+            .await?;
         let principals = store
             .list_security_principals()
             .await
@@ -3172,6 +3196,10 @@ impl GatewayHandler {
         };
         let operation_id = rand::random::<u64>().max(1);
         for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            store
+                .refresh()
+                .await
+                .map_err(|_| "durable security audit store is unavailable".to_string())?;
             let revision = store
                 .get_revision()
                 .await
@@ -3385,6 +3413,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
@@ -3436,6 +3465,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
@@ -22419,6 +22449,216 @@ mod s4_tests {
         let catalog = Arc::new(CatalogStubs::new());
         let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
         Arc::new(GatewayHandler::new(catalog, reader))
+    }
+
+    #[tokio::test]
+    async fn durable_policy_refresh_and_denial_append_observe_other_catalog_writers() {
+        use rockstream_storage::catalog::{
+            CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
+        };
+        use rockstream_types::authorization::{
+            AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset,
+            PolicyScope, ScopedPresetGrant, SecurityAction, SecurityAuditClass,
+            SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
+            SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
+        };
+        use rockstream_types::ids::PrincipalId;
+
+        let object_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "gateway-policy-refresh";
+        let writer = Arc::new(DurableCatalogStore::new(object_store.clone(), prefix));
+        let principal = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(1),
+            display_name: "Audit administrator".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::Oidc {
+                issuer: "https://issuer.example".to_string(),
+                subject: "admin".to_string(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![],
+        };
+        writer
+            .preprovision_first_administrator(principal.clone(), 1)
+            .await
+            .unwrap();
+        let reader = Arc::new(
+            DurableCatalogStore::recover(object_store.clone(), prefix)
+                .await
+                .unwrap(),
+        );
+        let stale_appender = Arc::new(
+            DurableCatalogStore::recover(object_store, prefix)
+                .await
+                .unwrap(),
+        );
+        let reader_catalog = Arc::new(CatalogStubs::new());
+        reader_catalog.set_durable_store(reader.clone());
+        let reader_handler = GatewayHandler::new(
+            reader_catalog,
+            Arc::new(NoopViewReader) as Arc<dyn ViewReader>,
+        );
+        let previous_identity = Principal::Oidc {
+            issuer: "https://issuer.example".to_string(),
+            sub: "admin".to_string(),
+        };
+        assert_eq!(
+            reader_handler
+                .security_principal_for_login(&previous_identity)
+                .await
+                .unwrap(),
+            Some(principal.clone())
+        );
+        let append_catalog = Arc::new(CatalogStubs::new());
+        append_catalog.set_durable_store(stale_appender.clone());
+        let append_handler = GatewayHandler::new(
+            append_catalog,
+            Arc::new(NoopViewReader) as Arc<dyn ViewReader>,
+        );
+
+        let audit_state = |principal: &SecurityPrincipal| {
+            let policy = serde_json::to_string(&(
+                principal.enabled,
+                &principal.preset_grants,
+                &principal.scoped_grants,
+            ))
+            .unwrap();
+            format!("revision={};policy={policy}", principal.revision)
+        };
+        let grant_audit = |event_id: &str,
+                           operation_id: &str,
+                           actor_id: u64,
+                           target: &SecurityPrincipal,
+                           before: Option<&SecurityPrincipal>| {
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: event_id.to_string(),
+                timestamp_ms: chrono::Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{actor_id}")),
+                target: AuditField::Known(format!("principal:{}", target.id.0)),
+                scope: AuditField::Known("cluster".to_string()),
+                action: SecurityAuditClass::GrantChange,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_string()),
+                operation_id: AuditField::Known(operation_id.to_string()),
+                policy_revision: AuditField::Known(target.revision),
+                before_state: before.map_or(AuditField::NotApplicable, |before| {
+                    AuditField::Known(audit_state(before))
+                }),
+                after_state: AuditField::Known(audit_state(target)),
+            }
+        };
+        let second_admin = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(2),
+            display_name: "Second administrator".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::Oidc {
+                issuer: "https://issuer.example".to_string(),
+                subject: "second-admin".to_string(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![],
+        };
+        writer
+            .commit_txn(
+                CatalogTxn::new(
+                    2,
+                    2,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: second_admin.clone(),
+                        expected_revision: None,
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit: grant_audit("gateway-test-add-admin", "2", 1, &second_admin, None),
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut operator = principal.clone();
+        operator.revision = 2;
+        operator.preset_grants = vec![ScopedPresetGrant {
+            preset: PermissionPreset::Operator,
+            scope: PolicyScope::Cluster,
+        }];
+        writer
+            .commit_txn(
+                CatalogTxn::new(
+                    3,
+                    3,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: operator.clone(),
+                        expected_revision: Some(1),
+                        grantor_revision: Some((PrincipalId(2), 1)),
+                        audit: grant_audit(
+                            "gateway-test-revoke-audit",
+                            "3",
+                            2,
+                            &operator,
+                            Some(&principal),
+                        ),
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        *reader_handler.security_policy_refreshed_at.lock().await = Some(
+            Instant::now()
+                .checked_sub(SECURITY_POLICY_REFRESH_INTERVAL + Duration::from_secs(1))
+                .unwrap(),
+        );
+        let refreshed = reader_handler
+            .security_principal_for_login(&previous_identity)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed, operator);
+        assert!(!rockstream_control::authorization::allows(
+            &refreshed,
+            SecurityAction::SecurityAuditRead,
+            &PolicyScope::AuditRange {
+                from_ms: None,
+                to_ms: None,
+            },
+        ));
+
+        append_handler
+            .append_authorization_denial(None, None, None, None, None)
+            .await
+            .unwrap();
+        stale_appender.refresh().await.unwrap();
+
+        let records = stale_appender.list_security_audit_records().await.unwrap();
+        assert_eq!(records.len(), 4);
+        let denial = records
+            .iter()
+            .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+            .unwrap();
+        assert!(denial.event_id.starts_with("gateway-authz-"));
+        assert!(denial.timestamp_ms > 0);
+        assert_eq!(denial.actor, AuditIdentity::Unknown);
+        assert_eq!(denial.target, AuditField::Unknown);
+        assert_eq!(denial.scope, AuditField::Unknown);
+        assert_eq!(denial.outcome, SecurityAuditOutcome::Denied);
+        assert_eq!(denial.correlation, AuditCorrelation::Unknown);
+        assert_eq!(denial.operation_id, AuditField::NotApplicable);
+        assert_eq!(denial.policy_revision, AuditField::Unknown);
+        assert_eq!(denial.before_state, AuditField::NotApplicable);
+        assert_eq!(denial.after_state, AuditField::NotApplicable);
     }
 
     async fn make_handler_with_admin() -> (Arc<GatewayHandler>, String) {
