@@ -113,10 +113,11 @@ enabled SCRAM login; startup rejects an unavailable or empty store. MD5 is not
 a release authentication mode. Enabling these startup paths does not satisfy
 the v0.73 ten-case release qualification gate by itself.
 
-Gateway authorization refreshes durable policy from other processes at most
-every 30 seconds, within the v0.73 60-second revocation maximum. Policy updates
-committed through the same catalog instance apply immediately. A failed policy
-refresh fails protected authorization closed.
+Gateway authorization reads current in-process policy for new operations and
+refreshes durable policy from other processes at most every 30 seconds, within
+the v0.73 60-second revocation maximum. Active subscriptions recheck before
+delivering rows at the same interval; a revoked subscription stops after the
+recheck. A failed policy refresh fails protected authorization closed.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 
