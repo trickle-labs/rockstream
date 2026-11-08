@@ -4989,6 +4989,7 @@ dependencies = [
  "libc",
  "object_store 0.14.2",
  "rcgen",
+ "rdkafka",
  "rockstream-connectors",
  "rockstream-control",
  "rockstream-docgen",

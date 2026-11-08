@@ -764,7 +764,32 @@ impl SourceConnector for KafkaSource {
         &mut self,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotDeltaFence, SourceError> {
-        let assigned = self.refresh_assignment()?;
+        let mut assigned = self.refresh_assignment()?;
+        let mut polled_for_assignment = false;
+        if assigned.is_empty() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while assigned.is_empty() && tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(self.idle_partition_timeout, self.consumer.recv()).await
+                {
+                    Ok(Ok(_)) => polled_for_assignment = true,
+                    Err(_) => {}
+                    Ok(Err(error)) => {
+                        return Err(SourceError::PollDeltaFailed {
+                            reason: format!(
+                                "Kafka group assignment poll failed: {error}. Next steps: retry source startup after verifying broker connectivity"
+                            ),
+                        });
+                    }
+                }
+                assigned = self.refresh_assignment()?;
+            }
+            if assigned.is_empty() {
+                return Err(SourceError::PollDeltaFailed {
+                    reason: "Kafka consumer has no assigned partitions while capturing its initial offset fence"
+                        .to_string(),
+                });
+            }
+        }
         let offsets = self
             .last_polled
             .clone()
@@ -780,6 +805,11 @@ impl SourceConnector for KafkaSource {
                 .map(OffsetToken::new)
                 .map_err(|error| SourceError::Io(format!("Kafka fence encoding failed: {error}")))
             })?;
+        if polled_for_assignment {
+            self.last_polled = None;
+            self.seek_recovery_offset(&offsets, &assigned)?;
+            self.last_polled = Some(offsets.clone());
+        }
         Ok(SnapshotDeltaFence::new(offsets.clone(), offsets))
     }
 

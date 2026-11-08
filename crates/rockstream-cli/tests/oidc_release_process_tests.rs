@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{BufReader, Read},
     path::Path,
     process::{Child, Command, Stdio},
@@ -6,6 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rdkafka::{
+    admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
+    config::ClientConfig,
+    producer::{FutureProducer, FutureRecord},
+};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_storage::catalog::{
     CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn,
@@ -21,9 +27,10 @@ use rockstream_types::{
     ids::{DatabaseId, NamespaceId, PrincipalId, ShardId, WorkerId},
 };
 use sha2::Digest;
-use testcontainers::core::{ContainerPort, WaitFor};
+use testcontainers::core::{ContainerPort, ExecCommand, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::{ContainerAsync, GenericImage, Image, ImageExt};
+use testcontainers_modules::kafka::apache;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -537,6 +544,142 @@ fn simple_query_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Vec
             _ => None,
         })
         .collect()
+}
+
+async fn wait_for_exact_query_rows(
+    broker: &ContainerAsync<apache::Kafka>,
+    client: &tokio_postgres::Client,
+    process: &mut Child,
+    query: &str,
+    expected: &[Vec<Option<String>>],
+    deadline: Instant,
+    label: &str,
+) {
+    loop {
+        let observed = client.simple_query(query).await.ok().map(|messages| {
+            let mut rows = simple_query_rows(&messages);
+            rows.sort();
+            rows
+        });
+        if observed
+            .as_ref()
+            .is_some_and(|rows| rows.as_slice() == expected)
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let sources = client
+                .simple_query("SHOW SOURCES")
+                .await
+                .ok()
+                .map(|messages| simple_query_rows(&messages));
+            let source_rows = client
+                .simple_query("SELECT * FROM rotating_orders")
+                .await
+                .ok()
+                .map(|messages| simple_query_rows(&messages));
+            let backfill = client
+                .simple_query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW rotating_a")
+                .await
+                .ok()
+                .map(|messages| simple_query_rows(&messages));
+            let mut view_diagnostics = Vec::new();
+            for view in ["rotating_a", "rotating_b", "steady_rows"] {
+                let rows = client
+                    .simple_query(&format!("SELECT * FROM {view}"))
+                    .await
+                    .ok()
+                    .map(|messages| simple_query_rows(&messages));
+                let status = client
+                    .simple_query(&format!(
+                        "SHOW BACKFILL STATUS FOR MATERIALIZED VIEW {view}"
+                    ))
+                    .await
+                    .ok()
+                    .map(|messages| simple_query_rows(&messages));
+                view_diagnostics.push((view, rows, status));
+            }
+            let consumer_lags =
+                kafka_source_group_lags(broker, "rotating-orders", "rotation-group-").await;
+            let _ = process.kill();
+            let _ = process.wait();
+            let mut stderr = String::new();
+            if let Some(stderr_pipe) = process.stderr.as_mut() {
+                let _ = stderr_pipe.read_to_string(&mut stderr);
+            }
+            panic!("{label}: expected {expected:?}, observed {observed:?}; sources={sources:?}; source_rows={source_rows:?}; backfill={backfill:?}; view_diagnostics={view_diagnostics:?}; consumer_lags={consumer_lags:?}; stderr={stderr}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn kafka_source_rows(
+    producer: &FutureProducer,
+    topic: &str,
+    rows: &[(i64, Option<i64>, i32)],
+) {
+    let mut deliveries = Vec::with_capacity(rows.len());
+    for (id, amount, partition) in rows {
+        let payload = serde_json::json!({
+            "timestamp": id,
+            "values": [id, amount],
+            "weight": 1,
+        })
+        .to_string();
+        deliveries.push(
+            producer
+                .send_result(
+                    FutureRecord::<(), _>::to(topic)
+                        .partition(*partition)
+                        .payload(&payload),
+                )
+                .unwrap(),
+        );
+    }
+    for delivery in deliveries {
+        delivery.await.unwrap().unwrap();
+    }
+}
+
+async fn kafka_source_group_lags<I: Image>(
+    broker: &ContainerAsync<I>,
+    topic: &str,
+    group_prefix: &str,
+) -> BTreeMap<String, u64> {
+    let mut command = broker
+        .exec(ExecCommand::new([
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "--bootstrap-server",
+            "localhost:9093",
+            "--describe",
+            "--all-groups",
+        ]))
+        .await
+        .unwrap();
+    let output = String::from_utf8(command.stdout_to_vec().await.unwrap()).unwrap();
+    assert_eq!(command.exit_code().await.unwrap(), Some(0), "{output}");
+    let mut lags = BTreeMap::new();
+    for line in output.lines() {
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() < 6 || !columns[0].starts_with(group_prefix) || columns[1] != topic {
+            continue;
+        }
+        if let Ok(lag) = columns[5].parse::<u64>() {
+            *lags.entry(columns[0].to_string()).or_default() += lag;
+        }
+    }
+    lags
+}
+
+fn kafka_sasl_client(bootstrap: &str, username: &str, password: &str) -> ClientConfig {
+    let mut config = ClientConfig::new();
+    config
+        .set("bootstrap.servers", bootstrap)
+        .set("security.protocol", "SASL_PLAINTEXT")
+        .set("sasl.mechanisms", "PLAIN")
+        .set("sasl.username", username)
+        .set("sasl.password", password);
+    config
 }
 
 #[tokio::test]
@@ -1592,6 +1735,408 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         rotation_audit.after_state,
         AuditField::Known("version=2".to_string())
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "blocked: this Kafka fixture cannot revoke SASL/PLAIN users through dynamic broker config; do not count as release proof"]
+async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    assert!(
+        rockstream_test_support::docker_available(),
+        "Docker is required for the Kafka secret-rotation release proof"
+    );
+    let initial_jaas = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotating=\"old-pass\" user_steady=\"steady-pass\";";
+    let broker = apache::Kafka::default()
+        .with_jvm_image()
+        .with_env_var(
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+            "PLAINTEXT:SASL_PLAINTEXT,BROKER:PLAINTEXT,CONTROLLER:PLAINTEXT",
+        )
+        .with_env_var("KAFKA_SASL_ENABLED_MECHANISMS", "PLAIN")
+        .with_env_var(
+            "KAFKA_LISTENER_NAME_PLAINTEXT_PLAIN_SASL_JAAS_CONFIG",
+            initial_jaas,
+        )
+        .with_env_var(
+            "KAFKA_LISTENER_NAME_PLAINTEXT_CONNECTIONS_MAX_REAUTH_MS",
+            "2000",
+        )
+        .with_env_var(
+            "KAFKA_PASSWORD_ENCODER_SECRET",
+            "release-test-password-encoder",
+        )
+        .start()
+        .await
+        .unwrap();
+    let bootstrap = format!(
+        "127.0.0.1:{}",
+        broker.get_host_port_ipv4(apache::KAFKA_PORT).await.unwrap()
+    );
+    let admin: AdminClient<_> = kafka_sasl_client(&bootstrap, "admin", "admin-pass")
+        .create()
+        .unwrap();
+    let created_topics = admin
+        .create_topics(
+            &[
+                NewTopic::new("rotating-orders", 3, TopicReplication::Fixed(1)),
+                NewTopic::new("steady-orders", 1, TopicReplication::Fixed(1)),
+            ],
+            &AdminOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created_topics,
+        [
+            Ok("rotating-orders".to_string()),
+            Ok("steady-orders".to_string())
+        ]
+    );
+    let producer: FutureProducer = kafka_sasl_client(&bootstrap, "admin", "admin-pass")
+        .create()
+        .unwrap();
+    let initial_rotating = [(1, Some(10), 0), (1, Some(10), 1), (2, None, 2)];
+    let initial_steady = [(10, Some(100), 0)];
+    kafka_source_rows(&producer, "rotating-orders", &initial_rotating).await;
+    kafka_source_rows(&producer, "steady-orders", &initial_steady).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("node-storage");
+    let shard_dir = storage.join("gateway-shard");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+    let mut principal = scram_principal();
+    principal.preset_grants.push(ScopedPresetGrant {
+        preset: PermissionPreset::Builder,
+        scope: PolicyScope::Namespace {
+            namespace: "public".to_string(),
+        },
+    });
+    for name in ["kafka_auth", "steady_auth"] {
+        principal.scoped_grants.push(ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: PolicyScope::Secret {
+                namespace: "public".to_string(),
+                name: name.to_string(),
+                consumer: Some(PrincipalId(1)),
+            },
+        });
+    }
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let durable = DurableCatalogStore::new(store.clone(), "gateway");
+    durable
+        .preprovision_first_administrator(principal, 1)
+        .await
+        .unwrap();
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![
+                    CatalogMutation::PutDatabase(CatalogDatabase {
+                        id: DatabaseId(1),
+                        name: "default".to_string(),
+                        default_namespace: "public".to_string(),
+                        created_at: 1,
+                    }),
+                    CatalogMutation::PutNamespace(CatalogNamespace {
+                        id: NamespaceId(1),
+                        name: "public".to_string(),
+                        database_id: DatabaseId(1),
+                        created_at: 1,
+                    }),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let tls_cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .self_signed(&tls_key)
+        .unwrap();
+    let cert_path = temp.path().join("gateway.pem");
+    let key_path = temp.path().join("gateway-key.pem");
+    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
+    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    let process_id = process.0.id();
+    wait_for_gateway(&mut process.0, address).await;
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection_task = tokio::spawn(connection);
+    for sql in [
+        "CREATE SECRET kafka_auth (TYPE = 'sasl_plain', USERNAME = 'rotating', PASSWORD = 'old-pass')",
+        "CREATE SECRET steady_auth (TYPE = 'sasl_plain', USERNAME = 'steady', PASSWORD = 'steady-pass')",
+        "CREATE TABLE rotating_orders (id BIGINT, amount BIGINT)",
+        "CREATE TABLE steady_orders (id BIGINT, amount BIGINT)",
+        &format!("CREATE SOURCE rotating_orders TYPE kafka (bootstrap.servers='{bootstrap}', topic='rotating-orders', group.id='rotation-group', security.protocol='SASL_PLAINTEXT', secret='kafka_auth') FORMAT json"),
+        &format!("CREATE SOURCE steady_orders TYPE kafka (bootstrap.servers='{bootstrap}', topic='steady-orders', group.id='steady-group', security.protocol='SASL_PLAINTEXT', secret='steady_auth') FORMAT json"),
+        "CREATE MATERIALIZED VIEW rotating_a AS SELECT id, amount FROM rotating_orders",
+        "CREATE MATERIALIZED VIEW rotating_b AS SELECT id, amount FROM rotating_orders",
+        "CREATE MATERIALIZED VIEW steady_rows AS SELECT id, amount FROM steady_orders",
+    ] {
+        client.simple_query(sql).await.unwrap();
+    }
+
+    let row = |id: i64, amount: Option<i64>| {
+        vec![Some(id.to_string()), amount.map(|value| value.to_string())]
+    };
+    let mut expected_rotating = initial_rotating
+        .iter()
+        .map(|(id, amount, _)| row(*id, *amount))
+        .collect::<Vec<_>>();
+    expected_rotating.sort();
+    let mut expected_steady = initial_steady
+        .iter()
+        .map(|(id, amount, _)| row(*id, *amount))
+        .collect::<Vec<_>>();
+    expected_steady.sort();
+    let initial_deadline = Instant::now() + Duration::from_secs(30);
+    for view in ["rotating_a", "rotating_b"] {
+        wait_for_exact_query_rows(
+            &broker,
+            &client,
+            &mut process.0,
+            &format!("SELECT * FROM {view}"),
+            &expected_rotating,
+            initial_deadline,
+            "initial Kafka materialized view backfill",
+        )
+        .await;
+    }
+    wait_for_exact_query_rows(
+        &broker,
+        &client,
+        &mut process.0,
+        "SELECT * FROM steady_rows",
+        &expected_steady,
+        initial_deadline,
+        "initial unaffected Kafka consumer backfill",
+    )
+    .await;
+
+    let pending_rows = (1000..11_000)
+        .map(|id| (id, (id % 7 != 0).then_some(id * 10), (id % 3) as i32))
+        .collect::<Vec<_>>();
+    kafka_source_rows(&producer, "rotating-orders", &pending_rows).await;
+    expected_rotating.extend(pending_rows.iter().map(|(id, amount, _)| row(*id, *amount)));
+    expected_rotating.sort();
+    let pending_lags = kafka_source_group_lags(&broker, "rotating-orders", "rotation-group-").await;
+    assert_eq!(pending_lags.len(), 2, "expected one Kafka group per view");
+    assert!(
+        pending_lags.values().all(|lag| *lag > 0),
+        "rotation began without pending work in each view: {pending_lags:?}"
+    );
+
+    let rotation_operation_id = "00000000-0000-4000-8000-000000000304";
+    client
+        .simple_query(&format!(
+            "SET rockstream.idempotency_key = '{rotation_operation_id}'"
+        ))
+        .await
+        .unwrap();
+    let updated_jaas = "listener.name.plaintext.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotated=\"new-pass\" user_steady=\"steady-pass\";";
+    let write_config_script =
+        format!("printf '%s\\n' '{updated_jaas}' > /tmp/rockstream-kafka-rotation.properties");
+    let mut write_config = broker
+        .exec(ExecCommand::new([
+            "/bin/sh",
+            "-c",
+            write_config_script.as_str(),
+        ]))
+        .await
+        .unwrap();
+    let write_stdout = String::from_utf8(write_config.stdout_to_vec().await.unwrap()).unwrap();
+    let write_stderr = String::from_utf8(write_config.stderr_to_vec().await.unwrap()).unwrap();
+    assert_eq!(
+        write_config.exit_code().await.unwrap(),
+        Some(0),
+        "stdout={write_stdout}; stderr={write_stderr}"
+    );
+    let mut update = broker
+        .exec(ExecCommand::new([
+            "/opt/kafka/bin/kafka-configs.sh",
+            "--bootstrap-server",
+            "localhost:9093",
+            "--entity-type",
+            "brokers",
+            "--entity-name",
+            "1",
+            "--alter",
+            "--add-config-file",
+            "/tmp/rockstream-kafka-rotation.properties",
+        ]))
+        .await
+        .unwrap();
+    let update_output = String::from_utf8(update.stdout_to_vec().await.unwrap()).unwrap();
+    let update_stderr = String::from_utf8(update.stderr_to_vec().await.unwrap()).unwrap();
+    assert_eq!(
+        update.exit_code().await.unwrap(),
+        Some(0),
+        "stdout={update_output}; stderr={update_stderr}"
+    );
+    assert_eq!(update_output, "Completed updating config for broker 1.\n");
+    let rotation = client
+        .simple_query("ALTER SECRET kafka_auth SET (USERNAME = 'rotated', PASSWORD = 'new-pass')")
+        .await
+        .unwrap();
+    assert!(matches!(
+        rotation.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+    ));
+    let drain_deadline = Instant::now() + Duration::from_secs(90);
+    for view in ["rotating_a", "rotating_b"] {
+        wait_for_exact_query_rows(
+            &broker,
+            &client,
+            &mut process.0,
+            &format!("SELECT * FROM {view}"),
+            &expected_rotating,
+            drain_deadline,
+            "pending Kafka records across secret rotation",
+        )
+        .await;
+    }
+
+    let rotated_producer: FutureProducer = kafka_sasl_client(&bootstrap, "rotated", "new-pass")
+        .create()
+        .unwrap();
+    let after_rotation = [(50_000, None, 1)];
+    kafka_source_rows(&rotated_producer, "rotating-orders", &after_rotation).await;
+    expected_rotating.push(row(50_000, None));
+    expected_rotating.sort();
+
+    let rejected_old_credentials = kafka_sasl_client(&bootstrap, "rotating", "old-pass")
+        .create::<FutureProducer>()
+        .unwrap()
+        .send(
+            FutureRecord::<(), _>::to("rotating-orders").payload("invalid old credential probe"),
+            Duration::from_secs(10),
+        )
+        .await;
+    assert!(
+        rejected_old_credentials.is_err(),
+        "Kafka continued to accept the rotated credential"
+    );
+    kafka_source_rows(&producer, "steady-orders", &[(50_001, Some(500_010), 0)]).await;
+    expected_steady.push(row(50_001, Some(500_010)));
+    expected_steady.sort();
+
+    let final_deadline = Instant::now() + Duration::from_secs(90);
+    for view in ["rotating_a", "rotating_b"] {
+        wait_for_exact_query_rows(
+            &broker,
+            &client,
+            &mut process.0,
+            &format!("SELECT * FROM {view}"),
+            &expected_rotating,
+            final_deadline,
+            "Kafka source after broker credential revocation",
+        )
+        .await;
+    }
+    wait_for_exact_query_rows(
+        &broker,
+        &client,
+        &mut process.0,
+        "SELECT * FROM steady_rows",
+        &expected_steady,
+        final_deadline,
+        "unaffected Kafka consumer after credential rotation",
+    )
+    .await;
+    assert!(process.0.try_wait().unwrap().is_none());
+    assert_eq!(process.0.id(), process_id);
+
+    connection_task.abort();
+    drop(client);
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    drop(process);
+    let mut recovered = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut recovered.0, address).await;
+    let (recovered_client, recovered_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let recovered_connection_task = tokio::spawn(recovered_connection);
+    let recovery_deadline = Instant::now() + Duration::from_secs(90);
+    for view in ["rotating_a", "rotating_b"] {
+        wait_for_exact_query_rows(
+            &broker,
+            &recovered_client,
+            &mut recovered.0,
+            &format!("SELECT * FROM {view}"),
+            &expected_rotating,
+            recovery_deadline,
+            "Kafka view after gateway restart",
+        )
+        .await;
+    }
+    wait_for_exact_query_rows(
+        &broker,
+        &recovered_client,
+        &mut recovered.0,
+        "SELECT * FROM steady_rows",
+        &expected_steady,
+        recovery_deadline,
+        "unaffected Kafka consumer after gateway restart",
+    )
+    .await;
+    let audit = FileAuditLog::open(&storage.join("audit.jsonl"))
+        .unwrap()
+        .read_all()
+        .unwrap();
+    let audit_json = serde_json::to_string(&audit).unwrap();
+    assert!(!audit_json.is_empty());
+    for value in ["old-pass", "new-pass", "steady-pass"] {
+        assert!(
+            !audit_json.contains(value),
+            "secret value leaked into audit"
+        );
+    }
+    recovered_connection_task.abort();
+    recovered.0.kill().unwrap();
+    recovered.0.wait().unwrap();
 }
 
 #[tokio::test]
