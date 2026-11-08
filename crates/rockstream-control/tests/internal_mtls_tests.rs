@@ -394,7 +394,7 @@ async fn internal_mtls_requires_security_audit_catalog() {
 async fn gateway_data_plane_requires_actor_assertion_and_audits_wrong_role() {
     let pki = TestPki::generate();
     let audit_dir = tempfile::tempdir().unwrap();
-    let audit = Arc::new(FileAuditLog::open(&audit_dir.path().join("audit.jsonl")).unwrap());
+    let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
     let security_catalog = security_audit_catalog();
     let service = ControlService::new(TopologyCatalog::new())
         .with_audit(audit)
