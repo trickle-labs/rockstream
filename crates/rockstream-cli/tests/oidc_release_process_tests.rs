@@ -53,6 +53,56 @@ fn free_port() -> u16 {
         .port()
 }
 
+async fn drop_command_complete_response(
+    upstream: std::net::SocketAddr,
+    command_tag: &'static [u8],
+) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (dropped, dropped_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut server_read, mut server_write) = server.into_split();
+        let client_to_server = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+            let _ = server_write.shutdown().await;
+        });
+        let mut dropped = Some(dropped);
+        loop {
+            let mut header = [0; 5];
+            if server_read.read_exact(&mut header).await.is_err() {
+                break;
+            }
+            let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+            if length < 4 {
+                break;
+            }
+            let mut payload = vec![0; length - 4];
+            if server_read.read_exact(&mut payload).await.is_err() {
+                break;
+            }
+            if header[0] == b'C' && payload.starts_with(command_tag) {
+                if let Some(dropped) = dropped.take() {
+                    let _ = dropped.send(());
+                }
+                let _ = client_write.shutdown().await;
+                client_to_server.abort();
+                return;
+            }
+            if client_write.write_all(&header).await.is_err()
+                || client_write.write_all(&payload).await.is_err()
+            {
+                break;
+            }
+        }
+        let _ = client_write.shutdown().await;
+        client_to_server.abort();
+    });
+    (address, dropped_rx)
+}
+
 async fn serve_jwks(listener: TcpListener, requests: usize) {
     let mut jwks: serde_json::Value = serde_json::from_str(TEST_JWKS).unwrap();
     jwks["keys"]
@@ -1268,22 +1318,41 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         missing_key.message(),
         "[RS-2007] write.idempotency_key_required: ALTER SECRET requires a client-supplied UUID in SET rockstream.idempotency_key. Next steps: set a new UUID before ALTER SECRET and reuse it for retries."
     );
+    let (proxy_address, dropped_response) =
+        drop_command_complete_response(address, b"ALTER SECRET").await;
+    let (rotation_client, rotation_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            proxy_address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let rotation_connection_task = tokio::spawn(rotation_connection);
+    rotation_client
+        .simple_query(&format!(
+            "SET rockstream.idempotency_key = '{rotation_operation_id}'"
+        ))
+        .await
+        .unwrap();
+    let lost_response = rotation_client
+        .simple_query(
+            "ALTER SECRET pg_auth SET (USERNAME = 'postgres', PASSWORD = 'rotated-fixture-value')",
+        )
+        .await
+        .unwrap_err();
+    assert!(lost_response.as_db_error().is_none());
+    dropped_response.await.unwrap();
+    drop(rotation_client);
+    rotation_connection_task.abort();
+    assert!(process.0.try_wait().unwrap().is_none());
     client
         .simple_query(&format!(
             "SET rockstream.idempotency_key = '{rotation_operation_id}'"
         ))
         .await
         .unwrap();
-    let rotation_result = client
-        .simple_query(
-            "ALTER SECRET pg_auth SET (USERNAME = 'postgres', PASSWORD = 'rotated-fixture-value')",
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        rotation_result.as_slice(),
-        [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
-    ));
     let changed_request = client
         .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'different-fixture-value')")
         .await
