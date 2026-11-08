@@ -92,6 +92,72 @@ async fn broker_free_fast_paths_preserve_offsets_and_reject_invalid_commits() {
     );
 }
 
+#[test]
+fn sasl_secret_rotation_updates_native_client_and_version_without_restart() {
+    let invalid_protocol_error = match KafkaSource::connect_with_sasl_plain(
+        ConnectorId(5129),
+        schema(),
+        "127.0.0.1:1",
+        "topic",
+        "group",
+        "PLAINTEXT",
+        "kafka_auth",
+        1,
+        "user",
+        "password",
+    ) {
+        Ok(_) => panic!("Kafka secret sources must reject implicit plaintext transport"),
+        Err(error) => error.to_string(),
+    };
+    let mut source = KafkaSource::connect_with_sasl_plain(
+        ConnectorId(5130),
+        schema(),
+        "127.0.0.1:1",
+        "topic",
+        "group",
+        "SASL_PLAINTEXT",
+        "kafka_auth",
+        1,
+        "initial-user",
+        "initial-password",
+    )
+    .unwrap();
+
+    assert!(!source
+        .rotate_sasl_plain_credentials("kafka_auth", 1, "initial-user", "initial-password")
+        .unwrap());
+    assert!(source
+        .rotate_sasl_plain_credentials("kafka_auth", 2, "next-user", "next-password")
+        .unwrap());
+    let stale_version_error = source
+        .rotate_sasl_plain_credentials("kafka_auth", 1, "stale-user", "stale-password")
+        .unwrap_err();
+    let wrong_binding_error = source
+        .rotate_sasl_plain_credentials("another_secret", 3, "user", "password")
+        .unwrap_err();
+
+    assert_eq!(
+        (
+            source.secret_binding(),
+            source.secret_rotations_applied(),
+            source.pipeline_restarts(),
+            source.failed_batches(),
+            stale_version_error,
+            wrong_binding_error,
+            invalid_protocol_error,
+        ),
+        (
+            (Some("kafka_auth"), 2),
+            1,
+            0,
+            0,
+            "Kafka source secret version moved backwards".to_string(),
+            "rotated secret does not match the Kafka source binding".to_string(),
+            "RS-4001: source I/O error: Kafka secret sources require security.protocol SASL_SSL or SASL_PLAINTEXT".to_string(),
+        )
+    );
+}
+
 #[tokio::test]
 async fn kafka_source_unreachable_broker_fails_closed() {
     let mut source =

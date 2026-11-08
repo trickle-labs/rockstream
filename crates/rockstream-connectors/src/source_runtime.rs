@@ -13,7 +13,7 @@ use crate::source_epoch::{
     BackfillLifecycle, CoupledBatchDescriptor, OffsetToken, SourceCheckpoint,
     SourceCheckpointStore, SourceEpochRegistry,
 };
-use crate::{PgOutputEvent, PostgresCdcSource};
+use crate::{KafkaSource, PgOutputEvent, PostgresCdcSource};
 
 /// Maximum epochs that may have durable input pending upstream acknowledgement.
 pub const SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS: usize = 64;
@@ -552,6 +552,30 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         self.blocked_reason = Some(reason.to_string());
         drop(self.source.pause(reason.to_string()));
         Err(SourceError::Io(reason.to_string()))
+    }
+}
+
+impl SourceRuntimeCoordinator<KafkaSource> {
+    pub fn kafka_secret_binding(
+        &self,
+        lease: &SourceOwnerLease,
+    ) -> Result<(Option<&str>, u64), SourceError> {
+        self.require_active_lease(lease)?;
+        Ok(self.source.secret_binding())
+    }
+
+    pub fn rotate_kafka_secret_at_epoch(
+        &mut self,
+        lease: &SourceOwnerLease,
+        secret_name: &str,
+        version: u64,
+        username: &str,
+        password: &str,
+    ) -> Result<bool, SourceError> {
+        self.require_active_lease(lease)?;
+        self.source
+            .rotate_sasl_plain_credentials(secret_name, version, username, password)
+            .map_err(SourceError::Io)
     }
 }
 
