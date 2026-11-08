@@ -2170,6 +2170,7 @@ fn stable_route(value: &str, shard_count: usize) -> usize {
     hash as usize % shard_count
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deploy_workload(
     request: DeploymentRequest,
     actor_principal_id: Option<PrincipalId>,
@@ -3121,6 +3122,7 @@ async fn append_gateway_delegation_audit(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reject_gateway_actor_assertion(
     sender: &mpsc::Sender<ControlMessage>,
     catalog: Option<&Arc<dyn CatalogStore>>,
@@ -3164,6 +3166,7 @@ async fn reject_gateway_actor_assertion(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn authorize_gateway_actor_assertion(
     sender: &mpsc::Sender<ControlMessage>,
     catalog: Option<&Arc<dyn CatalogStore>>,
