@@ -7,19 +7,22 @@ use crate::kek::{
 };
 use parking_lot::RwLock;
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
-use rockstream_types::authorization::SecurityAuditRecord;
+use rockstream_types::authorization::{AuditField, SecurityAuditRecord};
 use rockstream_types::error_code::{
     ErrorCode, RS_2420, RS_2421, RS_2422, RS_2423, RS_2424, RS_2425, RS_2426, RS_3601,
 };
 use rockstream_types::secret::{
     EncryptedSecret, Secret, SecretMetadata, SecretRotation, SecretToken, SecretType,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use slatedb::{Db, WriteBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock as AsyncRwLock};
+use uuid::Uuid;
 
 type SecretReferenceKey = (u128, String);
 type SecretReferences = HashMap<SecretReferenceKey, HashSet<String>>;
@@ -27,6 +30,8 @@ type SecretReferences = HashMap<SecretReferenceKey, HashSet<String>>;
 /// Prefix for secrets stored in the SlateDB catalog: `0x01 0x0B`.
 pub const CATALOG_SECRETS_PREFIX: [u8; 2] = [0x01, 0x0B];
 const SECURITY_AUDIT_OUTBOX_PREFIX: &[u8] = b"security-audit-outbox/";
+const SECRET_ROTATION_IDEMPOTENCY_PREFIX: &[u8] = b"secret-rotation-idempotency/";
+const SECRET_ROTATION_RECEIPT_VERSION: u16 = 1;
 
 /// Maximum number of secrets that can be stored per namespace.
 pub const MAX_SECRETS_PER_NAMESPACE: usize = 100_000;
@@ -213,6 +218,56 @@ pub fn secret_key(namespace_id: u128, name: &str) -> Vec<u8> {
 
 fn security_audit_outbox_key(event_id: &str) -> Vec<u8> {
     [SECURITY_AUDIT_OUTBOX_PREFIX, event_id.as_bytes()].concat()
+}
+
+fn secret_rotation_idempotency_key(operation_id: Uuid) -> Vec<u8> {
+    [SECRET_ROTATION_IDEMPOTENCY_PREFIX, operation_id.as_bytes()].concat()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecretRotationReceipt {
+    record_version: u16,
+    request_digest: String,
+    accepted_at_ms: i64,
+}
+
+fn secret_rotation_request_digest(
+    namespace_id: u128,
+    name: &str,
+    payload: &HashMap<String, String>,
+    audit: &SecurityAuditRecord,
+) -> Result<String, SecretStoreError> {
+    let actor = serde_json::to_vec(&audit.actor)
+        .map_err(|error| SecretStoreError::storage(format!("serialize audit actor: {error}")))?;
+    let target = serde_json::to_vec(&audit.target)
+        .map_err(|error| SecretStoreError::storage(format!("serialize audit target: {error}")))?;
+    let scope = serde_json::to_vec(&audit.scope)
+        .map_err(|error| SecretStoreError::storage(format!("serialize audit scope: {error}")))?;
+    let mut fields = payload
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    fields.sort_unstable_by_key(|(key, _)| *key);
+
+    let mut digest = Sha256::new();
+    digest.update(1u16.to_be_bytes());
+    digest.update(namespace_id.to_be_bytes());
+    for field in [
+        name.as_bytes(),
+        actor.as_slice(),
+        target.as_slice(),
+        scope.as_slice(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    for (key, value) in fields {
+        for field in [key.as_bytes(), value.as_bytes()] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 /// Construct the SlateDB prefix for all secrets in a namespace.
@@ -623,6 +678,8 @@ impl SecretStore {
         name: &str,
         encrypted: &EncryptedSecret,
         audit: &SecurityAuditRecord,
+        operation_id: Uuid,
+        receipt: &SecretRotationReceipt,
         rotation: OwnedRwLockReadGuard<()>,
     ) -> Result<(), SecretStoreError> {
         let db = self.db.clone().ok_or_else(|| {
@@ -633,11 +690,15 @@ impl SecretStore {
         let audit_bytes = serde_json::to_vec(audit).map_err(|error| {
             SecretStoreError::storage(format!("serialize audit record: {error}"))
         })?;
+        let receipt_bytes = serde_json::to_vec(receipt)
+            .map_err(|error| SecretStoreError::storage(format!("serialize receipt: {error}")))?;
         let secret_key = secret_key(namespace_id, name);
         let audit_key = security_audit_outbox_key(&audit.event_id);
+        let receipt_key = secret_rotation_idempotency_key(operation_id);
         let mut batch = WriteBatch::new();
         batch.put(&secret_key, &encrypted_bytes);
         batch.put(&audit_key, &audit_bytes);
+        batch.put(&receipt_key, &receipt_bytes);
 
         tokio::spawn(async move {
             let _rotation = rotation;
@@ -778,8 +839,15 @@ impl SecretStore {
         payload: HashMap<String, String>,
         actor: &str,
     ) -> Result<SecretMetadata, SecretStoreError> {
-        self.alter_secret_inner(namespace_id, name, payload, actor, None)
-            .await
+        match self
+            .alter_secret_inner(namespace_id, name, payload, actor, None, None)
+            .await?
+        {
+            Some(metadata) => Ok(metadata),
+            None => Err(SecretStoreError::storage(
+                "non-audited secret rotation unexpectedly replayed",
+            )),
+        }
     }
 
     /// Alter a secret and durably audit the rotation before acknowledging it.
@@ -789,10 +857,19 @@ impl SecretStore {
         name: &str,
         payload: HashMap<String, String>,
         actor: &str,
+        operation_id: Uuid,
         audit: SecurityAuditRecord,
-    ) -> Result<SecretMetadata, SecretStoreError> {
-        self.alter_secret_inner(namespace_id, name, payload, actor, Some(audit))
-            .await
+    ) -> Result<(), SecretStoreError> {
+        self.alter_secret_inner(
+            namespace_id,
+            name,
+            payload,
+            actor,
+            Some(audit),
+            Some(operation_id),
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn alter_secret_inner(
@@ -802,7 +879,8 @@ impl SecretStore {
         payload: HashMap<String, String>,
         actor: &str,
         mut audit: Option<SecurityAuditRecord>,
-    ) -> Result<SecretMetadata, SecretStoreError> {
+        operation_id: Option<Uuid>,
+    ) -> Result<Option<SecretMetadata>, SecretStoreError> {
         let _reference_lock = self.reference_mutation_lock.lock().await;
         let _audit_lock = self.security_audit_lock.lock().await;
         if self.security_audit_catalog.is_some() && audit.is_none() {
@@ -818,8 +896,66 @@ impl SecretStore {
             }
             self.flush_pending_security_audit_outbox_locked().await?;
         }
-        let rotation = self.rotation_lock.clone().read_owned().await;
         let trimmed_name = name.trim();
+        let mut rotation_receipt = None;
+        if let Some(record) = audit.as_ref() {
+            let operation_id = operation_id.ok_or_else(|| {
+                SecretStoreError::storage("secret rotation requires a client operation identity")
+            })?;
+            if record.operation_id != AuditField::Known(operation_id.to_string()) {
+                return Err(SecretStoreError::storage(
+                    "secret rotation audit operation identity does not match the request",
+                ));
+            }
+            let request_digest =
+                secret_rotation_request_digest(namespace_id, trimmed_name, &payload, record)?;
+            let db = self.db.as_ref().ok_or_else(|| {
+                SecretStoreError::storage("secret rotation audit requires durable secret storage")
+            })?;
+            let receipt_key = secret_rotation_idempotency_key(operation_id);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if let Some(bytes) = db
+                .get(&receipt_key)
+                .await
+                .map_err(|error| SecretStoreError::storage(error.to_string()))?
+            {
+                let receipt: SecretRotationReceipt =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        SecretStoreError::storage(format!("deserialize receipt: {error}"))
+                    })?;
+                if receipt.record_version != SECRET_ROTATION_RECEIPT_VERSION {
+                    return Err(SecretStoreError::storage(
+                        "unsupported secret rotation receipt version",
+                    ));
+                }
+                if receipt.accepted_at_ms
+                    < now_ms.saturating_sub(crate::management_store::IDEMPOTENCY_KEY_RETENTION_MS)
+                {
+                    return Err(SecretStoreError::ddl_invalid(
+                        "idempotency key has expired and cannot be reused. Next steps: use a new UUID for a new rotation.",
+                    ));
+                }
+                if receipt.request_digest != request_digest {
+                    return Err(SecretStoreError::ddl_invalid(
+                        "idempotency key is bound to a different secret rotation request. Next steps: retry the original request or use a new UUID.",
+                    ));
+                }
+                return Ok(None);
+            }
+            rotation_receipt = Some((
+                operation_id,
+                SecretRotationReceipt {
+                    record_version: SECRET_ROTATION_RECEIPT_VERSION,
+                    request_digest,
+                    accepted_at_ms: now_ms,
+                },
+            ));
+        } else if operation_id.is_some() {
+            return Err(SecretStoreError::storage(
+                "secret rotation operation identity requires a structured audit",
+            ));
+        }
+        let rotation = self.rotation_lock.clone().read_owned().await;
         let existing = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
             Some(e) => e,
             None => {
@@ -858,11 +994,18 @@ impl SecretStore {
             record.validate().map_err(|error| {
                 SecretStoreError::storage(format!("invalid rotation audit: {error:?}"))
             })?;
+            let Some((operation_id, receipt)) = rotation_receipt.as_ref() else {
+                return Err(SecretStoreError::storage(
+                    "secret rotation receipt is missing",
+                ));
+            };
             self.put_encrypted_raw_with_security_audit(
                 namespace_id,
                 trimmed_name,
                 &encrypted,
                 record,
+                *operation_id,
+                receipt,
                 rotation,
             )
             .await?;
@@ -885,7 +1028,7 @@ impl SecretStore {
         self.metrics.rotation_fill_level.store(1, Ordering::Relaxed);
         self.record_audit(actor, "secret.rotated", trimmed_name, None);
 
-        Ok(metadata)
+        Ok(Some(metadata))
     }
 
     /// Drop a secret from the store using point delete (zero range deletions).

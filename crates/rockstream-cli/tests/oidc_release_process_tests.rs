@@ -1257,10 +1257,43 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .simple_query("ALTER ROLE postgres PASSWORD 'rotated-fixture-value'")
         .await
         .unwrap();
-    client
+    let rotation_operation_id = "00000000-0000-4000-8000-000000000073";
+    let missing_key = client
         .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')")
         .await
+        .unwrap_err();
+    let missing_key = missing_key.as_db_error().unwrap();
+    assert_eq!(missing_key.code().code(), "XX000");
+    assert_eq!(
+        missing_key.message(),
+        "[RS-2007] write.idempotency_key_required: ALTER SECRET requires a client-supplied UUID in SET rockstream.idempotency_key. Next steps: set a new UUID before ALTER SECRET and reuse it for retries."
+    );
+    client
+        .simple_query(&format!(
+            "SET rockstream.idempotency_key = '{rotation_operation_id}'"
+        ))
+        .await
         .unwrap();
+    let rotation_result = client
+        .simple_query(
+            "ALTER SECRET pg_auth SET (USERNAME = 'postgres', PASSWORD = 'rotated-fixture-value')",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        rotation_result.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+    ));
+    let changed_request = client
+        .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'different-fixture-value')")
+        .await
+        .unwrap_err();
+    let changed_request = changed_request.as_db_error().unwrap();
+    assert_eq!(changed_request.code().code(), "42601");
+    assert_eq!(
+        changed_request.message(),
+        "[RS-2424] secret.ddl_invalid: idempotency key is bound to a different secret rotation request. Next steps: retry the original request or use a new UUID."
+    );
     upstream.batch_execute("COMMIT").await.unwrap();
     expected_rows.extend([row("3", Some("30")), row("3", Some("30")), row("4", None)]);
     expected_rows.sort();
@@ -1363,6 +1396,22 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
     let connection_task = tokio::spawn(connection);
     let after_restart = simple_query_rows(&client.simple_query("SHOW SECRETS").await.unwrap());
     assert_eq!(after_restart, before_restart);
+    client
+        .simple_query(&format!(
+            "SET rockstream.idempotency_key = '{rotation_operation_id}'"
+        ))
+        .await
+        .unwrap();
+    let replay_result = client
+        .simple_query(
+            "ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value', USERNAME = 'postgres')",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay_result.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+    ));
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let observed = match client.simple_query("SELECT * FROM order_rows").await {
@@ -1428,9 +1477,10 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .collect::<Vec<_>>();
     assert_eq!(rotation_audits.len(), 1);
     let rotation_audit = &rotation_audits[0];
-    assert!(rotation_audit
-        .event_id
-        .starts_with("gateway-secret-rotation-"));
+    assert_eq!(
+        rotation_audit.event_id,
+        format!("gateway-secret-rotation-{rotation_operation_id}")
+    );
     assert!(rotation_audit.timestamp_ms > 0);
     assert_eq!(
         rotation_audit.format_version,
@@ -1460,7 +1510,10 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         &rotation_audit.correlation,
         AuditCorrelation::Observed(id) if !id.is_empty()
     ));
-    assert_eq!(rotation_audit.operation_id, AuditField::Unknown);
+    assert_eq!(
+        rotation_audit.operation_id,
+        AuditField::Known(rotation_operation_id.to_string())
+    );
     assert_eq!(rotation_audit.policy_revision, AuditField::Known(1));
     assert_eq!(
         rotation_audit.before_state,

@@ -757,6 +757,13 @@ async fn administrator_can_manage_secret_and_read_only_its_metadata() {
     assert!(sales_rows.next().await.is_none());
     assert!(!format!("{sales_row:?}").contains("sales-secret"));
 
+    handler
+        .dispatch_async_with_conn(
+            "SET rockstream.idempotency_key = '00000000-0000-4000-8000-000000000002'",
+            Some("secret-admin-connection"),
+        )
+        .await
+        .unwrap();
     let altered_sales = handler
         .dispatch_async_with_conn(
             "ALTER SECRET kafka_auth SET (password = 'replacement')",

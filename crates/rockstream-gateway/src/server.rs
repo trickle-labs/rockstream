@@ -90,7 +90,7 @@ use rockstream_types::data_plane::{
 use rockstream_types::diagnostic::{
     global_diagnostic_journal, record_diagnostic, DiagnosticOccurrence, MAX_DIAGNOSTIC_OCCURRENCES,
 };
-use rockstream_types::error_code::{ErrorCode, ErrorDescriptor, RS_1012};
+use rockstream_types::error_code::{ErrorCode, ErrorDescriptor, RS_1012, RS_2007};
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
 use rockstream_types::ids::{ConnectorId, OperatorId, PrincipalId, ShardId, ViewId, WorkloadId};
@@ -11171,6 +11171,15 @@ impl GatewayHandler {
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
 
+        let operation_id = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .and_then(|session| session.secret_rotation_operation_id)
+        });
+        let Some(operation_id) = operation_id else {
+            return Ok(vec![write_idempotency_key_required_response()]);
+        };
+
         let ns = match self.secret_namespace_id(namespace).await {
             Ok(namespace_id) => namespace_id,
             Err(_) => {
@@ -11219,7 +11228,7 @@ impl GatewayHandler {
         };
         let audit = SecurityAuditRecord {
             format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
-            event_id: format!("gateway-secret-rotation-{:032x}", rand::random::<u128>()),
+            event_id: format!("gateway-secret-rotation-{operation_id}"),
             timestamp_ms: current_time_ms().max(1),
             actor,
             target: AuditField::Known(format!("secret:{namespace}/{}", parsed.name)),
@@ -11229,7 +11238,7 @@ impl GatewayHandler {
             correlation: conn_id.map_or(AuditCorrelation::Unknown, |id| {
                 AuditCorrelation::Observed(id.to_string())
             }),
-            operation_id: AuditField::Unknown,
+            operation_id: AuditField::Known(operation_id.to_string()),
             policy_revision: durable_principal
                 .as_ref()
                 .map_or(AuditField::Unknown, |principal| {
@@ -11240,7 +11249,14 @@ impl GatewayHandler {
         };
         if let Err(err) = self
             .secret_store
-            .alter_secret_with_security_audit(ns, &parsed.name, parsed.payload, "pgwire", audit)
+            .alter_secret_with_security_audit(
+                ns,
+                &parsed.name,
+                parsed.payload,
+                "pgwire",
+                operation_id,
+                audit,
+            )
             .await
         {
             return Ok(vec![secret_error_response(err.to_string())]);
@@ -12071,11 +12087,13 @@ impl GatewayHandler {
             "idempotency_key" => {
                 if val_raw == "default" || val_raw == "null" || val_raw == "''" {
                     session.idempotency_key = None;
+                    session.secret_rotation_operation_id = None;
                 } else {
                     // Strip surrounding single quotes
                     let key_str = val_raw.trim_matches('\'');
                     let hash = sha256_16(key_str.as_bytes());
                     session.idempotency_key = Some(hash);
+                    session.secret_rotation_operation_id = uuid::Uuid::parse_str(key_str).ok();
                 }
             }
             "source_epoch" => {
@@ -12552,6 +12570,7 @@ impl GatewayHandler {
             if let Some(mut session) = self.sessions.get_mut(id) {
                 session.cursors.clear();
                 session.idempotency_key = None;
+                session.secret_rotation_operation_id = None;
                 session.source_epoch_envelope = None;
                 session.wait_for_token = None;
                 session.last_written_epoch = None;
@@ -20353,6 +20372,16 @@ fn secret_error_response(message: String) -> Response<'static> {
         "ERROR".to_owned(),
         "42601".to_owned(),
         message,
+    )))
+}
+
+fn write_idempotency_key_required_response() -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "XX000".to_owned(),
+        format!(
+            "[{RS_2007}] write.idempotency_key_required: ALTER SECRET requires a client-supplied UUID in SET rockstream.idempotency_key. Next steps: set a new UUID before ALTER SECRET and reuse it for retries."
+        ),
     )))
 }
 

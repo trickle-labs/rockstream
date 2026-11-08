@@ -6,6 +6,7 @@ Canonical generated references: [functions](reference/functions.md) and [SQL sup
 
 ```sql
 CREATE SECRET kafka_auth (TYPE = 'sasl_plain', username = 'user', password = 'value');
+SET rockstream.idempotency_key = '00000000-0000-4000-8000-000000000001';
 ALTER SECRET kafka_auth SET (username = 'next-user', password = 'next-value');
 SHOW SECRETS;
 DROP SECRET kafka_auth;
