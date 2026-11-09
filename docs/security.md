@@ -59,6 +59,13 @@ does not cancel its commit. Success waits for durable storage before retiring
 the store's old provider. A provider or decode failure during staging leaves
 every stored envelope unchanged.
 
+With durable storage, rotation also requires the durable security audit
+catalog. The rewrap batch carries a structured audit outbox record, and success
+waits for that record to reach the catalog. The method's actor label is recorded
+as unverified because this internal API does not establish authentication; it
+has no client request identity, and its operation identity is recorded as
+unknown. Pending outbox records are flushed before gateway listeners open.
+
 Keep both KEKs available until rotation has returned success and the replacement
 provider has been configured for restart. After an interruption or storage error,
 the durable batch may contain either generation. Reopen the catalog using
