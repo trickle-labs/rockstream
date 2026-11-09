@@ -3225,6 +3225,7 @@ async fn reject_gateway_actor_assertion(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn authorize_gateway_actor_assertion(
     context: &GatewayActorAuthorizationContext<'_>,
     assertion: Option<&str>,
