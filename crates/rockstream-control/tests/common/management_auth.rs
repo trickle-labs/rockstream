@@ -26,6 +26,7 @@ pub struct ManagementAuth {
     pub store: Arc<InMemory>,
 }
 
+#[allow(dead_code)]
 impl ManagementAuth {
     pub async fn new(backup_destinations: &[String]) -> Self {
         Self::with_presets(
@@ -120,7 +121,6 @@ impl ManagementAuth {
         }
     }
 
-    #[allow(dead_code)]
     pub fn reloader(&self) -> Arc<rockstream_control::tls::TlsCertificateReloader> {
         Arc::new(
             rockstream_control::tls::TlsCertificateReloader::new(self.pki.control_tls_config())
@@ -144,7 +144,6 @@ impl ManagementAuth {
             .with_security_catalog(self.catalog.clone() as Arc<dyn CatalogStore>)
     }
 
-    #[allow(dead_code)]
     pub async fn start_management(&self, service: ManagementService) -> ManagementServiceHandle {
         service
             .with_security_catalog(self.catalog.clone() as Arc<dyn CatalogStore>)
