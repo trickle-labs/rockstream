@@ -13,6 +13,7 @@ use rockstream_cli::output::{
 use rockstream_cli::transport::ManagementCliClient;
 use rockstream_control::{
     ManagementOperationStore, ManagementService, ShardManager, TopologyCatalog,
+    MANAGEMENT_OPERATION_RECORD_VERSION,
 };
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
 use rockstream_test_support::pki::TestPki;
@@ -845,7 +846,7 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
             phase: "completed".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:4".to_owned(),
+            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
         }
     );
 
