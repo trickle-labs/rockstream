@@ -2228,6 +2228,121 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
 }
 
 #[tokio::test]
+async fn support_artifact_download_is_bound_to_authenticated_principal() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-scoped-artifact-download";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for scoped support-artifact qualification");
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let artifact_id = uuid::Uuid::new_v4().to_string();
+    let operator = mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        false,
+        Some(operator),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+    let mut admin = wait_for_management_client(management_address, &pki).await;
+    let mut client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+
+    let artifact = client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: artifact_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(artifact.opaque_id, artifact_id);
+    let generated_at_ms = artifact.expires_at_ms - 600_000;
+    let expected_content = format!(
+        "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":1,\"node\":null}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let (content, expires_at_ms) = download_support_artifact(&mut client, &artifact_id).await;
+    assert_eq!(String::from_utf8(content).unwrap(), expected_content);
+    assert_eq!(expires_at_ms, artifact.expires_at_ms);
+
+    let denial = admin
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: artifact_id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(denial.message(), "management action is not authorized");
+
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "gateway-shard",
+    ));
+    let catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    catalog.refresh().await.unwrap();
+    let audits = catalog.list_security_audit_records().await.unwrap();
+    let denials = audits
+        .iter()
+        .filter(|record| {
+            record.action == SecurityAuditClass::AuthorizationDenial
+                && record.target == AuditField::Known("SupportDownload".to_owned())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(denials.len(), 1);
+    let denial = denials[0];
+    assert!(denial.event_id.starts_with("management-denial-"));
+    assert!(denial.timestamp_ms > 0);
+    assert_eq!(
+        denial,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: denial.event_id.clone(),
+            timestamp_ms: denial.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("SupportDownload".to_owned()),
+            scope: AuditField::Known(
+                serde_json::to_string(&PolicyScope::Artifact {
+                    opaque_id: artifact_id,
+                })
+                .unwrap()
+            ),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+}
+
+#[tokio::test]
 async fn operator_with_explicit_backup_scope_can_create_backup_over_release_management_api() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
