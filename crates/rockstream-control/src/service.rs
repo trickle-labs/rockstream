@@ -31,16 +31,22 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
+use rockstream_storage::catalog::CatalogStore;
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, PolicyScope, SecurityAction, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::data_plane::{
     DeploymentDescriptor, DeploymentRequest, RuntimeExchangeMessage, RuntimeRow, ShardOutput,
     SourceDeltaRequest, WorkerExecutionStatus, WorkloadSnapshot,
 };
 use rockstream_types::error_code::{
-    RS_0001, RS_2401, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
+    ErrorCode, RS_0001, RS_0003, RS_2400, RS_2401, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610,
+    RS_3611, RS_3612, RS_8004,
 };
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
-use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
+use rockstream_types::ids::{PrincipalId, ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardRevokeReason;
 use rockstream_types::rendezvous::{fnv1a_64, rendezvous_hash};
 use rockstream_types::topology::{
@@ -122,10 +128,6 @@ fn error_code_for_secret_error(error: &SecretStoreError) -> String {
     secret_error_code(error).to_string()
 }
 
-fn secret_error_next_steps(error: &SecretStoreError) -> String {
-    rockstream_types::error_code::next_steps(secret_error_code(error)).to_string()
-}
-
 #[derive(Debug, Clone)]
 struct DrainTask {
     donor_worker_id: WorkerId,
@@ -170,12 +172,38 @@ struct DataPlaneState {
     operator_stats_waiters: HashMap<String, OperatorStatsWaiter>,
 }
 
+#[derive(Clone)]
+struct DelegatedActor {
+    principal_id: PrincipalId,
+    secret_use_scopes: Vec<PolicyScope>,
+}
+
 struct DeploymentState {
     request: DeploymentRequest,
+    actor: Option<DelegatedActor>,
     descriptors: HashMap<ShardId, DeploymentDescriptor>,
     workers: HashMap<WorkerId, WorkerExecutionStatus>,
     ready_shards: HashSet<ShardId>,
     ready_waiter: Option<mpsc::Sender<ControlMessage>>,
+}
+
+struct AuthorizedWorkerSecret {
+    namespace_id: u128,
+    scope: PolicyScope,
+    actor_principal_id: Option<PrincipalId>,
+    policy_revision: AuditField<u64>,
+}
+
+#[derive(Debug)]
+enum WorkerSecretAuthorizationError {
+    Denied(&'static str),
+    DeniedForActor {
+        message: &'static str,
+        actor: PrincipalId,
+        scope: PolicyScope,
+        policy_revision: AuditField<u64>,
+    },
+    Unavailable(&'static str),
 }
 
 struct SourceWaiter {
@@ -259,6 +287,7 @@ pub struct ControlServiceHandle {
     pub migration_recovery: Vec<MigrationStartupOutcome>,
     /// TLS certificate reloader (if internal mTLS is enabled).
     pub reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
+    management_reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
 }
 
 impl ControlServiceHandle {
@@ -276,6 +305,15 @@ impl ControlServiceHandle {
             r.reload(new_config)
         } else {
             Err("RS-2410: internal TLS is not enabled on this control service".to_string())
+        }
+    }
+
+    /// Reload a separately configured management listener certificate in place.
+    pub fn reload_management_tls(&self, new_config: InternalTlsConfig) -> Result<(), String> {
+        if let Some(reloader) = &self.management_reloader {
+            reloader.reload(new_config)
+        } else {
+            Err("RS-2410: management TLS is not enabled on this control service".to_owned())
         }
     }
 }
@@ -320,6 +358,7 @@ pub struct ControlService {
     drain_state: Arc<AsyncMutex<DrainState>>,
     /// Optional internal TLS configuration for control plane mTLS.
     internal_tls: Option<InternalTlsConfig>,
+    management_tls: Option<InternalTlsConfig>,
     /// Explicit loopback-only plaintext transport for local development.
     insecure_dev_mode: bool,
     secret_store: Arc<SecretStore>,
@@ -330,6 +369,8 @@ pub struct ControlService {
         Arc<dyn object_store::ObjectStore>,
         rockstream_types::config::NodeConfig,
     )>,
+    security_catalog: Option<Arc<dyn CatalogStore>>,
+    actor_assertion_verifier: Option<Arc<crate::delegation::ActorAssertionVerifier>>,
     backup_source: Option<BackupSource>,
 }
 
@@ -348,6 +389,7 @@ impl ControlService {
             migration_recovery_donors: BTreeMap::new(),
             drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
             internal_tls: None,
+            management_tls: None,
             insecure_dev_mode: false,
             secret_store: Arc::new(SecretStore::new(
                 None,
@@ -356,6 +398,8 @@ impl ControlService {
             worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
             data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),
             management: None,
+            security_catalog: None,
+            actor_assertion_verifier: None,
             backup_source: None,
         }
     }
@@ -414,8 +458,15 @@ impl ControlService {
     }
 
     /// Attach an [`InternalTlsConfig`] for internal mTLS mutual authentication.
+    /// Enabled mTLS also requires the durable security catalog before startup.
     pub fn with_internal_tls(mut self, config: InternalTlsConfig) -> Self {
         self.internal_tls = Some(config);
+        self
+    }
+
+    /// Configure a separate mTLS identity for the management listener.
+    pub fn with_management_tls(mut self, config: InternalTlsConfig) -> Self {
+        self.management_tls = Some(config);
         self
     }
 
@@ -442,6 +493,21 @@ impl ControlService {
         config: rockstream_types::config::NodeConfig,
     ) -> Self {
         self.management = Some((bind_addr.into(), operation_store, config));
+        self
+    }
+
+    /// Attach the durable principals, policy revisions, and audit catalog used by management and internal mTLS.
+    pub fn with_security_catalog(mut self, catalog: Arc<dyn CatalogStore>) -> Self {
+        self.security_catalog = Some(catalog);
+        self
+    }
+
+    /// Trust the deployment-managed RS256 key used by gateway actor assertions.
+    pub fn with_actor_assertion_verifier(
+        mut self,
+        verifier: crate::delegation::ActorAssertionVerifier,
+    ) -> Self {
+        self.actor_assertion_verifier = Some(Arc::new(verifier));
         self
     }
 
@@ -510,6 +576,31 @@ impl ControlService {
                 );
                 None
             }
+        };
+        if reloader.is_some() && self.security_catalog.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RS-2405: internal mTLS requires the durable security audit catalog",
+            ));
+        }
+        let management_reloader = match self.management_tls.as_ref() {
+            Some(config) => {
+                if !config.client_auth_required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RS-2405: management API requires client certificate authentication",
+                    ));
+                }
+                Some(Arc::new(
+                    crate::tls::TlsCertificateReloader::new(config.clone()).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("RS-2405: failed to initialize management mTLS: {error}"),
+                        )
+                    })?,
+                ))
+            }
+            None => reloader.clone(),
         };
 
         if self.raft.is_none() && self.shard_manager.is_empty() {
@@ -606,6 +697,12 @@ impl ControlService {
                 operations,
                 config.clone(),
             )
+            .with_security_catalog(self.security_catalog.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RS-2405: management API requires the durable security catalog",
+                )
+            })?)
             .with_drain_runtime(drain_runtime)
             .with_migration_runtime(migration_runtime);
             let management = if let Some((source, shared_store_id, local_worker_id)) = backup_source
@@ -630,7 +727,13 @@ impl ControlService {
             } else {
                 management
             };
-            Some(management.start(management_addr).await?)
+            let management_tls = management_reloader.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RS-2405: management API requires internal mTLS",
+                )
+            })?;
+            Some(management.start(management_addr, management_tls).await?)
         } else {
             None
         };
@@ -654,6 +757,8 @@ impl ControlService {
             operation_store,
             drain_state: self.drain_state.clone(),
             secret_store: self.secret_store.clone(),
+            security_catalog: self.security_catalog.clone(),
+            actor_assertion_verifier: self.actor_assertion_verifier.clone(),
             worker_senders: self.worker_senders.clone(),
             migration_waiters,
             backup_waiters,
@@ -716,6 +821,7 @@ impl ControlService {
             management,
             migration_recovery,
             reloader: reloader_for_handle,
+            management_reloader,
         })
     }
 
@@ -748,6 +854,8 @@ struct ConnectionContext {
     operation_store: Option<ManagementOperationStore>,
     drain_state: Arc<AsyncMutex<DrainState>>,
     secret_store: Arc<SecretStore>,
+    security_catalog: Option<Arc<dyn CatalogStore>>,
+    actor_assertion_verifier: Option<Arc<crate::delegation::ActorAssertionVerifier>>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     migration_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
     backup_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
@@ -2068,14 +2176,47 @@ fn stable_route(value: &str, shard_count: usize) -> usize {
     hash as usize % shard_count
 }
 
+#[derive(Clone, Copy)]
+struct WorkloadDeploymentContext<'a> {
+    secret_catalog: Option<&'a Arc<dyn CatalogStore>>,
+    sender: &'a mpsc::Sender<ControlMessage>,
+    catalog: &'a TopologyCatalog,
+    shard_manager: &'a ShardManager,
+    worker_senders: &'a Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    data_plane: &'a Arc<AsyncMutex<DataPlaneState>>,
+}
+
 async fn deploy_workload(
     request: DeploymentRequest,
-    sender: &mpsc::Sender<ControlMessage>,
-    catalog: &TopologyCatalog,
-    shard_manager: &ShardManager,
-    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
-    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    actor: Option<DelegatedActor>,
+    context: WorkloadDeploymentContext<'_>,
 ) {
+    let WorkloadDeploymentContext {
+        secret_catalog,
+        sender,
+        catalog,
+        shard_manager,
+        worker_senders,
+        data_plane,
+    } = context;
+    let secret_names = match secret_catalog {
+        Some(catalog) => match secret_names_for_deployment(Some(catalog), &request.schemas).await {
+            Ok(secret_names) => secret_names,
+            Err(error) => {
+                send_message(
+                    sender,
+                    &ControlMessage::OperationFailed {
+                        code: RS_0003.to_string(),
+                        message: format!("workload secret metadata is unavailable: {error:?}"),
+                        next_steps: rockstream_types::error_code::next_steps(RS_0003).to_string(),
+                    },
+                )
+                .await;
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
     let healthy = catalog.healthy_workers();
     let workers = PlacementAlgorithm::assign_n(&healthy, healthy.len());
     if workers.is_empty() {
@@ -2094,6 +2235,7 @@ async fn deploy_workload(
     }
 
     let mut descriptors = HashMap::new();
+    let workload_id = request.workload_id;
     for (index, worker_id) in workers.into_iter().enumerate() {
         let shard_id = ShardId(
             request
@@ -2114,15 +2256,20 @@ async fn deploy_workload(
     }
 
     data_plane.lock().await.deployments.insert(
-        request.workload_id,
+        workload_id,
         DeploymentState {
             request,
+            actor,
             descriptors: descriptors.clone(),
             workers: HashMap::new(),
             ready_shards: HashSet::new(),
             ready_waiter: Some(sender.clone()),
         },
     );
+    let assigned_workers: HashSet<_> = descriptors
+        .values()
+        .map(|descriptor| descriptor.shard.worker_id)
+        .collect();
     for descriptor in descriptors.into_values() {
         if let Some(target) = senders.get(&descriptor.shard.worker_id) {
             send_message(
@@ -2134,6 +2281,20 @@ async fn deploy_workload(
             )
             .await;
             send_message(target, &ControlMessage::Deploy { descriptor }).await;
+        }
+    }
+    for worker_id in assigned_workers {
+        if let Some(target) = senders.get(&worker_id) {
+            for secret_name in &secret_names {
+                send_message(
+                    target,
+                    &ControlMessage::SecretRefreshRequired {
+                        workload_id,
+                        secret_name: secret_name.clone(),
+                    },
+                )
+                .await;
+            }
         }
     }
 }
@@ -2791,6 +2952,663 @@ fn append_required_security_audit(
     }
 }
 
+async fn append_node_identity_rejection(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    identity: &NodeIdentity,
+    connected_worker_id: Option<WorkerId>,
+    claimed_worker_id: WorkerId,
+) -> bool {
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required node identity audit catalog is unavailable");
+        return false;
+    };
+    let actor = connected_worker_id.map_or_else(
+        || AuditIdentity::Unverified(identity.to_cn()),
+        |_| AuditIdentity::Verified(identity.to_cn()),
+    );
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let record = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("node-identity-rejection:{}", uuid::Uuid::new_v4()),
+        timestamp_ms: timestamp_ms.max(1),
+        actor,
+        target: AuditField::Unverified(claimed_worker_id.to_string()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::NodeIdentityRejection,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required node identity audit append failed");
+        return false;
+    }
+    true
+}
+
+async fn allow_gateway_data_plane_peer(
+    sender: &mpsc::Sender<ControlMessage>,
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    identity: Option<&NodeIdentity>,
+    operation: &str,
+) -> bool {
+    let Some(identity) = identity else {
+        // The listener permits no identity only in explicitly enabled loopback development mode.
+        return true;
+    };
+    if identity.role == NodeRole::Gateway {
+        return true;
+    }
+
+    let timestamp_ms = now_ms().max(1);
+    let record = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("node-identity-rejection:{}", uuid::Uuid::new_v4()),
+        timestamp_ms,
+        actor: AuditIdentity::Unverified(identity.to_cn()),
+        target: AuditField::Known(operation.to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::NodeIdentityRejection,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required node identity audit catalog is unavailable");
+        return false;
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required node identity audit append failed");
+        return false;
+    }
+    send_message(
+        sender,
+        &ControlMessage::OperationFailed {
+            code: RS_2412.to_string(),
+            message: "certificate identity is not authorized for the gateway data plane".to_owned(),
+            next_steps: rockstream_types::error_code::next_steps(RS_2412).to_string(),
+        },
+    )
+    .await;
+    false
+}
+
+fn is_gateway_data_plane_message(message: &WorkerMessage) -> bool {
+    matches!(
+        message,
+        WorkerMessage::DeployWorkload(_)
+            | WorkerMessage::SubmitSourceDelta(_)
+            | WorkerMessage::ReadOperatorStats { .. }
+            | WorkerMessage::ReadWorkload { .. }
+    )
+}
+
+async fn gateway_data_plane_scope(
+    request: &WorkerMessage,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+) -> Option<(SecurityAction, PolicyScope)> {
+    use rockstream_types::authorization::ResourceKind;
+
+    match request {
+        WorkerMessage::DeployWorkload(deployment) => Some((
+            SecurityAction::ViewAuthor,
+            PolicyScope::Resource {
+                namespace: deployment.namespace.clone(),
+                kind: ResourceKind::View,
+                name: deployment.workload_name.clone(),
+            },
+        )),
+        WorkerMessage::SubmitSourceDelta(delta) => {
+            let state = data_plane.lock().await;
+            let deployment = state.deployments.get(&delta.workload_id)?;
+            if !deployment
+                .request
+                .schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(&delta.source))
+            {
+                return None;
+            }
+            Some((
+                SecurityAction::DataWrite,
+                PolicyScope::Resource {
+                    namespace: deployment.request.namespace.clone(),
+                    kind: ResourceKind::Table,
+                    name: delta.source.clone(),
+                },
+            ))
+        }
+        WorkerMessage::ReadWorkload { workload_id }
+        | WorkerMessage::ReadOperatorStats { workload_id, .. } => {
+            let state = data_plane.lock().await;
+            let deployment = state.deployments.get(workload_id)?;
+            Some((
+                SecurityAction::DataRead,
+                PolicyScope::Resource {
+                    namespace: deployment.request.namespace.clone(),
+                    kind: ResourceKind::View,
+                    name: deployment.request.workload_name.clone(),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+async fn append_gateway_delegation_audit(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    actor: AuditIdentity,
+    target: AuditField<String>,
+    scope: AuditField<String>,
+    action: SecurityAuditClass,
+    outcome: SecurityAuditOutcome,
+    policy_revision: AuditField<u64>,
+) -> bool {
+    let record = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("gateway-delegation:{}", uuid::Uuid::new_v4()),
+        timestamp_ms: now_ms().max(1),
+        actor,
+        target,
+        scope,
+        action,
+        outcome,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required gateway delegation audit catalog is unavailable");
+        return false;
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required gateway delegation audit append failed");
+        return false;
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+struct GatewayActorAuthorizationContext<'a> {
+    sender: &'a mpsc::Sender<ControlMessage>,
+    catalog: Option<&'a Arc<dyn CatalogStore>>,
+    verifier: Option<&'a crate::delegation::ActorAssertionVerifier>,
+    identity: &'a NodeIdentity,
+    data_plane: &'a Arc<AsyncMutex<DataPlaneState>>,
+}
+
+struct GatewayActorRejectionAudit {
+    target: AuditField<String>,
+    scope: AuditField<String>,
+    action: SecurityAuditClass,
+    actor: AuditIdentity,
+    policy_revision: AuditField<u64>,
+}
+
+impl GatewayActorRejectionAudit {
+    fn authentication(scope: AuditField<String>, actor: AuditIdentity) -> Self {
+        Self {
+            target: AuditField::Known("gateway_data_plane".to_owned()),
+            scope,
+            action: SecurityAuditClass::AuthenticationFailure,
+            actor,
+            policy_revision: AuditField::NotApplicable,
+        }
+    }
+
+    fn unknown_target_authentication(actor: AuditIdentity) -> Self {
+        Self {
+            target: AuditField::Unknown,
+            scope: AuditField::Unknown,
+            action: SecurityAuditClass::AuthenticationFailure,
+            actor,
+            policy_revision: AuditField::NotApplicable,
+        }
+    }
+
+    fn authorization(
+        target: AuditField<String>,
+        scope: AuditField<String>,
+        actor: AuditIdentity,
+        policy_revision: AuditField<u64>,
+    ) -> Self {
+        Self {
+            target,
+            scope,
+            action: SecurityAuditClass::AuthorizationDenial,
+            actor,
+            policy_revision,
+        }
+    }
+}
+
+async fn reject_gateway_actor_assertion(
+    context: &GatewayActorAuthorizationContext<'_>,
+    code: ErrorCode,
+    message: &str,
+    audit: GatewayActorRejectionAudit,
+) -> bool {
+    if !append_gateway_delegation_audit(
+        context.catalog,
+        audit.actor,
+        audit.target,
+        audit.scope,
+        audit.action,
+        SecurityAuditOutcome::Denied,
+        audit.policy_revision,
+    )
+    .await
+    {
+        return false;
+    }
+    let next_steps = if code == RS_2400 {
+        rockstream_types::error_code::next_steps(RS_2400)
+    } else {
+        rockstream_types::error_code::next_steps(RS_2401)
+    };
+    tracing::warn!(peer = %context.identity.to_cn(), %code, "gateway actor assertion rejected");
+    send_message(
+        context.sender,
+        &ControlMessage::OperationFailed {
+            code: code.to_string(),
+            message: message.to_owned(),
+            next_steps: next_steps.to_string(),
+        },
+    )
+    .await;
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn authorize_gateway_actor_assertion(
+    context: &GatewayActorAuthorizationContext<'_>,
+    assertion: Option<&str>,
+    request: &WorkerMessage,
+    authorized_actor: &mut Option<DelegatedActor>,
+) -> bool {
+    let Some(assertion) = assertion else {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2400,
+            "a valid user actor assertion is required for gateway data-plane requests",
+            GatewayActorRejectionAudit::authentication(
+                AuditField::Unknown,
+                AuditIdentity::Unverified(context.identity.to_cn()),
+            ),
+        )
+        .await;
+    };
+    let Some(verifier) = context.verifier else {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2400,
+            "gateway actor assertion verification is not configured",
+            GatewayActorRejectionAudit::authentication(
+                AuditField::Unknown,
+                AuditIdentity::Unverified(context.identity.to_cn()),
+            ),
+        )
+        .await;
+    };
+    let expected = gateway_data_plane_scope(request, context.data_plane).await;
+    let digest = match crate::delegation::request_digest(request) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return reject_gateway_actor_assertion(
+                context,
+                RS_2400,
+                "gateway actor assertion could not be bound to this request",
+                GatewayActorRejectionAudit::authentication(
+                    AuditField::Unknown,
+                    AuditIdentity::Unverified(context.identity.to_cn()),
+                ),
+            )
+            .await;
+        }
+    };
+    let now = now_ms().max(1) / 1_000;
+    let claims = match verifier.verify(assertion, digest, now) {
+        Ok(claims) => claims,
+        Err(_) => {
+            return reject_gateway_actor_assertion(
+                context,
+                RS_2400,
+                "gateway actor assertion is invalid, expired, or bound to another deployment/request",
+                GatewayActorRejectionAudit::authentication(
+                    AuditField::Unknown,
+                    AuditIdentity::Unverified(context.identity.to_cn()),
+                ),
+            )
+            .await;
+        }
+    };
+    let (expected_action, expected_scope) = match expected {
+        Some(expected) => expected,
+        None => {
+            return reject_gateway_actor_assertion(
+                context,
+                RS_2401,
+                "gateway actor assertion does not identify an active scoped workload request",
+                GatewayActorRejectionAudit::authorization(
+                    AuditField::Known("gateway_data_plane".to_owned()),
+                    AuditField::Known(format!("{:?}", claims.scope())),
+                    AuditIdentity::Verified(claims.principal_id().to_string()),
+                    AuditField::NotApplicable,
+                ),
+            )
+            .await;
+        }
+    };
+    if claims.action() != expected_action || claims.scope() != &expected_scope {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2401,
+            "gateway actor assertion allowance does not match the requested operation and scope",
+            GatewayActorRejectionAudit::authorization(
+                AuditField::Known(format!("{expected_action:?}")),
+                AuditField::Known(format!("{expected_scope:?}")),
+                AuditIdentity::Verified(claims.principal_id().to_string()),
+                AuditField::Known(claims.policy_revision()),
+            ),
+        )
+        .await;
+    }
+    let Some(catalog_store) = context.catalog else {
+        tracing::error!(code = %RS_0003, "durable actor policy is unavailable");
+        return false;
+    };
+    let principals = match catalog_store.list_security_principals().await {
+        Ok(principals) => principals,
+        Err(_) => {
+            return reject_gateway_actor_assertion(
+                context,
+                RS_2400,
+                "durable actor policy is unavailable",
+                GatewayActorRejectionAudit::unknown_target_authentication(AuditIdentity::Verified(
+                    claims.principal_id().to_string(),
+                )),
+            )
+            .await;
+        }
+    };
+    let Some(principal) = principals
+        .into_iter()
+        .find(|principal| principal.id == claims.principal_id() && principal.enabled)
+    else {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2400,
+            "asserted user actor is no longer enabled",
+            GatewayActorRejectionAudit::unknown_target_authentication(AuditIdentity::Verified(
+                claims.principal_id().to_string(),
+            )),
+        )
+        .await;
+    };
+    if !crate::authorization::allows(&principal, expected_action, &expected_scope) {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2401,
+            "asserted user actor is no longer authorized for this operation and scope",
+            GatewayActorRejectionAudit::authorization(
+                AuditField::Known(format!("{expected_action:?}")),
+                AuditField::Known(format!("{expected_scope:?}")),
+                AuditIdentity::Verified(principal.id.to_string()),
+                AuditField::Known(principal.revision),
+            ),
+        )
+        .await;
+    }
+    let audited = append_gateway_delegation_audit(
+        Some(catalog_store),
+        AuditIdentity::Verified(principal.id.to_string()),
+        AuditField::Known(format!("{expected_action:?}")),
+        AuditField::Known(format!("{expected_scope:?}")),
+        SecurityAuditClass::AuthenticationSuccess,
+        SecurityAuditOutcome::Success,
+        AuditField::Known(principal.revision),
+    )
+    .await;
+    if audited && matches!(request, WorkerMessage::DeployWorkload(_)) {
+        *authorized_actor = Some(DelegatedActor {
+            principal_id: principal.id,
+            secret_use_scopes: claims.secret_use_scopes().to_vec(),
+        });
+    }
+    audited
+}
+
+async fn authorize_worker_secret_request(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_id: WorkerId,
+    workload_id: WorkloadId,
+    secret_name: &str,
+) -> Result<AuthorizedWorkerSecret, WorkerSecretAuthorizationError> {
+    let Some(catalog) = catalog else {
+        return Err(WorkerSecretAuthorizationError::Unavailable(
+            "durable secret authorization catalog is unavailable",
+        ));
+    };
+    let (request, delegated_actor) = {
+        let state = data_plane.lock().await;
+        let Some(deployment) = state.deployments.get(&workload_id) else {
+            return Err(WorkerSecretAuthorizationError::Denied(
+                "workload is not active",
+            ));
+        };
+        if !deployment
+            .descriptors
+            .values()
+            .any(|descriptor| descriptor.shard.worker_id == worker_id)
+        {
+            return Err(WorkerSecretAuthorizationError::Denied(
+                "worker is not assigned to this workload",
+            ));
+        }
+        (deployment.request.clone(), deployment.actor.clone())
+    };
+    let sources = catalog.list_sources().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
+    })?;
+    let mut matches = Vec::new();
+    for source in sources {
+        if !source.table_name.as_ref().is_some_and(|table| {
+            request
+                .schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(table))
+        }) {
+            continue;
+        }
+        let Some(reference) = source.options.get("secret") else {
+            continue;
+        };
+        if rockstream_types::secret::secret_name_from_reference(reference) != Some(secret_name) {
+            continue;
+        }
+        let (Some(namespace), Some(consumer)) = (source.secret_namespace, source.secret_consumer)
+        else {
+            return Err(WorkerSecretAuthorizationError::Denied(
+                "source secret scope is incomplete",
+            ));
+        };
+        matches.push((namespace, consumer));
+    }
+    let Some((namespace, consumer_id)) = matches.first().cloned() else {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "secret is not referenced by this workload",
+        ));
+    };
+    if matches.iter().any(|(other_namespace, other_consumer)| {
+        other_namespace != &namespace || *other_consumer != consumer_id
+    }) {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "secret name is ambiguous within this workload",
+        ));
+    }
+    let scope = PolicyScope::Secret {
+        namespace: namespace.clone(),
+        name: secret_name.to_owned(),
+        consumer: Some(consumer_id),
+    };
+    let namespace_id = catalog
+        .get_namespace_by_name(&namespace)
+        .await
+        .map_err(|_| {
+            WorkerSecretAuthorizationError::Unavailable("durable namespace catalog is unavailable")
+        })?
+        .map(|namespace| u128::from(namespace.id.0))
+        .ok_or(WorkerSecretAuthorizationError::Denied(
+            "secret namespace is no longer present",
+        ))?;
+    let principals = catalog.list_security_principals().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable principal catalog is unavailable")
+    })?;
+    let Some(consumer) = principals
+        .iter()
+        .find(|principal| principal.id == consumer_id && principal.enabled)
+    else {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "source consumer is no longer enabled",
+        ));
+    };
+    if !crate::authorization::allows(consumer, SecurityAction::SecretUse, &scope) {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "source consumer is no longer authorized for secret use",
+        ));
+    }
+    let mut policy_revision = AuditField::NotApplicable;
+    let actor_principal_id = delegated_actor.as_ref().map(|actor| actor.principal_id);
+    if let Some(delegated_actor) = delegated_actor {
+        let actor_id = delegated_actor.principal_id;
+        let Some(actor) = principals
+            .iter()
+            .find(|principal| principal.id == actor_id && principal.enabled)
+        else {
+            return Err(WorkerSecretAuthorizationError::DeniedForActor {
+                message: "delegated actor is no longer enabled",
+                actor: actor_id,
+                scope,
+                policy_revision: AuditField::NotApplicable,
+            });
+        };
+        if !crate::authorization::allows(actor, SecurityAction::SecretUse, &scope) {
+            return Err(WorkerSecretAuthorizationError::DeniedForActor {
+                message: "delegated actor is no longer authorized for secret use",
+                actor: actor_id,
+                scope,
+                policy_revision: AuditField::Known(actor.revision),
+            });
+        }
+        if !delegated_actor.secret_use_scopes.contains(&scope) {
+            return Err(WorkerSecretAuthorizationError::DeniedForActor {
+                message: "delegation assertion does not allow secret use for this scope",
+                actor: actor_id,
+                scope,
+                policy_revision: AuditField::Known(actor.revision),
+            });
+        }
+        policy_revision = AuditField::Known(actor.revision);
+    }
+    Ok(AuthorizedWorkerSecret {
+        namespace_id,
+        scope,
+        actor_principal_id,
+        policy_revision,
+    })
+}
+
+async fn workloads_for_secret_rotation(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_id: WorkerId,
+    secret_name: &str,
+) -> Result<Vec<WorkloadId>, WorkerSecretAuthorizationError> {
+    let Some(catalog) = catalog else {
+        return Err(WorkerSecretAuthorizationError::Unavailable(
+            "durable source catalog is unavailable",
+        ));
+    };
+    let sources = catalog.list_sources().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
+    })?;
+    let source_tables: HashSet<_> = sources
+        .into_iter()
+        .filter(|source| {
+            source.options.get("secret").and_then(|reference| {
+                rockstream_types::secret::secret_name_from_reference(reference)
+            }) == Some(secret_name)
+        })
+        .filter_map(|source| source.table_name.map(|name| name.to_lowercase()))
+        .collect();
+    let state = data_plane.lock().await;
+    Ok(state
+        .deployments
+        .iter()
+        .filter(|(_, deployment)| {
+            deployment
+                .descriptors
+                .values()
+                .any(|descriptor| descriptor.shard.worker_id == worker_id)
+                && deployment
+                    .request
+                    .schemas
+                    .iter()
+                    .any(|schema| source_tables.contains(&schema.relation.to_lowercase()))
+        })
+        .map(|(workload_id, _)| *workload_id)
+        .collect())
+}
+
+async fn secret_names_for_deployment(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    schemas: &[rockstream_types::data_plane::DeploymentSchema],
+) -> Result<Vec<String>, WorkerSecretAuthorizationError> {
+    let Some(catalog) = catalog else {
+        return Err(WorkerSecretAuthorizationError::Unavailable(
+            "durable source catalog is unavailable",
+        ));
+    };
+    let sources = catalog.list_sources().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
+    })?;
+    let mut secret_names = HashSet::new();
+    for source in sources {
+        if !source.table_name.as_ref().is_some_and(|table| {
+            schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(table))
+        }) {
+            continue;
+        }
+        if let Some(reference) = source.options.get("secret") {
+            let Some(secret_name) = rockstream_types::secret::secret_name_from_reference(reference)
+            else {
+                return Err(WorkerSecretAuthorizationError::Denied(
+                    "source secret reference is invalid",
+                ));
+            };
+            secret_names.insert(secret_name.to_owned());
+        }
+    }
+    let mut secret_names: Vec<_> = secret_names.into_iter().collect();
+    secret_names.sort();
+    Ok(secret_names)
+}
+
 fn claimed_worker_id(message: &WorkerMessage) -> Option<WorkerId> {
     match message {
         WorkerMessage::DeploymentReady { worker_id, .. }
@@ -3110,6 +3928,8 @@ async fn handle_connection_stream<R, W>(
         operation_store,
         drain_state,
         secret_store,
+        security_catalog,
+        actor_assertion_verifier,
         worker_senders,
         migration_waiters,
         backup_waiters,
@@ -3127,6 +3947,7 @@ async fn handle_connection_stream<R, W>(
                 break;
             }
         }
+        let _ = writer.shutdown().await;
     });
     let mut lines = BufReader::new(reader).lines();
     let mut connected_worker_id: Option<rockstream_types::ids::WorkerId> = None;
@@ -3144,6 +3965,49 @@ async fn handle_connection_stream<R, W>(
             }
         };
 
+        let (msg, actor_assertion) = match msg {
+            WorkerMessage::DelegatedDataPlane {
+                version,
+                actor_assertion,
+                request,
+            } if version == rockstream_types::topology::DATA_PLANE_DELEGATION_VERSION
+                && is_gateway_data_plane_message(&request) =>
+            {
+                (*request, Some(actor_assertion))
+            }
+            WorkerMessage::DelegatedDataPlane { .. } => {
+                let actor = peer_identity
+                    .as_ref()
+                    .map_or(AuditIdentity::Unknown, |identity| {
+                        AuditIdentity::Unverified(identity.to_cn())
+                    });
+                if !append_gateway_delegation_audit(
+                    security_catalog.as_ref(),
+                    actor,
+                    AuditField::Known("gateway_data_plane".to_owned()),
+                    AuditField::Unknown,
+                    SecurityAuditClass::AuthenticationFailure,
+                    SecurityAuditOutcome::Denied,
+                    AuditField::NotApplicable,
+                )
+                .await
+                {
+                    break;
+                }
+                send_message(
+                    &sender,
+                    &ControlMessage::OperationFailed {
+                        code: RS_2400.to_string(),
+                        message: "gateway data-plane delegation envelope is invalid".to_owned(),
+                        next_steps: rockstream_types::error_code::next_steps(RS_2400).to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
+            request => (request, None),
+        };
+
         if let (Some(identity), Some(claimed_id)) = (&peer_identity, claimed_worker_id(&msg)) {
             if identity.role != NodeRole::Worker
                 || !identity.matches_worker_id(claimed_id.0)
@@ -3152,24 +4016,107 @@ async fn handle_connection_stream<R, W>(
                 let registered_id = connected_worker_id
                     .map(|worker_id| worker_id.to_string())
                     .unwrap_or_else(|| "unknown".to_owned());
-                if !deny_authenticated_worker_action(
-                    &sender,
-                    audit.as_ref(),
+                if append_node_identity_rejection(
+                    security_catalog.as_ref(),
                     identity,
-                    claimed_id.to_string(),
-                    format!(
-                        "registered_worker_id={registered_id}, claimed_worker_id={claimed_id}, error_code={RS_2401}"
-                    ),
+                    connected_worker_id,
+                    claimed_id,
                 )
                 .await
                 {
-                    return;
+                    let event = AuditEvent::now(
+                        identity.to_cn(),
+                        "security.authorization_denied",
+                        claimed_id.to_string(),
+                    )
+                    .with_error_code(RS_2401.to_string())
+                    .with_detail(format!(
+                        "registered_worker_id={registered_id}, claimed_worker_id={claimed_id}, error_code={RS_2401}"
+                    ));
+                    if append_required_security_audit(
+                        audit.as_ref(),
+                        &event,
+                        "worker node identity rejection",
+                    ) {
+                        send_message(
+                            &sender,
+                            &ControlMessage::OperationFailed {
+                                code: RS_2401.to_string(),
+                                message:
+                                    "worker identity claim is not authorized for this connection"
+                                        .to_owned(),
+                                next_steps: rockstream_types::error_code::next_steps(RS_2401)
+                                    .to_string(),
+                            },
+                        )
+                        .await;
+                    }
                 }
-                continue;
+                break;
+            }
+        }
+
+        let mut delegated_actor = None;
+        if is_gateway_data_plane_message(&msg) {
+            if !allow_gateway_data_plane_peer(
+                &sender,
+                security_catalog.as_ref(),
+                peer_identity.as_ref(),
+                "gateway_data_plane",
+            )
+            .await
+            {
+                break;
+            }
+            if let Some(identity) = peer_identity.as_ref() {
+                let authorization_context = GatewayActorAuthorizationContext {
+                    sender: &sender,
+                    catalog: security_catalog.as_ref(),
+                    verifier: actor_assertion_verifier.as_deref(),
+                    identity,
+                    data_plane: &data_plane,
+                };
+                if !authorize_gateway_actor_assertion(
+                    &authorization_context,
+                    actor_assertion.as_deref(),
+                    &msg,
+                    &mut delegated_actor,
+                )
+                .await
+                {
+                    break;
+                }
+            } else if actor_assertion.is_some() {
+                if !append_gateway_delegation_audit(
+                    security_catalog.as_ref(),
+                    AuditIdentity::Unknown,
+                    AuditField::Known("gateway_data_plane".to_owned()),
+                    AuditField::Unknown,
+                    SecurityAuditClass::AuthenticationFailure,
+                    SecurityAuditOutcome::Denied,
+                    AuditField::NotApplicable,
+                )
+                .await
+                {
+                    break;
+                }
+                send_message(
+                    &sender,
+                    &ControlMessage::OperationFailed {
+                        code: RS_2400.to_string(),
+                        message:
+                            "gateway actor assertions require an authenticated node connection"
+                                .to_owned(),
+                        next_steps: rockstream_types::error_code::next_steps(RS_2400).to_string(),
+                    },
+                )
+                .await;
+                break;
             }
         }
 
         match msg {
+            WorkerMessage::DelegatedDataPlane { .. } => break,
             WorkerMessage::Register(reg) => {
                 if let Some(id) = &peer_identity {
                     if id.role != NodeRole::Worker || !id.matches_worker_id(reg.worker_id.0) {
@@ -3179,6 +4126,16 @@ async fn handle_connection_stream<R, W>(
                             registered_id = %reg.worker_id,
                             "control: worker mTLS identity mismatch rejected"
                         );
+                        if !append_node_identity_rejection(
+                            security_catalog.as_ref(),
+                            id,
+                            connected_worker_id,
+                            reg.worker_id,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         let event = AuditEvent::now(
                             id.to_cn(),
                             "security.internal_mtls_denied",
@@ -3190,11 +4147,13 @@ async fn handle_connection_stream<R, W>(
                             id.to_cn(),
                             reg.worker_id
                         ));
-                        append_required_security_audit(
+                        if !append_required_security_audit(
                             audit.as_ref(),
                             &event,
                             "worker node identity rejection",
-                        );
+                        ) {
+                            return;
+                        }
                         let reply = ControlMessage::OperationFailed {
                             code: RS_2412.to_string(),
                             message: format!(
@@ -3278,11 +4237,15 @@ async fn handle_connection_stream<R, W>(
             WorkerMessage::DeployWorkload(request) => {
                 deploy_workload(
                     request,
-                    &sender,
-                    &catalog,
-                    &shard_manager,
-                    &worker_senders,
-                    &data_plane,
+                    delegated_actor,
+                    WorkloadDeploymentContext {
+                        secret_catalog: security_catalog.as_ref(),
+                        sender: &sender,
+                        catalog: &catalog,
+                        shard_manager: &shard_manager,
+                        worker_senders: &worker_senders,
+                        data_plane: &data_plane,
+                    },
                 )
                 .await;
                 if let Some(store) = &shard_store {
@@ -3954,33 +4917,204 @@ async fn handle_connection_stream<R, W>(
                 );
             }
             WorkerMessage::ResolveSecretToken { secret_name } => {
+                let actor = peer_identity
+                    .as_ref()
+                    .map_or(AuditIdentity::Unknown, |identity| {
+                        AuditIdentity::Verified(identity.to_cn())
+                    });
+                let audited = append_gateway_delegation_audit(
+                    security_catalog.as_ref(),
+                    actor,
+                    AuditField::Known(secret_name),
+                    AuditField::Unknown,
+                    SecurityAuditClass::AuthorizationDenial,
+                    SecurityAuditOutcome::Denied,
+                    AuditField::NotApplicable,
+                )
+                .await;
+                let code = if audited { RS_2401 } else { RS_0003 };
+                send_message(
+                    &sender,
+                    &ControlMessage::OperationFailed {
+                        code: code.to_string(),
+                        message: "unscoped worker secret requests are disabled".to_owned(),
+                        next_steps: rockstream_types::error_code::next_steps(code).to_string(),
+                    },
+                )
+                .await;
+            }
+            WorkerMessage::ResolveWorkloadSecretToken {
+                workload_id,
+                secret_name,
+            } => {
                 let Some(identity) = peer_identity.as_ref().filter(|id| {
                     id.role == NodeRole::Worker
                         && connected_worker_id
                             .is_some_and(|worker_id| id.matches_worker_id(worker_id.0))
                 }) else {
-                    let reply = ControlMessage::OperationFailed {
-                        code: RS_2410.to_string(),
-                        message:
-                            "secret token requests require an authenticated worker certificate"
-                                .to_string(),
-                        next_steps: rockstream_types::error_code::next_steps(RS_2410).to_string(),
-                    };
-                    send_message(&sender, &reply).await;
+                    let actor = peer_identity
+                        .as_ref()
+                        .map_or(AuditIdentity::Unknown, |identity| {
+                            AuditIdentity::Verified(identity.to_cn())
+                        });
+                    let audited = append_gateway_delegation_audit(
+                        security_catalog.as_ref(),
+                        actor,
+                        AuditField::Known(secret_name),
+                        AuditField::Known(format!("workload:{}", workload_id.0)),
+                        SecurityAuditClass::AuthenticationFailure,
+                        SecurityAuditOutcome::Denied,
+                        AuditField::NotApplicable,
+                    )
+                    .await;
+                    let code = if audited { RS_2410 } else { RS_0003 };
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: code.to_string(),
+                            message:
+                                "secret token requests require the assigned worker certificate"
+                                    .to_string(),
+                            next_steps: rockstream_types::error_code::next_steps(code).to_string(),
+                        },
+                    )
+                    .await;
                     continue;
                 };
+                let Some(worker_id) = connected_worker_id else {
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: RS_2410.to_string(),
+                            message: "worker registration is not complete".to_owned(),
+                            next_steps: rockstream_types::error_code::next_steps(RS_2410)
+                                .to_string(),
+                        },
+                    )
+                    .await;
+                    continue;
+                };
+                let authorized = match authorize_worker_secret_request(
+                    security_catalog.as_ref(),
+                    &data_plane,
+                    worker_id,
+                    workload_id,
+                    &secret_name,
+                )
+                .await
+                {
+                    Ok(authorized) => authorized,
+                    Err(error) => {
+                        let (code, message, action, retry, audit_actor, audit_scope, revision) =
+                            match error {
+                                WorkerSecretAuthorizationError::Denied(message) => (
+                                    RS_2401,
+                                    message,
+                                    SecurityAuditClass::AuthorizationDenial,
+                                    false,
+                                    AuditIdentity::Verified(identity.to_cn()),
+                                    AuditField::Known(format!("workload:{}", workload_id.0)),
+                                    AuditField::NotApplicable,
+                                ),
+                                WorkerSecretAuthorizationError::DeniedForActor {
+                                    message,
+                                    actor,
+                                    scope,
+                                    policy_revision,
+                                } => (
+                                    RS_2401,
+                                    message,
+                                    SecurityAuditClass::AuthorizationDenial,
+                                    false,
+                                    AuditIdentity::Verified(actor.to_string()),
+                                    AuditField::Known(format!("{scope:?}")),
+                                    policy_revision,
+                                ),
+                                WorkerSecretAuthorizationError::Unavailable(message) => (
+                                    RS_0003,
+                                    message,
+                                    SecurityAuditClass::AuthenticationFailure,
+                                    true,
+                                    AuditIdentity::Verified(identity.to_cn()),
+                                    AuditField::Known(format!("workload:{}", workload_id.0)),
+                                    AuditField::NotApplicable,
+                                ),
+                            };
+                        let audited = append_gateway_delegation_audit(
+                            security_catalog.as_ref(),
+                            audit_actor,
+                            AuditField::Known(secret_name.clone()),
+                            audit_scope,
+                            action,
+                            SecurityAuditOutcome::Denied,
+                            revision,
+                        )
+                        .await;
+                        let code = if audited { code } else { RS_0003 };
+                        send_message(
+                            &sender,
+                            &ControlMessage::SecretTokenRejected {
+                                workload_id,
+                                secret_name: secret_name.clone(),
+                                code: code.to_string(),
+                                message: message.to_owned(),
+                                retry: retry || !audited,
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 match secret_store
-                    .issue_worker_token(0, &secret_name, &identity.node_id, 300, &identity.to_cn())
+                    .issue_worker_token(
+                        authorized.namespace_id,
+                        workload_id,
+                        &secret_name,
+                        &identity.node_id,
+                        300,
+                        &identity.to_cn(),
+                    )
                     .await
                 {
                     Ok(token) => {
-                        send_message(&sender, &ControlMessage::SecretTokenIssued { token }).await
+                        let actor = authorized.actor_principal_id.map_or_else(
+                            || AuditIdentity::Verified(identity.to_cn()),
+                            |principal| AuditIdentity::Verified(principal.to_string()),
+                        );
+                        if append_gateway_delegation_audit(
+                            security_catalog.as_ref(),
+                            actor,
+                            AuditField::Known(secret_name.clone()),
+                            AuditField::Known(format!("{:?}", authorized.scope)),
+                            SecurityAuditClass::AuthenticationSuccess,
+                            SecurityAuditOutcome::Success,
+                            authorized.policy_revision,
+                        )
+                        .await
+                        {
+                            send_message(&sender, &ControlMessage::SecretTokenIssued { token })
+                                .await;
+                        } else {
+                            send_message(
+                                &sender,
+                                &ControlMessage::SecretTokenRejected {
+                                    workload_id,
+                                    secret_name: secret_name.clone(),
+                                    code: RS_0003.to_string(),
+                                    message: "secret authorization audit is unavailable".into(),
+                                    retry: true,
+                                },
+                            )
+                            .await;
+                        }
                     }
                     Err(error) => {
-                        let reply = ControlMessage::OperationFailed {
+                        let reply = ControlMessage::SecretTokenRejected {
+                            workload_id,
+                            secret_name: secret_name.clone(),
                             code: error_code_for_secret_error(&error),
                             message: error.to_string(),
-                            next_steps: secret_error_next_steps(&error),
+                            retry: true,
                         };
                         send_message(&sender, &reply).await;
                     }
@@ -4211,7 +5345,35 @@ async fn handle_connection_stream<R, W>(
                 current.clone()
             };
             if let Some(rotation) = rotation {
-                send_message(&sender, &ControlMessage::SecretRotated { rotation }).await;
+                if let Some(worker_id) = connected_worker_id {
+                    match workloads_for_secret_rotation(
+                        security_catalog.as_ref(),
+                        &data_plane,
+                        worker_id,
+                        &rotation.secret_name,
+                    )
+                    .await
+                    {
+                        Ok(workloads) => {
+                            for workload_id in workloads {
+                                send_message(
+                                    &sender,
+                                    &ControlMessage::SecretRefreshRequired {
+                                        workload_id,
+                                        secret_name: rotation.secret_name.clone(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        Err(error) => tracing::error!(
+                            worker_id = %worker_id,
+                            secret_name = %rotation.secret_name,
+                            ?error,
+                            "secret rotation could not be scoped to active workloads"
+                        ),
+                    }
+                }
             }
         }
     }

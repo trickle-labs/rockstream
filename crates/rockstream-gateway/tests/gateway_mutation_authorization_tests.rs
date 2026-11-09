@@ -1314,7 +1314,7 @@ async fn show_security_audit_returns_stable_pages_and_denies_operator_only_acces
     durable
         .commit_txn(
             CatalogTxn::new(
-                3,
+                2,
                 203,
                 vec![
                     CatalogMutation::AppendSecurityAudit(event_z.clone()),
@@ -1367,7 +1367,7 @@ async fn show_security_audit_returns_stable_pages_and_denies_operator_only_acces
     durable
         .commit_txn(
             CatalogTxn::new(
-                4,
+                3,
                 204,
                 vec![CatalogMutation::PutSecurityPrincipal {
                     principal: operator.clone(),

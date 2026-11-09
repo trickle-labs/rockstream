@@ -86,7 +86,7 @@ async fn management_operation_store_upgrades_v1_records_without_request_payloads
     assert_eq!(
         exact_record(&recovered),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_legacy",
             "kind": "migrate_shard",
             "status": "pending",
@@ -101,13 +101,65 @@ async fn management_operation_store_upgrades_v1_records_without_request_payloads
     assert_eq!(recovered.request(), None);
 }
 
+#[tokio::test]
+async fn management_operation_store_upgrades_v2_records_without_losing_requests() {
+    let backing = Arc::new(InMemory::new());
+    backing
+        .put(
+            &Path::from(format!(
+                "control/management-operations/{}.json",
+                hex::encode("op_v2".as_bytes())
+            )),
+            serde_json::to_vec(&json!({
+                "record_version": 2,
+                "operation_id": "op_v2",
+                "kind": "drain_worker",
+                "status": "pending",
+                "started_at": 1000,
+                "updated_at": 1000,
+                "progress": null,
+                "phase": null,
+                "error_code": null,
+                "next_steps": [],
+                "request": {"worker_id": 7}
+            }))
+            .unwrap()
+            .into(),
+        )
+        .await
+        .unwrap();
+
+    let recovered = ManagementOperationStore::new(backing)
+        .get("op_v2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exact_record(&recovered),
+        json!({
+            "record_version": 3,
+            "operation_id": "op_v2",
+            "kind": "drain_worker",
+            "status": "pending",
+            "started_at": 1000,
+            "updated_at": 1000,
+            "progress": null,
+            "phase": null,
+            "error_code": null,
+            "next_steps": [],
+            "request": {"worker_id": 7}
+        })
+    );
+    assert_eq!(recovered.request(), Some(&json!({"worker_id": 7})));
+}
+
 #[test]
 fn management_operation_lifecycle_has_exact_state_records() {
     let mut succeeded = OperationRecord::accepted("op_01ABC", OperationKind::MigrateShard, 1_000);
     assert_eq!(
         exact_record(&succeeded),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_01ABC",
             "kind": "migrate_shard",
             "status": "pending",
@@ -152,7 +204,7 @@ fn management_operation_lifecycle_has_exact_state_records() {
     assert_eq!(
         exact_record(&succeeded),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_01ABC",
             "kind": "migrate_shard",
             "status": "waiting",
@@ -187,7 +239,7 @@ fn management_operation_lifecycle_has_exact_state_records() {
     assert_eq!(
         exact_record(&succeeded),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_01ABC",
             "kind": "migrate_shard",
             "status": "succeeded",
@@ -215,7 +267,7 @@ fn management_operation_lifecycle_has_exact_state_records() {
     assert_eq!(
         exact_record(&failed),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_failed",
             "kind": "drain_worker",
             "status": "failed",
@@ -253,7 +305,7 @@ fn management_operation_lifecycle_has_exact_state_records() {
     assert_eq!(
         exact_record(&cancelled),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_cancelled",
             "kind": "create_backup",
             "status": "cancelled",
@@ -419,7 +471,7 @@ async fn verify_operation_survives_store_reopen(
     assert_eq!(
         exact_record(&accepted),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": operation_id,
             "kind": "migrate_shard",
             "status": "pending",
@@ -452,7 +504,7 @@ async fn verify_operation_survives_store_reopen(
     assert_eq!(
         exact_record(&recovered),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": operation_id,
             "kind": "migrate_shard",
             "status": "running",
@@ -482,7 +534,7 @@ async fn verify_operation_survives_store_reopen(
     assert_eq!(
         exact_record(&completed),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": operation_id,
             "kind": "migrate_shard",
             "status": "succeeded",
@@ -542,7 +594,7 @@ async fn operation_acceptance_never_overwrites_existing_record() {
     assert_eq!(
         exact_record(&retained),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_unique",
             "kind": "drain_worker",
             "status": "pending",
@@ -576,7 +628,7 @@ async fn management_operation_list_pages_exact_records_and_rejects_invalid_token
     assert_eq!(
         exact_record(&first[0]),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_page_a",
             "kind": "drain_worker",
             "status": "pending",
@@ -595,7 +647,7 @@ async fn management_operation_list_pages_exact_records_and_rejects_invalid_token
     assert_eq!(
         exact_record(&second[0]),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_page_b",
             "kind": "migrate_shard",
             "status": "pending",
@@ -636,7 +688,7 @@ async fn operation_store_rejects_active_limit_with_exact_records() {
     assert_eq!(
         exact_record(&store.get("active_0000").await.unwrap().unwrap()),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "active_0000",
             "kind": "create_backup",
             "status": "pending",
@@ -693,7 +745,7 @@ async fn operation_store_rejects_retained_limit_with_exact_records() {
     assert_eq!(
         exact_record(&store.get("retained_09999").await.unwrap().unwrap()),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "retained_09999",
             "kind": "create_backup",
             "status": "succeeded",
@@ -753,7 +805,7 @@ async fn operation_store_cleans_expired_terminal_records_before_acceptance() {
     assert_eq!(
         exact_record(&accepted),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "after_cleanup",
             "kind": "drain_worker",
             "status": "pending",
@@ -799,7 +851,7 @@ async fn management_idempotency_retries_return_one_exact_record() {
     assert_eq!(
         exact_record(&retry),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_first",
             "kind": "migrate_shard",
             "status": "pending",
@@ -907,7 +959,7 @@ async fn operation_transition_claim_is_atomic_across_store_instances() {
     assert_eq!(
         exact_record(&record),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_claim",
             "kind": "migrate_shard",
             "status": "running",
@@ -962,7 +1014,7 @@ async fn repeated_transition_with_same_record_does_not_create_a_cycle() {
     assert_eq!(
         exact_record(&store.get("op_noop").await.unwrap().unwrap()),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_noop",
             "kind": "drain_worker",
             "status": "running",
@@ -1101,7 +1153,7 @@ async fn accepted_operation_and_idempotency_survive_lfs_process_restart() {
     assert_eq!(
         exact_record(&reopened.get("op_backup").await.unwrap().unwrap()),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_backup",
             "kind": "create_backup",
             "status": "pending",
@@ -1150,7 +1202,7 @@ async fn accepted_operation_and_idempotency_survive_minio_tc_process_restart() {
     assert_eq!(
         exact_record(&retry),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_minio_backup",
             "kind": "create_backup",
             "status": "pending",
@@ -1226,7 +1278,7 @@ async fn operation_store_rejects_terminal_transition() {
     assert_eq!(
         exact_record(&retained),
         json!({
-            "record_version": 2,
+            "record_version": 3,
             "operation_id": "op_terminal",
             "kind": "migrate_shard",
             "status": "succeeded",

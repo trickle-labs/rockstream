@@ -27,6 +27,8 @@ pub struct DeploymentSchema {
 pub struct DeploymentRequest {
     pub version: u32,
     pub workload_id: WorkloadId,
+    pub namespace: String,
+    pub workload_name: String,
     pub plan_json: String,
     pub join_strategy: JoinStrategy,
     pub schemas: Vec<DeploymentSchema>,
@@ -181,6 +183,8 @@ mod tests {
         DeploymentRequest {
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             workload_id: WorkloadId(7),
+            namespace: "public".into(),
+            workload_name: "orders_aggregate".into(),
             plan_json: "{\"operator\":\"aggregate\"}".into(),
             join_strategy: JoinStrategy::Auto,
             schemas: vec![DeploymentSchema {

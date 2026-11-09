@@ -202,7 +202,7 @@ async fn assert_single_workload_identity(snapshot: bool) {
                 definition: original.clone(),
             }]
         );
-        assert_eq!(catalog.compact_logs(1).await.unwrap(), 1);
+        assert_eq!(catalog.compact_logs(1).await.unwrap(), 2);
     }
 
     let recovered = DurableCatalogStore::recover(store, "identity")
@@ -272,7 +272,7 @@ async fn assert_gaps_deletion_and_second_recovery(snapshot: bool) {
 
     if snapshot {
         catalog.create_snapshot().await.unwrap();
-        assert_eq!(catalog.compact_logs(5).await.unwrap(), 5);
+        assert_eq!(catalog.compact_logs(5).await.unwrap(), 10);
     }
 
     let recovered = DurableCatalogStore::recover(store.clone(), "gaps")

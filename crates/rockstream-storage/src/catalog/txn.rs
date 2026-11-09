@@ -59,6 +59,13 @@ pub enum CatalogMutation {
         grantor_revision: Option<(PrincipalId, u64)>,
         audit: SecurityAuditRecord,
     },
+    PutSecurityPrincipalForOperation {
+        principal: SecurityPrincipal,
+        expected_revision: Option<u64>,
+        grantor_revision: Option<(PrincipalId, u64)>,
+        operation_id: String,
+        audit: SecurityAuditRecord,
+    },
     DeleteSecurityPrincipal {
         principal_id: PrincipalId,
         expected_revision: u64,
@@ -104,7 +111,14 @@ impl CatalogTxn {
             )));
         }
 
-        let format_version = if mutations.iter().any(is_security_mutation) {
+        let format_version = if mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                CatalogMutation::PutSecurityPrincipalForOperation { .. }
+            )
+        }) {
+            3
+        } else if mutations.iter().any(is_security_mutation) {
             2
         } else {
             1
@@ -136,15 +150,27 @@ impl CatalogTxn {
             ))
         })?;
 
-        if txn.format_version > 2 {
+        if txn.format_version > 3 {
             return Err(CatalogError::IncompatibleVersion(format!(
-                "[RS-1002] unsupported catalog transaction format version {}; supported format is 2; next_steps: upgrade RockStream binary",
+                "[RS-1002] unsupported catalog transaction format version {}; supported format is 3; next_steps: upgrade RockStream binary",
                 txn.format_version
             )));
         }
         if txn.format_version < 2 && txn.mutations.iter().any(is_security_mutation) {
             return Err(CatalogError::IncompatibleVersion(
                 "[RS-1002] security catalog mutations require transaction format version 2; next_steps: upgrade RockStream binary".to_string(),
+            ));
+        }
+        if txn.format_version < 3
+            && txn.mutations.iter().any(|mutation| {
+                matches!(
+                    mutation,
+                    CatalogMutation::PutSecurityPrincipalForOperation { .. }
+                )
+            })
+        {
+            return Err(CatalogError::IncompatibleVersion(
+                "[RS-1002] operation-correlated security mutations require transaction format version 3; next_steps: upgrade RockStream binary".to_string(),
             ));
         }
 
@@ -181,6 +207,7 @@ fn is_security_mutation(mutation: &CatalogMutation) -> bool {
     matches!(
         mutation,
         CatalogMutation::PutSecurityPrincipal { .. }
+            | CatalogMutation::PutSecurityPrincipalForOperation { .. }
             | CatalogMutation::DeleteSecurityPrincipal { .. }
             | CatalogMutation::AppendSecurityAudit(_)
     )

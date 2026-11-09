@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -41,10 +41,16 @@ use rockstream_types::workload::WorkloadDef;
 const SECURITY_AUDIT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_SECURITY_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
 
+pub const SECURITY_AUDIT_APPEND_ATTEMPTS: usize = 8;
+
 /// Abstract interface for catalog operations.
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CatalogStore: Send + Sync {
+    fn deployment_namespace(&self) -> String;
+    async fn refresh(&self) -> Result<(), CatalogError> {
+        Ok(())
+    }
     async fn commit_txn(&self, txn: CatalogTxn) -> Result<u64, CatalogError>;
     async fn get_revision(&self) -> u64;
     async fn allocate_id(&self) -> Result<u64, CatalogError>;
@@ -91,6 +97,10 @@ pub trait CatalogStore: Send + Sync {
         id: PrincipalId,
     ) -> Result<Option<SecurityPrincipal>, CatalogError>;
     async fn list_security_principals(&self) -> Result<Vec<SecurityPrincipal>, CatalogError>;
+    async fn get_security_audit_record(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<SecurityAuditRecord>, CatalogError>;
     async fn list_security_audit_records(&self) -> Result<Vec<SecurityAuditRecord>, CatalogError>;
     async fn list_security_audit_page(
         &self,
@@ -128,10 +138,54 @@ struct CatalogInnerState {
     roles: HashMap<PrincipalId, CatalogRoleEntry>,
     security_principals: HashMap<PrincipalId, SecurityPrincipal>,
     security_audit_records: Vec<SecurityAuditRecord>,
+    security_audit_by_id: HashMap<String, usize>,
     security_audit_order: Vec<usize>,
     security_audit_bytes: u64,
     security_audit_oldest_timestamp_ms: Option<u64>,
     compiled_plans: HashMap<CompiledPlanId, CompiledPlanRecord>,
+}
+
+async fn persist_catalog_log(
+    store: &dyn ObjectStore,
+    path: &ObjectPath,
+    bytes: &[u8],
+) -> Result<(), CatalogError> {
+    match store
+        .put_opts(path, bytes.to_vec().into(), PutMode::Create.into())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let existing = store
+                .get(path)
+                .await
+                .map_err(|error| {
+                    CatalogError::Storage(format!(
+                        "[RS-0003] failed to read catalog log {}: {error}",
+                        path.as_ref()
+                    ))
+                })?
+                .bytes()
+                .await
+                .map_err(|error| {
+                    CatalogError::Storage(format!(
+                        "[RS-0003] failed to read catalog log {}: {error}",
+                        path.as_ref()
+                    ))
+                })?;
+            if existing.as_ref() == bytes {
+                Ok(())
+            } else {
+                Err(CatalogError::OptimisticConflict(format!(
+                    "catalog log {} already contains a different transaction",
+                    path.as_ref()
+                )))
+            }
+        }
+        Err(error) => Err(CatalogError::Storage(format!(
+            "[RS-0003] failed to write catalog log: {error}"
+        ))),
+    }
 }
 
 /// Durable catalog store backed by an `ObjectStore`.
@@ -175,6 +229,11 @@ impl DurableCatalogStore {
             "{}/catalog/snapshots/{:020}.snap.tmp",
             self.prefix, revision
         );
+        ObjectPath::from(p.trim_start_matches('/'))
+    }
+
+    fn revision_log_path(&self, revision: u64) -> ObjectPath {
+        let p = format!("{}/catalog/log/{:020}.log", self.prefix, revision);
         ObjectPath::from(p.trim_start_matches('/'))
     }
 
@@ -465,7 +524,7 @@ impl DurableCatalogStore {
         let log_prefix = format!("{}/catalog/log/", prefix);
         let log_prefix_path = ObjectPath::from(log_prefix.trim_start_matches('/'));
 
-        let mut log_files: Vec<(u64, u64, ObjectPath)> = Vec::new();
+        let mut log_files: Vec<(u64, Option<u64>, ObjectPath)> = Vec::new();
         let mut log_stream = store.list(Some(&log_prefix_path));
         while let Some(item) = log_stream.next().await {
             let meta =
@@ -474,30 +533,38 @@ impl DurableCatalogStore {
             let filename = location.as_ref().split('/').next_back().unwrap_or_default();
             if filename.ends_with(".log") {
                 let parts: Vec<&str> = filename.trim_end_matches(".log").split('_').collect();
-                if parts.len() == 2 {
-                    if let (Ok(rev), Ok(op_id)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>())
-                    {
-                        if rev > start_revision {
-                            log_files.push((rev, op_id, location));
-                        }
+                let entry = match parts.as_slice() {
+                    [revision] => revision
+                        .parse::<u64>()
+                        .ok()
+                        .map(|revision| (revision, None)),
+                    [revision, operation_id] => revision
+                        .parse::<u64>()
+                        .ok()
+                        .zip(operation_id.parse::<u64>().ok())
+                        .map(|(revision, operation_id)| (revision, Some(operation_id))),
+                    _ => None,
+                };
+                if let Some((revision, operation_id)) = entry {
+                    if revision > start_revision {
+                        log_files.push((revision, operation_id, location));
                     }
                 }
             }
         }
 
-        log_files.sort_by_key(|(rev, op_id, _)| (*rev, *op_id));
+        log_files.sort_by_key(|(revision, operation_id, _)| {
+            (
+                *revision,
+                operation_id.is_some(),
+                operation_id.unwrap_or_default(),
+            )
+        });
 
-        let mut total_buffer_bytes = 0;
+        let mut total_buffer_bytes = 0usize;
         let mut expected_revision = start_revision;
-        for (rev, op_id, path) in log_files {
-            if rev != expected_revision.saturating_add(1) {
-                return Err(CatalogError::DecodeError(format!(
-                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
-                    expected_revision.saturating_add(1),
-                    rev
-                )));
-            }
-
+        let mut last_replayed_log: Option<(u64, u64, Vec<u8>)> = None;
+        for (revision, operation_id, path) in log_files {
             let res = store.get(&path).await.map_err(|e| {
                 CatalogError::Storage(format!(
                     "[RS-0003] failed to read log file {}: {e}",
@@ -508,7 +575,20 @@ impl DurableCatalogStore {
                 CatalogError::Storage(format!("[RS-0003] failed to load log bytes: {e}"))
             })?;
 
-            total_buffer_bytes += bytes.len();
+            if revision == expected_revision
+                && operation_id.is_some_and(|operation_id| {
+                    last_replayed_log.as_ref().is_some_and(
+                        |(last_revision, last_operation_id, last_bytes)| {
+                            *last_revision == revision
+                                && *last_operation_id == operation_id
+                                && last_bytes.as_slice() == bytes.as_ref()
+                        },
+                    )
+                })
+            {
+                continue;
+            }
+            total_buffer_bytes = total_buffer_bytes.saturating_add(bytes.len());
             if total_buffer_bytes > MAX_REPLAY_BUFFER_BYTES {
                 return Err(CatalogError::ReplayBufferExceeded(format!(
                     "[RS-1003] uncommitted txn replay buffer exceeded maximum size of {} bytes; next_steps: compact catalog log files",
@@ -519,22 +599,43 @@ impl DurableCatalogStore {
             // A bad record must not turn a complete listing into a partial
             // catalog. Preserve the original error and every stored object.
             let txn = CatalogTxn::decode(&bytes)?;
-            if txn.revision != rev || txn.operation_id != op_id {
+            if txn.revision != revision
+                || operation_id.is_some_and(|operation_id| txn.operation_id != operation_id)
+            {
                 return Err(CatalogError::DecodeError(format!(
                     "[RS-1003] catalog log {} has mismatched revision or operation ID; next_steps: inspect catalog log files",
                     path.as_ref()
                 )));
             }
-            expected_revision = rev;
-
             if recovered_state
                 .committed_operations
                 .contains(&txn.operation_id)
             {
-                continue;
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] duplicate catalog operation {} at revision {}; next_steps: inspect catalog log files",
+                    txn.operation_id, revision
+                )));
+            }
+            if revision != expected_revision.saturating_add(1) {
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
+                    expected_revision.saturating_add(1),
+                    revision
+                )));
             }
 
             validate_security_mutations(&recovered_state, &txn)?;
+
+            if operation_id.is_none() {
+                let legacy_path = ObjectPath::from(
+                    format!(
+                        "{}/catalog/log/{:020}_{:020}.log",
+                        prefix, revision, txn.operation_id
+                    )
+                    .trim_start_matches('/'),
+                );
+                persist_catalog_log(store.as_ref(), &legacy_path, &bytes).await?;
+            }
 
             for mutation in &txn.mutations {
                 apply_mutation_to_state(&mut recovered_state, &catalog.id_allocator, mutation)?;
@@ -544,6 +645,8 @@ impl DurableCatalogStore {
                 .committed_operations
                 .insert(txn.operation_id);
             recovered_state.revision = txn.revision;
+            expected_revision = revision;
+            last_replayed_log = Some((revision, txn.operation_id, bytes.to_vec()));
         }
 
         // An unreadable newer snapshot cannot be ignored if the remaining
@@ -694,6 +797,12 @@ fn ensure_security_audit_budget_bytes(bytes: u64, max_bytes: u64) -> Result<(), 
 
 fn rebuild_security_audit_index(state: &mut CatalogInnerState) -> Result<(), CatalogError> {
     state.security_audit_bytes = encoded_security_audit_bytes(&state.security_audit_records)?;
+    state.security_audit_by_id = state
+        .security_audit_records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.event_id.clone(), index))
+        .collect();
     state.security_audit_order = (0..state.security_audit_records.len()).collect();
     state.security_audit_order.sort_unstable_by(|left, right| {
         let left = &state.security_audit_records[*left];
@@ -730,9 +839,9 @@ fn append_security_audit_record_to_state(
     record: &SecurityAuditRecord,
 ) -> Result<(), CatalogError> {
     if let Some(existing) = state
-        .security_audit_records
-        .iter()
-        .find(|existing| existing.event_id == record.event_id)
+        .security_audit_by_id
+        .get(&record.event_id)
+        .and_then(|index| state.security_audit_records.get(*index))
     {
         return if existing == record {
             Ok(())
@@ -766,6 +875,9 @@ fn append_security_audit_record_to_state(
     });
     state.security_audit_records.push(record.clone());
     state
+        .security_audit_by_id
+        .insert(record.event_id.clone(), record_index);
+    state
         .security_audit_order
         .insert(insert_at.unwrap_or_else(|index| index), record_index);
     Ok(())
@@ -774,6 +886,7 @@ fn append_security_audit_record_to_state(
 fn security_audit_record(mutation: &CatalogMutation) -> Option<&SecurityAuditRecord> {
     match mutation {
         CatalogMutation::PutSecurityPrincipal { audit, .. }
+        | CatalogMutation::PutSecurityPrincipalForOperation { audit, .. }
         | CatalogMutation::DeleteSecurityPrincipal { audit, .. } => Some(audit),
         CatalogMutation::AppendSecurityAudit(record) => Some(record),
         _ => None,
@@ -862,7 +975,25 @@ fn validate_security_mutations(
                 expected_revision,
                 grantor_revision,
                 audit,
+            }
+            | CatalogMutation::PutSecurityPrincipalForOperation {
+                principal,
+                expected_revision,
+                grantor_revision,
+                audit,
+                ..
             } => {
+                let audit_operation_id = match mutation {
+                    CatalogMutation::PutSecurityPrincipalForOperation { operation_id, .. } => {
+                        if audit.correlation != AuditCorrelation::Observed(operation_id.clone()) {
+                            return Err(invalid_security_policy(
+                                "operation-correlated grant audit must retain the observed client UUID",
+                            ));
+                        }
+                        operation_id.clone()
+                    }
+                    _ => txn.operation_id.to_string(),
+                };
                 has_principal_change = true;
                 let is_first_administrator =
                     state.security_principals.is_empty() && expected_revision.is_none();
@@ -915,6 +1046,15 @@ fn validate_security_mutations(
                             ));
                         }
                         validate_grantor(state, *grantor_revision, audit)?;
+                        if grantor_revision
+                            .as_ref()
+                            .is_some_and(|(grantor_id, _)| *grantor_id == principal.id)
+                            && !self_update_adds_no_grants(old, principal)
+                        {
+                            return Err(invalid_security_policy(
+                                "grantor cannot increase its own authority",
+                            ));
+                        }
                     }
                     (Some(old), None) => {
                         return Err(security_revision_conflict(principal.id, 0, old.revision));
@@ -926,7 +1066,7 @@ fn validate_security_mutations(
 
                 validate_grant_audit(
                     audit,
-                    txn.operation_id,
+                    &audit_operation_id,
                     principal.id,
                     principal.revision,
                     old.map(principal_audit_state),
@@ -965,7 +1105,7 @@ fn validate_security_mutations(
                 validate_grantor(state, *grantor_revision, audit)?;
                 validate_grant_audit(
                     audit,
-                    txn.operation_id,
+                    &txn.operation_id.to_string(),
                     *principal_id,
                     expected_revision.saturating_add(1),
                     Some(principal_audit_state(old)),
@@ -1059,6 +1199,17 @@ fn validate_grantor(
     Ok(())
 }
 
+fn self_update_adds_no_grants(current: &SecurityPrincipal, updated: &SecurityPrincipal) -> bool {
+    updated
+        .preset_grants
+        .iter()
+        .all(|grant| current.preset_grants.contains(grant))
+        && updated
+            .scoped_grants
+            .iter()
+            .all(|grant| current.scoped_grants.contains(grant))
+}
+
 fn is_active_administrator(principal: &SecurityPrincipal) -> bool {
     principal.enabled
         && principal.validate().is_ok()
@@ -1080,7 +1231,7 @@ fn principal_audit_state(principal: &SecurityPrincipal) -> String {
 
 fn validate_grant_audit(
     audit: &SecurityAuditRecord,
-    operation_id: u64,
+    operation_id: &str,
     principal_id: PrincipalId,
     policy_revision: u64,
     before_state: Option<String>,
@@ -1100,7 +1251,7 @@ fn validate_grant_audit(
         || audit.outcome != SecurityAuditOutcome::Success
         || !matches!(&audit.target, AuditField::Known(value) if value == &target)
         || audit.scope != AuditField::Known("cluster".to_string())
-        || audit.operation_id != AuditField::Known(operation_id.to_string())
+        || audit.operation_id != AuditField::Known(operation_id.to_owned())
         || audit.policy_revision != AuditField::Known(policy_revision)
         || audit.before_state != before_state.map_or(AuditField::NotApplicable, AuditField::Known)
         || audit.after_state != after_state.map_or(AuditField::NotApplicable, AuditField::Known)
@@ -1215,6 +1366,9 @@ fn apply_mutation_to_state(
         }
         CatalogMutation::PutSecurityPrincipal {
             principal, audit, ..
+        }
+        | CatalogMutation::PutSecurityPrincipalForOperation {
+            principal, audit, ..
         } => {
             allocator.observe(principal.id.0);
             state
@@ -1246,12 +1400,38 @@ fn apply_mutation_to_state(
 
 #[async_trait]
 impl CatalogStore for DurableCatalogStore {
+    fn deployment_namespace(&self) -> String {
+        self.prefix.clone()
+    }
+
+    async fn refresh(&self) -> Result<(), CatalogError> {
+        let recovered = Self::recover(self.store.clone(), self.prefix.clone()).await?;
+        let recovered_state = recovered.state.read().await.clone();
+        self.id_allocator
+            .observe(recovered.id_allocator.high_water_mark());
+        let mut state = self.state.write().await;
+        if recovered_state.revision >= state.revision {
+            *state = recovered_state;
+        }
+        Ok(())
+    }
+
     async fn commit_txn(&self, txn: CatalogTxn) -> Result<u64, CatalogError> {
         let mut state = self.state.write().await;
 
         // 1. Replay deduplication: if operation_id already committed, return current revision as idempotent no-op
         if state.committed_operations.contains(&txn.operation_id) {
             return Ok(state.revision);
+        }
+
+        let next_revision = state.revision.checked_add(1).ok_or_else(|| {
+            CatalogError::OptimisticConflict("catalog revision is exhausted".to_owned())
+        })?;
+        if txn.revision != next_revision {
+            return Err(CatalogError::OptimisticConflict(format!(
+                "catalog revision {} is stale; current revision is {}",
+                txn.revision, state.revision
+            )));
         }
 
         validate_security_mutations(&state, &txn)?;
@@ -1388,10 +1568,10 @@ impl CatalogStore for DurableCatalogStore {
 
         // 3. Durably persist transaction log
         let bytes = txn.encode()?;
+        let revision_path = self.revision_log_path(txn.revision);
+        persist_catalog_log(self.store.as_ref(), &revision_path, &bytes).await?;
         let path = self.log_path(txn.revision, txn.operation_id);
-        self.store.put(&path, bytes.into()).await.map_err(|e| {
-            CatalogError::Storage(format!("[RS-0003] failed to write catalog log: {e}"))
-        })?;
+        persist_catalog_log(self.store.as_ref(), &path, &bytes).await?;
 
         // 4. Apply all mutations to in-memory state
         if audit_cutoff_ms > 0 {
@@ -1562,6 +1742,20 @@ impl CatalogStore for DurableCatalogStore {
             .values()
             .cloned()
             .collect())
+    }
+
+    async fn get_security_audit_record(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<SecurityAuditRecord>, CatalogError> {
+        let cutoff_ms = security_audit_cutoff_ms(current_time_ms()?);
+        let state = self.state.read().await;
+        Ok(state
+            .security_audit_by_id
+            .get(event_id)
+            .and_then(|index| state.security_audit_records.get(*index))
+            .filter(|record| record.timestamp_ms >= cutoff_ms)
+            .cloned())
     }
 
     async fn list_security_audit_records(&self) -> Result<Vec<SecurityAuditRecord>, CatalogError> {

@@ -454,6 +454,7 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
 
     let workload_id = WorkloadId(stable_name_id("workload", "r1_uniform_scaling"));
     let snapshot = DataPlaneClient::new(&control_addr)
+        .with_insecure_internal_dev()
         .read_workload(workload_id)
         .await
         .unwrap();
@@ -506,6 +507,7 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
 
     let join_workload_id = WorkloadId(stable_name_id("workload", "r1_ordinary_join"));
     let join_snapshot = DataPlaneClient::new(&control_addr)
+        .with_insecure_internal_dev()
         .read_workload(join_workload_id)
         .await
         .unwrap();
@@ -583,6 +585,7 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let snapshot = DataPlaneClient::new(&control_addr)
+                .with_insecure_internal_dev()
                 .read_workload(workload_id)
                 .await
                 .unwrap();

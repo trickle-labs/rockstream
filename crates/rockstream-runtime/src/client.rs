@@ -221,6 +221,9 @@ pub async fn execute_frame(
         .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workload is not deployed"))?;
     let descriptor = &deployment.descriptor;
+    client
+        .secret_manager
+        .initialize_workload_epoch(frame.workload_id, descriptor.frontier);
     if frame.version != DEPLOYMENT_DESCRIPTOR_VERSION
         || frame.shard_id != descriptor.shard.shard_id
         || frame.operator_id != descriptor.sink_operator_id
@@ -247,6 +250,9 @@ pub async fn execute_frame(
         .get(&frame.source)
         .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown source relation"))?;
+    client
+        .secret_manager
+        .advance_workload_epoch(frame.workload_id, frame.epoch);
     let worker_id = client
         .worker_id()
         .expect("execution identity checked above");
@@ -913,11 +919,17 @@ impl WorkerClientHandle {
     /// Request a fresh short-lived token over the authenticated control channel.
     pub async fn request_secret_token(
         &self,
+        workload_id: rockstream_types::ids::WorkloadId,
         secret_name: impl Into<String>,
     ) -> Result<(), io::Error> {
+        let secret_name = secret_name.into();
+        self.secret_manager
+            .track_refresh(workload_id, secret_name.clone())
+            .map_err(io::Error::other)?;
         self.msg_tx
-            .send(WorkerMessage::ResolveSecretToken {
-                secret_name: secret_name.into(),
+            .send(WorkerMessage::ResolveWorkloadSecretToken {
+                workload_id,
+                secret_name,
             })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "Client channel closed"))
@@ -926,10 +938,11 @@ impl WorkerClientHandle {
     /// Read a decrypted credential from memory. No storage path is consulted.
     pub fn secret(
         &self,
+        workload_id: rockstream_types::ids::WorkloadId,
         secret_name: &str,
         now_secs: u64,
     ) -> Option<crate::secrets::ResolvedSecret> {
-        self.secret_manager.get(secret_name, now_secs)
+        self.secret_manager.get(workload_id, secret_name, now_secs)
     }
 
     pub fn secret_manager(&self) -> Arc<WorkerSecretManager> {
@@ -1390,6 +1403,36 @@ where
                     }
                 }
                 sleep(Duration::from_millis(500)).await;
+            }
+        }));
+
+        let refresh_msg_tx = msg_tx.clone();
+        let refresh_secret_manager = secret_manager_clone.clone();
+        let refresh_deployments = deployments_clone.clone();
+        let _secret_refresh_task = AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let active_workloads: std::collections::HashSet<_> = refresh_deployments
+                    .read()
+                    .keys()
+                    .map(|(workload_id, _)| *workload_id)
+                    .collect();
+                for (workload_id, secret_name) in
+                    refresh_secret_manager.refresh_targets(&active_workloads)
+                {
+                    if refresh_msg_tx
+                        .send(WorkerMessage::ResolveWorkloadSecretToken {
+                            workload_id,
+                            secret_name,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
         }));
 
@@ -2013,15 +2056,45 @@ where
                         );
                     }
                 }
-                ControlMessage::SecretRotated { rotation } => {
+                ControlMessage::SecretRefreshRequired {
+                    workload_id,
+                    secret_name,
+                } => {
+                    if let Err(error) =
+                        secret_manager_clone.track_refresh(workload_id, secret_name.clone())
+                    {
+                        tracing::error!(
+                            code = %rockstream_types::error_code::RS_3601,
+                            %error,
+                            "worker secret refresh target limit reached"
+                        );
+                        continue;
+                    }
                     if let Err(error) = msg_tx
-                        .send(WorkerMessage::ResolveSecretToken {
-                            secret_name: rotation.secret_name,
+                        .send(WorkerMessage::ResolveWorkloadSecretToken {
+                            workload_id,
+                            secret_name,
                         })
                         .await
                     {
                         tracing::warn!(code = %rockstream_types::error_code::RS_0001, error = %error, "secret rotation refresh request could not be queued");
                     }
+                }
+                ControlMessage::SecretTokenRejected {
+                    workload_id,
+                    secret_name,
+                    code,
+                    message,
+                    retry,
+                } => {
+                    secret_manager_clone.reject_refresh(workload_id, &secret_name, retry);
+                    tracing::warn!(
+                        %code,
+                        %message,
+                        workload_id = %workload_id,
+                        %secret_name,
+                        "worker secret token refresh was rejected"
+                    );
                 }
                 ControlMessage::Shutdown => {
                     tracing::info!("Control plane requested shutdown");

@@ -518,6 +518,8 @@ pub struct NodeSection {
     #[serde(default = "default_node_role")]
     pub role: String,
     #[serde(default)]
+    pub deployment_id: Option<String>,
+    #[serde(default)]
     pub host_id: Option<String>,
     #[serde(default)]
     pub availability_zone: Option<String>,
@@ -531,6 +533,7 @@ impl Default for NodeSection {
     fn default() -> Self {
         Self {
             role: default_node_role(),
+            deployment_id: None,
             host_id: None,
             availability_zone: None,
         }
@@ -770,6 +773,10 @@ pub struct AuthSection {
     pub oidc_audience: Option<String>,
     #[serde(default)]
     pub oidc_jwks_url: Option<String>,
+    #[serde(default)]
+    pub actor_assertion_signing_key_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub actor_assertion_public_key_path: Option<std::path::PathBuf>,
 }
 
 fn default_auth_mode() -> String {
@@ -785,6 +792,8 @@ impl Default for AuthSection {
             oidc_issuer: None,
             oidc_audience: None,
             oidc_jwks_url: None,
+            actor_assertion_signing_key_path: None,
+            actor_assertion_public_key_path: None,
         }
     }
 }
@@ -901,6 +910,7 @@ impl From<&RockstreamConfig> for NodeConfig {
             version: 1,
             node: NodeSection {
                 role: "all".to_string(),
+                deployment_id: None,
                 host_id: None,
                 availability_zone: None,
             },

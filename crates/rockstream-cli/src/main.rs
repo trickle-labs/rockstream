@@ -22,11 +22,12 @@ use rockstream_cli::{
     run_interactive_shell, run_manifest_validate, run_project_apply, run_project_verify,
     run_qualify, run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
     run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
-    run_source_drop, run_source_list, run_source_pause, run_source_resume, run_source_show,
-    run_sql_compile, run_start_with_dev_transport, run_support_bundle, run_view_list,
-    run_view_pause, run_view_query, run_view_resume, run_view_show, run_view_status,
-    run_view_subscribe, run_workload_alter, run_workload_create, run_workload_drop,
-    run_workload_list, run_workload_show, DemoOptions, DoctorOptions, InitOptions, StartOptions,
+    run_security_preprovision, run_source_drop, run_source_list, run_source_pause,
+    run_source_resume, run_source_show, run_sql_compile, run_start_with_dev_transport,
+    run_support_bundle, run_view_list, run_view_pause, run_view_query, run_view_resume,
+    run_view_show, run_view_status, run_view_subscribe, run_workload_alter, run_workload_create,
+    run_workload_drop, run_workload_list, run_workload_show, DemoOptions, DoctorOptions,
+    InitOptions, StartOptions,
 };
 use rockstream_types::acl::Role as AclRole;
 use rockstream_types::config_resolver::CliConfigOverrides;
@@ -673,6 +674,28 @@ fn main() -> ExitCode {
             };
             handle_result(res, format)
         }
+        Command::Security { command } => match command {
+            SecurityCommand::PreprovisionAdministrator {
+                layout,
+                storage,
+                principal_file,
+                operation_id,
+                yes,
+            } => {
+                let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+                handle_result(
+                    runtime.block_on(run_security_preprovision(
+                        format,
+                        &storage,
+                        layout,
+                        &principal_file,
+                        operation_id,
+                        yes,
+                    )),
+                    format,
+                )
+            }
+        },
         Command::Explain {
             view,
             estimate,
@@ -858,12 +881,20 @@ fn run_management<T>(
 where
     T: serde::Serialize + Formattable,
 {
-    let result = ManagementCliClient::connect(
-        override_addr
-            .or(cli.management.as_deref())
-            .unwrap_or("127.0.0.1:9201"),
-    )
-    .and_then(|mut client| request(&mut client))
+    let result = match tls_config(cli) {
+        Some(tls) => ManagementCliClient::connect(
+            override_addr
+                .or(cli.management.as_deref())
+                .unwrap_or("127.0.0.1:9201"),
+            tls,
+        )
+        .and_then(|mut client| request(&mut client)),
+        None => Err(rockstream_cli::CliError::new(
+            rockstream_types::error_code::RS_2410,
+            "management API requires client mTLS credentials",
+            "Configure --tls-cert-path, --tls-key-path, and --tls-ca-cert-path for the management client.",
+        )),
+    }
     .map(|output| render_output(&output, format));
     handle_result(result, format)
 }
