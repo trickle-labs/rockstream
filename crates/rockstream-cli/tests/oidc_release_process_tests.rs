@@ -1958,6 +1958,15 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         .await
         .unwrap();
     let updated_jaas = "listener.name.plaintext.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotated=\"new-pass\" user_steady=\"steady-pass\";";
+    let write_jaas = broker
+        .exec(ExecCommand::new([
+            "sh",
+            "-c",
+            &format!("printf '%s\\n' '{updated_jaas}' > /tmp/rockstream-kafka-rotation.properties"),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(write_jaas.exit_code().await.unwrap(), Some(0));
     let mut update = broker
         .exec(ExecCommand::new([
             "/opt/kafka/bin/kafka-configs.sh",
@@ -1968,8 +1977,8 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             "--entity-name",
             "1",
             "--alter",
-            "--add-config",
-            updated_jaas,
+            "--add-config-file",
+            "/tmp/rockstream-kafka-rotation.properties",
         ]))
         .await
         .unwrap();
