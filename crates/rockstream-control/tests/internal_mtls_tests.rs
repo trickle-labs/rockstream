@@ -68,7 +68,11 @@ fn delegated_view_request() -> DeploymentRequest {
     }
 }
 
-fn sign_delegated_view_request(principal_id: PrincipalId, request: &DeploymentRequest) -> String {
+fn sign_delegated_view_request(
+    principal_id: PrincipalId,
+    request: &DeploymentRequest,
+    secret_use_scopes: &[PolicyScope],
+) -> String {
     let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let signer = ActorAssertionSigner::from_pkcs8_pem(
         &fixtures.join("actor-assertion-test-key.pem"),
@@ -86,6 +90,7 @@ fn sign_delegated_view_request(principal_id: PrincipalId, request: &DeploymentRe
                 kind: ResourceKind::View,
                 name: request.workload_name.clone(),
             },
+            secret_use_scopes.to_vec(),
             request_digest(&worker_request).unwrap(),
         )
         .unwrap()
@@ -531,7 +536,7 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
     gateway
         .deploy_delegated(
             request.clone(),
-            &sign_delegated_view_request(PrincipalId(2), &request),
+            &sign_delegated_view_request(PrincipalId(2), &request, &[]),
         )
         .await
         .unwrap();
@@ -559,6 +564,34 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
     .unwrap();
 
     set_actor_secret_use(&auth, true).await;
+    worker
+        .request_secret_token(request.workload_id, "kafka")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let records = auth.catalog.list_security_audit_records().await.unwrap();
+            if records.iter().any(|record| {
+                record.action == SecurityAuditClass::AuthorizationDenial
+                    && record.target == AuditField::Known("kafka".to_owned())
+                    && record.policy_revision == AuditField::Known(2)
+            }) {
+                assert!(worker
+                    .secret(request.workload_id, "kafka", current_time_secs())
+                    .is_none());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let assertion = sign_delegated_view_request(PrincipalId(2), &request, &[worker_secret_scope()]);
+    gateway
+        .deploy_delegated(request.clone(), &assertion)
+        .await
+        .unwrap();
     worker
         .request_secret_token(request.workload_id, "kafka")
         .await
@@ -617,7 +650,7 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
                 && record.target == AuditField::Known("kafka".to_owned())
         })
         .collect();
-    assert_eq!(denials.len(), 2);
+    assert_eq!(denials.len(), 3);
     assert!(denials.iter().all(|record| {
         record.actor == AuditIdentity::Verified("principal-2".to_owned())
             && record.scope == AuditField::Known(format!("{:?}", worker_secret_scope()))
@@ -625,6 +658,9 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
     assert!(denials
         .iter()
         .any(|record| record.policy_revision == AuditField::Known(1)));
+    assert!(denials
+        .iter()
+        .any(|record| record.policy_revision == AuditField::Known(2)));
     assert!(denials
         .iter()
         .any(|record| record.policy_revision == AuditField::Known(3)));
@@ -659,7 +695,7 @@ async fn gateway_actor_assertion_intersects_current_durable_policy() {
     )
     .unwrap();
     let request = delegated_view_request();
-    let assertion = sign_delegated_view_request(PrincipalId(1), &request);
+    let assertion = sign_delegated_view_request(PrincipalId(1), &request, &[]);
 
     let service = ControlService::new(TopologyCatalog::new())
         .with_security_catalog(auth.catalog.clone())
@@ -703,7 +739,7 @@ async fn gateway_actor_assertion_allows_independent_scoped_grant() {
     )
     .unwrap();
     let request = delegated_view_request();
-    let assertion = sign_delegated_view_request(PrincipalId(2), &request);
+    let assertion = sign_delegated_view_request(PrincipalId(2), &request, &[]);
     let enforcement_catalog = Arc::new(DurableCatalogStore::new(
         auth.store.clone(),
         "management-security",

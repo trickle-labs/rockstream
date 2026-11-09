@@ -172,9 +172,15 @@ struct DataPlaneState {
     operator_stats_waiters: HashMap<String, OperatorStatsWaiter>,
 }
 
+#[derive(Clone)]
+struct DelegatedActor {
+    principal_id: PrincipalId,
+    secret_use_scopes: Vec<PolicyScope>,
+}
+
 struct DeploymentState {
     request: DeploymentRequest,
-    actor_principal_id: Option<PrincipalId>,
+    actor: Option<DelegatedActor>,
     descriptors: HashMap<ShardId, DeploymentDescriptor>,
     workers: HashMap<WorkerId, WorkerExecutionStatus>,
     ready_shards: HashSet<ShardId>,
@@ -2182,7 +2188,7 @@ struct WorkloadDeploymentContext<'a> {
 
 async fn deploy_workload(
     request: DeploymentRequest,
-    actor_principal_id: Option<PrincipalId>,
+    actor: Option<DelegatedActor>,
     context: WorkloadDeploymentContext<'_>,
 ) {
     let WorkloadDeploymentContext {
@@ -2253,7 +2259,7 @@ async fn deploy_workload(
         workload_id,
         DeploymentState {
             request,
-            actor_principal_id,
+            actor,
             descriptors: descriptors.clone(),
             workers: HashMap::new(),
             ready_shards: HashSet::new(),
@@ -3230,7 +3236,7 @@ async fn authorize_gateway_actor_assertion(
     context: &GatewayActorAuthorizationContext<'_>,
     assertion: Option<&str>,
     request: &WorkerMessage,
-    authorized_actor: &mut Option<PrincipalId>,
+    authorized_actor: &mut Option<DelegatedActor>,
 ) -> bool {
     let Some(assertion) = assertion else {
         return reject_gateway_actor_assertion(
@@ -3381,7 +3387,10 @@ async fn authorize_gateway_actor_assertion(
     )
     .await;
     if audited && matches!(request, WorkerMessage::DeployWorkload(_)) {
-        *authorized_actor = Some(principal.id);
+        *authorized_actor = Some(DelegatedActor {
+            principal_id: principal.id,
+            secret_use_scopes: claims.secret_use_scopes().to_vec(),
+        });
     }
     audited
 }
@@ -3403,7 +3412,7 @@ async fn authorize_worker_secret_request(
             "durable secret authorization catalog is unavailable",
         )
     })?;
-    let (request, actor_principal_id) = {
+    let (request, delegated_actor) = {
         let state = data_plane.lock().await;
         let Some(deployment) = state.deployments.get(&workload_id) else {
             return Err(WorkerSecretAuthorizationError::Denied(
@@ -3419,7 +3428,7 @@ async fn authorize_worker_secret_request(
                 "worker is not assigned to this workload",
             ));
         }
-        (deployment.request.clone(), deployment.actor_principal_id)
+        (deployment.request.clone(), deployment.actor.clone())
     };
     let sources = catalog.list_sources().await.map_err(|_| {
         WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
@@ -3492,7 +3501,9 @@ async fn authorize_worker_secret_request(
         ));
     }
     let mut policy_revision = AuditField::NotApplicable;
-    if let Some(actor_id) = actor_principal_id {
+    let actor_principal_id = delegated_actor.as_ref().map(|actor| actor.principal_id);
+    if let Some(delegated_actor) = delegated_actor {
+        let actor_id = delegated_actor.principal_id;
         let Some(actor) = principals
             .iter()
             .find(|principal| principal.id == actor_id && principal.enabled)
@@ -3507,6 +3518,14 @@ async fn authorize_worker_secret_request(
         if !crate::authorization::allows(actor, SecurityAction::SecretUse, &scope) {
             return Err(WorkerSecretAuthorizationError::DeniedForActor {
                 message: "delegated actor is no longer authorized for secret use",
+                actor: actor_id,
+                scope,
+                policy_revision: AuditField::Known(actor.revision),
+            });
+        }
+        if !delegated_actor.secret_use_scopes.contains(&scope) {
+            return Err(WorkerSecretAuthorizationError::DeniedForActor {
+                message: "delegation assertion does not allow secret use for this scope",
                 actor: actor_id,
                 scope,
                 policy_revision: AuditField::Known(actor.revision),
