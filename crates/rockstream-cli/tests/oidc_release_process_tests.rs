@@ -2708,6 +2708,94 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             .as_ref(),
         foreign_content
     );
+    let live_expiry_id = uuid::Uuid::new_v4().to_string();
+    let live_expiry_content = b"{\"format_version\":1,\"safe\":\"live expiry fixture\"}";
+    let live_expiry_blob_path = support_artifact_object_path(&live_expiry_id);
+    let live_expiry_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 3_000;
+    let mut ledger: serde_json::Value = serde_json::from_slice(
+        &management_store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    management_store
+        .put(&live_expiry_blob_path, live_expiry_content.to_vec().into())
+        .await
+        .unwrap();
+    ledger["artifacts"][&live_expiry_id] = serde_json::json!({
+        "owner": PrincipalId(1),
+        "scope": PolicyScope::Cluster,
+        "size": live_expiry_content.len(),
+        "expires_at_ms": live_expiry_ms,
+    });
+    management_store
+        .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(
+        live_expiry_ms.saturating_sub(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        ),
+    ))
+    .await;
+    let expired_download = client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: live_expiry_id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(expired_download.code(), tonic::Code::NotFound);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let blob_deleted = match management_store.get(&live_expiry_blob_path).await {
+                Err(object_store::Error::NotFound { .. }) => true,
+                Err(error) => panic!("live expiry blob lookup failed: {error:?}"),
+                Ok(_) => false,
+            };
+            let ledger_bytes = management_store
+                .get(&ledger_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+            if blob_deleted
+                && !ledger["artifacts"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key(&live_expiry_id)
+            {
+                break ledger;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("live artifact cleanup must finish within 10 seconds");
+    assert_eq!(
+        management_store
+            .get(&first_blob_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        expected_content.as_bytes()
+    );
     process.0.kill().unwrap();
     process.0.wait().unwrap();
     // Seed expiry only after stopping the cleaner so startup recovery owns this fixture.
@@ -2847,6 +2935,10 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         opaque_id: pressure_id.clone(),
     })
     .unwrap();
+    let live_expiry_scope = serde_json::to_string(&PolicyScope::Artifact {
+        opaque_id: live_expiry_id.clone(),
+    })
+    .unwrap();
     let mut expected_audit = vec![
         SecurityAuditRecord {
             format_version: SECURITY_AUDIT_FORMAT_VERSION,
@@ -2935,6 +3027,21 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
                 })
                 .unwrap(),
             ),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        },
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "support-artifact".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known(format!("support-artifact:{live_expiry_id}")),
+            scope: AuditField::Known(live_expiry_scope),
             action: SecurityAuditClass::AuthorizationDenial,
             outcome: SecurityAuditOutcome::Denied,
             correlation: AuditCorrelation::Unknown,
