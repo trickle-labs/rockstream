@@ -267,7 +267,7 @@ jobs:
           retention-days: 14
 
   verus-verify:
-    name: Verus verify and qualify (VS6)
+    name: Verus verify and qualify (VS6) (${{ matrix.check_os }}, ${{ matrix.target }})
     timeout-minutes: 90
     needs: [ci-policy, verus-qualify]
     if: always()
@@ -276,8 +276,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            check_os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: macos-15
+            check_os: macos-14
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     env:
