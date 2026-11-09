@@ -1,5 +1,5 @@
 use rockstream_control::kek::EnvKekProvider;
-use rockstream_control::secret_store::{SecretStore, SecretStoreError};
+use rockstream_control::secret_store::{secret_key, SecretStore, SecretStoreError};
 use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{minio_object_store, start_minio};
@@ -7,7 +7,7 @@ use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
     SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
 };
-use rockstream_types::secret::SecretType;
+use rockstream_types::secret::{EncryptedSecret, SecretType};
 use slatedb::Db;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,6 +103,21 @@ async fn secrets_survive_lfs_reopen_and_kek_rotation_uses_point_keys() {
             .await
             .unwrap(),
     );
+    let stored_bytes = reopened_db
+        .get(&secret_key(0, "durable"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!stored_bytes
+        .windows(b"durable-secret".len())
+        .any(|window| window == b"durable-secret"));
+    let envelope: EncryptedSecret = serde_json::from_slice(&stored_bytes).unwrap();
+    assert_eq!(envelope.name, "durable");
+    assert_eq!(envelope.secret_type, SecretType::SaslPlain);
+    assert_eq!(envelope.kek_provider, "env");
+    assert!(!envelope.wrapped_dek.is_empty());
+    assert!(!envelope.ciphertext.is_empty());
+    assert_eq!(envelope.nonce.len(), 12);
     let reopened = SecretStore::new(
         Some(reopened_db.clone()),
         Arc::new(EnvKekProvider::from_passphrase("after")),
