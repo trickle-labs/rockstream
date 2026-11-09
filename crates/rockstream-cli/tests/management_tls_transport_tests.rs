@@ -13,6 +13,7 @@ use rockstream_cli::output::{
 use rockstream_cli::transport::ManagementCliClient;
 use rockstream_control::{
     ManagementOperationStore, ManagementService, ShardManager, TopologyCatalog,
+    MANAGEMENT_OPERATION_RECORD_VERSION,
 };
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
 use rockstream_test_support::pki::TestPki;
@@ -634,7 +635,29 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         .parse::<chrono::DateTime<chrono::FixedOffset>>()
         .is_ok());
     assert!(actual_status.source_version.starts_with("topology:"));
+    assert!(actual_status
+        .nodes
+        .iter()
+        .all(|node| node.source_version == actual_status.source_version));
+    let actual_capacity_headroom = actual_status
+        .nodes
+        .first()
+        .expect("status must include the registered worker")
+        .capacity_headroom;
+    assert!((0.0..=1.0).contains(&actual_capacity_headroom));
     let version = actual_status.source_version.clone();
+    let before_revision = before_workers
+        .source_version
+        .strip_prefix("topology:")
+        .expect("worker response must include a topology revision")
+        .parse::<u64>()
+        .expect("worker response topology revision must be numeric");
+    let actual_revision = version
+        .strip_prefix("topology:")
+        .expect("status response must include a topology revision")
+        .parse::<u64>()
+        .expect("status response topology revision must be numeric");
+    assert!(actual_revision >= before_revision);
     actual_status.observed_at = "<timestamp>".to_owned();
     actual_status.source_version = "<topology-version>".to_owned();
     for node in &mut actual_status.nodes {
@@ -652,7 +675,7 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
                 role: "worker".to_owned(),
                 address: "127.0.0.1:0".to_owned(),
                 state: "active".to_owned(),
-                capacity_headroom: before_workers.nodes[0].capacity_headroom,
+                capacity_headroom: actual_capacity_headroom,
                 host_id: "management-test-worker".to_owned(),
                 availability_zone: "management-test-zone".to_owned(),
                 healthy: true,
@@ -668,8 +691,6 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
             ack_waiter_capacity: 64,
         }
     );
-    assert_eq!(before_workers.source_version, version);
-
     let denied_status = run_management_cli(
         binary,
         management_addr,
@@ -724,9 +745,31 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         &["cluster", "workers", "list"],
     );
     let mut after_denied_drain: ManagementNodesInfo = parse_json(&after_denied_drain);
+    assert!(after_denied_drain
+        .observed_at
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .is_ok());
+    let denied_capacity_headroom = after_denied_drain
+        .nodes
+        .first()
+        .expect("denied drain must preserve the registered worker")
+        .capacity_headroom;
+    assert!((0.0..=1.0).contains(&denied_capacity_headroom));
+    assert!(after_denied_drain
+        .nodes
+        .iter()
+        .all(|node| node.source_version == after_denied_drain.source_version));
+    let denied_revision = after_denied_drain
+        .source_version
+        .strip_prefix("topology:")
+        .expect("denied-drain response must include a topology revision")
+        .parse::<u64>()
+        .expect("denied-drain topology revision must be numeric");
+    assert!(denied_revision >= actual_revision);
     let mut expected_after_denial = before_workers.clone();
     expected_after_denial.observed_at = "<timestamp>".to_owned();
     expected_after_denial.source_version = "<topology-version>".to_owned();
+    expected_after_denial.nodes[0].capacity_headroom = denied_capacity_headroom;
     expected_after_denial.nodes[0].registered_at_ms = 0;
     expected_after_denial.nodes[0].source_version = "<topology-version>".to_owned();
     after_denied_drain.observed_at = "<timestamp>".to_owned();
@@ -803,7 +846,7 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
             phase: "completed".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:2".to_owned(),
+            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
         }
     );
 
