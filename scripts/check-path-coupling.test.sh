@@ -8,7 +8,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 git -C "$TMP_ROOT" init -q
 git -C "$TMP_ROOT" config user.email test@example.com
 git -C "$TMP_ROOT" config user.name test
-mkdir -p "$TMP_ROOT/crates/rockstream-control" "$TMP_ROOT/crates/rockstream-storage/src/catalog" "$TMP_ROOT/formal/verus" "$TMP_ROOT/formal"
+mkdir -p "$TMP_ROOT/crates/rockstream-control" "$TMP_ROOT/crates/rockstream-storage/src/catalog" "$TMP_ROOT/crates/rockstream-runtime/src/exchange" "$TMP_ROOT/formal/verus" "$TMP_ROOT/formal"
 touch "$TMP_ROOT/README.md"
 git -C "$TMP_ROOT" add .
 git -C "$TMP_ROOT" commit -q -m baseline
@@ -32,7 +32,12 @@ assert_output "check-path-coupling: no changed files found for range 'HEAD~1..HE
 touch "$TMP_ROOT/crates/rockstream-storage/src/catalog/snapshot.rs"
 git -C "$TMP_ROOT" add .
 git -C "$TMP_ROOT" commit -q -m catalog-recovery-without-formal-model
-assert_output "check-path-coupling: only data-plane tests/benchmarks changed — OK."
+assert_output "check-path-coupling: only model-exempt files changed — OK."
+
+touch "$TMP_ROOT/crates/rockstream-runtime/src/exchange/multiplexer.rs"
+git -C "$TMP_ROOT" add .
+git -C "$TMP_ROOT" commit -q -m exchange-data-plane
+assert_output "check-path-coupling: only model-exempt files changed — OK."
 
 touch "$TMP_ROOT/crates/rockstream-control/src.rs"
 git -C "$TMP_ROOT" add .
@@ -48,4 +53,4 @@ git -C "$TMP_ROOT" add .
 git -C "$TMP_ROOT" commit -q -m coordination-with-model
 assert_output "check-path-coupling: coordination change accompanied by model touch — OK."
 
-echo "check-path-coupling tests: Verus-only and catalog recovery changes are excluded; protocol changes require model updates."
+echo "check-path-coupling tests: exchange data-plane and catalog recovery changes are excluded; protocol changes require model updates."

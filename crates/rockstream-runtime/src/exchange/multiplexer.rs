@@ -596,6 +596,12 @@ impl WorkerStreamMultiplexer {
                     )
                     .await?;
 
+                    // Reject corrupt input before recording it as received.
+                    let zset = crate::exchange::serialization::deserialize_zset(
+                        &payload,
+                        inlet.schema.clone(),
+                    )?;
+
                     // Persist to inbox db
                     crate::exchange::persistence::persist_inbox(
                         &db,
@@ -607,13 +613,19 @@ impl WorkerStreamMultiplexer {
                     )
                     .await?;
 
-                    // Deserialize ZSet and forward to target inlet
-                    let zset = crate::exchange::serialization::deserialize_zset(
-                        &payload,
-                        inlet.schema.clone(),
-                    )?;
                     if inlet.sender.send(zset).await.is_err() {
-                        tracing::warn!("Failed to forward durable shuffle batch to local inlet");
+                        crate::exchange::persistence::delete_inbox(
+                            &db,
+                            exchange_id,
+                            entry.src_shard,
+                            epoch,
+                            entry.seq,
+                        )
+                        .await?;
+                        return Err(
+                            "Failed to forward durable shuffle batch: target inlet is closed"
+                                .to_owned(),
+                        );
                     }
                 }
             }
