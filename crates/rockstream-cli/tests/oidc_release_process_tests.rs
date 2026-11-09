@@ -1069,100 +1069,6 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
     );
 }
 
-#[tokio::test]
-async fn release_control_rejects_valid_wrong_node_certificate_without_registration() {
-    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let temp = tempfile::tempdir().unwrap();
-    let storage = temp.path().join("control-storage");
-    let pki = rockstream_test_support::pki::TestPki::generate();
-    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut process =
-        start_control_process(temp.path(), &storage, address, &pki, None, false).await;
-    wait_for_gateway(&mut process.0, address).await;
-
-    let object_store = rockstream_storage::build_runtime_object_store(
-        &storage.join("gateway-shard"),
-        "gateway-shard",
-    )
-    .unwrap();
-    let catalog = DurableCatalogStore::recover(object_store, "gateway")
-        .await
-        .unwrap();
-    let mut principals_before = catalog.list_security_principals().await.unwrap();
-    principals_before.sort_by_key(|principal| principal.id);
-    let audit_before = catalog.list_security_audit_records().await.unwrap();
-
-    let worker_storage = temp.path().join("worker-storage");
-    let (worker, worker_handle) = rockstream_runtime::client::start_worker_client_with_tls(
-        2,
-        &address.to_string(),
-        &worker_storage,
-        pki.mismatched_worker_tls_config(),
-    )
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            catalog.refresh().await.unwrap();
-            if catalog
-                .list_security_audit_records()
-                .await
-                .unwrap()
-                .iter()
-                .any(|record| record.action == SecurityAuditClass::NodeIdentityRejection)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(worker.worker_id(), None);
-    worker_handle.abort();
-    let _ = worker_handle.await;
-    process.0.kill().unwrap();
-    process.0.wait().unwrap();
-
-    let recovered_store = rockstream_storage::build_runtime_object_store(
-        &storage.join("gateway-shard"),
-        "gateway-shard",
-    )
-    .unwrap();
-    let recovered = DurableCatalogStore::recover(recovered_store, "gateway")
-        .await
-        .unwrap();
-    let mut principals_after = recovered.list_security_principals().await.unwrap();
-    principals_after.sort_by_key(|principal| principal.id);
-    assert_eq!(principals_after, principals_before);
-    let records = recovered.list_security_audit_records().await.unwrap();
-    let rejections = &records[audit_before.len()..];
-    assert!(!rejections.is_empty());
-    for rejection in rejections {
-        assert!(rejection.event_id.starts_with("node-identity-rejection:"));
-        assert!(rejection.timestamp_ms > 0);
-        assert_eq!(
-            rejection,
-            &SecurityAuditRecord {
-                format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
-                event_id: rejection.event_id.clone(),
-                timestamp_ms: rejection.timestamp_ms,
-                actor: AuditIdentity::Unverified("worker:worker-999".to_owned()),
-                target: AuditField::Unverified("worker-2".to_owned()),
-                scope: AuditField::Known("cluster".to_owned()),
-                action: SecurityAuditClass::NodeIdentityRejection,
-                outcome: SecurityAuditOutcome::Denied,
-                correlation: AuditCorrelation::Unknown,
-                operation_id: AuditField::NotApplicable,
-                policy_revision: AuditField::NotApplicable,
-                before_state: AuditField::NotApplicable,
-                after_state: AuditField::NotApplicable,
-            }
-        );
-    }
-}
-
 fn parse_error_fields(payload: &[u8]) -> std::collections::BTreeMap<u8, String> {
     let mut fields = std::collections::BTreeMap::new();
     let mut cursor = 0;
@@ -2486,6 +2392,21 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
         start_control_process(temp.path(), &storage, address, &pki, None, false).await;
     wait_for_gateway(&mut process.0, address).await;
 
+    let security_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let mut principals_before = security_catalog.list_security_principals().await.unwrap();
+    principals_before.sort_by_key(|principal| principal.id);
+    let audit_before = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+
     let (client, worker_handle) = rockstream_runtime::start_worker_client_with_tls(
         1,
         &address.to_string(),
@@ -2502,10 +2423,18 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let events = FileAuditLog::open(&audit_path).unwrap().read_all().unwrap();
+        security_catalog.refresh().await.unwrap();
+        let security_audit = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
         if events.iter().any(|event| {
             event.action == "security.internal_mtls_denied"
                 && event.detail.as_deref() == Some(expected_detail)
-        }) {
+        }) && security_audit
+            .iter()
+            .any(|record| record.action == SecurityAuditClass::NodeIdentityRejection)
+        {
             break;
         }
         assert!(
@@ -2531,6 +2460,43 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
     assert_eq!(denial.actor, "worker:worker-999");
     assert!(denial.resource.starts_with("worker_id=worker-1, peer="));
     assert_eq!(denial.error_code.as_deref(), Some("RS-2412"));
+
+    let recovered_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let recovered = DurableCatalogStore::recover(recovered_store, "gateway")
+        .await
+        .unwrap();
+    let mut principals_after = recovered.list_security_principals().await.unwrap();
+    principals_after.sort_by_key(|principal| principal.id);
+    assert_eq!(principals_after, principals_before);
+    let security_audit = recovered.list_security_audit_records().await.unwrap();
+    let rejections = &security_audit[audit_before.len()..];
+    assert!(!rejections.is_empty());
+    for rejection in rejections {
+        assert!(rejection.event_id.starts_with("node-identity-rejection:"));
+        assert!(rejection.timestamp_ms > 0);
+        assert_eq!(
+            rejection,
+            &SecurityAuditRecord {
+                format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: rejection.event_id.clone(),
+                timestamp_ms: rejection.timestamp_ms,
+                actor: AuditIdentity::Unverified("worker:worker-999".to_owned()),
+                target: AuditField::Unverified("worker-1".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::NodeIdentityRejection,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::NotApplicable,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+    }
 }
 
 #[cfg(unix)]
