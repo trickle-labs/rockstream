@@ -167,6 +167,7 @@ async fn provision_view_author(auth: &management_auth::ManagementAuth) {
 }
 
 async fn revoke_view_author(auth: &management_auth::ManagementAuth) {
+    auth.catalog.refresh().await.unwrap();
     let mut principal = auth
         .catalog
         .get_security_principal(PrincipalId(2))
@@ -333,6 +334,7 @@ async fn provision_worker_secret_source(auth: &management_auth::ManagementAuth) 
 }
 
 async fn set_actor_secret_use(auth: &management_auth::ManagementAuth, allowed: bool) {
+    auth.catalog.refresh().await.unwrap();
     let mut actor = auth
         .catalog
         .get_security_principal(PrincipalId(2))
@@ -483,8 +485,12 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
         "test-deployment",
     )
     .unwrap();
+    let enforcement_catalog = Arc::new(DurableCatalogStore::new(
+        auth.store.clone(),
+        "management-security",
+    ));
     let service = ControlService::new(TopologyCatalog::new())
-        .with_security_catalog(auth.catalog.clone())
+        .with_security_catalog(enforcement_catalog)
         .with_secret_store(secret_store)
         .with_internal_tls(auth.pki.control_tls_config())
         .with_actor_assertion_verifier(verifier);
@@ -540,6 +546,7 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            auth.catalog.refresh().await.unwrap();
             let records = auth.catalog.list_security_audit_records().await.unwrap();
             if records.iter().any(|record| {
                 record.action == SecurityAuditClass::AuthorizationDenial
@@ -617,6 +624,7 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
     })
     .await;
     if refresh_result.is_err() {
+        auth.catalog.refresh().await.unwrap();
         let records = auth.catalog.list_security_audit_records().await.unwrap();
         let denials = records
             .iter()
@@ -633,6 +641,7 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
             .is_some();
         panic!("periodic secret reauthorization did not revoke the cache; denials={denials}, active={active}, targets={targets:?}");
     }
+    auth.catalog.refresh().await.unwrap();
     let records = auth.catalog.list_security_audit_records().await.unwrap();
     let denials: Vec<_> = records
         .iter()
@@ -731,9 +740,13 @@ async fn gateway_actor_assertion_allows_independent_scoped_grant() {
     .unwrap();
     let request = delegated_view_request();
     let assertion = sign_delegated_view_request(PrincipalId(2), &request, &[]);
+    let enforcement_catalog = Arc::new(DurableCatalogStore::new(
+        auth.store.clone(),
+        "management-security",
+    ));
 
     let service = ControlService::new(TopologyCatalog::new())
-        .with_security_catalog(auth.catalog.clone())
+        .with_security_catalog(enforcement_catalog)
         .with_internal_tls(auth.pki.control_tls_config())
         .with_actor_assertion_verifier(verifier);
     let handle = service.start("127.0.0.1:0").await.unwrap();
@@ -750,6 +763,7 @@ async fn gateway_actor_assertion_allows_independent_scoped_grant() {
         .deploy_delegated(request, &assertion)
         .await
         .unwrap_err();
+    auth.catalog.refresh().await.unwrap();
     let records = auth.catalog.list_security_audit_records().await.unwrap();
     let denied = records
         .iter()

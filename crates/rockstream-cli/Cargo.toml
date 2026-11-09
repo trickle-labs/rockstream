@@ -54,7 +54,8 @@ rustls-pemfile.workspace = true
 chrono.workspace = true
 rockstream-sim = { workspace = true }
 testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["kafka"] }
+rdkafka.workspace = true
 tokio = { workspace = true }
 async-trait = { workspace = true }
 

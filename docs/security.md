@@ -16,6 +16,16 @@ grants `secret.use`. A gateway running without a durable authenticated policy
 denies secret administration. Secret input remains write-only, and no SQL GET
 returns an existing secret value.
 
+Each `ALTER SECRET` also requires a client-generated UUID set with
+`SET rockstream.idempotency_key` before the mutation. Keep that UUID until the
+result is known and reuse it with the exact same request after a timeout or
+restart; the gateway returns the original `ALTER SECRET` result without another
+rotation or audit event. The deployment-local durable binding includes the
+authenticated actor, secret scope, and canonical request digest. A changed
+request using the same UUID, or a retry after the existing 90-day idempotency
+window, is rejected with `RS-2424`; use a new UUID for a new rotation.
+`DISCARD ALL` clears the session key.
+
 Applications can inject an `AwsKmsKekProvider::new(key_arn, region)` into a
 `SecretStore` and supply that store through `ControlService::with_secret_store`.
 Supplying an ARN alone does not select this provider in the default services.
@@ -112,6 +122,12 @@ boundary. SCRAM-SHA-256 requires a recovered durable principal store with an
 enabled SCRAM login; startup rejects an unavailable or empty store. MD5 is not
 a release authentication mode. Enabling these startup paths does not satisfy
 the v0.73 ten-case release qualification gate by itself.
+
+Gateway authorization reads current in-process policy for new operations and
+refreshes durable policy from other processes at most every 30 seconds, within
+the v0.73 60-second revocation maximum. Active subscriptions recheck before
+delivering rows at the same interval; a revoked subscription stops after the
+recheck. A failed policy refresh fails protected authorization closed.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 

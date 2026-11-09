@@ -1,4 +1,4 @@
-# Real Kafka and MinIO worker, ACK, sink-cursor, and bounded ENOSPC recovery; no p99 claim.
+# Real Kafka/MinIO recovery and Kafka secret-rotation qualification; no p99 claim.
 
 name: Real Cluster Chaos Soak
 
@@ -64,6 +64,8 @@ jobs:
         run: |
           bash scripts/check-qualification-mutations.test.sh
           cargo test --locked -p rockstream-sim --lib qualification::worker_failure
+      - name: Qualify Kafka secret rotation across maintained views
+        run: cargo test --locked -p rockstream-cli --test oidc_release_process_tests kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers -- --exact --test-threads=1
       - name: Qualify observed worker-failure recovery and corrupted records
         run: bash scripts/run-release-qualification.sh --suite recovery --output target/real-cluster-chaos/qualification.json
       - name: Reject stale-owner writes, ACKs, and frontier reports
