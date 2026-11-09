@@ -3903,7 +3903,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "quick-xml",
- "rand 0.10.1",
+ "rand 0.10.3",
  "reqwest 0.13.5",
  "rustls-pki-types",
  "serde",
@@ -4270,7 +4270,7 @@ dependencies = [
  "hmac 0.13.0",
  "md-5",
  "memchr",
- "rand 0.10.1",
+ "rand 0.10.3",
  "sha2 0.11.0",
  "stringprep",
 ]
@@ -4579,7 +4579,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.2",
  "lru-slab",
- "rand 0.10.1",
+ "rand 0.10.3",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -4650,9 +4650,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.1"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.2",
@@ -4728,6 +4728,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
 dependencies = [
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_xoshiro"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "662effc7698e08ea324d3acccf8d9d7f7bf79b9785e270a174ea36e56900c91d"
+dependencies = [
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -5458,7 +5467,7 @@ dependencies = [
  "serial_test",
  "sha2 0.10.9",
  "slatedb",
- "slatedb-common",
+ "slatedb-common 0.18.0",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
@@ -6033,7 +6042,7 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
- "slatedb-common",
+ "slatedb-common 0.16.0",
  "slatedb-txn-obj",
  "smallvec",
  "sysinfo",
@@ -6057,8 +6066,27 @@ dependencies = [
  "log",
  "object_store 0.14.2",
  "rand 0.9.4",
- "rand_xoshiro",
+ "rand_xoshiro 0.7.0",
  "serde",
+ "thread_local",
+ "tokio",
+]
+
+[[package]]
+name = "slatedb-common"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b4bc81b9976656a06649896cc62d44d45eb9b9125a8b8b5c0ffd5469915bca2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "log",
+ "lru",
+ "object_store 0.14.2",
+ "parking_lot",
+ "rand 0.10.3",
+ "rand_xoshiro 0.8.1",
  "thread_local",
  "tokio",
 ]
@@ -6076,7 +6104,7 @@ dependencies = [
  "log",
  "object_store 0.14.2",
  "parking_lot",
- "slatedb-common",
+ "slatedb-common 0.16.0",
  "thiserror 1.0.69",
 ]
 
@@ -6532,7 +6560,7 @@ dependencies = [
  "pin-project-lite",
  "postgres-protocol",
  "postgres-types",
- "rand 0.10.1",
+ "rand 0.10.3",
  "socket2 0.6.4",
  "tokio",
  "tokio-util",
