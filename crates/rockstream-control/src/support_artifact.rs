@@ -406,6 +406,60 @@ mod tests {
     use object_store::memory::InMemory;
 
     #[tokio::test]
+    async fn reserved_artifact_is_written_when_retried_after_store_restart() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = SupportArtifactStore::new(Arc::clone(&object_store));
+        store.initialize().await.unwrap();
+        let id = "reserved-artifact".to_owned();
+        let now_ms = 1_000_000;
+        let expires_at_ms = now_ms + ARTIFACT_TTL.as_millis() as u64;
+        let content: Arc<[u8]> = Arc::from(b"{\"safe\":\"resumed\"}".to_vec());
+        let expiry = ArtifactExpiry {
+            unix_ms: expires_at_ms,
+        };
+        let reservation = LedgerArtifact {
+            owner: PrincipalId(7),
+            scope: PolicyScope::Cluster,
+            size: content.len(),
+            expires_at_ms,
+        };
+        store
+            .mutate_ledger(|ledger| {
+                ledger.artifacts.insert(id.clone(), reservation.clone());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let restarted = SupportArtifactStore::new(object_store);
+        restarted.initialize().await.unwrap();
+        restarted
+            .insert(
+                id,
+                PrincipalId(7),
+                PolicyScope::Cluster,
+                content.clone(),
+                expiry,
+                now_ms,
+            )
+            .await
+            .unwrap();
+        let metadata = restarted
+            .metadata("reserved-artifact", now_ms)
+            .await
+            .unwrap();
+        assert_eq!(metadata.owner, reservation.owner);
+        assert_eq!(metadata.scope, reservation.scope);
+        assert_eq!(metadata.expires_at_ms, reservation.expires_at_ms);
+        let (downloaded, downloaded_expiry, _) = restarted
+            .download("reserved-artifact", PrincipalId(7), now_ms)
+            .await
+            .unwrap();
+        assert_eq!(downloaded.as_ref(), content.as_ref());
+        assert_eq!(downloaded_expiry, expires_at_ms);
+    }
+
+    #[tokio::test]
     async fn artifacts_are_shared_actor_bound_and_expire_at_the_deadline() {
         let object_store = Arc::new(InMemory::new());
         let store = SupportArtifactStore::new(object_store.clone());
