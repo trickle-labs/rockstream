@@ -93,13 +93,21 @@ impl CliContributor {
             },
         ];
 
-        let mut error_codes = vec![
-            "RS-0001".to_string(),
-            "RS-1001".to_string(),
-            "RS-1012".to_string(),
-            "RS-1013".to_string(),
-            "RS-2001".to_string(),
-        ];
+        let mut error_codes = if matches!(name.as_str(), "security" | "preprovision-admin") {
+            vec![
+                "RS-0002".to_string(),
+                "RS-0003".to_string(),
+                "RS-0005".to_string(),
+            ]
+        } else {
+            vec![
+                "RS-0001".to_string(),
+                "RS-1001".to_string(),
+                "RS-1012".to_string(),
+                "RS-1013".to_string(),
+                "RS-2001".to_string(),
+            ]
+        };
         error_codes.sort();
 
         CliCommandDescriptor {
@@ -110,5 +118,33 @@ impl CliContributor {
             exit_codes,
             error_codes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliContributor;
+
+    #[test]
+    fn offline_security_command_documents_its_actual_error_codes() {
+        let surface = CliContributor::extract();
+        let security = surface
+            .commands
+            .iter()
+            .find(|command| command.name == "security")
+            .unwrap();
+        let preprovision = security
+            .subcommands
+            .iter()
+            .find(|command| command.name == "preprovision-admin")
+            .unwrap();
+        let expected = vec![
+            "RS-0002".to_string(),
+            "RS-0003".to_string(),
+            "RS-0005".to_string(),
+        ];
+
+        assert_eq!(security.error_codes, expected);
+        assert_eq!(preprovision.error_codes, expected);
     }
 }

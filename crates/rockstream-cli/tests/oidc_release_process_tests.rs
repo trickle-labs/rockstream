@@ -311,6 +311,80 @@ fn oidc_bootstrap_administrator() -> SecurityPrincipal {
     }
 }
 
+fn expected_bootstrap_audit(
+    principal: &SecurityPrincipal,
+    operation_id: u64,
+    timestamp_ms: u64,
+) -> SecurityAuditRecord {
+    let policy = serde_json::to_string(&(
+        principal.enabled,
+        &principal.preset_grants,
+        &principal.scoped_grants,
+    ))
+    .unwrap();
+    SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("first-admin-bootstrap:{operation_id}"),
+        timestamp_ms,
+        actor: AuditIdentity::Unknown,
+        target: AuditField::Known(format!("principal:{}", principal.id.0)),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known(operation_id.to_string()),
+        policy_revision: AuditField::Known(principal.revision),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision={};policy={policy}", principal.revision)),
+    }
+}
+
+#[tokio::test]
+async fn security_preprovision_uses_all_role_catalog_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("node-storage");
+    let principal = oidc_bootstrap_administrator();
+    let principal_file = temp.path().join("administrator.json");
+    std::fs::write(&principal_file, serde_json::to_vec(&principal).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .arg("--json")
+        .arg("security")
+        .arg("preprovision-admin")
+        .arg("--storage")
+        .arg(&storage)
+        .arg("--layout")
+        .arg("all")
+        .arg("--principal-file")
+        .arg(&principal_file)
+        .arg("--operation-id")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "{\n  \"principal_id\": 1,\n  \"catalog_revision\": 1\n}\n"
+    );
+
+    let store =
+        rockstream_storage::build_runtime_object_store(&storage.join("shards/0"), "shards/0")
+            .unwrap();
+    let catalog = DurableCatalogStore::recover(store, "db").await.unwrap();
+    assert_eq!(
+        catalog.get_security_principal(principal.id).await.unwrap(),
+        Some(principal.clone())
+    );
+    let audit_records = catalog.list_security_audit_records().await.unwrap();
+    let expected_audit = expected_bootstrap_audit(&principal, 1, audit_records[0].timestamp_ms);
+    assert!(expected_audit.timestamp_ms > 0);
+    assert_eq!(audit_records, vec![expected_audit]);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_gateway_process(
     working_dir: &Path,
@@ -659,15 +733,66 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("node-storage");
     let shard_dir = storage.join("gateway-shard");
-    let store =
-        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
-    let durable = DurableCatalogStore::new(store.clone(), "gateway");
     let administrator = oidc_bootstrap_administrator();
     let reader = oidc_principal();
-    durable
-        .preprovision_first_administrator(administrator.clone(), 1)
+    let principal_file = temp.path().join("administrator.json");
+    std::fs::write(&principal_file, serde_json::to_vec(&administrator).unwrap()).unwrap();
+    let run_bootstrap = || {
+        Command::new(env!("CARGO_BIN_EXE_rockstream"))
+            .arg("--json")
+            .arg("security")
+            .arg("preprovision-admin")
+            .arg("--storage")
+            .arg(&storage)
+            .arg("--layout")
+            .arg("gateway")
+            .arg("--principal-file")
+            .arg(&principal_file)
+            .arg("--operation-id")
+            .arg("1")
+            .arg("--yes")
+            .output()
+            .unwrap()
+    };
+    let expected_output = "{\n  \"principal_id\": 1,\n  \"catalog_revision\": 1\n}\n";
+    let first_bootstrap = run_bootstrap();
+    assert!(
+        first_bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_bootstrap.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(first_bootstrap.stdout).unwrap(),
+        expected_output
+    );
+    let retry_bootstrap = run_bootstrap();
+    assert!(
+        retry_bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry_bootstrap.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(retry_bootstrap.stdout).unwrap(),
+        expected_output
+    );
+
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let durable = DurableCatalogStore::recover(store, "gateway")
         .await
         .unwrap();
+    assert_eq!(
+        durable
+            .get_security_principal(administrator.id)
+            .await
+            .unwrap(),
+        Some(administrator.clone())
+    );
+    let audit_records = durable.list_security_audit_records().await.unwrap();
+    let bootstrap_audit =
+        expected_bootstrap_audit(&administrator, 1, audit_records[0].timestamp_ms);
+    assert!(bootstrap_audit.timestamp_ms > 0);
+    assert_eq!(audit_records, vec![bootstrap_audit]);
     let reader_policy =
         serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
             .unwrap();

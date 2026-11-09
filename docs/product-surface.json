@@ -3283,6 +3283,105 @@
         ]
       },
       {
+        "name": "security",
+        "about": "Offline security administration against the durable catalog",
+        "subcommands": [
+          {
+            "name": "preprovision-admin",
+            "about": "Preprovision the first administrator before opening application listeners",
+            "options": [
+              {
+                "name": "layout",
+                "long": "layout",
+                "help": "Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`",
+                "required": true,
+                "value_name": "LAYOUT",
+                "possible_values": [
+                  "all",
+                  "gateway"
+                ]
+              },
+              {
+                "name": "operation_id",
+                "long": "operation-id",
+                "help": "Stable catalog operation ID to reuse if this command must be retried",
+                "required": true,
+                "value_name": "OPERATION_ID"
+              },
+              {
+                "name": "principal_file",
+                "long": "principal-file",
+                "help": "JSON-serialized SecurityPrincipal containing an enabled interactive cluster administrator",
+                "required": true,
+                "value_name": "PRINCIPAL_FILE"
+              },
+              {
+                "name": "storage",
+                "long": "storage",
+                "help": "Node storage directory used by `start --storage` for this deployment",
+                "required": true,
+                "value_name": "STORAGE"
+              },
+              {
+                "name": "yes",
+                "long": "yes",
+                "help": "Confirm the deployment is stopped and the selected durable store is correct",
+                "required": false,
+                "value_name": "YES",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0002",
+              "RS-0003",
+              "RS-0005"
+            ]
+          }
+        ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0002",
+          "RS-0003",
+          "RS-0005"
+        ]
+      },
+      {
         "name": "shard",
         "about": "Shard inspection commands",
         "subcommands": [

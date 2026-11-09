@@ -31,6 +31,7 @@ pub enum OperationKind {
     MigrateShard,
     CreateBackup,
     GenerateSupportArtifact,
+    SecurityPrincipalGrants,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +83,8 @@ pub struct OperationRecord {
     request: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_audit: Option<SecurityAuditRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
 }
 
 /// Durable binding of one client idempotency key to one accepted operation.
@@ -135,6 +138,7 @@ impl OperationRecord {
             next_steps: Vec::new(),
             request,
             pending_audit: None,
+            result: None,
         }
     }
 
@@ -184,6 +188,10 @@ impl OperationRecord {
 
     pub fn request(&self) -> Option<&serde_json::Value> {
         self.request.as_ref()
+    }
+
+    pub fn result(&self) -> Option<&serde_json::Value> {
+        self.result.as_ref()
     }
 
     pub fn apply_update(&mut self, update: OperationUpdate) -> Result<(), OperationLifecycleError> {
@@ -700,7 +708,17 @@ impl ManagementOperationStore {
         operation_id: &str,
         update: OperationUpdate,
     ) -> Result<OperationRecord, OperationStoreError> {
-        self.write_transition(operation_id, None, None, update, None)
+        self.write_transition(operation_id, None, None, update, None, None)
+            .await
+    }
+
+    pub async fn transition_with_result(
+        &self,
+        operation_id: &str,
+        update: OperationUpdate,
+        result: serde_json::Value,
+    ) -> Result<OperationRecord, OperationStoreError> {
+        self.write_transition(operation_id, None, None, update, None, Some(result))
             .await
     }
 
@@ -716,6 +734,7 @@ impl ManagementOperationStore {
             Some(expected_status),
             expected_phase,
             update,
+            None,
             None,
         )
         .await
@@ -735,6 +754,26 @@ impl ManagementOperationStore {
             expected_phase,
             update,
             Some(audit),
+            None,
+        )
+        .await
+    }
+
+    pub async fn transition_if_with_result(
+        &self,
+        operation_id: &str,
+        expected_status: OperationStatus,
+        expected_phase: Option<&str>,
+        update: OperationUpdate,
+        result: serde_json::Value,
+    ) -> Result<OperationRecord, OperationStoreError> {
+        self.write_transition(
+            operation_id,
+            Some(expected_status),
+            expected_phase,
+            update,
+            None,
+            Some(result),
         )
         .await
     }
@@ -795,6 +834,7 @@ impl ManagementOperationStore {
         expected_phase: Option<&str>,
         update: OperationUpdate,
         pending_audit: Option<SecurityAuditRecord>,
+        result: Option<serde_json::Value>,
     ) -> Result<OperationRecord, OperationStoreError> {
         let _guard = self.write_lock.lock().await;
         let (mut record, previous_bytes) = self
@@ -816,6 +856,9 @@ impl ManagementOperationStore {
                 ));
             }
             record.pending_audit = Some(audit);
+        }
+        if let Some(result) = result {
+            record.result = Some(result);
         }
         let payload = serde_json::to_vec(&record)
             .map_err(|error| OperationStoreError::Serialization(error.to_string()))?;

@@ -2,13 +2,13 @@
 
 The management API exposes typed status reads and long-running administrative operations. The protocol source is [`management.proto`](../../crates/rockstream-management-proto/proto/management/v1/management.proto).
 
-**Qualification status:** v0.66 is signed off. The v0.73 support-artifact API is implemented but has not completed release qualification. `CreateBackup` runs only when the server has an attached shard store. Health telemetry remains unavailable, so health is `unknown`.
+**Qualification status:** v0.66 is signed off. The v0.73 mTLS principal, scoped-grant, and support-artifact paths are implemented in part and still require release qualification. `CreateBackup` runs only when the server has an attached shard store. Health remains `unknown` until authoritative process-health telemetry is available.
 
 ## Endpoint and protocol
 
 `control.management_addr` selects the server address. Its default is `127.0.0.1:9201`. The CLI uses that address unless you pass `--management`.
 
-The service uses tonic over HTTP/2 with mutual TLS. The server maps the verified client certificate fingerprint to an enabled principal in the durable security catalog and checks that principal's current scoped grants on each request. Management calls fail closed if the security catalog or required audit storage is unavailable. CLI callers must provide the CA certificate, client certificate, and private key.
+The service uses tonic over HTTP/2 with mutual TLS. The verified CLI client certificate fingerprint must map to an enabled durable principal. Each RPC checks that principal's current persisted grants; a CLI role flag does not grant authority. Management calls fail closed if the security catalog or required audit storage is unavailable. See [security.md](../security.md) for certificate setup and policy.
 
 The protocol version is `1`. Every request carries `protocol_version`. The server returns `FAILED_PRECONDITION` for an unsupported version.
 
@@ -23,6 +23,8 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 | `GetShard` | Returns one current shard lease or `NOT_FOUND`. |
 | `ListOperations` | Returns a page of retained operation records. |
 | `GetOperation` | Returns one operation or `NOT_FOUND`. |
+| `ListSecurityPrincipals` | Returns safe principal, fixed-preset, scoped-grant, and effective-permission data to a principal authorized for grant management. Login credentials are omitted. |
+| `SetSecurityPrincipalGrants` | Replaces an existing principal's grants after checking the reviewed target and grantor revisions. Persists the operation before applying the change and commits the grant record with its audit event. |
 | `GetConfigSummary` | Returns effective configuration values and redaction flags. |
 | `GetCapabilities` | Returns the methods attached to this server. |
 | `GetHealth` | Returns `unknown` until the process registers authoritative health telemetry. |
@@ -76,7 +78,7 @@ A successful `DrainWorker` result requires a matching recipient-open acknowledge
 
 `Shard` reports its owner and lease token. `key_range_known` is false and `key_range` is empty because the current lease store does not publish key ranges.
 
-`Operation` reports an identifier, kind, state, start and update times, progress, phase, error code, next steps, and source record version. The states are `Pending`, `Running`, `Waiting`, `Succeeded`, `Failed`, and `Cancelled`. The server persists times as Unix milliseconds and renders them as RFC 3339 UTC.
+`Operation` reports an identifier, kind, state, start and update times, progress, phase, error code, next steps, source record version, and (when authorized) a complete `result_json`. Operation listings omit result contents. For grant changes, the grantor or a current grant manager can use `GetOperation` to recover the safe committed grant result. The states are `Pending`, `Running`, `Waiting`, `Succeeded`, `Failed`, and `Cancelled`. The server persists times as Unix milliseconds and renders them as RFC 3339 UTC.
 
 `GetConfigSummary` marks each redacted value with `redacted=true`. It does not return the original secret.
 
@@ -84,11 +86,11 @@ A successful `DrainWorker` result requires a matching recipient-open acknowledge
 
 `page_size=0` selects the default of 50. The maximum page size is 100. Page tokens are decimal offsets; malformed or out-of-range tokens return `INVALID_ARGUMENT`.
 
-The server admits at most 64 concurrent management requests and 64 ACK waiters for each attached migration or backup executor. It limits gRPC messages to 1 MiB and support-artifact chunks to 64 KiB. The operation store retains at most 1,000 active records and 10,000 total records. Terminal records and idempotency keys remain bound for 90 days. Each operation accepts at most 64 state transitions.
+The server admits at most 64 concurrent management requests and 64 ACK waiters for each attached migration or backup executor. It limits gRPC messages to 1 MiB and support-artifact chunks to 64 KiB. The operation store retains at most 1,000 active records and 10,000 total records. Terminal records and idempotency bindings remain for 90 days. Each operation accepts at most 64 state transitions. Operation record version 4 adds durable mutation results and audit outbox state while migrating versions 1 through 3.
 
 ## Idempotency and cancellation
 
-`DrainWorker`, `MigrateShard`, and `CreateBackup` accept an `idempotency_key`. The server binds the key to the protocol version, operation kind, request digest, and operation ID before it dispatches work. An exact retry returns the same record. A changed request under the same key returns `ALREADY_EXISTS`. An expired key returns `FAILED_PRECONDITION`.
+`DrainWorker`, `MigrateShard`, and `CreateBackup` accept an `idempotency_key`. `SetSecurityPrincipalGrants` requires a canonical client-generated UUID; the same UUID is its operation ID. The server binds it to the protocol version, authenticated grantor, deployment context, target, reviewed revisions, and requested grants before applying the change. An exact retry returns the original operation and result. A changed request under the same key returns `ALREADY_EXISTS` without changing policy. An expired key returns `FAILED_PRECONDITION`. The authorized `GetOperation` RPC reconciles a lost response; submit the original UUID and never resubmit the mutation with a new key.
 
 The valid status transitions are:
 
@@ -111,6 +113,6 @@ Cancellation is allowed before lease transfer. A migration cancelled during dono
 
 Management RPC errors retain their gRPC status. The CLI currently maps management status errors to `RS-0003`, so automation cannot distinguish every gRPC failure through the CLI output.
 
-The management endpoint has no TLS or server-side role check. Do not expose it to an untrusted network. The CLI's local identity flags do not authenticate a caller to the management service.
+`SetSecurityPrincipalGrants` updates grants on an existing principal. Principal creation, deletion, login-method changes, password changes, and their bootstrap workflows have separate interfaces and are not implemented by this RPC. The CLI's local identity flags do not authenticate a caller to the management service.
 
 The server has no authoritative process-health telemetry, so `GetHealth` returns `unknown`. This is the qualified behavior for v0.66; the limitation remains explicit until health telemetry is implemented.
