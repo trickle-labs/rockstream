@@ -1958,23 +1958,6 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         .await
         .unwrap();
     let updated_jaas = "listener.name.plaintext.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotated=\"new-pass\" user_steady=\"steady-pass\";";
-    let write_config_script =
-        format!("printf '%s\\n' '{updated_jaas}' > /tmp/rockstream-kafka-rotation.properties");
-    let mut write_config = broker
-        .exec(ExecCommand::new([
-            "/bin/sh",
-            "-c",
-            write_config_script.as_str(),
-        ]))
-        .await
-        .unwrap();
-    let write_stdout = String::from_utf8(write_config.stdout_to_vec().await.unwrap()).unwrap();
-    let write_stderr = String::from_utf8(write_config.stderr_to_vec().await.unwrap()).unwrap();
-    assert_eq!(
-        write_config.exit_code().await.unwrap(),
-        Some(0),
-        "stdout={write_stdout}; stderr={write_stderr}"
-    );
     let mut update = broker
         .exec(ExecCommand::new([
             "/opt/kafka/bin/kafka-configs.sh",
@@ -1985,8 +1968,8 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             "--entity-name",
             "1",
             "--alter",
-            "--add-config-file",
-            "/tmp/rockstream-kafka-rotation.properties",
+            "--add-config",
+            updated_jaas,
         ]))
         .await
         .unwrap();
@@ -1998,6 +1981,36 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         "stdout={update_output}; stderr={update_stderr}"
     );
     assert_eq!(update_output, "Completed updating config for broker 1.\n");
+    let mut describe = broker
+        .exec(ExecCommand::new([
+            "/opt/kafka/bin/kafka-configs.sh",
+            "--bootstrap-server",
+            "localhost:9093",
+            "--entity-type",
+            "brokers",
+            "--entity-name",
+            "1",
+            "--describe",
+        ]))
+        .await
+        .unwrap();
+    let describe_output = String::from_utf8(describe.stdout_to_vec().await.unwrap()).unwrap();
+    assert_eq!(describe.exit_code().await.unwrap(), Some(0));
+    assert!(
+        describe_output.contains("listener.name.plaintext.plain.sasl.jaas.config"),
+        "broker did not report the dynamic SASL JAAS override"
+    );
+    let mut rotated_client = kafka_sasl_client(&bootstrap, "rotated", "new-pass");
+    rotated_client.set("message.timeout.ms", "10000");
+    let rotated_producer: FutureProducer = rotated_client.create().unwrap();
+    let rotation_probe = [(49_999, Some(499_990), 1)];
+    kafka_source_rows(&rotated_producer, "rotating-orders", &rotation_probe).await;
+    expected_rotating.extend(
+        rotation_probe
+            .iter()
+            .map(|(id, amount, _)| row(*id, *amount)),
+    );
+    expected_rotating.sort();
     let rotation = client
         .simple_query("ALTER SECRET kafka_auth SET (USERNAME = 'rotated', PASSWORD = 'new-pass')")
         .await
@@ -2020,9 +2033,6 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         .await;
     }
 
-    let rotated_producer: FutureProducer = kafka_sasl_client(&bootstrap, "rotated", "new-pass")
-        .create()
-        .unwrap();
     let after_rotation = [(50_000, None, 1)];
     kafka_source_rows(&rotated_producer, "rotating-orders", &after_rotation).await;
     expected_rotating.push(row(50_000, None));
