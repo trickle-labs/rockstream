@@ -11,6 +11,7 @@
 //! All user/operator-visible failures carry an `RS-XXXX` error code with
 //! actionable `next_steps` text (see [`CliError`]).
 
+use crate::cli_args::SecurityCatalogLayout;
 use crate::output::OutputFormat;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
@@ -504,6 +505,100 @@ pub async fn start_gateway(
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
     start_gateway_with_catalog_and_dev_transport(opts, catalog, false).await
+}
+
+async fn open_security_catalog(
+    storage_root: &Path,
+    layout: SecurityCatalogLayout,
+) -> Result<Arc<rockstream_storage::catalog::DurableCatalogStore>, CliError> {
+    let (path, object_prefix, catalog_prefix) = match layout {
+        SecurityCatalogLayout::All => (storage_root.join("shards/0"), "shards/0", "db"),
+        SecurityCatalogLayout::Gateway => (
+            storage_root.join("gateway-shard"),
+            "gateway-shard",
+            "gateway",
+        ),
+    };
+    let store =
+        rockstream_storage::build_runtime_object_store(&path, object_prefix).map_err(|error| {
+            CliError::new(
+                RS_0003,
+                format!("failed to open control security catalog: {error}"),
+                "Check durable storage permissions and restore the security catalog.",
+            )
+        })?;
+    let catalog = rockstream_storage::catalog::DurableCatalogStore::recover(store, catalog_prefix)
+        .await
+        .map_err(|error| {
+            CliError::new(
+                RS_0003,
+                format!("failed to recover control security catalog: {error}"),
+                "Restore the durable security catalog before starting control.",
+            )
+        })?;
+    Ok(Arc::new(catalog))
+}
+
+#[derive(Serialize)]
+struct SecurityPreprovisionResult {
+    principal_id: u64,
+    catalog_revision: u64,
+}
+
+impl output::Formattable for SecurityPreprovisionResult {
+    fn to_text(&self) -> String {
+        format!(
+            "Preprovisioned administrator principal {} at catalog revision {}",
+            self.principal_id, self.catalog_revision
+        )
+    }
+}
+
+pub async fn run_security_preprovision(
+    format: output::OutputFormat,
+    storage_root: &Path,
+    layout: SecurityCatalogLayout,
+    principal_file: &Path,
+    operation_id: u64,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        "Confirm RockStream processes are stopped and this is the intended deployment store",
+        yes,
+    )?;
+    let principal: rockstream_types::authorization::SecurityPrincipal =
+        serde_json::from_reader(fs::File::open(principal_file).map_err(|error| {
+            CliError::new(
+                RS_0002,
+                format!("could not open administrator principal file: {error}"),
+                "Check the selected principal file and its permissions.",
+            )
+        })?)
+        .map_err(|error| {
+            CliError::new(
+            RS_0002,
+            format!("could not parse administrator principal file: {error}"),
+            "Provide a JSON SecurityPrincipal with an enabled interactive cluster administrator.",
+        )
+        })?;
+    let catalog = open_security_catalog(storage_root, layout).await?;
+    let revision = catalog
+        .preprovision_first_administrator(principal.clone(), operation_id)
+        .await
+        .map_err(|error| {
+            CliError::new(
+                RS_0003,
+                format!("first administrator preprovisioning failed: {error}"),
+                "Use a stopped deployment with an empty security catalog and a valid interactive administrator.",
+            )
+        })?;
+    Ok(output::render_output(
+        &SecurityPreprovisionResult {
+            principal_id: principal.id.0,
+            catalog_revision: revision,
+        },
+        format,
+    ))
 }
 
 fn gateway_start_error(context: &str, bind_next_steps: &str, error: std::io::Error) -> CliError {
@@ -1293,31 +1388,8 @@ pub fn run_start_with_dev_transport(
             if opts.config.internal_tls.is_enabled()
                 || (opts.listen_addr.is_some() && node_config.control.management_addr.is_some())
             {
-                let security_store = rockstream_storage::build_runtime_object_store(
-                    &opts.storage.join("shards/0"),
-                    "shards/0",
-                )
-                .map_err(|error| {
-                    CliError::new(
-                        RS_0003,
-                        format!("failed to open control security catalog: {error}"),
-                        "Check durable storage permissions and restore the security catalog.",
-                    )
-                })?;
-                let security_catalog = Arc::new(
-                    rockstream_storage::catalog::DurableCatalogStore::recover(
-                        security_store,
-                        "db",
-                    )
-                    .await
-                    .map_err(|error| {
-                        CliError::new(
-                            RS_0003,
-                            format!("failed to recover control security catalog: {error}"),
-                            "Restore the durable security catalog before starting control.",
-                        )
-                    })?,
-                );
+                let security_catalog =
+                    open_security_catalog(&opts.storage, SecurityCatalogLayout::All).await?;
                 service = service.with_security_catalog(security_catalog);
             }
             if opts.listen_addr.is_some() {
@@ -1384,31 +1456,8 @@ pub fn run_start_with_dev_transport(
             if opts.config.internal_tls.is_enabled()
                 || (opts.daemon && node_config.control.management_addr.is_some())
             {
-                let security_store = rockstream_storage::build_runtime_object_store(
-                    &opts.storage.join("gateway-shard"),
-                    "gateway-shard",
-                )
-                .map_err(|error| {
-                    CliError::new(
-                        RS_0003,
-                        format!("failed to open control security catalog: {error}"),
-                        "Check durable storage permissions and restore the security catalog.",
-                    )
-                })?;
-                let security_catalog = Arc::new(
-                    rockstream_storage::catalog::DurableCatalogStore::recover(
-                        security_store,
-                        "gateway",
-                    )
-                    .await
-                    .map_err(|error| {
-                        CliError::new(
-                            RS_0003,
-                            format!("failed to recover control security catalog: {error}"),
-                            "Restore the durable security catalog before starting control.",
-                        )
-                    })?,
-                );
+                let security_catalog =
+                    open_security_catalog(&opts.storage, SecurityCatalogLayout::Gateway).await?;
                 service = service.with_security_catalog(security_catalog);
             }
 

@@ -331,7 +331,7 @@ impl SecretStore {
         catalog: &dyn CatalogStore,
         record: &SecurityAuditRecord,
     ) -> Result<(), SecretStoreError> {
-        for attempt in 0..2 {
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
             let revision =
                 catalog.get_revision().await.checked_add(1).ok_or_else(|| {
                     SecretStoreError::storage("durable catalog revision exhausted")
@@ -345,7 +345,8 @@ impl SecretStore {
             match catalog.commit_txn(transaction).await {
                 Ok(_) => return Ok(()),
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                    if attempt == 0 =>
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
                     continue;
                 }

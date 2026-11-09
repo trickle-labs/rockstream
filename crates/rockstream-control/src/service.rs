@@ -2170,17 +2170,29 @@ fn stable_route(value: &str, shard_count: usize) -> usize {
     hash as usize % shard_count
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+struct WorkloadDeploymentContext<'a> {
+    secret_catalog: Option<&'a Arc<dyn CatalogStore>>,
+    sender: &'a mpsc::Sender<ControlMessage>,
+    catalog: &'a TopologyCatalog,
+    shard_manager: &'a ShardManager,
+    worker_senders: &'a Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    data_plane: &'a Arc<AsyncMutex<DataPlaneState>>,
+}
+
 async fn deploy_workload(
     request: DeploymentRequest,
     actor_principal_id: Option<PrincipalId>,
-    secret_catalog: Option<&Arc<dyn CatalogStore>>,
-    sender: &mpsc::Sender<ControlMessage>,
-    catalog: &TopologyCatalog,
-    shard_manager: &ShardManager,
-    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
-    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    context: WorkloadDeploymentContext<'_>,
 ) {
+    let WorkloadDeploymentContext {
+        secret_catalog,
+        sender,
+        catalog,
+        shard_manager,
+        worker_senders,
+        data_plane,
+    } = context;
     let secret_names = match secret_catalog {
         Some(catalog) => match secret_names_for_deployment(Some(catalog), &request.schemas).await {
             Ok(secret_names) => secret_names,
@@ -3122,27 +3134,74 @@ async fn append_gateway_delegation_audit(
     true
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn reject_gateway_actor_assertion(
-    sender: &mpsc::Sender<ControlMessage>,
-    catalog: Option<&Arc<dyn CatalogStore>>,
-    identity: &NodeIdentity,
-    code: ErrorCode,
-    message: &str,
+#[derive(Clone, Copy)]
+struct GatewayActorAuthorizationContext<'a> {
+    sender: &'a mpsc::Sender<ControlMessage>,
+    catalog: Option<&'a Arc<dyn CatalogStore>>,
+    verifier: Option<&'a crate::delegation::ActorAssertionVerifier>,
+    identity: &'a NodeIdentity,
+    data_plane: &'a Arc<AsyncMutex<DataPlaneState>>,
+}
+
+struct GatewayActorRejectionAudit {
     target: AuditField<String>,
     scope: AuditField<String>,
     action: SecurityAuditClass,
     actor: AuditIdentity,
     policy_revision: AuditField<u64>,
+}
+
+impl GatewayActorRejectionAudit {
+    fn authentication(scope: AuditField<String>, actor: AuditIdentity) -> Self {
+        Self {
+            target: AuditField::Known("gateway_data_plane".to_owned()),
+            scope,
+            action: SecurityAuditClass::AuthenticationFailure,
+            actor,
+            policy_revision: AuditField::NotApplicable,
+        }
+    }
+
+    fn unknown_target_authentication(actor: AuditIdentity) -> Self {
+        Self {
+            target: AuditField::Unknown,
+            scope: AuditField::Unknown,
+            action: SecurityAuditClass::AuthenticationFailure,
+            actor,
+            policy_revision: AuditField::NotApplicable,
+        }
+    }
+
+    fn authorization(
+        target: AuditField<String>,
+        scope: AuditField<String>,
+        actor: AuditIdentity,
+        policy_revision: AuditField<u64>,
+    ) -> Self {
+        Self {
+            target,
+            scope,
+            action: SecurityAuditClass::AuthorizationDenial,
+            actor,
+            policy_revision,
+        }
+    }
+}
+
+async fn reject_gateway_actor_assertion(
+    context: &GatewayActorAuthorizationContext<'_>,
+    code: ErrorCode,
+    message: &str,
+    audit: GatewayActorRejectionAudit,
 ) -> bool {
     if !append_gateway_delegation_audit(
-        catalog,
-        actor,
-        target,
-        scope,
-        action,
+        context.catalog,
+        audit.actor,
+        audit.target,
+        audit.scope,
+        audit.action,
         SecurityAuditOutcome::Denied,
-        policy_revision,
+        audit.policy_revision,
     )
     .await
     {
@@ -3153,9 +3212,9 @@ async fn reject_gateway_actor_assertion(
     } else {
         rockstream_types::error_code::next_steps(RS_2401)
     };
-    tracing::warn!(peer = %identity.to_cn(), %code, "gateway actor assertion rejected");
+    tracing::warn!(peer = %context.identity.to_cn(), %code, "gateway actor assertion rejected");
     send_message(
-        sender,
+        context.sender,
         &ControlMessage::OperationFailed {
             code: code.to_string(),
             message: message.to_owned(),
@@ -3168,61 +3227,47 @@ async fn reject_gateway_actor_assertion(
 
 #[allow(clippy::too_many_arguments)]
 async fn authorize_gateway_actor_assertion(
-    sender: &mpsc::Sender<ControlMessage>,
-    catalog: Option<&Arc<dyn CatalogStore>>,
-    verifier: Option<&crate::delegation::ActorAssertionVerifier>,
-    identity: &NodeIdentity,
+    context: &GatewayActorAuthorizationContext<'_>,
     assertion: Option<&str>,
     request: &WorkerMessage,
-    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
     authorized_actor: &mut Option<PrincipalId>,
 ) -> bool {
-    let target = AuditField::Known("gateway_data_plane".to_owned());
     let Some(assertion) = assertion else {
         return reject_gateway_actor_assertion(
-            sender,
-            catalog,
-            identity,
+            context,
             RS_2400,
             "a valid user actor assertion is required for gateway data-plane requests",
-            target,
-            AuditField::Unknown,
-            SecurityAuditClass::AuthenticationFailure,
-            AuditIdentity::Unverified(identity.to_cn()),
-            AuditField::NotApplicable,
+            GatewayActorRejectionAudit::authentication(
+                AuditField::Unknown,
+                AuditIdentity::Unverified(context.identity.to_cn()),
+            ),
         )
         .await;
     };
-    let Some(verifier) = verifier else {
+    let Some(verifier) = context.verifier else {
         return reject_gateway_actor_assertion(
-            sender,
-            catalog,
-            identity,
+            context,
             RS_2400,
             "gateway actor assertion verification is not configured",
-            target,
-            AuditField::Unknown,
-            SecurityAuditClass::AuthenticationFailure,
-            AuditIdentity::Unverified(identity.to_cn()),
-            AuditField::NotApplicable,
+            GatewayActorRejectionAudit::authentication(
+                AuditField::Unknown,
+                AuditIdentity::Unverified(context.identity.to_cn()),
+            ),
         )
         .await;
     };
-    let expected = gateway_data_plane_scope(request, data_plane).await;
+    let expected = gateway_data_plane_scope(request, context.data_plane).await;
     let digest = match crate::delegation::request_digest(request) {
         Ok(digest) => digest,
         Err(_) => {
             return reject_gateway_actor_assertion(
-                sender,
-                catalog,
-                identity,
+                context,
                 RS_2400,
                 "gateway actor assertion could not be bound to this request",
-                target,
-                AuditField::Unknown,
-                SecurityAuditClass::AuthenticationFailure,
-                AuditIdentity::Unverified(identity.to_cn()),
-                AuditField::NotApplicable,
+                GatewayActorRejectionAudit::authentication(
+                    AuditField::Unknown,
+                    AuditIdentity::Unverified(context.identity.to_cn()),
+                ),
             )
             .await;
         }
@@ -3232,16 +3277,13 @@ async fn authorize_gateway_actor_assertion(
         Ok(claims) => claims,
         Err(_) => {
             return reject_gateway_actor_assertion(
-                sender,
-                catalog,
-                identity,
+                context,
                 RS_2400,
                 "gateway actor assertion is invalid, expired, or bound to another deployment/request",
-                target,
-                AuditField::Unknown,
-                SecurityAuditClass::AuthenticationFailure,
-                AuditIdentity::Unverified(identity.to_cn()),
-                AuditField::NotApplicable,
+                GatewayActorRejectionAudit::authentication(
+                    AuditField::Unknown,
+                    AuditIdentity::Unverified(context.identity.to_cn()),
+                ),
             )
             .await;
         }
@@ -3250,36 +3292,34 @@ async fn authorize_gateway_actor_assertion(
         Some(expected) => expected,
         None => {
             return reject_gateway_actor_assertion(
-                sender,
-                catalog,
-                identity,
+                context,
                 RS_2401,
                 "gateway actor assertion does not identify an active scoped workload request",
-                target,
-                AuditField::Known(format!("{:?}", claims.scope())),
-                SecurityAuditClass::AuthorizationDenial,
-                AuditIdentity::Verified(claims.principal_id().to_string()),
-                AuditField::NotApplicable,
+                GatewayActorRejectionAudit::authorization(
+                    AuditField::Known("gateway_data_plane".to_owned()),
+                    AuditField::Known(format!("{:?}", claims.scope())),
+                    AuditIdentity::Verified(claims.principal_id().to_string()),
+                    AuditField::NotApplicable,
+                ),
             )
             .await;
         }
     };
     if claims.action() != expected_action || claims.scope() != &expected_scope {
         return reject_gateway_actor_assertion(
-            sender,
-            catalog,
-            identity,
+            context,
             RS_2401,
             "gateway actor assertion allowance does not match the requested operation and scope",
-            AuditField::Known(format!("{expected_action:?}")),
-            AuditField::Known(format!("{expected_scope:?}")),
-            SecurityAuditClass::AuthorizationDenial,
-            AuditIdentity::Verified(claims.principal_id().to_string()),
-            AuditField::Known(claims.policy_revision()),
+            GatewayActorRejectionAudit::authorization(
+                AuditField::Known(format!("{expected_action:?}")),
+                AuditField::Known(format!("{expected_scope:?}")),
+                AuditIdentity::Verified(claims.principal_id().to_string()),
+                AuditField::Known(claims.policy_revision()),
+            ),
         )
         .await;
     }
-    let Some(catalog_store) = catalog else {
+    let Some(catalog_store) = context.catalog else {
         tracing::error!(code = %RS_0003, "durable actor policy is unavailable");
         return false;
     };
@@ -3287,16 +3327,12 @@ async fn authorize_gateway_actor_assertion(
         Ok(principals) => principals,
         Err(_) => {
             return reject_gateway_actor_assertion(
-                sender,
-                Some(catalog_store),
-                identity,
+                context,
                 RS_2400,
                 "durable actor policy is unavailable",
-                AuditField::Unknown,
-                AuditField::Unknown,
-                SecurityAuditClass::AuthenticationFailure,
-                AuditIdentity::Verified(claims.principal_id().to_string()),
-                AuditField::NotApplicable,
+                GatewayActorRejectionAudit::unknown_target_authentication(AuditIdentity::Verified(
+                    claims.principal_id().to_string(),
+                )),
             )
             .await;
         }
@@ -3306,31 +3342,26 @@ async fn authorize_gateway_actor_assertion(
         .find(|principal| principal.id == claims.principal_id() && principal.enabled)
     else {
         return reject_gateway_actor_assertion(
-            sender,
-            Some(catalog_store),
-            identity,
+            context,
             RS_2400,
             "asserted user actor is no longer enabled",
-            AuditField::Unknown,
-            AuditField::Unknown,
-            SecurityAuditClass::AuthenticationFailure,
-            AuditIdentity::Verified(claims.principal_id().to_string()),
-            AuditField::NotApplicable,
+            GatewayActorRejectionAudit::unknown_target_authentication(AuditIdentity::Verified(
+                claims.principal_id().to_string(),
+            )),
         )
         .await;
     };
     if !crate::authorization::allows(&principal, expected_action, &expected_scope) {
         return reject_gateway_actor_assertion(
-            sender,
-            Some(catalog_store),
-            identity,
+            context,
             RS_2401,
             "asserted user actor is no longer authorized for this operation and scope",
-            AuditField::Known(format!("{expected_action:?}")),
-            AuditField::Known(format!("{expected_scope:?}")),
-            SecurityAuditClass::AuthorizationDenial,
-            AuditIdentity::Verified(principal.id.to_string()),
-            AuditField::Known(principal.revision),
+            GatewayActorRejectionAudit::authorization(
+                AuditField::Known(format!("{expected_action:?}")),
+                AuditField::Known(format!("{expected_scope:?}")),
+                AuditIdentity::Verified(principal.id.to_string()),
+                AuditField::Known(principal.revision),
+            ),
         )
         .await;
     }
@@ -4019,14 +4050,17 @@ async fn handle_connection_stream<R, W>(
                 break;
             }
             if let Some(identity) = peer_identity.as_ref() {
-                if !authorize_gateway_actor_assertion(
-                    &sender,
-                    security_catalog.as_ref(),
-                    actor_assertion_verifier.as_deref(),
+                let authorization_context = GatewayActorAuthorizationContext {
+                    sender: &sender,
+                    catalog: security_catalog.as_ref(),
+                    verifier: actor_assertion_verifier.as_deref(),
                     identity,
+                    data_plane: &data_plane,
+                };
+                if !authorize_gateway_actor_assertion(
+                    &authorization_context,
                     actor_assertion.as_deref(),
                     &msg,
-                    &data_plane,
                     &mut delegated_actor,
                 )
                 .await
@@ -4185,12 +4219,14 @@ async fn handle_connection_stream<R, W>(
                 deploy_workload(
                     request,
                     delegated_actor,
-                    security_catalog.as_ref(),
-                    &sender,
-                    &catalog,
-                    &shard_manager,
-                    &worker_senders,
-                    &data_plane,
+                    WorkloadDeploymentContext {
+                        secret_catalog: security_catalog.as_ref(),
+                        sender: &sender,
+                        catalog: &catalog,
+                        shard_manager: &shard_manager,
+                        worker_senders: &worker_senders,
+                        data_plane: &data_plane,
+                    },
                 )
                 .await;
                 if let Some(store) = &shard_store {
