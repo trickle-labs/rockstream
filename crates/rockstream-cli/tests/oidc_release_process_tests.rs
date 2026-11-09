@@ -648,6 +648,16 @@ async fn start_control_process(
         drop(secret_store);
     }
 
+    spawn_control_process(working_dir, storage, address, pki, seed_worker_secret)
+}
+
+fn spawn_control_process(
+    working_dir: &Path,
+    storage: &Path,
+    address: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    seed_worker_secret: bool,
+) -> RunningGateway {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
     command
         .current_dir(working_dir)
@@ -906,8 +916,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         }],
         scoped_grants: Vec::new(),
     };
-    let mut control_actor = gateway_actor.clone();
-    control_actor.preset_grants.clear();
+    let control_actor = gateway_actor.clone();
 
     let gateway_working_dir = temp.path().join("gateway-process");
     std::fs::create_dir_all(&gateway_working_dir).unwrap();
@@ -939,16 +948,18 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     .unwrap();
     let control_storage = temp.path().join("control-storage");
     let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut control_process = start_control_process(
+    let mut control_seed_process = start_control_process(
         &control_working_dir,
         &control_storage,
         control_address,
         &pki,
-        Some(control_actor),
+        Some(control_actor.clone()),
         false,
     )
     .await;
-    wait_for_gateway(&mut control_process.0, control_address).await;
+    wait_for_gateway(&mut control_seed_process.0, control_address).await;
+    control_seed_process.0.kill().unwrap();
+    control_seed_process.0.wait().unwrap();
     let control_store = rockstream_storage::build_runtime_object_store(
         &control_storage.join("gateway-shard"),
         "gateway-shard",
@@ -957,6 +968,70 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     let control_catalog = DurableCatalogStore::recover(control_store, "gateway")
         .await
         .unwrap();
+    let mut updated_control_actor = control_catalog
+        .get_security_principal(PrincipalId(2))
+        .await
+        .unwrap()
+        .unwrap();
+    let before_policy = serde_json::to_string(&(
+        updated_control_actor.enabled,
+        &updated_control_actor.preset_grants,
+        &updated_control_actor.scoped_grants,
+    ))
+    .unwrap();
+    updated_control_actor.revision = 2;
+    updated_control_actor.preset_grants.clear();
+    let after_policy = serde_json::to_string(&(
+        updated_control_actor.enabled,
+        &updated_control_actor.preset_grants,
+        &updated_control_actor.scoped_grants,
+    ))
+    .unwrap();
+    let catalog_revision = control_catalog.get_revision().await + 1;
+    let policy_operation_id = catalog_revision.to_string();
+    let policy_audit = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "release-test-policy-revision-2".to_owned(),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Observed(policy_operation_id.to_owned()),
+        operation_id: AuditField::Known(policy_operation_id.to_owned()),
+        policy_revision: AuditField::Known(2),
+        before_state: AuditField::Known(format!("revision=1;policy={before_policy}")),
+        after_state: AuditField::Known(format!("revision=2;policy={after_policy}")),
+    };
+    control_catalog
+        .commit_txn(
+            CatalogTxn::new(
+                catalog_revision,
+                catalog_revision,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: updated_control_actor,
+                    expected_revision: Some(1),
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: policy_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut control_process = spawn_control_process(
+        &control_working_dir,
+        &control_storage,
+        control_address,
+        &pki,
+        false,
+    );
+    wait_for_gateway(&mut control_process.0, control_address).await;
+    control_catalog.refresh().await.unwrap();
     let mut principals_before = control_catalog.list_security_principals().await.unwrap();
     principals_before.sort_by_key(|principal| principal.id);
     let audit_before = control_catalog.list_security_audit_records().await.unwrap();
@@ -1114,7 +1189,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
             outcome: SecurityAuditOutcome::Denied,
             correlation: AuditCorrelation::Unknown,
             operation_id: AuditField::NotApplicable,
-            policy_revision: AuditField::Known(1),
+            policy_revision: AuditField::Known(2),
             before_state: AuditField::NotApplicable,
             after_state: AuditField::NotApplicable,
         }
