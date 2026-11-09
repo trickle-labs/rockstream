@@ -1738,7 +1738,6 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: this Kafka fixture cannot revoke SASL/PLAIN users through dynamic broker config; do not count as release proof"]
 async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     assert!(
