@@ -3454,6 +3454,12 @@ async fn support_artifact_generation_rejects_full_deployment_budget() {
 
 #[tokio::test]
 async fn support_artifact_budget_is_shared_between_release_processes() {
+    for _ in 0..3 {
+        support_artifact_budget_is_shared_between_release_processes_once().await;
+    }
+}
+
+async fn support_artifact_budget_is_shared_between_release_processes_once() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     assert!(rockstream_test_support::docker_available());
