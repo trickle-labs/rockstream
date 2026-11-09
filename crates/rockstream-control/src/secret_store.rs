@@ -672,6 +672,7 @@ impl SecretStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn put_encrypted_raw_with_security_audit(
         &self,
         namespace_id: u128,
