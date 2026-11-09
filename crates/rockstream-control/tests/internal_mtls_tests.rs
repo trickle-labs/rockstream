@@ -90,6 +90,10 @@ async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_dat
         !denial_events.is_empty(),
         "Audited denial events must be recorded for failed mTLS handshakes"
     );
+    assert!(
+        denial_events.iter().all(|event| event.actor == "unknown"),
+        "pre-authentication TLS failures must not claim an authenticated actor: {denial_events:?}"
+    );
 
     h1.abort();
     h2.abort();
@@ -98,7 +102,7 @@ async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_dat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_certificate_rotation_3_worker_cluster_under_load_zero_loss_zero_restart() {
+async fn test_certificate_rotation_preserves_streams_and_accepts_gen2_worker() {
     let pki = TestPki::generate();
     let audit_dir = tempfile::tempdir().unwrap();
     let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
@@ -134,19 +138,33 @@ async fn test_certificate_rotation_3_worker_cluster_under_load_zero_loss_zero_re
     assert_eq!(catalog.len(), 3);
 
     // Actively stream shard lease requests
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(clients.len());
+    let (resume_tx, resume_rx) = tokio::sync::watch::channel(());
     let mut traffic_tasks = Vec::new();
     for client in &clients {
         let c = client.clone();
+        let started_tx = started_tx.clone();
+        let mut resume_rx = resume_rx.clone();
         traffic_tasks.push(tokio::spawn(async move {
-            for i in 1..=15 {
-                let _ = c.request_shard(ShardId(i)).await;
+            let worker_id = c.worker_id().unwrap();
+            c.request_shard(ShardId(1)).await.unwrap();
+            let mut requests = vec![(worker_id, ShardId(1))];
+            started_tx.send(()).await.unwrap();
+            resume_rx.changed().await.unwrap();
+            for i in 2..=15 {
+                c.request_shard(ShardId(i)).await.unwrap();
+                requests.push((worker_id, ShardId(i)));
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            requests
         }));
+    }
+    for _ in 0..clients.len() {
+        started_rx.recv().await.unwrap();
     }
 
     // In-flight certificate rotation
-    let (ca2_path, ctrl2_cfg, _w2_cfg) = pki.generate_gen2_pki();
+    let (ca2_path, ctrl2_cfg, _) = pki.generate_gen2_pki();
     handle
         .reloader
         .as_ref()
@@ -154,15 +172,44 @@ async fn test_certificate_rotation_3_worker_cluster_under_load_zero_loss_zero_re
         .add_trusted_ca(&ca2_path)
         .unwrap();
     handle.reload_tls(ctrl2_cfg).unwrap();
+    let (gen2_client, gen2_handle) = start_worker_client_with_tls(
+        4,
+        &control_url,
+        storage_dir.path(),
+        pki.gen2_worker_tls_config(4),
+    )
+    .await
+    .unwrap();
+    handles.push(gen2_handle);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while catalog.len() != 4 || gen2_client.worker_id().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(gen2_client.worker_id(), Some(WorkerId(4)));
+    resume_tx.send(()).unwrap();
 
+    let expected_requests = clients
+        .iter()
+        .map(|client| {
+            let worker_id = client.worker_id().unwrap();
+            (1..=15)
+                .map(|shard| (worker_id, ShardId(shard)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut actual_requests = Vec::new();
     for task in traffic_tasks {
-        let _ = task.await;
+        actual_requests.push(task.await.unwrap());
     }
+    assert_eq!(actual_requests, expected_requests);
 
-    // Verification: Zero epoch loss, zero restarts, continuous worker registration
-    assert_eq!(catalog.len(), 3);
-    for client in &clients {
-        assert!(client.worker_id().is_some());
+    // The three old-generation streams survived, and the new generation registered.
+    assert_eq!(catalog.len(), 4);
+    for (id, client) in (1..=3).zip(&clients) {
+        assert_eq!(client.worker_id(), Some(WorkerId(id)));
     }
 
     for h in handles {

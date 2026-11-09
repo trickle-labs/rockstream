@@ -1,4 +1,5 @@
 use std::io::Error as IOError;
+use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Buf;
@@ -243,9 +244,18 @@ where
 {
     match error {
         PgWireError::UserError(error_info) => {
+            let close_connection = error_info.severity.eq_ignore_ascii_case("FATAL")
+                || error_info.severity.eq_ignore_ascii_case("PANIC");
             socket
-                .feed(PgWireBackendMessage::ErrorResponse((*error_info).into()))
+                .send(PgWireBackendMessage::ErrorResponse((*error_info).into()))
                 .await?;
+            if close_connection {
+                socket.close().await?;
+                return Err(IOError::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "fatal pgwire error closed the connection",
+                ));
+            }
         }
         PgWireError::ApiError(e) => {
             let error_info = ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string());
@@ -387,6 +397,31 @@ pub async fn process_socket<H>(
 where
     H: PgWireServerHandlers,
 {
+    #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
+    {
+        process_socket_with_tls_error_handler(tcp_socket, tls_acceptor, handlers, |_| async {})
+            .await
+    }
+    #[cfg(not(any(feature = "_ring", feature = "_aws-lc-rs")))]
+    {
+        process_socket_with_tls_error_handler(tcp_socket, handlers, |_| async {}).await
+    }
+}
+
+/// Process a socket, calling `on_tls_error` when TLS negotiation fails before
+/// the PostgreSQL startup handler can observe the connection.
+pub async fn process_socket_with_tls_error_handler<H, F, Fut>(
+    tcp_socket: TcpStream,
+    #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))] tls_acceptor: Option<Arc<TlsAcceptor>>,
+    handlers: H,
+    on_tls_error: F,
+) -> Result<(), IOError>
+where
+    H: PgWireServerHandlers,
+    F: FnOnce(String) -> Fut + Send,
+    Fut: Future<Output = ()> + Send,
+{
+    let _ = &on_tls_error;
     let addr = tcp_socket.peer_addr()?;
     tcp_socket.set_nodelay(true)?;
 
@@ -423,10 +458,17 @@ where
             // mention the use of ssl
             let client_info = DefaultClient::new(addr, true);
             // safe to unwrap tls_acceptor here
-            let ssl_socket = tls_acceptor
+            let ssl_socket = match tls_acceptor
                 .unwrap()
                 .accept(tcp_socket.into_inner())
-                .await?;
+                .await
+            {
+                Ok(socket) => socket,
+                Err(error) => {
+                    on_tls_error(error.to_string()).await;
+                    return Err(error);
+                }
+            };
 
             // check alpn for direct ssl connection
             if ssl == SslNegotiationType::Direct {

@@ -48,6 +48,8 @@ tonic = { workspace = true }
 rockstream-connectors = { workspace = true }
 rockstream-test-support = { workspace = true }
 rockstream-docgen = { workspace = true }
+rcgen.workspace = true
+tokio-postgres-rustls.workspace = true
 rockstream-sim = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }

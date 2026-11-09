@@ -2,7 +2,7 @@
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-#[allow(clippy::result_large_err)]
+#[allow(clippy::double_must_use, clippy::result_large_err)]
 pub mod v1 {
     tonic::include_proto!("rockstream.management.v1");
 }

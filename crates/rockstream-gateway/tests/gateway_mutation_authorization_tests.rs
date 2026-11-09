@@ -1,12 +1,90 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64_URL_SAFE;
+use base64::Engine as _;
+use futures::StreamExt;
 use rockstream_control::audit::FileAuditLog;
+use rockstream_control::kek::EnvKekProvider;
+use rockstream_control::SecretStore;
 use rockstream_gateway::auth::Principal;
-use rockstream_gateway::catalog_stubs::CatalogStubs;
+use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable, CatalogView};
+use rockstream_gateway::role_catalog::{gen_scram_verifiers, RoleEntry};
 use rockstream_gateway::server::GatewayHandler;
 use rockstream_gateway::view_reader::{ViewReadStrategy, ViewReader};
 use rockstream_gateway::GatewayError;
+use rockstream_storage::catalog::{
+    CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn, DurableCatalogStore,
+};
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
+    ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
+    SECURITY_PRINCIPAL_FORMAT_VERSION,
+};
+use rockstream_types::ids::{DatabaseId, NamespaceId, PrincipalId};
 use rockstream_types::mutation_policy::{pgwire_mutation_policy, PGWIRE_MUTATION_POLICY};
+use rockstream_types::secret::SecretType;
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_millis() as u64
+}
+
+async fn seed_public_namespace(durable: &DurableCatalogStore) {
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                1,
+                100,
+                vec![
+                    CatalogMutation::PutNamespace(CatalogNamespace {
+                        id: NamespaceId(1),
+                        name: "public".to_string(),
+                        database_id: DatabaseId(1),
+                        created_at: 1,
+                    }),
+                    CatalogMutation::PutNamespace(CatalogNamespace {
+                        id: NamespaceId(2),
+                        name: "sales".to_string(),
+                        database_id: DatabaseId(1),
+                        created_at: 2,
+                    }),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+fn decode_pgwire_row(row: &pgwire::messages::data::DataRow) -> Vec<Option<String>> {
+    let mut data = row.data.as_ref();
+    let mut fields = Vec::with_capacity(row.field_count as usize);
+    for _ in 0..row.field_count {
+        let length = i32::from_be_bytes(
+            data[..4]
+                .try_into()
+                .expect("data row field length is present"),
+        );
+        data = &data[4..];
+        if length == -1 {
+            fields.push(None);
+            continue;
+        }
+        let length = usize::try_from(length).expect("data row field length is nonnegative");
+        let value = std::str::from_utf8(&data[..length])
+            .expect("metadata field is utf-8")
+            .to_string();
+        fields.push(Some(value));
+        data = &data[length..];
+    }
+    assert!(data.is_empty(), "data row contains no trailing fields");
+    fields
+}
 
 struct NoopViewReader;
 
@@ -89,28 +167,53 @@ fn mutation_cases() -> Vec<(&'static str, &'static str, &'static str)> {
 
 async fn denied_matrix(handler: &GatewayHandler, conn_id: &str) -> Vec<(String, String, String)> {
     let mut results = Vec::new();
-    for (operation, query, resource) in mutation_cases() {
+    for (index, (operation, query, resource)) in mutation_cases().into_iter().enumerate() {
+        let case_conn_id = format!("{conn_id}-{index}");
+        set_viewer(handler, &case_conn_id);
         let spec = pgwire_mutation_policy(query).expect("matrix query must be policy-covered");
         assert_eq!(spec.operation, operation);
-        let responses = handler
-            .dispatch_async_with_conn(query, Some(conn_id))
-            .await
-            .expect("authorization denial must be a pgwire response");
+        let result = handler
+            .dispatch_async_with_conn(query, Some(&case_conn_id))
+            .await;
+        if matches!(operation, "CREATE SECRET" | "ALTER SECRET" | "DROP SECRET") {
+            let error = match result {
+                Err(pgwire::error::PgWireError::UserError(error)) => error,
+                Ok(_) => panic!("expected fatal audit failure for {query}, got a response"),
+                Err(_) => panic!("expected fatal user error for {query}, got another error"),
+            };
+            assert_eq!(error.severity, "FATAL");
+            assert_eq!(error.code, "42501");
+            assert_eq!(
+                error.message,
+                format!(
+                    "[RS-2401] auth.permission_denied: principal 'viewer' is not authorized for action 'SecretManage' on public.{resource}. next_steps: Request an authorized scoped grant, then retry. The required security audit could not be persisted; this session's authorization state was invalidated."
+                )
+            );
+            assert!(!handler.sessions.contains_key(&case_conn_id));
+            results.push((
+                spec.operation.to_string(),
+                spec.audit_action.to_string(),
+                resource.to_string(),
+            ));
+            continue;
+        }
+        let responses = result.expect("authorization denial must be a pgwire response");
         assert_eq!(responses.len(), 1, "exact denial response for {query}");
         let error = match &responses[0] {
             pgwire::api::results::Response::Error(error) => error,
             _ => panic!("expected denial for {query}"),
         };
         assert_eq!(error.severity, "ERROR");
-        assert_eq!(error.code, "42501");
+        assert_eq!(error.code, "42501", "operation={operation} query={query}");
+        let expected_message = format!(
+            "[RS-2401] auth.permission_denied: principal 'viewer' lacks required role '{:?}' on {resource}. next_steps: Request an ACL grant for the required role, then retry.",
+            spec.minimum_role
+        );
         assert_eq!(
-            error.message,
-            format!(
-                "[RS-2401] auth.permission_denied: principal 'viewer' lacks required role '{:?}' on {resource}. next_steps: Request an ACL grant for the required role, then retry.",
-                spec.minimum_role
-            ),
+            error.message, expected_message,
             "operation={operation} query={query}"
         );
+        assert!(handler.sessions.contains_key(&case_conn_id));
         results.push((
             spec.operation.to_string(),
             spec.audit_action.to_string(),
@@ -132,6 +235,183 @@ fn set_viewer(handler: &GatewayHandler, conn_id: &str) {
     };
 }
 
+fn audit_page_event(event_id: &str, timestamp_ms: u64) -> SecurityAuditRecord {
+    SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: event_id.to_string(),
+        timestamp_ms,
+        actor: AuditIdentity::Verified("actor-1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Observed("client-1".to_string()),
+        operation_id: AuditField::Known("17".to_string()),
+        policy_revision: AuditField::Known(2),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known("revision=2;policy=test".to_string()),
+    }
+}
+
+async fn collect_query_rows(
+    handler: &GatewayHandler,
+    sql: &str,
+    conn_id: &str,
+) -> Vec<Vec<Option<String>>> {
+    let responses = handler
+        .dispatch_async_with_conn(sql, Some(conn_id))
+        .await
+        .unwrap();
+    let mut responses = responses.into_iter();
+    let Some(pgwire::api::results::Response::Query(query)) = responses.next() else {
+        panic!("expected one query response for {sql}");
+    };
+    assert!(
+        responses.next().is_none(),
+        "expected exactly one query response"
+    );
+    assert_eq!(
+        query
+            .row_schema()
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>(),
+        vec![
+            "format_version",
+            "event_id",
+            "timestamp_ms",
+            "actor",
+            "target",
+            "scope",
+            "action",
+            "outcome",
+            "correlation",
+            "operation_id",
+            "policy_revision",
+            "before_state",
+            "after_state",
+            "cursor",
+        ]
+    );
+    let mut rows = query.data_rows();
+    let mut collected = Vec::new();
+    while let Some(row) = rows.next().await {
+        collected.push(decode_pgwire_row(&row.unwrap()));
+    }
+    collected
+}
+
+#[tokio::test]
+async fn oidc_login_uses_exact_issuer_and_subject_for_durable_policy() {
+    let issuer = "https://issuer.example";
+    let subject = "reader";
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "OIDC administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: issuer.to_string(),
+            subject: subject.to_string(),
+        }],
+        preset_grants: vec![
+            ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            },
+            ScopedPresetGrant {
+                preset: PermissionPreset::DataReader,
+                scope: PolicyScope::Namespace {
+                    namespace: "public".to_string(),
+                },
+            },
+        ],
+        scoped_grants: vec![],
+    };
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "oidc-policy-test",
+    ));
+    seed_public_namespace(&durable).await;
+    durable
+        .preprovision_first_administrator(principal, 801)
+        .await
+        .unwrap();
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.set_durable_store(durable.clone());
+    catalog.add_view_in_namespace(CatalogView {
+        name: "allowed_view".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader));
+
+    let allowed_connection = "oidc-allowed";
+    handler
+        .sessions
+        .entry(allowed_connection.to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: issuer.to_string(),
+        sub: subject.to_string(),
+    };
+    let allowed = handler
+        .dispatch_async_with_conn("SELECT * FROM allowed_view", Some(allowed_connection))
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed.as_slice(),
+        [pgwire::api::results::Response::Query(_)]
+    ));
+
+    let wrong_issuer = "https://wrong.example";
+    let wrong_issuer_connection = "oidc-wrong-issuer";
+    handler
+        .sessions
+        .entry(wrong_issuer_connection.to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: wrong_issuer.to_string(),
+        sub: subject.to_string(),
+    };
+    let denied = handler
+        .dispatch_async_with_conn("SELECT * FROM allowed_view", Some(wrong_issuer_connection))
+        .await
+        .unwrap();
+    let error = match denied.as_slice() {
+        [pgwire::api::results::Response::Error(error)] => error,
+        _ => panic!("expected one authorization denial for the wrong issuer"),
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "42501");
+    assert_eq!(
+        error.message,
+        "[RS-2401] auth.permission_denied: principal 'reader' is not authorized for action 'DataRead' on public.allowed_view. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert!(handler.sessions.contains_key(wrong_issuer_connection));
+
+    let records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[1].actor,
+        AuditIdentity::Verified(format!(
+            "oidc:{}:{}:{}:{}",
+            wrong_issuer.len(),
+            wrong_issuer,
+            subject.len(),
+            subject
+        ))
+    );
+    assert_eq!(records[1].outcome, SecurityAuditOutcome::Denied);
+}
+
 #[tokio::test]
 async fn pgwire_mutation_policy_simple_and_extended() {
     assert_eq!(PGWIRE_MUTATION_POLICY.len(), mutation_cases().len());
@@ -149,6 +429,129 @@ async fn pgwire_mutation_policy_simple_and_extended() {
     set_viewer(&extended_handler, "extended");
     let extended = denied_matrix(&extended_handler, "extended").await;
     assert_eq!(simple, extended);
+}
+
+#[tokio::test]
+async fn scoped_data_write_grant_allows_copy_for_operator_without_legacy_acl() {
+    let catalog = Arc::new(CatalogStubs::new());
+    assert!(catalog.add_table(CatalogTable::new(
+        "copy_target",
+        vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    )));
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "copy-operator-policy-test",
+    ));
+    let administrator = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "Administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: "https://issuer.example".to_string(),
+            subject: "admin".to_string(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    durable
+        .preprovision_first_administrator(administrator, 1)
+        .await
+        .unwrap();
+
+    let operator = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Operator with scoped builder grant".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: "https://issuer.example".to_string(),
+            subject: "operator".to_string(),
+        }],
+        preset_grants: vec![
+            ScopedPresetGrant {
+                preset: PermissionPreset::Operator,
+                scope: PolicyScope::Cluster,
+            },
+            ScopedPresetGrant {
+                preset: PermissionPreset::Builder,
+                scope: PolicyScope::Namespace {
+                    namespace: "public".to_string(),
+                },
+            },
+        ],
+        scoped_grants: vec![],
+    };
+    let policy = serde_json::to_string(&(
+        operator.enabled,
+        &operator.preset_grants,
+        &operator.scoped_grants,
+    ))
+    .unwrap();
+    let grant_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "copy-operator-builder-grant".to_string(),
+        timestamp_ms: current_timestamp_ms(),
+        actor: AuditIdentity::Verified("principal:1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("2".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={policy}")),
+    };
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: operator,
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    catalog.set_durable_store(durable);
+
+    let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader));
+    handler
+        .sessions
+        .entry("operator-copy".to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: "https://issuer.example".to_string(),
+        sub: "operator".to_string(),
+    };
+    let responses = handler
+        .copy_from_stdin_response("COPY copy_target FROM STDIN", "operator-copy")
+        .await
+        .unwrap();
+    let copy = match responses.as_slice() {
+        [pgwire::api::results::Response::CopyIn(copy)] => copy,
+        [pgwire::api::results::Response::Error(error)] => {
+            panic!("scoped data-write grant was denied: {}", error.message)
+        }
+        _ => panic!("scoped data-write grant returned an unexpected response"),
+    };
+    assert_eq!(copy.format, 0);
+    assert_eq!(copy.columns, 1);
+    assert_eq!(copy.column_formats, vec![0]);
 }
 
 #[tokio::test]
@@ -207,6 +610,208 @@ async fn viewer_cannot_bypass_mutation_policy_with_multi_statement_sql() {
 }
 
 #[tokio::test]
+async fn administrator_can_manage_secret_and_read_only_its_metadata() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "secret-administration-policy-test",
+    ));
+    seed_public_namespace(&durable).await;
+    let salt = vec![3; 16];
+    let iterations = 4096;
+    let (_, stored_key, server_key) = gen_scram_verifiers("test-password", &salt, iterations);
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(31),
+        display_name: "Secret administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "secret-admin".to_string(),
+            salt,
+            iterations,
+            stored_key: stored_key.to_vec(),
+            server_key: server_key.to_vec(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    durable
+        .preprovision_first_administrator(principal, 1)
+        .await
+        .unwrap();
+    catalog.set_durable_store(durable.clone());
+
+    let secret_store = Arc::new(
+        SecretStore::open_durable(
+            "secret-administration-policy-test-secrets",
+            Arc::new(object_store::memory::InMemory::new()),
+            Arc::new(EnvKekProvider::from_passphrase(
+                "secret-admin-policy-test-kek",
+            )),
+        )
+        .await
+        .unwrap()
+        .with_security_audit_catalog(durable),
+    );
+    let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader))
+        .with_secret_store(secret_store.clone());
+    handler
+        .sessions
+        .entry("secret-admin-connection".to_string())
+        .or_default()
+        .principal = Principal::ScramUser {
+        username: "secret-admin".to_string(),
+    };
+
+    let created = handler
+        .dispatch_async_with_conn(
+            "CREATE SECRET kafka_auth (TYPE = 'sasl_plain', username = 'alice', password = 'literal-secret')",
+            Some("secret-admin-connection"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        created.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+
+    let shown = handler
+        .dispatch_async_with_conn("SHOW SECRETS", Some("secret-admin-connection"))
+        .await
+        .unwrap();
+    assert_eq!(shown.len(), 1);
+    let pgwire::api::results::Response::Query(query) = shown.into_iter().next().unwrap() else {
+        panic!("authorized SHOW SECRETS returns one metadata query");
+    };
+    let schema = query.row_schema();
+    assert_eq!(
+        schema.iter().map(|field| field.name()).collect::<Vec<_>>(),
+        vec!["name", "type", "created_at", "updated_at"]
+    );
+    let metadata = secret_store
+        .get_secret_metadata(1, "kafka_auth")
+        .await
+        .unwrap();
+    let mut rows = query.data_rows();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        decode_pgwire_row(&row),
+        vec![
+            Some("kafka_auth".to_string()),
+            Some("sasl_plain".to_string()),
+            Some(metadata.created_at.to_string()),
+            Some(metadata.updated_at.to_string()),
+        ]
+    );
+    assert!(rows.next().await.is_none());
+    assert!(!format!("{row:?}").contains("literal-secret"));
+
+    assert!(secret_store.contains_secret(1, "kafka_auth").await.unwrap());
+    handler
+        .sessions
+        .get_mut("secret-admin-connection")
+        .unwrap()
+        .current_namespace = "sales".to_string();
+    let created_sales = handler
+        .dispatch_async_with_conn(
+            "CREATE SECRET kafka_auth (TYPE = 'sasl_plain', username = 'bob', password = 'sales-secret')",
+            Some("secret-admin-connection"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        created_sales.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    assert!(secret_store.contains_secret(1, "kafka_auth").await.unwrap());
+    assert!(secret_store.contains_secret(2, "kafka_auth").await.unwrap());
+
+    let shown_sales = handler
+        .dispatch_async_with_conn("SHOW SECRETS", Some("secret-admin-connection"))
+        .await
+        .unwrap();
+    assert_eq!(shown_sales.len(), 1);
+    let pgwire::api::results::Response::Query(query) = shown_sales.into_iter().next().unwrap()
+    else {
+        panic!("authorized sales SHOW SECRETS returns one metadata query");
+    };
+    let sales_metadata = secret_store
+        .get_secret_metadata(2, "kafka_auth")
+        .await
+        .unwrap();
+    let mut sales_rows = query.data_rows();
+    let sales_row = sales_rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        decode_pgwire_row(&sales_row),
+        vec![
+            Some("kafka_auth".to_string()),
+            Some("sasl_plain".to_string()),
+            Some(sales_metadata.created_at.to_string()),
+            Some(sales_metadata.updated_at.to_string()),
+        ]
+    );
+    assert!(sales_rows.next().await.is_none());
+    assert!(!format!("{sales_row:?}").contains("sales-secret"));
+
+    let altered_sales = handler
+        .dispatch_async_with_conn(
+            "ALTER SECRET kafka_auth SET (password = 'replacement')",
+            Some("secret-admin-connection"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        altered_sales.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    assert_eq!(
+        secret_store
+            .get_secret(1, "kafka_auth")
+            .await
+            .unwrap()
+            .payload["password"],
+        "literal-secret"
+    );
+    assert_eq!(
+        secret_store
+            .get_secret(2, "kafka_auth")
+            .await
+            .unwrap()
+            .payload["password"],
+        "replacement"
+    );
+
+    let dropped_sales = handler
+        .dispatch_async_with_conn("DROP SECRET kafka_auth", Some("secret-admin-connection"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        dropped_sales.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    assert!(secret_store.contains_secret(1, "kafka_auth").await.unwrap());
+    assert!(!secret_store.contains_secret(2, "kafka_auth").await.unwrap());
+    handler
+        .sessions
+        .get_mut("secret-admin-connection")
+        .unwrap()
+        .current_namespace = "public".to_string();
+    let dropped_public = handler
+        .dispatch_async_with_conn("DROP SECRET kafka_auth", Some("secret-admin-connection"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        dropped_public.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    assert!(!secret_store.contains_secret(1, "kafka_auth").await.unwrap());
+}
+
+#[tokio::test]
 async fn gateway_mutation_authorization_lfs() {
     let temp = tempfile::tempdir().unwrap();
     let audit_path = temp.path().join("audit.jsonl");
@@ -233,6 +838,683 @@ async fn gateway_mutation_authorization_lfs() {
     assert_eq!(events[0].resource, "durable");
     assert_eq!(events[0].detail.as_deref(), Some("unauthorized role"));
     assert_eq!(events[0].error_code.as_deref(), Some("RS-2401"));
+}
+
+#[tokio::test]
+async fn durable_policy_denial_is_audited_without_mutating_catalog_or_session() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let secret_store = Arc::new(SecretStore::new(
+        None,
+        Arc::new(EnvKekProvider::from_passphrase("secret-use-test-kek")),
+    ));
+    secret_store
+        .create_secret(
+            1,
+            "kafka_auth",
+            SecretType::SaslPlain,
+            HashMap::from([
+                ("username".to_string(), "source-user".to_string()),
+                ("password".to_string(), "source-password".to_string()),
+            ]),
+            "test",
+        )
+        .await
+        .unwrap();
+    let handler = GatewayHandler::new(catalog.clone(), Arc::new(NoopViewReader))
+        .with_secret_store(secret_store);
+    let protected_table = CatalogTable::new(
+        "blocked",
+        vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    );
+    assert!(catalog.add_table(protected_table.clone()));
+    let salt = vec![1; 16];
+    let iterations = 4096;
+    let (salted_password, stored_key, server_key) =
+        gen_scram_verifiers("test-password", &salt, iterations);
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "Durable administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "admin-login".to_string(),
+            salt: salt.clone(),
+            iterations,
+            stored_key: stored_key.to_vec(),
+            server_key: server_key.to_vec(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "security-policy-test",
+    ));
+    seed_public_namespace(&durable).await;
+    durable
+        .preprovision_first_administrator(principal.clone(), 1)
+        .await
+        .unwrap();
+    let bootstrap_audit = durable
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("first administrator bootstrap audit");
+    assert_eq!(bootstrap_audit.actor, AuditIdentity::Unknown);
+    assert_eq!(bootstrap_audit.event_id, "first-admin-bootstrap:1");
+
+    let reader = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Durable reader".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "reader-login".to_string(),
+            salt: salt.clone(),
+            iterations,
+            stored_key: stored_key.to_vec(),
+            server_key: server_key.to_vec(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Builder,
+            scope: PolicyScope::Namespace {
+                namespace: "public".to_string(),
+            },
+        }],
+        scoped_grants: vec![ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: PolicyScope::Secret {
+                namespace: "public".to_string(),
+                name: "kafka_auth".to_string(),
+                consumer: Some(PrincipalId(2)),
+            },
+        }],
+    };
+    let reader_policy =
+        serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
+            .unwrap();
+    let reader_grant_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "reader-grant".to_string(),
+        timestamp_ms: current_timestamp_ms(),
+        actor: AuditIdentity::Verified("principal:1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("2".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={reader_policy}")),
+    };
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                3,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: reader.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: reader_grant_audit.clone(),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    catalog.set_durable_store(durable.clone());
+    handler
+        .role_catalog
+        .insert(RoleEntry {
+            username: "admin-login".to_string(),
+            scram_salted_password: salted_password.to_vec(),
+            scram_salt: salt.clone(),
+            scram_iterations: iterations,
+            md5_hash: None,
+        })
+        .unwrap();
+    handler
+        .role_catalog
+        .insert(RoleEntry {
+            username: "reader-login".to_string(),
+            scram_salted_password: salted_password.to_vec(),
+            scram_salt: salt,
+            scram_iterations: iterations,
+            md5_hash: None,
+        })
+        .unwrap();
+
+    catalog.add_view_in_namespace(CatalogView {
+        name: "allowed_view".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+
+    let connection_id = "durable-policy-denial";
+    handler
+        .sessions
+        .entry(connection_id.to_string())
+        .or_default()
+        .principal = Principal::ScramUser {
+        username: "admin-login".to_string(),
+    };
+    let responses = handler
+        .dispatch_async_with_conn("CREATE TABLE blocked (id BIGINT)", Some(connection_id))
+        .await
+        .unwrap();
+    let error = match responses.as_slice() {
+        [pgwire::api::results::Response::Error(error)] => error,
+        _ => panic!("expected exactly one authorization error response"),
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "42501");
+    assert_eq!(
+        error.message,
+        "[RS-2401] auth.permission_denied: principal 'admin-login' is not authorized for action 'TableCreate' on public.blocked. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert_eq!(catalog.get_table("blocked"), Some(protected_table.clone()));
+    assert!(handler.sessions.contains_key(connection_id));
+
+    let read_responses = handler
+        .dispatch_async_with_conn("SELECT * FROM blocked", Some(connection_id))
+        .await
+        .unwrap();
+    let read_error = match read_responses.as_slice() {
+        [pgwire::api::results::Response::Error(error)] => error,
+        _ => panic!("expected exactly one read authorization error response"),
+    };
+    assert_eq!(read_error.severity, "ERROR");
+    assert_eq!(read_error.code, "42501");
+    assert_eq!(
+        read_error.message,
+        "[RS-2401] auth.permission_denied: principal 'admin-login' is not authorized for action 'DataRead' on public.blocked. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert_eq!(catalog.get_table("blocked"), Some(protected_table));
+    assert!(handler.sessions.contains_key(connection_id));
+
+    let reader_connection = "durable-policy-reader";
+    handler
+        .sessions
+        .entry(reader_connection.to_string())
+        .or_default()
+        .principal = Principal::ScramUser {
+        username: "reader-login".to_string(),
+    };
+    let allowed_read = handler
+        .dispatch_async_with_conn("SELECT * FROM allowed_view", Some(reader_connection))
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed_read.as_slice(),
+        [pgwire::api::results::Response::Query(_)]
+    ));
+
+    let denial = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: String::new(),
+        timestamp_ms: 0,
+        actor: AuditIdentity::Verified("scram:admin-login".to_string()),
+        target: AuditField::Known("public.blocked".to_string()),
+        scope: AuditField::Known(
+            serde_json::to_string(&PolicyScope::Resource {
+                namespace: "public".to_string(),
+                kind: rockstream_types::authorization::ResourceKind::Table,
+                name: "blocked".to_string(),
+            })
+            .unwrap(),
+        ),
+        action: SecurityAuditClass::AuthorizationDenial,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Observed(connection_id.to_string()),
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    let records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0], bootstrap_audit);
+    assert_eq!(records[1], reader_grant_audit);
+    for actual_denial in &records[2..] {
+        assert!(actual_denial.event_id.starts_with("gateway-authz-"));
+        assert!(actual_denial.timestamp_ms > 0);
+        assert_eq!(
+            &SecurityAuditRecord {
+                event_id: String::new(),
+                timestamp_ms: 0,
+                ..actual_denial.clone()
+            },
+            &denial
+        );
+    }
+
+    let secret_metadata_denial = handler
+        .dispatch_async_with_conn("SHOW SECRETS", Some(reader_connection))
+        .await
+        .unwrap();
+    let metadata_error = match secret_metadata_denial.as_slice() {
+        [pgwire::api::results::Response::Error(error)] => error,
+        _ => panic!("expected exactly one secret metadata denial response"),
+    };
+    assert_eq!(metadata_error.severity, "ERROR");
+    assert_eq!(metadata_error.code, "42501");
+    assert_eq!(
+        metadata_error.message,
+        "[RS-2401] auth.permission_denied: principal 'reader-login' is not authorized for action 'SecretMetadataRead' on public. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert!(handler.sessions.contains_key(reader_connection));
+    let records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 5);
+    let metadata_denial = records.last().unwrap();
+    assert_eq!(
+        metadata_denial.actor,
+        AuditIdentity::Verified("scram:reader-login".to_string())
+    );
+    assert_eq!(
+        metadata_denial.target,
+        AuditField::Known("public".to_string())
+    );
+    assert_eq!(
+        metadata_denial.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::Namespace {
+                namespace: "public".to_string(),
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(
+        metadata_denial.action,
+        SecurityAuditClass::AuthorizationDenial
+    );
+    assert_eq!(metadata_denial.outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(
+        metadata_denial.correlation,
+        AuditCorrelation::Observed(reader_connection.to_string())
+    );
+    assert_eq!(metadata_denial.policy_revision, AuditField::Known(1));
+
+    let allowed_source = handler
+        .dispatch_async_with_conn(
+            "CREATE SOURCE kafka_src TYPE kafka (bootstrap.servers='localhost:9092', topic='orders', secret='kafka_auth') FORMAT json",
+            Some(reader_connection),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed_source.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    let source = catalog.get_source("kafka_src").unwrap();
+    assert_eq!(
+        source.options.get("secret").map(String::as_str),
+        Some("secret://kafka_auth")
+    );
+    assert_eq!(source.secret_consumer, Some(PrincipalId(2)));
+    assert_eq!(source.secret_namespace.as_deref(), Some("public"));
+    let persisted_source = durable
+        .list_sources()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|source| source.name == "kafka_src")
+        .expect("authorized source must be durable before the request is acknowledged");
+    assert_eq!(
+        persisted_source.options.get("secret").map(String::as_str),
+        Some("secret://kafka_auth")
+    );
+    assert_eq!(persisted_source.secret_consumer, Some(PrincipalId(2)));
+    assert_eq!(persisted_source.secret_namespace.as_deref(), Some("public"));
+
+    let allowed_sink = handler
+        .dispatch_async_with_conn(
+            "CREATE SINK kafka_sink FOR VIEW allowed_view TO ICEBERG 's3://bucket/path' WITH (catalog='filesystem', secret='kafka_auth')",
+            Some(reader_connection),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed_sink.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
+    let persisted_sink = durable
+        .list_sinks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|sink| sink.name == "kafka_sink")
+        .expect("authorized sink must be durable before the request is acknowledged");
+    assert_eq!(
+        persisted_sink.secret_reference.as_deref(),
+        Some("secret://kafka_auth")
+    );
+    assert_eq!(persisted_sink.secret_consumer, Some(PrincipalId(2)));
+    assert_eq!(persisted_sink.secret_namespace.as_deref(), Some("public"));
+
+    let denied_source = handler
+        .dispatch_async_with_conn(
+            "CREATE SOURCE denied_src TYPE kafka (bootstrap.servers='localhost:9092', topic='orders', secret='restricted_secret') FORMAT json",
+            Some(reader_connection),
+        )
+        .await
+        .unwrap();
+    let error = match denied_source.as_slice() {
+        [pgwire::api::results::Response::Error(error)] => error,
+        _ => panic!("expected secret-use denial"),
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "42601");
+    assert_eq!(
+        error.message,
+        "[RS-2401] auth.permission_denied: secret reference use is not authorized. Next steps: request an authorized scoped secret-use grant."
+    );
+    assert!(catalog.get_source("denied_src").is_none());
+    assert!(handler.sessions.contains_key(reader_connection));
+
+    let records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 6);
+    let denied_secret_use = records.last().unwrap();
+    assert!(denied_secret_use.event_id.starts_with("gateway-authz-"));
+    assert!(denied_secret_use.timestamp_ms > 0);
+    assert_eq!(
+        denied_secret_use.actor,
+        AuditIdentity::Verified("scram:reader-login".to_string())
+    );
+    assert_eq!(
+        denied_secret_use.target,
+        AuditField::Known("restricted_secret".to_string())
+    );
+    assert_eq!(
+        denied_secret_use.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::Secret {
+                namespace: "public".to_string(),
+                name: "restricted_secret".to_string(),
+                consumer: Some(PrincipalId(2)),
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(
+        denied_secret_use.action,
+        SecurityAuditClass::AuthorizationDenial
+    );
+    assert_eq!(denied_secret_use.outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(
+        denied_secret_use.correlation,
+        AuditCorrelation::Observed(reader_connection.to_string())
+    );
+    assert_eq!(denied_secret_use.policy_revision, AuditField::Known(1));
+
+    for query in ["DROP SINK kafka_sink", "DROP SOURCE kafka_src"] {
+        let response = handler
+            .dispatch_async_with_conn(query, Some(reader_connection))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response.as_slice(),
+                [pgwire::api::results::Response::Execution(_)]
+            ),
+            "{query} must be acknowledged after durable deletion"
+        );
+    }
+    assert!(durable.list_sinks().await.unwrap().is_empty());
+    assert!(durable.list_sources().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn show_security_audit_returns_stable_pages_and_denies_operator_only_access() {
+    let issuer = "https://issuer.example";
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "security-audit-history",
+    ));
+    let administrator = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "Audit administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: issuer.to_string(),
+            subject: "admin".to_string(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    durable
+        .preprovision_first_administrator(administrator, 201)
+        .await
+        .unwrap();
+    let base_ms = current_timestamp_ms() + 60_000;
+    let event_a = audit_page_event("a", base_ms + 1);
+    let event_z = audit_page_event("z", base_ms + 1);
+    let event_b = audit_page_event("b", base_ms + 2);
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                3,
+                203,
+                vec![
+                    CatalogMutation::AppendSecurityAudit(event_z.clone()),
+                    CatalogMutation::AppendSecurityAudit(event_a.clone()),
+                    CatalogMutation::AppendSecurityAudit(event_b.clone()),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let operator = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Audit operator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: issuer.to_string(),
+            subject: "operator".to_string(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Operator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    let operator_policy = serde_json::to_string(&(
+        operator.enabled,
+        &operator.preset_grants,
+        &operator.scoped_grants,
+    ))
+    .unwrap();
+    let operator_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "operator-grant".to_string(),
+        timestamp_ms: base_ms + 10,
+        actor: AuditIdentity::Verified("principal:1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known("204".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={operator_policy}")),
+    };
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                4,
+                204,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: operator.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: operator_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.set_durable_store(durable.clone());
+    let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader));
+    handler
+        .sessions
+        .entry("audit-admin".to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: issuer.to_string(),
+        sub: "admin".to_string(),
+    };
+    let expected_row = |event_id: &str, timestamp_ms: u64| {
+        vec![
+            Some("1".to_string()),
+            Some(event_id.to_string()),
+            Some(timestamp_ms.to_string()),
+            Some("verified:actor-1".to_string()),
+            Some("known:principal:2".to_string()),
+            Some("known:cluster".to_string()),
+            Some("grant_change".to_string()),
+            Some("success".to_string()),
+            Some("observed:client-1".to_string()),
+            Some("known:17".to_string()),
+            Some("known:2".to_string()),
+            Some("not_applicable".to_string()),
+            Some("known:revision=2;policy=test".to_string()),
+            Some(format!(
+                "{timestamp_ms}:{}",
+                B64_URL_SAFE.encode(event_id.as_bytes())
+            )),
+        ]
+    };
+    let page_one = collect_query_rows(
+        &handler,
+        &format!(
+            "SHOW SECURITY AUDIT FROM {base_ms} TO {} LIMIT 1",
+            base_ms + 2
+        ),
+        "audit-admin",
+    )
+    .await;
+    assert_eq!(page_one, vec![expected_row("a", base_ms + 1)]);
+    let page_two = collect_query_rows(
+        &handler,
+        &format!(
+            "SHOW SECURITY AUDIT FROM {base_ms} TO {} AFTER {}:{} LIMIT 1",
+            base_ms + 2,
+            event_a.timestamp_ms,
+            B64_URL_SAFE.encode(event_a.event_id.as_bytes())
+        ),
+        "audit-admin",
+    )
+    .await;
+    assert_eq!(page_two, vec![expected_row("z", base_ms + 1)]);
+    let page_three = collect_query_rows(
+        &handler,
+        &format!(
+            "SHOW SECURITY AUDIT FROM {base_ms} TO {} AFTER {}:{} LIMIT 1",
+            base_ms + 2,
+            event_z.timestamp_ms,
+            B64_URL_SAFE.encode(event_z.event_id.as_bytes())
+        ),
+        "audit-admin",
+    )
+    .await;
+    assert_eq!(page_three, vec![expected_row("b", base_ms + 2)]);
+
+    let invalid = handler
+        .dispatch_async_with_conn("SHOW SECURITY AUDIT LIMIT 501", Some("audit-admin"))
+        .await
+        .unwrap();
+    let pgwire::api::results::Response::Error(error) = &invalid[0] else {
+        panic!("page limits above 500 must be rejected");
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "42601");
+    assert_eq!(
+        error.message,
+        "[RS-1012] sql.parse_error: invalid SHOW SECURITY AUDIT query. next_steps: Check SQL syntax; see docs/language-features.md for the supported SQL subset."
+    );
+
+    handler
+        .sessions
+        .entry("audit-operator".to_string())
+        .or_default()
+        .principal = Principal::Oidc {
+        issuer: issuer.to_string(),
+        sub: "operator".to_string(),
+    };
+    let denied = handler
+        .dispatch_async_with_conn(
+            &format!(
+                "SHOW SECURITY AUDIT FROM {base_ms} TO {} LIMIT 1",
+                base_ms + 2
+            ),
+            Some("audit-operator"),
+        )
+        .await
+        .unwrap();
+    let pgwire::api::results::Response::Error(error) = &denied[0] else {
+        panic!("operator-only access must be denied");
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "42501");
+    assert_eq!(
+        error.message,
+        "[RS-2401] auth.permission_denied: principal 'operator' is not authorized for action 'SecurityAuditRead' on the requested security audit range. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert!(handler.sessions.contains_key("audit-operator"));
+    assert_eq!(
+        durable
+            .get_security_principal(PrincipalId(2))
+            .await
+            .unwrap(),
+        Some(operator)
+    );
+    let audit = durable.list_security_audit_records().await.unwrap();
+    let denied_event = audit
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+        .expect("the denied read is durably audited");
+    assert_eq!(
+        denied_event.actor,
+        AuditIdentity::Verified(format!("oidc:{}:{}:8:operator", issuer.len(), issuer))
+    );
+    assert_eq!(
+        denied_event.target,
+        AuditField::Known("security_audit".to_string())
+    );
+    assert_eq!(denied_event.outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(
+        denied_event.correlation,
+        AuditCorrelation::Observed("audit-operator".to_string())
+    );
 }
 
 #[cfg(feature = "testcontainers")]

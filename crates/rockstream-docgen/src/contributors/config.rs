@@ -12,7 +12,7 @@ impl ConfigContributor {
                 key: "auth.mode".to_string(),
                 data_type: "String".to_string(),
                 default_value: "off".to_string(),
-                description: "Explicit --auth selects a mode; OIDC and gateway mTLS require their settings. SCRAM remains unavailable until durable principal grants are enforced.".to_string(),
+                description: "Explicit --auth selects off, SCRAM, OIDC, or gateway mTLS. SCRAM requires an enabled durable login; OIDC and gateway mTLS require their settings. MD5 is rejected.".to_string(),
                 deprecated: false,
                 env_var: Some("ROCKSTREAM_AUTH_MODE".to_string()),
                 source_origin: "rockstream-types::config::AuthSection".to_string(),

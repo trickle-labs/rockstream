@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
+use rockstream_gateway::role_catalog::{create_role_entry, gen_scram_verifiers, RoleCatalog};
 use rockstream_gateway::{
     catalog_stubs::{
         CatalogColumn, CatalogIndexEntry, CatalogIndexState, CatalogStubs, CatalogTable,
@@ -19,13 +20,17 @@ use rockstream_gateway::{
     GatewayError, GatewayServer,
 };
 use rockstream_sql::WorkloadCatalog;
-use rockstream_storage::{ShardDb, ShardReader};
+use rockstream_storage::{catalog::DurableCatalogStore, ShardDb, ShardReader};
 use rockstream_types::{
+    authorization::{
+        LoginMethod, PermissionPreset, PolicyScope, ScopedPresetGrant, SecurityPrincipal,
+        SECURITY_PRINCIPAL_FORMAT_VERSION,
+    },
     cost::set_active_pricing_config,
     frontier::{
         bloom_filter_might_contain, build_exact_membership_filter, ColumnStats, ShardColumnStats,
     },
-    ids::{ShardId, ViewId},
+    ids::{PrincipalId, ShardId, ViewId},
     metrics::{
         generate_prometheus_metrics, inc_shard_bloom_false_positive_total,
         read_scatter_shards_pruned_total, read_scatter_shards_total,
@@ -38,6 +43,9 @@ use rockstream_types::{
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio_postgres::NoTls;
+
+#[path = "common/security_policy.rs"]
+mod security_policy;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
@@ -3497,6 +3505,7 @@ async fn copy_in_auth_enforced_lfs() {
 
     let responses = handler
         .copy_from_stdin_response("COPY auth_t FROM STDIN", viewer_conn)
+        .await
         .expect("copy_from_stdin_response should return Ok (error inside response)");
 
     let viewer_err = responses
@@ -3528,6 +3537,7 @@ async fn copy_in_auth_enforced_lfs() {
 
     let responses = handler
         .copy_from_stdin_response("COPY auth_t FROM STDIN", owner_conn)
+        .await
         .expect("owner should get a response");
 
     let has_copy_in = responses
@@ -5483,13 +5493,41 @@ fn test_role_catalog_create_alter_drop() {
 /// End-to-end SCRAM handshake via tokio-postgres client against in-process gateway.
 #[tokio::test]
 async fn test_scram_auth_flow_unit() {
-    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
-
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    let role = create_role_entry("alice", "pencil");
+    let (_, stored_key, server_key) =
+        gen_scram_verifiers("pencil", &role.scram_salt, role.scram_iterations);
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(InMemory::new()),
+        "gateway-proof-scram-test",
+    ));
+    durable
+        .preprovision_first_administrator(
+            SecurityPrincipal {
+                format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+                id: PrincipalId(1),
+                display_name: "Test SCRAM administrator".to_string(),
+                enabled: true,
+                revision: 1,
+                login_methods: vec![LoginMethod::ScramSha256 {
+                    username: "alice".to_string(),
+                    salt: role.scram_salt,
+                    iterations: role.scram_iterations,
+                    stored_key: stored_key.to_vec(),
+                    server_key: server_key.to_vec(),
+                }],
+                preset_grants: vec![ScopedPresetGrant {
+                    preset: PermissionPreset::Administrator,
+                    scope: PolicyScope::Cluster,
+                }],
+                scoped_grants: vec![],
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    catalog.set_durable_store(durable);
     let role_catalog = Arc::new(RoleCatalog::new());
-    role_catalog
-        .insert(create_role_entry("alice", "pencil"))
-        .expect("insert alice");
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server =
@@ -5519,50 +5557,21 @@ async fn test_scram_auth_flow_unit() {
     assert!(!rows.is_empty(), "should have at least one row");
 }
 
-/// S6 green gate: test_md5_auth_flow_unit
-/// End-to-end MD5 handshake via tokio-postgres client against in-process gateway.
+/// MD5 is not a release authentication mode and must fail before binding.
 #[tokio::test]
-async fn test_md5_auth_flow_unit() {
-    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
-
+async fn md5_auth_is_unavailable_at_startup() {
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
-    let role_catalog = Arc::new(RoleCatalog::new());
-    role_catalog
-        .insert(create_role_entry("bob", "secret"))
-        .expect("insert bob");
-
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server =
-        GatewayServer::with_md5_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
-    let (local_addr, _handle) = server.serve_background().await.unwrap();
-    let port = local_addr.port();
-
-    let (client, conn) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={port} user=bob password=secret dbname=test sslmode=disable"),
-        NoTls,
-    )
-    .await
-    .expect("MD5 auth should succeed for bob/secret");
-
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            eprintln!("conn error: {e}");
-        }
-    });
-
-    let rows = client
-        .simple_query("SELECT 1")
-        .await
-        .expect("SELECT 1 should work after MD5 auth");
-    assert!(!rows.is_empty(), "should have at least one row");
-
-    // Wrong password must fail
-    let bad = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={port} user=bob password=wrong dbname=test sslmode=disable"),
-        NoTls,
-    )
-    .await;
-    assert!(bad.is_err(), "wrong password should be rejected");
+    let server = GatewayServer::with_md5_auth(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+        Arc::new(rockstream_gateway::RoleCatalog::new()),
+    );
+    let error = server.serve_background().await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "gateway MD5 authentication is unavailable; configure SCRAM-SHA-256"
+    );
 }
 
 /// S7 green gate: test_bootstrap_functions
@@ -5570,13 +5579,9 @@ async fn test_md5_auth_flow_unit() {
 /// pg_postmaster_start_time, txid_current, current_schemas via live gateway.
 #[tokio::test]
 async fn test_bootstrap_functions() {
-    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
-
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
-    let role_catalog = Arc::new(RoleCatalog::new());
-    role_catalog
-        .insert(create_role_entry("alice", "pencil"))
-        .expect("insert alice");
+    let role_catalog =
+        security_policy::role_catalog_with_authorized_builder(&catalog, "alice", "pencil").await;
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server =
@@ -5693,13 +5698,9 @@ async fn test_bootstrap_functions() {
 /// SET search_path / client_encoding / timezone then SHOW verifies round-trip.
 #[tokio::test]
 async fn test_guc_round_trip() {
-    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
-
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
-    let role_catalog = Arc::new(RoleCatalog::new());
-    role_catalog
-        .insert(create_role_entry("alice", "pencil"))
-        .expect("insert alice");
+    let role_catalog =
+        security_policy::role_catalog_with_authorized_builder(&catalog, "alice", "pencil").await;
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server =

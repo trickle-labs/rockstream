@@ -16,6 +16,7 @@ use super::{
     CatalogRoleEntry, CatalogSinkEntry, CatalogSourceEntry, CatalogTable, CatalogView,
     CatalogWorkloadEntry, CompiledPlanRecord, ViewDependency,
 };
+use rockstream_types::authorization::{SecurityAuditRecord, SecurityPrincipal};
 use rockstream_types::ids::{
     CompiledPlanId, IndexId, PrincipalId, SinkId, SourceId, TableId, ViewId, WorkloadId,
 };
@@ -52,6 +53,19 @@ pub enum CatalogMutation {
     DeleteSink(SinkId),
     PutRole(CatalogRoleEntry),
     DeleteRole(PrincipalId),
+    PutSecurityPrincipal {
+        principal: SecurityPrincipal,
+        expected_revision: Option<u64>,
+        grantor_revision: Option<(PrincipalId, u64)>,
+        audit: SecurityAuditRecord,
+    },
+    DeleteSecurityPrincipal {
+        principal_id: PrincipalId,
+        expected_revision: u64,
+        grantor_revision: Option<(PrincipalId, u64)>,
+        audit: SecurityAuditRecord,
+    },
+    AppendSecurityAudit(SecurityAuditRecord),
     PutCompiledPlan(CompiledPlanRecord),
     DeleteCompiledPlan(CompiledPlanId),
 }
@@ -59,6 +73,12 @@ pub enum CatalogMutation {
 /// An atomic logical catalog transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogTxn {
+    /// Version of the serialized transaction contract. Legacy transactions omit this field.
+    #[serde(
+        default = "legacy_txn_format_version",
+        skip_serializing_if = "is_legacy_txn_format"
+    )]
+    pub format_version: u16,
     /// Monotonic revision sequence number.
     pub revision: u64,
     /// Operation identifier for deduplication and retry safety.
@@ -84,10 +104,16 @@ impl CatalogTxn {
             )));
         }
 
+        let format_version = if mutations.iter().any(is_security_mutation) {
+            2
+        } else {
+            1
+        };
         let serialized = canonical_serialize_mutations(&mutations)?;
         let checksum = compute_checksum(&serialized);
 
         Ok(Self {
+            format_version,
             revision,
             operation_id,
             mutations,
@@ -110,6 +136,18 @@ impl CatalogTxn {
             ))
         })?;
 
+        if txn.format_version > 2 {
+            return Err(CatalogError::IncompatibleVersion(format!(
+                "[RS-1002] unsupported catalog transaction format version {}; supported format is 2; next_steps: upgrade RockStream binary",
+                txn.format_version
+            )));
+        }
+        if txn.format_version < 2 && txn.mutations.iter().any(is_security_mutation) {
+            return Err(CatalogError::IncompatibleVersion(
+                "[RS-1002] security catalog mutations require transaction format version 2; next_steps: upgrade RockStream binary".to_string(),
+            ));
+        }
+
         if txn.mutations.len() > MAX_MUTATIONS_PER_TRANSACTION {
             return Err(CatalogError::TransactionTooLarge(format!(
                 "[RS-1002] transaction contains {} mutations, exceeding limit of {}",
@@ -129,6 +167,23 @@ impl CatalogTxn {
 
         Ok(txn)
     }
+}
+
+fn legacy_txn_format_version() -> u16 {
+    1
+}
+
+fn is_legacy_txn_format(version: &u16) -> bool {
+    *version == 1
+}
+
+fn is_security_mutation(mutation: &CatalogMutation) -> bool {
+    matches!(
+        mutation,
+        CatalogMutation::PutSecurityPrincipal { .. }
+            | CatalogMutation::DeleteSecurityPrincipal { .. }
+            | CatalogMutation::AppendSecurityAudit(_)
+    )
 }
 
 fn canonical_serialize_mutations(mutations: &[CatalogMutation]) -> Result<Vec<u8>, CatalogError> {

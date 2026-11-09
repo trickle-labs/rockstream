@@ -605,6 +605,28 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
         self.source.relation_column_policies(relation_id).await
     }
 
+    pub fn pgoutput_secret_binding(
+        &self,
+        lease: &SourceOwnerLease,
+    ) -> Result<(Option<&str>, u64), SourceError> {
+        self.require_active_lease(lease)?;
+        Ok(self.source.secret_binding())
+    }
+
+    pub async fn rotate_pgoutput_secret_at_epoch(
+        &mut self,
+        lease: &SourceOwnerLease,
+        secret_name: &str,
+        version: u64,
+        password: String,
+    ) -> Result<bool, SourceError> {
+        self.require_active_lease(lease)?;
+        let has_checkpoint = self.committed_epoch() != 0;
+        self.source
+            .rotate_pgoutput_secret_at_epoch(secret_name, version, password, has_checkpoint)
+            .await
+    }
+
     pub fn close_pgoutput(&mut self, lease: &SourceOwnerLease) -> bool {
         if self.active_lease.as_ref() != Some(lease) {
             return false;
