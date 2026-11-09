@@ -72,7 +72,7 @@ impl SupportArtifactStore {
     pub async fn initialize(&self) -> Result<(), ArtifactStoreError> {
         match async {
             self.mutate_ledger(|_| Ok(true)).await?;
-            self.mutate_ledger(|_| Ok(true)).await
+            self.mutate_ledger(|_| Ok(true)).await.map(|_| ())
         }
         .await
         {
@@ -109,28 +109,29 @@ impl SupportArtifactStore {
             size: content.len(),
             expires_at_ms: expiry.unix_ms,
         };
-        self.mutate_ledger(|ledger| {
-            if let Some(existing) = ledger.artifacts.get(&id) {
-                return if existing == &entry {
-                    Ok(false)
-                } else {
-                    Err(ArtifactStoreError::Exists)
+        let reserved = self
+            .mutate_ledger(|ledger| {
+                if let Some(existing) = ledger.artifacts.get(&id) {
+                    return if existing == &entry {
+                        Ok(false)
+                    } else {
+                        Err(ArtifactStoreError::Exists)
+                    };
+                }
+                let used = ledger
+                    .artifacts
+                    .values()
+                    .try_fold(0usize, |total, item| total.checked_add(item.size));
+                let Some(next_size) = used.and_then(|used| used.checked_add(entry.size)) else {
+                    return Err(ArtifactStoreError::StorageFull);
                 };
-            }
-            let used = ledger
-                .artifacts
-                .values()
-                .try_fold(0usize, |total, item| total.checked_add(item.size));
-            let Some(next_size) = used.and_then(|used| used.checked_add(entry.size)) else {
-                return Err(ArtifactStoreError::StorageFull);
-            };
-            if next_size > MAX_ARTIFACT_STORAGE_BYTES {
-                return Err(ArtifactStoreError::StorageFull);
-            }
-            ledger.artifacts.insert(id.clone(), entry.clone());
-            Ok(true)
-        })
-        .await?;
+                if next_size > MAX_ARTIFACT_STORAGE_BYTES {
+                    return Err(ArtifactStoreError::StorageFull);
+                }
+                ledger.artifacts.insert(id.clone(), entry.clone());
+                Ok(true)
+            })
+            .await?;
 
         let path = self.artifact_path(&id);
         match self
@@ -156,6 +157,17 @@ impl SupportArtifactStore {
                 if existing.as_ref() == content.as_ref() {
                     Ok(())
                 } else {
+                    if reserved {
+                        self.mutate_ledger(|ledger| {
+                            if ledger.artifacts.get(&id) == Some(&entry) {
+                                ledger.artifacts.remove(&id);
+                                Ok(true)
+                            } else {
+                                Ok(false)
+                            }
+                        })
+                        .await?;
+                    }
                     Err(ArtifactStoreError::Exists)
                 }
             }
@@ -255,6 +267,7 @@ impl SupportArtifactStore {
             }
         })
         .await
+        .map(|_| ())
     }
 
     pub async fn cleanup_expired(&self, now_ms: u64) -> Result<(), ArtifactStoreError> {
@@ -280,6 +293,7 @@ impl SupportArtifactStore {
             Ok(ledger.artifacts.len() != before)
         })
         .await
+        .map(|_| ())
     }
 
     async fn delete_artifact(&self, id: &str) -> Result<(), ArtifactStoreError> {
@@ -336,7 +350,7 @@ impl SupportArtifactStore {
         }
     }
 
-    async fn mutate_ledger<F>(&self, mutation: F) -> Result<(), ArtifactStoreError>
+    async fn mutate_ledger<F>(&self, mutation: F) -> Result<bool, ArtifactStoreError>
     where
         F: Fn(&mut ArtifactLedger) -> Result<bool, ArtifactStoreError>,
     {
@@ -344,7 +358,7 @@ impl SupportArtifactStore {
             let (mut ledger, version) = self.read_ledger().await?;
             let changed = mutation(&mut ledger)?;
             if !changed {
-                return Ok(());
+                return Ok(false);
             }
             let bytes =
                 serde_json::to_vec(&ledger).map_err(|_| ArtifactStoreError::StorageUnavailable)?;
@@ -361,7 +375,7 @@ impl SupportArtifactStore {
                 )
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(true),
                 Err(ObjectStoreError::AlreadyExists { .. })
                 | Err(ObjectStoreError::Precondition { .. })
                 | Err(ObjectStoreError::NotFound { .. }) => continue,
@@ -516,6 +530,45 @@ mod tests {
             object_store.get(&store.artifact_path(id)).await,
             Err(ObjectStoreError::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn conflicting_existing_object_does_not_reserve_artifact_quota() {
+        let object_store = Arc::new(InMemory::new());
+        let store = SupportArtifactStore::new(object_store.clone());
+        store.initialize().await.unwrap();
+        let id = "existing-collision";
+        let existing_content = b"existing object";
+        object_store
+            .put(&store.artifact_path(id), existing_content.to_vec().into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .insert(
+                    id.to_owned(),
+                    PrincipalId(1),
+                    PolicyScope::Cluster,
+                    Arc::from(b"requested object".to_vec()),
+                    ArtifactExpiry { unix_ms: 2_000 },
+                    1_000,
+                )
+                .await,
+            Err(ArtifactStoreError::Exists)
+        );
+        assert!(store.read_ledger().await.unwrap().0.artifacts.is_empty());
+        assert_eq!(
+            object_store
+                .get(&store.artifact_path(id))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            existing_content
+        );
     }
 
     #[tokio::test]
