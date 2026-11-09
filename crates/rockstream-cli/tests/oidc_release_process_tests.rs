@@ -8,8 +8,8 @@ use std::{
 
 use rockstream_control::audit::FileAuditLog;
 use rockstream_storage::catalog::{
-    CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn,
-    DurableCatalogStore,
+    CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogSourceEntry, CatalogStore,
+    CatalogTable, CatalogTxn, DurableCatalogStore,
 };
 use rockstream_types::{
     authorization::{
@@ -398,6 +398,7 @@ async fn start_control_process(
     address: std::net::SocketAddr,
     pki: &rockstream_test_support::pki::TestPki,
     additional_principal: Option<SecurityPrincipal>,
+    seed_worker_secret: bool,
 ) -> RunningGateway {
     let certs = rustls_pemfile::certs(&mut BufReader::new(
         std::fs::File::open(&pki.cli_cert_path).unwrap(),
@@ -424,7 +425,7 @@ async fn start_control_process(
         "gateway-shard",
     )
     .unwrap();
-    let catalog = DurableCatalogStore::new(security_store, "gateway");
+    let catalog = DurableCatalogStore::new(security_store.clone(), "gateway");
     catalog
         .preprovision_first_administrator(principal, 1)
         .await
@@ -468,8 +469,128 @@ async fn start_control_process(
             .await
             .unwrap();
     }
+    if seed_worker_secret {
+        let secret_scope = PolicyScope::Secret {
+            namespace: "public".to_owned(),
+            name: "kafka".to_owned(),
+            consumer: Some(PrincipalId(3)),
+        };
+        let consumer = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(3),
+            display_name: "Release source consumer".to_owned(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::Service {
+                service_id: "release-source".to_owned(),
+            }],
+            preset_grants: Vec::new(),
+            scoped_grants: vec![ScopedActionGrant {
+                action: SecurityAction::SecretUse,
+                scope: secret_scope.clone(),
+            }],
+        };
+        let policy = serde_json::to_string(&(
+            consumer.enabled,
+            &consumer.preset_grants,
+            &consumer.scoped_grants,
+        ))
+        .unwrap();
+        let audit = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "release-test-consumer-provision".to_owned(),
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:3".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::Known("3".to_owned()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(format!("revision=1;policy={policy}")),
+        };
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    3,
+                    3,
+                    vec![
+                        CatalogMutation::PutDatabase(CatalogDatabase {
+                            id: rockstream_types::ids::DatabaseId(1),
+                            name: "rockstream".to_owned(),
+                            default_namespace: "public".to_owned(),
+                            created_at: 1,
+                        }),
+                        CatalogMutation::PutNamespace(CatalogNamespace {
+                            id: rockstream_types::ids::NamespaceId(1),
+                            name: "public".to_owned(),
+                            database_id: rockstream_types::ids::DatabaseId(1),
+                            created_at: 1,
+                        }),
+                        CatalogMutation::PutTable(CatalogTable {
+                            id: rockstream_types::ids::TableId(1),
+                            name: "orders".to_owned(),
+                            namespace_id: rockstream_types::ids::NamespaceId(1),
+                            columns: Vec::new(),
+                            pk_cols: Vec::new(),
+                        }),
+                        CatalogMutation::PutSource(CatalogSourceEntry {
+                            id: rockstream_types::ids::SourceId(1),
+                            name: "orders_source".to_owned(),
+                            connector_type: "kafka".to_owned(),
+                            table_name: Some("orders".to_owned()),
+                            format: "json".to_owned(),
+                            options: std::collections::HashMap::from([(
+                                "secret".to_owned(),
+                                "secret://kafka".to_owned(),
+                            )]),
+                            secret_consumer: Some(PrincipalId(3)),
+                            secret_namespace: Some("public".to_owned()),
+                        }),
+                        CatalogMutation::PutSecurityPrincipal {
+                            principal: consumer,
+                            expected_revision: None,
+                            grantor_revision: Some((PrincipalId(1), 1)),
+                            audit,
+                        },
+                    ],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let secret_store = rockstream_control::SecretStore::open_durable(
+            "gateway-secrets",
+            security_store,
+            Arc::new(rockstream_control::EnvKekProvider::from_passphrase(
+                "release-test-kek",
+            )),
+        )
+        .await
+        .unwrap();
+        secret_store
+            .create_secret(
+                1,
+                "kafka",
+                rockstream_types::secret::SecretType::BearerToken,
+                std::collections::HashMap::from([(
+                    "password".to_owned(),
+                    "release-worker-secret".to_owned(),
+                )]),
+                "release-test",
+            )
+            .await
+            .unwrap();
+        drop(secret_store);
+    }
 
-    let child = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    command
         .current_dir(working_dir)
         .env("RUST_LOG", "off")
         .env_remove("ROCKSTREAM_CONFIG")
@@ -492,9 +613,11 @@ async fn start_control_process(
             pki.ca_cert_path.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    if seed_worker_secret {
+        command.env("RS_SECRET_KEK", "release-test-kek");
+    }
+    let child = command.spawn().unwrap();
     RunningGateway(child)
 }
 
@@ -531,8 +654,15 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
     .unwrap();
 
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut process =
-        start_control_process(temp.path(), &storage, address, &pki, Some(actor.clone())).await;
+    let mut process = start_control_process(
+        temp.path(),
+        &storage,
+        address,
+        &pki,
+        Some(actor.clone()),
+        false,
+    )
+    .await;
     wait_for_gateway(&mut process.0, address).await;
 
     let object_store = rockstream_storage::build_runtime_object_store(
@@ -688,6 +818,254 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
             before_state: AuditField::NotApplicable,
             after_state: AuditField::NotApplicable,
         }
+    );
+}
+
+#[tokio::test]
+async fn delegated_worker_secret_uses_durable_store_in_release_control_process() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../rockstream-control/tests/fixtures");
+    let secret_scope = PolicyScope::Secret {
+        namespace: "public".to_owned(),
+        name: "kafka".to_owned(),
+        consumer: Some(PrincipalId(3)),
+    };
+    let actor = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Release secret actor".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Service {
+            service_id: "release-test-actor".to_owned(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Builder,
+            scope: PolicyScope::Resource {
+                namespace: "public".to_owned(),
+                kind: ResourceKind::View,
+                name: "delegated_view".to_owned(),
+            },
+        }],
+        scoped_grants: vec![ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: secret_scope.clone(),
+        }],
+    };
+    let mut config = rockstream_types::config::NodeConfig::default();
+    config.node.deployment_id = Some("release-deployment".to_owned());
+    config.auth.actor_assertion_public_key_path =
+        Some(fixtures.join("actor-assertion-test-public.jwk"));
+    std::fs::write(
+        temp.path().join("rockstream.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_control_process(
+        temp.path(),
+        &storage,
+        address,
+        &pki,
+        Some(actor.clone()),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, address).await;
+
+    let object_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let catalog = DurableCatalogStore::recover(object_store, "gateway")
+        .await
+        .unwrap();
+    let audit_before = catalog.list_security_audit_records().await.unwrap();
+    let gateway_address: std::net::SocketAddr =
+        format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut gateway_process = start_gateway_process(
+        temp.path(),
+        &storage,
+        gateway_address,
+        &pki.gateway_cert_path,
+        &pki.gateway_key_path,
+        "off",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut gateway_process.0, gateway_address).await;
+    let worker_storage = temp.path().join("worker-storage");
+    let (worker, worker_handle) = rockstream_runtime::client::start_worker_client_with_tls(
+        1,
+        &address.to_string(),
+        &worker_storage,
+        pki.worker_tls_config(1),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while worker.worker_id().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut request = DeploymentRequest {
+        version: DEPLOYMENT_DESCRIPTOR_VERSION,
+        workload_id: WorkloadId(42),
+        namespace: "public".to_owned(),
+        workload_name: "delegated_view".to_owned(),
+        plan_json: "{}".to_owned(),
+        join_strategy: rockstream_types::config::JoinStrategy::Auto,
+        schemas: vec![rockstream_types::data_plane::DeploymentSchema {
+            relation: "orders".to_owned(),
+            columns: vec![rockstream_types::data_plane::DeploymentColumn {
+                name: "id".to_owned(),
+                data_type: "i64".to_owned(),
+            }],
+        }],
+        frontier: 0,
+        storage_root: temp.path().join("workload").to_string_lossy().into_owned(),
+        sink_operator_id: OperatorId(43),
+        output_columns: vec!["id".to_owned()],
+        primary_key: vec![0],
+        merge_key_columns: Vec::new(),
+        routing_columns: Default::default(),
+    };
+    request.plan_json = serde_json::to_string(&rockstream_plan::PlanNode::ViewSink {
+        view_name: request.workload_name.clone(),
+        pk: vec![0],
+        child: Box::new(rockstream_plan::PlanNode::Source {
+            name: "orders".to_owned(),
+        }),
+    })
+    .unwrap();
+    let message = WorkerMessage::DeployWorkload(request.clone());
+    let action = SecurityAction::ViewAuthor;
+    let view_scope = PolicyScope::Resource {
+        namespace: "public".to_owned(),
+        kind: ResourceKind::View,
+        name: "delegated_view".to_owned(),
+    };
+    let assertion = rockstream_control::delegation::ActorAssertionSigner::from_pkcs8_pem(
+        &fixtures.join("actor-assertion-test-key.pem"),
+        "release-deployment",
+    )
+    .unwrap()
+    .issue(
+        actor.id,
+        actor.revision,
+        action,
+        view_scope,
+        vec![secret_scope.clone()],
+        rockstream_control::delegation::request_digest(&message).unwrap(),
+    )
+    .unwrap();
+    let gateway = rockstream_runtime::data_plane::DataPlaneClient::new(address.to_string())
+        .with_internal_tls(&pki.gateway_tls_config())
+        .unwrap();
+    gateway
+        .deploy_delegated(request.clone(), &assertion)
+        .await
+        .unwrap();
+    assert!(worker
+        .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
+        .is_some());
+
+    worker
+        .request_secret_token(request.workload_id, "kafka")
+        .await
+        .unwrap();
+    let resolved = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(secret) = worker.secret(
+                request.workload_id,
+                "kafka",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            ) {
+                break secret;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if resolved.is_err() {
+        worker_handle.abort();
+        gateway_process.0.kill().unwrap();
+        gateway_process.0.wait().unwrap();
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        let recovered_store = rockstream_storage::build_runtime_object_store(
+            &storage.join("gateway-shard"),
+            "gateway-shard",
+        )
+        .unwrap();
+        let recovered = DurableCatalogStore::recover(recovered_store, "gateway")
+            .await
+            .unwrap();
+        let records = recovered.list_security_audit_records().await.unwrap();
+        panic!(
+            "worker secret refresh timed out; new records: {:?}",
+            &records[audit_before.len()..]
+        );
+    }
+    let resolved = resolved.unwrap();
+    assert_eq!(resolved.workload_id, request.workload_id);
+    assert_eq!(resolved.secret_name, "kafka");
+    assert_eq!(
+        resolved.payload,
+        std::collections::HashMap::from([(
+            "password".to_owned(),
+            "release-worker-secret".to_owned(),
+        )])
+    );
+    worker_handle.abort();
+    gateway_process.0.kill().unwrap();
+    gateway_process.0.wait().unwrap();
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let recovered_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let recovered = DurableCatalogStore::recover(recovered_store, "gateway")
+        .await
+        .unwrap();
+    let records = recovered.list_security_audit_records().await.unwrap();
+    let secret_audits: Vec<_> = records[audit_before.len()..]
+        .iter()
+        .filter(|record| {
+            record.action == SecurityAuditClass::AuthenticationSuccess
+                && record.target == AuditField::Known("kafka".to_owned())
+        })
+        .collect();
+    assert_eq!(secret_audits.len(), 1);
+    assert_eq!(
+        secret_audits[0].actor,
+        AuditIdentity::Verified(actor.id.to_string())
+    );
+    assert_eq!(
+        secret_audits[0].scope,
+        AuditField::Known(format!("{secret_scope:?}"))
+    );
+    assert_eq!(secret_audits[0].outcome, SecurityAuditOutcome::Success);
+    assert_eq!(
+        secret_audits[0].policy_revision,
+        AuditField::Known(actor.revision)
     );
 }
 
@@ -1867,7 +2245,8 @@ async fn expired_and_wrong_ca_worker_certificates_are_rejected_by_release_contro
     let storage = temp.path().join("control-storage");
     let pki = rockstream_test_support::pki::TestPki::generate();
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut process = start_control_process(temp.path(), &storage, address, &pki, None).await;
+    let mut process =
+        start_control_process(temp.path(), &storage, address, &pki, None, false).await;
     wait_for_gateway(&mut process.0, address).await;
 
     let audit_path = storage.join("audit.jsonl");
@@ -2009,7 +2388,8 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
     let worker_storage = temp.path().join("worker-storage");
     let pki = rockstream_test_support::pki::TestPki::generate();
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut process = start_control_process(temp.path(), &storage, address, &pki, None).await;
+    let mut process =
+        start_control_process(temp.path(), &storage, address, &pki, None, false).await;
     wait_for_gateway(&mut process.0, address).await;
 
     let (client, worker_handle) = rockstream_runtime::start_worker_client_with_tls(
@@ -2088,7 +2468,8 @@ async fn in_flight_internal_mtls_rotation_preserves_release_worker_stream() {
     let storage = temp.path().join("control-storage");
     let pki = rockstream_test_support::pki::TestPki::generate();
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut process = start_control_process(temp.path(), &storage, address, &pki, None).await;
+    let mut process =
+        start_control_process(temp.path(), &storage, address, &pki, None, false).await;
     wait_for_gateway(&mut process.0, address).await;
     let process_id = process.0.id();
 
