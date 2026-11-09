@@ -2190,6 +2190,97 @@ pub struct GatewayHandler {
     cursor_producer_slots: Arc<tokio::sync::Semaphore>,
 }
 
+fn secret_use_scopes_for_deployment(
+    principal: &rockstream_types::authorization::SecurityPrincipal,
+    schemas: &[rockstream_types::data_plane::DeploymentSchema],
+    sources: impl IntoIterator<Item = CatalogSourceEntry>,
+) -> Vec<rockstream_types::authorization::PolicyScope> {
+    use rockstream_types::authorization::{PolicyScope, SecurityAction};
+
+    sources
+        .into_iter()
+        .filter_map(|source| {
+            let table = source.table_name.as_deref()?;
+            if !schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(table))
+            {
+                return None;
+            }
+            let name = rockstream_types::secret::secret_name_from_reference(
+                source.options.get("secret")?,
+            )?;
+            Some(PolicyScope::Secret {
+                namespace: source.secret_namespace?,
+                name: name.to_owned(),
+                consumer: Some(source.secret_consumer?),
+            })
+        })
+        .filter(|scope| {
+            rockstream_control::authorization::allows(principal, SecurityAction::SecretUse, scope)
+        })
+        .fold(Vec::new(), |mut scopes, scope| {
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+            scopes
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn delegated_secret_allowance_matches_the_authorized_source_scope() {
+    use rockstream_types::authorization::{
+        LoginMethod, PolicyScope, ScopedActionGrant, SecurityAction, SecurityPrincipal,
+        SECURITY_PRINCIPAL_FORMAT_VERSION,
+    };
+
+    let scope = PolicyScope::Secret {
+        namespace: "public".to_owned(),
+        name: "kafka".to_owned(),
+        consumer: Some(PrincipalId(3)),
+    };
+    let source = CatalogSourceEntry {
+        name: "orders_source".to_owned(),
+        table_name: Some("orders".to_owned()),
+        source_type: "kafka".to_owned(),
+        options: HashMap::from([("secret".to_owned(), "secret://kafka".to_owned())]),
+        format: "json".to_owned(),
+        status: "RUNNING".to_owned(),
+        live_offset: "0".to_owned(),
+        live_lag: 0,
+        secret_consumer: Some(PrincipalId(3)),
+        secret_namespace: Some("public".to_owned()),
+    };
+    let mut principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "view author".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Service {
+            service_id: "view-author".to_owned(),
+        }],
+        preset_grants: Vec::new(),
+        scoped_grants: vec![ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: scope.clone(),
+        }],
+    };
+    let schemas = [rockstream_types::data_plane::DeploymentSchema {
+        relation: "ORDERS".to_owned(),
+        columns: Vec::new(),
+    }];
+
+    assert_eq!(
+        secret_use_scopes_for_deployment(&principal, &schemas, [source.clone()],),
+        vec![scope]
+    );
+
+    principal.scoped_grants.clear();
+    assert!(secret_use_scopes_for_deployment(&principal, &schemas, [source]).is_empty());
+}
+
 impl GatewayHandler {
     pub fn mark_draining(&self) {
         self.is_draining.store(true, Ordering::SeqCst);
@@ -2699,8 +2790,23 @@ impl GatewayHandler {
             "[RS-2401] dedicated actor assertion signing key is not configured".to_owned()
         })?;
         let digest = rockstream_control::delegation::request_digest(request)?;
+        let secret_use_scopes = match request {
+            WorkerMessage::DeployWorkload(deployment) => secret_use_scopes_for_deployment(
+                &principal,
+                &deployment.schemas,
+                self.catalog.list_sources(),
+            ),
+            _ => Vec::new(),
+        };
         signer
-            .issue(principal.id, principal.revision, action, scope, digest)
+            .issue(
+                principal.id,
+                principal.revision,
+                action,
+                scope,
+                secret_use_scopes,
+                digest,
+            )
             .map(Some)
     }
 
@@ -9707,19 +9813,13 @@ impl GatewayHandler {
                         &worker_request,
                     )
                     .await
-                    .map_err(|detail| {
-                        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                            detail,
-                        }))
-                    })?;
+                    .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
                 let deployment = match assertion {
                     Some(assertion) => data_plane.deploy_delegated(request, &assertion).await,
                     None => data_plane.deploy(request).await,
                 };
-                deployment.map_err(|error| {
-                    PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                        detail: format!("deploy distributed view {view_name}: {error}"),
-                    }))
+                deployment.map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("deploy distributed view {view_name}: {error}"),
                 })?;
                 Some(sink_operator_id.0)
             } else if let Some(shard_db) = self.shard_db.clone() {
