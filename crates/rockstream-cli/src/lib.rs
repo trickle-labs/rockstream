@@ -539,6 +539,38 @@ async fn open_security_catalog(
     Ok(Arc::new(catalog))
 }
 
+async fn open_durable_secret_store(
+    store: Arc<dyn object_store::ObjectStore>,
+    shard_path: &str,
+    security_catalog: Arc<dyn rockstream_storage::catalog::CatalogStore>,
+) -> Result<Arc<rockstream_control::SecretStore>, CliError> {
+    let secret_store = rockstream_control::SecretStore::open_durable(
+        format!("{shard_path}-secrets"),
+        store,
+        Arc::new(rockstream_control::EnvKekProvider::from_env()),
+    )
+    .await
+    .map_err(|error| {
+        CliError::new(
+            RS_0003,
+            format!("durable secret store failed to open: {error}"),
+            "Check durable storage and the configured key provider.",
+        )
+    })?
+    .with_security_audit_catalog(security_catalog);
+    secret_store
+        .flush_pending_security_audit_outbox()
+        .await
+        .map_err(|_| {
+            CliError::new(
+                RS_0003,
+                "secret-store audit recovery failed",
+                "Restore durable catalog and secret-store access before starting the service.",
+            )
+        })?;
+    Ok(Arc::new(secret_store))
+}
+
 #[derive(Serialize)]
 struct SecurityPreprovisionResult {
     principal_id: u64,
@@ -693,6 +725,7 @@ async fn start_gateway_with_catalog_and_dev_transport(
         "gateway",
         catalog,
         allow_insecure_internal_dev,
+        None,
     )
     .await
 }
@@ -714,8 +747,27 @@ pub async fn start_gateway_with_shard(
     store: Arc<dyn object_store::ObjectStore>,
     shard_path: &str,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    start_gateway_with_shard_and_secret_store(opts, shard_db, store, shard_path, None).await
+}
+
+async fn start_gateway_with_shard_and_secret_store(
+    opts: &StartOptions,
+    shard_db: Arc<rockstream_storage::ShardDb>,
+    store: Arc<dyn object_store::ObjectStore>,
+    shard_path: &str,
+    secret_store: Option<Arc<rockstream_control::SecretStore>>,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
-    start_gateway_with_shard_and_catalog(opts, shard_db, store, shard_path, catalog).await
+    start_gateway_with_shard_and_catalog_and_dev_transport(
+        opts,
+        shard_db,
+        store,
+        shard_path,
+        catalog,
+        false,
+        secret_store,
+    )
+    .await
 }
 
 pub async fn start_gateway_with_shard_and_catalog(
@@ -726,7 +778,7 @@ pub async fn start_gateway_with_shard_and_catalog(
     catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     start_gateway_with_shard_and_catalog_and_dev_transport(
-        opts, shard_db, store, shard_path, catalog, false,
+        opts, shard_db, store, shard_path, catalog, false, None,
     )
     .await
 }
@@ -738,6 +790,7 @@ async fn start_gateway_with_shard_and_catalog_and_dev_transport(
     shard_path: &str,
     catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
     allow_insecure_internal_dev: bool,
+    shared_secret_store: Option<Arc<rockstream_control::SecretStore>>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let node_config = opts
         .node_config
@@ -941,31 +994,10 @@ async fn start_gateway_with_shard_and_catalog_and_dev_transport(
         server = server.with_actor_assertion_signer(signer);
     }
 
-    let secret_store = rockstream_control::SecretStore::open_durable(
-        format!("{shard_path}-secrets"),
-        store,
-        Arc::new(rockstream_control::EnvKekProvider::from_env()),
-    )
-    .await
-    .map_err(|error| {
-        CliError::new(
-            RS_0003,
-            format!("gateway secret store failed to open: {error}"),
-            "Check that gateway storage is accessible and the configured key provider is available.",
-        )
-    })?;
-    let secret_store = secret_store.with_security_audit_catalog(security_audit_catalog);
-    secret_store
-        .flush_pending_security_audit_outbox()
-        .await
-        .map_err(|_| {
-            CliError::new(
-                RS_0003,
-                "gateway secret-rotation audit recovery failed",
-                "Restore durable catalog and secret-store access before starting the gateway.",
-            )
-        })?;
-    let secret_store = Arc::new(secret_store);
+    let secret_store = match shared_secret_store {
+        Some(secret_store) => secret_store,
+        None => open_durable_secret_store(store, shard_path, security_audit_catalog).await?,
+    };
     let mut server = server
         .with_secret_store(secret_store)
         .with_query_time_shard_topology_provider(topology_provider)
@@ -1372,6 +1404,7 @@ pub fn run_start_with_dev_transport(
             Arc<rockstream_storage::ShardDb>,
             Arc<dyn object_store::ObjectStore>,
         )> = None;
+        let mut shared_gateway_secret_store: Option<Arc<rockstream_control::SecretStore>> = None;
 
         if opts.role == "all" {
             let catalog = rockstream_control::TopologyCatalog::new();
@@ -1385,13 +1418,29 @@ pub fn run_start_with_dev_transport(
             } else if allow_insecure_internal_dev {
                 service = service.with_insecure_dev_mode();
             }
-            if opts.config.internal_tls.is_enabled()
-                || (opts.listen_addr.is_some() && node_config.control.management_addr.is_some())
-            {
-                let security_catalog =
-                    open_security_catalog(&opts.storage, SecurityCatalogLayout::All).await?;
-                service = service.with_security_catalog(security_catalog);
-            }
+            let security_catalog =
+                open_security_catalog(&opts.storage, SecurityCatalogLayout::All).await?;
+            let secret_object_store = rockstream_storage::build_runtime_object_store(
+                &opts.storage.join("shards/0"),
+                "shards/0",
+            )
+            .map_err(|error| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed to open control secret store: {error}"),
+                    "Check durable storage permissions and object-store credentials.",
+                )
+            })?;
+            let secret_store = open_durable_secret_store(
+                secret_object_store,
+                "db",
+                security_catalog.clone(),
+            )
+            .await?;
+            service = service
+                .with_security_catalog(security_catalog)
+                .with_secret_store(secret_store.clone());
+            shared_gateway_secret_store = Some(secret_store);
             if opts.listen_addr.is_some() {
                 let store: Arc<dyn object_store::ObjectStore> = Arc::new(
                     object_store::local::LocalFileSystem::new_with_prefix(&opts.storage).map_err(
@@ -1460,13 +1509,28 @@ pub fn run_start_with_dev_transport(
             } else if allow_insecure_internal_dev {
                 service = service.with_insecure_dev_mode();
             }
-            if opts.config.internal_tls.is_enabled()
-                || (opts.daemon && node_config.control.management_addr.is_some())
-            {
-                let security_catalog =
-                    open_security_catalog(&opts.storage, SecurityCatalogLayout::Gateway).await?;
-                service = service.with_security_catalog(security_catalog);
-            }
+            let security_catalog =
+                open_security_catalog(&opts.storage, SecurityCatalogLayout::Gateway).await?;
+            let secret_object_store = rockstream_storage::build_runtime_object_store(
+                &opts.storage.join("gateway-shard"),
+                "gateway-shard",
+            )
+            .map_err(|error| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed to open control secret store: {error}"),
+                    "Check durable storage permissions and object-store credentials.",
+                )
+            })?;
+            let secret_store = open_durable_secret_store(
+                secret_object_store,
+                "gateway",
+                security_catalog.clone(),
+            )
+            .await?;
+            service = service
+                .with_security_catalog(security_catalog)
+                .with_secret_store(secret_store);
 
             // v0.45.2 M7 S4/S5: state that must be visible to whichever
             // control node in the group is currently elected leader (the
@@ -1743,7 +1807,14 @@ pub fn run_start_with_dev_transport(
             // gateway` opens its own shard, since there's no worker sharing
             // this process with it.
             let gateway_result = if let Some((shard_db, store)) = shared_gateway_shard.take() {
-                start_gateway_with_shard(opts, shard_db, store, "db").await
+                start_gateway_with_shard_and_secret_store(
+                    opts,
+                    shard_db,
+                    store,
+                    "db",
+                    shared_gateway_secret_store.take(),
+                )
+                .await
             } else {
                 start_gateway_with_dev_transport(opts, allow_insecure_internal_dev).await
             };

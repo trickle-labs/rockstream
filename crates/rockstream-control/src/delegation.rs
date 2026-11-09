@@ -32,6 +32,8 @@ pub struct ActorAssertionClaims {
     policy_revision: u64,
     action: SecurityAction,
     scope: PolicyScope,
+    #[serde(default)]
+    secret_use_scopes: Vec<PolicyScope>,
     request_digest: String,
 }
 
@@ -50,6 +52,10 @@ impl ActorAssertionClaims {
 
     pub fn scope(&self) -> &PolicyScope {
         &self.scope
+    }
+
+    pub fn secret_use_scopes(&self) -> &[PolicyScope] {
+        &self.secret_use_scopes
     }
 }
 
@@ -104,6 +110,7 @@ impl ActorAssertionSigner {
         policy_revision: u64,
         action: SecurityAction,
         scope: PolicyScope,
+        secret_use_scopes: Vec<PolicyScope>,
         request_digest: [u8; 32],
     ) -> Result<String, String> {
         if principal_id.0 == 0 || policy_revision == 0 {
@@ -114,10 +121,18 @@ impl ActorAssertionSigner {
         scope
             .validate()
             .map_err(|error| format!("actor assertion scope is invalid: {error}"))?;
+        for secret_scope in &secret_use_scopes {
+            if !matches!(secret_scope, PolicyScope::Secret { .. }) {
+                return Err("actor assertion secret-use scope is invalid".to_owned());
+            }
+            secret_scope
+                .validate()
+                .map_err(|error| format!("actor assertion secret-use scope is invalid: {error}"))?;
+        }
 
         let now = unix_time_secs()?;
         let claims = ActorAssertionClaims {
-            version: 1,
+            version: 2,
             iss: ASSERTION_ISSUER.to_owned(),
             sub: principal_id,
             aud: control_audience(&self.deployment_id),
@@ -128,6 +143,7 @@ impl ActorAssertionSigner {
             policy_revision,
             action,
             scope,
+            secret_use_scopes,
             request_digest: hex::encode(request_digest),
         };
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
@@ -247,7 +263,7 @@ impl ActorAssertionVerifier {
                 .map_err(|_| "actor assertion payload encoding is invalid".to_owned())?,
         )
         .map_err(|_| "actor assertion claims are invalid".to_owned())?;
-        if claims.version != 1
+        if !matches!(claims.version, 1 | 2)
             || claims.iss != ASSERTION_ISSUER
             || claims.aud != control_audience(&self.deployment_id)
             || claims.deployment_id != self.deployment_id
@@ -269,6 +285,14 @@ impl ActorAssertionVerifier {
             .scope
             .validate()
             .map_err(|error| format!("actor assertion scope is invalid: {error}"))?;
+        for secret_scope in &claims.secret_use_scopes {
+            if !matches!(secret_scope, PolicyScope::Secret { .. }) {
+                return Err("actor assertion secret-use scope is invalid".to_owned());
+            }
+            secret_scope
+                .validate()
+                .map_err(|error| format!("actor assertion secret-use scope is invalid: {error}"))?;
+        }
         Ok(claims)
     }
 }
@@ -339,14 +363,28 @@ mod tests {
                 3,
                 SecurityAction::DataRead,
                 scope.clone(),
+                vec![PolicyScope::Secret {
+                    namespace: "public".to_owned(),
+                    name: "orders_password".to_owned(),
+                    consumer: Some(PrincipalId(8)),
+                }],
                 digest,
             )
             .unwrap();
         let now = unix_time_secs().unwrap();
         let claims = verifier.verify(&token, digest, now).unwrap();
+        assert_eq!(claims.version, 2);
         assert_eq!(claims.principal_id(), PrincipalId(7));
         assert_eq!(claims.policy_revision(), 3);
         assert_eq!(claims.scope(), &scope);
+        assert_eq!(
+            claims.secret_use_scopes(),
+            &[PolicyScope::Secret {
+                namespace: "public".to_owned(),
+                name: "orders_password".to_owned(),
+                consumer: Some(PrincipalId(8)),
+            }]
+        );
         assert!(verifier.verify(&token, [0; 32], now).is_err());
         assert!(verifier
             .verify(&token, digest, now + MAX_ACTOR_ASSERTION_LIFETIME_SECS + 1)
