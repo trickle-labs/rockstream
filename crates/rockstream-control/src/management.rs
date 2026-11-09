@@ -3393,6 +3393,7 @@ mod tests {
                 error_code: String::new(),
                 next_steps: Vec::new(),
                 source_version: format!("operation-record:{}", accepted.record_version()),
+                result_json: String::new(),
             }
         );
 
@@ -3544,6 +3545,7 @@ mod tests {
             audit.iter().map(|record| record.action).collect::<Vec<_>>(),
             vec![
                 SecurityAuditClass::GrantChange,
+                SecurityAuditClass::GrantChange,
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::AdminOperationCompletion,
             ]
@@ -3574,6 +3576,7 @@ mod tests {
             audit.iter().map(|record| record.action).collect::<Vec<_>>(),
             vec![
                 SecurityAuditClass::GrantChange,
+                SecurityAuditClass::GrantChange,
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::AdminOperationCompletion,
                 SecurityAuditClass::AdminOperationStart,
@@ -3602,6 +3605,7 @@ mod tests {
         assert_eq!(
             audit.iter().map(|record| record.action).collect::<Vec<_>>(),
             vec![
+                SecurityAuditClass::GrantChange,
                 SecurityAuditClass::GrantChange,
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::AdminOperationCompletion,
@@ -3733,6 +3737,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 SecurityAuditClass::GrantChange,
+                SecurityAuditClass::GrantChange,
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::GrantChange,
                 SecurityAuditClass::AuthorizationDenial,
@@ -3807,6 +3812,7 @@ mod tests {
         assert_eq!(
             audit.iter().map(|record| record.action).collect::<Vec<_>>(),
             vec![
+                SecurityAuditClass::GrantChange,
                 SecurityAuditClass::GrantChange,
                 SecurityAuditClass::AdminOperationCompletion,
             ]

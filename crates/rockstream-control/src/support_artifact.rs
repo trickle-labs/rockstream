@@ -492,6 +492,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_over_limit_is_rejected_without_writing_data() {
+        let object_store = Arc::new(InMemory::new());
+        let store = SupportArtifactStore::new(object_store.clone());
+        store.initialize().await.unwrap();
+        let id = "over-limit";
+
+        assert_eq!(
+            store
+                .insert(
+                    id.to_owned(),
+                    PrincipalId(1),
+                    PolicyScope::Cluster,
+                    Arc::from(vec![0; MAX_ARTIFACT_BYTES + 1]),
+                    ArtifactExpiry { unix_ms: 2_000 },
+                    1_000,
+                )
+                .await,
+            Err(ArtifactStoreError::TooLarge)
+        );
+        assert!(store.read_ledger().await.unwrap().0.artifacts.is_empty());
+        assert!(matches!(
+            object_store.get(&store.artifact_path(id)).await,
+            Err(ObjectStoreError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn concurrent_services_share_the_deployment_storage_budget() {
         let object_store = Arc::new(InMemory::new());
         let first = SupportArtifactStore::new(object_store.clone());
