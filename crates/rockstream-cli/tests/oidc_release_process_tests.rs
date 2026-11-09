@@ -392,6 +392,65 @@ fn start_gateway_process(
     RunningGateway(child)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn start_delegated_oidc_gateway_process(
+    working_dir: &Path,
+    storage: &Path,
+    address: std::net::SocketAddr,
+    control: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    cert_path: &Path,
+    key_path: &Path,
+    assertion_key_path: &Path,
+    jwks_url: &str,
+) -> RunningGateway {
+    let mut node_config = rockstream_types::config::NodeConfig::default();
+    node_config.node.deployment_id = Some("release-deployment".to_owned());
+    node_config.auth.mode = "oidc".to_owned();
+    node_config.auth.oidc_issuer = Some("https://issuer.example".to_owned());
+    node_config.auth.oidc_audience = Some("rockstream".to_owned());
+    node_config.auth.oidc_jwks_url = Some(jwks_url.to_owned());
+    node_config.auth.actor_assertion_signing_key_path = Some(assertion_key_path.to_path_buf());
+    node_config.gateway.tls.cert_path = Some(cert_path.to_path_buf());
+    node_config.gateway.tls.key_path = Some(key_path.to_path_buf());
+    std::fs::write(
+        working_dir.join("rockstream.toml"),
+        toml::to_string(&node_config).unwrap(),
+    )
+    .unwrap();
+
+    let listen = address.to_string();
+    let control = control.to_string();
+    let child = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .current_dir(working_dir)
+        .env("RUST_LOG", "off")
+        .env_remove("ROCKSTREAM_CONFIG")
+        .args([
+            "start",
+            "--role",
+            "gateway",
+            "--storage",
+            storage.to_str().unwrap(),
+            "--listen",
+            &listen,
+            "--auth",
+            "oidc",
+            "--control",
+            &control,
+            "--internal-tls-cert-path",
+            pki.gateway_cert_path.to_str().unwrap(),
+            "--internal-tls-key-path",
+            pki.gateway_key_path.to_str().unwrap(),
+            "--internal-tls-ca-cert-path",
+            pki.ca_cert_path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    RunningGateway(child)
+}
+
 async fn start_control_process(
     working_dir: &Path,
     storage: &Path,
@@ -815,6 +874,247 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
             correlation: AuditCorrelation::Unknown,
             operation_id: AuditField::NotApplicable,
             policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+}
+
+#[tokio::test]
+async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../rockstream-control/tests/fixtures");
+    let gateway_actor = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Release delegated SQL actor".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Oidc {
+            issuer: "https://issuer.example".to_owned(),
+            subject: "alice".to_owned(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Builder,
+            scope: PolicyScope::Namespace {
+                namespace: "public".to_owned(),
+            },
+        }],
+        scoped_grants: Vec::new(),
+    };
+    let mut control_actor = gateway_actor.clone();
+    control_actor.preset_grants.clear();
+
+    let gateway_working_dir = temp.path().join("gateway-process");
+    std::fs::create_dir_all(&gateway_working_dir).unwrap();
+    let gateway_storage = temp.path().join("gateway-storage");
+    let seed_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut seed_process = start_control_process(
+        &gateway_working_dir,
+        &gateway_storage,
+        seed_address,
+        &pki,
+        Some(gateway_actor.clone()),
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut seed_process.0, seed_address).await;
+    seed_process.0.kill().unwrap();
+    seed_process.0.wait().unwrap();
+
+    let control_working_dir = temp.path().join("control-process");
+    std::fs::create_dir_all(&control_working_dir).unwrap();
+    let mut control_config = rockstream_types::config::NodeConfig::default();
+    control_config.node.deployment_id = Some("release-deployment".to_owned());
+    control_config.auth.actor_assertion_public_key_path =
+        Some(fixtures.join("actor-assertion-test-public.jwk"));
+    std::fs::write(
+        control_working_dir.join("rockstream.toml"),
+        toml::to_string(&control_config).unwrap(),
+    )
+    .unwrap();
+    let control_storage = temp.path().join("control-storage");
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut control_process = start_control_process(
+        &control_working_dir,
+        &control_storage,
+        control_address,
+        &pki,
+        Some(control_actor),
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut control_process.0, control_address).await;
+    let control_store = rockstream_storage::build_runtime_object_store(
+        &control_storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let control_catalog = DurableCatalogStore::recover(control_store, "gateway")
+        .await
+        .unwrap();
+    let mut principals_before = control_catalog.list_security_principals().await.unwrap();
+    principals_before.sort_by_key(|principal| principal.id);
+    let audit_before = control_catalog.list_security_audit_records().await.unwrap();
+
+    let mut tls_params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+    tls_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let tls_cert = tls_params.self_signed(&tls_key).unwrap();
+    let cert_path = temp.path().join("gateway.pem");
+    let key_path = temp.path().join("gateway-key.pem");
+    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
+    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
+
+    let jwks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let jwks_addr = jwks_listener.local_addr().unwrap();
+    let jwks_url = format!("http://{jwks_addr}/jwks");
+    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 1));
+    let gateway_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut gateway_process = start_delegated_oidc_gateway_process(
+        &gateway_working_dir,
+        &gateway_storage,
+        gateway_address,
+        control_address,
+        &pki,
+        &cert_path,
+        &key_path,
+        &fixtures.join("actor-assertion-test-key.pem"),
+        &jwks_url,
+    );
+    wait_for_gateway(&mut gateway_process.0, gateway_address).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(tls_cert.der().clone()).unwrap();
+    let client_tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host("127.0.0.1")
+        .port(gateway_address.port())
+        .user("alice")
+        .password(VALID_TOKEN)
+        .dbname("test")
+        .ssl_mode(tokio_postgres::config::SslMode::Require);
+    let (client, connection) = config
+        .connect(tokio_postgres_rustls::MakeRustlsConnect::new(client_tls))
+        .await
+        .expect("normal OIDC PostgreSQL client should connect to the delegated gateway");
+    let connection_task = tokio::spawn(connection);
+    client
+        .execute("CREATE TABLE orders (id BIGINT, amount BIGINT)", &[])
+        .await
+        .unwrap();
+
+    let error = client
+        .execute(
+            "CREATE MATERIALIZED VIEW stale_view AS SELECT id, SUM(amount) AS total FROM orders GROUP BY id",
+            &[],
+        )
+        .await
+        .expect_err("control must reject a gateway assertion outside current actor policy");
+    let db_error = error
+        .as_db_error()
+        .expect("delegation denial is a pgwire error");
+    let descriptor = rockstream_types::error_code::ErrorDescriptor::lookup(
+        rockstream_types::error_code::RS_2026,
+    )
+    .unwrap();
+    let (prefix, with_correlation) = db_error
+        .message()
+        .split_once("(correlation_id=")
+        .expect("registered error includes its correlation ID");
+    let (correlation_id, suffix) = with_correlation
+        .split_once(" context=")
+        .expect("registered error includes diagnostic context");
+    assert!(uuid::Uuid::parse_str(correlation_id).is_ok());
+    let expected_message = format!(
+        "[RS-2026] query.query_time_execution_failed: Query-time DataFusion planning or execution failed for an ad hoc query (detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope) (correlation_id=<uuid> context=detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope) next_steps: {}",
+        descriptor.default_next_steps
+    );
+    assert_eq!(
+        format!("{prefix}(correlation_id=<uuid> context={suffix}"),
+        expected_message
+    );
+    assert_eq!(db_error.severity(), descriptor.severity.to_string());
+    assert_eq!(db_error.code().code(), descriptor.sqlstate);
+    assert_eq!(
+        client
+            .query_one("SELECT 1 AS value", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1_i64
+    );
+    drop(client);
+    connection_task.abort();
+    jwks_task.await.unwrap();
+    gateway_process.0.kill().unwrap();
+    gateway_process.0.wait().unwrap();
+    control_process.0.kill().unwrap();
+    control_process.0.wait().unwrap();
+
+    let gateway_store = rockstream_storage::build_runtime_object_store(
+        &gateway_storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let gateway_catalog = DurableCatalogStore::recover(gateway_store, "gateway")
+        .await
+        .unwrap();
+    assert_eq!(
+        gateway_catalog
+            .get_view_by_name("stale_view")
+            .await
+            .unwrap(),
+        None
+    );
+
+    let control_store = rockstream_storage::build_runtime_object_store(
+        &control_storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let recovered = DurableCatalogStore::recover(control_store, "gateway")
+        .await
+        .unwrap();
+    let mut principals_after = recovered.list_security_principals().await.unwrap();
+    principals_after.sort_by_key(|principal| principal.id);
+    assert_eq!(principals_after, principals_before);
+    let records = recovered.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), audit_before.len() + 1);
+    assert_eq!(&records[..audit_before.len()], audit_before.as_slice());
+    let denial = &records[audit_before.len()];
+    assert!(denial.event_id.starts_with("gateway-delegation:"));
+    assert!(denial.timestamp_ms > 0);
+    assert_eq!(
+        denial,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: denial.event_id.clone(),
+            timestamp_ms: denial.timestamp_ms,
+            actor: AuditIdentity::Verified(PrincipalId(2).to_string()),
+            target: AuditField::Known("ViewAuthor".to_owned()),
+            scope: AuditField::Known(format!(
+                "{:?}",
+                PolicyScope::Resource {
+                    namespace: "public".to_owned(),
+                    kind: ResourceKind::View,
+                    name: "stale_view".to_owned(),
+                }
+            )),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
             before_state: AuditField::NotApplicable,
             after_state: AuditField::NotApplicable,
         }

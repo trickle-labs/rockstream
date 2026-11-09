@@ -9813,19 +9813,13 @@ impl GatewayHandler {
                         &worker_request,
                     )
                     .await
-                    .map_err(|detail| {
-                        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                            detail,
-                        }))
-                    })?;
+                    .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
                 let deployment = match assertion {
                     Some(assertion) => data_plane.deploy_delegated(request, &assertion).await,
                     None => data_plane.deploy(request).await,
                 };
-                deployment.map_err(|error| {
-                    PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                        detail: format!("deploy distributed view {view_name}: {error}"),
-                    }))
+                deployment.map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("deploy distributed view {view_name}: {error}"),
                 })?;
                 Some(sink_operator_id.0)
             } else if let Some(shard_db) = self.shard_db.clone() {
