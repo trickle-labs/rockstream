@@ -9,7 +9,7 @@ use std::{
 use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::management_store::{
-    ManagementOperationStore, OperationKind, OperationStatus,
+    ManagementOperationStore, OperationKind, OperationStatus, OperationUpdate,
 };
 use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CancelOperationRequest,
@@ -4363,6 +4363,223 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     for (index, (actual, expected)) in actual_audit.iter().zip(&expected_audit).enumerate() {
         assert_eq!(actual, expected, "audit record {index}");
     }
+
+    restarted.0.kill().unwrap();
+    restarted.0.wait().unwrap();
+    let recovery_id = uuid::Uuid::new_v4().to_string();
+    let started_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let expires_at_ms = (started_at_ms + 600_000) as u64;
+    let operations =
+        ManagementOperationStore::new(Arc::new(object_store::prefix::PrefixStore::new(
+            rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+            "management",
+        )));
+    let pending = operations
+        .accept_idempotent(
+            &recovery_id,
+            rockstream_management_proto::PROTOCOL_VERSION as u16,
+            &serde_json::json!({ "principal_id": 1, "node_id": null }),
+            recovery_id.clone(),
+            OperationKind::GenerateSupportArtifact,
+            started_at_ms,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), OperationStatus::Pending);
+    operations
+        .transition_if(
+            &recovery_id,
+            OperationStatus::Pending,
+            None,
+            OperationUpdate {
+                status: OperationStatus::Running,
+                updated_at_ms: started_at_ms,
+                progress: Some(0),
+                phase: Some("generating_support_artifact".to_owned()),
+                error_code: None,
+                next_steps: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let recovery_content = format!(
+        "{{\"format_version\":1,\"generated_at_ms\":{started_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":2,\"node\":null}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let recovery_start_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("test-seeded-start:{recovery_id}"),
+        timestamp_ms: started_at_ms as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known(format!("support-artifact:{recovery_id}")),
+        scope: AuditField::Known(serde_json::to_string(&PolicyScope::Cluster).unwrap()),
+        action: SecurityAuditClass::AdminOperationStart,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Observed(recovery_id.clone()),
+        operation_id: AuditField::Known(recovery_id.clone()),
+        policy_revision: AuditField::Known(principal.revision),
+        before_state: AuditField::Known("pending".to_owned()),
+        after_state: AuditField::Known("generating".to_owned()),
+    };
+    let recovery_security_store: Arc<dyn ObjectStore> =
+        Arc::new(object_store::prefix::PrefixStore::new(
+            rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+            "gateway-shard",
+        ));
+    let recovery_catalog = DurableCatalogStore::recover(recovery_security_store, "gateway")
+        .await
+        .unwrap();
+    let revision = recovery_catalog.get_revision().await + 1;
+    recovery_catalog
+        .commit_txn(
+            CatalogTxn::new(
+                revision,
+                uuid::Uuid::new_v4().as_u128() as u64,
+                vec![CatalogMutation::AppendSecurityAudit(
+                    recovery_start_audit.clone(),
+                )],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let recovery_blob_path = support_artifact_object_path(&recovery_id);
+    let ledger_bytes = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+    ledger["artifacts"][&recovery_id] = serde_json::json!({
+        "owner": PrincipalId(1),
+        "scope": PolicyScope::Cluster,
+        "size": recovery_content.len(),
+        "expires_at_ms": expires_at_ms,
+    });
+    management_store
+        .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
+        .await
+        .unwrap();
+    assert!(matches!(
+        management_store.get(&recovery_blob_path).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    let mut recovered_process = start_control_process(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        minio,
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut recovered_process.0, control_address).await;
+    let mut recovery_client = wait_for_management_client(management_address, &pki).await;
+    let recovered = recovery_client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: recovery_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        recovered,
+        rockstream_management_proto::v1::GenerateSupportArtifactResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: recovery_id.clone(),
+            expires_at_ms,
+        }
+    );
+    let (recovered_content, download_expiry) =
+        download_support_artifact(&mut recovery_client, &recovery_id).await;
+    assert_eq!(recovered_content, recovery_content.as_bytes());
+    assert_eq!(download_expiry, expires_at_ms);
+    assert_eq!(
+        management_store
+            .get(&recovery_blob_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        recovery_content.as_bytes()
+    );
+    let operation = recovery_client
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: recovery_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(operation.operation_id, recovery_id);
+    assert_eq!(operation.kind, "generate_support_artifact");
+    assert_eq!(operation.state, "succeeded");
+    assert_eq!(operation.progress, "100%");
+    assert_eq!(
+        operation.phase,
+        format!("available_until_ms:{expires_at_ms}")
+    );
+    assert!(operation.error_code.is_empty());
+    assert!(operation.next_steps.is_empty());
+    assert!(operation.result_json.is_empty());
+
+    recovery_catalog.refresh().await.unwrap();
+    let mut recovery_audit = recovery_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.operation_id == AuditField::Known(recovery_id.clone()))
+        .collect::<Vec<_>>();
+    let retry_start_audit = SecurityAuditRecord {
+        event_id: "support-artifact".to_owned(),
+        timestamp_ms: 0,
+        ..recovery_start_audit.clone()
+    };
+    let completion_audit = SecurityAuditRecord {
+        event_id: "support-artifact".to_owned(),
+        timestamp_ms: 0,
+        action: SecurityAuditClass::AdminOperationCompletion,
+        before_state: AuditField::Known("generating".to_owned()),
+        after_state: AuditField::Known(format!("available_until_ms:{expires_at_ms}")),
+        ..recovery_start_audit.clone()
+    };
+    for record in &mut recovery_audit {
+        record.timestamp_ms = 0;
+        if record.event_id.starts_with("support-artifact-") {
+            record.event_id = "support-artifact".to_owned();
+        }
+    }
+    let mut expected_recovery_audit = vec![
+        SecurityAuditRecord {
+            timestamp_ms: 0,
+            ..recovery_start_audit
+        },
+        retry_start_audit,
+        completion_audit,
+    ];
+    let sort_audits = |records: &mut Vec<SecurityAuditRecord>| {
+        records.sort_by_key(|record| serde_json::to_string(record).unwrap());
+    };
+    sort_audits(&mut recovery_audit);
+    sort_audits(&mut expected_recovery_audit);
+    assert_eq!(recovery_audit, expected_recovery_audit);
+    recovered_process.0.kill().unwrap();
+    recovered_process.0.wait().unwrap();
 }
 
 #[tokio::test]
