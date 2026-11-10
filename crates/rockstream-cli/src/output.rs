@@ -1510,6 +1510,29 @@ impl Formattable for ManagementHealthInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagementSupportArtifactInfo {
+    pub opaque_id: String,
+    pub expires_at_ms: u64,
+    pub downloaded_to: Option<String>,
+    pub size_bytes: Option<u64>,
+}
+
+impl Formattable for ManagementSupportArtifactInfo {
+    fn to_text(&self) -> String {
+        match (&self.downloaded_to, self.size_bytes) {
+            (Some(path), Some(size)) => format!(
+                "Support artifact {} downloaded to {} ({} bytes; expires at {})",
+                self.opaque_id, path, size, self.expires_at_ms
+            ),
+            _ => format!(
+                "Support artifact {} available until {}",
+                self.opaque_id, self.expires_at_ms
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RestoreOutcome {
     pub checkpoint_id: u64,
     pub source: String,

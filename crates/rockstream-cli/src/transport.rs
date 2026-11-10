@@ -37,11 +37,11 @@ use crate::output::{
     ManagementConfigSummaryInfo, ManagementConfigValue, ManagementHealthInfo,
     ManagementNodeDetailInfo, ManagementNodeInfo, ManagementNodesInfo, ManagementOperationInfo,
     ManagementOperationsInfo, ManagementShardDetailInfo, ManagementShardInfo, ManagementShardsInfo,
-    MigrationOutcome, MutationOutcome, QueryResult, ResourceUsageInfo, RestoreOutcome,
-    SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo, SchemaEvolutionStatusInfo,
-    SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail, SourceSummary, SubscribeEvent,
-    SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary, WorkerStatusInfo, WorkloadDetail,
-    WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
+    ManagementSupportArtifactInfo, MigrationOutcome, MutationOutcome, QueryResult,
+    ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo,
+    SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail,
+    SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary,
+    WorkerStatusInfo, WorkloadDetail, WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
 };
 use crate::CliError;
 
@@ -585,6 +585,88 @@ impl ManagementCliClient {
         })
     }
 
+    pub fn generate_support_artifact(
+        &mut self,
+        node_id: Option<u64>,
+        idempotency_key: uuid::Uuid,
+    ) -> Result<ManagementSupportArtifactInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(self.client.generate_support_artifact(
+                rockstream_management_proto::v1::GenerateSupportArtifactRequest {
+                    protocol_version: 1,
+                    node_id: node_id.map_or_else(String::new, |id| id.to_string()),
+                    idempotency_key: idempotency_key.to_string(),
+                },
+            ))
+            .map_err(|error| management_status_error("GenerateSupportArtifact", error))?
+            .into_inner();
+        Ok(ManagementSupportArtifactInfo {
+            opaque_id: response.opaque_id,
+            expires_at_ms: response.expires_at_ms,
+            downloaded_to: None,
+            size_bytes: None,
+        })
+    }
+
+    pub fn download_support_artifact(
+        &mut self,
+        opaque_id: uuid::Uuid,
+        path: &Path,
+    ) -> Result<ManagementSupportArtifactInfo, CliError> {
+        let opaque_id = opaque_id.to_string();
+        let (content, expires_at_ms) = self
+            .runtime
+            .block_on(async {
+                let response = self
+                    .client
+                    .download_support_artifact(
+                        rockstream_management_proto::v1::DownloadSupportArtifactRequest {
+                            protocol_version: 1,
+                            opaque_id: opaque_id.clone(),
+                        },
+                    )
+                    .await?;
+                let mut stream = response.into_inner();
+                let mut content = Vec::new();
+                let mut expires_at_ms = None;
+                let mut final_chunk = false;
+                while let Some(chunk) = stream.message().await? {
+                    append_support_artifact_chunk(
+                        &mut content,
+                        &mut expires_at_ms,
+                        &mut final_chunk,
+                        &chunk,
+                    )
+                    .map_err(|error| match error {
+                        SupportArtifactChunkError::OutOfOrder
+                        | SupportArtifactChunkError::ExpiryChanged => {
+                            tonic::Status::data_loss("support artifact chunks are inconsistent")
+                        }
+                        SupportArtifactChunkError::TooLarge => tonic::Status::resource_exhausted(
+                            "support artifact exceeds the 10 MiB limit",
+                        ),
+                    })?;
+                }
+                if !final_chunk {
+                    return Err(tonic::Status::data_loss(
+                        "support artifact download ended before its final chunk",
+                    ));
+                }
+                Ok((content, expires_at_ms.unwrap_or_default()))
+            })
+            .map_err(|error| management_status_error("DownloadSupportArtifact", error))?;
+        fs::write(path, &content).map_err(|error| {
+            management_client_error("write support artifact", error.to_string())
+        })?;
+        Ok(ManagementSupportArtifactInfo {
+            opaque_id,
+            expires_at_ms,
+            downloaded_to: Some(path.to_string_lossy().into_owned()),
+            size_bytes: Some(content.len() as u64),
+        })
+    }
+
     pub fn cancel_operation(
         &mut self,
         operation_id: &str,
@@ -607,6 +689,39 @@ impl ManagementCliClient {
 
 fn management_status_error(method: &str, error: tonic::Status) -> CliError {
     management_client_error(method, format!("{}: {}", error.code(), error.message()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SupportArtifactChunkError {
+    OutOfOrder,
+    ExpiryChanged,
+    TooLarge,
+}
+
+fn append_support_artifact_chunk(
+    content: &mut Vec<u8>,
+    expires_at_ms: &mut Option<u64>,
+    final_chunk: &mut bool,
+    chunk: &rockstream_management_proto::v1::DownloadSupportArtifactChunk,
+) -> Result<(), SupportArtifactChunkError> {
+    if *final_chunk || chunk.offset != content.len() as u64 {
+        return Err(SupportArtifactChunkError::OutOfOrder);
+    }
+    if content.len().saturating_add(chunk.content.len())
+        > rockstream_types::diagnostic::MAX_DIAGNOSTIC_BUNDLE_BYTES
+    {
+        return Err(SupportArtifactChunkError::TooLarge);
+    }
+    match expires_at_ms {
+        Some(expected) if *expected != chunk.expires_at_ms => {
+            return Err(SupportArtifactChunkError::ExpiryChanged);
+        }
+        None => *expires_at_ms = Some(chunk.expires_at_ms),
+        _ => {}
+    }
+    content.extend_from_slice(&chunk.content);
+    *final_chunk = chunk.final_chunk;
+    Ok(())
 }
 
 fn management_client_error(method: &str, message: String) -> CliError {
@@ -3978,5 +4093,55 @@ impl StorageAdminApi for RemoteStorageAdminClient {
         _yes: bool,
     ) -> Result<crate::output::RestoreOutcome, CliError> {
         self.unavailable("backup restore")
+    }
+}
+
+#[cfg(test)]
+mod support_artifact_download_tests {
+    use super::*;
+
+    #[test]
+    fn download_chunks_must_reconstruct_exact_bytes_in_order() {
+        let chunks = [
+            rockstream_management_proto::v1::DownloadSupportArtifactChunk {
+                content: b"{\"format_version\":".to_vec(),
+                offset: 0,
+                final_chunk: false,
+                expires_at_ms: 600_000,
+            },
+            rockstream_management_proto::v1::DownloadSupportArtifactChunk {
+                content: b"1}".to_vec(),
+                offset: 18,
+                final_chunk: true,
+                expires_at_ms: 600_000,
+            },
+        ];
+        let mut content = Vec::new();
+        let mut expiry = None;
+        let mut final_chunk = false;
+        for chunk in &chunks {
+            append_support_artifact_chunk(&mut content, &mut expiry, &mut final_chunk, chunk)
+                .unwrap();
+        }
+        assert_eq!(content, br#"{"format_version":1}"#);
+        assert_eq!(expiry, Some(600_000));
+        assert!(final_chunk);
+
+        let out_of_order = rockstream_management_proto::v1::DownloadSupportArtifactChunk {
+            content: b"invalid".to_vec(),
+            offset: 0,
+            final_chunk: true,
+            expires_at_ms: 600_000,
+        };
+        assert_eq!(
+            append_support_artifact_chunk(
+                &mut content,
+                &mut expiry,
+                &mut final_chunk,
+                &out_of_order,
+            )
+            .unwrap_err(),
+            SupportArtifactChunkError::OutOfOrder
+        );
     }
 }
