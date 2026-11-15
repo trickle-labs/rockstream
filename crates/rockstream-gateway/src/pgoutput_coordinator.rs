@@ -1132,7 +1132,9 @@ mod tests {
             tag: PgOutputTruncateTag::Truncate,
         });
         assert!(matches!(&envelope.changes[2], EncodedChange::Row { operation: CdcOperation::Insert, .. }));
-        assert!(coordinator.push_truncate(57, &[7, 7]).is_err());
+        coordinator.begin(58).unwrap();
+        let error = coordinator.push_truncate(58, &[7, 7]).unwrap_err();
+        assert!(error.to_string().contains("duplicate TRUNCATE relation ID"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
