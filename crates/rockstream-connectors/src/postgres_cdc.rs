@@ -586,6 +586,17 @@ impl PostgresCdcSource {
         require_partition_root_identity(table, publication.get(0))
     }
 
+    /// Validate additional imported aliases that share the same pgoutput slot.
+    /// Checking only the primary table would leave newly attached partitioned
+    /// sources vulnerable to silently unrouted child-table changes.
+    pub async fn validate_pgoutput_table(&self, table: &str) -> Result<(), SourceError> {
+        let pgoutput = self.pgoutput.as_ref().ok_or_else(|| {
+            SourceError::Io("native pgoutput connection is unavailable".to_string())
+        })?;
+        Self::validate_partitioned_publication(&pgoutput.client, table, &pgoutput.publication)
+            .await
+    }
+
     pub fn set_snapshot_batches(&mut self, batches: Vec<RecordBatch>) {
         self.snapshot_batches = batches;
     }
