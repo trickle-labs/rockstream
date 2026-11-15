@@ -87,6 +87,24 @@ Standby status updates sent to PostgreSQL never outrun durable SlateDB storage.
 
 Unaffected tables in a publication continue ingestion without interruption (relation isolation).
 
+### TRUNCATE semantics
+
+The source-wide pgoutput gateway applies PostgreSQL `TRUNCATE` to the imported
+relation and every dependent materialized view in the **same durable M3 epoch**
+as its transaction and LSN. It reconstructs exact negative row deltas from
+local committed table images (not from the already-truncated upstream table),
+including earlier and later row changes in that PostgreSQL transaction and
+multi-relation TRUNCATE messages. A TRUNCATE of an empty table is a no-op.
+
+For bounded, atomic processing, expansion is limited to **65,536 DML operations
+and 8 MiB of expanded row keys/images per upstream transaction**. A full scan
+that exceeds the same bound, malformed row storage, or a missing route blocks
+the source with `RS-4014` (or `RS-4013` for a protocol error) **without advancing
+the slot**. Operators must resolve the bound or resnapshot; the source cannot
+silently ignore or partially apply TRUNCATE. The legacy row-only
+`PostgresCdcSource::poll_delta` path does not have local imported-row state and
+therefore rejects TRUNCATE with `RS-4013`; it does not claim support for it.
+
 ### Recovery and Resnapshot
 
 When PostgreSQL invalidates a replication slot (e.g. WAL retention exhaustion, errors `55000` / `58P01`), the connector transitions to `BLOCKED` with error code `RS-4011` / `RS-4016` and requires an operator-initiated resnapshot.
@@ -241,7 +259,8 @@ sink cells below exercise legacy marker transport and recovery only.
 | Cell | Test |
 | --- | --- |
 | Snapshot → stream handoff over the v0.52.1 fence | `postgres_cdc_snapshot_stream_fence_has_exact_transcript` |
-| INSERT, UPDATE including key change, DELETE, and TRUNCATE | `postgres_cdc_all_mutation_types_have_exact_transcript` |
+| INSERT, UPDATE including key change, DELETE | `postgres_cdc_insert_update_delete_have_exact_transcript` |
+| TRUNCATE (nonempty tables, multi-relation, same-transaction row changes, dependent views, gateway restart) | `pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart` (gateway TestContainers) |
 | Restart at every commit boundary | `postgres_cdc_each_commit_boundary_recovers_exactly_once` |
 | WAL lag | `postgres_cdc_wal_lag_pauses_at_bound_and_recovers_within_slo` |
 | Malformed replication record | `postgres_cdc_malformed_replication_record_fails_closed_then_recovers_exactly` |
