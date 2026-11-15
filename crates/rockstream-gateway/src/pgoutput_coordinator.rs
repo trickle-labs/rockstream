@@ -532,10 +532,7 @@ impl SharedPgOutputCoordinator {
         }
         // Validate the whole message before staging any marker.
         let mut seen = BTreeSet::new();
-        if relation_ids
-            .iter()
-            .any(|&relation_id| !seen.insert(relation_id))
-        {
+        if relation_ids.iter().any(|&relation_id| !seen.insert(relation_id)) {
             return Err(protocol_error("duplicate TRUNCATE relation ID"));
         }
         for &relation_id in relation_ids {
