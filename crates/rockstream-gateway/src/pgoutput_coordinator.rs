@@ -1081,7 +1081,7 @@ mod tests {
 
     #[test]
     fn truncated_marker_json_cannot_misread_legacy_row_or_corruption() {
-        let legacy = r#"{"relation_id":7,"operation":"Insert","old_values":null,"new_values":[["1"]],"schema_version":1}"#;
+        let legacy = r#"{"relation_id":7,"operation":"Insert","old_values":null,"new_values":["1"],"schema_version":1}"#;
         assert!(matches!(
             serde_json::from_str::<EncodedChange>(legacy).unwrap(),
             EncodedChange::Row { operation: CdcOperation::Insert, .. }
