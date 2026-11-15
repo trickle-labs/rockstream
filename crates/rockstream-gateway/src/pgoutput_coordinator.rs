@@ -1176,7 +1176,16 @@ mod tests {
                 envelope
                     .changes
                     .iter()
-                    .map(|change| (change.relation_id, change.new_values.clone()))
+                    .map(|change| match change {
+                        EncodedChange::Row {
+                            relation_id,
+                            new_values,
+                            ..
+                        } => (*relation_id, new_values.clone()),
+                        EncodedChange::Truncate { .. } => {
+                            panic!("row-only spill oracle unexpectedly contained TRUNCATE")
+                        }
+                    })
                     .collect::<Vec<_>>(),
             ),
             (
