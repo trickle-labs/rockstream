@@ -4163,7 +4163,10 @@ impl GatewayHandler {
                 let restored_aliases = handler.pgoutput_source_aliases(connector_id);
                 for alias in &restored_aliases {
                     let upstream_table = alias.options.get("table").cloned().or_else(|| {
-                        handler.catalog.source_table(&alias.name).map(|table| table.name)
+                        handler
+                            .catalog
+                            .source_table(&alias.name)
+                            .map(|table| table.name)
                     });
                     if let Some(upstream_table) = upstream_table {
                         if let Err(error) = coordinator

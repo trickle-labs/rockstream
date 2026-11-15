@@ -149,9 +149,7 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
     // upstream snapshot no longer has the historical row, regardless of
     // what an existing durable RockStream materialization already contains.
     admin
-        .batch_execute(
-            "ALTER TABLE events DETACH PARTITION events_old; DROP TABLE events_old;",
-        )
+        .batch_execute("ALTER TABLE events DETACH PARTITION events_old; DROP TABLE events_old;")
         .await
         .unwrap();
     let pruned_fence = source.capture_snapshot_delta_fence(None).await.unwrap();
@@ -189,7 +187,10 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         .await
         .unwrap()
         .get(0);
-    assert_eq!(slot_after, slot_before, "TRUNCATE must not advance slot acknowledgment");
+    assert_eq!(
+        slot_after, slot_before,
+        "TRUNCATE must not advance slot acknowledgment"
+    );
 
     // Losing an existing slot must not turn a checkpointed source into a
     // fresh bootstrap: that would make already-pruned historical rows vanish.

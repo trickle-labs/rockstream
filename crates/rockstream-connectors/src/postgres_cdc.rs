@@ -535,8 +535,7 @@ impl PostgresCdcSource {
             }
             None => {}
         }
-        Self::validate_partitioned_publication(&client, &config.table, &config.publication)
-            .await?;
+        Self::validate_partitioned_publication(&client, &config.table, &config.publication).await?;
         self.pgoutput = Some(PgOutputConnection {
             client,
             slot: config.slot,
@@ -581,7 +580,9 @@ impl PostgresCdcSource {
                 reason: format!("RS-4013: inspect partitioned publication for '{table}': {error}"),
             })?
             .ok_or_else(|| SourceError::DiscoverSchemaFailed {
-                reason: format!("RS-4013: publication for partitioned table '{table}' does not exist"),
+                reason: format!(
+                    "RS-4013: publication for partitioned table '{table}' does not exist"
+                ),
             })?;
         require_partition_root_identity(table, publication.get(0))
     }
@@ -593,8 +594,7 @@ impl PostgresCdcSource {
         let pgoutput = self.pgoutput.as_ref().ok_or_else(|| {
             SourceError::Io("native pgoutput connection is unavailable".to_string())
         })?;
-        Self::validate_partitioned_publication(&pgoutput.client, table, &pgoutput.publication)
-            .await
+        Self::validate_partitioned_publication(&pgoutput.client, table, &pgoutput.publication).await
     }
 
     pub fn set_snapshot_batches(&mut self, batches: Vec<RecordBatch>) {
@@ -2568,7 +2568,9 @@ mod tests {
         begin.extend_from_slice(&0_u64.to_be_bytes());
         begin.extend_from_slice(&52_u32.to_be_bytes());
         decode_pgoutput_event(&mut xid, &begin).unwrap();
-        let error = decode_pgoutput_event(&mut xid, &truncate).unwrap_err().to_string();
+        let error = decode_pgoutput_event(&mut xid, &truncate)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("RS-4015"));
         // The transaction remains uncommitted: callers must not acknowledge.
         assert_eq!(xid, Some(52));
