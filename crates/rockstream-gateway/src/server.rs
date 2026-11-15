@@ -16896,6 +16896,119 @@ fn pgoutput_dml_op_size(op: &DmlOp) -> usize {
     }
 }
 
+#[cfg(test)]
+mod pgoutput_truncate_unit_tests {
+    use super::*;
+
+    fn route(id: u32, table: &str) -> RelationRoute {
+        RelationRoute {
+            version: 1,
+            relation_id: id,
+            upstream_namespace: "public".to_string(),
+            upstream_relation: table.to_string(),
+            imported_table_id: u64::from(id),
+            imported_table_name: table.to_string(),
+            columns: vec![ColumnRoute {
+                upstream_name: "id".to_string(),
+                imported_name: "id".to_string(),
+                type_oid: 20,
+                type_modifier: -1,
+                nullable: false,
+                has_default: false,
+                key: true,
+            }],
+            replica_identity: ReplicaIdentity::Full,
+            schema_version: 1,
+        }
+    }
+
+    fn insert(relation_id: u32, id: &str) -> EncodedChange {
+        EncodedChange::Row {
+            relation_id,
+            operation: CdcOperation::Insert,
+            old_values: None,
+            new_values: Some(vec![Some(id.to_string())]),
+            schema_version: 1,
+        }
+    }
+
+    #[test]
+    fn truncate_expansion_retracts_preexisting_and_pending_rows_in_wire_order() {
+        let a = route(7, "a");
+        let b = route(8, "b");
+        let routes = HashMap::from([(7, &a), (8, &b)]);
+        let images = HashMap::from([
+            ("a".to_string(), BTreeMap::from([
+                ("id=1".to_string(), "1".to_string()),
+                ("id=2".to_string(), "2".to_string()),
+            ])),
+            ("b".to_string(), BTreeMap::from([
+                ("id=9".to_string(), "9".to_string()),
+            ])),
+        ]);
+        let ops = pgoutput_envelope_to_dml_ops(
+            &[
+                insert(7, "3"),
+                EncodedChange::Truncate { relation_id: 7, schema_version: 1 },
+                insert(7, "4"),
+                EncodedChange::Truncate { relation_id: 8, schema_version: 1 },
+                EncodedChange::Truncate { relation_id: 8, schema_version: 1 },
+            ],
+            &routes,
+            images,
+        )
+        .unwrap();
+        assert_eq!(ops.len(), 6); // INSERT(3), DELETE(1,2,3), INSERT(4), DELETE(9)
+        assert!(matches!(&ops[0], DmlOp::Insert { row_key, .. } if row_key == "id=3"));
+        assert!(matches!(&ops[1], DmlOp::Delete { row_key, returning_tsv: Some(tsv), .. } if row_key == "id=1" && tsv == "1"));
+        assert!(matches!(&ops[2], DmlOp::Delete { row_key, .. } if row_key == "id=2"));
+        assert!(matches!(&ops[3], DmlOp::Delete { row_key, .. } if row_key == "id=3"));
+        assert!(matches!(&ops[4], DmlOp::Insert { row_key, .. } if row_key == "id=4"));
+        assert!(matches!(&ops[5], DmlOp::Delete { table, row_key, .. } if table == "b" && row_key == "id=9"));
+    }
+
+    #[test]
+    fn truncate_expansion_rejects_missing_route_or_schema_mismatch() {
+        let a = route(7, "a");
+        let routes = HashMap::from([(7, &a)]);
+        let bad_route = EncodedChange::Truncate { relation_id: 8, schema_version: 1 };
+        let bad_schema = EncodedChange::Truncate { relation_id: 7, schema_version: 2 };
+        for change in [bad_route, bad_schema] {
+            assert!(pgoutput_envelope_to_dml_ops(
+                &[change],
+                &routes,
+                HashMap::from([("a".to_string(), BTreeMap::new())]),
+            ).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn truncate_preimage_scan_refuses_oversized_state_without_partial_rows() {
+        let db = rockstream_storage::ShardDb::builder(
+            "pgoutput-truncate-bounded",
+            Arc::new(object_store::memory::InMemory::new()),
+        )
+        .build()
+        .await
+        .unwrap();
+        db.put(
+            b"view_output/a/id=1",
+            &vec![b'9'; rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES + 1],
+        )
+        .await
+        .unwrap();
+        let a = route(7, "a");
+        let routes = HashMap::from([(7, &a)]);
+        let changes = [EncodedChange::Truncate { relation_id: 7, schema_version: 1 }];
+        let error = load_pgoutput_truncate_images(&db, &changes, &routes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RS-4014"), "{error}");
+        assert!(db.get(b"view_output/a/id=1").await.unwrap().is_some());
+    }
+}
+
 fn dml_table_name(op: &DmlOp) -> &str {
     match op {
         DmlOp::Insert { table, .. } | DmlOp::Update { table, .. } | DmlOp::Delete { table, .. } => {
