@@ -94,6 +94,28 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         2
     );
 
+    // A new row in a child partition is decoded under the parent identity.
+    admin
+        .batch_execute("INSERT INTO events VALUES (3, 12)")
+        .await
+        .unwrap();
+    let delta = source
+        .poll_delta(first_fence.live.clone(), 8 * 1024 * 1024, 4_096, None)
+        .await
+        .unwrap();
+    assert_eq!(delta.batches.len(), 1);
+    let (rows, weights) =
+        rockstream_types::arrow_batch::split_weight_column(&delta.batches[0]).unwrap();
+    let ids = rows
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(ids.values().to_vec(), vec![3]);
+    assert_eq!(weights, vec![1]);
+    source.commit_offset(1, delta.new_offset).await.unwrap();
+    let durable_lsn = source.last_committed_lsn();
+
     // DETACH + DROP is DDL; no per-row DELETE is sent over pgoutput. A new
     // upstream snapshot no longer has the historical row, regardless of
     // what an existing durable RockStream materialization already contains.
@@ -111,7 +133,7 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         .collect::<Vec<_>>();
     assert_eq!(
         pruned.iter().map(|batch| batch.batch.num_rows()).sum::<usize>(),
-        1
+        2
     );
 
     // In contrast to DDL pruning, a published TRUNCATE has an explicit
@@ -124,7 +146,7 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         .unwrap_err()
         .to_string();
     assert!(err.contains("RS-4015"), "{err}");
-    assert!(source.last_committed_lsn().is_none());
+    assert_eq!(source.last_committed_lsn(), durable_lsn);
 
     // Losing an existing slot must not turn a checkpointed source into a
     // fresh bootstrap: that would make already-pruned historical rows vanish.
