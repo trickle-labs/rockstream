@@ -4114,6 +4114,100 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
 }
 
 #[tokio::test]
+async fn concurrent_processes_reconcile_same_support_artifact_request() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-support-contention";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for multi-process support-artifact contention");
+    let temp = tempfile::tempdir().unwrap();
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_a = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_a = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let control_b = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_b = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let minio = Some((minio_port, bucket));
+    let mut process_a = start_control_process(
+        temp.path(),
+        &temp.path().join("control-a"),
+        control_a,
+        management_a,
+        &pki,
+        minio,
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process_a.0, control_a).await;
+    let mut process_b = start_control_process(
+        temp.path(),
+        &temp.path().join("control-b"),
+        control_b,
+        management_b,
+        &pki,
+        minio,
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process_b.0, control_b).await;
+    let mut client_a = wait_for_management_client(management_a, &pki).await;
+    let mut client_b = wait_for_management_client(management_b, &pki).await;
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
+    let request = || GenerateSupportArtifactRequest {
+        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        node_id: String::new(),
+        idempotency_key: idempotency_key.clone(),
+    };
+
+    let (first, retry) = tokio::join!(
+        client_a.generate_support_artifact(request()),
+        client_b.generate_support_artifact(request()),
+    );
+    let first = first.unwrap().into_inner();
+    let retry = retry.unwrap().into_inner();
+    assert_eq!(first, retry);
+    assert_eq!(first.opaque_id, idempotency_key);
+
+    let get_operation = || GetOperationRequest {
+        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        operation_id: first.opaque_id.clone(),
+    };
+    let (operation_a, operation_b) = tokio::join!(
+        client_a.get_operation(get_operation()),
+        client_b.get_operation(get_operation()),
+    );
+    let operation_a = operation_a.unwrap().into_inner().operation.unwrap();
+    let operation_b = operation_b.unwrap().into_inner().operation.unwrap();
+    assert_eq!(operation_a, operation_b);
+    assert_eq!(operation_a.operation_id, idempotency_key);
+    assert_eq!(operation_a.kind, "generate_support_artifact");
+    assert_eq!(operation_a.state, "succeeded");
+    assert_eq!(operation_a.progress, "100%");
+    assert_eq!(
+        operation_a.phase,
+        format!("available_until_ms:{}", first.expires_at_ms)
+    );
+
+    let (content_a, expiry_a) = download_support_artifact(&mut client_a, &first.opaque_id).await;
+    let (content_b, expiry_b) = download_support_artifact(&mut client_b, &first.opaque_id).await;
+    let generated_at_ms = first.expires_at_ms - 600_000;
+    let expected_content = format!(
+        "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":1,\"node\":null}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(content_a, expected_content.as_bytes());
+    assert_eq!(content_b, expected_content.as_bytes());
+    assert_eq!(expiry_a, first.expires_at_ms);
+    assert_eq!(expiry_b, first.expires_at_ms);
+
+    process_a.0.kill().unwrap();
+    process_a.0.wait().unwrap();
+    process_b.0.kill().unwrap();
+    process_b.0.wait().unwrap();
+}
+
+#[tokio::test]
 async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

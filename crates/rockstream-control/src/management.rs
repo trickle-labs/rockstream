@@ -2666,7 +2666,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("support artifact generation is busy"))?;
-        let accepted = self
+        let mut accepted = self
             .operations
             .accept_idempotent(
                 &key,
@@ -2688,6 +2688,49 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .filter(|value| *value > 0)
             .ok_or_else(|| Status::internal("support artifact expiry overflow"))?
             as u64;
+        loop {
+            if matches!(
+                accepted.status(),
+                OperationStatus::Running
+                    | OperationStatus::Succeeded
+                    | OperationStatus::Failed
+                    | OperationStatus::Cancelled
+            ) || Utc::now().timestamp_millis().max(1) as u64 >= expires_at_ms
+            {
+                break;
+            }
+            match self
+                .operations
+                .transition_if(
+                    accepted.operation_id(),
+                    accepted.status(),
+                    accepted.phase(),
+                    crate::management_store::OperationUpdate {
+                        status: OperationStatus::Running,
+                        updated_at_ms: Utc::now().timestamp_millis().max(1),
+                        progress: Some(0),
+                        phase: Some("generating_support_artifact".to_owned()),
+                        error_code: None,
+                        next_steps: Vec::new(),
+                    },
+                )
+                .await
+            {
+                Ok(running) => {
+                    accepted = running;
+                    break;
+                }
+                Err(crate::management_store::OperationStoreError::TransitionConflict(_)) => {
+                    accepted = self
+                        .operations
+                        .get(&key)
+                        .await
+                        .map_err(store_error)?
+                        .ok_or_else(|| Status::not_found(format!("operation {key} not found")))?;
+                }
+                Err(error) => return Err(store_error(error)),
+            }
+        }
         if accepted.status() == OperationStatus::Succeeded {
             let available = self
                 .support_artifacts
@@ -2766,26 +2809,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 "support artifact operation expired before generation",
             ));
         }
-        let running = if accepted.status() == OperationStatus::Running {
-            accepted
-        } else {
-            self.operations
-                .transition_if(
-                    accepted.operation_id(),
-                    accepted.status(),
-                    accepted.phase(),
-                    crate::management_store::OperationUpdate {
-                        status: OperationStatus::Running,
-                        updated_at_ms: Utc::now().timestamp_millis().max(1),
-                        progress: Some(0),
-                        phase: Some("generating_support_artifact".to_owned()),
-                        error_code: None,
-                        next_steps: Vec::new(),
-                    },
-                )
-                .await
-                .map_err(store_error)?
-        };
+        let running = accepted;
         crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-running");
         self.record_support_artifact_audit(
             &request,
@@ -2920,7 +2944,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
             return Err(status);
         }
         crate::support_artifact::maybe_crash_after_debug_test_boundary("completion-audit");
-        self.operations
+        let completion_phase = format!("available_until_ms:{expires_at_ms}");
+        match self
+            .operations
             .transition_if(
                 running.operation_id(),
                 OperationStatus::Running,
@@ -2929,13 +2955,31 @@ impl v1::management_service_server::ManagementService for ManagementService {
                     status: OperationStatus::Succeeded,
                     updated_at_ms: Utc::now().timestamp_millis().max(1),
                     progress: Some(100),
-                    phase: Some(format!("available_until_ms:{expires_at_ms}")),
+                    phase: Some(completion_phase.clone()),
                     error_code: None,
                     next_steps: Vec::new(),
                 },
             )
             .await
-            .map_err(store_error)?;
+        {
+            Ok(_) => {}
+            Err(error @ crate::management_store::OperationStoreError::TransitionConflict(_)) => {
+                let completed = self
+                    .operations
+                    .get(running.operation_id())
+                    .await
+                    .map_err(store_error)?
+                    .ok_or_else(|| {
+                        Status::not_found(format!("operation {} not found", running.operation_id()))
+                    })?;
+                if completed.status() != OperationStatus::Succeeded
+                    || completed.phase() != Some(completion_phase.as_str())
+                {
+                    return Err(store_error(error));
+                }
+            }
+            Err(error) => return Err(store_error(error)),
+        }
         crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-succeeded");
         Ok(Response::new(v1::GenerateSupportArtifactResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
