@@ -596,6 +596,17 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
         self.source.capture_source_snapshot(relations).await
     }
 
+    /// Reject unsafe publication identities for every imported table under
+    /// the active source lease, including attachments made after bootstrap.
+    pub async fn validate_pgoutput_table(
+        &self,
+        lease: &SourceOwnerLease,
+        table: &str,
+    ) -> Result<(), SourceError> {
+        self.require_active_lease(lease)?;
+        self.source.validate_pgoutput_table(table).await
+    }
+
     pub async fn pgoutput_relation_column_policies(
         &self,
         lease: &SourceOwnerLease,
