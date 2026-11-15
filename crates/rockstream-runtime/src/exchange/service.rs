@@ -16,7 +16,7 @@ use crate::exchange::serialization::deserialize_zset;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::compatibility::{ProtocolVersion, SupportedVersionRange};
 use rockstream_types::config::ExchangeConfig;
-use rockstream_types::error_code::{RS_2401, RS_2410};
+use rockstream_types::error_code::{RS_0001, RS_2401, RS_2410};
 use rockstream_types::identity::{NodeIdentity, NodeRole};
 
 /// Holds the input channel and Schema metadata for a local exchange target.
@@ -250,6 +250,9 @@ impl ExchangeService {
                 "{RS_2410}: plaintext worker shuffle requires explicit loopback development opt-in"
             ));
         }
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+            format!("{RS_0001}: failed to bind worker shuffle listener {addr}: {error}")
+        })?;
         let server = ShuffleServer::new_with_tracker(
             self.registry.clone(),
             Some(self.task_tracker.clone()),
@@ -267,16 +270,23 @@ impl ExchangeService {
                 .map_err(|e| format!("{RS_2410}: failed to configure worker shuffle TLS: {e}"))?;
         }
         let handle = self.task_tracker.spawn(async move {
-            let _ = builder
+            let incoming = futures::stream::unfold(listener, |listener| async move {
+                let accepted = listener.accept().await.map(|(stream, _)| stream);
+                Some((accepted, listener))
+            });
+            if let Err(error) = builder
                 .add_service(
                     crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
                         server,
                     ),
                 )
-                .serve_with_shutdown(addr, async move {
+                .serve_with_incoming_shutdown(incoming, async move {
                     cancel_token.cancelled().await;
                 })
-                .await;
+                .await
+            {
+                tracing::error!(code = %RS_0001, %error, %addr, "worker shuffle endpoint stopped");
+            }
         });
         Ok(handle)
     }
