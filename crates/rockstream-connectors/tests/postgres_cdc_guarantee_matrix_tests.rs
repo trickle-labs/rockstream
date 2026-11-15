@@ -127,7 +127,9 @@ async fn postgres_cdc_insert_update_delete_have_exact_transcript() {
     let fixture = common::connector_fixture("mutations").await;
     fixture
         .postgres
-        .batch_execute("INSERT INTO orders VALUES (1); UPDATE orders SET id = 2 WHERE id = 1; DELETE FROM orders WHERE id = 2")
+        .batch_execute(
+            "INSERT INTO orders VALUES (1); UPDATE orders SET id = 2 WHERE id = 1; DELETE FROM orders WHERE id = 2",
+        )
         .await
         .unwrap();
     let mut source = source();
