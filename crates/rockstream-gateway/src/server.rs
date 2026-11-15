@@ -16792,7 +16792,7 @@ async fn load_pgoutput_truncate_images(
             }
             let key = std::str::from_utf8(&key)
                 .map_err(|_| pgoutput_truncate_error("non-UTF8 stored row key"))?;
-            let row_key = key.strip_prefix(&prefix).ok_or_else(|| {
+            let row_key = key.strip_prefix(prefix.as_str()).ok_or_else(|| {
                 pgoutput_truncate_error("stored row key is outside its relation prefix")
             })?;
             let image = std::str::from_utf8(&value)
