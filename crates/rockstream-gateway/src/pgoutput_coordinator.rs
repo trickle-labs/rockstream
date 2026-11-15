@@ -291,6 +291,13 @@ impl SpillKey for EnvelopeKey {
     }
 }
 
+/// An explicit discriminator prevents a malformed old row object from being
+/// mistaken for a TRUNCATE marker by the untagged compatibility decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PgOutputTruncateTag {
+    Truncate,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)] // Keep preexisting spilled row JSON readable after an upgrade.
 pub enum EncodedChange {
@@ -307,6 +314,7 @@ pub enum EncodedChange {
     Truncate {
         relation_id: u32,
         schema_version: u64,
+        tag: PgOutputTruncateTag,
     },
 }
 
@@ -535,6 +543,7 @@ impl SharedPgOutputCoordinator {
                 EncodedChange::Truncate {
                     relation_id,
                     schema_version,
+                    tag: PgOutputTruncateTag::Truncate,
                 }
             })?;
         }
@@ -1070,6 +1079,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn truncated_marker_json_cannot_misread_legacy_row_or_corruption() {
+        let legacy = r#"{"relation_id":7,"operation":"Insert","old_values":null,"new_values":[["1"]],"schema_version":1}"#;
+        assert!(matches!(
+            serde_json::from_str::<EncodedChange>(legacy).unwrap(),
+            EncodedChange::Row { operation: CdcOperation::Insert, .. }
+        ));
+        let corrupt = r#"{"relation_id":7,"operation":"BOGUS","schema_version":1}"#;
+        assert!(serde_json::from_str::<EncodedChange>(corrupt).is_err());
+        let marker = EncodedChange::Truncate {
+            relation_id: 7,
+            schema_version: 1,
+            tag: PgOutputTruncateTag::Truncate,
+        };
+        assert_eq!(serde_json::from_str::<EncodedChange>(&serde_json::to_string(&marker).unwrap()).unwrap(), marker);
+    }
+
     #[tokio::test]
     async fn truncate_markers_preserve_order_in_a_spilled_envelope() {
         let mut coordinator = coordinator().await;
@@ -1103,6 +1129,7 @@ mod tests {
         assert_eq!(envelope.changes[1], EncodedChange::Truncate {
             relation_id: 7,
             schema_version: 1,
+            tag: PgOutputTruncateTag::Truncate,
         });
         assert!(matches!(&envelope.changes[2], EncodedChange::Row { operation: CdcOperation::Insert, .. }));
         assert!(coordinator.push_truncate(57, &[7, 7]).is_err());
