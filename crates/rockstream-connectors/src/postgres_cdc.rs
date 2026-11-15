@@ -1371,12 +1371,22 @@ impl PostgresCdcSource {
                 }
                 _ => {}
             }
-            if let Some(change) = decode_native_pgoutput_text_message(
+            let change = match decode_native_pgoutput_text_message(
                 &mut pgoutput.relations,
                 self.schema.fields().len(),
                 lsn,
                 &payload,
-            )? {
+            ) {
+                Ok(change) => change,
+                Err(error) => {
+                    // The row-only caller may retry after a poll error. Do not
+                    // skip an unsupported TRUNCATE (or other malformed frame)
+                    // on retry and accidentally acknowledge its COMMIT.
+                    self.native_seen_messages = self.native_seen_messages.saturating_sub(1);
+                    return Err(error);
+                }
+            };
+            if let Some(change) = change {
                 let Some((_, changes, bytes)) = &mut self.native_transaction else {
                     return Err(SourceError::PollDeltaFailed {
                         reason: "pgoutput row frame without BEGIN is invalid".to_string(),
@@ -1432,7 +1442,13 @@ impl PostgresCdcSource {
         };
         let payload = message.get::<_, Vec<u8>>(1);
         self.native_seen_messages = self.native_seen_messages.saturating_add(1);
-        let event = decode_pgoutput_event(&mut self.native_xid, &payload)?;
+        let event = match decode_pgoutput_event(&mut self.native_xid, &payload) {
+            Ok(event) => event,
+            Err(error) => {
+                self.native_seen_messages = self.native_seen_messages.saturating_sub(1);
+                return Err(error);
+            }
+        };
         if matches!(event, PgOutputEvent::Commit { .. }) {
             self.native_seen_messages = 0;
         }
