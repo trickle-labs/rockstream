@@ -34,11 +34,8 @@ pub enum GatewayError {
 
     /// [RS-2007] write.idempotency_key_required.
     ///
-    /// As of v0.51.1, a COMMIT with neither `SET rockstream.idempotency_key`
-    /// nor `SET rockstream.source_epoch` no longer fails: the server mints a
-    /// fresh CSPRNG-derived idempotency key for that commit instead. This
-    /// variant is retained for protocol/documentation stability but is no
-    /// longer reachable from the normal write-commit path.
+    /// COMMIT generates its own key when neither setting is provided. ALTER
+    /// SECRET still requires a client UUID so a lost response can be retried.
     IdempotencyKeyRequired,
 
     /// [RS-2500] copy.table_not_found — COPY target table does not exist in the catalog.

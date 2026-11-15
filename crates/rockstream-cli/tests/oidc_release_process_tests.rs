@@ -2246,10 +2246,51 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .simple_query("ALTER ROLE postgres PASSWORD 'rotated-fixture-value'")
         .await
         .unwrap();
-    client
-        .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')")
+    let rotation_id = "d931137e-9e28-4a29-96f2-0cb10e5acb21";
+    let rotation_query = "ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')";
+    let missing_key = client.simple_query(rotation_query).await.unwrap_err();
+    let missing_key = missing_key.as_db_error().unwrap();
+    assert_eq!(missing_key.code().code(), "XX000");
+    assert!(missing_key
+        .message()
+        .starts_with("[RS-2007] write.idempotency_key_required:"));
+    let set_response = client
+        .simple_query(&format!("SET rockstream.idempotency_key = '{rotation_id}'"))
         .await
         .unwrap();
+    assert!(
+        matches!(
+            set_response.as_slice(),
+            [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+        ),
+        "expected exactly one successful SET response, got {set_response:?}"
+    );
+    let first_rotation_response = client.simple_query(rotation_query).await.unwrap();
+    assert!(
+        matches!(
+            first_rotation_response.as_slice(),
+            [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+        ),
+        "expected exactly one successful ALTER SECRET response, got {first_rotation_response:?}"
+    );
+    let conflict = client
+        .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'different-fixture-value')")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflict.as_db_error().unwrap().message(),
+        format!(
+            "idempotency key is already bound to operation {rotation_id} with a different request"
+        )
+    );
+    let retry_response = client.simple_query(rotation_query).await.unwrap();
+    assert!(
+        matches!(
+            retry_response.as_slice(),
+            [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+        ),
+        "expected exactly one successful retry response, got {retry_response:?}"
+    );
     upstream.batch_execute("COMMIT").await.unwrap();
     expected_rows.extend([row("3", Some("30")), row("3", Some("30")), row("4", None)]);
     expected_rows.sort();
@@ -2417,9 +2458,10 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .collect::<Vec<_>>();
     assert_eq!(rotation_audits.len(), 1);
     let rotation_audit = &rotation_audits[0];
-    assert!(rotation_audit
-        .event_id
-        .starts_with("gateway-secret-rotation-"));
+    assert_eq!(
+        rotation_audit.event_id,
+        format!("gateway-secret-rotation-{rotation_id}")
+    );
     assert!(rotation_audit.timestamp_ms > 0);
     assert_eq!(
         rotation_audit.format_version,
@@ -2449,7 +2491,10 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         &rotation_audit.correlation,
         AuditCorrelation::Observed(id) if !id.is_empty()
     ));
-    assert_eq!(rotation_audit.operation_id, AuditField::Unknown);
+    assert_eq!(
+        rotation_audit.operation_id,
+        AuditField::Known(rotation_id.to_owned())
+    );
     assert_eq!(rotation_audit.policy_revision, AuditField::Known(1));
     assert_eq!(
         rotation_audit.before_state,
@@ -2459,6 +2504,29 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         rotation_audit.after_state,
         AuditField::Known("version=2".to_string())
     );
+    let operation = rockstream_control::ManagementOperationStore::new(
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap(),
+    )
+    .get(rotation_id)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(operation.operation_id(), rotation_id);
+    assert_eq!(
+        operation.kind(),
+        rockstream_control::OperationKind::SecretRotation
+    );
+    assert_eq!(
+        operation.status(),
+        rockstream_control::OperationStatus::Succeeded
+    );
+    assert_eq!(
+        operation.result(),
+        Some(&serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0}))
+    );
+    assert!(!serde_json::to_string(operation.request().unwrap())
+        .unwrap()
+        .contains("rotated-fixture-value"));
 }
 
 #[tokio::test]

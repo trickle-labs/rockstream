@@ -3,7 +3,7 @@ use std::sync::Arc;
 use object_store::memory::InMemory;
 use rockstream_control::{
     ManagementOperationStore, ManagementService, OperationKind, OperationStatus, OperationUpdate,
-    ShardManager, TopologyCatalog,
+    SecretRotationOperationRequest, ShardManager, TopologyCatalog,
 };
 use rockstream_management_proto::v1::{
     CancelOperationRequest, CreateBackupRequest, DrainWorkerRequest, GetCapabilitiesRequest,
@@ -713,6 +713,106 @@ async fn management_grant_mutation_is_idempotent_and_audits_the_complete_result(
 }
 
 #[tokio::test]
+async fn secret_rotation_operation_is_listed_and_reconciled_by_its_owner() {
+    let auth = ManagementAuth::new(&[]).await;
+    let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
+    let operation_id = "00000000-0000-4000-8000-000000000305";
+    let request = SecretRotationOperationRequest {
+        deployment_id: rockstream_control::management::security_deployment_fingerprint(
+            &NodeConfig::default(),
+            "management-security",
+        ),
+        actor_id: Some(1),
+        scope: PolicyScope::Secret {
+            namespace: "sales".to_owned(),
+            name: "warehouse".to_owned(),
+            consumer: None,
+        },
+        payload_digest: "sha256:payload-digest".to_owned(),
+    };
+    operations
+        .accept_idempotent(
+            operation_id,
+            1,
+            &request,
+            operation_id,
+            OperationKind::SecretRotation,
+            1_000,
+        )
+        .await
+        .unwrap();
+    operations
+        .transition(
+            operation_id,
+            OperationUpdate {
+                status: OperationStatus::Running,
+                updated_at_ms: 2_000,
+                progress: None,
+                phase: Some("rotating_secret".to_owned()),
+                error_code: None,
+                next_steps: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    operations
+        .transition_with_result(
+            operation_id,
+            OperationUpdate {
+                status: OperationStatus::Succeeded,
+                updated_at_ms: 3_000,
+                progress: Some(100),
+                phase: Some("secret_rotation_committed".to_owned()),
+                error_code: None,
+                next_steps: Vec::new(),
+            },
+            serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0}),
+        )
+        .await
+        .unwrap();
+
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        operations,
+        NodeConfig::default(),
+    );
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
+    let listed = client
+        .list_operations(ListOperationsRequest {
+            protocol_version: 1,
+            page_size: 10,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.operations.len(), 1);
+    assert_eq!(listed.operations[0].operation_id, operation_id);
+    assert_eq!(listed.operations[0].kind, "secret_rotation");
+
+    let recovered = client
+        .get_operation(GetOperationRequest {
+            protocol_version: 1,
+            operation_id: operation_id.to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(recovered.operation_id, operation_id);
+    assert_eq!(recovered.kind, "secret_rotation");
+    assert_eq!(recovered.state, "succeeded");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&recovered.result_json).unwrap(),
+        serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0})
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn grantor_can_reconcile_its_self_revocation_without_removing_last_admin() {
     let auth = ManagementAuth::with_presets(
         &[],
@@ -1277,7 +1377,7 @@ async fn management_start_recovers_running_operation_with_exact_phase() {
             next_steps: vec![
                 "Management restarted; reconcile this operation before retrying.".to_owned(),
             ],
-            source_version: "operation-record:3".to_owned(),
+            source_version: "operation-record:4".to_owned(),
             result_json: String::new(),
         }
     );
@@ -1360,7 +1460,7 @@ async fn management_cancellation_obeys_the_safe_boundary() {
             phase: "cancelled_before_start".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:3".to_owned(),
+            source_version: "operation-record:4".to_owned(),
             result_json: String::new(),
         }
     );
@@ -1399,7 +1499,7 @@ async fn management_cancellation_obeys_the_safe_boundary() {
             phase: "worker_handoff_started".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:3".to_owned(),
+            source_version: "operation-record:4".to_owned(),
             result_json: String::new(),
         }
     );
@@ -1573,7 +1673,7 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
     assert_eq!(completed.phase, "completed");
     assert!(completed.error_code.is_empty());
     assert!(completed.next_steps.is_empty());
-    assert_eq!(completed.source_version, "operation-record:3");
+    assert_eq!(completed.source_version, "operation-record:4");
     assert_eq!(
         shard_manager.get(ShardId(77)).unwrap().worker_id,
         WorkerId(2)
@@ -1716,7 +1816,7 @@ async fn management_migrate_moves_a_real_shard_once() {
     assert_eq!(completed.phase, "completed");
     assert_eq!(completed.error_code, "");
     assert_eq!(completed.next_steps, Vec::<String>::new());
-    assert_eq!(completed.source_version, "operation-record:3");
+    assert_eq!(completed.source_version, "operation-record:4");
     assert_eq!(shard_manager.get(ShardId(77)), Some(new_lease));
     control.shutdown();
 }

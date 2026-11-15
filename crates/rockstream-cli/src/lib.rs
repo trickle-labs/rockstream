@@ -13,6 +13,7 @@
 
 use crate::cli_args::SecurityCatalogLayout;
 use crate::output::OutputFormat;
+use rockstream_storage::catalog::CatalogStore;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::diagnostic::{
@@ -543,8 +544,9 @@ async fn open_durable_secret_store(
     store: Arc<dyn object_store::ObjectStore>,
     shard_path: &str,
     security_catalog: Arc<dyn rockstream_storage::catalog::CatalogStore>,
+    operation_store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
 ) -> Result<Arc<rockstream_control::SecretStore>, CliError> {
-    let secret_store = rockstream_control::SecretStore::open_durable(
+    let mut secret_store = rockstream_control::SecretStore::open_durable(
         format!("{shard_path}-secrets"),
         store,
         Arc::new(rockstream_control::EnvKekProvider::from_env()),
@@ -558,6 +560,12 @@ async fn open_durable_secret_store(
         )
     })?
     .with_security_audit_catalog(security_catalog);
+    if let Some((store, deployment_id)) = operation_store {
+        secret_store = secret_store.with_management_operation_store(
+            rockstream_control::ManagementOperationStore::new(store),
+            deployment_id,
+        );
+    }
     secret_store
         .flush_pending_security_audit_outbox()
         .await
@@ -996,7 +1004,42 @@ async fn start_gateway_with_shard_and_catalog_and_dev_transport(
 
     let secret_store = match shared_secret_store {
         Some(secret_store) => secret_store,
-        None => open_durable_secret_store(store, shard_path, security_audit_catalog).await?,
+        None => {
+            let operations_store: Arc<dyn object_store::ObjectStore> =
+                if let Some(shared_dir) = &opts.control_shared_storage {
+                    fs::create_dir_all(shared_dir).map_err(|error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to create management shared-storage dir: {error}"),
+                            "Check filesystem permissions for --control-shared-storage.",
+                        )
+                    })?;
+                    Arc::new(
+                        object_store::local::LocalFileSystem::new_with_prefix(shared_dir).map_err(
+                            |error| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open management shared storage: {error}"),
+                                    "Check filesystem permissions for --control-shared-storage.",
+                                )
+                            },
+                        )?,
+                    )
+                } else {
+                    store.clone()
+                };
+            let deployment_id = rockstream_control::management::security_deployment_fingerprint(
+                &node_config,
+                &security_audit_catalog.deployment_namespace(),
+            );
+            open_durable_secret_store(
+                store,
+                shard_path,
+                security_audit_catalog,
+                Some((operations_store, deployment_id)),
+            )
+            .await?
+        }
     };
     let mut server = server
         .with_secret_store(secret_store)
@@ -1420,6 +1463,37 @@ pub fn run_start_with_dev_transport(
             }
             let security_catalog =
                 open_security_catalog(&opts.storage, SecurityCatalogLayout::All).await?;
+            let management_store: Arc<dyn object_store::ObjectStore> =
+                if let Some(shared_dir) = &opts.control_shared_storage {
+                    fs::create_dir_all(shared_dir).map_err(|error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to create management shared-storage dir: {error}"),
+                            "Check filesystem permissions for --control-shared-storage.",
+                        )
+                    })?;
+                    Arc::new(
+                        object_store::local::LocalFileSystem::new_with_prefix(shared_dir)
+                            .map_err(|error| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open management shared storage: {error}"),
+                                    "Check filesystem permissions for --control-shared-storage.",
+                                )
+                            })?,
+                    )
+                } else {
+                    Arc::new(
+                        object_store::local::LocalFileSystem::new_with_prefix(&opts.storage)
+                            .map_err(|error| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open management store: {error}"),
+                                    "Check storage directory permissions.",
+                                )
+                            })?,
+                    )
+                };
             let secret_object_store = rockstream_storage::build_runtime_object_store(
                 &opts.storage.join("shards/0"),
                 "shards/0",
@@ -1435,6 +1509,13 @@ pub fn run_start_with_dev_transport(
                 secret_object_store,
                 "db",
                 security_catalog.clone(),
+                Some((
+                    management_store.clone(),
+                    rockstream_control::management::security_deployment_fingerprint(
+                        &node_config,
+                        &security_catalog.deployment_namespace(),
+                    ),
+                )),
             )
             .await?;
             service = service
@@ -1452,28 +1533,11 @@ pub fn run_start_with_dev_transport(
                     rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
                 );
                 if let Some(addr) = &node_config.control.management_addr {
-                    let management_store = if let Some(shared_dir) = &opts.control_shared_storage {
-                        fs::create_dir_all(shared_dir).map_err(|e| {
-                            CliError::new(
-                                RS_0003,
-                                format!("failed to create management shared-storage dir: {e}"),
-                                "Check filesystem permissions for --control-shared-storage.",
-                            )
-                        })?;
-                        Arc::new(
-                            object_store::local::LocalFileSystem::new_with_prefix(shared_dir)
-                                .map_err(|e| {
-                                    CliError::new(
-                                        RS_0003,
-                                        format!("failed to open management shared storage: {e}"),
-                                        "Check filesystem permissions for --control-shared-storage.",
-                                    )
-                                })?,
-                        ) as Arc<dyn object_store::ObjectStore>
-                    } else {
-                        store.clone()
-                    };
-                    service = service.with_management(addr.clone(), management_store, node_config.clone());
+                    service = service.with_management(
+                        addr.clone(),
+                        management_store.clone(),
+                        node_config.clone(),
+                    );
                 }
             }
             let handle = service
@@ -1519,6 +1583,7 @@ pub fn run_start_with_dev_transport(
                 secret_object_store,
                 "gateway",
                 security_catalog.clone(),
+                None,
             )
             .await?;
             service = service

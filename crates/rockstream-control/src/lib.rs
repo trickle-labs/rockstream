@@ -69,7 +69,8 @@ pub use management::{ManagementService, ManagementServiceHandle};
 pub use management_store::{
     IdempotencyRecord, ManagementOperationStore, OperationKind, OperationLifecycleError,
     OperationRecord, OperationStatus, OperationStoreError, OperationUpdate,
-    IDEMPOTENCY_KEY_RETENTION_MS, MANAGEMENT_OPERATION_RECORD_VERSION,
+    SecretRotationOperationRequest, IDEMPOTENCY_KEY_RETENTION_MS,
+    MANAGEMENT_OPERATION_RECORD_VERSION,
 };
 pub use manifest::{
     compute_file_sha256, validate_catalog_reference, verify_backup_payload_files,
@@ -90,7 +91,9 @@ pub use placement::PlacementAlgorithm;
 pub use qualification_store::QualificationEvidenceStore;
 pub use rockstream_types::migration::MigrationProgress;
 pub use scheduler::{ShardAssignment, ShardScheduler};
-pub use secret_store::{SecretListing, SecretStore, SecretStoreError};
+pub use secret_store::{
+    SecretListing, SecretRotationOperationError, SecretStore, SecretStoreError,
+};
 pub use service::{ControlService, ControlServiceHandle};
 pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};
 pub use shard_stats::ShardStatsPersistentStore;

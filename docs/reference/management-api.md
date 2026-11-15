@@ -70,7 +70,7 @@ A successful `DrainWorker` result requires a matching recipient-open acknowledge
 
 `Shard` reports its owner and lease token. `key_range_known` is false and `key_range` is empty because the current lease store does not publish key ranges.
 
-`Operation` reports an identifier, kind, state, start and update times, progress, phase, error code, next steps, source record version, and (when authorized) a complete `result_json`. Operation listings omit result contents. For grant changes, the grantor or a current grant manager can use `GetOperation` to recover the safe committed grant result. The states are `Pending`, `Running`, `Waiting`, `Succeeded`, `Failed`, and `Cancelled`. The server persists times as Unix milliseconds and renders them as RFC 3339 UTC.
+`Operation` reports an identifier, kind, state, start and update times, progress, phase, error code, next steps, source record version, and (when authorized) a complete `result_json`. Operation listings omit result contents. The submitting principal can use `GetOperation` to recover its secret-rotation result; a principal with current `operation_history_read` authority can also read it. The states are `Pending`, `Running`, `Waiting`, `Succeeded`, `Failed`, and `Cancelled`. The server persists times as Unix milliseconds and renders them as RFC 3339 UTC.
 
 `GetConfigSummary` marks each redacted value with `redacted=true`. It does not return the original secret.
 
@@ -78,11 +78,11 @@ A successful `DrainWorker` result requires a matching recipient-open acknowledge
 
 `page_size=0` selects the default of 50. The maximum page size is 100. Page tokens are decimal offsets; malformed or out-of-range tokens return `INVALID_ARGUMENT`.
 
-The server admits at most 64 concurrent management requests and 64 ACK waiters for each attached migration or backup executor. It limits gRPC messages to 1 MiB. The operation store retains at most 1,000 active records and 10,000 total records. Terminal records and idempotency bindings remain for 90 days. Each operation accepts at most 64 state transitions. Operation record version 3 adds durable mutation results and reads version 1 and 2 records through the compatibility migration.
+The server admits at most 64 concurrent management requests and 64 ACK waiters for each attached migration or backup executor. It limits gRPC messages to 1 MiB. The operation store retains at most 1,000 active records and 10,000 total records. Terminal records and idempotency bindings remain for 90 days. Each operation accepts at most 64 state transitions. Operation record version 4 adds secret-rotation records and reads version 1 through 3 records through compatibility migration.
 
 ## Idempotency and cancellation
 
-`DrainWorker`, `MigrateShard`, and `CreateBackup` accept an `idempotency_key`. `SetSecurityPrincipalGrants` requires a canonical client-generated UUID; the same UUID is its operation ID. The server binds it to the protocol version, authenticated grantor, deployment context, target, reviewed revisions, and requested grants before applying the change. An exact retry returns the original operation and result. A changed request under the same key returns `ALREADY_EXISTS` without changing policy. An expired key returns `FAILED_PRECONDITION`. The authorized `GetOperation` RPC reconciles a lost response; submit the original UUID and never resubmit the mutation with a new key.
+`DrainWorker`, `MigrateShard`, and `CreateBackup` accept an `idempotency_key`. `SetSecurityPrincipalGrants` and SQL `ALTER SECRET` use a canonical client-generated UUID as the operation ID. For secret rotation, set `rockstream.idempotency_key` in the SQL session before the mutation. The server binds the UUID to the authenticated actor, deployment, secret scope, and a digest of the submitted values; it does not persist those values in the operation record. An exact retry returns the original result. A changed request under the same key is rejected without applying another mutation. A submitting principal or a principal with current `operation_history_read` authority can use `GetOperation` to recover the safe result when the gateway and management service share the operation store. Retry SQL with the original UUID and request; never resubmit the mutation with a new key.
 
 The valid status transitions are:
 
