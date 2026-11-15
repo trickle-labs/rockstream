@@ -86,10 +86,9 @@ async fn secrets_survive_minio_tc_reopen_and_kek_rotation() {
         return;
     }
 
-    let (_container, port) = match start_minio(MINIO_BUCKET).await {
-        Some(res) => res,
-        None => return,
-    };
+    let (_container, port) = start_minio(MINIO_BUCKET)
+        .await
+        .expect("MinIO must start when Docker is available");
 
     let db = Arc::new(
         Db::builder("catalog_db", minio_object_store(port, MINIO_BUCKET))
