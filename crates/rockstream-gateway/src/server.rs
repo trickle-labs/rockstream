@@ -16842,7 +16842,12 @@ fn pgoutput_envelope_to_dml_ops(
                         DmlOp::Insert { row_key, values_tsv, .. } => {
                             images.insert(row_key.clone(), values_tsv.clone());
                         }
-                        DmlOp::Update { old_row_key, new_row_key, new_tsv, .. } => {
+                        DmlOp::Update {
+                            old_row_key,
+                            new_row_key,
+                            new_tsv,
+                            ..
+                        } => {
                             images.remove(old_row_key);
                             images.insert(new_row_key.clone(), new_tsv.clone());
                         }
@@ -16885,14 +16890,27 @@ fn pgoutput_envelope_to_dml_ops(
 
 fn pgoutput_dml_op_size(op: &DmlOp) -> usize {
     match op {
-        DmlOp::Insert { row_key, values_tsv, .. } => row_key.len().saturating_add(values_tsv.len()),
-        DmlOp::Update { old_row_key, new_row_key, old_tsv, new_tsv, .. } => {
-            old_row_key.len().saturating_add(new_row_key.len())
-                .saturating_add(old_tsv.len()).saturating_add(new_tsv.len())
-        }
-        DmlOp::Delete { row_key, returning_tsv, .. } => {
-            row_key.len().saturating_add(returning_tsv.as_ref().map_or(0, String::len))
-        }
+        DmlOp::Insert {
+            row_key, values_tsv, ..
+        } => row_key.len().saturating_add(values_tsv.len()),
+        DmlOp::Update {
+            old_row_key,
+            new_row_key,
+            old_tsv,
+            new_tsv,
+            ..
+        } => old_row_key
+            .len()
+            .saturating_add(new_row_key.len())
+            .saturating_add(old_tsv.len())
+            .saturating_add(new_tsv.len()),
+        DmlOp::Delete {
+            row_key,
+            returning_tsv,
+            ..
+        } => row_key
+            .len()
+            .saturating_add(returning_tsv.as_ref().map_or(0, String::len)),
     }
 }
 
@@ -16952,36 +16970,81 @@ mod pgoutput_truncate_unit_tests {
         let ops = pgoutput_envelope_to_dml_ops(
             &[
                 insert(7, "3"),
-                EncodedChange::Truncate { relation_id: 7, schema_version: 1, tag: PgOutputTruncateTag::Truncate },
+                EncodedChange::Truncate {
+                    relation_id: 7,
+                    schema_version: 1,
+                    tag: PgOutputTruncateTag::Truncate,
+                },
                 insert(7, "4"),
-                EncodedChange::Truncate { relation_id: 8, schema_version: 1, tag: PgOutputTruncateTag::Truncate },
-                EncodedChange::Truncate { relation_id: 8, schema_version: 1, tag: PgOutputTruncateTag::Truncate },
+                EncodedChange::Truncate {
+                    relation_id: 8,
+                    schema_version: 1,
+                    tag: PgOutputTruncateTag::Truncate,
+                },
+                EncodedChange::Truncate {
+                    relation_id: 8,
+                    schema_version: 1,
+                    tag: PgOutputTruncateTag::Truncate,
+                },
             ],
             &routes,
             images,
         )
         .unwrap();
         assert_eq!(ops.len(), 6); // INSERT(3), DELETE(1,2,3), INSERT(4), DELETE(9)
-        assert!(matches!(&ops[0], DmlOp::Insert { row_key, .. } if row_key == "id=3"));
-        assert!(matches!(&ops[1], DmlOp::Delete { row_key, returning_tsv: Some(tsv), .. } if row_key == "id=1" && tsv == "1"));
-        assert!(matches!(&ops[2], DmlOp::Delete { row_key, .. } if row_key == "id=2"));
-        assert!(matches!(&ops[3], DmlOp::Delete { row_key, .. } if row_key == "id=3"));
-        assert!(matches!(&ops[4], DmlOp::Insert { row_key, .. } if row_key == "id=4"));
-        assert!(matches!(&ops[5], DmlOp::Delete { table, row_key, .. } if table == "b" && row_key == "id=9"));
+        assert!(matches!(
+            &ops[0],
+            DmlOp::Insert { row_key, .. } if row_key == "id=3"
+        ));
+        assert!(matches!(
+            &ops[1],
+            DmlOp::Delete {
+                row_key,
+                returning_tsv: Some(tsv),
+                ..
+            } if row_key == "id=1" && tsv == "1"
+        ));
+        assert!(matches!(
+            &ops[2],
+            DmlOp::Delete { row_key, .. } if row_key == "id=2"
+        ));
+        assert!(matches!(
+            &ops[3],
+            DmlOp::Delete { row_key, .. } if row_key == "id=3"
+        ));
+        assert!(matches!(
+            &ops[4],
+            DmlOp::Insert { row_key, .. } if row_key == "id=4"
+        ));
+        assert!(matches!(
+            &ops[5],
+            DmlOp::Delete { table, row_key, .. } if table == "b" && row_key == "id=9"
+        ));
     }
 
     #[test]
     fn truncate_expansion_rejects_missing_route_or_schema_mismatch() {
         let a = route(7, "a");
         let routes = HashMap::from([(7, &a)]);
-        let bad_route = EncodedChange::Truncate { relation_id: 8, schema_version: 1, tag: PgOutputTruncateTag::Truncate };
-        let bad_schema = EncodedChange::Truncate { relation_id: 7, schema_version: 2, tag: PgOutputTruncateTag::Truncate };
+        let bad_route = EncodedChange::Truncate {
+            relation_id: 8,
+            schema_version: 1,
+            tag: PgOutputTruncateTag::Truncate,
+        };
+        let bad_schema = EncodedChange::Truncate {
+            relation_id: 7,
+            schema_version: 2,
+            tag: PgOutputTruncateTag::Truncate,
+        };
         for change in [bad_route, bad_schema] {
-            assert!(pgoutput_envelope_to_dml_ops(
-                &[change],
-                &routes,
-                HashMap::from([("a".to_string(), BTreeMap::new())]),
-            ).is_err());
+            assert!(
+                pgoutput_envelope_to_dml_ops(
+                    &[change],
+                    &routes,
+                    HashMap::from([("a".to_string(), BTreeMap::new())]),
+                )
+                .is_err()
+            );
         }
     }
 
@@ -17002,13 +17065,21 @@ mod pgoutput_truncate_unit_tests {
         .unwrap();
         let a = route(7, "a");
         let routes = HashMap::from([(7, &a)]);
-        let changes = [EncodedChange::Truncate { relation_id: 7, schema_version: 1, tag: PgOutputTruncateTag::Truncate }];
+        let changes = [EncodedChange::Truncate {
+            relation_id: 7,
+            schema_version: 1,
+            tag: PgOutputTruncateTag::Truncate,
+        }];
         let error = load_pgoutput_truncate_images(&db, &changes, &routes)
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("RS-4014"), "{error}");
-        assert!(db.get(b"view_output/a/id=1").await.unwrap().is_some());
+        assert!(db
+            .get(b"view_output/a/id=1")
+            .await
+            .unwrap()
+            .is_some());
     }
 }
 
