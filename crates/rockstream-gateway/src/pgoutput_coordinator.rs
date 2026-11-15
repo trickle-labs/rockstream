@@ -292,6 +292,7 @@ impl SpillKey for EnvelopeKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)] // Keep preexisting spilled row JSON readable after an upgrade.
 pub enum EncodedChange {
     Row {
         relation_id: u32,
