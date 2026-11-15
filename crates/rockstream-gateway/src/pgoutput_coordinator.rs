@@ -292,12 +292,37 @@ impl SpillKey for EnvelopeKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EncodedChange {
-    pub relation_id: u32,
-    pub operation: CdcOperation,
-    pub old_values: Option<Vec<Option<String>>>,
-    pub new_values: Option<Vec<Option<String>>>,
-    pub schema_version: u64,
+pub enum EncodedChange {
+    Row {
+        relation_id: u32,
+        operation: CdcOperation,
+        old_values: Option<Vec<Option<String>>>,
+        new_values: Option<Vec<Option<String>>>,
+        schema_version: u64,
+    },
+    /// A truncate marker remains ordered among row changes in the spilled
+    /// transaction. Row images are recovered from local durable table state
+    /// at commit time, never from the already-truncated upstream table.
+    Truncate {
+        relation_id: u32,
+        schema_version: u64,
+    },
+}
+
+impl EncodedChange {
+    pub fn relation_id(&self) -> u32 {
+        match self {
+            Self::Row { relation_id, .. } | Self::Truncate { relation_id, .. } => *relation_id,
+        }
+    }
+
+    pub fn schema_version(&self) -> u64 {
+        match self {
+            Self::Row { schema_version, .. } | Self::Truncate { schema_version, .. } => {
+                *schema_version
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -482,6 +507,45 @@ impl SharedPgOutputCoordinator {
         old_values: Option<Vec<Option<String>>>,
         new_values: Option<Vec<Option<String>>>,
     ) -> Result<(), GatewayError> {
+        self.push_encoded_change(xid, relation_id, |schema_version| EncodedChange::Row {
+            relation_id,
+            operation,
+            old_values,
+            new_values,
+            schema_version,
+        })
+    }
+
+    pub fn push_truncate(
+        &mut self,
+        xid: u32,
+        relation_ids: &[u32],
+    ) -> Result<(), GatewayError> {
+        self.require_xid(xid)?;
+        if relation_ids.is_empty() {
+            return Err(protocol_error("TRUNCATE has no relations"));
+        }
+        let mut seen = BTreeSet::new();
+        for &relation_id in relation_ids {
+            if !seen.insert(relation_id) {
+                return Err(protocol_error("duplicate TRUNCATE relation ID"));
+            }
+            self.push_encoded_change(xid, relation_id, |schema_version| {
+                EncodedChange::Truncate {
+                    relation_id,
+                    schema_version,
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn push_encoded_change(
+        &mut self,
+        xid: u32,
+        relation_id: u32,
+        make_change: impl FnOnce(u64) -> EncodedChange,
+    ) -> Result<(), GatewayError> {
         self.require_xid(xid)?;
         if self.is_relation_blocked(relation_id) {
             return Ok(());
@@ -504,13 +568,7 @@ impl SharedPgOutputCoordinator {
                 "row for relation {relation_id} has no durable route or preceding Relation message"
             )));
         };
-        let change = EncodedChange {
-            relation_id,
-            operation,
-            old_values,
-            new_values,
-            schema_version,
-        };
+        let change = make_change(schema_version);
         let encoded_bytes = serde_json::to_vec(&change)
             .map_err(|error| coordinator_error(&format!("encode pgoutput change: {error}")))?
             .len();
@@ -1011,6 +1069,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn truncate_markers_preserve_order_in_a_spilled_envelope() {
+        let mut coordinator = coordinator().await;
+        coordinator
+            .relation_routes
+            .insert(7, route(vec![column("id", 25)]));
+        coordinator.envelope_buffer.set_memory_limit(64);
+        coordinator.begin(57).unwrap();
+        coordinator
+            .push_change(
+                57,
+                7,
+                CdcOperation::Insert,
+                None,
+                Some(vec![Some("1".to_string())]),
+            )
+            .unwrap();
+        coordinator.push_truncate(57, &[7]).unwrap();
+        coordinator
+            .push_change(
+                57,
+                7,
+                CdcOperation::Insert,
+                None,
+                Some(vec![Some("2".to_string())]),
+            )
+            .unwrap();
+        let envelope = coordinator.finish_envelope(57, PgLsn(0x57)).unwrap();
+        assert!(coordinator.spill_bytes() > 0);
+        assert!(matches!(&envelope.changes[0], EncodedChange::Row { operation: CdcOperation::Insert, .. }));
+        assert_eq!(envelope.changes[1], EncodedChange::Truncate {
+            relation_id: 7,
+            schema_version: 1,
+        });
+        assert!(matches!(&envelope.changes[2], EncodedChange::Row { operation: CdcOperation::Insert, .. }));
+        assert!(coordinator.push_truncate(57, &[7, 7]).is_err());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cdc_tx_spilled_two_tables_exact_atomic_batch_oracle() {
         let mut coordinator = coordinator().await;
@@ -1055,7 +1151,7 @@ mod tests {
             ),
             (
                 true,
-                serde_json::to_vec(&EncodedChange {
+                serde_json::to_vec(&EncodedChange::Row {
                     relation_id: 7,
                     operation: CdcOperation::Insert,
                     old_values: None,
