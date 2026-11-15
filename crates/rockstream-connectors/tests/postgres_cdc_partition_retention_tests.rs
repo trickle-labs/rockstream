@@ -14,6 +14,31 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use tokio_postgres::NoTls;
 
+fn snapshot_transcript(
+    batches: &[rockstream_connectors::source_connector::SnapshotBatch],
+) -> Vec<(i64, i64, i64)> {
+    let mut transcript = Vec::new();
+    for batch in batches {
+        let (data, weights) =
+            rockstream_types::arrow_batch::split_weight_column(&batch.batch).unwrap();
+        let ids = data
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let hours = data
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        for (index, weight) in weights.into_iter().enumerate() {
+            transcript.push((ids.value(index), hours.value(index), weight));
+        }
+    }
+    transcript.sort_unstable();
+    transcript
+}
+
 #[tokio::test]
 async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed() {
     assert!(
@@ -89,10 +114,7 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         .await
         .unwrap()
         .collect::<Vec<_>>();
-    assert_eq!(
-        first.iter().map(|batch| batch.batch.num_rows()).sum::<usize>(),
-        2
-    );
+    assert_eq!(snapshot_transcript(&first), vec![(1, 1, 1), (2, 11, 1)]);
 
     // A new row in a child partition is decoded under the parent identity.
     admin
@@ -111,8 +133,15 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
         .unwrap();
-    assert_eq!(ids.values().to_vec(), vec![3]);
-    assert_eq!(weights, vec![1]);
+    let hours = rows
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(
+        (ids.values().to_vec(), hours.values().to_vec(), weights),
+        (vec![3], vec![12], vec![1])
+    );
     source.commit_offset(1, delta.new_offset).await.unwrap();
     let durable_lsn = source.last_committed_lsn();
 
@@ -131,14 +160,19 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         .await
         .unwrap()
         .collect::<Vec<_>>();
-    assert_eq!(
-        pruned.iter().map(|batch| batch.batch.num_rows()).sum::<usize>(),
-        2
-    );
+    assert_eq!(snapshot_transcript(&pruned), vec![(2, 11, 1), (3, 12, 1)]);
 
     // In contrast to DDL pruning, a published TRUNCATE has an explicit
     // message. It must block before its LSN is acknowledged, rather than
     // silently behaving like an empty delta.
+    let slot_before: Option<String> = admin
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'rockstream_partition_retention'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
     admin.batch_execute("TRUNCATE events").await.unwrap();
     let err = source
         .poll_delta(pruned_fence.live, 8 * 1024 * 1024, 4_096, None)
@@ -147,6 +181,15 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         .to_string();
     assert!(err.contains("RS-4015"), "{err}");
     assert_eq!(source.last_committed_lsn(), durable_lsn);
+    let slot_after: Option<String> = admin
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'rockstream_partition_retention'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(slot_after, slot_before, "TRUNCATE must not advance slot acknowledgment");
 
     // Losing an existing slot must not turn a checkpointed source into a
     // fresh bootstrap: that would make already-pruned historical rows vanish.
