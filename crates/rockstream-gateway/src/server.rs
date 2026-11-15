@@ -16897,6 +16897,7 @@ fn pgoutput_dml_op_size(op: &DmlOp) -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod pgoutput_truncate_unit_tests {
     use super::*;
 
