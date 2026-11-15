@@ -59,6 +59,11 @@ pub enum CatalogMutation {
         grantor_revision: Option<(PrincipalId, u64)>,
         audit: SecurityAuditRecord,
     },
+    RecoverAdministratorCredentials {
+        principal: SecurityPrincipal,
+        expected_revision: u64,
+        audit: SecurityAuditRecord,
+    },
     DeleteSecurityPrincipal {
         principal_id: PrincipalId,
         expected_revision: u64,
@@ -181,6 +186,7 @@ fn is_security_mutation(mutation: &CatalogMutation) -> bool {
     matches!(
         mutation,
         CatalogMutation::PutSecurityPrincipal { .. }
+            | CatalogMutation::RecoverAdministratorCredentials { .. }
             | CatalogMutation::DeleteSecurityPrincipal { .. }
             | CatalogMutation::AppendSecurityAudit(_)
     )
