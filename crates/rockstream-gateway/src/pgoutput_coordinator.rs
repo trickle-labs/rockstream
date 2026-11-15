@@ -534,11 +534,12 @@ impl SharedPgOutputCoordinator {
         if relation_ids.is_empty() {
             return Err(protocol_error("TRUNCATE has no relations"));
         }
+        // Validate the whole message before staging any marker.
         let mut seen = BTreeSet::new();
+        if relation_ids.iter().any(|&relation_id| !seen.insert(relation_id)) {
+            return Err(protocol_error("duplicate TRUNCATE relation ID"));
+        }
         for &relation_id in relation_ids {
-            if !seen.insert(relation_id) {
-                return Err(protocol_error("duplicate TRUNCATE relation ID"));
-            }
             self.push_encoded_change(xid, relation_id, |schema_version| {
                 EncodedChange::Truncate {
                     relation_id,
@@ -1132,8 +1133,7 @@ mod tests {
             tag: PgOutputTruncateTag::Truncate,
         });
         assert!(matches!(&envelope.changes[2], EncodedChange::Row { operation: CdcOperation::Insert, .. }));
-        coordinator.begin(58).unwrap();
-        let error = coordinator.push_truncate(58, &[7, 7]).unwrap_err();
+        let error = coordinator.push_truncate(57, &[7, 7]).unwrap_err();
         assert!(error.to_string().contains("duplicate TRUNCATE relation ID"), "{error}");
     }
 
