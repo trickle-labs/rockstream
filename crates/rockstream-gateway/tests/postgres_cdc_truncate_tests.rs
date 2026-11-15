@@ -68,11 +68,19 @@ async fn wait_ids(client: &Client, table: &str, expected: &[Vec<i64>]) {
             let a_status = client
                 .query("SHOW SOURCE STATUS FOR a", &[])
                 .await
-                .map(|rows| rows.into_iter().map(|row| (
-                    row.get::<_, Option<String>>(3),
-                    row.get::<_, Option<String>>(9),
-                )).collect::<Vec<_>>());
-            panic!("pgoutput '{table}' did not converge: expected={expected:?} actual={found:?} a_status={a_status:?}");
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| {
+                            (
+                                row.get::<_, Option<String>>(3),
+                                row.get::<_, Option<String>>(9),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+            panic!(
+                "pgoutput '{table}' did not converge: expected={expected:?} actual={found:?} a_status={a_status:?}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -151,8 +159,12 @@ async fn pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart(
     for sql in [
         "CREATE TABLE a (id BIGINT)",
         "CREATE TABLE b (id BIGINT)",
-        &format!("CREATE SOURCE a TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='trunc_pub', slot='trunc_slot', table='a') FORMAT pgoutput"),
-        &format!("CREATE SOURCE b TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='trunc_pub', slot='trunc_slot', table='b') FORMAT pgoutput"),
+        &format!(
+            "CREATE SOURCE a TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='trunc_pub', slot='trunc_slot', table='a') FORMAT pgoutput"
+        ),
+        &format!(
+            "CREATE SOURCE b TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='trunc_pub', slot='trunc_slot', table='b') FORMAT pgoutput"
+        ),
         "CREATE MATERIALIZED VIEW a_view AS SELECT id FROM a",
         "CREATE MATERIALIZED VIEW b_view AS SELECT id FROM b",
         "CREATE MATERIALIZED VIEW a_doubled AS SELECT id, id * 2 AS doubled FROM a",
@@ -189,9 +201,9 @@ async fn pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart(
     wait_ids(&client, "b_view", &[]).await;
     assert!(ids(&client, "a").await.is_empty());
     assert!(ids(&client, "b").await.is_empty());
-    assert!(
-        query_pairs(&client, "SELECT id, doubled FROM a_doubled ORDER BY id").await.is_empty()
-    );
+    assert!(query_pairs(&client, "SELECT id, doubled FROM a_doubled ORDER BY id")
+        .await
+        .is_empty());
     upstream
         .batch_execute("INSERT INTO a VALUES (7); INSERT INTO b VALUES (9)")
         .await
@@ -243,7 +255,10 @@ async fn pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart(
         query_pairs(&restarted_client, "SELECT id, doubled FROM a_doubled ORDER BY id").await,
         vec![vec![7, 14]]
     );
-    upstream.execute("INSERT INTO a VALUES (8)", &[]).await.unwrap();
+    upstream
+        .execute("INSERT INTO a VALUES (8)", &[])
+        .await
+        .unwrap();
     wait_ids(&restarted_client, "a_view", &[vec![7], vec![8]]).await;
     assert_eq!(
         query_pairs(&restarted_client, "SELECT id, doubled FROM a_doubled ORDER BY id").await,
