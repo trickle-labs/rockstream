@@ -62,7 +62,7 @@ jobs:
 
   harness-macos:
     name: macOS observed CPU/RSS capture checks (not capacity qualification)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

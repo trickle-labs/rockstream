@@ -91,7 +91,15 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("CI_NEEDS: ${{ toJSON(needs) }}", blocks["benchmark"])
         self.assertIn("run: make qualify-verus", blocks["verus-qualify"])
         self.assertIn("phase: [debug, release]", blocks["verus-qualify"])
-        self.assertIn("os: [ubuntu-latest, macos-14]", blocks["verus-qualify"])
+        self.assertIn("os: [ubuntu-latest, macos-15]", blocks["verus-qualify"])
+        self.assertNotIn("macos-14", workflow)
+        self.assertIn(
+            "- os: macos-15\n            target: aarch64-apple-darwin",
+            blocks["verus-verify"],
+        )
+        evidence = (ROOT / ".github/workflows/v072-evidence-checks.yml").read_text()
+        self.assertIn("runs-on: macos-15", evidence)
+        self.assertNotIn("macos-14", evidence)
         self.assertIn("VERUS_QUALIFICATION_PHASE: ${{ matrix.phase }}", blocks["verus-qualify"])
         self.assertIn("VERUS_MUTATION_OUTPUT: evidence/verus/${{ matrix.target }}/${{ matrix.phase }}/mutations", blocks["verus-qualify"])
         self.assertIn("needs: [ci-policy, verus-qualify]\n    if: always()", blocks["verus-verify"])
@@ -102,7 +110,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("VERUS_QUALIFICATION_OUTPUT: evidence/verus/${{ matrix.target }}", blocks["verus-verify"])
         self.assertIn('"$VERUS_QUALIFICATION_OUTPUT/rockstream-debug" --help', blocks["verus-verify"])
         self.assertIn('"$VERUS_QUALIFICATION_OUTPUT/rockstream-release" --help', blocks["verus-verify"])
-        self.assertIn("os: [ubuntu-latest, macos-14]", blocks["verus-consumer"])
+        self.assertIn("os: [ubuntu-latest, macos-15]", blocks["verus-consumer"])
         self.assertIn("run: cargo build --locked --release -p rockstream-cli", blocks["verus-consumer"])
         self.assertNotIn("cargo build --locked --release -p rockstream-cli", blocks["verus-verify"])
         runner = (ROOT / "scripts/run-verus-qualification.sh").read_text()
