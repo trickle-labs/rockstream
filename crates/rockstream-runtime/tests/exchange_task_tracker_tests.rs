@@ -22,3 +22,15 @@ async fn test_exchange_service_graceful_shutdown_joins_all_tasks() {
         elapsed
     );
 }
+
+#[tokio::test]
+async fn test_exchange_service_reports_listener_bind_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let service = ExchangeService::new(ExchangeRegistry::new()).with_insecure_internal_dev();
+
+    let error = service.start(addr).await.err().expect("bind must fail");
+    assert!(error.starts_with(&format!(
+        "RS-0001: failed to bind worker shuffle listener {addr}:"
+    )));
+}
