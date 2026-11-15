@@ -662,6 +662,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_services_at_artifact_count_limit_reject_without_eviction() {
+        let object_store = Arc::new(InMemory::new());
+        let first = SupportArtifactStore::new(object_store.clone());
+        let second = SupportArtifactStore::new(object_store.clone());
+        first.initialize().await.unwrap();
+        let now_ms = 1_000;
+        let expiry = ArtifactExpiry { unix_ms: 2_000 };
+        let mut expected = (0..MAX_ARTIFACTS_PER_DEPLOYMENT - 1)
+            .map(|index| {
+                (
+                    format!("retained-{index:04}"),
+                    LedgerArtifact {
+                        owner: PrincipalId(1),
+                        scope: PolicyScope::Cluster,
+                        size: 0,
+                        expires_at_ms: expiry.unix_ms,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        first
+            .mutate_ledger(|ledger| {
+                ledger.artifacts = expected.clone();
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let content: Arc<[u8]> = Arc::from(Vec::new());
+        let (left, right) = tokio::join!(
+            first.insert(
+                "race-left".to_owned(),
+                PrincipalId(1),
+                PolicyScope::Cluster,
+                content.clone(),
+                expiry,
+                now_ms,
+            ),
+            second.insert(
+                "race-right".to_owned(),
+                PrincipalId(1),
+                PolicyScope::Cluster,
+                content,
+                expiry,
+                now_ms,
+            ),
+        );
+
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        let (accepted_id, rejected_id, rejected_result) = if left.is_ok() {
+            ("race-left", "race-right", right)
+        } else {
+            ("race-right", "race-left", left)
+        };
+        assert!(matches!(
+            rejected_result,
+            Err(ArtifactStoreError::StorageFull)
+        ));
+        expected.insert(
+            accepted_id.to_owned(),
+            LedgerArtifact {
+                owner: PrincipalId(1),
+                scope: PolicyScope::Cluster,
+                size: 0,
+                expires_at_ms: expiry.unix_ms,
+            },
+        );
+        assert_eq!(first.read_ledger().await.unwrap().0.artifacts, expected);
+        assert_eq!(
+            object_store
+                .get(&first.artifact_path(accepted_id))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b""
+        );
+        assert!(matches!(
+            object_store.get(&first.artifact_path(rejected_id)).await,
+            Err(ObjectStoreError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn cleanup_at_the_artifact_count_limit_removes_every_expired_object() {
         let object_store = Arc::new(InMemory::new());
         let store = SupportArtifactStore::new(object_store.clone());
