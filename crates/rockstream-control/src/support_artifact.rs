@@ -300,6 +300,7 @@ impl SupportArtifactStore {
         }
         for id in &expired {
             self.delete_artifact(id).await?;
+            maybe_crash_after_debug_test_boundary("cleanup-after-delete");
         }
         self.mutate_ledger(|ledger| {
             let before = ledger.artifacts.len();

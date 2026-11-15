@@ -3995,6 +3995,122 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
     actual_ids.sort();
     operation_ids.sort();
     assert_eq!(actual_ids, operation_ids);
+
+    let expired_id = operation_ids[0].clone();
+    let expired_path = support_artifact_object_path(&expired_id);
+    let survivor_id = operation_ids[1].clone();
+    let survivor_path = support_artifact_object_path(&survivor_id);
+    let survivor_bytes = management_store
+        .get(&survivor_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let ledger_bytes = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+    ledger["artifacts"][&expired_id]["expires_at_ms"] = serde_json::json!(1);
+    management_store
+        .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
+        .await
+        .unwrap();
+
+    let mut cleanup_crashed = start_control_process_with_operator_and_crash_after(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+        None,
+        true,
+        true,
+        Some("cleanup-after-delete"),
+    )
+    .await;
+    let exit_status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = cleanup_crashed.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("support-artifact cleanup process did not exit at its delete boundary");
+    assert_eq!(exit_status.code(), Some(86));
+
+    let mut recovered = start_control_process(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut recovered.0, control_address).await;
+    let mut client = wait_for_management_client(management_address, &pki).await;
+    let expired_download = client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: expired_id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(expired_download.code(), tonic::Code::NotFound);
+    assert_eq!(
+        expired_download.message(),
+        "support artifact not found or expired"
+    );
+    assert!(matches!(
+        management_store.get(&expired_path).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    assert_eq!(
+        management_store
+            .get(&survivor_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        survivor_bytes
+    );
+    let ledger = serde_json::from_slice::<serde_json::Value>(
+        &management_store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let mut recovered_ids = ledger["artifacts"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    recovered_ids.sort();
+    assert_eq!(
+        recovered_ids,
+        operation_ids
+            .into_iter()
+            .filter(|id| id != &expired_id)
+            .collect::<Vec<_>>()
+    );
+    recovered.0.kill().unwrap();
+    recovered.0.wait().unwrap();
 }
 
 #[tokio::test]
