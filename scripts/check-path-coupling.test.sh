@@ -32,12 +32,7 @@ assert_output "check-path-coupling: no changed files found for range 'HEAD~1..HE
 touch "$TMP_ROOT/crates/rockstream-storage/src/catalog/snapshot.rs"
 git -C "$TMP_ROOT" add .
 git -C "$TMP_ROOT" commit -q -m catalog-recovery-without-formal-model
-assert_output "check-path-coupling: only model-exempt files changed — OK."
-
-touch "$TMP_ROOT/crates/rockstream-runtime/src/exchange/multiplexer.rs"
-git -C "$TMP_ROOT" add .
-git -C "$TMP_ROOT" commit -q -m exchange-data-plane
-assert_output "check-path-coupling: only model-exempt files changed — OK."
+assert_output "check-path-coupling: only data-plane tests/benchmarks changed — OK."
 
 touch "$TMP_ROOT/crates/rockstream-control/src.rs"
 git -C "$TMP_ROOT" add .
@@ -47,10 +42,24 @@ if (cd "$TMP_ROOT" && GITHUB_BASE_REF= BASE=HEAD~1 "$ROOT/scripts/check-path-cou
 	exit 1
 fi
 
+touch "$TMP_ROOT/crates/rockstream-runtime/src/exchange/multiplexer.rs"
+git -C "$TMP_ROOT" add .
+git -C "$TMP_ROOT" commit -q -m exchange-without-model
+set +e
+actual="$(cd "$TMP_ROOT" && GITHUB_BASE_REF= BASE=HEAD~1 "$ROOT/scripts/check-path-coupling.sh" 2>&1)"
+status=$?
+set -e
+expected="$(printf '\nPATH-COUPLING VIOLATION: coordination-crate or DESIGN.md changed without a\ncorresponding touch to formal/*.fizz or FIZZBEE_TEST_PLAN.md.\n\nChanged coordination files:\ncrates/rockstream-runtime/src/exchange/multiplexer.rs\n\nFix: update the relevant FizzBee model and/or FIZZBEE_TEST_PLAN.md §3.6\nto reflect the protocol change before merging.\n\nSee FIZZBEE_TEST_PLAN.md §4.4 DC.2 for the full policy.')"
+if [[ "$status" -ne 1 || "$actual" != "$expected" ]]; then
+	echo "$actual" >&2
+	echo "expected: $expected" >&2
+	exit 1
+fi
+
 touch "$TMP_ROOT/crates/rockstream-control/src2.rs"
 touch "$TMP_ROOT/formal/m2_frontier_agg.fizz"
 git -C "$TMP_ROOT" add .
 git -C "$TMP_ROOT" commit -q -m coordination-with-model
 assert_output "check-path-coupling: coordination change accompanied by model touch — OK."
 
-echo "check-path-coupling tests: exchange data-plane and catalog recovery changes are excluded; protocol changes require model updates."
+echo "check-path-coupling tests: Verus-only and catalog recovery changes are excluded; protocol changes require model updates."
