@@ -107,8 +107,8 @@ use crate::copy_state::{
 use crate::notify_registry::NotifyRegistry;
 use crate::pgoutput_coordinator::{
     append_blocked_state, BlockedRelationState, BufferedPgOutputEnvelope, ColumnRoute,
-    EncodedChange, RelationChange, RelationRoute, ReplicaIdentity, SharedPgOutputCoordinator,
-    SourceIdentityV1,
+    EncodedChange, PgOutputTruncateTag, RelationChange, RelationRoute, ReplicaIdentity,
+    SharedPgOutputCoordinator, SourceIdentityV1,
 };
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
@@ -16950,10 +16950,10 @@ mod pgoutput_truncate_unit_tests {
         let ops = pgoutput_envelope_to_dml_ops(
             &[
                 insert(7, "3"),
-                EncodedChange::Truncate { relation_id: 7, schema_version: 1 },
+                EncodedChange::Truncate { relation_id: 7, schema_version: 1, tag: PgOutputTruncateTag::Truncate },
                 insert(7, "4"),
-                EncodedChange::Truncate { relation_id: 8, schema_version: 1 },
-                EncodedChange::Truncate { relation_id: 8, schema_version: 1 },
+                EncodedChange::Truncate { relation_id: 8, schema_version: 1, tag: PgOutputTruncateTag::Truncate },
+                EncodedChange::Truncate { relation_id: 8, schema_version: 1, tag: PgOutputTruncateTag::Truncate },
             ],
             &routes,
             images,
@@ -16972,8 +16972,8 @@ mod pgoutput_truncate_unit_tests {
     fn truncate_expansion_rejects_missing_route_or_schema_mismatch() {
         let a = route(7, "a");
         let routes = HashMap::from([(7, &a)]);
-        let bad_route = EncodedChange::Truncate { relation_id: 8, schema_version: 1 };
-        let bad_schema = EncodedChange::Truncate { relation_id: 7, schema_version: 2 };
+        let bad_route = EncodedChange::Truncate { relation_id: 8, schema_version: 1, tag: PgOutputTruncateTag::Truncate };
+        let bad_schema = EncodedChange::Truncate { relation_id: 7, schema_version: 2, tag: PgOutputTruncateTag::Truncate };
         for change in [bad_route, bad_schema] {
             assert!(pgoutput_envelope_to_dml_ops(
                 &[change],
@@ -17000,7 +17000,7 @@ mod pgoutput_truncate_unit_tests {
         .unwrap();
         let a = route(7, "a");
         let routes = HashMap::from([(7, &a)]);
-        let changes = [EncodedChange::Truncate { relation_id: 7, schema_version: 1 }];
+        let changes = [EncodedChange::Truncate { relation_id: 7, schema_version: 1, tag: PgOutputTruncateTag::Truncate }];
         let error = load_pgoutput_truncate_images(&db, &changes, &routes)
             .await
             .unwrap_err()
