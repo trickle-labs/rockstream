@@ -5075,6 +5075,76 @@ async fn support_artifact_generation_rejects_full_deployment_budget() {
         Err(object_store::Error::NotFound { .. })
     ));
 
+    let mut count_ledger = ledger.clone();
+    let mut count_artifacts = serde_json::Map::new();
+    for index in 0..2_048 {
+        count_artifacts.insert(
+            format!("count-seed-{index:04}"),
+            serde_json::json!({
+                "owner": PrincipalId(1),
+                "scope": PolicyScope::Cluster,
+                "size": 0,
+                "expires_at_ms": expiry_ms,
+            }),
+        );
+    }
+    count_ledger["artifacts"] = serde_json::Value::Object(count_artifacts);
+    let expected_count_ledger = serde_json::to_vec(&count_ledger).unwrap();
+    management_store
+        .put(&ledger_path, expected_count_ledger.clone().into())
+        .await
+        .unwrap();
+
+    let count_key = uuid::Uuid::new_v4().to_string();
+    let count_error = client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: count_key.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(count_error.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        count_error.message(),
+        "support artifact storage budget is full"
+    );
+    assert_eq!(
+        management_store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        expected_count_ledger.as_slice()
+    );
+    assert!(matches!(
+        management_store
+            .get(&support_artifact_object_path(&count_key))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    let count_operation = client
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: count_key.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(count_operation.operation_id, count_key);
+    assert_eq!(count_operation.kind, "generate_support_artifact");
+    assert_eq!(count_operation.state, "failed");
+    assert_eq!(count_operation.progress, "100%");
+    assert_eq!(count_operation.phase, "generation_failed");
+    assert!(count_operation.error_code.is_empty());
+    assert!(count_operation.next_steps.is_empty());
+    assert!(count_operation.result_json.is_empty());
+
     let fingerprint = {
         let mut certificate_pem =
             std::io::BufReader::new(std::fs::File::open(&pki.cli_cert_path).unwrap());
@@ -5093,7 +5163,7 @@ async fn support_artifact_generation_rejects_full_deployment_budget() {
     .unwrap();
     let bootstrap_state = format!("revision={};policy={policy}", principal.revision);
     let cluster_scope = serde_json::to_string(&PolicyScope::Cluster).unwrap();
-    let expected_audit = vec![
+    let mut expected_audit = vec![
         SecurityAuditRecord {
             format_version: SECURITY_AUDIT_FORMAT_VERSION,
             event_id: "first-admin-bootstrap:1".to_owned(),
@@ -5155,6 +5225,15 @@ async fn support_artifact_generation_rejects_full_deployment_budget() {
             after_state: AuditField::Known("generation_failed".to_owned()),
         },
     ];
+    let mut count_start_audit = expected_audit[2].clone();
+    count_start_audit.target = AuditField::Known(format!("support-artifact:{count_key}"));
+    count_start_audit.correlation = AuditCorrelation::Observed(count_key.clone());
+    count_start_audit.operation_id = AuditField::Known(count_key.clone());
+    let mut count_completion_audit = expected_audit[3].clone();
+    count_completion_audit.target = AuditField::Known(format!("support-artifact:{count_key}"));
+    count_completion_audit.correlation = AuditCorrelation::Observed(count_key.clone());
+    count_completion_audit.operation_id = AuditField::Known(count_key);
+    expected_audit.extend([count_start_audit, count_completion_audit]);
     let security_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::prefix::PrefixStore::new(
             rockstream_test_support::minio::minio_object_store(minio_port, bucket),
