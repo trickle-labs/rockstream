@@ -2019,7 +2019,10 @@ fn pgoutput_truncate_unsupported() -> SourceError {
     }
 }
 
-fn require_partition_root_identity(table: &str, publish_via_partition_root: bool) -> Result<(), SourceError> {
+fn require_partition_root_identity(
+    table: &str,
+    publish_via_partition_root: bool,
+) -> Result<(), SourceError> {
     if publish_via_partition_root {
         Ok(())
     } else {
