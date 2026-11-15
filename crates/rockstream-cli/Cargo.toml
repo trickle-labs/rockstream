@@ -45,6 +45,7 @@ async-trait = { workspace = true }
 tonic = { workspace = true }
 
 [dev-dependencies]
+rockstream-control = { workspace = true, features = ["test-support-artifact-crash-injection"] }
 rockstream-connectors = { workspace = true }
 rockstream-test-support = { workspace = true }
 rockstream-docgen = { workspace = true }

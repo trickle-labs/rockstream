@@ -20,11 +20,11 @@ const LEDGER_CAS_RETRIES: usize = 32;
 const LEDGER_FORMAT_VERSION: u16 = 1;
 
 pub(crate) fn maybe_crash_after_debug_test_boundary(boundary: &str) {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support-artifact-crash-injection"))]
     if std::env::var("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_CRASH_AFTER").as_deref() == Ok(boundary) {
         std::process::exit(86);
     }
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, feature = "test-support-artifact-crash-injection")))]
     let _ = boundary;
 }
 
