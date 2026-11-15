@@ -7,9 +7,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use rockstream_connectors::{
-    PgOutputConfig, PostgresCdcSource, SourceConnector,
-};
+use rockstream_connectors::{PgOutputConfig, PostgresCdcSource, SourceConnector};
 use rockstream_types::ids::ConnectorId;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
@@ -35,9 +33,7 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         .unwrap();
     let host = postgres.get_host().await.unwrap().to_string();
     let port = postgres.get_host_port_ipv4(5432).await.unwrap();
-    let dsn = format!(
-        "host={host} port={port} user=postgres password=postgres dbname=postgres"
-    );
+    let dsn = format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
     let (admin, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = connection.await;
@@ -129,4 +125,18 @@ async fn partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed()
         .to_string();
     assert!(err.contains("RS-4015"), "{err}");
     assert!(source.last_committed_lsn().is_none());
+
+    // Losing an existing slot must not turn a checkpointed source into a
+    // fresh bootstrap: that would make already-pruned historical rows vanish.
+    source.close_pgoutput();
+    admin
+        .query_one(
+            "SELECT pg_drop_replication_slot('rockstream_partition_retention')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let err = source.open_pgoutput(true).await.unwrap_err().to_string();
+    assert!(err.contains("RS-4011"), "{err}");
+    assert!(err.contains("checkpointed pgoutput slot"), "{err}");
 }
