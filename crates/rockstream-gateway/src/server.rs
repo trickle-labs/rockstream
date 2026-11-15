@@ -107,8 +107,8 @@ use crate::copy_state::{
 use crate::notify_registry::NotifyRegistry;
 use crate::pgoutput_coordinator::{
     append_blocked_state, BlockedRelationState, BufferedPgOutputEnvelope, ColumnRoute,
-    EncodedChange, PgOutputTruncateTag, RelationChange, RelationRoute, ReplicaIdentity,
-    SharedPgOutputCoordinator, SourceIdentityV1,
+    EncodedChange, RelationChange, RelationRoute, ReplicaIdentity, SharedPgOutputCoordinator,
+    SourceIdentityV1,
 };
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
@@ -16900,6 +16900,7 @@ fn pgoutput_dml_op_size(op: &DmlOp) -> usize {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod pgoutput_truncate_unit_tests {
     use super::*;
+    use crate::pgoutput_coordinator::PgOutputTruncateTag;
 
     fn route(id: u32, table: &str) -> RelationRoute {
         RelationRoute {
