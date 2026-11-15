@@ -17,6 +17,15 @@ pub(crate) const ARTIFACT_TTL: Duration = Duration::from_secs(10 * 60);
 const LEDGER_CAS_RETRIES: usize = 32;
 const LEDGER_FORMAT_VERSION: u16 = 1;
 
+pub(crate) fn maybe_crash_after_debug_test_boundary(boundary: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_CRASH_AFTER").as_deref() == Ok(boundary) {
+        std::process::exit(86);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = boundary;
+}
+
 #[derive(Clone)]
 pub(crate) struct SupportArtifactStore {
     store: Arc<dyn ObjectStore>,
@@ -133,6 +142,10 @@ impl SupportArtifactStore {
             })
             .await?;
 
+        if reserved {
+            maybe_crash_after_debug_test_boundary("ledger-reserved");
+        }
+
         let path = self.artifact_path(&id);
         match self
             .store
@@ -143,7 +156,10 @@ impl SupportArtifactStore {
             )
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                maybe_crash_after_debug_test_boundary("artifact-written");
+                Ok(())
+            }
             Err(ObjectStoreError::AlreadyExists { .. }) => {
                 let result = self
                     .store

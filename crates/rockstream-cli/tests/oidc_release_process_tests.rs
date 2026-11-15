@@ -10,11 +10,13 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::management_store::{
     ManagementOperationStore, OperationKind, OperationStatus, OperationUpdate,
+    MANAGEMENT_OPERATION_RECORD_VERSION,
 };
 use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CancelOperationRequest,
     CreateBackupRequest, DownloadSupportArtifactRequest, GenerateSupportArtifactRequest,
-    GetClusterStatusRequest, GetOperationRequest, ListOperationsRequest,
+    GenerateSupportArtifactResponse, GetClusterStatusRequest, GetOperationRequest,
+    ListOperationsRequest,
 };
 use rockstream_storage::catalog::{
     CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogSourceEntry, CatalogStore,
@@ -747,6 +749,36 @@ async fn start_control_process_with_operator(
     provision_first_admin: bool,
     seed_worker_secret: bool,
 ) -> RunningGateway {
+    start_control_process_with_operator_and_crash_after(
+        working_dir,
+        storage,
+        address,
+        management_address,
+        pki,
+        minio,
+        support_operator,
+        operator,
+        provision_first_admin,
+        seed_worker_secret,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_control_process_with_operator_and_crash_after(
+    working_dir: &Path,
+    storage: &Path,
+    address: std::net::SocketAddr,
+    management_address: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    minio: Option<(u16, &str)>,
+    support_operator: bool,
+    operator: Option<SecurityPrincipal>,
+    provision_first_admin: bool,
+    seed_worker_secret: bool,
+    crash_after: Option<&str>,
+) -> RunningGateway {
     let fingerprint = certificate_sha256(&pki.cli_cert_path);
     let principal = if support_operator {
         mtls_support_admin_with_fingerprint(fingerprint)
@@ -832,6 +864,7 @@ async fn start_control_process_with_operator(
         .current_dir(working_dir)
         .env("RUST_LOG", "off")
         .env_remove("ROCKSTREAM_CONFIG")
+        .env_remove("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_CRASH_AFTER")
         .args([
             "start",
             "--role",
@@ -871,6 +904,9 @@ async fn start_control_process_with_operator(
     }
     if seed_worker_secret {
         command.env("RS_SECRET_KEK", "release-test-kek");
+    }
+    if let Some(boundary) = crash_after {
+        command.env("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_CRASH_AFTER", boundary);
     }
     let child = command
         .stdout(Stdio::null())
@@ -3710,6 +3746,255 @@ async fn operator_can_cancel_pending_support_artifact_over_release_management_ap
     ));
     process.0.kill().unwrap();
     process.0.wait().unwrap();
+}
+
+#[tokio::test]
+async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(
+        rockstream_test_support::docker_available(),
+        "Docker is required for support-artifact durable-boundary recovery"
+    );
+    let bucket = "rockstream-release-support-artifact-boundaries";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO must be available for support-artifact durable-boundary recovery");
+    let scenarios = [
+        "operation-accepted",
+        "operation-running",
+        "start-audit",
+        "ledger-reserved",
+        "artifact-written",
+        "completion-audit",
+        "operation-succeeded",
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let principal = mtls_support_admin_with_fingerprint(certificate_sha256(&pki.cli_cert_path));
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "gateway-shard",
+    ));
+    let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let management_store = object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "management",
+    );
+    let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
+    let mut operation_ids = Vec::new();
+
+    for (index, boundary) in scenarios.iter().enumerate() {
+        let expected_actions = match *boundary {
+            "start-audit" | "ledger-reserved" | "artifact-written" => vec![
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationCompletion,
+            ],
+            "completion-audit" => vec![
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationCompletion,
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationCompletion,
+            ],
+            _ => vec![
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationCompletion,
+            ],
+        };
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        operation_ids.push(operation_id.clone());
+        let mut crashed = start_control_process_with_operator_and_crash_after(
+            temp.path(),
+            &storage,
+            control_address,
+            management_address,
+            &pki,
+            Some((minio_port, bucket)),
+            true,
+            None,
+            true,
+            false,
+            Some(*boundary),
+        )
+        .await;
+        wait_for_gateway(&mut crashed.0, control_address).await;
+        let mut client = wait_for_management_client(management_address, &pki).await;
+        assert!(
+            client
+                .generate_support_artifact(GenerateSupportArtifactRequest {
+                    protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                    node_id: String::new(),
+                    idempotency_key: operation_id.clone(),
+                })
+                .await
+                .is_err(),
+            "configured boundary {boundary} did not terminate the process"
+        );
+        drop(client);
+        let exit_status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = crashed.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("support-artifact process did not exit at its durable boundary");
+        assert_eq!(exit_status.code(), Some(86), "boundary {boundary}");
+
+        let mut recovered = start_control_process(
+            temp.path(),
+            &storage,
+            control_address,
+            management_address,
+            &pki,
+            Some((minio_port, bucket)),
+            true,
+        )
+        .await;
+        wait_for_gateway(&mut recovered.0, control_address).await;
+        let mut client = wait_for_management_client(management_address, &pki).await;
+        let response = client
+            .generate_support_artifact(GenerateSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                node_id: String::new(),
+                idempotency_key: operation_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let operation = client
+            .get_operation(GetOperationRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                operation_id: operation_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .operation
+            .expect("reconciled operation remains queryable");
+        let started_at = chrono::DateTime::parse_from_rfc3339(&operation.started_at).unwrap();
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&operation.updated_at).unwrap();
+        assert_eq!(
+            response.expires_at_ms,
+            started_at.timestamp_millis() as u64 + 600_000
+        );
+        assert!(updated_at >= started_at);
+        assert_eq!(
+            response,
+            GenerateSupportArtifactResponse {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: operation_id.clone(),
+                expires_at_ms: response.expires_at_ms,
+            }
+        );
+        assert_eq!(
+            operation,
+            rockstream_management_proto::v1::Operation {
+                operation_id: operation_id.clone(),
+                kind: "generate_support_artifact".to_owned(),
+                state: "succeeded".to_owned(),
+                started_at: operation.started_at.clone(),
+                updated_at: operation.updated_at.clone(),
+                progress: "100%".to_owned(),
+                phase: format!("available_until_ms:{}", response.expires_at_ms),
+                error_code: String::new(),
+                next_steps: Vec::new(),
+                source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
+                result_json: String::new(),
+            }
+        );
+
+        let expected_content = format!(
+            "{{\"format_version\":1,\"generated_at_ms\":{},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":{},\"node\":null}}",
+            response.expires_at_ms - 600_000,
+            env!("CARGO_PKG_VERSION"),
+            index + 1
+        );
+        let (content, expires_at_ms) =
+            download_support_artifact(&mut client, &response.opaque_id).await;
+        assert_eq!(String::from_utf8(content).unwrap(), expected_content);
+        assert_eq!(expires_at_ms, response.expires_at_ms);
+
+        security_catalog.refresh().await.unwrap();
+        let mut audit = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.operation_id == AuditField::Known(operation_id.clone()))
+            .collect::<Vec<_>>();
+        audit.sort_by_key(|record| record.timestamp_ms);
+        assert_eq!(
+            audit.iter().map(|record| record.action).collect::<Vec<_>>(),
+            expected_actions
+        );
+        for record in audit {
+            let event_id = record
+                .event_id
+                .strip_prefix("support-artifact-")
+                .expect("support-artifact audit event prefix");
+            assert!(uuid::Uuid::parse_str(event_id).is_ok());
+            let (before_state, after_state) = match record.action {
+                SecurityAuditClass::AdminOperationStart => (
+                    AuditField::Known("pending".to_owned()),
+                    AuditField::Known("generating".to_owned()),
+                ),
+                SecurityAuditClass::AdminOperationCompletion => (
+                    AuditField::Known("generating".to_owned()),
+                    AuditField::Known(format!("available_until_ms:{}", response.expires_at_ms)),
+                ),
+                action => panic!("unexpected support-artifact audit action: {action:?}"),
+            };
+            assert_eq!(
+                record,
+                SecurityAuditRecord {
+                    format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                    event_id: record.event_id.clone(),
+                    timestamp_ms: record.timestamp_ms,
+                    actor: AuditIdentity::Verified(format!("principal:{}", principal.id.0)),
+                    target: AuditField::Known(format!("support-artifact:{operation_id}")),
+                    scope: AuditField::Known(serde_json::to_string(&PolicyScope::Cluster).unwrap()),
+                    action: record.action,
+                    outcome: SecurityAuditOutcome::Success,
+                    correlation: AuditCorrelation::Observed(operation_id.clone()),
+                    operation_id: AuditField::Known(operation_id.clone()),
+                    policy_revision: AuditField::Known(principal.revision),
+                    before_state,
+                    after_state,
+                }
+            );
+        }
+        recovered.0.kill().unwrap();
+        recovered.0.wait().unwrap();
+    }
+
+    let ledger = serde_json::from_slice::<serde_json::Value>(
+        &management_store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let mut actual_ids = ledger["artifacts"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    actual_ids.sort();
+    operation_ids.sort();
+    assert_eq!(actual_ids, operation_ids);
 }
 
 #[tokio::test]

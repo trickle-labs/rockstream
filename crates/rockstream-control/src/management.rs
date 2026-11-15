@@ -2681,6 +2681,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
             )
             .await
             .map_err(store_error)?;
+        crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-accepted");
         let expires_at_ms = accepted
             .started_at_ms()
             .checked_add(ARTIFACT_TTL.as_millis() as i64)
@@ -2785,6 +2786,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 .await
                 .map_err(store_error)?
         };
+        crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-running");
         self.record_support_artifact_audit(
             &request,
             principal_id,
@@ -2799,6 +2801,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
             ),
         )
         .await?;
+        crate::support_artifact::maybe_crash_after_debug_test_boundary("start-audit");
         let now_ms = Utc::now().timestamp_millis().max(1) as u64;
         let existing = self.support_artifacts.metadata(&key, now_ms).await;
         match existing {
@@ -2916,6 +2919,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
             }
             return Err(status);
         }
+        crate::support_artifact::maybe_crash_after_debug_test_boundary("completion-audit");
         self.operations
             .transition_if(
                 running.operation_id(),
@@ -2932,6 +2936,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
             )
             .await
             .map_err(store_error)?;
+        crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-succeeded");
         Ok(Response::new(v1::GenerateSupportArtifactResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             opaque_id: key,
