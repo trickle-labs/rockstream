@@ -525,18 +525,17 @@ impl SharedPgOutputCoordinator {
         })
     }
 
-    pub fn push_truncate(
-        &mut self,
-        xid: u32,
-        relation_ids: &[u32],
-    ) -> Result<(), GatewayError> {
+    pub fn push_truncate(&mut self, xid: u32, relation_ids: &[u32]) -> Result<(), GatewayError> {
         self.require_xid(xid)?;
         if relation_ids.is_empty() {
             return Err(protocol_error("TRUNCATE has no relations"));
         }
         // Validate the whole message before staging any marker.
         let mut seen = BTreeSet::new();
-        if relation_ids.iter().any(|&relation_id| !seen.insert(relation_id)) {
+        if relation_ids
+            .iter()
+            .any(|&relation_id| !seen.insert(relation_id))
+        {
             return Err(protocol_error("duplicate TRUNCATE relation ID"));
         }
         for &relation_id in relation_ids {
@@ -1082,10 +1081,19 @@ mod tests {
 
     #[test]
     fn truncated_marker_json_cannot_misread_legacy_row_or_corruption() {
-        let legacy = r#"{"relation_id":7,"operation":"Insert","old_values":null,"new_values":["1"],"schema_version":1}"#;
+        let legacy = r#"{
+            "relation_id": 7,
+            "operation": "Insert",
+            "old_values": null,
+            "new_values": ["1"],
+            "schema_version": 1
+        }"#;
         assert!(matches!(
             serde_json::from_str::<EncodedChange>(legacy).unwrap(),
-            EncodedChange::Row { operation: CdcOperation::Insert, .. }
+            EncodedChange::Row {
+                operation: CdcOperation::Insert,
+                ..
+            }
         ));
         let corrupt = r#"{"relation_id":7,"operation":"BOGUS","schema_version":1}"#;
         assert!(serde_json::from_str::<EncodedChange>(corrupt).is_err());
@@ -1094,7 +1102,10 @@ mod tests {
             schema_version: 1,
             tag: PgOutputTruncateTag::Truncate,
         };
-        assert_eq!(serde_json::from_str::<EncodedChange>(&serde_json::to_string(&marker).unwrap()).unwrap(), marker);
+        assert_eq!(
+            serde_json::from_str::<EncodedChange>(&serde_json::to_string(&marker).unwrap()).unwrap(),
+            marker
+        );
     }
 
     #[tokio::test]
@@ -1126,15 +1137,33 @@ mod tests {
             .unwrap();
         let envelope = coordinator.finish_envelope(57, PgLsn(0x57)).unwrap();
         assert!(coordinator.spill_bytes() > 0);
-        assert!(matches!(&envelope.changes[0], EncodedChange::Row { operation: CdcOperation::Insert, .. }));
-        assert_eq!(envelope.changes[1], EncodedChange::Truncate {
-            relation_id: 7,
-            schema_version: 1,
-            tag: PgOutputTruncateTag::Truncate,
-        });
-        assert!(matches!(&envelope.changes[2], EncodedChange::Row { operation: CdcOperation::Insert, .. }));
+        assert!(matches!(
+            &envelope.changes[0],
+            EncodedChange::Row {
+                operation: CdcOperation::Insert,
+                ..
+            }
+        ));
+        assert_eq!(
+            envelope.changes[1],
+            EncodedChange::Truncate {
+                relation_id: 7,
+                schema_version: 1,
+                tag: PgOutputTruncateTag::Truncate,
+            }
+        );
+        assert!(matches!(
+            &envelope.changes[2],
+            EncodedChange::Row {
+                operation: CdcOperation::Insert,
+                ..
+            }
+        ));
         let error = coordinator.push_truncate(57, &[7, 7]).unwrap_err();
-        assert!(error.to_string().contains("duplicate TRUNCATE relation ID"), "{error}");
+        assert!(
+            error.to_string().contains("duplicate TRUNCATE relation ID"),
+            "{error}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
