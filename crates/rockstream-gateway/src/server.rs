@@ -3762,14 +3762,14 @@ impl GatewayHandler {
             .get("table")
             .map(String::as_str)
             .unwrap_or(&imported.name);
-        let lease = coordinator.owner_lease.as_ref().ok_or_else(|| {
+        let lease = coordinator.owner_lease.clone().ok_or_else(|| {
             GatewayError::QueryTimeExecutionFailed {
                 detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
             }
         })?;
         coordinator
             .runtime
-            .validate_pgoutput_table(lease, upstream_table)
+            .validate_pgoutput_table(&lease, upstream_table)
             .await
             .map_err(source_backfill_error)?;
         let _guard = self.shard_commit_lock.lock().await;
