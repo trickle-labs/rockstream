@@ -220,6 +220,26 @@ async fn test_worker_shuffle_grpc_mtls_fails_closed_without_trust_roots() {
         error,
         "RS-2410: plaintext worker shuffle is limited to loopback development"
     );
+
+    let service = ExchangeService::new(ExchangeRegistry::new());
+    let error = match service.start("127.0.0.1:0".parse().unwrap()).await {
+        Err(error) => error,
+        Ok(_) => panic!("plaintext loopback worker shuffle requires explicit opt-in"),
+    };
+    assert_eq!(
+        error,
+        "RS-2410: plaintext worker shuffle requires explicit loopback development opt-in"
+    );
+
+    let service = ExchangeService::new(ExchangeRegistry::new()).with_insecure_internal_dev();
+    let error = match service.start("0.0.0.0:0".parse().unwrap()).await {
+        Err(error) => error,
+        Ok(_) => panic!("development opt-in must not allow non-loopback plaintext shuffle"),
+    };
+    assert_eq!(
+        error,
+        "RS-2410: plaintext worker shuffle is limited to loopback development"
+    );
 }
 
 #[tokio::test]
