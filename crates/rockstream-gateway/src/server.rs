@@ -4636,11 +4636,8 @@ impl GatewayHandler {
         // A failed/incomplete scan must never advance the PostgreSQL LSN.
         let truncate_images =
             load_pgoutput_truncate_images(shard_db, &envelope.changes, &resolved_routes).await?;
-        let ops = pgoutput_envelope_to_dml_ops(
-            &envelope.changes,
-            &resolved_routes,
-            truncate_images,
-        )?;
+        let ops =
+            pgoutput_envelope_to_dml_ops(&envelope.changes, &resolved_routes, truncate_images)?;
         let changed_relations = ops
             .iter()
             .map(dml_table_name)
@@ -4773,9 +4770,7 @@ impl GatewayHandler {
                 .unwrap_or_else(|| SnapshotDeltaFence::new(offset.clone(), offset.clone()));
             let estimated_rows = previous
                 .as_ref()
-                .map_or(ops.len() as u64, |lifecycle| {
-                    lifecycle.estimated_rows
-                });
+                .map_or(ops.len() as u64, |lifecycle| lifecycle.estimated_rows);
             lifecycles.push(BackfillLifecycle::new(
                 BackfillPhase::Running,
                 BackfillCursor::new(view_name, 0, offset.as_bytes().to_vec(), fence, epoch),
@@ -16672,7 +16667,8 @@ fn pgoutput_change_to_dml(
         old_values,
         new_values,
         ..
-    } = change else {
+    } = change
+    else {
         return Err(pgoutput_truncate_error(
             "TRUNCATE marker must be expanded before row conversion",
         ));
@@ -16782,7 +16778,9 @@ async fn load_pgoutput_truncate_images(
         let mut table_images = BTreeMap::new();
         for (key, value) in rows {
             total_rows = total_rows.saturating_add(1);
-            total_bytes = total_bytes.saturating_add(key.len()).saturating_add(value.len());
+            total_bytes = total_bytes
+                .saturating_add(key.len())
+                .saturating_add(value.len());
             if total_rows > MAX_PGOUTPUT_TRUNCATE_ROWS
                 || total_bytes > rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES
             {
@@ -16820,11 +16818,14 @@ fn pgoutput_envelope_to_dml_ops(
     let mut bytes = 0_usize;
     for change in changes {
         let relation_id = change.relation_id();
-        let route = routes.get(&relation_id).ok_or_else(|| {
-            GatewayError::QueryTimeExecutionFailed {
-                detail: format!("RS-4013: pgoutput relation {relation_id} has no durable route"),
-            }
-        })?;
+        let route =
+            routes
+                .get(&relation_id)
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4013: pgoutput relation {relation_id} has no durable route"
+                    ),
+                })?;
         if route.schema_version != change.schema_version() {
             return Err(GatewayError::QueryTimeExecutionFailed {
                 detail: format!(
@@ -16839,7 +16840,11 @@ fn pgoutput_envelope_to_dml_ops(
                 let op = pgoutput_change_to_dml(route, change)?;
                 if let Some(images) = truncate_images.get_mut(table) {
                     match &op {
-                        DmlOp::Insert { row_key, values_tsv, .. } => {
+                        DmlOp::Insert {
+                            row_key,
+                            values_tsv,
+                            ..
+                        } => {
                             images.insert(row_key.clone(), values_tsv.clone());
                         }
                         DmlOp::Update {
@@ -16862,9 +16867,9 @@ fn pgoutput_envelope_to_dml_ops(
                 ops.push(op);
             }
             EncodedChange::Truncate { .. } => {
-                let images = truncate_images.get_mut(table).ok_or_else(|| {
-                    pgoutput_truncate_error("missing imported table images")
-                })?;
+                let images = truncate_images
+                    .get_mut(table)
+                    .ok_or_else(|| pgoutput_truncate_error("missing imported table images"))?;
                 for (row_key, returning_tsv) in std::mem::take(images) {
                     let op = DmlOp::Delete {
                         table: table.clone(),
@@ -16891,7 +16896,9 @@ fn pgoutput_envelope_to_dml_ops(
 fn pgoutput_dml_op_size(op: &DmlOp) -> usize {
     match op {
         DmlOp::Insert {
-            row_key, values_tsv, ..
+            row_key,
+            values_tsv,
+            ..
         } => row_key.len().saturating_add(values_tsv.len()),
         DmlOp::Update {
             old_row_key,
@@ -16959,13 +16966,17 @@ mod pgoutput_truncate_unit_tests {
         let b = route(8, "b");
         let routes = HashMap::from([(7, &a), (8, &b)]);
         let images = HashMap::from([
-            ("a".to_string(), BTreeMap::from([
-                ("id=1".to_string(), "1".to_string()),
-                ("id=2".to_string(), "2".to_string()),
-            ])),
-            ("b".to_string(), BTreeMap::from([
-                ("id=9".to_string(), "9".to_string()),
-            ])),
+            (
+                "a".to_string(),
+                BTreeMap::from([
+                    ("id=1".to_string(), "1".to_string()),
+                    ("id=2".to_string(), "2".to_string()),
+                ]),
+            ),
+            (
+                "b".to_string(),
+                BTreeMap::from([("id=9".to_string(), "9".to_string())]),
+            ),
         ]);
         let ops = pgoutput_envelope_to_dml_ops(
             &[
@@ -17037,14 +17048,12 @@ mod pgoutput_truncate_unit_tests {
             tag: PgOutputTruncateTag::Truncate,
         };
         for change in [bad_route, bad_schema] {
-            assert!(
-                pgoutput_envelope_to_dml_ops(
-                    &[change],
-                    &routes,
-                    HashMap::from([("a".to_string(), BTreeMap::new())]),
-                )
-                .is_err()
-            );
+            assert!(pgoutput_envelope_to_dml_ops(
+                &[change],
+                &routes,
+                HashMap::from([("a".to_string(), BTreeMap::new())]),
+            )
+            .is_err());
         }
     }
 
@@ -17075,11 +17084,7 @@ mod pgoutput_truncate_unit_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("RS-4014"), "{error}");
-        assert!(db
-            .get(b"view_output/a/id=1")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(db.get(b"view_output/a/id=1").await.unwrap().is_some());
     }
 }
 

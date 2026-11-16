@@ -2565,7 +2565,9 @@ mod tests {
         }
         let mut relations = std::collections::HashMap::new();
         assert!(decode_native_pgoutput_message(&mut relations, 1, PgLsn(1), &truncate).is_err());
-        assert!(decode_native_pgoutput_text_message(&mut relations, 1, PgLsn(1), &truncate).is_err());
+        assert!(
+            decode_native_pgoutput_text_message(&mut relations, 1, PgLsn(1), &truncate).is_err()
+        );
     }
 
     #[test]

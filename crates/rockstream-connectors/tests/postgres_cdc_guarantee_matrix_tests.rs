@@ -181,7 +181,10 @@ async fn postgres_cdc_row_only_truncate_retries_same_frame_without_ack() {
                 break;
             }
             Ok(result) => {
-                assert!(result.batches.is_empty(), "must not emit a partial transaction");
+                assert!(
+                    result.batches.is_empty(),
+                    "must not emit a partial transaction"
+                );
                 assert!(Instant::now() < deadline, "TRUNCATE did not reach decoder");
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }

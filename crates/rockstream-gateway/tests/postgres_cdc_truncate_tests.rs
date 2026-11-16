@@ -201,9 +201,11 @@ async fn pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart(
     wait_ids(&client, "b_view", &[]).await;
     assert!(ids(&client, "a").await.is_empty());
     assert!(ids(&client, "b").await.is_empty());
-    assert!(query_pairs(&client, "SELECT id, doubled FROM a_doubled ORDER BY id")
-        .await
-        .is_empty());
+    assert!(
+        query_pairs(&client, "SELECT id, doubled FROM a_doubled ORDER BY id")
+            .await
+            .is_empty()
+    );
     upstream
         .batch_execute("INSERT INTO a VALUES (7); INSERT INTO b VALUES (9)")
         .await
@@ -227,7 +229,6 @@ async fn pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart(
         .collect::<Vec<_>>();
     drop(client);
     handle.abort();
-    drop(server);
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let recovered_catalog = Arc::new(CatalogStubs::new());
@@ -252,7 +253,11 @@ async fn pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart(
     wait_ids(&restarted_client, "b_view", &[vec![9]]).await;
     assert_eq!(ids(&restarted_client, "a").await, vec![vec![7]]);
     assert_eq!(
-        query_pairs(&restarted_client, "SELECT id, doubled FROM a_doubled ORDER BY id").await,
+        query_pairs(
+            &restarted_client,
+            "SELECT id, doubled FROM a_doubled ORDER BY id"
+        )
+        .await,
         vec![vec![7, 14]]
     );
     upstream
@@ -261,7 +266,11 @@ async fn pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart(
         .unwrap();
     wait_ids(&restarted_client, "a_view", &[vec![7], vec![8]]).await;
     assert_eq!(
-        query_pairs(&restarted_client, "SELECT id, doubled FROM a_doubled ORDER BY id").await,
+        query_pairs(
+            &restarted_client,
+            "SELECT id, doubled FROM a_doubled ORDER BY id"
+        )
+        .await,
         vec![vec![7, 14], vec![8, 16]]
     );
     assert_eq!(ids(&restarted_client, "b_view").await, vec![vec![9]]);

@@ -532,16 +532,17 @@ impl SharedPgOutputCoordinator {
         }
         // Validate the whole message before staging any marker.
         let mut seen = BTreeSet::new();
-        if relation_ids.iter().any(|&relation_id| !seen.insert(relation_id)) {
+        if relation_ids
+            .iter()
+            .any(|&relation_id| !seen.insert(relation_id))
+        {
             return Err(protocol_error("duplicate TRUNCATE relation ID"));
         }
         for &relation_id in relation_ids {
-            self.push_encoded_change(xid, relation_id, |schema_version| {
-                EncodedChange::Truncate {
-                    relation_id,
-                    schema_version,
-                    tag: PgOutputTruncateTag::Truncate,
-                }
+            self.push_encoded_change(xid, relation_id, |schema_version| EncodedChange::Truncate {
+                relation_id,
+                schema_version,
+                tag: PgOutputTruncateTag::Truncate,
             })?;
         }
         Ok(())
@@ -1100,7 +1101,8 @@ mod tests {
             tag: PgOutputTruncateTag::Truncate,
         };
         assert_eq!(
-            serde_json::from_str::<EncodedChange>(&serde_json::to_string(&marker).unwrap()).unwrap(),
+            serde_json::from_str::<EncodedChange>(&serde_json::to_string(&marker).unwrap())
+                .unwrap(),
             marker
         );
     }
