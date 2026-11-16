@@ -5367,6 +5367,7 @@ async fn handle_connection_stream<R, W>(
                             }
                         }
                         Err(error) => tracing::error!(
+                            code = %rockstream_types::error_code::RS_2425,
                             worker_id = %worker_id,
                             secret_name = %rotation.secret_name,
                             ?error,

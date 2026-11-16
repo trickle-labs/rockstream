@@ -287,9 +287,10 @@ fn load_actor_assertion_verifier(
     rockstream_control::delegation::ActorAssertionVerifier::from_jwk_file(key_path, deployment_id)
         .map(Some)
         .map_err(|error| {
+            let detail = error.strip_prefix("RS-2400: ").unwrap_or(error.as_str());
             CliError::new(
                 rockstream_types::error_code::RS_2400,
-                format!("control actor assertion verification key is invalid: {error}"),
+                format!("control actor assertion verification key is invalid: {detail}"),
                 "Configure the matching RSA RS256 public JWK and deployment ID.",
             )
         })
@@ -1188,7 +1189,11 @@ async fn wait_for_signal_or_tls_reload(
                     _ = &mut shutdown => break,
                     _ = signal.recv() => match control.reload_tls(tls.clone()) {
                         Ok(()) => tracing::info!("internal TLS credentials reloaded after SIGHUP"),
-                        Err(error) => tracing::error!(%error, "internal TLS reload after SIGHUP failed"),
+                        Err(error) => tracing::error!(
+                            code = %rockstream_types::error_code::RS_2413,
+                            %error,
+                            "internal TLS reload after SIGHUP failed"
+                        ),
                     }
                 }
             }
@@ -3643,6 +3648,30 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(reused.to_string(), "RS-2400 gateway actor assertion signing key must not reuse a TLS key pair\n  next steps: Configure a dedicated deployment-managed RS256 private key.");
+    }
+
+    #[test]
+    fn invalid_actor_assertion_verification_key_uses_one_registered_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join("invalid-actor-assertion.jwk");
+        std::fs::write(
+            &key_path,
+            r#"{"kty":"RSA","alg":"RS384","use":"sig","n":"AQ","e":"AQAB"}"#,
+        )
+        .unwrap();
+        let mut node_config = rockstream_types::config::NodeConfig::default();
+        node_config.node.deployment_id = Some("deployment-a".to_owned());
+        node_config.auth.actor_assertion_public_key_path = Some(key_path);
+
+        let error = match load_actor_assertion_verifier(&node_config) {
+            Ok(_) => panic!("invalid actor assertion verification key was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code.to_string(), "RS-2400");
+        assert_eq!(
+            error.message,
+            "control actor assertion verification key is invalid: actor assertion verification key must be RSA RS256"
+        );
     }
 
     #[test]
