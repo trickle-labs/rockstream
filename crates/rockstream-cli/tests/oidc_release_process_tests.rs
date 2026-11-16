@@ -3048,12 +3048,6 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     );
 
     let rotation_operation_id = "00000000-0000-4000-8000-000000000304";
-    client
-        .simple_query(&format!(
-            "SET rockstream.idempotency_key = '{rotation_operation_id}'"
-        ))
-        .await
-        .unwrap();
     kafka_acl(
         &broker,
         &[
@@ -3088,6 +3082,38 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         ],
     )
     .await;
+    let (proxy_address, dropped_response) =
+        drop_command_complete_response(address, b"ALTER SECRET").await;
+    let (rotation_client, rotation_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            proxy_address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let rotation_connection_task = tokio::spawn(rotation_connection);
+    rotation_client
+        .simple_query(&format!(
+            "SET rockstream.idempotency_key = '{rotation_operation_id}'"
+        ))
+        .await
+        .unwrap();
+    let lost_response = rotation_client
+        .simple_query("ALTER SECRET kafka_auth SET (USERNAME = 'rotated', PASSWORD = 'new-pass')")
+        .await
+        .unwrap_err();
+    assert!(lost_response.as_db_error().is_none());
+    dropped_response.await.unwrap();
+    drop(rotation_client);
+    rotation_connection_task.abort();
+    client
+        .simple_query(&format!(
+            "SET rockstream.idempotency_key = '{rotation_operation_id}'"
+        ))
+        .await
+        .unwrap();
     let rotation = client
         .simple_query("ALTER SECRET kafka_auth SET (USERNAME = 'rotated', PASSWORD = 'new-pass')")
         .await
@@ -3235,6 +3261,7 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     let envelope: rockstream_types::secret::EncryptedSecret =
         serde_json::from_slice(&envelope_bytes).unwrap();
     assert_eq!(envelope.name, "kafka_auth");
+    assert_eq!(envelope.metadata.version, 2);
     assert!(!envelope.ciphertext.is_empty());
     assert_eq!(envelope.nonce.len(), 12);
     for value in [b"old-pass".as_slice(), b"new-pass".as_slice()] {
