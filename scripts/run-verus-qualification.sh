@@ -100,8 +100,18 @@ if [ "$PHASE" != release ]; then
 fi
 
 if [ "$PHASE" != debug ]; then
-  run_step cargo-release env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.95}" \
-    cargo build --workspace --locked --release ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}
+  # Registry/network resolution is not compiler execution. Fetch the exact
+  # locked target graph first, but keep the full release build and its original
+  # strict production_compile_seconds budget in run_step.
+  if ! env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.95}" \
+      cargo fetch --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
+      >"$OUTPUT_ROOT/cargo-fetch.log" 2>&1; then
+    echo "verus qualification: RS-0906: locked release dependencies could not be fetched" >&2
+    OVERALL=1
+  else
+    run_step cargo-release env RUSTUP_TOOLCHAIN="${ROCKSTREAM_RUST_TOOLCHAIN:-1.95}" \
+      cargo build --workspace --locked --release ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}
+  fi
 fi
 
 RUNTIME_ARTIFACT="$OUTPUT_ROOT/rockstream-release"

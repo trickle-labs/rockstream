@@ -101,6 +101,12 @@ async fn connect_gateway(port: u16) -> Client {
 
 #[tokio::test]
 async fn pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart() {
+    tokio::time::timeout(Duration::from_secs(600), run_pgoutput_truncate_proof())
+        .await
+        .expect("pgoutput TRUNCATE proof exceeded the ten-minute CI bound");
+}
+
+async fn run_pgoutput_truncate_proof() {
     if !rockstream_test_support::docker_available() {
         eprintln!("SKIP pgoutput TRUNCATE end-to-end proof: Docker not available");
         return;
