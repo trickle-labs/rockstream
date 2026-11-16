@@ -1212,6 +1212,7 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
 }
 
 /// Start a worker with its peer shuffle listener available before registration.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_worker_client_with_exchange_endpoint(
     proposed_worker_id: u64,
     control_url: &str,
@@ -1238,6 +1239,7 @@ pub async fn start_worker_client_with_exchange_endpoint(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_worker_client_with_runtime(
     proposed_worker_id: u64,
     control_url: &str,
