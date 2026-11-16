@@ -985,12 +985,18 @@ mod data_plane_tests {
             source: "items".to_owned(),
             rows: Vec::new(),
         };
-        let rows = vec![RuntimeRow {
-            values_tsv: "10\talice".to_owned(),
-            weight: 1,
-        }];
+        let rows = vec![
+            RuntimeRow {
+                values_tsv: "1\t10".to_owned(),
+                weight: 1,
+            },
+            RuntimeRow {
+                values_tsv: "2\t20".to_owned(),
+                weight: 1,
+            },
+        ];
         let schema = deployments.read()[&(WorkloadId(1), ShardId(100))].schemas["items"].clone();
-        let input = rows_to_zset(&rows, schema).unwrap();
+        let input = rows_to_zset(&rows, schema.clone()).unwrap();
         let frame = crate::exchange::proto::ShuffleFrame {
             exchange_id: 1,
             src_shard: 0,
@@ -1000,7 +1006,7 @@ mod data_plane_tests {
             payload: crate::exchange::serialization::serialize_zset(&input)
                 .unwrap()
                 .into(),
-            row_count: 1,
+            row_count: 2,
         };
         let actors = ShardActorRegistry::new();
         let started = Arc::new(tokio::sync::Notify::new());
@@ -1030,10 +1036,12 @@ mod data_plane_tests {
         let handle = owned_shuffle_handler(actors, deployments, client);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let service = crate::exchange::service::ExchangeService::new(
-            crate::exchange::service::ExchangeRegistry::new(),
-        )
-        .with_owned_handler(handle);
+        let registry = crate::exchange::service::ExchangeRegistry::new();
+        let (inlet_tx, inlet_rx) = mpsc::channel(1);
+        registry.register(1, 100, inlet_tx, schema);
+        drop(inlet_rx);
+        let service =
+            crate::exchange::service::ExchangeService::new(registry).with_owned_handler(handle);
         let server_task = service.start_listener(listener).await.unwrap();
         let info = |id, address: String, host: &str| {
             let registration = WorkerRegistration::new(
@@ -1089,7 +1097,7 @@ mod data_plane_tests {
             .await
             .unwrap();
         assert!(!sending.is_finished());
-        assert_eq!(flow.rows_in_flight(1, 100, 100), 1);
+        assert_eq!(flow.rows_in_flight(1, 100, 100), 2);
         assert_eq!(
             db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
                 .await
@@ -1103,7 +1111,7 @@ mod data_plane_tests {
                 output,
                 input_rows,
                 output_rows,
-            } => assert_eq!((output.rows, input_rows, output_rows), (rows, 1, 1)),
+            } => assert_eq!((output.rows, input_rows, output_rows), (rows, 2, 2)),
             other => panic!("unexpected worker response: {other:?}"),
         }
         assert_eq!(
@@ -1115,19 +1123,24 @@ mod data_plane_tests {
         );
         use rockstream_ops::sink::{read_view_output, ColumnValue};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
+        let expected = vec![
+            (
+                1,
+                vec![ColumnValue::Int64(1), ColumnValue::Utf8("10".to_owned())],
+                1,
+            ),
+            (
+                1,
+                vec![ColumnValue::Int64(2), ColumnValue::Utf8("20".to_owned())],
+                1,
+            ),
+        ];
         assert_eq!(
             stored
                 .into_iter()
                 .map(|(epoch, _, row, weight)| (epoch, row, weight))
                 .collect::<Vec<_>>(),
-            vec![(
-                1,
-                vec![
-                    ColumnValue::Int64(10),
-                    ColumnValue::Utf8("alice".to_owned())
-                ],
-                1
-            )]
+            expected
         );
         assert_eq!(
             mux.send_owned_frame(WorkerId(42), frame.clone(), context)
@@ -1172,6 +1185,15 @@ mod data_plane_tests {
                 .unwrap()
                 .map(|value| value.to_vec()),
             Some(1_u64.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            read_view_output(&db, OperatorId(10), 2)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(epoch, _, row, weight)| (epoch, row, weight))
+                .collect::<Vec<_>>(),
+            expected
         );
         assert_eq!(
             (
