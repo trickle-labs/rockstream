@@ -119,7 +119,10 @@ fn test_catalog_domain_entities_serialization() {
         name: "kafka_source".to_string(),
         connector_type: "kafka".to_string(),
         table_name: Some("events_tbl".to_string()),
+        format: "json".to_string(),
         options: options.clone(),
+        secret_consumer: None,
+        secret_namespace: None,
     };
     let json = serde_json::to_string(&src).unwrap();
     let src_back: CatalogSourceEntry = serde_json::from_str(&json).unwrap();
@@ -132,6 +135,9 @@ fn test_catalog_domain_entities_serialization() {
         target: "s3://bucket/iceberg".to_string(),
         options,
         status: "RUNNING".to_string(),
+        secret_reference: None,
+        secret_consumer: None,
+        secret_namespace: None,
     };
     let json = serde_json::to_string(&sink).unwrap();
     let sink_back: CatalogSinkEntry = serde_json::from_str(&json).unwrap();
@@ -452,7 +458,10 @@ async fn test_source_metadata_durability() {
         name: "kafka_in".to_string(),
         connector_type: "kafka".to_string(),
         table_name: Some("raw_events".to_string()),
+        format: "json".to_string(),
         options: opts,
+        secret_consumer: None,
+        secret_namespace: None,
     };
     let txn = CatalogTxn::new(1, 1, vec![CatalogMutation::PutSource(src.clone())]).unwrap();
     catalog.commit_txn(txn).await.unwrap();
@@ -476,6 +485,9 @@ async fn test_sink_metadata_durability() {
         target: "/data/export".to_string(),
         options: opts,
         status: "ACTIVE".to_string(),
+        secret_reference: None,
+        secret_consumer: None,
+        secret_namespace: None,
     };
     let txn = CatalogTxn::new(1, 1, vec![CatalogMutation::PutSink(sink.clone())]).unwrap();
     catalog.commit_txn(txn).await.unwrap();

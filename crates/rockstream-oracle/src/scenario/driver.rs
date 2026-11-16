@@ -60,6 +60,7 @@ impl From<crate::scenario::transcript::TranscriptCapacityExceeded> for DriverErr
 
 /// A pluggable backend that runs a [`Scenario`] and reports what it observed.
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ScenarioDriver {
     async fn run(&self, scenario: &Scenario) -> Result<ScenarioTranscript, DriverError>;
 }

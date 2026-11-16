@@ -9,6 +9,7 @@
 
 use std::io::Write;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::memory::InMemory;
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair};
@@ -16,9 +17,26 @@ use rockstream_gateway::{
     catalog_stubs::CatalogStubs, server::GatewayServer, view_reader::ViewReadStrategy,
     view_reader::ViewReader, GatewayError,
 };
-use rockstream_storage::ShardDb;
+use rockstream_storage::{
+    catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore},
+    ShardDb,
+};
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
+    ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
+    SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
+};
+use rockstream_types::ids::PrincipalId;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_millis() as u64
+}
 
 /// rustls 0.23 requires a process-level `CryptoProvider` to be installed
 /// before any `ClientConfig`/`ServerConfig` is built. `tokio-rustls`'s default
@@ -88,6 +106,16 @@ fn make_leaf(
 ) -> (String, String) {
     let mut params = CertificateParams::new(sans).unwrap();
     params.distinguished_name.push(DnType::CommonName, cn);
+    let key_pair = KeyPair::generate().unwrap();
+    let cert = params.signed_by(&key_pair, ca_cert, ca_key).unwrap();
+    (cert.pem(), key_pair.serialize_pem())
+}
+
+fn make_expired_leaf(ca_cert: &rcgen::Certificate, ca_key: &KeyPair, cn: &str) -> (String, String) {
+    let mut params = CertificateParams::new(vec![]).unwrap();
+    params.distinguished_name.push(DnType::CommonName, cn);
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2020, 1, 2);
     let key_pair = KeyPair::generate().unwrap();
     let cert = params.signed_by(&key_pair, ca_cert, ca_key).unwrap();
     (cert.pem(), key_pair.serialize_pem())
@@ -171,6 +199,35 @@ async fn connect_tls(
 async fn new_shard_db(name: &str) -> Arc<ShardDb> {
     let store = Arc::new(InMemory::new());
     Arc::new(ShardDb::builder(name, store).build().await.unwrap())
+}
+
+fn new_audit_catalog(name: &str) -> (Arc<CatalogStubs>, Arc<DurableCatalogStore>) {
+    let catalog = Arc::new(CatalogStubs::new());
+    let durable = Arc::new(DurableCatalogStore::new(Arc::new(InMemory::new()), name));
+    catalog.set_durable_store(durable.clone());
+    (catalog, durable)
+}
+
+async fn assert_single_unknown_tls_failure(durable: &DurableCatalogStore) {
+    let records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.format_version, SECURITY_AUDIT_FORMAT_VERSION);
+    assert!(record.event_id.starts_with("gateway-authn-"));
+    assert!(record.timestamp_ms > 0);
+    assert_eq!(record.actor, AuditIdentity::Unknown);
+    assert_eq!(record.target, AuditField::Unknown);
+    assert_eq!(record.scope, AuditField::NotApplicable);
+    assert_eq!(record.action, SecurityAuditClass::AuthenticationFailure);
+    assert_eq!(record.outcome, SecurityAuditOutcome::Failure);
+    assert!(matches!(
+        &record.correlation,
+        AuditCorrelation::Observed(connection_id) if connection_id.len() == 32
+    ));
+    assert_eq!(record.operation_id, AuditField::NotApplicable);
+    assert_eq!(record.policy_revision, AuditField::Unknown);
+    assert_eq!(record.before_state, AuditField::NotApplicable);
+    assert_eq!(record.after_state, AuditField::NotApplicable);
 }
 
 // ── gateway_with_tls_starts_and_binds ────────────────────────────────────────
@@ -331,17 +388,89 @@ async fn mtls_end_to_end_authenticates_real_client_cert() {
     let server_key_path = write_file(dir.path(), "server-key.pem", &server_key_pem);
     let (client_cert_pem, client_key_pem) =
         make_leaf(&ca_cert, &ca_key, "alice@rockstream.test", vec![]);
+    let mut client_cert_reader = std::io::BufReader::new(client_cert_pem.as_bytes());
+    let client_cert_der = rustls_pemfile::certs(&mut client_cert_reader)
+        .next()
+        .unwrap()
+        .unwrap();
+    let certificate_sha256 = Sha256::digest(client_cert_der.as_ref()).into();
+
+    let catalog = Arc::new(CatalogStubs::new());
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(InMemory::new()),
+        "gateway-mtls-authorization-test",
+    ));
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "mTLS administrator".to_string(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Mtls { certificate_sha256 }],
+        preset_grants: vec![
+            ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            },
+            ScopedPresetGrant {
+                preset: PermissionPreset::Builder,
+                scope: PolicyScope::Namespace {
+                    namespace: "public".to_string(),
+                },
+            },
+        ],
+        scoped_grants: vec![],
+    };
+    let principal_policy = serde_json::to_string(&(
+        principal.enabled,
+        &principal.preset_grants,
+        &principal.scoped_grants,
+    ))
+    .unwrap();
+    let bootstrap_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "mtls-bootstrap".to_string(),
+        timestamp_ms: current_timestamp_ms(),
+        actor: AuditIdentity::Unknown,
+        target: AuditField::Known("principal:1".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("1".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={principal_policy}")),
+    };
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                1,
+                1,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal,
+                    expected_revision: None,
+                    grantor_revision: None,
+                    audit: bootstrap_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    catalog.set_durable_store(durable.clone());
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let shard_db = new_shard_db("mtls-e2e-shard").await;
     let server = GatewayServer::with_shard_db_and_mtls_auth(
         addr,
-        Arc::new(CatalogStubs::new()),
+        catalog.clone(),
         Arc::new(NoopViewReader),
         shard_db,
     )
     .with_tls(&server_cert_path, &server_key_path, Some(&ca_cert_path))
     .expect("mTLS gateway with CA cert should start");
+    let handler = server.handler().clone();
     let (local_addr, _handle) = server.serve_background().await.unwrap();
 
     let client_cert = ClientCert {
@@ -360,6 +489,88 @@ async fn mtls_end_to_end_authenticates_real_client_cert() {
         )
     });
     assert!(found_row, "expected a result row containing \"1\"");
+
+    let created = client
+        .simple_query("CREATE TABLE mtls_authorized (id BIGINT)")
+        .await
+        .unwrap();
+    assert!(matches!(
+        created.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(rows)] if *rows == 0
+    ));
+    assert!(catalog.get_table("mtls_authorized").is_some());
+
+    let (same_cn_cert_pem, same_cn_key_pem) =
+        make_leaf(&ca_cert, &ca_key, "alice@rockstream.test", vec![]);
+    let mut same_cn_cert_reader = std::io::BufReader::new(same_cn_cert_pem.as_bytes());
+    let same_cn_cert_der = rustls_pemfile::certs(&mut same_cn_cert_reader)
+        .next()
+        .unwrap()
+        .unwrap();
+    let same_cn_certificate_sha256 = Sha256::digest(same_cn_cert_der.as_ref()).into();
+    let same_cn_client = ClientCert {
+        cert_pem: same_cn_cert_pem,
+        key_pem: same_cn_key_pem,
+    };
+    let same_cn_config = rustls_client_config_with_cert(&ca_cert_pem, &same_cn_client);
+    let error = connect_tls(&local_addr.to_string(), same_cn_config)
+        .await
+        .expect_err("unmapped certificate fingerprint must not establish a session");
+    let db_error = error.as_db_error().expect("authorization denial error");
+    assert_eq!(db_error.code().code(), "28000");
+    assert_eq!(
+        db_error.message(),
+        "[RS-2400] auth.unauthenticated: verified client certificate has no enabled principal mapping. next_steps: Configure the certificate fingerprint in the durable security catalog"
+    );
+    assert!(catalog.get_table("mtls_denied").is_none());
+    assert_eq!(handler.sessions.len(), 1);
+
+    let audit = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(audit.len(), 3);
+    for record in &audit[1..] {
+        assert_eq!(record.format_version, SECURITY_AUDIT_FORMAT_VERSION);
+        assert!(record.event_id.starts_with("gateway-authn-"));
+        assert!(record.timestamp_ms > 0);
+        assert_eq!(record.scope, AuditField::NotApplicable);
+        assert_eq!(record.operation_id, AuditField::NotApplicable);
+        assert_eq!(record.before_state, AuditField::NotApplicable);
+        assert_eq!(record.after_state, AuditField::NotApplicable);
+        assert!(matches!(
+            &record.correlation,
+            AuditCorrelation::Observed(connection_id) if connection_id.len() == 32
+        ));
+    }
+    assert_ne!(audit[1].event_id, audit[2].event_id);
+    assert_ne!(audit[1].correlation, audit[2].correlation);
+    assert_eq!(
+        audit[1].actor,
+        AuditIdentity::Verified(format!("mtls:{}", hex_fingerprint(&certificate_sha256)))
+    );
+    assert_eq!(
+        audit[1].target,
+        AuditField::Known("principal:1".to_string())
+    );
+    assert_eq!(audit[1].action, SecurityAuditClass::AuthenticationSuccess);
+    assert_eq!(audit[1].outcome, SecurityAuditOutcome::Success);
+    assert_eq!(audit[1].policy_revision, AuditField::Known(1));
+    assert_eq!(
+        audit[2].actor,
+        AuditIdentity::Verified(format!(
+            "mtls:{}",
+            hex_fingerprint(&same_cn_certificate_sha256)
+        ))
+    );
+    assert_eq!(audit[2].target, AuditField::Unknown);
+    assert_eq!(audit[2].action, SecurityAuditClass::AuthenticationFailure);
+    assert_eq!(audit[2].outcome, SecurityAuditOutcome::Failure);
+    assert_eq!(audit[2].policy_revision, AuditField::Unknown);
+}
+
+fn hex_fingerprint(fingerprint: &[u8; 32]) -> String {
+    fingerprint
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // ── mtls_rejects_connection_with_no_client_cert ──────────────────────────────
@@ -382,14 +593,16 @@ async fn mtls_rejects_connection_with_no_client_cert() {
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let shard_db = new_shard_db("mtls-no-cert-shard").await;
+    let (catalog, durable) = new_audit_catalog("mtls-no-cert-audit");
     let server = GatewayServer::with_shard_db_and_mtls_auth(
         addr,
-        Arc::new(CatalogStubs::new()),
+        catalog,
         Arc::new(NoopViewReader),
         shard_db,
     )
     .with_tls(&server_cert_path, &server_key_path, Some(&ca_cert_path))
     .unwrap();
+    let handler = server.handler().clone();
     let (local_addr, _handle) = server.serve_background().await.unwrap();
 
     // Client trusts the CA but presents no client certificate at all — the
@@ -400,6 +613,55 @@ async fn mtls_rejects_connection_with_no_client_cert() {
         result.is_err(),
         "connection without a client cert must be rejected by mTLS"
     );
+    assert!(handler.sessions.is_empty());
+    assert_single_unknown_tls_failure(&durable).await;
+}
+
+// ── mtls_rejects_connection_with_expired_client_cert ─────────────────────────
+
+#[tokio::test]
+async fn mtls_rejects_connection_with_expired_client_cert() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let (ca_cert, ca_key) = make_ca();
+    let ca_cert_pem = ca_cert.pem();
+    let ca_cert_path = write_file(dir.path(), "ca.pem", &ca_cert_pem);
+    let (server_cert_pem, server_key_pem) = make_leaf(
+        &ca_cert,
+        &ca_key,
+        "localhost",
+        vec!["localhost".to_string(), "127.0.0.1".to_string()],
+    );
+    let server_cert_path = write_file(dir.path(), "server.pem", &server_cert_pem);
+    let server_key_path = write_file(dir.path(), "server-key.pem", &server_key_pem);
+    let (client_cert_pem, client_key_pem) = make_expired_leaf(&ca_cert, &ca_key, "expired-client");
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let shard_db = new_shard_db("mtls-expired-cert-shard").await;
+    let (catalog, durable) = new_audit_catalog("mtls-expired-cert-audit");
+    let server = GatewayServer::with_shard_db_and_mtls_auth(
+        addr,
+        catalog,
+        Arc::new(NoopViewReader),
+        shard_db,
+    )
+    .with_tls(&server_cert_path, &server_key_path, Some(&ca_cert_path))
+    .unwrap();
+    let handler = server.handler().clone();
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+
+    let client_cert = ClientCert {
+        cert_pem: client_cert_pem,
+        key_pem: client_key_pem,
+    };
+    let config = rustls_client_config_with_cert(&ca_cert_pem, &client_cert);
+    let result = connect_tls(&local_addr.to_string(), config).await;
+    assert!(
+        result.is_err(),
+        "expired client certificate must be rejected"
+    );
+    assert!(handler.sessions.is_empty());
+    assert_single_unknown_tls_failure(&durable).await;
 }
 
 // ── mtls_rejects_connection_with_untrusted_client_cert ───────────────────────
@@ -427,14 +689,16 @@ async fn mtls_rejects_connection_with_untrusted_client_cert() {
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let shard_db = new_shard_db("mtls-untrusted-cert-shard").await;
+    let (catalog, durable) = new_audit_catalog("mtls-untrusted-cert-audit");
     let server = GatewayServer::with_shard_db_and_mtls_auth(
         addr,
-        Arc::new(CatalogStubs::new()),
+        catalog,
         Arc::new(NoopViewReader),
         shard_db,
     )
     .with_tls(&server_cert_path, &server_key_path, Some(&ca_cert_path))
     .unwrap();
+    let handler = server.handler().clone();
     let (local_addr, _handle) = server.serve_background().await.unwrap();
 
     let client_cert = ClientCert {
@@ -449,4 +713,6 @@ async fn mtls_rejects_connection_with_untrusted_client_cert() {
         result.is_err(),
         "connection with an untrusted client cert must be rejected by mTLS"
     );
+    assert!(handler.sessions.is_empty());
+    assert_single_unknown_tls_failure(&durable).await;
 }
