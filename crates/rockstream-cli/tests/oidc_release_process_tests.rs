@@ -3346,6 +3346,61 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             "durable source {source_name} must retain a canonical secret reference"
         );
     }
+    let rotation_audits = durable_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.action == SecurityAuditClass::SecretRotation)
+        .collect::<Vec<_>>();
+    assert_eq!(rotation_audits.len(), 1);
+    let rotation_audit = &rotation_audits[0];
+    assert_eq!(
+        rotation_audit.event_id,
+        format!("gateway-secret-rotation-{rotation_operation_id}")
+    );
+    assert!(rotation_audit.timestamp_ms > 0);
+    assert_eq!(
+        rotation_audit.format_version,
+        rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION
+    );
+    assert_eq!(
+        rotation_audit.actor,
+        AuditIdentity::Verified("principal:1".to_string())
+    );
+    assert_eq!(
+        rotation_audit.target,
+        AuditField::Known("secret:public/kafka_auth".to_string())
+    );
+    assert_eq!(
+        rotation_audit.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::Secret {
+                namespace: "public".to_string(),
+                name: "kafka_auth".to_string(),
+                consumer: None,
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(rotation_audit.outcome, SecurityAuditOutcome::Success);
+    assert!(matches!(
+        &rotation_audit.correlation,
+        AuditCorrelation::Observed(id) if !id.is_empty()
+    ));
+    assert_eq!(
+        rotation_audit.operation_id,
+        AuditField::Known(rotation_operation_id.to_string())
+    );
+    assert_eq!(rotation_audit.policy_revision, AuditField::Known(1));
+    assert_eq!(
+        rotation_audit.before_state,
+        AuditField::Known("version=1".to_string())
+    );
+    assert_eq!(
+        rotation_audit.after_state,
+        AuditField::Known("version=2".to_string())
+    );
 }
 
 #[tokio::test]
