@@ -924,8 +924,8 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
-            *state.entry(col.value(i)).or_insert(0) += zset.weights[i];
+        for (i, &weight) in zset.weights.iter().enumerate().take(zset.num_rows()) {
+            *state.entry(col.value(i)).or_insert(0) += weight;
         }
     }
 

@@ -441,10 +441,9 @@ impl Operator for MinMaxOp {
 
         let mut state = self.state.lock().expect("MinMaxOp mutex poisoned");
 
-        for row in 0..n {
+        for (row, &w) in delta.weights.iter().enumerate().take(n) {
             let k = k_col.value(row);
             let v = v_col.value(row);
-            let w = delta.weights[row];
 
             let (old_ext, new_ext) = state.apply_delta(k, v, w)?;
 

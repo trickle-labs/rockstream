@@ -900,13 +900,12 @@ impl AggregateOp {
         let max_bytes = self.max_bytes.load(Ordering::Relaxed);
         let mut staged = StagedEpochAggregator::with_limits(max_groups, max_bytes);
 
-        for row in 0..n {
+        for (row, &w) in delta.weights.iter().enumerate().take(n) {
             if k_col.is_null(row) || v_col.is_null(row) || v_raw.is_null(row) {
                 continue;
             }
             let k = k_col.value(row);
             let v = v_col.value(row);
-            let w = delta.weights[row];
             if w == 0 {
                 continue;
             }
@@ -1442,10 +1441,9 @@ impl Operator for BucketedAggregateOp {
         let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
             std::collections::HashMap::new();
         let mut order: Vec<(i64, i64)> = Vec::new();
-        for row in 0..delta.num_rows() {
+        for (row, &w) in delta.weights.iter().enumerate().take(delta.num_rows()) {
             let k = k_col.value(row);
             let v = v_col.value(row);
-            let w = delta.weights[row];
             let entry = consolidated.entry((k, v)).or_insert_with(|| {
                 order.push((k, v));
                 0

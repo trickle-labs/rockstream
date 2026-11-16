@@ -79,9 +79,9 @@ mod proptest_oracle {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..batch.num_rows() {
+        for (i, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
             *acc.entry((pk_col.value(i), v_col.value(i), id_col.value(i)))
-                .or_insert(0) += batch.weights[i];
+                .or_insert(0) += weight;
         }
     }
 
@@ -150,9 +150,9 @@ mod proptest_oracle {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..batch.num_rows() {
+        for (i, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
             *out.entry((pk_col.value(i), v_col.value(i), id_col.value(i)))
-                .or_insert(0) += batch.weights[i];
+                .or_insert(0) += weight;
         }
     }
 

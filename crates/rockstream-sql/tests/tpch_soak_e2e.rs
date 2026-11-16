@@ -634,9 +634,9 @@ fn accumulate_zset_output(out: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
                 .unwrap()
         })
         .collect();
-    for i in 0..out.num_rows() {
+    for (i, &weight) in out.weights.iter().enumerate().take(out.num_rows()) {
         let row: Vec<i64> = col_arrays.iter().map(|c| c.value(i)).collect();
-        *acc.entry(row).or_insert(0) += out.weights[i];
+        *acc.entry(row).or_insert(0) += weight;
     }
     acc.retain(|_, &mut w| w != 0);
 }
@@ -799,12 +799,12 @@ async fn test_tpch_queries_incremental_vs_batch() {
                         .unwrap(),
                 );
             }
-            for i in 0..out_0.num_rows() {
+            for (i, &weight) in out_0.weights.iter().enumerate().take(out_0.num_rows()) {
                 let mut row = Vec::with_capacity(col_arrays.len());
                 for col in &col_arrays {
                     row.push(col.value(i));
                 }
-                *inc_acc.entry(row).or_insert(0) += out_0.weights[i];
+                *inc_acc.entry(row).or_insert(0) += weight;
             }
         }
         inc_acc.retain(|_, &mut w| w != 0);
@@ -858,12 +858,12 @@ async fn test_tpch_queries_incremental_vs_batch() {
                         .unwrap(),
                 );
             }
-            for i in 0..out_1.num_rows() {
+            for (i, &weight) in out_1.weights.iter().enumerate().take(out_1.num_rows()) {
                 let mut row = Vec::with_capacity(col_arrays.len());
                 for col in &col_arrays {
                     row.push(col.value(i));
                 }
-                *inc_acc.entry(row).or_insert(0) += out_1.weights[i];
+                *inc_acc.entry(row).or_insert(0) += weight;
             }
         }
         inc_acc.retain(|_, &mut w| w != 0);
@@ -917,12 +917,12 @@ async fn test_tpch_queries_incremental_vs_batch() {
                         .unwrap(),
                 );
             }
-            for i in 0..out_2.num_rows() {
+            for (i, &weight) in out_2.weights.iter().enumerate().take(out_2.num_rows()) {
                 let mut row = Vec::with_capacity(col_arrays.len());
                 for col in &col_arrays {
                     row.push(col.value(i));
                 }
-                *inc_acc.entry(row).or_insert(0) += out_2.weights[i];
+                *inc_acc.entry(row).or_insert(0) += weight;
             }
         }
         inc_acc.retain(|_, &mut w| w != 0);

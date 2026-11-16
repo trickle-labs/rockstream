@@ -512,9 +512,9 @@ fn consolidate_first_two_cols(zset: &ArrowZSet) -> std::collections::BTreeMap<(i
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..zset.num_rows() {
+    for (i, &weight) in zset.weights.iter().enumerate() {
         let key = (col0.value(i), col1.value(i));
-        *map.entry(key).or_insert(0) += zset.weights[i];
+        *map.entry(key).or_insert(0) += weight;
     }
     map.retain(|_, &mut w| w != 0);
     map

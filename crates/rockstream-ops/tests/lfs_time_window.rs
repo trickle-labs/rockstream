@@ -78,10 +78,10 @@ fn accumulate(state: &mut std::collections::HashMap<(i64, i64, i64), i64>, zset:
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..zset.num_rows() {
+    for (i, &weight) in zset.weights.iter().enumerate().take(zset.num_rows()) {
         *state
             .entry((wid_col.value(i), t_col.value(i), v_col.value(i)))
-            .or_insert(0) += zset.weights[i];
+            .or_insert(0) += weight;
     }
 }
 
@@ -126,10 +126,10 @@ fn accumulate_session(
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..zset.num_rows() {
+    for (i, &weight) in zset.weights.iter().enumerate().take(zset.num_rows()) {
         *state
             .entry((start.value(i), end.value(i), t.value(i), v.value(i)))
-            .or_insert(0) += zset.weights[i];
+            .or_insert(0) += weight;
     }
 }
 

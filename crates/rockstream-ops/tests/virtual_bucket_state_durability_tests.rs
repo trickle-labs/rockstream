@@ -66,13 +66,13 @@ fn extract_rows(batch: &rockstream_ops::ArrowZSet) -> Vec<(i64, i64, i64, f64, i
         .downcast_ref::<Float64Array>()
         .unwrap();
     let mut rows = Vec::new();
-    for index in 0..batch.num_rows() {
+    for (index, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
         rows.push((
             k.value(index),
             sum.value(index),
             count.value(index),
             avg.value(index),
-            batch.weights[index],
+            weight,
         ));
     }
     rows

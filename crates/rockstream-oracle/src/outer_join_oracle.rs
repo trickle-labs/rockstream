@@ -240,13 +240,12 @@ pub fn incremental_left_join(epochs: &[EpochPair]) -> Vec<(i64, i64, Option<i64>
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..output.num_rows() {
+        for (i, &w) in output.weights.iter().enumerate().take(output.num_rows()) {
             let key = (
                 lk_col.value(i),
                 lv_col.value(i),
                 (!rv_col.is_null(i)).then(|| rv_col.value(i)),
             );
-            let w = output.weights[i];
             let entry = output_acc.entry(key).or_insert(0);
             *entry += w;
             if *entry == 0 {
@@ -300,9 +299,8 @@ pub fn incremental_semi_join(epochs: &[EpochPair]) -> Vec<(i64, i64)> {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..output.num_rows() {
+        for (i, &w) in output.weights.iter().enumerate().take(output.num_rows()) {
             let key = (lk_col.value(i), lv_col.value(i));
-            let w = output.weights[i];
             let entry = output_acc.entry(key).or_insert(0);
             *entry += w;
             if *entry == 0 {
@@ -356,9 +354,8 @@ pub fn incremental_anti_join(epochs: &[EpochPair]) -> Vec<(i64, i64)> {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..output.num_rows() {
+        for (i, &w) in output.weights.iter().enumerate().take(output.num_rows()) {
             let key = (lk_col.value(i), lv_col.value(i));
-            let w = output.weights[i];
             let entry = output_acc.entry(key).or_insert(0);
             *entry += w;
             if *entry == 0 {

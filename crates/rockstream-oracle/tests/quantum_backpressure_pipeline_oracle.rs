@@ -200,9 +200,9 @@ fn rechunk(zset: &ArrowZSet, max_rows: usize) -> Vec<ArrowZSet> {
         .collect();
     let mut chunks = Vec::new();
     let mut rows = Vec::new();
-    for i in 0..zset.num_rows() {
+    for (i, &weight) in zset.weights.iter().enumerate() {
         let mut row: Vec<i64> = cols.iter().map(|c| c.value(i)).collect();
-        row.push(zset.weights[i]);
+        row.push(weight);
         rows.push((row[0], row[1], row[2]));
         if rows.len() == max_rows {
             chunks.push(ArrowZSet::from_ab_weighted(&rows));

@@ -137,10 +137,9 @@ fn run_q1_incremental(op: &AggregateOp, lineitem: &ArrowZSet) -> Vec<(i64, i64)>
         .downcast_ref::<Int64Array>()
         .unwrap();
     let mut acc: BTreeMap<i64, i64> = BTreeMap::new();
-    for i in 0..output.num_rows() {
+    for (i, &w) in output.weights.iter().enumerate().take(output.num_rows()) {
         let k = k_out.value(i);
         let s = s_out.value(i);
-        let w = output.weights[i];
         if w > 0 {
             acc.insert(k, s);
         } else if w < 0 {
@@ -172,10 +171,9 @@ fn apply_agg_delta(state: &mut BTreeMap<i64, i64>, output: &ArrowZSet) {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..output.num_rows() {
+    for (i, &w) in output.weights.iter().enumerate().take(output.num_rows()) {
         let k = k_col.value(i);
         let s = s_col.value(i);
-        let w = output.weights[i];
         if w > 0 {
             state.insert(k, s);
         } else if w < 0 {
@@ -631,10 +629,9 @@ async fn tpch_q11_lfs_join_aggregate() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     let mut acc_state: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
-    for i in 0..agg_out.num_rows() {
+    for (i, &w) in agg_out.weights.iter().enumerate().take(agg_out.num_rows()) {
         let k = k_col.value(i);
         let s = s_col.value(i);
-        let w = agg_out.weights[i];
         if w > 0 {
             acc_state.insert(k, s);
         } else if w < 0 {

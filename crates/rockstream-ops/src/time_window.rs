@@ -1787,10 +1787,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate().take(zset.num_rows()) {
             *state
                 .entry((wid_col.value(i), t_col.value(i), v_col.value(i)))
-                .or_insert(0) += zset.weights[i];
+                .or_insert(0) += weight;
         }
     }
 
@@ -1873,7 +1873,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate().take(zset.num_rows()) {
             *state
                 .entry((
                     session_start.value(i),
@@ -1881,7 +1881,7 @@ mod tests {
                     t_col.value(i),
                     v_col.value(i),
                 ))
-                .or_insert(0) += zset.weights[i];
+                .or_insert(0) += weight;
         }
     }
 
@@ -1924,13 +1924,13 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         let mut rows = Vec::new();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate().take(zset.num_rows()) {
             rows.push((
                 session_start.value(i),
                 session_end.value(i),
                 t_col.value(i),
                 v_col.value(i),
-                zset.weights[i],
+                weight,
             ));
         }
         rows.sort();

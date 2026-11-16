@@ -947,9 +947,9 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for row_idx in 0..batch.num_rows() {
+        for (row_idx, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
             *out.entry((src.value(row_idx), dst.value(row_idx)))
-                .or_insert(0) += batch.weights[row_idx];
+                .or_insert(0) += weight;
         }
         out.retain(|_, weight| *weight > 0);
         out

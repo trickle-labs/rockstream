@@ -71,10 +71,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for idx in 0..batch.num_rows() {
+        for (idx, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
             let key = (ids.value(idx), tags.value(idx));
             let entry = state.entry(key).or_insert(0);
-            *entry += batch.weights[idx];
+            *entry += weight;
             if *entry == 0 {
                 state.remove(&key);
             }

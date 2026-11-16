@@ -69,9 +69,9 @@ fn collect_positive_kv(zset: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..zset.num_rows() {
-        if zset.weights[i] > 0 {
-            out.insert((k_col.value(i), v_col.value(i)), zset.weights[i]);
+    for (i, &weight) in zset.weights.iter().enumerate().take(zset.num_rows()) {
+        if weight > 0 {
+            out.insert((k_col.value(i), v_col.value(i)), weight);
         }
     }
     out

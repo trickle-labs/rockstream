@@ -161,10 +161,10 @@ fn accumulate_kv(acc: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..batch.num_rows() {
+    for (i, &weight) in batch.weights.iter().enumerate() {
         let key = (k_col.value(i), v_col.value(i));
         let entry = acc.entry(key).or_insert(0);
-        *entry += batch.weights[i];
+        *entry += weight;
         if *entry == 0 {
             acc.remove(&key);
         }
@@ -198,14 +198,14 @@ fn collect_agg_output(acc: &mut BTreeMap<i64, i64>, batch: &ArrowZSet) {
         .unwrap();
 
     // Pass 1: retractions — remove old state for each retracted key.
-    for i in 0..batch.num_rows() {
-        if batch.weights[i] < 0 {
+    for (i, &weight) in batch.weights.iter().enumerate() {
+        if weight < 0 {
             acc.remove(&k_col.value(i));
         }
     }
     // Pass 2: insertions — set new state for each inserted key.
-    for i in 0..batch.num_rows() {
-        if batch.weights[i] > 0 {
+    for (i, &weight) in batch.weights.iter().enumerate() {
+        if weight > 0 {
             acc.insert(k_col.value(i), sum_col.value(i));
         }
     }
@@ -554,9 +554,9 @@ async fn sql_engine_window_row_number_over_view() {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate() {
             let key = (k_col.value(i), v_col.value(i), r_col.value(i));
-            *state.entry(key).or_insert(0) += zset.weights[i];
+            *state.entry(key).or_insert(0) += weight;
         }
     }
 

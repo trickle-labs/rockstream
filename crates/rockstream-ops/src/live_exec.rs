@@ -2441,8 +2441,8 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            for i in 0..out.num_rows() {
-                *net.entry((k0.value(i), k1.value(i))).or_insert(0) += out.weights[i];
+            for (i, &weight) in out.weights.iter().enumerate().take(out.num_rows()) {
+                *net.entry((k0.value(i), k1.value(i))).or_insert(0) += weight;
             }
         }
         let mut live: Vec<(i64, i64)> = net

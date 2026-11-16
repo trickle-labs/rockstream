@@ -155,12 +155,11 @@ fn incremental_output(epochs: &[Vec<(i64, i64, i64)>]) -> Vec<(i64, i64, i64, f6
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
-        for i in 0..output.num_rows() {
+        for (i, &w) in output.weights.iter().enumerate().take(output.num_rows()) {
             let k = k_col.value(i);
             let sum = s_col.value(i);
             let count = c_col.value(i);
             let avg = a_col.value(i);
-            let w = output.weights[i];
             if w > 0 {
                 state.insert(k, (sum, count, avg));
             } else if w < 0 {

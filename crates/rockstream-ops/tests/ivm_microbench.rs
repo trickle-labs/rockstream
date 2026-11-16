@@ -81,10 +81,10 @@ fn apply_agg_output(state: &mut BTreeMap<i64, i64>, output: &ArrowZSet) {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..output.num_rows() {
+    for (i, &weight) in output.weights.iter().enumerate().take(output.num_rows()) {
         let k = k_col.value(i);
         let s = s_col.value(i);
-        match output.weights[i] {
+        match weight {
             w if w > 0 => {
                 state.insert(k, s);
             }
