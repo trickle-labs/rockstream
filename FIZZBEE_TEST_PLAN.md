@@ -1150,6 +1150,40 @@ guarantee matrix covered by
 `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
 `crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
 
+Issue #339 extends that **external PostgreSQL pgoutput boundary** with
+transactional `TRUNCATE` semantics. A decoded `T` message retains the enclosing
+XID, relation IDs, and CASCADE / RESTART IDENTITY flags; the source-wide gateway
+stages an ordered marker among INSERT / UPDATE / DELETE records, including when
+the transaction spills. Under the shard commit lock, it expands each affected
+relation's locally committed row images into negative deltas, first overlaying
+earlier changes in the same upstream transaction. Thus `INSERT; TRUNCATE;
+INSERT` retracts the preexisting and first inserted rows, while retaining the
+last INSERT. A multi-relation `T` must retract each imported relation and every
+reachable compiled materialized view in the **same M3 durable epoch** as the
+source checkpoint and frontier advancement; no reader may observe a partial
+truncate. An empty relation contributes no retractions.
+
+**Safety / failure boundary:** if a relation route, row image, or complete
+bounded scan is unavailable, or the expanded transaction exceeds the 65,536
+DML-op / 8 MiB bound, the gateway blocks without advancing PostgreSQL's
+confirmed slot LSN. The legacy row-only decoder cannot obtain these preimages,
+so it rejects `T` and retains the failed frame on retry rather than silently
+acknowledging its COMMIT. This is an implementation-level refinement of M1's
+atomic-WriteBatch and M3's checkpoint-coupled epoch assumptions; the abstract
+M1–M7 FizzBee models do **not** model PostgreSQL relation contents, `T` frames,
+or source-slot state, and therefore do not establish this CDC correctness claim.
+Concrete proof obligations are exercised by
+`pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames`,
+`truncate_markers_preserve_order_in_a_spilled_envelope`,
+`truncate_expansion_retracts_preexisting_and_pending_rows_in_wire_order`,
+`truncate_preimage_scan_refuses_oversized_state_without_partial_rows`,
+`postgres_cdc_row_only_truncate_retries_same_frame_without_ack`, and the real
+PostgreSQL gateway test
+`pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart`.
+The last test covers nonempty tables, flags, same-transaction ordering,
+multi-relation changes, dependent views, later writes and restart replay; see
+`docs/connectors.md` for the documented operating bounds.
+
 The v0.70 Kafka golden connector provides external streaming ingestion with
 partition offset watermark coordination, bounded buffer consumer groups,
 rebalance fence isolation, and schema policy verification in
