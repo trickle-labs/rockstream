@@ -3749,6 +3749,178 @@ async fn operator_can_cancel_pending_support_artifact_over_release_management_ap
 }
 
 #[tokio::test]
+async fn support_artifact_generation_and_cancellation_race_has_one_durable_winner() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-support-cancel-race";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for support-artifact cancellation race qualification");
+    let management_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "management",
+    ));
+    let operations = ManagementOperationStore::new(Arc::clone(&management_store));
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    operations
+        .accept_idempotent(
+            &operation_id,
+            rockstream_management_proto::PROTOCOL_VERSION as u16,
+            &serde_json::json!({ "principal_id": 2, "node_id": null }),
+            operation_id.clone(),
+            OperationKind::GenerateSupportArtifact,
+            chrono::Utc::now().timestamp_millis().max(1),
+        )
+        .await
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let operator = mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        false,
+        Some(operator),
+        true,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+    let _admin = wait_for_management_client(management_address, &pki).await;
+    let mut generator = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let mut canceller = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+
+    let (generated, cancelled) = tokio::join!(
+        generator.generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: operation_id.clone(),
+        }),
+        canceller.cancel_operation(CancelOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: operation_id.clone(),
+        }),
+    );
+    let operation = generator
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    let expected_audit = match (generated, cancelled) {
+        (Ok(response), Err(error)) => {
+            let response = response.into_inner();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(operation.state, "succeeded");
+            assert_eq!(
+                operation.phase,
+                format!("available_until_ms:{}", response.expires_at_ms)
+            );
+            let (content, expiry) =
+                download_support_artifact(&mut generator, &response.opaque_id).await;
+            let generated_at_ms = response.expires_at_ms - 600_000;
+            let expected_content = format!(
+                "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":1,\"node\":null}}",
+                env!("CARGO_PKG_VERSION")
+            );
+            assert_eq!(content, expected_content.as_bytes());
+            assert_eq!(expiry, response.expires_at_ms);
+            vec![
+                (
+                    SecurityAuditClass::AdminOperationStart,
+                    "pending",
+                    "generating",
+                ),
+                (
+                    SecurityAuditClass::AdminOperationCompletion,
+                    "generating",
+                    &operation.phase,
+                ),
+            ]
+        }
+        (Err(error), Ok(response)) => {
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            let cancelled = response.into_inner().operation.unwrap();
+            assert_eq!(cancelled.state, "cancelled");
+            assert_eq!(cancelled.phase, "cancelled_before_start");
+            assert_eq!(operation, cancelled);
+            assert!(matches!(
+                management_store
+                    .get(&support_artifact_object_path(&operation_id))
+                    .await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+            vec![(
+                SecurityAuditClass::AdminOperationCompletion,
+                "pending",
+                "cancelled_before_start",
+            )]
+        }
+        (generated, cancelled) => panic!(
+            "generation and cancellation returned an invalid pair: generated={}, cancelled={}",
+            generated.is_ok(),
+            cancelled.is_ok()
+        ),
+    };
+
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "gateway-shard",
+    ));
+    let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let actual_audit = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.operation_id == AuditField::Known(operation_id.clone()))
+        .map(|record| (record.action, record.before_state, record.after_state))
+        .collect::<Vec<_>>();
+    let expected_audit = expected_audit
+        .into_iter()
+        .map(|(action, before, after)| {
+            (
+                action,
+                AuditField::Known(before.to_owned()),
+                AuditField::Known(after.to_owned()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual_audit, expected_audit);
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+}
+
+#[tokio::test]
 async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
