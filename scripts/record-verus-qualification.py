@@ -74,6 +74,15 @@ def mutation_evidence(directory: Path, root: Path, inventory: list[dict]) -> dic
     return {f"mutations/{name}": checksum for name, checksum in files.items()}
 
 
+def compile_budget_for_target(budgets: dict, target: str) -> int:
+    """Use the reviewed ARM64 cold-build bound, never for Linux verification."""
+    return budgets[
+        "production_compile_macos_arm64_seconds"
+        if target == "aarch64-apple-darwin"
+        else "production_compile_seconds"
+    ]
+
+
 def merge_phases(directory: Path, output: Path, revision: str, target: str,
                  artifacts: dict, budgets: dict, root: Path, inventory: list[dict]) -> tuple[list[str], list[Path], dict, dict]:
     """Only complete, matching phase evidence can become full qualification."""
@@ -96,6 +105,8 @@ def merge_phases(directory: Path, output: Path, revision: str, target: str,
             budget = budgets["cold_verification_seconds" if row[0] == "verifier" else
                              "incremental_verification_seconds" if row[0] == "verifier-incremental" else
                              "production_compile_seconds"]
+            if row[0].startswith("cargo-"):
+                budget = compile_budget_for_target(budgets, target)
             if len(row) != 4 or row[1] != "0" or not row[3] or not 0 <= int(row[2]) <= budget:
                 raise ValueError(f"{phase}: unsuccessful or over-budget step {row[0]}")
         binary = directory / phase / f"rockstream-{phase}"
