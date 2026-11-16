@@ -3328,6 +3328,24 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     recovered_connection_task.abort();
     recovered.0.kill().unwrap();
     recovered.0.wait().unwrap();
+    let durable_catalog = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    let sources = durable_catalog.list_sources().await.unwrap();
+    for (source_name, expected_reference) in [
+        ("rotating_orders", "secret://kafka_auth"),
+        ("steady_orders", "secret://steady_auth"),
+    ] {
+        let source = sources
+            .iter()
+            .find(|source| source.name == source_name)
+            .unwrap_or_else(|| panic!("missing durable source {source_name}"));
+        assert_eq!(
+            source.options.get("secret").map(String::as_str),
+            Some(expected_reference),
+            "durable source {source_name} must retain a canonical secret reference"
+        );
+    }
 }
 
 #[tokio::test]
