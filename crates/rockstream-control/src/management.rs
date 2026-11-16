@@ -48,6 +48,14 @@ const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGEMENT_REQUESTS: usize = 64;
 
+pub fn security_deployment_fingerprint(config: &NodeConfig, catalog_namespace: &str) -> String {
+    let context = format!(
+        "{:?}|{:?}|{catalog_namespace}",
+        config.storage.url, config.control.shared_storage,
+    );
+    hex::encode(Sha256::digest(context.as_bytes()))
+}
+
 fn has_management_admin(principals: &[SecurityPrincipal]) -> bool {
     principals.iter().any(|principal| {
         principal.enabled
@@ -605,11 +613,7 @@ impl ManagementService {
             .as_ref()
             .map(|catalog| catalog.deployment_namespace())
             .unwrap_or_else(|| "unavailable".to_owned());
-        let context = format!(
-            "{:?}|{:?}|{catalog_namespace}",
-            self.config.storage.url, self.config.control.shared_storage,
-        );
-        hex::encode(Sha256::digest(context.as_bytes()))
+        security_deployment_fingerprint(&self.config, &catalog_namespace)
     }
 
     fn acquire_request(&self) -> Result<OwnedSemaphorePermit, Status> {
@@ -988,6 +992,7 @@ impl ManagementService {
             crate::management_store::OperationKind::SecurityPrincipalGrants => {
                 "security_principal_grants"
             }
+            crate::management_store::OperationKind::SecretRotation => "secret_rotation",
         };
         v1::Operation {
             operation_id: record.operation_id().to_owned(),
@@ -1167,6 +1172,7 @@ impl ManagementService {
                     tracing::error!(operation_id = record.operation_id(), %error, "security grant operation reconciliation failed");
                 }
             }
+            crate::management_store::OperationKind::SecretRotation => {}
         }
     }
 
@@ -2173,12 +2179,15 @@ impl v1::management_service_server::ManagementService for ManagementService {
         let items = items
             .into_iter()
             .filter(|record| {
-                record.kind() != crate::management_store::OperationKind::SecurityPrincipalGrants
-                    || record
-                        .request()
-                        .and_then(|request| request.get("deployment_id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(deployment_id.as_str())
+                !matches!(
+                    record.kind(),
+                    crate::management_store::OperationKind::SecurityPrincipalGrants
+                        | crate::management_store::OperationKind::SecretRotation
+                ) || record
+                    .request()
+                    .and_then(|request| request.get("deployment_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(deployment_id.as_str())
             })
             .collect::<Vec<_>>();
         let mut reconciled = Vec::with_capacity(items.len());
@@ -2229,6 +2238,26 @@ impl v1::management_service_server::ManagementService for ManagementService {
             if caller.id.0 != change.grantor_id {
                 self.authorize(&request, SecurityAction::GrantManage, PolicyScope::Cluster)
                     .await?;
+            }
+        } else if record.kind() == crate::management_store::OperationKind::SecretRotation {
+            let rotation: crate::management_store::SecretRotationOperationRequest = record
+                .request()
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or_else(|| Status::not_found("operation was not found"))?;
+            if rotation.deployment_id != self.deployment_fingerprint() {
+                return Err(Status::not_found("operation was not found"));
+            }
+            let caller = self.current_principal(&request).await?;
+            if Some(caller.id.0) != rotation.actor_id {
+                self.authorize(
+                    &request,
+                    SecurityAction::OperationHistoryRead,
+                    PolicyScope::Operation {
+                        operation_id: request.get_ref().operation_id.clone(),
+                    },
+                )
+                .await?;
             }
         } else {
             self.authorize(

@@ -11272,6 +11272,14 @@ impl GatewayHandler {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
+        let operation_id = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .and_then(|session| session.idempotency_operation_id.clone())
+        });
+        let Some(operation_id) = operation_id else {
+            return Err(GatewayError::IdempotencyKeyRequired.into());
+        };
 
         let ns = match self.secret_namespace_id(namespace).await {
             Ok(namespace_id) => namespace_id,
@@ -11311,7 +11319,7 @@ impl GatewayHandler {
             name: parsed.name.clone(),
             consumer: None,
         };
-        let scope = match serde_json::to_string(&scope) {
+        let scope_json = match serde_json::to_string(&scope) {
             Ok(scope) => scope,
             Err(_) => {
                 return Ok(vec![secret_error_response(
@@ -11321,17 +11329,17 @@ impl GatewayHandler {
         };
         let audit = SecurityAuditRecord {
             format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
-            event_id: format!("gateway-secret-rotation-{:032x}", rand::random::<u128>()),
+            event_id: format!("gateway-secret-rotation-{operation_id}"),
             timestamp_ms: current_time_ms().max(1),
             actor,
             target: AuditField::Known(format!("secret:{namespace}/{}", parsed.name)),
-            scope: AuditField::Known(scope),
+            scope: AuditField::Known(scope_json),
             action: SecurityAuditClass::SecretRotation,
             outcome: SecurityAuditOutcome::Success,
             correlation: conn_id.map_or(AuditCorrelation::Unknown, |id| {
                 AuditCorrelation::Observed(id.to_string())
             }),
-            operation_id: AuditField::Unknown,
+            operation_id: AuditField::Known(operation_id.clone()),
             policy_revision: durable_principal
                 .as_ref()
                 .map_or(AuditField::Unknown, |principal| {
@@ -11340,12 +11348,49 @@ impl GatewayHandler {
             before_state: AuditField::Unknown,
             after_state: AuditField::Unknown,
         };
-        if let Err(err) = self
+        let operation = match self
             .secret_store
-            .alter_secret_with_security_audit(ns, &parsed.name, parsed.payload, "pgwire", audit)
+            .alter_secret_with_operation(
+                ns,
+                &parsed.name,
+                parsed.payload,
+                "pgwire",
+                rockstream_control::secret_store::SecretRotationOperationContext {
+                    actor_id: durable_principal.as_ref().map(|principal| principal.id.0),
+                    scope,
+                    operation_id: operation_id.clone(),
+                    audit,
+                },
+            )
             .await
         {
-            return Ok(vec![secret_error_response(err.to_string())]);
+            Ok(operation) => operation,
+            Err(error) => return Ok(vec![secret_error_response(error.to_string())]),
+        };
+        match operation.status() {
+            rockstream_control::OperationStatus::Succeeded => {}
+            rockstream_control::OperationStatus::Failed => {
+                return Ok(vec![secret_error_response(
+                    operation
+                        .result()
+                        .and_then(|result| result.get("error"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("secret rotation failed")
+                        .to_owned(),
+                )]);
+            }
+            rockstream_control::OperationStatus::Cancelled => {
+                return Ok(vec![secret_error_response(
+                    "secret rotation operation was cancelled before it started".to_owned(),
+                )]);
+            }
+            rockstream_control::OperationStatus::Pending
+            | rockstream_control::OperationStatus::Running
+            | rockstream_control::OperationStatus::Waiting => {
+                return Ok(vec![secret_error_response(
+                    "secret rotation operation is still in progress; retry using the same idempotency UUID".to_owned(),
+                )]);
+            }
         }
 
         Ok(vec![Response::Execution(
@@ -12173,11 +12218,16 @@ impl GatewayHandler {
             "idempotency_key" => {
                 if val_raw == "default" || val_raw == "null" || val_raw == "''" {
                     session.idempotency_key = None;
+                    session.idempotency_operation_id = None;
                 } else {
                     // Strip surrounding single quotes
                     let key_str = val_raw.trim_matches('\'');
                     let hash = sha256_16(key_str.as_bytes());
                     session.idempotency_key = Some(hash);
+                    session.idempotency_operation_id = uuid::Uuid::parse_str(key_str)
+                        .ok()
+                        .filter(|key| key.hyphenated().to_string() == key_str)
+                        .map(|key| key.hyphenated().to_string());
                 }
             }
             "source_epoch" => {
@@ -12654,6 +12704,7 @@ impl GatewayHandler {
             if let Some(mut session) = self.sessions.get_mut(id) {
                 session.cursors.clear();
                 session.idempotency_key = None;
+                session.idempotency_operation_id = None;
                 session.source_epoch_envelope = None;
                 session.wait_for_token = None;
                 session.last_written_epoch = None;

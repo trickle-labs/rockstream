@@ -16,6 +16,14 @@ grants `secret.use`. A gateway running without a durable authenticated policy
 denies secret administration. Secret input remains write-only, and no SQL GET
 returns an existing secret value.
 
+Before each `ALTER SECRET`, set `rockstream.idempotency_key` to a canonical
+client-generated UUID in the same SQL session. Reuse that UUID and the exact
+request after a lost response; the durable operation binds it to the actor,
+deployment, secret scope, and a digest of the submitted values. A changed request
+under the same UUID is rejected. The authorized management `GetOperation` path
+returns the safe operation result when it uses the same operation store; the
+client-known UUID remains the SQL retry identity.
+
 Applications can inject an `AwsKmsKekProvider::new(key_arn, region)` into a
 `SecretStore` and supply that store through `ControlService::with_secret_store`.
 Supplying an ARN alone does not select this provider in the default services.

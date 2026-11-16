@@ -2,7 +2,10 @@ use std::{
     io::{BufReader, Read},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -102,6 +105,84 @@ async fn read_backend_message(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8
     let mut payload = vec![0; length - 4];
     stream.read_exact(&mut payload).await.unwrap();
     (header[0], payload)
+}
+
+async fn pgwire_proxy_dropping_query_response(
+    target: std::net::SocketAddr,
+    query: &'static str,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = listener.local_addr().unwrap();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = tokio::net::TcpStream::connect(target).await.unwrap();
+        let (mut client_reader, mut client_writer) = client.into_split();
+        let (mut server_reader, mut server_writer) = server.into_split();
+        let query_seen = Arc::new(AtomicBool::new(false));
+        let request_marker = Arc::clone(&query_seen);
+        let mut request = tokio::spawn(async move {
+            let mut tail = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = client_reader.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                if !request_marker.load(Ordering::Acquire) {
+                    tail.extend_from_slice(&buffer[..count]);
+                    if tail
+                        .windows(query.len())
+                        .any(|window| window == query.as_bytes())
+                    {
+                        request_marker.store(true, Ordering::Release);
+                    }
+                    let retained = query.len() - 1;
+                    if tail.len() > retained {
+                        tail.drain(..tail.len() - retained);
+                    }
+                }
+                server_writer.write_all(&buffer[..count]).await.unwrap();
+            }
+        });
+        let mut response = tokio::spawn(async move {
+            loop {
+                let mut header = [0; 5];
+                if server_reader.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+                let mut payload = vec![0; length - 4];
+                if server_reader.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                if query_seen.load(Ordering::Acquire) && header[0] == b'C' {
+                    let _ = dropped_tx.send(());
+                    return;
+                }
+                if client_writer.write_all(&header).await.is_err()
+                    || client_writer.write_all(&payload).await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+        tokio::select! {
+            result = &mut request => {
+                response.abort();
+                result.unwrap();
+            }
+            result = &mut response => {
+                request.abort();
+                result.unwrap();
+            }
+        }
+    });
+    (proxy_address, dropped_rx, proxy)
 }
 
 fn scram_principal() -> SecurityPrincipal {
@@ -2572,10 +2653,80 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .simple_query("ALTER ROLE postgres PASSWORD 'rotated-fixture-value'")
         .await
         .unwrap();
-    client
-        .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')")
+    let rotation_id = "d931137e-9e28-4a29-96f2-0cb10e5acb21";
+    let rotation_query = "ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')";
+    let missing_key = client.simple_query(rotation_query).await.unwrap_err();
+    let missing_key = missing_key.as_db_error().unwrap();
+    assert_eq!(missing_key.code().code(), "XX000");
+    assert!(missing_key
+        .message()
+        .starts_with("[RS-2007] write.idempotency_key_required:"));
+    let (proxy_address, response_dropped, proxy) =
+        pgwire_proxy_dropping_query_response(address, rotation_query).await;
+    let (lost_response_client, lost_response_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            proxy_address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let lost_response_connection_task = tokio::spawn(lost_response_connection);
+    let set_response = lost_response_client
+        .simple_query(&format!("SET rockstream.idempotency_key = '{rotation_id}'"))
         .await
         .unwrap();
+    assert!(
+        matches!(
+            set_response.as_slice(),
+            [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+        ),
+        "expected exactly one successful SET response, got {set_response:?}"
+    );
+    let lost_response = tokio::time::timeout(
+        Duration::from_secs(10),
+        lost_response_client.simple_query(rotation_query),
+    )
+    .await
+    .unwrap();
+    assert!(
+        lost_response.is_err(),
+        "the proxy should drop the committed ALTER SECRET response"
+    );
+    tokio::time::timeout(Duration::from_secs(10), response_dropped)
+        .await
+        .unwrap()
+        .unwrap();
+    lost_response_connection_task.abort();
+    drop(lost_response_client);
+    proxy.await.unwrap();
+    let set_response = client
+        .simple_query(&format!("SET rockstream.idempotency_key = '{rotation_id}'"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        set_response.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+    ));
+    let conflict = client
+        .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'different-fixture-value')")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflict.as_db_error().unwrap().message(),
+        format!(
+            "idempotency key is already bound to operation {rotation_id} with a different request"
+        )
+    );
+    let retry_response = client.simple_query(rotation_query).await.unwrap();
+    assert!(
+        matches!(
+            retry_response.as_slice(),
+            [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+        ),
+        "expected exactly one successful retry response, got {retry_response:?}"
+    );
     upstream.batch_execute("COMMIT").await.unwrap();
     expected_rows.extend([row("3", Some("30")), row("3", Some("30")), row("4", None)]);
     expected_rows.sort();
@@ -2743,9 +2894,10 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .collect::<Vec<_>>();
     assert_eq!(rotation_audits.len(), 1);
     let rotation_audit = &rotation_audits[0];
-    assert!(rotation_audit
-        .event_id
-        .starts_with("gateway-secret-rotation-"));
+    assert_eq!(
+        rotation_audit.event_id,
+        format!("gateway-secret-rotation-{rotation_id}")
+    );
     assert!(rotation_audit.timestamp_ms > 0);
     assert_eq!(
         rotation_audit.format_version,
@@ -2775,7 +2927,10 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         &rotation_audit.correlation,
         AuditCorrelation::Observed(id) if !id.is_empty()
     ));
-    assert_eq!(rotation_audit.operation_id, AuditField::Unknown);
+    assert_eq!(
+        rotation_audit.operation_id,
+        AuditField::Known(rotation_id.to_owned())
+    );
     assert_eq!(rotation_audit.policy_revision, AuditField::Known(1));
     assert_eq!(
         rotation_audit.before_state,
@@ -2785,6 +2940,29 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         rotation_audit.after_state,
         AuditField::Known("version=2".to_string())
     );
+    let operation = rockstream_control::ManagementOperationStore::new(
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap(),
+    )
+    .get(rotation_id)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(operation.operation_id(), rotation_id);
+    assert_eq!(
+        operation.kind(),
+        rockstream_control::OperationKind::SecretRotation
+    );
+    assert_eq!(
+        operation.status(),
+        rockstream_control::OperationStatus::Succeeded
+    );
+    assert_eq!(
+        operation.result(),
+        Some(&serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0}))
+    );
+    assert!(!serde_json::to_string(operation.request().unwrap())
+        .unwrap()
+        .contains("rotated-fixture-value"));
 }
 
 #[tokio::test]
