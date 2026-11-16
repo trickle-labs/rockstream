@@ -973,6 +973,23 @@ mod data_plane_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let (client, deployments, db, _, mut progress_rx) =
             setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        {
+            let mut deployments = deployments.write();
+            let deployment =
+                Arc::get_mut(deployments.get_mut(&(WorkloadId(1), ShardId(100))).unwrap()).unwrap();
+            deployment.descriptor.schemas[0].columns[1].data_type = "i64".to_owned();
+            let schemas = deployment_schema(&deployment.descriptor).unwrap();
+            let plan = serde_json::from_str(&deployment.descriptor.plan_json).unwrap();
+            deployment.compiled = rockstream_ops::compile_plan_with_sink_id_and_strategy(
+                &plan,
+                db.clone(),
+                &schemas,
+                deployment.descriptor.sink_operator_id,
+                deployment.descriptor.join_strategy,
+            )
+            .unwrap();
+            deployment.schemas = schemas;
+        }
         let owner = RuntimeExchangeMessage {
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
@@ -1030,7 +1047,6 @@ mod data_plane_tests {
                 execute_frame_and_report(&client, &deployments, frame).await
             })
         });
-        actors.register_owned(owner.shard_id, owner.lease_token, execute);
         let actors_for_test = actors.clone();
         let sender_deployments = deployments.clone();
         let handle = owned_shuffle_handler(actors, deployments, client);
@@ -1038,10 +1054,10 @@ mod data_plane_tests {
         let addr = listener.local_addr().unwrap();
         let registry = crate::exchange::service::ExchangeRegistry::new();
         let (inlet_tx, inlet_rx) = mpsc::channel(1);
-        registry.register(1, 100, inlet_tx, schema);
+        registry.register(1, 100, inlet_tx, schema.clone());
         drop(inlet_rx);
-        let service =
-            crate::exchange::service::ExchangeService::new(registry).with_owned_handler(handle);
+        let service = crate::exchange::service::ExchangeService::new(registry.clone())
+            .with_owned_handler(handle);
         let server_task = service.start_listener(listener).await.unwrap();
         let info = |id, address: String, host: &str| {
             let registration = WorkerRegistration::new(
@@ -1082,6 +1098,28 @@ mod data_plane_tests {
             ),
             other => panic!("unexpected worker response: {other:?}"),
         }
+        let unavailable =
+            crate::shard_actor::ShardActorError::UnknownShard(owner.shard_id).to_string();
+        assert_eq!(
+            mux.send_owned_frame(WorkerId(42), frame.clone(), context.clone())
+                .await,
+            Err(unavailable.clone())
+        );
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionFailed { output, message } => {
+                assert_eq!((output, message), (failure_identity(&owner), unavailable))
+            }
+            other => panic!("unexpected unavailable-target response: {other:?}"),
+        }
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap(),
+            None
+        );
+        let (inlet_tx, mut reopened_inlet) = mpsc::channel(1);
+        registry.register(1, 100, inlet_tx, schema);
+        actors_for_test.register_owned(owner.shard_id, owner.lease_token, execute);
         let sending = {
             let mux = mux.clone();
             let deployments = sender_deployments.clone();
@@ -1106,6 +1144,10 @@ mod data_plane_tests {
         );
         release.notify_one();
         assert_eq!(sending.await.unwrap(), Ok(()));
+        assert!(matches!(
+            reopened_inlet.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         match progress_rx.recv().await.unwrap() {
             WorkerMessage::ExecutionProgress {
                 output,
@@ -1124,16 +1166,8 @@ mod data_plane_tests {
         use rockstream_ops::sink::{read_view_output, ColumnValue};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
         let expected = vec![
-            (
-                1,
-                vec![ColumnValue::Int64(1), ColumnValue::Utf8("10".to_owned())],
-                1,
-            ),
-            (
-                1,
-                vec![ColumnValue::Int64(2), ColumnValue::Utf8("20".to_owned())],
-                1,
-            ),
+            (1, vec![ColumnValue::Int64(1), ColumnValue::Int64(10)], 1),
+            (1, vec![ColumnValue::Int64(2), ColumnValue::Int64(20)], 1),
         ];
         assert_eq!(
             stored
