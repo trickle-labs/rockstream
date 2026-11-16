@@ -17,7 +17,8 @@ spec.loader.exec_module(recorder)
 IDS = {"debug": ["verifier", "production-mutations", "verifier-incremental", "cargo-debug", "cargo-check", "cargo-all-features"],
        "release": ["cargo-release"]}
 BUDGETS = {"cold_verification_seconds": 100, "incremental_verification_seconds": 10,
-           "production_compile_seconds": 100}
+           "production_compile_seconds": 100,
+           "production_compile_macos_arm64_seconds": 160}
 
 
 class MergeTests(unittest.TestCase):
@@ -114,6 +115,31 @@ class MergeTests(unittest.TestCase):
                     self.merge(root)
                 self.assertEqual(str(raised.exception), message)
                 self.assertFalse((root / "complete").exists())
+
+    def test_macos_arm64_uses_recorded_cold_release_budget_only(self):
+        self.assertEqual(recorder.compile_budget_for_target(BUDGETS, "aarch64-apple-darwin"), 160)
+        self.assertEqual(recorder.compile_budget_for_target(BUDGETS, "x86_64-unknown-linux-gnu"), 100)
+        for duration, accepted in ((100, True), (160, True), (161, False)):
+            with self.subTest(duration=duration), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                records = self.fixture(root)
+                for phase in IDS:
+                    records[phase]["target"] = "aarch64-apple-darwin"
+                records["release"]["steps"] = [f"cargo-release\t0\t{duration}\tbuild"]
+                self.write_records(root, records)
+                if accepted:
+                    steps, _, _, _ = recorder.merge_phases(
+                        root, root / "complete", "candidate", "aarch64-apple-darwin",
+                        {"Cargo.lock": "digest"}, BUDGETS, SOURCE, INVENTORY)
+                    self.assertEqual(steps[-1], f"cargo-release\t0\t{duration}\tbuild")
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "release: unsuccessful or over-budget step cargo-release"
+                    ):
+                        recorder.merge_phases(
+                            root, root / "complete", "candidate", "aarch64-apple-darwin",
+                            {"Cargo.lock": "digest"}, BUDGETS, SOURCE, INVENTORY)
+                    self.assertFalse((root / "complete").exists())
 
     def test_missing_or_changed_artifact_and_missing_phase_fail_closed(self):
         for missing in ("release/phase.json", "release/rockstream-release", "debug/rockstream-debug"):
