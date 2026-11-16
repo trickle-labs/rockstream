@@ -388,7 +388,7 @@ mod tc {
         CapacityHeadroom, ControlMessage, NodeRole, RaftRoleWire, WorkerMessage, WorkerRegistration,
     };
 
-    type WorkerStream = TlsStream<TcpStream>;
+    pub(super) type WorkerStream = TlsStream<TcpStream>;
 
     pub const IMAGE_NAME: &str = "rockstream-tc-test";
     pub const IMAGE_TAG: &str = "latest";
@@ -891,7 +891,7 @@ mod tc {
         }
     }
 
-    async fn read_message_line<S>(stream: &mut S) -> std::io::Result<String>
+    pub(super) async fn read_message_line<S>(stream: &mut S) -> std::io::Result<String>
     where
         S: AsyncRead + Unpin,
     {
@@ -1323,27 +1323,12 @@ mod real_leader_fencing_108 {
 
     use object_store::local::LocalFileSystem;
     use rockstream_storage::ShardDb;
-    use rockstream_test_support::pki::TestPki;
     use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
     use rockstream_types::topology::{ControlMessage, WorkerMessage};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::AsyncWriteExt;
 
-    /// A real worker authorization round trip against an actual control
-    /// process. Never infer an acceptance from a local ShardManager.
-    async fn fence(
-        addr: std::net::SocketAddr,
-        worker_id: u64,
-        token: LeaseToken,
-        pki: &TestPki,
-    ) -> bool {
-        let Ok(Ok(mut stream)) = tokio::time::timeout(
-            Duration::from_secs(2),
-            tc::connect_worker(addr, worker_id, pki),
-        )
-        .await
-        else {
-            return false;
-        };
+    /// A real worker authorization round trip on its registered control session.
+    async fn fence(stream: &mut tc::WorkerStream, token: LeaseToken) -> bool {
         let request = WorkerMessage::FenceWrite {
             shard_id: ShardId(108),
             lease_token: token,
@@ -1352,37 +1337,37 @@ mod real_leader_fencing_108 {
         if stream.write_all(wire.as_bytes()).await.is_err() {
             return false;
         }
-        let mut line = String::new();
-        let mut reader = BufReader::new(&mut stream);
-        let Ok(Ok(read)) =
-            tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line)).await
-        else {
-            return false;
-        };
-        if read == 0 {
-            return false;
-        }
-        match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
-            ControlMessage::FenceAck { shard_id, valid } => {
-                assert_eq!(shard_id, ShardId(108));
-                valid
+        loop {
+            let Ok(Ok(line)) =
+                tokio::time::timeout(Duration::from_secs(3), tc::read_message_line(stream)).await
+            else {
+                return false;
+            };
+            if line.is_empty() {
+                return false;
             }
-            other => panic!("unexpected fencing reply: {other:?}"),
+            match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
+                ControlMessage::TopologyChanged { .. } => continue,
+                ControlMessage::FenceAck { shard_id, valid } => {
+                    assert_eq!(shard_id, ShardId(108));
+                    return valid;
+                }
+                other => panic!("unexpected fencing reply: {other:?}"),
+            }
         }
     }
 
     /// The test's storage writer only commits on a successful production
     /// FenceWrite reply. Keep an independent acknowledged-history oracle.
     async fn attempt(
-        addr: std::net::SocketAddr,
+        stream: &mut tc::WorkerStream,
         token: LeaseToken,
-        pki: &TestPki,
         db: &ShardDb,
         key: &'static [u8],
         value: &'static [u8],
         committed: &mut Vec<(Vec<u8>, Vec<u8>)>,
     ) -> bool {
-        let accepted = fence(addr, 10, token, pki).await;
+        let accepted = fence(stream, token).await;
         if accepted {
             db.put(key, value).await.unwrap();
             db.flush().await.unwrap();
@@ -1400,8 +1385,8 @@ mod real_leader_fencing_108 {
         let (old_idx, old_term) = cluster
             .wait_for_single_leader(Duration::from_secs(15))
             .await;
-        let old_addr = cluster.nodes[old_idx].control_addr;
-        let (_, old_lease, old_worker) = tc::register_and_request_shard(&cluster, 10, 108).await;
+        let (_, old_lease, mut old_worker) =
+            tc::register_and_request_shard(&cluster, 10, 108).await;
         assert_eq!(old_lease.worker_id, WorkerId(10));
 
         let dir = tempfile::tempdir().unwrap();
@@ -1414,9 +1399,8 @@ mod real_leader_fencing_108 {
         let mut outcomes = Vec::new();
         outcomes.push(
             attempt(
-                old_addr,
+                &mut old_worker,
                 old_lease.lease_token,
-                &cluster.pki,
                 &db,
                 b"row/01",
                 b"ack-before",
@@ -1466,7 +1450,6 @@ mod real_leader_fencing_108 {
 
         // Keep original socket alive for isolation: avoid a synthetic worker
         // disconnect that would release the original lease.
-        let _old_worker = old_worker;
         let mut new_worker = tc::register_worker(new_addr, 10, &cluster.pki).await;
         let wire = serde_json::to_string(&WorkerMessage::RequestShard {
             worker_id: WorkerId(10),
@@ -1475,13 +1458,14 @@ mod real_leader_fencing_108 {
         .unwrap()
             + "\n";
         new_worker.write_all(wire.as_bytes()).await.unwrap();
-        let mut reader = BufReader::new(&mut new_worker);
         let new_lease = loop {
-            let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-                .await
-                .unwrap()
-                .unwrap();
+            let line = tokio::time::timeout(
+                Duration::from_secs(5),
+                tc::read_message_line(&mut new_worker),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
                 ControlMessage::ShardAssigned { lease, .. } => break lease,
                 ControlMessage::TopologyChanged { .. } => continue,
@@ -1493,9 +1477,8 @@ mod real_leader_fencing_108 {
 
         outcomes.push(
             attempt(
-                new_addr,
+                &mut new_worker,
                 old_lease.lease_token,
-                &cluster.pki,
                 &db,
                 b"row/stale",
                 b"never-commit",
@@ -1505,9 +1488,8 @@ mod real_leader_fencing_108 {
         );
         outcomes.push(
             attempt(
-                new_addr,
+                &mut new_worker,
                 new_lease.lease_token,
-                &cluster.pki,
                 &db,
                 b"row/02",
                 b"ack-after",
@@ -1519,9 +1501,8 @@ mod real_leader_fencing_108 {
             // Old process is still alive and must reject its own old token.
             outcomes.push(
                 attempt(
-                    old_addr,
+                    &mut old_worker,
                     old_lease.lease_token,
-                    &cluster.pki,
                     &db,
                     b"row/isolated",
                     b"never-commit",
@@ -1554,7 +1535,6 @@ mod real_leader_fencing_108 {
             .collect();
         assert_eq!(rows, committed);
         recovered.close().await.unwrap();
-        drop(reader);
         drop(new_worker);
         cluster.cleanup().await;
     }

@@ -5,6 +5,31 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Return the name carried by a supported secret reference.
+///
+/// Bare names are accepted for reading legacy catalog entries and the
+/// documented `secret = '<name>'` connector input. New durable metadata should
+/// be written with [`canonical_secret_reference`].
+pub fn secret_name_from_reference(reference: &str) -> Option<&str> {
+    let reference = reference.trim();
+    let name = match reference.strip_prefix("secret://") {
+        Some(name) => name,
+        None if !reference.contains("://") => reference,
+        None => return None,
+    }
+    .trim();
+    if name.is_empty() || name.contains("://") {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Canonicalize a documented bare secret name or an existing secret URI.
+pub fn canonical_secret_reference(reference: &str) -> Option<String> {
+    secret_name_from_reference(reference).map(|name| format!("secret://{name}"))
+}
+
 /// Secret type discriminator.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -265,6 +290,27 @@ pub fn get_global_secrets() -> Arc<SecretsRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_references_have_one_canonical_durable_form() {
+        assert_eq!(
+            canonical_secret_reference("warehouse_password").as_deref(),
+            Some("secret://warehouse_password")
+        );
+        assert_eq!(
+            canonical_secret_reference("secret://warehouse_password").as_deref(),
+            Some("secret://warehouse_password")
+        );
+        assert_eq!(
+            secret_name_from_reference("secret://warehouse_password"),
+            Some("warehouse_password")
+        );
+        assert_eq!(
+            canonical_secret_reference("vault://warehouse_password"),
+            None
+        );
+        assert_eq!(canonical_secret_reference("secret://"), None);
+    }
 
     #[test]
     fn test_secret_types_and_models() {

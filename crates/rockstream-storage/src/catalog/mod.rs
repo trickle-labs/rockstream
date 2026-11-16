@@ -59,6 +59,12 @@ pub enum CatalogError {
     TransactionTooLarge(String),
 
     #[error("{0}")]
+    OptimisticConflict(String),
+
+    #[error("{0}")]
+    InvalidSecurityPolicy(String),
+
+    #[error("{0}")]
     DependencyCycle(String),
 
     #[error("{0}")]
@@ -175,7 +181,17 @@ pub struct CatalogSourceEntry {
     pub name: String,
     pub connector_type: String,
     pub table_name: Option<String>,
+    #[serde(default = "default_source_format")]
+    pub format: String,
     pub options: HashMap<String, String>,
+    #[serde(default)]
+    pub secret_consumer: Option<PrincipalId>,
+    #[serde(default)]
+    pub secret_namespace: Option<String>,
+}
+
+fn default_source_format() -> String {
+    "json".to_string()
 }
 
 /// Persisted source record with explicit version tag (v0.69 Step 1, V069-01).
@@ -254,6 +270,12 @@ pub struct CatalogSinkEntry {
     pub target: String,
     pub options: HashMap<String, String>,
     pub status: String,
+    #[serde(default)]
+    pub secret_reference: Option<String>,
+    #[serde(default)]
+    pub secret_consumer: Option<PrincipalId>,
+    #[serde(default)]
+    pub secret_namespace: Option<String>,
 }
 
 /// A workload and its immutable catalog identity.

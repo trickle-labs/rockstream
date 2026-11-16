@@ -488,13 +488,26 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
         .operation
         .unwrap();
     let repeated = client
-        .drain_worker(request)
+        .drain_worker(request.clone())
         .await
         .unwrap()
         .into_inner()
         .operation
         .unwrap();
+    assert_eq!(accepted.operation_id, request.idempotency_key);
     assert_eq!(repeated.operation_id, accepted.operation_id);
+    let reconciled = client
+        .get_operation(GetOperationRequest {
+            protocol_version: 1,
+            operation_id: request.idempotency_key,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(reconciled.operation_id, accepted.operation_id);
+    assert_eq!(reconciled.kind, accepted.kind);
     assert_eq!(accepted.kind, "drain_worker");
     assert_eq!(accepted.state, "pending");
     assert!(accepted.phase.is_empty());
@@ -650,12 +663,13 @@ async fn management_migrate_moves_a_real_shard_once() {
         .operation
         .unwrap();
     let retried = client
-        .migrate_shard(request)
+        .migrate_shard(request.clone())
         .await
         .unwrap()
         .into_inner()
         .operation
         .unwrap();
+    assert_eq!(accepted.operation_id, request.idempotency_key);
     assert_eq!(retried.operation_id, accepted.operation_id);
     assert_eq!(accepted.kind, "migrate_shard");
     assert!(matches!(accepted.state.as_str(), "pending" | "running"));

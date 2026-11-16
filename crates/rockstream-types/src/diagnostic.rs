@@ -308,6 +308,7 @@ fn redact_json_value(value: &mut serde_json::Value) -> usize {
 
 fn is_sensitive_json_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
+    let normalized = key.replace(['_', '-', ' '], "");
     [
         "password",
         "passwd",
@@ -320,9 +321,13 @@ fn is_sensitive_json_key(key: &str) -> bool {
         "private_key",
         "private-key",
         "privatekey",
+        "credential",
     ]
     .iter()
     .any(|sensitive| key.contains(sensitive))
+        || matches!(normalized.as_str(), "key" | "keys" | "kek" | "dek")
+        || normalized.ends_with("key")
+        || normalized.contains("keymaterial")
 }
 
 fn redact_secrets_text(input: &str) -> String {
@@ -343,6 +348,20 @@ fn redact_secrets_text(input: &str) -> String {
         "private-key",
         "privatekey",
         "private key",
+        "secret_key",
+        "secret-key",
+        "encryption_key",
+        "encryption-key",
+        "signing_key",
+        "signing-key",
+        "wrapping_key",
+        "wrapping-key",
+        "key_material",
+        "key-material",
+        "kek",
+        "dek",
+        "credential",
+        "credentials",
     ] {
         output = redact_assignment(&output, key);
     }
@@ -689,6 +708,15 @@ mod tests {
             (
                 r#"{"Authorization":"[REDACTED]","private_key":"[REDACTED]"}"#.to_string(),
                 2
+            )
+        );
+        assert_eq!(
+            redact_secrets_with_count(
+                r#"{"key":"fixture-key","signing_key":"fixture-signing-key","credential":"fixture-credential","kek":"fixture-kek","dek":"fixture-dek"}"#
+            ),
+            (
+                r#"{"credential":"[REDACTED]","dek":"[REDACTED]","kek":"[REDACTED]","key":"[REDACTED]","signing_key":"[REDACTED]"}"#.to_string(),
+                5
             )
         );
         assert_eq!(
