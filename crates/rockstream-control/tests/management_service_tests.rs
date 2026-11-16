@@ -1403,6 +1403,44 @@ async fn management_cancellation_obeys_the_safe_boundary() {
             result_json: String::new(),
         }
     );
+    let cancellation_audits = auth
+        .catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.operation_id == AuditField::Known("op_cancel_late".to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(cancellation_audits.len(), 1);
+    let denial = &cancellation_audits[0];
+    assert!(denial
+        .event_id
+        .strip_prefix("management-operation-cancel-denied:")
+        .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok())
+        .is_some());
+    assert_eq!(
+        denial,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: denial.event_id.clone(),
+            timestamp_ms: denial.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("operation:op_cancel_late".to_owned()),
+            scope: AuditField::Known(
+                serde_json::to_string(&PolicyScope::Operation {
+                    operation_id: "op_cancel_late".to_owned(),
+                })
+                .unwrap(),
+            ),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Observed("op_cancel_late".to_owned()),
+            operation_id: AuditField::Known("op_cancel_late".to_owned()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::Known("waiting:worker_handoff_started".to_owned()),
+            after_state: AuditField::Known("waiting:worker_handoff_started".to_owned()),
+        }
+    );
     server.shutdown();
 }
 
