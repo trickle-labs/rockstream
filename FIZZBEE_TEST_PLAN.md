@@ -68,6 +68,12 @@ SlateDB `WriteBatch`) and the CALM invariant
 contributing shard's persisted frontier satisfies `frontier ≥ N`, verifiable by
 any reader of the object store with no coordinator).
 
+The durable shuffle catch-up helper currently persists its inbox marker before
+the inlet handoff, outside the operator's epoch commit. The closed-inlet retry
+test covers explicit rejection and retry; it does not establish atomicity with
+operator state or recovery of a marker left before delivery. Concurrent
+catch-up and owning-epoch recovery remain unqualified (issue #321).
+
 Verification targets:
 - `WriteBatch` is **all-or-nothing**: a crash mid-commit leaves the shard at
   epoch `N-1`, never a torn state where the frontier advanced but state did not
