@@ -3420,7 +3420,7 @@ mod tests {
         let err = super::run_start(&opts).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "RS-2405 control and worker roles require internal mTLS\n  next steps: Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development."
+            "RS-2405 control, worker, and connected gateway roles require internal mTLS\n  next steps: Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development."
         );
         assert!(!storage.exists());
     }
