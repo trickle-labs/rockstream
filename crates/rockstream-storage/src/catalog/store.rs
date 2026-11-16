@@ -40,7 +40,6 @@ use rockstream_types::workload::WorkloadDef;
 
 const SECURITY_AUDIT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_SECURITY_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
-
 pub const SECURITY_AUDIT_APPEND_ATTEMPTS: usize = 8;
 
 /// Abstract interface for catalog operations.
@@ -607,6 +606,24 @@ impl DurableCatalogStore {
                     path.as_ref()
                 )));
             }
+            if revision == expected_revision
+                && last_replayed_log.as_ref().is_some_and(
+                    |(last_revision, last_operation_id, last_bytes)| {
+                        *last_revision == revision
+                            && *last_operation_id == txn.operation_id
+                            && last_bytes.as_slice() == bytes.as_ref()
+                    },
+                )
+            {
+                continue;
+            }
+            if revision != expected_revision.saturating_add(1) {
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
+                    expected_revision.saturating_add(1),
+                    revision
+                )));
+            }
             if recovered_state
                 .committed_operations
                 .contains(&txn.operation_id)
@@ -614,13 +631,6 @@ impl DurableCatalogStore {
                 return Err(CatalogError::DecodeError(format!(
                     "[RS-1003] duplicate catalog operation {} at revision {}; next_steps: inspect catalog log files",
                     txn.operation_id, revision
-                )));
-            }
-            if revision != expected_revision.saturating_add(1) {
-                return Err(CatalogError::DecodeError(format!(
-                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
-                    expected_revision.saturating_add(1),
-                    revision
                 )));
             }
 
@@ -1423,7 +1433,6 @@ impl CatalogStore for DurableCatalogStore {
         if state.committed_operations.contains(&txn.operation_id) {
             return Ok(state.revision);
         }
-
         let next_revision = state.revision.checked_add(1).ok_or_else(|| {
             CatalogError::OptimisticConflict("catalog revision is exhausted".to_owned())
         })?;
