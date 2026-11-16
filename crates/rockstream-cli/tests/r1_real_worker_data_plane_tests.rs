@@ -80,41 +80,6 @@ fn spawn_with_tls(
     command.spawn().unwrap()
 }
 
-fn spawn_worker(
-    storage: &std::path::Path,
-    control_addr: &str,
-    worker_id: u64,
-    minio_port: u16,
-    bucket: &str,
-) -> Child {
-    let worker_id = worker_id.to_string();
-    Command::new(env!("CARGO_BIN_EXE_rockstream"))
-        .args([
-            "start",
-            "--storage",
-            storage.to_str().unwrap(),
-            "--role",
-            "worker",
-            "--allow-insecure-internal-dev",
-            "--control",
-            control_addr,
-            "--worker-id",
-            &worker_id,
-        ])
-        .env(
-            "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
-            format!("http://127.0.0.1:{minio_port}"),
-        )
-        .env("ROCKSTREAM_OBJECT_STORE_BUCKET", bucket)
-        .env("ROCKSTREAM_OBJECT_STORE_REGION", "us-east-1")
-        .env("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY", MINIO_USER)
-        .env("ROCKSTREAM_OBJECT_STORE_SECRET_KEY", MINIO_PASS)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
-}
-
 fn spawn_worker_with_tls(
     storage: &std::path::Path,
     control_addr: &str,
