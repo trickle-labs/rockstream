@@ -2875,6 +2875,239 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn worker_peer_certificate_rejections_are_audited_by_release_process() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_addr: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut control =
+        start_control_process(temp.path(), &storage, control_addr, &pki, None, false).await;
+    wait_for_gateway(&mut control.0, control_addr).await;
+
+    let security_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let principals_before = security_catalog.list_security_principals().await.unwrap();
+
+    let exchange_addr: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let worker_dir = temp.path().join("worker-process");
+    std::fs::create_dir_all(&worker_dir).unwrap();
+    let worker_storage = temp.path().join("worker-process-storage");
+    let mut worker = start_worker_shuffle_process(
+        &worker_dir,
+        &worker_storage,
+        control_addr,
+        exchange_addr,
+        &pki,
+        3,
+    );
+    wait_for_gateway(&mut worker.0, exchange_addr).await;
+    let audit_path = storage.join("audit.jsonl");
+    let registration_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = FileAuditLog::open(&audit_path).unwrap().read_all().unwrap();
+        if events
+            .iter()
+            .any(|event| event.action == "worker.registered" && event.resource == "worker-3")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < registration_deadline,
+            "release worker did not register before peer qualification: {events:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wait_for_worker_shuffle_peer(exchange_addr, WorkerId(3), pki.worker_tls_config(3)).await;
+
+    security_catalog.refresh().await.unwrap();
+    let registrations_before = FileAuditLog::open(&audit_path)
+        .unwrap()
+        .read_all()
+        .unwrap()
+        .iter()
+        .filter(|event| event.action == "worker.registered")
+        .count();
+    let audit_before = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+
+    let peers = Arc::new(RwLock::new(std::collections::HashMap::from([(
+        WorkerId(3),
+        exchange_addr.to_string(),
+    )])));
+    let mut handshake_rejections = Vec::new();
+    for tls in [
+        pki.expired_worker_tls_config(),
+        pki.untrusted_worker_tls_config(),
+    ] {
+        let mut config = rockstream_types::config::ExchangeConfig::default();
+        config.max_retries = 1;
+        let pool = ShuffleClientPool::new(peers.clone())
+            .with_config(config)
+            .with_internal_tls(tls);
+        let mut client = pool.get_client(WorkerId(3)).await.unwrap();
+        let mut request = tonic::Request::new(futures::stream::iter(Vec::<ShuffleFrame>::new()));
+        request.metadata_mut().insert(
+            "protocol_version",
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        assert!(client.shuffle_stream(request).await.is_err());
+
+        let prior_count = audit_before.len() + handshake_rejections.len();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed_count = prior_count;
+        let mut stable_since = None;
+        let audit = loop {
+            security_catalog.refresh().await.unwrap();
+            let records = security_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap();
+            if records.len() > prior_count {
+                if records.len() != observed_count {
+                    observed_count = records.len();
+                    stable_since = Some(Instant::now());
+                } else if stable_since
+                    .is_some_and(|since: Instant| since.elapsed() >= Duration::from_millis(200))
+                {
+                    break records;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker listener did not durably audit the rejected TLS handshake: {records:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let new_rejections = &audit[prior_count..];
+        assert!(!new_rejections.is_empty());
+        for rejection in new_rejections {
+            assert!(
+                rejection.event_id.starts_with("shuffle-tls-handshake:"),
+                "unexpected security audit during rejected TLS connect: {rejection:?}"
+            );
+            let AuditCorrelation::Observed(peer) = &rejection.correlation else {
+                panic!("handshake audit must use the listener-observed peer address");
+            };
+            assert!(peer
+                .strip_prefix("peer=")
+                .unwrap()
+                .parse::<std::net::SocketAddr>()
+                .is_ok());
+            assert_eq!(
+                rejection,
+                &SecurityAuditRecord {
+                    format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                    event_id: rejection.event_id.clone(),
+                    timestamp_ms: rejection.timestamp_ms,
+                    actor: AuditIdentity::Unknown,
+                    target: AuditField::Unknown,
+                    scope: AuditField::Known("worker_shuffle".to_owned()),
+                    action: SecurityAuditClass::NodeIdentityRejection,
+                    outcome: SecurityAuditOutcome::Denied,
+                    correlation: AuditCorrelation::Observed(peer.clone()),
+                    operation_id: AuditField::NotApplicable,
+                    policy_revision: AuditField::NotApplicable,
+                    before_state: AuditField::NotApplicable,
+                    after_state: AuditField::NotApplicable,
+                }
+            );
+            handshake_rejections.push(rejection.clone());
+        }
+    }
+
+    let pool = ShuffleClientPool::new(peers).with_internal_tls(pki.mismatched_worker_tls_config());
+    let mut client = pool.get_client(WorkerId(3)).await.unwrap();
+    let mut request = tonic::Request::new(futures::stream::iter(Vec::<ShuffleFrame>::new()));
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    let denial = client.shuffle_stream(request).await.unwrap_err();
+    assert_eq!(denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denial.message(),
+        "RS-2401: worker node identity is not currently registered"
+    );
+
+    security_catalog.refresh().await.unwrap();
+    let audit_after = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_after.len(),
+        audit_before.len() + handshake_rejections.len() + 1
+    );
+    assert_eq!(
+        &audit_after[audit_before.len()..audit_before.len() + handshake_rejections.len()],
+        handshake_rejections
+    );
+    let rejection = audit_after.last().unwrap();
+    assert!(rejection.event_id.starts_with("shuffle-node-identity:"));
+    assert_eq!(
+        rejection,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: rejection.event_id.clone(),
+            timestamp_ms: rejection.timestamp_ms,
+            actor: AuditIdentity::Unverified("worker:worker-999".to_owned()),
+            target: AuditField::Unverified("worker:worker-999".to_owned()),
+            scope: AuditField::Known("worker_shuffle".to_owned()),
+            action: SecurityAuditClass::NodeIdentityRejection,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    assert_eq!(
+        security_catalog.list_security_principals().await.unwrap(),
+        principals_before
+    );
+    assert_eq!(
+        FileAuditLog::open(&audit_path)
+            .unwrap()
+            .read_all()
+            .unwrap()
+            .iter()
+            .filter(|event| event.action == "worker.registered")
+            .count(),
+        registrations_before
+    );
+
+    wait_for_worker_shuffle_peer(exchange_addr, WorkerId(3), pki.worker_tls_config(3)).await;
+    assert!(worker.0.try_wait().unwrap().is_none());
+    worker.0.kill().unwrap();
+    worker.0.wait().unwrap();
+    control.0.kill().unwrap();
+    control.0.wait().unwrap();
+    let recovered_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let recovered = DurableCatalogStore::recover(recovered_store, "gateway")
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.list_security_audit_records().await.unwrap(),
+        audit_after
+    );
+}
+
+#[cfg(unix)]
 async fn wait_for_release_worker_lease(
     client: &rockstream_runtime::WorkerClientHandle,
     shard_id: ShardId,
@@ -3137,7 +3370,7 @@ async fn in_flight_internal_mtls_rotation_preserves_release_worker_stream() {
     frame_tx
         .send(ShuffleFrame {
             exchange_id: 100,
-            src_shard: 0,
+            src_shard: first_shard.0 as u32,
             target_shard: u32::MAX,
             epoch: 1,
             seq: 1,

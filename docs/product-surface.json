@@ -5101,6 +5101,22 @@
         "deprecated": false,
         "env_var": "ROCKSTREAM_OBJECT_STORE_URL",
         "source_origin": "rockstream-storage"
+      },
+      {
+        "key": "worker.exchange_advertise_addr",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Reachable host:port registered for worker-to-worker shuffle; must not be a wildcard or use port 0",
+        "deprecated": false,
+        "source_origin": "rockstream-types::config::WorkerSection"
+      },
+      {
+        "key": "worker.exchange_bind_addr",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Local socket address for the worker-to-worker shuffle listener; configure with worker.exchange_advertise_addr",
+        "deprecated": false,
+        "source_origin": "rockstream-types::config::WorkerSection"
       }
     ]
   },

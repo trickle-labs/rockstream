@@ -193,6 +193,29 @@ impl ExchangeRegistry {
         }
     }
 
+    fn tls_handshake_rejection(peer_addr: std::net::SocketAddr) -> SecurityAuditRecord {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("shuffle-tls-handshake:{}", uuid::Uuid::new_v4()),
+            timestamp_ms: timestamp_ms.max(1),
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Unknown,
+            scope: AuditField::Known("worker_shuffle".to_owned()),
+            action: SecurityAuditClass::NodeIdentityRejection,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Observed(format!("peer={peer_addr}")),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    }
+
     async fn audit_authorization_denial(
         &self,
         worker_id: WorkerId,
@@ -451,6 +474,7 @@ impl ExchangeService {
         let task_tracker = self.task_tracker.clone();
 
         let handle = self.task_tracker.spawn(async move {
+            let audit_registry = server.registry.clone();
             let api = crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
                 server,
             );
@@ -490,6 +514,7 @@ impl ExchangeService {
                         let reloader = reloader.clone();
                         let incoming_tx = incoming_tx.clone();
                         let handshake_cancel = accept_cancel.clone();
+                        let audit_registry = audit_registry.clone();
                         handshake_tracker.clone().spawn(async move {
                             let _permit = permit;
                             let handshake = tokio::select! {
@@ -504,6 +529,14 @@ impl ExchangeService {
                                     let _ = incoming_tx.send(Ok(stream)).await;
                                 }
                                 Ok(Err(_)) | Err(_) => {
+                                    if let Err(error) = audit_registry
+                                        .append_security_audit(
+                                            ExchangeRegistry::tls_handshake_rejection(peer_addr),
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(%peer_addr, %error, code = %RS_0003, "failed to durably audit worker shuffle mTLS rejection");
+                                    }
                                     tracing::warn!(%peer_addr, "worker shuffle mTLS handshake rejected");
                                 }
                             }
@@ -723,7 +756,6 @@ impl ShuffleService for ShuffleServer {
         let mut stream = request.into_inner();
         let registry = self.registry.clone();
         let require_local_assignment = self.require_worker_identity;
-        let authenticated_worker_id = authenticated_worker_id;
 
         let cap = self.exchange_config.frame_channel_capacity.max(1);
         let (tx, rx) = mpsc::channel(cap);
