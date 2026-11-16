@@ -31,6 +31,14 @@ async fn test_worker_heartbeat_timeout_and_lease_reassignment() {
 
     // 3. Acquire shard 0 lease on Worker 1
     tokio::time::sleep(Duration::from_millis(100)).await;
+    let endpoint: std::net::SocketAddr =
+        catalog.get(WorkerId(101)).unwrap().address.parse().unwrap();
+    assert_eq!(
+        endpoint.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    assert_ne!(endpoint.port(), 0);
+    tokio::net::TcpStream::connect(endpoint).await.unwrap();
     let _ = client_1.request_shard(ShardId(0)).await;
 
     // Verify Worker 1 owns shard 0
@@ -50,6 +58,16 @@ async fn test_worker_heartbeat_timeout_and_lease_reassignment() {
     // 4. Disconnect Worker 1 (abort task) and release in control plane
     handle_1.abort();
     drop(client_1);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if tokio::net::TcpStream::connect(endpoint).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker exchange listener did not stop");
     catalog.deregister(WorkerId(101));
     manager.release_worker(WorkerId(101));
 

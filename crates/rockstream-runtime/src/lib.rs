@@ -15,6 +15,7 @@ pub mod client;
 pub mod compaction;
 pub mod data_plane;
 pub mod epoch_compaction;
+mod owned_epoch;
 pub use epoch_compaction::{
     EpochCompactionConfig, EpochCompactionError, EpochCompactionFilter, EpochCompactionMetrics,
     EpochCompactionMetricsSnapshot, EpochCompactor, InFlightZSetAccumulator, KeyExtractionStrategy,
