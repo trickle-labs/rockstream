@@ -27,4 +27,6 @@
 | skew_split.max_skew_buckets | u16 | 16 | ROCKSTREAM_SKEW_SPLIT_MAX_SKEW_BUCKETS | false | rockstream-types::config::SkewSplitConfig | Maximum number of sub-buckets per skewed key |
 | storage.base_dir | String | ./data | ROCKSTREAM_STORAGE_DIR | false | rockstream-storage | Local filesystem storage directory root |
 | storage.object_store_url | Option<String> | None | ROCKSTREAM_OBJECT_STORE_URL | false | rockstream-storage | Object store bucket URL (e.g. s3://bucket or minio://bucket) |
+| worker.exchange_advertise_addr | Option<String> | None | — | false | rockstream-types::config::WorkerSection | Reachable host:port registered for worker-to-worker shuffle; must not be a wildcard or use port 0 |
+| worker.exchange_bind_addr | Option<String> | None | — | false | rockstream-types::config::WorkerSection | Local socket address for the worker-to-worker shuffle listener; configure with worker.exchange_advertise_addr |
 

@@ -6,7 +6,40 @@ use rockstream_runtime::exchange::service::{ExchangeRegistry, ExchangeService};
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::config::ExchangeConfig;
 use rockstream_types::ids::WorkerId;
+use rockstream_types::topology::{
+    CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
+    WorkerLocation,
+};
 use std::collections::HashMap;
+
+fn registry_with_workers(worker_ids: &[u64]) -> ExchangeRegistry {
+    let workers = worker_ids
+        .iter()
+        .map(|worker_id| {
+            let worker_id = WorkerId(*worker_id);
+            (
+                worker_id,
+                WorkerInfo {
+                    worker_id,
+                    role: NodeRole::Worker,
+                    address: "127.0.0.1:1".to_owned(),
+                    capacity_headroom: CapacityHeadroom::FULL,
+                    location: WorkerLocation::default(),
+                    capabilities: WorkerCapabilities::default(),
+                    protocol_range: Default::default(),
+                    storage_format_range: Default::default(),
+                    registered_at_ms: 1,
+                    healthy: true,
+                    lifecycle: WorkerLifecycleState::Active,
+                },
+            )
+        })
+        .collect();
+    ExchangeRegistry::with_worker_state(
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(workers)),
+    )
+}
 
 #[tokio::test]
 async fn test_worker_shuffle_grpc_mtls_valid_cert_admitted() {
@@ -16,7 +49,7 @@ async fn test_worker_shuffle_grpc_mtls_valid_cert_admitted() {
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
-    let registry = ExchangeRegistry::new();
+    let registry = registry_with_workers(&[2]);
     let service = ExchangeService::new(registry).with_internal_tls(pki.worker_tls_config(1));
 
     service.start(addr).await.unwrap();
@@ -42,6 +75,42 @@ async fn test_worker_shuffle_grpc_mtls_valid_cert_admitted() {
         res.err()
     );
 
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_worker_shuffle_grpc_mtls_rejects_unregistered_worker_identity() {
+    let pki = TestPki::generate();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let service = ExchangeService::new(registry_with_workers(&[1]))
+        .with_internal_tls(pki.worker_tls_config(1));
+    service.start(addr).await.unwrap();
+    let peers = Arc::new(RwLock::new(HashMap::from([(
+        WorkerId(1),
+        addr.to_string(),
+    )])));
+    let pool = ShuffleClientPool::new(peers).with_internal_tls(pki.worker_tls_config(2));
+    let mut client = pool.get_client(WorkerId(1)).await.unwrap();
+    let mut request = tonic::Request::new(futures::stream::iter(Vec::<
+        rockstream_runtime::exchange::proto::ShuffleFrame,
+    >::new()));
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+
+    let status = match client.shuffle_stream(request).await {
+        Err(status) => status,
+        Ok(_) => panic!("unregistered worker certificate must be rejected"),
+    };
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        status.message(),
+        "RS-2401: worker node identity is not currently registered"
+    );
     service.shutdown().await;
 }
 

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +20,10 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+use rockstream_types::config::ExchangeConfig;
 use rockstream_types::data_plane::{
     DeploymentDescriptor, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow,
     DEPLOYMENT_DESCRIPTOR_VERSION,
@@ -916,6 +919,13 @@ impl WorkerClientHandle {
         self.topology_workers.read().values().cloned().collect()
     }
 
+    pub(crate) fn exchange_registry(&self) -> crate::exchange::service::ExchangeRegistry {
+        crate::exchange::service::ExchangeRegistry::with_worker_state(
+            self.active_shards.clone(),
+            self.topology_workers.clone(),
+        )
+    }
+
     /// Request a fresh short-lived token over the authenticated control channel.
     pub async fn request_secret_token(
         &self,
@@ -1025,6 +1035,20 @@ impl WorkerClientHandle {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkerExchangeEndpoint {
+    pub bind_addr: SocketAddr,
+    pub advertise_addr: String,
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Connect to the control plane and start the worker client daemon loop.
 pub async fn start_worker_client(
     proposed_worker_id: u64,
@@ -1129,9 +1153,67 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
     tls_config: InternalTlsConfig,
     compaction_config: EpochCompactionConfig,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_runtime(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        tls_config,
+        compaction_config,
+        None,
+        ExchangeConfig::default(),
+        false,
+    )
+    .await
+}
+
+/// Start a worker with its peer shuffle listener available before registration.
+pub async fn start_worker_client_with_exchange_endpoint(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+    exchange_config: ExchangeConfig,
+    endpoint: WorkerExchangeEndpoint,
+    allow_insecure_internal_dev: bool,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_runtime(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        tls_config,
+        EpochCompactionConfig::default(),
+        Some(endpoint),
+        exchange_config,
+        allow_insecure_internal_dev,
+    )
+    .await
+}
+
+async fn start_worker_client_with_runtime(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+    compaction_config: EpochCompactionConfig,
+    exchange_endpoint: Option<WorkerExchangeEndpoint>,
+    exchange_config: ExchangeConfig,
+    allow_insecure_internal_dev: bool,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
     compaction_config
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let registration_address = exchange_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.advertise_addr.clone())
+        .unwrap_or_else(|| "127.0.0.1:0".to_owned());
     let initial_headroom = system_memory_headroom()?;
     let clean_url = control_url
         .trim_start_matches("https://")
@@ -1164,6 +1246,11 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
             capabilities,
             initial_headroom,
             compaction_config,
+            registration_address,
+            exchange_endpoint,
+            tls_config,
+            exchange_config,
+            allow_insecure_internal_dev,
             reader,
             writer,
         )
@@ -1177,6 +1264,11 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
             capabilities,
             initial_headroom,
             compaction_config,
+            registration_address,
+            exchange_endpoint,
+            tls_config,
+            exchange_config,
+            allow_insecure_internal_dev,
             reader,
             writer,
         )
@@ -1254,6 +1346,11 @@ async fn run_worker_client<R, W>(
     capabilities: WorkerCapabilities,
     initial_headroom: CapacityHeadroom,
     compaction_config: EpochCompactionConfig,
+    registration_address: String,
+    exchange_endpoint: Option<WorkerExchangeEndpoint>,
+    tls_config: InternalTlsConfig,
+    exchange_config: ExchangeConfig,
+    allow_insecure_internal_dev: bool,
     reader: R,
     mut writer: W,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)>
@@ -1298,6 +1395,30 @@ where
         deployments: deployments.clone(),
     };
 
+    let exchange_shutdown = if let Some(endpoint) = exchange_endpoint {
+        let mut service =
+            crate::exchange::service::ExchangeService::new(handle.exchange_registry())
+                .with_exchange_config(exchange_config);
+        if tls_config.is_enabled() {
+            service = service.with_internal_tls(tls_config);
+        } else if allow_insecure_internal_dev {
+            service = service.with_insecure_internal_dev();
+        }
+        let shutdown = service.cancel_token().clone();
+        let _exchange_task = service
+            .start(endpoint.bind_addr)
+            .await
+            .map_err(io::Error::other)?;
+        tracing::info!(
+            bind_addr = %endpoint.bind_addr,
+            advertise_addr = %endpoint.advertise_addr,
+            "worker shuffle listener started"
+        );
+        Some(shutdown)
+    } else {
+        None
+    };
+
     let actor_registry = ShardActorRegistry::new();
     let executor_client = handle.clone();
     let executor_deployments = deployments.clone();
@@ -1328,11 +1449,12 @@ where
     let compaction_config_clone = compaction_config.clone();
 
     let join_handle = tokio::spawn(async move {
+        let _exchange_shutdown = exchange_shutdown.map(CancelOnDrop);
         // 1. Send Registration message.
         let reg = WorkerRegistration::new(
             WorkerId(proposed_worker_id),
             NodeRole::Worker,
-            "127.0.0.1:0", // Default loopback
+            registration_address,
             initial_headroom,
         )
         .with_location(location.clone())

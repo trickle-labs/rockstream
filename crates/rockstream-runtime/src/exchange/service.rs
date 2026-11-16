@@ -31,6 +31,9 @@ pub struct ExchangeInlet {
 pub struct ExchangeRegistry {
     inlets: Arc<RwLock<HashMap<(u64, u32), ExchangeInlet>>>,
     active_shards: Arc<RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>>,
+    topology_workers: Arc<
+        RwLock<HashMap<rockstream_types::ids::WorkerId, rockstream_types::topology::WorkerInfo>>,
+    >,
     cluster_frontier: Arc<std::sync::atomic::AtomicU64>,
     grpc_frames_received: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -40,6 +43,7 @@ impl Default for ExchangeRegistry {
         Self {
             inlets: Arc::new(RwLock::new(HashMap::new())),
             active_shards: Arc::new(RwLock::new(HashMap::new())),
+            topology_workers: Arc::new(RwLock::new(HashMap::new())),
             cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -56,9 +60,23 @@ impl ExchangeRegistry {
             RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>,
         >,
     ) -> Self {
-        ExchangeRegistry {
+        Self::with_worker_state(active_shards, Arc::new(RwLock::new(HashMap::new())))
+    }
+
+    pub fn with_worker_state(
+        active_shards: Arc<
+            RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>,
+        >,
+        topology_workers: Arc<
+            RwLock<
+                HashMap<rockstream_types::ids::WorkerId, rockstream_types::topology::WorkerInfo>,
+            >,
+        >,
+    ) -> Self {
+        Self {
             inlets: Arc::new(RwLock::new(HashMap::new())),
             active_shards,
+            topology_workers,
             cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -113,6 +131,14 @@ impl ExchangeRegistry {
         shards
             .get(&rockstream_types::ids::ShardId(shard_id as u64))
             .and_then(|state| state.db.clone())
+    }
+
+    fn is_registered_worker(&self, identity: &NodeIdentity) -> bool {
+        self.topology_workers.read().values().any(|worker| {
+            worker.healthy
+                && worker.lifecycle == rockstream_types::topology::WorkerLifecycleState::Active
+                && identity.matches_worker_id(worker.worker_id.0)
+        })
     }
 
     pub fn register(
@@ -375,6 +401,17 @@ impl ShuffleServer {
                 "{RS_2401}: worker shuffle requires a worker node identity"
             )));
         }
+        if !self.registry.is_registered_worker(&identity) {
+            tracing::warn!(
+                action = "security.authorization_denied",
+                actor = %identity.to_cn(),
+                error_code = %RS_2401,
+                "unregistered worker identity denied on worker shuffle endpoint"
+            );
+            return Err(Status::permission_denied(format!(
+                "{RS_2401}: worker node identity is not currently registered"
+            )));
+        }
         Ok(())
     }
 
@@ -433,6 +470,7 @@ impl ShuffleService for ShuffleServer {
         self.validate_protocol_version(request.metadata())?;
         let mut stream = request.into_inner();
         let registry = self.registry.clone();
+        let require_local_assignment = self.require_worker_identity;
 
         let cap = self.exchange_config.frame_channel_capacity.max(1);
         let (tx, rx) = mpsc::channel(cap);
@@ -442,49 +480,62 @@ impl ShuffleService for ShuffleServer {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(frame) => {
+                        if require_local_assignment
+                            && registry.get_shard_db(frame.target_shard).is_none()
+                        {
+                            let status = Status::permission_denied(format!(
+                                "{RS_2401}: target shard is not assigned to this worker"
+                            ));
+                            let _ = tx.send(Err(status)).await;
+                            break;
+                        }
                         registry
                             .grpc_frames_received
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let inlet_opt = registry.get(frame.exchange_id, frame.target_shard);
-                        if let Some(inlet) = inlet_opt {
-                            let mut already_reflected = false;
-                            if let Some(db) = registry.get_shard_db(frame.target_shard) {
-                                match crate::exchange::persistence::committed_frontier(&db).await {
-                                    Ok(frontier) => {
-                                        already_reflected = frame.epoch <= frontier;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            code = %rockstream_types::error_code::RS_3023,
-                                            exchange_id = frame.exchange_id,
-                                            target_shard = frame.target_shard,
-                                            epoch = frame.epoch,
-                                            "failed to read committed frontier for shuffle replay dedup; delivering conservatively: {:?}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-
-                            if !already_reflected {
-                                if let Ok(zset) =
-                                    deserialize_zset(&frame.payload, inlet.schema.clone())
-                                {
-                                    if inlet.sender.send(zset).await.is_err() {
-                                        tracing::warn!(
-                                            exchange_id = frame.exchange_id,
-                                            target_shard = frame.target_shard,
-                                            "Target inlet receiver dropped"
-                                        );
-                                    }
-                                }
-                            }
-                        } else {
+                        let Some(inlet) = registry.get(frame.exchange_id, frame.target_shard)
+                        else {
                             tracing::warn!(
                                 exchange_id = frame.exchange_id,
                                 target_shard = frame.target_shard,
                                 "Received shuffle frame for unregistered target"
                             );
+                            let _ = tx
+                                .send(Err(Status::permission_denied(format!(
+                                    "{RS_2401}: shuffle target is not registered"
+                                ))))
+                                .await;
+                            break;
+                        };
+                        let mut already_reflected = false;
+                        if let Some(db) = registry.get_shard_db(frame.target_shard) {
+                            match crate::exchange::persistence::committed_frontier(&db).await {
+                                Ok(frontier) => {
+                                    already_reflected = frame.epoch <= frontier;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        code = %rockstream_types::error_code::RS_3023,
+                                        exchange_id = frame.exchange_id,
+                                        target_shard = frame.target_shard,
+                                        epoch = frame.epoch,
+                                        "failed to read committed frontier for shuffle replay dedup; delivering conservatively: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+
+                        if !already_reflected {
+                            if let Ok(zset) = deserialize_zset(&frame.payload, inlet.schema.clone())
+                            {
+                                if inlet.sender.send(zset).await.is_err() {
+                                    tracing::warn!(
+                                        exchange_id = frame.exchange_id,
+                                        target_shard = frame.target_shard,
+                                        "Target inlet receiver dropped"
+                                    );
+                                }
+                            }
                         }
 
                         let ack = ShuffleAck {
@@ -540,11 +591,26 @@ impl ShuffleService for ShuffleServer {
         self.validate_worker_identity(&request)?;
         self.validate_protocol_version(request.metadata())?;
         let mut stream = request.into_inner();
+        let registry = self.registry.clone();
+        let require_local_assignment = self.require_worker_identity;
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(frame) => {
+                        if require_local_assignment
+                            && u32::try_from(frame.shard_id)
+                                .ok()
+                                .and_then(|shard_id| registry.get_shard_db(shard_id))
+                                .is_none()
+                        {
+                            let _ = tx
+                                .send(Err(Status::permission_denied(format!(
+                                    "{RS_2401}: target shard is not assigned to this worker"
+                                ))))
+                                .await;
+                            break;
+                        }
                         let ack = crate::exchange::proto::ExchangeAck {
                             protocol_version: frame.protocol_version,
                             workload_id: frame.workload_id,
@@ -914,6 +980,46 @@ mod tests {
         let _ = tx_close.send(());
         server_handle.abort();
         eprintln!("TEST FINISHED");
+    }
+
+    #[tokio::test]
+    async fn grpc_shuffle_rejects_unregistered_target_instead_of_acknowledging_loss() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let service = ExchangeService::new(ExchangeRegistry::new()).with_insecure_internal_dev();
+        service.start(addr).await.unwrap();
+
+        let peers = Arc::new(RwLock::new(HashMap::from([(
+            WorkerId(1),
+            addr.to_string(),
+        )])));
+        let pool = ShuffleClientPool::new(peers);
+        let mut client = pool.get_client(WorkerId(1)).await.unwrap();
+        let frame = ShuffleFrame {
+            exchange_id: 10,
+            src_shard: 1,
+            target_shard: 2,
+            epoch: 1,
+            seq: 1,
+            payload: Vec::new().into(),
+            row_count: 1,
+        };
+        let request = Request::new(futures::stream::iter(vec![frame]));
+        let mut request = request;
+        request.metadata_mut().insert(
+            "protocol_version",
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        let mut response = client.shuffle_stream(request).await.unwrap().into_inner();
+        let status = response.next().await.unwrap().unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            status.message(),
+            "RS-2401: shuffle target is not registered"
+        );
+        service.shutdown().await;
     }
 
     #[tokio::test]
