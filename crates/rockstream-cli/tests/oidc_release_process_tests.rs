@@ -1588,15 +1588,15 @@ async fn wait_for_exact_query_rows(
                     .map(|messages| simple_query_rows(&messages));
                 view_diagnostics.push((view, rows, status));
             }
-            let consumer_lags =
-                kafka_source_group_lags(broker, "rotating-orders", "rotation-group-").await;
+            let consumer_checkpoints =
+                kafka_source_group_checkpoints(broker, "rotating-orders", "rotation-group-").await;
             let _ = process.kill();
             let _ = process.wait();
             let mut stderr = String::new();
             if let Some(stderr_pipe) = process.stderr.as_mut() {
                 let _ = stderr_pipe.read_to_string(&mut stderr);
             }
-            panic!("{label}: expected {expected:?}, observed {observed:?}; sources={sources:?}; source_rows={source_rows:?}; backfill={backfill:?}; view_diagnostics={view_diagnostics:?}; consumer_lags={consumer_lags:?}; stderr={stderr}");
+            panic!("{label}: expected {expected:?}, observed {observed:?}; sources={sources:?}; source_rows={source_rows:?}; backfill={backfill:?}; view_diagnostics={view_diagnostics:?}; consumer_checkpoints={consumer_checkpoints:?}; stderr={stderr}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1630,11 +1630,11 @@ async fn kafka_source_rows(
     }
 }
 
-async fn kafka_source_group_lags<I: Image>(
+async fn kafka_source_group_checkpoints<I: Image>(
     broker: &ContainerAsync<I>,
     topic: &str,
     group_prefix: &str,
-) -> BTreeMap<String, u64> {
+) -> BTreeMap<String, BTreeMap<i32, (i64, i64)>> {
     let mut command = broker
         .exec(ExecCommand::new([
             "/opt/kafka/bin/kafka-consumer-groups.sh",
@@ -1647,17 +1647,53 @@ async fn kafka_source_group_lags<I: Image>(
         .unwrap();
     let output = String::from_utf8(command.stdout_to_vec().await.unwrap()).unwrap();
     assert_eq!(command.exit_code().await.unwrap(), Some(0), "{output}");
-    let mut lags = BTreeMap::new();
+    let mut checkpoints = BTreeMap::new();
     for line in output.lines() {
         let columns = line.split_whitespace().collect::<Vec<_>>();
         if columns.len() < 6 || !columns[0].starts_with(group_prefix) || columns[1] != topic {
             continue;
         }
-        if let Ok(lag) = columns[5].parse::<u64>() {
-            *lags.entry(columns[0].to_string()).or_default() += lag;
-        }
+        let (Ok(partition), Ok(current), Ok(log_end)) = (
+            columns[2].parse::<i32>(),
+            columns[3].parse::<i64>(),
+            columns[4].parse::<i64>(),
+        ) else {
+            continue;
+        };
+        checkpoints
+            .entry(columns[0].to_string())
+            .or_insert_with(BTreeMap::new)
+            .insert(partition, (current, log_end));
     }
-    lags
+    checkpoints
+}
+
+async fn wait_for_kafka_group_checkpoints<I: Image>(
+    broker: &ContainerAsync<I>,
+    topic: &str,
+    group_prefix: &str,
+    expected_groups: usize,
+    expected_offsets: &BTreeMap<i32, i64>,
+    deadline: Instant,
+    label: &str,
+) -> BTreeMap<String, BTreeMap<i32, (i64, i64)>> {
+    let expected = expected_offsets
+        .iter()
+        .map(|(partition, offset)| (*partition, (*offset, *offset)))
+        .collect::<BTreeMap<_, _>>();
+    loop {
+        let observed = kafka_source_group_checkpoints(broker, topic, group_prefix).await;
+        if observed.len() == expected_groups
+            && observed.values().all(|partitions| partitions == &expected)
+        {
+            return observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: expected {expected_groups} groups at {expected:?}, observed {observed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn kafka_sasl_client(bootstrap: &str, username: &str, password: &str) -> ClientConfig {
@@ -2990,14 +3026,25 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     let pending_rows = (1000..11_000)
         .map(|id| (id, (id % 7 != 0).then_some(id * 10), (id % 3) as i32))
         .collect::<Vec<_>>();
+    let mut expected_rotating_offsets = BTreeMap::from([(0, 1), (1, 1), (2, 1)]);
+    for (_, _, partition) in &pending_rows {
+        *expected_rotating_offsets.get_mut(partition).unwrap() += 1;
+    }
     kafka_source_rows(&producer, "rotating-orders", &pending_rows).await;
     expected_rotating.extend(pending_rows.iter().map(|(id, amount, _)| row(*id, *amount)));
     expected_rotating.sort();
-    let pending_lags = kafka_source_group_lags(&broker, "rotating-orders", "rotation-group-").await;
-    assert_eq!(pending_lags.len(), 2, "expected one Kafka group per view");
+    let pending_checkpoints =
+        kafka_source_group_checkpoints(&broker, "rotating-orders", "rotation-group-").await;
+    assert_eq!(
+        pending_checkpoints.len(),
+        2,
+        "expected one Kafka group per view"
+    );
     assert!(
-        pending_lags.values().all(|lag| *lag > 0),
-        "rotation began without pending work in each view: {pending_lags:?}"
+        pending_checkpoints.values().all(|partitions| partitions
+            .values()
+            .any(|(current, log_end)| log_end > current)),
+        "rotation began without pending work in each view: {pending_checkpoints:?}"
     );
 
     let rotation_operation_id = "00000000-0000-4000-8000-000000000304";
@@ -3102,6 +3149,7 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     let rotated_producer: FutureProducer = rotated_client.create().unwrap();
     let after_rotation = [(50_000, None, 1)];
     kafka_source_rows(&rotated_producer, "rotating-orders", &after_rotation).await;
+    *expected_rotating_offsets.get_mut(&1).unwrap() += 1;
     expected_rotating.push(row(50_000, None));
     expected_rotating.sort();
 
@@ -3134,6 +3182,16 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         )
         .await;
     }
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "rotating-orders",
+        "rotation-group-",
+        2,
+        &expected_rotating_offsets,
+        final_deadline,
+        "rotating view checkpoints after credential replacement",
+    )
+    .await;
     wait_for_exact_query_rows(
         &broker,
         &client,
@@ -3142,6 +3200,17 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         &expected_steady,
         final_deadline,
         "unaffected Kafka consumer after credential rotation",
+    )
+    .await;
+    let expected_steady_offsets = BTreeMap::from([(0, 2)]);
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "steady-orders",
+        "steady-group-",
+        1,
+        &expected_steady_offsets,
+        final_deadline,
+        "unaffected consumer checkpoint after rotation",
     )
     .await;
     assert!(process.0.try_wait().unwrap().is_none());
@@ -3214,6 +3283,16 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         )
         .await;
     }
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "rotating-orders",
+        "rotation-group-",
+        2,
+        &expected_rotating_offsets,
+        recovery_deadline,
+        "rotating view checkpoints after gateway restart",
+    )
+    .await;
     wait_for_exact_query_rows(
         &broker,
         &recovered_client,
@@ -3222,6 +3301,16 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         &expected_steady,
         recovery_deadline,
         "unaffected Kafka consumer after gateway restart",
+    )
+    .await;
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "steady-orders",
+        "steady-group-",
+        1,
+        &expected_steady_offsets,
+        recovery_deadline,
+        "unaffected consumer checkpoint after gateway restart",
     )
     .await;
     let audit = FileAuditLog::open(&storage.join("audit.jsonl"))
