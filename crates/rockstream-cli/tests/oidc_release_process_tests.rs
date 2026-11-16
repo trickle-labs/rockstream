@@ -3340,7 +3340,7 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         "unaffected consumer checkpoint after gateway restart",
     )
     .await;
-    let audit = FileAuditLog::open(&storage.join("audit.jsonl"))
+    let audit = FileAuditLog::open(storage.join("audit.jsonl"))
         .unwrap()
         .read_all()
         .unwrap();
