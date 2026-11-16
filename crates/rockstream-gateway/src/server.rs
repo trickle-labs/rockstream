@@ -2166,6 +2166,7 @@ pub struct GatewayHandler {
     /// materializer fallback left (v0.51.4 Slice 8).
     compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
     distributed_data_plane: Option<DataPlaneClient>,
+    actor_assertion_signer: Option<Arc<rockstream_control::delegation::ActorAssertionSigner>>,
     distributed_storage_root: Option<String>,
     backfill_admission: Arc<crate::admission::BackfillAdmissionController>,
     /// Bound only by `GatewayServer`; source tasks upgrade it per poll and
@@ -2187,6 +2188,97 @@ pub struct GatewayHandler {
     pub in_flight_queries: Arc<AtomicUsize>,
     /// Bound concurrent eager cursor producers across all connections.
     cursor_producer_slots: Arc<tokio::sync::Semaphore>,
+}
+
+fn secret_use_scopes_for_deployment(
+    principal: &rockstream_types::authorization::SecurityPrincipal,
+    schemas: &[rockstream_types::data_plane::DeploymentSchema],
+    sources: impl IntoIterator<Item = CatalogSourceEntry>,
+) -> Vec<rockstream_types::authorization::PolicyScope> {
+    use rockstream_types::authorization::{PolicyScope, SecurityAction};
+
+    sources
+        .into_iter()
+        .filter_map(|source| {
+            let table = source.table_name.as_deref()?;
+            if !schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(table))
+            {
+                return None;
+            }
+            let name = rockstream_types::secret::secret_name_from_reference(
+                source.options.get("secret")?,
+            )?;
+            Some(PolicyScope::Secret {
+                namespace: source.secret_namespace?,
+                name: name.to_owned(),
+                consumer: Some(source.secret_consumer?),
+            })
+        })
+        .filter(|scope| {
+            rockstream_control::authorization::allows(principal, SecurityAction::SecretUse, scope)
+        })
+        .fold(Vec::new(), |mut scopes, scope| {
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+            scopes
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn delegated_secret_allowance_matches_the_authorized_source_scope() {
+    use rockstream_types::authorization::{
+        LoginMethod, PolicyScope, ScopedActionGrant, SecurityAction, SecurityPrincipal,
+        SECURITY_PRINCIPAL_FORMAT_VERSION,
+    };
+
+    let scope = PolicyScope::Secret {
+        namespace: "public".to_owned(),
+        name: "kafka".to_owned(),
+        consumer: Some(PrincipalId(3)),
+    };
+    let source = CatalogSourceEntry {
+        name: "orders_source".to_owned(),
+        table_name: Some("orders".to_owned()),
+        source_type: "kafka".to_owned(),
+        options: HashMap::from([("secret".to_owned(), "secret://kafka".to_owned())]),
+        format: "json".to_owned(),
+        status: "RUNNING".to_owned(),
+        live_offset: "0".to_owned(),
+        live_lag: 0,
+        secret_consumer: Some(PrincipalId(3)),
+        secret_namespace: Some("public".to_owned()),
+    };
+    let mut principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "view author".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Service {
+            service_id: "view-author".to_owned(),
+        }],
+        preset_grants: Vec::new(),
+        scoped_grants: vec![ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: scope.clone(),
+        }],
+    };
+    let schemas = [rockstream_types::data_plane::DeploymentSchema {
+        relation: "ORDERS".to_owned(),
+        columns: Vec::new(),
+    }];
+
+    assert_eq!(
+        secret_use_scopes_for_deployment(&principal, &schemas, [source.clone()],),
+        vec![scope]
+    );
+
+    principal.scoped_grants.clear();
+    assert!(secret_use_scopes_for_deployment(&principal, &schemas, [source]).is_empty());
 }
 
 impl GatewayHandler {
@@ -2496,7 +2588,7 @@ impl GatewayHandler {
             after_state: AuditField::NotApplicable,
         };
         let operation_id = rand::random::<u64>().max(1);
-        for attempt in 0..2 {
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
             let revision = store
                 .get_revision()
                 .await
@@ -2511,7 +2603,8 @@ impl GatewayHandler {
             match store.commit_txn(transaction).await {
                 Ok(_) => return Ok(()),
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                    if attempt == 0 =>
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
                     continue;
                 }
@@ -2643,6 +2736,78 @@ impl GatewayHandler {
             );
         }
         Ok(found)
+    }
+
+    async fn actor_assertion_for_request(
+        &self,
+        conn_id: Option<&str>,
+        action: SecurityAction,
+        scope: PolicyScope,
+        request: &rockstream_types::topology::WorkerMessage,
+    ) -> Result<Option<String>, String> {
+        use rockstream_types::topology::WorkerMessage;
+
+        if !matches!(
+            request,
+            WorkerMessage::DeployWorkload(_)
+                | WorkerMessage::SubmitSourceDelta(_)
+                | WorkerMessage::ReadWorkload { .. }
+                | WorkerMessage::ReadOperatorStats { .. }
+        ) {
+            return Err("[RS-2401] actor assertion may only authorize a data-plane request".into());
+        }
+        if self
+            .distributed_data_plane
+            .as_ref()
+            .is_some_and(DataPlaneClient::uses_insecure_internal_dev)
+        {
+            return Ok(None);
+        }
+        let conn_id = conn_id.ok_or_else(|| {
+            "[RS-2401] delegated data-plane operation has no authenticated client session"
+                .to_owned()
+        })?;
+        let (authenticated, namespace) = self
+            .sessions
+            .get(conn_id)
+            .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+            .ok_or_else(|| "[RS-2401] delegated data-plane session is unavailable".to_owned())?;
+        if authenticated.is_system() {
+            return Err("[RS-2401] system service identity cannot assert a user actor".into());
+        }
+        let principal = self
+            .security_principal_for_login(&authenticated)
+            .await?
+            .ok_or_else(|| "[RS-2401] authenticated actor has no durable principal".to_owned())?;
+        if !principal.enabled
+            || !rockstream_control::authorization::allows(&principal, action, &scope)
+        {
+            return Err(format!(
+                "[RS-2401] actor is not currently authorized for {action:?} on {scope:?} in namespace {namespace}"
+            ));
+        }
+        let signer = self.actor_assertion_signer.as_ref().ok_or_else(|| {
+            "[RS-2401] dedicated actor assertion signing key is not configured".to_owned()
+        })?;
+        let digest = rockstream_control::delegation::request_digest(request)?;
+        let secret_use_scopes = match request {
+            WorkerMessage::DeployWorkload(deployment) => secret_use_scopes_for_deployment(
+                &principal,
+                &deployment.schemas,
+                self.catalog.list_sources(),
+            ),
+            _ => Vec::new(),
+        };
+        signer
+            .issue(
+                principal.id,
+                principal.revision,
+                action,
+                scope,
+                secret_use_scopes,
+                digest,
+            )
+            .map(Some)
     }
 
     async fn authorize_secret_use_for_connection(
@@ -3112,7 +3277,7 @@ impl GatewayHandler {
             after_state: AuditField::NotApplicable,
         };
         let operation_id = rand::random::<u64>().max(1);
-        for attempt in 0..2 {
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
             let revision = store
                 .get_revision()
                 .await
@@ -3127,7 +3292,8 @@ impl GatewayHandler {
             match store.commit_txn(transaction).await {
                 Ok(_) => return Ok(()),
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                    if attempt == 0 =>
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
                     continue;
                 }
@@ -3338,6 +3504,7 @@ impl GatewayHandler {
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
             distributed_data_plane: None,
+            actor_assertion_signer: None,
             distributed_storage_root: None,
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
@@ -3388,6 +3555,7 @@ impl GatewayHandler {
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
             distributed_data_plane: None,
+            actor_assertion_signer: None,
             distributed_storage_root: None,
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
@@ -6432,6 +6600,7 @@ impl GatewayHandler {
         &'a self,
         query: &'a str,
         session_info: &crate::catalog_stubs::SessionInfo,
+        conn_id: Option<&str>,
     ) -> Option<PgWireResult<Vec<Response<'a>>>> {
         let q = query.trim();
         let ql = q.to_lowercase();
@@ -6570,7 +6739,7 @@ impl GatewayHandler {
             || ql.starts_with("create or replace view ")
             || ql.starts_with("create or replace materialized view ")
         {
-            return Some(self.handle_create_view(q).await);
+            return Some(self.handle_create_view(q, conn_id).await);
         }
 
         // REFRESH MATERIALIZED VIEW
@@ -7377,14 +7546,66 @@ impl GatewayHandler {
                                 .filter_map(|operator| parse_operator_id(&operator.op_id))
                                 .collect();
                             let stats = if let Some(data_plane) = &self.distributed_data_plane {
-                                data_plane
-                                    .read_operator_stats(
-                                        WorkloadId(stable_name_id("workload", &view.name)),
-                                        operator_ids.clone(),
+                                let workload_id =
+                                    WorkloadId(stable_name_id("workload", &view.name));
+                                let request_id = uuid::Uuid::new_v4().to_string();
+                                let namespace = conn_id
+                                    .and_then(|id| {
+                                        self.sessions
+                                            .get(id)
+                                            .map(|session| session.current_namespace.clone())
+                                    })
+                                    .unwrap_or_else(|| "public".to_owned());
+                                let worker_request =
+                                    rockstream_types::topology::WorkerMessage::ReadOperatorStats {
+                                        request_id: request_id.clone(),
+                                        workload_id,
+                                        operator_ids: operator_ids.clone(),
+                                    };
+                                let assertion = self
+                                    .actor_assertion_for_request(
+                                        conn_id,
+                                        SecurityAction::DataRead,
+                                        PolicyScope::Resource {
+                                            namespace,
+                                            kind: ResourceKind::View,
+                                            name: view.name.clone(),
+                                        },
+                                        &worker_request,
                                     )
                                     .await
-                                    .ok()
-                                    .flatten()
+                                    .map_err(|detail| {
+                                        PgWireError::ApiError(Box::new(
+                                            GatewayError::QueryTimeExecutionFailed { detail },
+                                        ))
+                                    })?;
+                                let stats = match assertion {
+                                    Some(assertion) => {
+                                        data_plane
+                                            .read_operator_stats_delegated(
+                                                workload_id,
+                                                operator_ids.clone(),
+                                                request_id,
+                                                &assertion,
+                                            )
+                                            .await
+                                    }
+                                    None => {
+                                        data_plane
+                                            .read_operator_stats(workload_id, operator_ids.clone())
+                                            .await
+                                    }
+                                };
+                                stats.map_err(|error| {
+                                    PgWireError::ApiError(Box::new(
+                                        GatewayError::QueryTimeExecutionFailed {
+                                            detail: format!(
+                                                "read delegated operator stats for {}: {error}",
+                                                view.name
+                                            ),
+                                        },
+                                    ))
+                                })?
                             } else if self.compiled_views.contains_key(&view.name) {
                                 let local =
                                     rockstream_types::metrics::operator_runtime_stats_for_ids(
@@ -8184,7 +8405,7 @@ impl GatewayHandler {
                 .collect());
         }
 
-        if let Some(result) = self.dispatch_sync(query, &session_info).await {
+        if let Some(result) = self.dispatch_sync(query, &session_info, conn_id).await {
             // Promote lifetime — responses from dispatch_sync hold no borrows
             // from `query`, only owned data.
             let result = result.map(|v| v.into_iter().map(promote_response).collect());
@@ -9191,14 +9412,46 @@ impl GatewayHandler {
             .filter(|_| self.catalog.get_view(view_name).is_some());
         let batches: Vec<RecordBatch> = if let Some(distributed_data_plane) = distributed_data_plane
         {
-            let snapshot = distributed_data_plane
-                .read_workload(WorkloadId(stable_name_id("workload", view_name)))
+            let namespace = conn_id
+                .and_then(|id| {
+                    self.sessions
+                        .get(id)
+                        .map(|session| session.current_namespace.clone())
+                })
+                .unwrap_or_else(|| "public".to_owned());
+            let workload_id = WorkloadId(stable_name_id("workload", view_name));
+            let worker_request =
+                rockstream_types::topology::WorkerMessage::ReadWorkload { workload_id };
+            let assertion = self
+                .actor_assertion_for_request(
+                    conn_id,
+                    SecurityAction::DataRead,
+                    PolicyScope::Resource {
+                        namespace,
+                        kind: ResourceKind::View,
+                        name: view_name.to_owned(),
+                    },
+                    &worker_request,
+                )
                 .await
-                .map_err(|error| {
+                .map_err(|detail| {
                     PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                        detail: format!("read distributed view {view_name}: {error}"),
+                        detail,
                     }))
                 })?;
+            let snapshot = match assertion {
+                Some(assertion) => {
+                    distributed_data_plane
+                        .read_workload_delegated(workload_id, &assertion)
+                        .await
+                }
+                None => distributed_data_plane.read_workload(workload_id).await,
+            }
+            .map_err(|error| {
+                PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("read distributed view {view_name}: {error}"),
+                }))
+            })?;
             let mut rows = merge_workload_snapshot(&snapshot)
                 .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
             if !order_by.is_empty() {
@@ -9345,7 +9598,11 @@ impl GatewayHandler {
         ))])
     }
 
-    async fn handle_create_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_view<'a>(
+        &'a self,
+        q: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let is_materialized = ql.contains("materialized view");
         let if_not_exists = ql.contains("if not exists");
@@ -9491,9 +9748,18 @@ impl GatewayHandler {
                     )))]);
                 };
                 let sink_operator_id = OperatorId(stable_name_id("distributed-sink", &view_name));
+                let namespace = conn_id
+                    .and_then(|id| {
+                        self.sessions
+                            .get(id)
+                            .map(|session| session.current_namespace.clone())
+                    })
+                    .unwrap_or_else(|| "public".to_owned());
                 let request = DeploymentRequest {
                     version: DEPLOYMENT_DESCRIPTOR_VERSION,
                     workload_id: WorkloadId(stable_name_id("workload", &view_name)),
+                    namespace: namespace.clone(),
+                    workload_name: view_name.clone(),
                     plan_json: serde_json::to_string(&plan).map_err(|error| {
                         PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
                             detail: format!("serialize distributed plan {view_name}: {error}"),
@@ -9533,10 +9799,27 @@ impl GatewayHandler {
                     merge_key_columns,
                     routing_columns,
                 };
-                data_plane.deploy(request).await.map_err(|error| {
-                    PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                        detail: format!("deploy distributed view {view_name}: {error}"),
-                    }))
+                let worker_request =
+                    rockstream_types::topology::WorkerMessage::DeployWorkload(request.clone());
+                let assertion = self
+                    .actor_assertion_for_request(
+                        conn_id,
+                        SecurityAction::ViewAuthor,
+                        PolicyScope::Resource {
+                            namespace,
+                            kind: ResourceKind::View,
+                            name: view_name.clone(),
+                        },
+                        &worker_request,
+                    )
+                    .await
+                    .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+                let deployment = match assertion {
+                    Some(assertion) => data_plane.deploy_delegated(request, &assertion).await,
+                    None => data_plane.deploy(request).await,
+                };
+                deployment.map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("deploy distributed view {view_name}: {error}"),
                 })?;
                 Some(sink_operator_id.0)
             } else if let Some(shard_db) = self.shard_db.clone() {
@@ -12046,7 +12329,7 @@ impl GatewayHandler {
         self.recover_pending_views_locked()
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-        let (epoch, ops, changes) = {
+        let (epoch, ops, changes, distributed_deltas) = {
             let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
@@ -12082,19 +12365,79 @@ impl GatewayHandler {
                 &epoch.to_be_bytes(),
             );
 
+            let changed_tables: std::collections::HashSet<String> = ops
+                .iter()
+                .map(|op| match op {
+                    DmlOp::Insert { table, .. }
+                    | DmlOp::Update { table, .. }
+                    | DmlOp::Delete { table, .. } => table.clone(),
+                })
+                .collect();
             let views = if self.distributed_data_plane.is_none() {
-                let changed_tables = ops
-                    .iter()
-                    .map(|op| match op {
-                        DmlOp::Insert { table, .. }
-                        | DmlOp::Update { table, .. }
-                        | DmlOp::Delete { table, .. } => table.clone(),
-                    })
-                    .collect();
                 self.reachable_compiled_views(&changed_tables)
             } else {
                 Vec::new()
             };
+            let mut distributed_deltas = Vec::new();
+            if self.distributed_data_plane.is_some() {
+                let namespace = conn_id
+                    .and_then(|id| {
+                        self.sessions
+                            .get(id)
+                            .map(|session| session.current_namespace.clone())
+                    })
+                    .unwrap_or_else(|| "public".to_owned());
+                for view_name in self.reachable_compiled_views(&changed_tables) {
+                    for source in self.catalog.get_view_deps(&view_name) {
+                        if !changed_tables
+                            .iter()
+                            .any(|table| table.eq_ignore_ascii_case(&source))
+                        {
+                            continue;
+                        }
+                        let rows = runtime_rows_for_table(&source, &ops);
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        let request = SourceDeltaRequest {
+                            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                            request_id: format!(
+                                "{}-{epoch}-{}",
+                                std::process::id(),
+                                NEXT_DISTRIBUTED_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+                            ),
+                            workload_id: WorkloadId(stable_name_id("workload", &view_name)),
+                            epoch,
+                            source: source.clone(),
+                            rows,
+                        };
+                        let assertion = self
+                            .actor_assertion_for_request(
+                                conn_id,
+                                SecurityAction::DataWrite,
+                                PolicyScope::Resource {
+                                    namespace: namespace.clone(),
+                                    kind: ResourceKind::Table,
+                                    name: source,
+                                },
+                                &rockstream_types::topology::WorkerMessage::SubmitSourceDelta(
+                                    request.clone(),
+                                ),
+                            )
+                            .await
+                            .map_err(|error| {
+                                PgWireError::ApiError(Box::new(
+                                    GatewayError::QueryTimeExecutionFailed {
+                                        detail: format!(
+                                            "distributed view refresh {view_name}: {error}"
+                                        ),
+                                    },
+                                ))
+                            })?;
+                        distributed_deltas.push((view_name.clone(), request, assertion));
+                    }
+                }
+            }
             *self.pending_view_recovery.lock() = views.clone();
             for view in &views {
                 if let Err(error) = self
@@ -12178,7 +12521,7 @@ impl GatewayHandler {
             }
             // Do not expose this epoch yet. The table write is staged, but
             // dependent materialized view writes and the durable flush follow.
-            (epoch, ops, changes)
+            (epoch, ops, changes, distributed_deltas)
         };
         let affected = ops.len();
 
@@ -12187,52 +12530,19 @@ impl GatewayHandler {
         // every view that transitively depends on them.  This converts the
         // serving shard from a raw DML store into a live view serving layer.
         {
-            let changed_tables: std::collections::HashSet<String> = ops
-                .iter()
-                .map(|op| match op {
-                    DmlOp::Insert { table, .. } => table.clone(),
-                    DmlOp::Update { table, .. } => table.clone(),
-                    DmlOp::Delete { table, .. } => table.clone(),
-                })
-                .collect();
             if let Some(data_plane) = &self.distributed_data_plane {
-                for view_name in self.reachable_compiled_views(&changed_tables) {
-                    for source in self.catalog.get_view_deps(&view_name) {
-                        if !changed_tables
-                            .iter()
-                            .any(|table| table.eq_ignore_ascii_case(&source))
-                        {
-                            continue;
+                for (view_name, request, assertion) in distributed_deltas {
+                    let response = match assertion {
+                        Some(assertion) => {
+                            data_plane.submit_delta_delegated(request, &assertion).await
                         }
-                        let rows = runtime_rows_for_table(&source, &ops);
-                        if rows.is_empty() {
-                            continue;
-                        }
-                        let request_id = format!(
-                            "{}-{epoch}-{}",
-                            std::process::id(),
-                            NEXT_DISTRIBUTED_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-                        );
-                        data_plane
-                            .submit_delta(SourceDeltaRequest {
-                                version: DEPLOYMENT_DESCRIPTOR_VERSION,
-                                request_id,
-                                workload_id: WorkloadId(stable_name_id("workload", &view_name)),
-                                epoch,
-                                source,
-                                rows,
-                            })
-                            .await
-                            .map_err(|error| {
-                                PgWireError::ApiError(Box::new(
-                                    GatewayError::QueryTimeExecutionFailed {
-                                        detail: format!(
-                                            "distributed view refresh {view_name}: {error}"
-                                        ),
-                                    },
-                                ))
-                            })?;
-                    }
+                        None => data_plane.submit_delta(request).await,
+                    };
+                    response.map_err(|error| {
+                        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("distributed view refresh {view_name}: {error}"),
+                        }))
+                    })?;
                 }
             }
             // Flush the WAL so that materialised view output is immediately
@@ -16079,6 +16389,16 @@ impl GatewayServer {
         if let Some(handler) = Arc::get_mut(&mut self.handler) {
             handler.distributed_data_plane = Some(client);
             handler.distributed_storage_root = Some(storage_root.into());
+        }
+        self
+    }
+
+    pub fn with_actor_assertion_signer(
+        mut self,
+        signer: rockstream_control::delegation::ActorAssertionSigner,
+    ) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.actor_assertion_signer = Some(Arc::new(signer));
         }
         self
     }

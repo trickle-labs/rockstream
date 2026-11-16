@@ -88,6 +88,8 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
     let deploy_req = DeploymentRequest {
         version: 1,
         workload_id,
+        namespace: "public".to_owned(),
+        workload_name: "workload-42".to_owned(),
         plan_json: "{}".to_string(),
         join_strategy: JoinStrategy::Auto,
         schemas: vec![],
@@ -331,6 +333,8 @@ async fn operator_stats_round_trip_is_scoped_to_workload_and_operator_ids() {
         let deployment = DeploymentRequest {
             version: 1,
             workload_id,
+            namespace: "public".to_owned(),
+            workload_name: format!("workload-{}", workload_id.0),
             plan_json: "{}".to_string(),
             join_strategy: JoinStrategy::Auto,
             schemas: vec![],
@@ -346,6 +350,7 @@ async fn operator_stats_round_trip_is_scoped_to_workload_and_operator_ids() {
             let gateway_addr = gateway_addr.clone();
             async move {
                 rockstream_runtime::data_plane::DataPlaneClient::new(gateway_addr)
+                    .with_insecure_internal_dev()
                     .deploy(deployment)
                     .await
             }
@@ -391,6 +396,7 @@ async fn operator_stats_round_trip_is_scoped_to_workload_and_operator_ids() {
             let gateway_addr = gateway_addr.clone();
             async move {
                 rockstream_runtime::data_plane::DataPlaneClient::new(gateway_addr)
+                    .with_insecure_internal_dev()
                     .read_operator_stats(workload_id, requested_ids.to_vec())
                     .await
             }
