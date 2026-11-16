@@ -238,6 +238,9 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         if: needs.ci-policy.outputs.expensive == 'true'
+        with:
+          cache-on-failure: ${{ matrix.os == 'macos-15' && matrix.phase == 'release' }}
+          cache-workspace-crates: ${{ matrix.os == 'macos-15' && matrix.phase == 'release' }}
       - name: Cache pinned Verus
         if: needs.ci-policy.outputs.expensive == 'true'
         uses: actions/cache@v4
