@@ -57,6 +57,7 @@ async fn register(addr: std::net::SocketAddr, worker_id: u64) -> TcpStream {
     match serde_json::from_str::<ControlMessage>(response.trim()).unwrap() {
         ControlMessage::Registered {
             worker_id: registered,
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
         } => assert_eq!(registered, WorkerId(worker_id)),
         other => panic!("expected exact registration response, got {other:?}"),
     }

@@ -43,7 +43,7 @@ async fn test_exchange_service_reports_listener_bind_failure() {
 }
 
 #[tokio::test]
-async fn worker_exchange_listener_binds_before_registration_advertises_it() {
+async fn worker_exchange_listener_lifecycle_tracks_control_connection() {
     let exchange_reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let exchange_addr = exchange_reservation.local_addr().unwrap();
     drop(exchange_reservation);
@@ -61,6 +61,7 @@ async fn worker_exchange_listener_binds_before_registration_advertises_it() {
         assert_eq!(registration.address, exchange_addr.to_string());
         let reply = serde_json::to_string(&ControlMessage::Registered {
             worker_id: registration.worker_id,
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
         })
         .unwrap()
             + "\n";
@@ -90,6 +91,18 @@ async fn worker_exchange_listener_binds_before_registration_advertises_it() {
     .unwrap();
 
     control_task.await.unwrap();
-    worker_task.abort();
-    let _ = worker_task.await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), worker_task)
+        .await
+        .expect("worker must stop when the control stream closes")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if tokio::net::TcpStream::connect(exchange_addr).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shuffle listener must stop when the control stream closes");
 }

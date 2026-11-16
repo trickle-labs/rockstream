@@ -415,6 +415,8 @@ pub async fn setup_test_deployment(
     let worker_id = Arc::new(RwLock::new(Some(WorkerId(42))));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
+    let shard_leases = Arc::new(RwLock::new(HashMap::new()));
+    let security_audit_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let frontier_report_waiter = Arc::new(parking_lot::Mutex::new(None));
     let secret_manager = Arc::new(WorkerSecretManager::new("worker-42".to_string()));
@@ -431,7 +433,9 @@ pub async fn setup_test_deployment(
         worker_id,
         active_shards,
         topology_workers,
+        shard_leases,
         msg_tx,
+        security_audit_waiters,
         fence_waiters: fence_waiters.clone(),
         frontier_report_waiter: frontier_report_waiter.clone(),
         secret_manager,
@@ -854,7 +858,9 @@ pub struct WorkerClientHandle {
     worker_id: Arc<RwLock<Option<WorkerId>>>,
     active_shards: Arc<RwLock<HashMap<ShardId, ShardState>>>,
     topology_workers: Arc<RwLock<HashMap<WorkerId, WorkerInfo>>>,
+    shard_leases: Arc<RwLock<HashMap<ShardId, ShardLease>>>,
     msg_tx: mpsc::Sender<WorkerMessage>,
+    security_audit_waiters: crate::exchange::service::SecurityAuditWaiters,
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
     frontier_report_waiter: FrontierReportWaiter,
@@ -967,6 +973,8 @@ impl WorkerClientHandle {
             self.active_shards.clone(),
             self.topology_workers.clone(),
         )
+        .with_shard_leases(self.shard_leases.clone())
+        .with_security_audit(self.msg_tx.clone(), self.security_audit_waiters.clone())
     }
 
     /// Request a fresh short-lived token over the authenticated control channel.
@@ -1408,7 +1416,9 @@ where
     let worker_id = Arc::new(RwLock::new(None));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
+    let shard_leases = Arc::new(RwLock::new(HashMap::new()));
     let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMessage>(32);
+    let security_audit_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let frontier_report_waiter = Arc::new(parking_lot::Mutex::new(None));
     let secret_manager = Arc::new(WorkerSecretManager::new(format!(
@@ -1439,7 +1449,9 @@ where
         worker_id: worker_id.clone(),
         active_shards: active_shards.clone(),
         topology_workers: topology_workers.clone(),
+        shard_leases: shard_leases.clone(),
         msg_tx: msg_tx.clone(),
+        security_audit_waiters: security_audit_waiters.clone(),
         fence_waiters: fence_waiters.clone(),
         frontier_report_waiter: frontier_report_waiter.clone(),
         secret_manager: secret_manager.clone(),
@@ -1517,7 +1529,7 @@ where
         .with_location(location.clone())
         .with_capabilities(capabilities)
         .with_compatibility(
-            rockstream_types::compatibility::SupportedVersionRange::v1_through_v2(),
+            rockstream_types::compatibility::SupportedVersionRange::v3_only(),
             rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(),
         );
         let reg_msg = WorkerMessage::Register(reg);
@@ -1635,6 +1647,14 @@ where
             };
 
             match msg {
+                ControlMessage::SecurityAuditRecorded {
+                    request_id,
+                    persisted,
+                } => {
+                    if let Some(waiter) = security_audit_waiters.lock().remove(&request_id) {
+                        let _ = waiter.send(persisted);
+                    }
+                }
                 ControlMessage::BeginDrain(request) => {
                     let Some(id) = *worker_id_clone.read() else {
                         continue;
@@ -1692,14 +1712,33 @@ where
                         }
                     }
                 }
-                ControlMessage::Registered { worker_id: wid } => {
+                ControlMessage::Registered {
+                    worker_id: wid,
+                    protocol_version,
+                } => {
+                    if !rockstream_types::compatibility::SupportedVersionRange::v3_only()
+                        .contains(protocol_version)
+                    {
+                        tracing::error!(
+                            code = %rockstream_types::error_code::RS_5021,
+                            %protocol_version,
+                            "control plane does not support the worker protocol required for audited shard ownership"
+                        );
+                        break;
+                    }
                     tracing::info!("Worker client registered successfully as {:?}", wid);
                     *worker_id_clone.write() = Some(wid);
                 }
-                ControlMessage::TopologyChanged { workers } => {
+                ControlMessage::TopologyChanged {
+                    workers,
+                    shard_leases: leases,
+                } => {
                     let mut topology = topology_workers.write();
                     topology.clear();
                     topology.extend(workers.into_iter().map(|worker| (worker.worker_id, worker)));
+                    let mut current_leases = shard_leases.write();
+                    current_leases.clear();
+                    current_leases.extend(leases.into_iter().map(|lease| (lease.shard_id, lease)));
                 }
                 ControlMessage::Deploy { descriptor } => {
                     let result: io::Result<Arc<WorkerDeployment>> = async {
@@ -2283,6 +2322,14 @@ where
             }
         }
 
+        if let Some(shutdown) = &_exchange_shutdown {
+            shutdown.0.cancel();
+        }
+        topology_workers.write().clear();
+        shard_leases.write().clear();
+        for (_, waiter) in std::mem::take(&mut *security_audit_waiters.lock()) {
+            let _ = waiter.send(false);
+        }
         if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
             let _ = waiter.send(Err("Control channel closed".to_owned()));
         }

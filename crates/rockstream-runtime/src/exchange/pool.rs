@@ -111,8 +111,8 @@ impl ShuffleClientPool {
             (Some(local), Some(peer)) => local
                 .protocol_range
                 .highest_common(peer.protocol_range)
-                .unwrap_or(ProtocolVersion::V1),
-            _ => ProtocolVersion::V1,
+                .unwrap_or(ProtocolVersion::V3),
+            _ => ProtocolVersion::V3,
         }
     }
 

@@ -66,7 +66,7 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
     worker_reader.read_line(&mut line).await.unwrap();
     let reg_resp: ControlMessage = serde_json::from_str(&line).unwrap();
     assert!(
-        matches!(reg_resp, ControlMessage::Registered { worker_id } if worker_id == WorkerId(1)),
+        matches!(reg_resp, ControlMessage::Registered { worker_id, protocol_version: rockstream_types::compatibility::ProtocolVersion::V3 } if worker_id == WorkerId(1)),
         "Expected Registered, got {reg_resp:?}"
     );
 
@@ -317,7 +317,8 @@ async fn operator_stats_round_trip_is_scoped_to_workload_and_operator_ids() {
     assert!(matches!(
         read_control_message(&mut worker_reader).await,
         ControlMessage::Registered {
-            worker_id: WorkerId(1)
+            worker_id: WorkerId(1),
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
         }
     ));
     assert!(matches!(
