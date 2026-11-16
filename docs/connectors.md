@@ -17,10 +17,10 @@ transaction and after its committed epoch. If it changes during the transaction,
 the worker commits the complete result and slot checkpoint, then opens a new
 upstream connection with the authorized replacement while keeping the source
 worker alive. A Kafka source uses an explicit SASL transport and PLAIN credentials;
-at the next committed epoch it updates librdkafka's credentials without replacing
-the consumer. Existing broker connections keep their current authentication until
-they authenticate again. Kafka source rotation still needs release-process
-qualification across views and partitions. Kafka sink rotation remains
+at the next source epoch it replaces the consumer with the authorized credentials,
+seeking from the durable source checkpoint while keeping the worker alive. Kafka
+source rotation still needs release-process qualification across views and
+partitions. Kafka sink rotation remains
 unqualified; the experimental sink is not configured by SQL `CREATE SINK` and
 has no supported full-Core qualification route.
 
