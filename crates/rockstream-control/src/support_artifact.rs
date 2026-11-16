@@ -748,6 +748,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_artifact_writers_fill_remaining_slots_without_eviction() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = SupportArtifactStore::new(Arc::clone(&object_store));
+        store.initialize().await.unwrap();
+        let now_ms = 1_000;
+        let expiry = ArtifactExpiry { unix_ms: 2_000 };
+        let entry = || LedgerArtifact {
+            owner: PrincipalId(1),
+            scope: PolicyScope::Cluster,
+            size: 0,
+            expires_at_ms: expiry.unix_ms,
+        };
+        let mut expected = (0..MAX_ARTIFACTS_PER_DEPLOYMENT - 8)
+            .map(|index| (format!("retained-{index:04}"), entry()))
+            .collect::<BTreeMap<_, _>>();
+        store
+            .mutate_ledger(|ledger| {
+                ledger.artifacts = expected.clone();
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let services = (0..16)
+            .map(|_| SupportArtifactStore::new(Arc::clone(&object_store)))
+            .collect::<Vec<_>>();
+        let attempts = (0..16).map(|index| {
+            let service = services[index % services.len()].clone();
+            async move {
+                let id = format!("pressure-{index:02}");
+                let result = service
+                    .insert(
+                        id.clone(),
+                        PrincipalId(1),
+                        PolicyScope::Cluster,
+                        Arc::from(Vec::new()),
+                        expiry,
+                        now_ms,
+                    )
+                    .await;
+                (id, result)
+            }
+        });
+        let results = futures::future::join_all(attempts).await;
+        let (accepted, rejected): (Vec<_>, Vec<_>) =
+            results.into_iter().partition(|(_, result)| result.is_ok());
+        assert_eq!(accepted.len(), 8);
+        for (id, result) in accepted {
+            assert_eq!(result, Ok(()));
+            expected.insert(id.clone(), entry());
+            assert_eq!(
+                object_store
+                    .get(&store.artifact_path(&id))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b""
+            );
+        }
+        for (id, result) in rejected {
+            assert_eq!(result, Err(ArtifactStoreError::StorageFull));
+            assert!(matches!(
+                object_store.get(&store.artifact_path(&id)).await,
+                Err(ObjectStoreError::NotFound { .. })
+            ));
+        }
+
+        assert_eq!(expected.len(), MAX_ARTIFACTS_PER_DEPLOYMENT);
+        assert_eq!(store.read_ledger().await.unwrap().0.artifacts, expected);
+    }
+
+    #[tokio::test]
     async fn cleanup_at_the_artifact_count_limit_removes_every_expired_object() {
         let object_store = Arc::new(InMemory::new());
         let store = SupportArtifactStore::new(object_store.clone());
