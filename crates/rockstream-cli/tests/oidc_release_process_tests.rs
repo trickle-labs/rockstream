@@ -6810,6 +6810,60 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
         deployment_budget as u64
     );
 
+    let pressure_ids = (0..16)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect::<Vec<_>>();
+    let mut pressure_operation_ids = Vec::new();
+    let mut pressure_busy_ids = Vec::new();
+    let mut pressure = tokio::task::JoinSet::new();
+    for (index, id) in pressure_ids.iter().cloned().enumerate() {
+        let mut client = if index % 2 == 0 {
+            first_client.clone()
+        } else {
+            second_client.clone()
+        };
+        pressure.spawn(async move {
+            let result = client
+                .generate_support_artifact(GenerateSupportArtifactRequest {
+                    protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                    node_id: String::new(),
+                    idempotency_key: id.clone(),
+                })
+                .await;
+            (id, result)
+        });
+    }
+    while let Some(joined) = pressure.join_next().await {
+        let (id, result) = joined.expect("support-artifact pressure request task should finish");
+        let error = result.expect_err("full deployment budget must reject each pressure request");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted, "request {id}");
+        match error.message() {
+            "support artifact generation is busy" => pressure_busy_ids.push(id.clone()),
+            "support artifact storage budget is full" => pressure_operation_ids.push(id.clone()),
+            message => panic!("unexpected pressure response for {id}: {message}"),
+        }
+        assert!(matches!(
+            management_store
+                .get(&support_artifact_object_path(&id))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+    assert!(!pressure_busy_ids.is_empty());
+    assert!(!pressure_operation_ids.is_empty());
+    assert_eq!(
+        pressure_busy_ids.len() + pressure_operation_ids.len(),
+        pressure_ids.len()
+    );
+    let ledger_after_pressure = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(ledger_after_pressure.as_ref(), ledger_bytes.as_ref());
+
     let operations = first_client
         .list_operations(ListOperationsRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -6833,9 +6887,13 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
     operation_ids.sort();
     let mut expected_operation_ids =
         vec![seed.opaque_id.clone(), winner_id.clone(), loser_id.clone()];
+    expected_operation_ids.extend(pressure_operation_ids.iter().cloned());
     expected_operation_ids.sort();
     assert_eq!(operation_ids, expected_operation_ids);
-    for (id, state, phase) in [
+    for id in &pressure_busy_ids {
+        assert!(operation_ids.binary_search(id).is_err());
+    }
+    let mut expected_operations = vec![
         (
             seed.opaque_id.as_str(),
             "succeeded",
@@ -6847,7 +6905,13 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
             format!("available_until_ms:{}", winner.expires_at_ms),
         ),
         (loser_id.as_str(), "failed", "generation_failed".to_owned()),
-    ] {
+    ];
+    expected_operations.extend(
+        pressure_operation_ids
+            .iter()
+            .map(|id| (id.as_str(), "failed", "generation_failed".to_owned())),
+    );
+    for (id, state, phase) in expected_operations {
         let matching = operations
             .operations
             .iter()
@@ -6882,11 +6946,22 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
             record.event_id = "support-artifact".to_owned();
         }
     }
+    for id in &pressure_busy_ids {
+        assert!(!actual_audit
+            .iter()
+            .any(|record| record.operation_id == AuditField::Known(id.clone())));
+    }
     let cluster_scope = serde_json::to_string(&PolicyScope::Cluster).unwrap();
-    for (id, successful, expiry_ms) in [
+    let mut audit_operations = vec![
         (winner_id.as_str(), true, winner.expires_at_ms),
         (loser_id.as_str(), false, 0),
-    ] {
+    ];
+    audit_operations.extend(
+        pressure_operation_ids
+            .iter()
+            .map(|id| (id.as_str(), false, 0)),
+    );
+    for (id, successful, expiry_ms) in audit_operations {
         let expected_audit = vec![
             SecurityAuditRecord {
                 format_version: SECURITY_AUDIT_FORMAT_VERSION,
