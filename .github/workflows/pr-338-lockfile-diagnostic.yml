@@ -1,0 +1,34 @@
+name: PR 338 lockfile resolution diagnostic
+on:
+  push:
+    branches:
+      - fix/338-postgres-cdc-retention-recovery
+    paths:
+      - .github/workflows/pr-338-lockfile-diagnostic.yml
+permissions:
+  contents: read
+jobs:
+  resolve:
+    name: Resolve patched Quinn lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - name: Regenerate minimal dependency locks and show exact diff
+        run: |
+          set -euxo pipefail
+          cargo update -p quinn-proto --precise 0.11.19
+          cargo update -p quinn-udp --precise 0.5.16
+          git diff -- Cargo.lock
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+      - name: Upload resolved Cargo.lock
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr338-resolved-cargo-lock
+          path: Cargo.lock
+          retention-days: 2
+          if-no-files-found: error
