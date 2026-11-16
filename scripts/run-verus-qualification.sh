@@ -24,7 +24,9 @@ rm -f "$OUTPUT_ROOT/qualification.json" "$OUTPUT_ROOT/phase.json"
 QUALIFICATION_TOML="$ROOT/formal/verus/qualification.toml"
 COLD_VERIFICATION_BUDGET="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["budgets"]["cold_verification_seconds"])' "$QUALIFICATION_TOML")"
 INCREMENTAL_VERIFICATION_BUDGET="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["budgets"]["incremental_verification_seconds"])' "$QUALIFICATION_TOML")"
-PRODUCTION_COMPILE_BUDGET="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["budgets"]["production_compile_seconds"])' "$QUALIFICATION_TOML")"
+# Keep the standard production budget on Linux; the separately recorded
+# macOS ARM64 cold-release ceiling is selected by the qualified target.
+PRODUCTION_COMPILE_BUDGET="$(python3 -c 'import sys,tomllib; b=tomllib.load(open(sys.argv[1], "rb"))["budgets"]; print(b["production_compile_macos_arm64_seconds"] if sys.argv[2] == "aarch64-apple-darwin" else b["production_compile_seconds"])' "$QUALIFICATION_TOML" "$QUALIFY_TARGET")"
 
 run_step() {
   local id="$1"
