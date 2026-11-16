@@ -4878,6 +4878,24 @@
   "config_surface": {
     "options": [
       {
+        "key": "auth.actor_assertion_public_key_path",
+        "data_type": "Option<PathBuf>",
+        "default_value": "None",
+        "description": "Matching single-key RSA RS256 public JWK used by control to verify gateway actor assertions",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.actor_assertion_signing_key_path",
+        "data_type": "Option<PathBuf>",
+        "default_value": "None",
+        "description": "Dedicated RSA private key used by an authenticated gateway connected to control; use a distinct key pair from gateway and internal TLS",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
         "key": "auth.mode",
         "data_type": "String",
         "default_value": "off",
@@ -4993,6 +5011,15 @@
         "deprecated": false,
         "env_var": "ROCKSTREAM_AUTOTUNER_MIN_PARALLELISM",
         "source_origin": "rockstream-types::config::AutotunerConfig"
+      },
+      {
+        "key": "node.deployment_id",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Shared deployment identifier required by gateway actor assertions; configure the same value on gateway and control",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_NODE_DEPLOYMENT_ID",
+        "source_origin": "rockstream-types::config::NodeSection"
       },
       {
         "key": "scatter_pruning.shard_bloom_budget_bytes",
