@@ -3151,6 +3151,32 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     drop(client);
     process.0.kill().unwrap();
     process.0.wait().unwrap();
+    let envelope_db = rockstream_storage::ShardDb::builder("gateway-secrets", store.clone())
+        .build()
+        .await
+        .unwrap();
+    let envelope_bytes = envelope_db
+        .get(&rockstream_control::secret_store::secret_key(
+            1,
+            "kafka_auth",
+        ))
+        .await
+        .unwrap()
+        .expect("the released secret must have a durable envelope");
+    let envelope: rockstream_types::secret::EncryptedSecret =
+        serde_json::from_slice(&envelope_bytes).unwrap();
+    assert_eq!(envelope.name, "kafka_auth");
+    assert!(!envelope.ciphertext.is_empty());
+    assert_eq!(envelope.nonce.len(), 12);
+    for value in [b"old-pass".as_slice(), b"new-pass".as_slice()] {
+        assert!(
+            !envelope_bytes
+                .windows(value.len())
+                .any(|window| window == value),
+            "durable secret envelope contains plaintext credentials"
+        );
+    }
+    drop(envelope_db);
     drop(process);
     let mut recovered = start_gateway_process(
         temp.path(),
