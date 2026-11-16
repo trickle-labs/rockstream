@@ -99,6 +99,11 @@ tolerances_frozen = true
 cold_verification_seconds = 900
 incremental_verification_seconds = 300
 production_compile_seconds = 2100
+# An explicitly reviewed cold macOS ARM64 release-workspace limit. The
+# 2026-11-16 qualifying job compiled successfully in 2883s; the former
+# universal 2100s ceiling was calibrated for smaller pre-v0.73 builds.
+# Linux and all non-ARM64 targets retain the original 2100s gate.
+production_compile_macos_arm64_seconds = 3300
 runtime_regression_percent = 15
 rss_regression_percent = 15
 proof_maintenance_hours = 4

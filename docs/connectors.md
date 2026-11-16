@@ -103,7 +103,26 @@ Unaffected tables in a publication continue ingestion without interruption (rela
 
 ### Recovery and Resnapshot
 
-When PostgreSQL invalidates a replication slot (e.g. WAL retention exhaustion, errors `55000` / `58P01`), the connector transitions to `BLOCKED` with error code `RS-4011` / `RS-4016` and requires an operator-initiated resnapshot.
+When PostgreSQL invalidates a replication slot (e.g. WAL retention exhaustion, errors `55000` / `58P01`), the connector transitions to `BLOCKED` with error code `RS-4011` / `RS-4016`. A source with a durable checkpoint **does not silently create a replacement slot**. If the original slot cannot be recovered, a new snapshot alone is not sufficient to reconstruct already-pruned events.
+
+### Partitioned sources, retention, and historical view correctness
+
+For a PostgreSQL partitioned **root** used as an imported source table, its publication **must** set `publish_via_partition_root = true`; RockStream rejects a root published under child partition relation IDs with `RS-4013`, rather than silently missing their changes. For example:
+
+```sql
+CREATE PUBLICATION events_pub FOR TABLE public.events
+    WITH (publish_via_partition_root = true);
+```
+
+PostgreSQL defaults this flag to false. Changes are otherwise published using individual child relation identities, not the parent identity imported by RockStream. Configure the publication before initial capture and keep its identity mode stable.
+
+**Important retention boundary:** `ALTER TABLE ... DETACH PARTITION` and `DROP TABLE` on a partition do not produce row-level DELETE events over `pgoutput`. A maintained view may therefore still contain the historical rows or aggregates from that partition. This is a consequence of retaining local materialization, **not** a source-retention or rebuild guarantee. A fresh initial snapshot/backfill sees only the rows still present in PostgreSQL and **cannot** reconstruct omitted historical aggregates. This includes rebuilding a view, discarding a checkpoint, and recovery after replication-slot loss. A normal process restart that restores an intact RockStream checkpoint is different from rebuilding from the upstream snapshot.
+
+`TRUNCATE` is different from row-by-row DELETE: `pgoutput` carries a TRUNCATE message without old row images. RockStream now fails closed with `RS-4015` on that message before acknowledging its LSN, rather than ignoring it and returning stale results as though the operation succeeded. PostgreSQL **does not publish** direct child-partition TRUNCATE when `publish_via_partition_root = true`, so even this guard cannot detect those operations. Do not perform direct partition TRUNCATE against a source whose view must stay exact.
+
+**Operational contract until historical resnapshot retention is implemented:** Do not treat source-side partition pruning as safe, reconstructable materialized-view retention. Keep a complete replayable source/archive and validated checkpoints, or accept that rebuilding pruned historical groups is impossible. After slot loss, preserve the current RockStream checkpoint and investigate upstream history availability; never replace it with a newly truncated snapshot and describe the result as complete. A finalized TUMBLE window surviving a checkpoint restart is **not** evidence that it can be re-derived after the input partitions have been dropped.
+
+See [PostgreSQL's publication settings](https://www.postgresql.org/docs/current/sql-createpublication.html) for partition identity, DDL, and TRUNCATE limitations.
 
 ## Kafka source
 
@@ -255,7 +274,7 @@ sink cells below exercise legacy marker transport and recovery only.
 | Cell | Test |
 | --- | --- |
 | Snapshot → stream handoff over the v0.52.1 fence | `postgres_cdc_snapshot_stream_fence_has_exact_transcript` |
-| INSERT, UPDATE including key change, DELETE, and TRUNCATE | `postgres_cdc_all_mutation_types_have_exact_transcript` |
+| INSERT, UPDATE including key change, and DELETE (TRUNCATE is rejected) | `postgres_cdc_insert_update_delete_have_exact_transcript` |
 | Restart at every commit boundary | `postgres_cdc_each_commit_boundary_recovers_exactly_once` |
 | WAL lag | `postgres_cdc_wal_lag_pauses_at_bound_and_recovers_within_slo` |
 | Malformed replication record | `postgres_cdc_malformed_replication_record_fails_closed_then_recovers_exactly` |
