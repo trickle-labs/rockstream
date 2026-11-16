@@ -2541,7 +2541,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 operation_scope.clone(),
             )
             .await?;
-        self.security_catalog.as_ref().ok_or_else(|| {
+        let security_catalog = self.security_catalog.as_ref().ok_or_else(|| {
             required_audit_unavailable(&request, "management security catalog is unavailable")
         })?;
         let record = self
@@ -2550,6 +2550,30 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .await
             .map_err(store_error)?
             .ok_or_else(|| Status::not_found(format!("operation {operation_id} not found")))?;
+        let scope = serde_json::to_string(&operation_scope)
+            .map_err(|_| Status::internal("management operation scope serialization failed"))?;
+        let cancellation_denial = |record: &crate::management_store::OperationRecord| {
+            let status = format!("{:?}", record.status()).to_lowercase();
+            let state = format!("{status}:{}", record.phase().unwrap_or("not_applicable"));
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!(
+                    "management-operation-cancel-denied:{}",
+                    uuid::Uuid::new_v4()
+                ),
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", principal_id.0)),
+                target: AuditField::Known(format!("operation:{operation_id}")),
+                scope: AuditField::Known(scope.clone()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Failure,
+                correlation: AuditCorrelation::Observed(operation_id.clone()),
+                operation_id: AuditField::Known(operation_id.clone()),
+                policy_revision: AuditField::Known(policy_revision),
+                before_state: AuditField::Known(state.clone()),
+                after_state: AuditField::Known(state),
+            }
+        };
         let safe = record.status() == OperationStatus::Pending
             || (matches!(
                 record.status(),
@@ -2564,6 +2588,14 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 )
             ));
         if !safe {
+            append_security_audit(security_catalog.as_ref(), cancellation_denial(&record))
+                .await
+                .map_err(|_| {
+                    required_audit_unavailable(
+                        &request,
+                        "management operation audit is unavailable",
+                    )
+                })?;
             return Err(Status::failed_precondition(
                 "operation cancellation is past its safe boundary",
             ));
@@ -2575,24 +2607,22 @@ impl v1::management_service_server::ManagementService for ManagementService {
             "cancelled_before_lease_transfer"
         };
         let cancelled_at_ms = Utc::now().timestamp_millis().max(1);
-        let scope = serde_json::to_string(&operation_scope)
-            .map_err(|_| Status::internal("management operation scope serialization failed"))?;
         let audit = SecurityAuditRecord {
             format_version: SECURITY_AUDIT_FORMAT_VERSION,
             event_id: format!("management-operation-cancel:{operation_id}"),
             timestamp_ms: cancelled_at_ms as u64,
             actor: AuditIdentity::Verified(format!("principal:{}", principal_id.0)),
             target: AuditField::Known(format!("operation:{operation_id}")),
-            scope: AuditField::Known(scope),
+            scope: AuditField::Known(scope.clone()),
             action: SecurityAuditClass::AdminOperationCompletion,
             outcome: SecurityAuditOutcome::Success,
             correlation: AuditCorrelation::Observed(operation_id.clone()),
-            operation_id: AuditField::Known(operation_id),
+            operation_id: AuditField::Known(operation_id.clone()),
             policy_revision: AuditField::Known(policy_revision),
             before_state: AuditField::Known(format!("{:?}", status).to_lowercase()),
             after_state: AuditField::Known(phase.to_owned()),
         };
-        let record = self
+        let record = match self
             .operations
             .transition_if_with_audit(
                 record.operation_id(),
@@ -2609,7 +2639,31 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 audit,
             )
             .await
-            .map_err(store_error)?;
+        {
+            Ok(record) => record,
+            Err(crate::management_store::OperationStoreError::TransitionConflict(_)) => {
+                let current = self
+                    .operations
+                    .get(&operation_id)
+                    .await
+                    .map_err(store_error)?
+                    .ok_or_else(|| {
+                        Status::not_found(format!("operation {operation_id} not found"))
+                    })?;
+                append_security_audit(security_catalog.as_ref(), cancellation_denial(&current))
+                    .await
+                    .map_err(|_| {
+                        required_audit_unavailable(
+                            &request,
+                            "management operation audit is unavailable",
+                        )
+                    })?;
+                return Err(Status::failed_precondition(
+                    "operation cancellation is past its safe boundary",
+                ));
+            }
+            Err(error) => return Err(store_error(error)),
+        };
         let record = self.flush_operation_audit(record).await.map_err(|_| {
             required_audit_unavailable(&request, "management operation audit is unavailable")
         })?;

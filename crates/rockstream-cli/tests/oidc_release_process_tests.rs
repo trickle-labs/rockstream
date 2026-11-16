@@ -3897,13 +3897,23 @@ async fn support_artifact_generation_and_cancellation_race_has_one_durable_winne
     let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
         .await
         .unwrap();
-    let actual_audit = security_catalog
+    let operation_audit = security_catalog
         .list_security_audit_records()
         .await
         .unwrap()
         .into_iter()
         .filter(|record| record.operation_id == AuditField::Known(operation_id.clone()))
-        .map(|record| (record.action, record.before_state, record.after_state))
+        .collect::<Vec<_>>();
+    let actual_audit = operation_audit
+        .iter()
+        .filter(|record| record.outcome == SecurityAuditOutcome::Success)
+        .map(|record| {
+            (
+                record.action,
+                record.before_state.clone(),
+                record.after_state.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     let expected_audit = expected_audit
         .into_iter()
@@ -3916,6 +3926,50 @@ async fn support_artifact_generation_and_cancellation_race_has_one_durable_winne
         })
         .collect::<Vec<_>>();
     assert_eq!(actual_audit, expected_audit);
+    let cancellation_denials = operation_audit
+        .iter()
+        .filter(|record| record.outcome == SecurityAuditOutcome::Failure)
+        .collect::<Vec<_>>();
+    if operation.state == "succeeded" {
+        assert_eq!(cancellation_denials.len(), 1);
+        let denial = cancellation_denials[0];
+        assert!(denial
+            .event_id
+            .strip_prefix("management-operation-cancel-denied:")
+            .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok())
+            .is_some());
+        assert_eq!(
+            denial.actor,
+            AuditIdentity::Verified("principal:2".to_owned())
+        );
+        assert_eq!(
+            denial.target,
+            AuditField::Known(format!("operation:{operation_id}"))
+        );
+        assert_eq!(
+            denial.scope,
+            AuditField::Known(
+                serde_json::to_string(&PolicyScope::Operation {
+                    operation_id: operation_id.clone(),
+                })
+                .unwrap()
+            )
+        );
+        assert_eq!(denial.action, SecurityAuditClass::AdminOperationCompletion);
+        assert_eq!(
+            denial.correlation,
+            AuditCorrelation::Observed(operation_id.clone())
+        );
+        assert_eq!(denial.operation_id, AuditField::Known(operation_id.clone()));
+        assert_eq!(denial.policy_revision, AuditField::Known(1));
+        assert!(matches!(
+            &denial.before_state,
+            AuditField::Known(state) if state.starts_with("running:") || state.starts_with("succeeded:")
+        ));
+        assert_eq!(denial.before_state, denial.after_state);
+    } else {
+        assert!(cancellation_denials.is_empty());
+    }
     process.0.kill().unwrap();
     process.0.wait().unwrap();
 }
