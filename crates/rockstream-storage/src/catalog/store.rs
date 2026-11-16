@@ -559,6 +559,12 @@ impl DurableCatalogStore {
                 operation_id.unwrap_or_default(),
             )
         });
+        let operation_logs = log_files
+            .iter()
+            .filter_map(|(revision, operation_id, _)| {
+                operation_id.map(|operation_id| (*revision, operation_id))
+            })
+            .collect::<HashSet<_>>();
 
         let mut total_buffer_bytes = 0usize;
         let mut expected_revision = start_revision;
@@ -636,7 +642,7 @@ impl DurableCatalogStore {
 
             validate_security_mutations(&recovered_state, &txn)?;
 
-            if operation_id.is_none() {
+            if operation_id.is_none() && !operation_logs.contains(&(revision, txn.operation_id)) {
                 let legacy_path = ObjectPath::from(
                     format!(
                         "{}/catalog/log/{:020}_{:020}.log",

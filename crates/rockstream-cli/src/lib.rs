@@ -146,8 +146,8 @@ fn validate_internal_transport(
     opts: &StartOptions,
     allow_insecure_internal_dev: bool,
 ) -> Result<(), CliError> {
-    if !matches!(opts.role.as_str(), "all" | "control" | "worker")
-        && !(opts.role == "gateway" && opts.control.is_some())
+    if !(matches!(opts.role.as_str(), "all" | "control" | "worker")
+        || opts.role == "gateway" && opts.control.is_some())
     {
         return Ok(());
     }

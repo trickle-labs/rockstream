@@ -220,7 +220,7 @@ async fn call_without_management_credentials(
             .await
             .map_err(|error| error.to_string())?;
         let server_name = rustls::pki_types::ServerName::IpAddress(address.ip().into());
-        let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(server_name, stream)
             .await
             .map_err(|error| error.to_string());
