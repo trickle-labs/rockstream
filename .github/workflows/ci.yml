@@ -397,6 +397,21 @@ jobs:
       - name: Require Docker
         if: contains(fromJSON('["crates", "oracle", "ops", "storage-sql", "gateway-components"]'), matrix.shard)
         run: docker info
+      - name: Pre-pull oracle Kafka fixture with bounded registry retries
+        if: matrix.shard == 'oracle'
+        run: |
+          # Testcontainers uses this exact image. Transient Docker Hub 502/503
+          # errors must not fail an unrelated mandatory oracle assertion.
+          for attempt in 1 2 3 4 5; do
+            if docker pull apache/kafka-native:3.8.0; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Kafka fixture image pull failed after five attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Record workspace test case execution
         if: matrix.shard == 'workspace'
         run: python3 scripts/ci-test-inventory.py run --job pr-workspace

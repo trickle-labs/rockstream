@@ -68,6 +68,12 @@ SlateDB `WriteBatch`) and the CALM invariant
 contributing shard's persisted frontier satisfies `frontier ≥ N`, verifiable by
 any reader of the object store with no coordinator).
 
+The durable shuffle catch-up helper currently persists its inbox marker before
+the inlet handoff, outside the operator's epoch commit. The closed-inlet retry
+test covers explicit rejection and retry; it does not establish atomicity with
+operator state or recovery of a marker left before delivery. Concurrent
+catch-up and owning-epoch recovery remain unqualified (issue #321).
+
 Verification targets:
 - `WriteBatch` is **all-or-nothing**: a crash mid-commit leaves the shard at
   epoch `N-1`, never a torn state where the frontier advanced but state did not
@@ -897,6 +903,34 @@ state remains an external source boundary outside M1–M7, so this adds real
 cluster evidence without a new abstract invariant or a general CDC guarantee
 (`docs/testing/postgres-cdc-kafka-minio-v1.md`). The adjacent spill-governor
 atomic compatibility annotation changes no coordination transition.
+
+Issue #338's partitioned `postgres_cdc` retention contract refines M3's
+external source admission and ACK boundary, not M3's abstract record-level
+transition. A partitioned source published without
+`publish_via_partition_root = true` is rejected with `RS-4013` before the
+gateway accepts child-relation changes as parent-table data. A `pgoutput`
+TRUNCATE frame lacks row images, so its decoder fails closed with `RS-4015`
+before committing/acknowledging the containing transaction; it must not
+silently advance the slot LSN or leave stale aggregates presented as correct.
+The M3 abstraction still requires durable input/output/checkpoint coupling
+before source acknowledgement, but does not model PostgreSQL relation OIDs,
+publication modes, partition DDL, or historical window state. Source-side
+DETACH/DROP PARTITION emits no row-level retractions, and a fresh snapshot of
+retained partitions cannot reconstruct already-pruned historical aggregates.
+These limitations must remain explicit instead of asserting a new abstract
+exactly-once or historical-resnapshot property.
+
+Concrete evidence: `postgres_cdc::tests::pgoutput_truncate_fails_closed_on_all_decode_paths`
+checks the three decoders and uncommitted xid;
+`postgres_cdc::tests::partitioned_sources_require_root_publication_identity`
+checks the admission guard; and the real PostgreSQL 16
+`postgres_cdc_partition_retention_tests::partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed`
+checks parent publication identity, exact initial and post-pruning snapshot
+transcripts, the child INSERT delta, unchanged slot acknowledgement on rejected
+TRUNCATE, and missing-slot recovery refusal. It does **not** test preserving
+closed TUMBLE aggregates through resnapshot, reconstructing missing WAL, or
+publication-level DDL replay. Those require a separate durable-state model
+and end-to-end recovery proof before being claimed.
 
 Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
 still abstracts epochs, not row contents. The adapter persists the full pending
