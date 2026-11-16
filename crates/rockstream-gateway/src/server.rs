@@ -6400,6 +6400,17 @@ impl GatewayHandler {
                     continue;
                 }
             };
+            let Some(handler) = weak.upgrade() else {
+                break;
+            };
+            if let Err(error) = handler
+                .refresh_kafka_secret_at_epoch(&mut runtime, &lease, &source)
+                .await
+            {
+                tracing::warn!(view = %view_name, %error, "Kafka source credential refresh failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             if delta.batches.is_empty() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -6431,17 +6442,6 @@ impl GatewayHandler {
                 }
             }
             if decode_failed {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-            let Some(handler) = weak.upgrade() else {
-                break;
-            };
-            if let Err(error) = handler
-                .refresh_kafka_secret_at_epoch(&mut runtime, &lease, &source)
-                .await
-            {
-                tracing::warn!(view = %view_name, %error, "Kafka source credential refresh failed");
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }

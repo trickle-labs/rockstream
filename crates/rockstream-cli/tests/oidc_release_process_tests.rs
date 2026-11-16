@@ -1671,6 +1671,24 @@ fn kafka_sasl_client(bootstrap: &str, username: &str, password: &str) -> ClientC
     config
 }
 
+async fn kafka_acl<I: Image>(broker: &ContainerAsync<I>, args: &[&str]) {
+    let mut command_args = vec![
+        "/opt/kafka/bin/kafka-acls.sh",
+        "--bootstrap-server",
+        "localhost:9093",
+    ];
+    command_args.extend_from_slice(args);
+    let mut command = broker.exec(ExecCommand::new(command_args)).await.unwrap();
+    let stdout = String::from_utf8(command.stdout_to_vec().await.unwrap()).unwrap();
+    let stderr = String::from_utf8(command.stderr_to_vec().await.unwrap()).unwrap();
+    assert_eq!(
+        command.exit_code().await.unwrap(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert_eq!(stderr, "");
+}
+
 #[tokio::test]
 async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
@@ -2727,14 +2745,13 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: the Apache Kafka fixture does not accept the replacement SASL principal after dynamic JAAS update; tracked in #304"]
 async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     assert!(
         rockstream_test_support::docker_available(),
         "Docker is required for the Kafka secret-rotation release proof"
     );
-    let initial_jaas = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotating=\"old-pass\" user_steady=\"steady-pass\";";
+    let initial_jaas = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotating=\"old-pass\" user_rotated=\"new-pass\" user_steady=\"steady-pass\";";
     let broker = apache::Kafka::default()
         .with_jvm_image()
         .with_env_var(
@@ -2742,6 +2759,12 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             "PLAINTEXT:SASL_PLAINTEXT,BROKER:PLAINTEXT,CONTROLLER:PLAINTEXT",
         )
         .with_env_var("KAFKA_SASL_ENABLED_MECHANISMS", "PLAIN")
+        .with_env_var(
+            "KAFKA_AUTHORIZER_CLASS_NAME",
+            "org.apache.kafka.metadata.authorizer.StandardAuthorizer",
+        )
+        .with_env_var("KAFKA_SUPER_USERS", "User:admin;User:ANONYMOUS")
+        .with_env_var("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND", "false")
         .with_env_var(
             "KAFKA_LISTENER_NAME_PLAINTEXT_PLAIN_SASL_JAAS_CONFIG",
             initial_jaas,
@@ -2781,6 +2804,43 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             Ok("steady-orders".to_string())
         ]
     );
+    for (principal, topic, group) in [
+        ("User:rotating", "rotating-orders", "rotation-group-"),
+        ("User:steady", "steady-orders", "steady-group-"),
+    ] {
+        kafka_acl(
+            &broker,
+            &[
+                "--add",
+                "--allow-principal",
+                principal,
+                "--operation",
+                "Read",
+                "--operation",
+                "Describe",
+                "--topic",
+                topic,
+            ],
+        )
+        .await;
+        kafka_acl(
+            &broker,
+            &[
+                "--add",
+                "--allow-principal",
+                principal,
+                "--operation",
+                "Read",
+                "--operation",
+                "Describe",
+                "--group",
+                group,
+                "--resource-pattern-type",
+                "prefixed",
+            ],
+        )
+        .await;
+    }
     let producer: FutureProducer = kafka_sasl_client(&bootstrap, "admin", "admin-pass")
         .create()
         .unwrap();
@@ -2947,73 +3007,40 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         ))
         .await
         .unwrap();
-    let updated_jaas = "listener.name.plaintext.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotated=\"new-pass\" user_steady=\"steady-pass\";";
-    let mut write_jaas = broker
-        .exec(ExecCommand::new([
-            "sh",
-            "-c",
-            &format!("printf '%s\\n' '{updated_jaas}' > /tmp/rockstream-kafka-rotation.properties"),
-        ]))
-        .await
-        .unwrap();
-    let write_jaas_stdout = String::from_utf8(write_jaas.stdout_to_vec().await.unwrap()).unwrap();
-    let write_jaas_stderr = String::from_utf8(write_jaas.stderr_to_vec().await.unwrap()).unwrap();
-    assert_eq!(write_jaas.exit_code().await.unwrap(), Some(0));
-    assert_eq!(write_jaas_stdout, "");
-    assert_eq!(write_jaas_stderr, "");
-    let mut update = broker
-        .exec(ExecCommand::new([
-            "/opt/kafka/bin/kafka-configs.sh",
-            "--bootstrap-server",
-            "localhost:9093",
-            "--entity-type",
-            "brokers",
-            "--entity-name",
-            "1",
-            "--alter",
-            "--add-config-file",
-            "/tmp/rockstream-kafka-rotation.properties",
-        ]))
-        .await
-        .unwrap();
-    let update_output = String::from_utf8(update.stdout_to_vec().await.unwrap()).unwrap();
-    let update_stderr = String::from_utf8(update.stderr_to_vec().await.unwrap()).unwrap();
-    assert_eq!(
-        update.exit_code().await.unwrap(),
-        Some(0),
-        "stdout={update_output}; stderr={update_stderr}"
-    );
-    assert_eq!(update_output, "Completed updating config for broker 1.\n");
-    let mut describe = broker
-        .exec(ExecCommand::new([
-            "/opt/kafka/bin/kafka-configs.sh",
-            "--bootstrap-server",
-            "localhost:9093",
-            "--entity-type",
-            "brokers",
-            "--entity-name",
-            "1",
-            "--describe",
-        ]))
-        .await
-        .unwrap();
-    let describe_output = String::from_utf8(describe.stdout_to_vec().await.unwrap()).unwrap();
-    assert_eq!(describe.exit_code().await.unwrap(), Some(0));
-    assert!(
-        describe_output.contains("listener.name.plaintext.plain.sasl.jaas.config"),
-        "broker did not report the dynamic SASL JAAS override"
-    );
-    let mut rotated_client = kafka_sasl_client(&bootstrap, "rotated", "new-pass");
-    rotated_client.set("message.timeout.ms", "10000");
-    let rotated_producer: FutureProducer = rotated_client.create().unwrap();
-    let rotation_probe = [(49_999, Some(499_990), 1)];
-    kafka_source_rows(&rotated_producer, "rotating-orders", &rotation_probe).await;
-    expected_rotating.extend(
-        rotation_probe
-            .iter()
-            .map(|(id, amount, _)| row(*id, *amount)),
-    );
-    expected_rotating.sort();
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--allow-principal",
+            "User:rotated",
+            "--operation",
+            "Read",
+            "--operation",
+            "Write",
+            "--operation",
+            "Describe",
+            "--topic",
+            "rotating-orders",
+        ],
+    )
+    .await;
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--allow-principal",
+            "User:rotated",
+            "--operation",
+            "Read",
+            "--operation",
+            "Describe",
+            "--group",
+            "rotation-group-",
+            "--resource-pattern-type",
+            "prefixed",
+        ],
+    )
+    .await;
     let rotation = client
         .simple_query("ALTER SECRET kafka_auth SET (USERNAME = 'rotated', PASSWORD = 'new-pass')")
         .await
@@ -3036,6 +3063,43 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         .await;
     }
 
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--deny-principal",
+            "User:rotating",
+            "--operation",
+            "Read",
+            "--operation",
+            "Write",
+            "--operation",
+            "Describe",
+            "--topic",
+            "rotating-orders",
+        ],
+    )
+    .await;
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--deny-principal",
+            "User:rotating",
+            "--operation",
+            "Read",
+            "--operation",
+            "Describe",
+            "--group",
+            "rotation-group-",
+            "--resource-pattern-type",
+            "prefixed",
+        ],
+    )
+    .await;
+    let mut rotated_client = kafka_sasl_client(&bootstrap, "rotated", "new-pass");
+    rotated_client.set("message.timeout.ms", "10000");
+    let rotated_producer: FutureProducer = rotated_client.create().unwrap();
     let after_rotation = [(50_000, None, 1)];
     kafka_source_rows(&rotated_producer, "rotating-orders", &after_rotation).await;
     expected_rotating.push(row(50_000, None));
