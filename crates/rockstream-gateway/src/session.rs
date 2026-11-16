@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use rockstream_types::diagnostic::DiagnosticOccurrence;
+use rockstream_types::ids::PrincipalId;
 
 /// Maximum GUC parameters stored per connection.
 /// Fill-level metric: `guc_params.len()`.
@@ -18,8 +19,13 @@ pub enum ScramAuthState {
     Idle,
     /// Server-first message has been sent; waiting for client-final.
     ServerFirstSent {
-        /// SaltedPassword from the RoleCatalog.
-        salted_password: Vec<u8>,
+        /// Persisted SCRAM client verifier.
+        stored_key: Vec<u8>,
+        /// Persisted SCRAM server verifier.
+        server_key: Vec<u8>,
+        /// Principal and policy revision used to begin this exchange.
+        principal_id: PrincipalId,
+        policy_revision: u64,
         /// Full nonce (client_nonce + server_nonce).
         server_nonce: String,
         /// Partial auth-message: `client_first_bare + "," + server_first`.

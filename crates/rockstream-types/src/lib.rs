@@ -8,6 +8,7 @@ pub mod acl;
 pub mod arrangement;
 pub mod arrow_batch;
 pub mod audit;
+pub mod authorization;
 pub mod batch;
 pub mod candidate_identity;
 pub mod capability;
@@ -58,6 +59,12 @@ pub use arrangement::{
     ArrangementSpec, CanonicalBinaryOp, CanonicalExpr, CanonicalLiteral, CanonicalType,
     CanonicalUnaryOp, CollationId, CollationVersion, NullSemantics, PartitioningSpec,
     SourceIdentity, TimeDomainSemantics,
+};
+pub use authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, AuthorizationModelError, LoginMethod,
+    PermissionPreset, PolicyScope, ResourceKind, ScopedActionGrant, ScopedPresetGrant,
+    SecurityAction, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
+    SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
 pub use candidate_identity::CandidateIdentity;
 pub use capability::{CapabilityDocument, CapabilityEntry, CapabilityRegistry};

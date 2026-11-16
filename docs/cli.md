@@ -8,6 +8,22 @@ Support bundles contain sanitized metadata and audit events only. Secret
 payloads are envelope-encrypted in the catalog and are not included in CLI
 output, `SHOW SECRETS`, errors, or generated support bundles.
 
+## Security audit history
+
+Connect to the PGWire endpoint as an authorized principal and run:
+
+```sql
+SHOW SECURITY AUDIT FROM 1798761600000 TO 1798848000000 LIMIT 100;
+```
+
+The optional inclusive time bounds use epoch milliseconds. Results are ordered
+by `(timestamp_ms, event_id)` and include a `cursor` column. Continue with
+`AFTER <cursor>` using the last row's cursor; `AFTER` is exclusive. The default
+page size is 100 rows and the maximum is 500. The current `security.audit.read`
+grant is checked on every request. See [security](security.md#audit-trail) for
+retention, storage-full behavior, and how live pagination handles concurrent
+history growth.
+
 RockStream ships as a **single binary** named `rockstream`. Every node role is a
 flag on this one binary — there is no separate server, worker, or gateway
 executable. `main` is always runnable through it.
@@ -55,7 +71,7 @@ Starts a RockStream node.
 | `--storage <dir>` | yes | — | Local storage directory for node state and artifacts. Created if missing. |
 | `--role <role>` | no | `all` | Node role. One of `all`, `control`, `worker`, `gateway`, `frontier`. An unrecognised role, or a role requiring `--control` when it is omitted, is rejected with `RS-0002`. |
 | `--control <url>` | no (required for `worker`/`frontier`) | — | Control service URL. Required for the `worker` and `frontier` roles; omitting it is rejected with `RS-0002`. |
-| `--auth <mode>` | no | `off` | Authentication mode. One of `off`, `oidc`, `mtls`. |
+| `--auth <mode>` | no | `off` | Authentication mode. One of `off`, `scram`, `oidc`, `mtls`; MD5 is rejected. SCRAM requires an enabled durable login. |
 | `--host-id <id>` | no | — | Stable same-host identity advertised during worker registration. |
 | `--availability-zone <az>` | no | — | Availability zone advertised during worker registration. |
 | `--metrics-addr <addr>` | no | — | Metrics HTTP server listen address. |
@@ -139,7 +155,7 @@ Inspect cluster state, quotas, and worker fleet.
 - `rockstream cluster quotas` — Show total memory budgets, used memory, and parallelism limits.
 - `rockstream cluster workers list` — List all registered workers, addresses, availability zones, and health.
 - `rockstream cluster workers status [<worker_id>]` — Show detailed worker status, capacity headroom, and lifecycle state.
-- `rockstream cluster workers drain <worker_id> [--control <addr>] [--yes]` — Signal a worker to drain shard assignments before shutdown.
+- `rockstream cluster workers drain <worker_id> [--control <addr>] [--idempotency-key <uuid>] [--yes]` — Signal a worker to drain shard assignments before shutdown.
 
 ---
 
@@ -148,7 +164,9 @@ Inspect cluster state, quotas, and worker fleet.
 Inspect shard lease ownership and key ranges, and trigger shard migrations.
 
 - `rockstream shard list` — List all shards, lease tokens, owner workers, and active key ranges.
-- `rockstream shard migrate <shard_id> --to <worker_id> [--yes]` — Migrate a shard lease and state to another worker.
+- `rockstream shard migrate <shard_id> --to <worker_id> [--idempotency-key <uuid>] [--yes]` — Migrate a shard lease and state to another worker.
+
+For management drain, migration, and backup operations, RockStream prints `Idempotency-Key: <key>` to stderr before submitting the request. The key is also the operation ID, so after a lost response, retry with the same `--idempotency-key <key>` or inspect it with `rockstream admin operation show <key>`.
 
 Management mutations accept `--idempotency-key <UUID>`. For backup creation, set `--management` to select the management service. If the key is omitted, the CLI prints a generated key to stderr before submitting the request. If the response is lost, repeat the same command with that key, then reconcile with `rockstream admin operation show <UUID>`; the key is also the operation ID.
 
@@ -174,6 +192,9 @@ Generate on-demand diagnostic support bundles as local files. Bundles contain
 sanitized operational metadata only: diagnostic context values and the selected
 view name are omitted, and each bundle is limited to 10 MiB. This command does
 not download an actor-scoped artifact from a remote service.
+Generation outcomes are durably recorded in the local `audit.jsonl`; an audit
+failure returns an error, though a bundle written just before that failure can
+remain at the requested local path.
 
 - `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Write a sanitized diagnostic bundle to a local path, subject to the 10 MiB limit.
 

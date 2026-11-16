@@ -137,7 +137,10 @@ async fn test_source_id_invariance_across_status_changes() {
         name: "kafka_stream".to_string(),
         connector_type: "kafka".to_string(),
         table_name: None,
+        format: "json".to_string(),
         options: opts,
+        secret_consumer: None,
+        secret_namespace: None,
     };
     let txn1 = CatalogTxn::new(1, 1, vec![CatalogMutation::PutSource(src.clone())]).unwrap();
     catalog.commit_txn(txn1).await.unwrap();

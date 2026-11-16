@@ -173,6 +173,7 @@ pub struct PollDeltaResult {
 
 /// Trait implemented by every source connector (§13.3).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait SourceConnector: Send + Sync {
     /// Returns the Arrow schema of the source data.
     fn discover_schema(&self) -> Result<SchemaRef, SourceError>;

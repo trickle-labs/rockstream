@@ -3731,7 +3731,7 @@
           {
             "name": "auth",
             "long": "auth",
-            "help": "Authentication mode. Only `off` is available; others fail closed. Omitted uses `[auth].mode`",
+            "help": "Authentication mode. SCRAM requires an enabled durable login; OIDC and mTLS require their configuration. MD5 is rejected. Omitted uses `[auth].mode`",
             "required": false,
             "value_name": "AUTH",
             "possible_values": [
@@ -4782,7 +4782,7 @@
         "key": "auth.mode",
         "data_type": "String",
         "default_value": "off",
-        "description": "Explicit --auth selects a mode; OIDC and gateway mTLS require their settings. SCRAM remains unavailable until durable principal grants are enforced.",
+        "description": "Explicit --auth selects off, SCRAM, OIDC, or gateway mTLS. SCRAM requires an enabled durable login; OIDC and gateway mTLS require their settings. MD5 is rejected.",
         "deprecated": false,
         "env_var": "ROCKSTREAM_AUTH_MODE",
         "source_origin": "rockstream-types::config::AuthSection"

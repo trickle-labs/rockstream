@@ -92,17 +92,15 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("run: make qualify-verus", blocks["verus-qualify"])
         self.assertIn("phase: [debug, release]", blocks["verus-qualify"])
         self.assertIn("os: [ubuntu-latest, macos-15]", blocks["verus-qualify"])
-        self.assertNotIn("macos-14", workflow)
-        self.assertIn(
-            "- os: macos-15\n            target: aarch64-apple-darwin",
-            blocks["verus-verify"],
-        )
         evidence = (ROOT / ".github/workflows/v072-evidence-checks.yml").read_text()
         self.assertIn("runs-on: macos-15", evidence)
-        self.assertNotIn("macos-14", evidence)
+        self.assertNotIn("runs-on: macos-14", evidence)
         self.assertIn("VERUS_QUALIFICATION_PHASE: ${{ matrix.phase }}", blocks["verus-qualify"])
         self.assertIn("VERUS_MUTATION_OUTPUT: evidence/verus/${{ matrix.target }}/${{ matrix.phase }}/mutations", blocks["verus-qualify"])
         self.assertIn("needs: [ci-policy, verus-qualify]\n    if: always()", blocks["verus-verify"])
+        self.assertIn("name: Verus verify and qualify (VS6) (${{ matrix.check_os }}, ${{ matrix.target }})", blocks["verus-verify"])
+        self.assertIn("          - os: macos-15\n            check_os: macos-14\n            target: aarch64-apple-darwin", blocks["verus-verify"])
+        self.assertIn("runs-on: ${{ matrix.os }}", blocks["verus-verify"])
         self.assertIn("run: python3 scripts/ci-scope.py check-verus", blocks["verus-verify"])
         self.assertIn("--status passed --merge target/verus-phases", blocks["verus-verify"])
         self.assertIn("name: verus-phase-${{ matrix.target }}-debug", blocks["verus-verify"])
