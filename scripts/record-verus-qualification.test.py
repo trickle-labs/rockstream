@@ -125,13 +125,13 @@ class MergeTests(unittest.TestCase):
                 records = self.fixture(root)
                 for phase in IDS:
                     records[phase]["target"] = "aarch64-apple-darwin"
-                records["release"]["steps"] = [f"cargo-release\\t0\\t{duration}\\tbuild"]
+                records["release"]["steps"] = [f"cargo-release\t0\t{duration}\tbuild"]
                 self.write_records(root, records)
                 if accepted:
                     steps, _, _, _ = recorder.merge_phases(
                         root, root / "complete", "candidate", "aarch64-apple-darwin",
                         {"Cargo.lock": "digest"}, BUDGETS, SOURCE, INVENTORY)
-                    self.assertEqual(steps[-1], f"cargo-release\\t0\\t{duration}\\tbuild")
+                    self.assertEqual(steps[-1], f"cargo-release\t0\t{duration}\tbuild")
                 else:
                     with self.assertRaisesRegex(
                         ValueError, "release: unsuccessful or over-budget step cargo-release"
