@@ -198,7 +198,7 @@ impl ActorAssertionVerifier {
         let jwk: RsaJwk = serde_json::from_slice(&bytes)
             .map_err(|_| "actor assertion verification key is not a valid RSA JWK".to_owned())?;
         if jwk.kty != "RSA" || jwk.alg != "RS256" || jwk.key_use != "sig" {
-            return Err("actor assertion verification key must be an RSA RS256 signing key".into());
+            return Err("RS-2400: actor assertion verification key must be RSA RS256".into());
         }
         let modulus = URL_SAFE_NO_PAD
             .decode(jwk.n)

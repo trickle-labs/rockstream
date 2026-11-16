@@ -920,7 +920,7 @@ async fn management_grant_mutation_rejects_last_management_administrator_removal
         serde_json::from_str::<serde_json::Value>(&operation.result_json).unwrap(),
         serde_json::json!({
             "status": "failed",
-            "reason": "grant mutation would remove the last mTLS management administrator"
+            "reason": "RS-2401: grant mutation would remove the last mTLS management administrator"
         })
     );
     assert_eq!(
