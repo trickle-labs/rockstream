@@ -231,7 +231,9 @@ async fn call_without_management_credentials(
             .map_err(|error| error.to_string())?;
         let mut byte = [0; 1];
         return match tokio::time::timeout(Duration::from_secs(3), stream.read(&mut byte)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => Err("management listener rejected the TLS client".into()),
+            Ok(Ok(0)) | Ok(Err(_)) => {
+                Err("RS-2400: management listener rejected the TLS client".into())
+            }
             Ok(Ok(_)) | Err(_) => Ok(()),
         };
     }
@@ -245,8 +247,12 @@ async fn call_without_management_credentials(
         .map_err(|error| error.to_string())?;
     let mut byte = [0; 1];
     match tokio::time::timeout(Duration::from_secs(3), stream.read(&mut byte)).await {
-        Ok(Ok(0)) | Ok(Err(_)) => Err("management listener closed the plaintext connection".into()),
-        Ok(Ok(1)) if byte[0] == 0x15 => Err("management TLS listener rejected plaintext".into()),
+        Ok(Ok(0)) | Ok(Err(_)) => {
+            Err("RS-2400: management listener closed the plaintext connection".into())
+        }
+        Ok(Ok(1)) if byte[0] == 0x15 => {
+            Err("RS-2400: management TLS listener rejected plaintext".into())
+        }
         Ok(Ok(_)) => Ok(()),
         Err(_) => Ok(()),
     }

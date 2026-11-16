@@ -1762,10 +1762,6 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
         .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
         .is_some());
 
-    worker
-        .request_secret_token(request.workload_id, "kafka")
-        .await
-        .unwrap();
     let resolved = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(secret) = worker.secret(

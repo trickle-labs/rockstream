@@ -534,7 +534,12 @@ impl ManagementService {
                         },
                         Ok(Err(_)) | Err(_) => {
                             if let Err(error) = service.record_authentication_failure().await {
-                                tracing::error!(%error, %peer_addr, "management authentication audit failed");
+                                tracing::error!(
+                                    code = %rockstream_types::error_code::RS_0003,
+                                    %error,
+                                    %peer_addr,
+                                    "management authentication audit failed"
+                                );
                             }
                             tracing::warn!(%peer_addr, "management mTLS handshake rejected");
                         }
@@ -1169,7 +1174,12 @@ impl ManagementService {
             }
             crate::management_store::OperationKind::SecurityPrincipalGrants => {
                 if let Err(error) = self.process_security_principal_grants(record).await {
-                    tracing::error!(operation_id = record.operation_id(), %error, "security grant operation reconciliation failed");
+                    tracing::error!(
+                        code = %rockstream_types::error_code::RS_0001,
+                        operation_id = record.operation_id(),
+                        %error,
+                        "security grant operation reconciliation failed"
+                    );
                 }
             }
             crate::management_store::OperationKind::SecretRotation => {}
@@ -1361,7 +1371,9 @@ impl ManagementService {
                     &PolicyScope::Cluster,
                 )
             {
-                return Err("grantor authority or reviewed revision is no longer current".into());
+                return Err(
+                    "RS-2401: grantor authority or reviewed revision is no longer current".into(),
+                );
             }
             let mut target = catalog
                 .get_security_principal(target_id)
@@ -1370,7 +1382,7 @@ impl ManagementService {
                 .ok_or_else(|| "security principal was not found".to_owned())?;
             if target.revision != change.expected_revision {
                 return Err(format!(
-                    "security principal revision changed from {} to {}; review the current grants",
+                    "RS-2008: security principal revision changed from {} to {}; review the current grants",
                     change.expected_revision, target.revision
                 ));
             }
@@ -1390,7 +1402,8 @@ impl ManagementService {
             *changed_target = target.clone();
             if !has_management_admin(&principals) {
                 return Err(
-                    "grant mutation would remove the last mTLS management administrator".into(),
+                    "RS-2401: grant mutation would remove the last mTLS management administrator"
+                        .into(),
                 );
             }
             let after_state = security_principal_policy_state(&target)?;
@@ -1608,10 +1621,14 @@ pub(crate) async fn append_security_audit(
             {
                 continue;
             }
-            Err(error) => return Err(format!("management security audit commit failed: {error}")),
+            Err(error) => {
+                return Err(format!(
+                    "RS-0003: management security audit commit failed: {error}"
+                ));
+            }
         }
     }
-    Err("management security audit retry was exhausted".to_owned())
+    Err("RS-0003: management security audit retry was exhausted".to_owned())
 }
 
 pub struct ManagementServiceHandle {
