@@ -119,6 +119,26 @@ The control-worker TCP listener used for registration, heartbeats, and shard lea
 
 For local development only, `--allow-insecure-internal-dev` explicitly permits plaintext control traffic when the control listener or worker target uses a literal loopback socket address. The option rejects non-loopback addresses and must not be used for production or release qualification.
 
+Worker-to-worker shuffle uses separate `[worker].exchange_bind_addr` and
+`[worker].exchange_advertise_addr` settings. A `worker` process requires both;
+the listener binds before registration, and control receives only the advertised
+address. Bind may use a wildcard socket, while the advertised address must be a
+reachable non-wildcard `host:port`. Without internal mTLS, both addresses must
+be numeric loopback addresses and startup also requires
+`--allow-insecure-internal-dev`. Workers without a shuffle endpoint do not
+advertise `shuffle_codec_v1`; embedded `all` may omit the endpoint for its
+single local worker.
+
+The shuffle listener accepts only CA-verified worker certificates whose identity
+matches a currently healthy registered worker, and it checks that a target shard
+is active locally before processing a frame. A frame for an unregistered exchange
+target is rejected instead of acknowledged. Identity denials are currently
+tracing events rather than durable correlated audit records, and the CLI worker
+does not yet wire exchange inlets into its application data path. The listener
+also does not yet verify that the claimed source shard is assigned to the
+certificate holder. Those gaps and the release negative-case/rollover matrix keep
+#303 open.
+
 When a gateway connects to `--control`, its cross-process SQL data-plane client uses internal mTLS and presents a CA-verified `Gateway` node identity. For authenticated gateway configurations, each deploy, source-delta, workload-read, and operator-stats request carries a short-lived RS256 actor assertion. Version 2 claims include explicit `SecretUse` scopes for secret-backed sources in a deployment, limited to scopes the actor is authorized to use when the assertion is issued. Control retains those scopes with the workload; each worker secret refresh must match the retained allowance and the actor's current scoped policy. A later grant applies to a workload only after a fresh authorized deployment assertion includes that scope. The gateway signs assertions with the dedicated deployment-managed private key at `auth.actor_assertion_signing_key_path`; control verifies them with the matching RSA public JWK at `auth.actor_assertion_public_key_path`. Both nodes require the same `node.deployment_id`. The assertion audience is exactly `rockstream-control:<deployment_id>`, and its lifetime is 60 seconds. Control verifies the gateway certificate role, signature, deployment, request digest, action and scope, then checks the actor's current durable grants. Effective authority is the intersection of the asserted allowance and those current grants. Version 1 assertions remain valid for their original action and scope and carry no delegated secret-use scopes. Missing keys, invalid assertions, disabled actors, and revoked grants are rejected and audited before the data-plane request is dispatched. The signing key pair must be distinct from both gateway and internal TLS key pairs.
 
 The explicit loopback plaintext development mode continues to permit bare data-plane messages for local development. It does not establish a verified node identity and cannot carry actor assertions; signed delegation requires internal mTLS. Worker secret-token requests name an active workload. Control verifies that the mTLS worker is assigned to it, derives the reference and namespace from durable source metadata, and rechecks both the source consumer's and delegated actor's current scoped `SecretUse` grants. Name-only legacy requests are rejected and audited. Versioned tokens are encrypted and cached per worker and workload; unsupported token formats are rejected. Tokens expire within 60 seconds and are reauthorized every 30 seconds while the workload is active. A denied refresh removes the cached token. Secret-rotation refreshes target only workloads that reference that secret; replacement tokens remain pending until the workload enters a later epoch. The worker secret-token path still needs real-process release qualification, including revocation and refresh behavior.
