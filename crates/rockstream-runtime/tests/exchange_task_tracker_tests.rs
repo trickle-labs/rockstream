@@ -8,7 +8,7 @@ async fn test_exchange_service_graceful_shutdown_joins_all_tasks() {
     drop(listener);
 
     let registry = ExchangeRegistry::new();
-    let service = ExchangeService::new(registry);
+    let service = ExchangeService::new(registry).with_insecure_internal_dev();
 
     service.start(addr).await.unwrap();
 
