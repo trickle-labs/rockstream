@@ -2133,7 +2133,7 @@ fn workload_failure(message: impl Into<String>) -> ControlMessage {
     ControlMessage::OperationFailed {
         code: rockstream_types::error_code::RS_0001.to_string(),
         message: message.into(),
-        next_steps: "Reconcile the affected workload before retrying.".to_owned(),
+        next_steps: "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
     }
 }
 

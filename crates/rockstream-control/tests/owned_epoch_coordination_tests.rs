@@ -357,7 +357,7 @@ async fn owned_epoch_is_prepared_before_dispatch_and_finished_before_reply() {
                 (
                     "RS-0001".to_owned(),
                     "owned epoch preparation failed: test failure".to_owned(),
-                    "Reconcile the affected workload before retrying.".to_owned()
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned()
                 )
             ),
             other => panic!("unexpected preparation response: {other:?}"),

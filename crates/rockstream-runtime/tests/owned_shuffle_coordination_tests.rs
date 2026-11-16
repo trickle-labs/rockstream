@@ -245,7 +245,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
             );
             assert_eq!(
                 next_steps,
-                "Reconcile the affected workload before retrying."
+                "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying."
             );
         }
         other => panic!("unexpected failed source response: {other:?}"),
@@ -306,7 +306,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
             (
                 "RS-0001".to_owned(),
                 "workload requires recovery after failed execution".to_owned(),
-                "Reconcile the affected workload before retrying.".to_owned()
+                "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned()
             )
         ),
         other => panic!("unexpected response after failure: {other:?}"),
@@ -388,7 +388,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
             (
                 "RS-0001".to_owned(),
                 "workload requires recovery after failed execution".to_owned(),
-                "Reconcile the affected workload before retrying.".to_owned()
+                "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned()
             )
         ),
         other => panic!("unexpected deployment response after restart: {other:?}"),
@@ -420,7 +420,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
             (
                 "RS-0001".to_owned(),
                 "workload requires recovery after failed execution".to_owned(),
-                "Reconcile the affected workload before retrying.".to_owned()
+                "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned()
             )
         ),
         other => panic!("unexpected source response after restart: {other:?}"),

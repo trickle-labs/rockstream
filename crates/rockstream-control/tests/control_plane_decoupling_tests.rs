@@ -316,7 +316,7 @@ async fn source_delta_waits_for_each_routed_shard() {
                 (
                     "RS-0001".to_owned(),
                     "worker execution failed: test delivery rejected".to_owned(),
-                    "Reconcile the affected workload before retrying.".to_owned(),
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
                 )
             ),
             other => panic!("unexpected failure response: {other:?}"),
@@ -376,7 +376,7 @@ async fn source_delta_waits_for_each_routed_shard() {
                     (
                         "RS-0001".to_owned(),
                         "workload requires recovery after failed execution".to_owned(),
-                        "Reconcile the affected workload before retrying.".to_owned(),
+                        "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
                     )
                 ),
                 other => panic!("unexpected later response: {other:?}"),
@@ -400,7 +400,7 @@ async fn source_delta_waits_for_each_routed_shard() {
                 (
                     "RS-0001".to_owned(),
                     "workload requires recovery after failed execution".to_owned(),
-                    "Reconcile the affected workload before retrying.".to_owned(),
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
                 )
             ),
             other => panic!("unexpected redeployment response: {other:?}"),
@@ -491,7 +491,7 @@ async fn source_delta_waits_for_each_routed_shard() {
                 (
                     "RS-0001".to_owned(),
                     "worker disconnected before source delta completed".to_owned(),
-                    "Reconcile the affected workload before retrying.".to_owned()
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned()
                 )
             ),
             other => panic!("unexpected disconnect response: {other:?}"),
@@ -518,7 +518,7 @@ async fn source_delta_waits_for_each_routed_shard() {
                 (
                     "RS-0001".to_owned(),
                     "workload requires recovery after failed execution".to_owned(),
-                    "Reconcile the affected workload before retrying.".to_owned()
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned()
                 )
             ),
             other => panic!("unexpected post-disconnect response: {other:?}"),
