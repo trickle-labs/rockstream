@@ -564,6 +564,15 @@ impl PostgresCdcSource {
             let _ = connection_task.await;
             return Err(SourceError::Io(error));
         }
+        let table = &config.table;
+        let publication = &config.publication;
+        let validation = Self::validate_partitioned_publication(&client, table, publication).await;
+        if let Err(error) = validation {
+            drop(client);
+            connection_task.abort();
+            let _ = connection_task.await;
+            return Err(error);
+        }
         self.pgoutput = Some(PgOutputConnection {
             client,
             slot: config.slot,
@@ -574,6 +583,56 @@ impl PostgresCdcSource {
             connection_task,
         });
         Ok(())
+    }
+
+    /// Partitioned parents must publish changes under the imported root identity,
+    /// not under individual child relation IDs which are not routed to the view.
+    async fn validate_partitioned_publication(
+        client: &Client,
+        table: &str,
+        publication: &str,
+    ) -> Result<(), SourceError> {
+        let row = client
+            .query_opt(
+                "SELECT c.relkind::text FROM pg_class c WHERE c.oid = to_regclass($1)",
+                &[&table],
+            )
+            .await
+            .map_err(|error| SourceError::DiscoverSchemaFailed {
+                reason: format!("RS-4013: inspect PostgreSQL source table '{table}': {error}"),
+            })?
+            .ok_or_else(|| SourceError::DiscoverSchemaFailed {
+                reason: format!("RS-4013: PostgreSQL source table '{table}' does not exist"),
+            })?;
+        let relation_kind: String = row.get(0);
+        if relation_kind != "p" {
+            return Ok(());
+        }
+        let publication = client
+            .query_opt(
+                "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+                &[&publication],
+            )
+            .await
+            .map_err(|error| SourceError::DiscoverSchemaFailed {
+                reason: format!("RS-4013: inspect partitioned publication for '{table}': {error}"),
+            })?
+            .ok_or_else(|| SourceError::DiscoverSchemaFailed {
+                reason: format!(
+                    "RS-4013: publication for partitioned table '{table}' does not exist"
+                ),
+            })?;
+        require_partition_root_identity(table, publication.get(0))
+    }
+
+    /// Validate additional imported aliases that share the same pgoutput slot.
+    /// Checking only the primary table would leave newly attached partitioned
+    /// sources vulnerable to silently unrouted child-table changes.
+    pub async fn validate_pgoutput_table(&self, table: &str) -> Result<(), SourceError> {
+        let pgoutput = self.pgoutput.as_ref().ok_or_else(|| {
+            SourceError::Io("native pgoutput connection is unavailable".to_string())
+        })?;
+        Self::validate_partitioned_publication(&pgoutput.client, table, &pgoutput.publication).await
     }
 
     pub fn set_snapshot_batches(&mut self, batches: Vec<RecordBatch>) {
@@ -651,6 +710,10 @@ impl PostgresCdcSource {
                 .map_err(|error| SourceError::StartSnapshotFailed {
                     reason: format!("create pgoutput slot '{}': {error}", pgoutput.slot),
                 })?;
+        }
+        for (table, _) in relations {
+            Self::validate_partitioned_publication(&pgoutput.client, table, &pgoutput.publication)
+                .await?;
         }
         pgoutput
             .client
@@ -1721,7 +1784,8 @@ fn decode_native_pgoutput_message(
         });
     };
     match tag {
-        b'B' | b'C' | b'O' | b'Y' | b'T' => Ok(None),
+        b'B' | b'C' | b'O' | b'Y' => Ok(None),
+        b'T' => Err(pgoutput_truncate_unsupported()),
         b'R' => {
             let relation_id = take_u32(&mut data)?;
             take_cstring(&mut data)?;
@@ -1810,7 +1874,8 @@ fn decode_native_pgoutput_text_message(
         });
     };
     match tag {
-        b'B' | b'C' | b'O' | b'Y' | b'T' => Ok(None),
+        b'B' | b'C' | b'O' | b'Y' => Ok(None),
+        b'T' => Err(pgoutput_truncate_unsupported()),
         b'R' => {
             let relation_id = take_u32(&mut data)?;
             take_cstring(&mut data)?;
@@ -1888,6 +1953,7 @@ pub fn decode_pgoutput_event(
     }
     let xid = active_xid.ok_or_else(|| pgoutput_protocol_error("message without BEGIN"))?;
     match tag {
+        b'T' => Err(pgoutput_truncate_unsupported()),
         b'C' => {
             let commit_lsn = pgoutput_commit_lsn(payload)?;
             *active_xid = None;
@@ -2007,6 +2073,28 @@ fn ensure_consumed(data: &[u8], frame: &str) -> Result<(), SourceError> {
         Ok(())
     } else {
         Err(pgoutput_protocol_error(&format!("malformed {frame} frame")))
+    }
+}
+
+/// pgoutput TRUNCATE has no row images with which to retract old aggregates.
+fn pgoutput_truncate_unsupported() -> SourceError {
+    SourceError::PollDeltaFailed {
+        reason: "RS-4015: pgoutput TRUNCATE cannot be applied to retained materialized views without row retractions; source blocked before LSN acknowledgment. Next steps: use row-level DELETE, or rebuild from a complete historical source and verify view totals".to_string(),
+    }
+}
+
+fn require_partition_root_identity(
+    table: &str,
+    publish_via_partition_root: bool,
+) -> Result<(), SourceError> {
+    if publish_via_partition_root {
+        Ok(())
+    } else {
+        Err(SourceError::DiscoverSchemaFailed {
+            reason: format!(
+                "RS-4013: partitioned PostgreSQL source '{table}' requires its publication to use publish_via_partition_root = true; child partition relation IDs are not routed to the parent import"
+            ),
+        })
     }
 }
 
@@ -2511,6 +2599,44 @@ mod tests {
             }
         );
         assert_eq!(xid, None);
+    }
+
+    #[test]
+    fn pgoutput_truncate_fails_closed_on_all_decode_paths() {
+        // pgoutput TRUNCATE: relation count, option flags, then relation OIDs.
+        let mut truncate = vec![b'T'];
+        truncate.extend_from_slice(&1_u32.to_be_bytes());
+        truncate.push(0);
+        truncate.extend_from_slice(&7_u32.to_be_bytes());
+
+        let mut relations = std::collections::HashMap::new();
+        let legacy = decode_native_pgoutput_message(&mut relations, 1, PgLsn(10), &truncate);
+        assert!(legacy.unwrap_err().to_string().contains("RS-4015"));
+        let text = decode_native_pgoutput_text_message(&mut relations, 1, PgLsn(10), &truncate);
+        assert!(text.unwrap_err().to_string().contains("RS-4015"));
+
+        let mut xid = None;
+        let mut begin = vec![b'B'];
+        begin.extend_from_slice(&100_u64.to_be_bytes());
+        begin.extend_from_slice(&0_u64.to_be_bytes());
+        begin.extend_from_slice(&52_u32.to_be_bytes());
+        decode_pgoutput_event(&mut xid, &begin).unwrap();
+        let error = decode_pgoutput_event(&mut xid, &truncate)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RS-4015"));
+        // The transaction remains uncommitted: callers must not acknowledge.
+        assert_eq!(xid, Some(52));
+    }
+
+    #[test]
+    fn partitioned_sources_require_root_publication_identity() {
+        assert!(require_partition_root_identity("public.events", true).is_ok());
+        let failure = require_partition_root_identity("public.events", false)
+            .unwrap_err()
+            .to_string();
+        assert!(failure.contains("RS-4013"));
+        assert!(failure.contains("publish_via_partition_root"));
     }
 
     #[test]

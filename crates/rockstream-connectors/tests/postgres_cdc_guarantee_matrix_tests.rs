@@ -123,11 +123,11 @@ async fn postgres_cdc_snapshot_stream_fence_has_exact_transcript() {
 }
 
 #[tokio::test]
-async fn postgres_cdc_all_mutation_types_have_exact_transcript() {
+async fn postgres_cdc_insert_update_delete_have_exact_transcript() {
     let fixture = common::connector_fixture("mutations").await;
     fixture
         .postgres
-        .batch_execute("INSERT INTO orders VALUES (1); UPDATE orders SET id = 2 WHERE id = 1; DELETE FROM orders WHERE id = 2; TRUNCATE orders")
+        .batch_execute("INSERT INTO orders VALUES (1); UPDATE orders SET id = 2 WHERE id = 1; DELETE FROM orders WHERE id = 2")
         .await
         .unwrap();
     let mut source = source();

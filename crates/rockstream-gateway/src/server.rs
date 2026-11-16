@@ -5057,6 +5057,29 @@ impl GatewayHandler {
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
         let mut coordinator = coordinator.lock().await;
+        // A newly attached alias may point to a different PostgreSQL table
+        // than the first source using this shared slot. Check its partition
+        // publication before reading or publishing a view from it.
+        let imported = self.catalog.source_table(&source.name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("source '{}' is not bound to a table", source.name),
+            }
+        })?;
+        let upstream_table = source
+            .options
+            .get("table")
+            .map(String::as_str)
+            .unwrap_or(&imported.name);
+        let lease = coordinator.owner_lease.clone().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
+            }
+        })?;
+        coordinator
+            .runtime
+            .validate_pgoutput_table(&lease, upstream_table)
+            .await
+            .map_err(source_backfill_error)?;
         let _guard = self.shard_commit_lock.lock().await;
         self.recover_pending_views_locked().await?;
         self.validate_pgoutput_lifecycles(&coordinator).await?;
@@ -5442,6 +5465,32 @@ impl GatewayHandler {
                     .open_pgoutput(&lease)
                     .await
                     .map_err(|_| ())?;
+                // Revalidate all existing imported aliases on restart. One
+                // shared slot can contain multiple independently imported
+                // tables, including a partitioned root not used by the first
+                // alias that opened the physical connection.
+                let restored_aliases = handler.pgoutput_source_aliases(connector_id);
+                for alias in &restored_aliases {
+                    let upstream_table = alias.options.get("table").cloned().or_else(|| {
+                        handler
+                            .catalog
+                            .source_table(&alias.name)
+                            .map(|table| table.name)
+                    });
+                    if let Some(upstream_table) = upstream_table {
+                        if let Err(error) = coordinator
+                            .runtime
+                            .validate_pgoutput_table(&lease, &upstream_table)
+                            .await
+                        {
+                            handler.block_pgoutput_aliases(
+                                &restored_aliases,
+                                format!("pgoutput publication validation failed: {error}"),
+                            );
+                            return Err(());
+                        }
+                    }
+                }
                 let durable_lsn = rockstream_connectors::PgLsn::from_offset_token(
                     coordinator.runtime.committed_offset(),
                 )
