@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::exchange::proto::{shuffle_service_server::ShuffleService, ShuffleAck, ShuffleFrame};
@@ -174,6 +174,7 @@ pub struct ExchangeService {
     cancel_token: CancellationToken,
     exchange_config: ExchangeConfig,
     internal_tls: Option<rockstream_types::identity::InternalTlsConfig>,
+    tls_reloader: Option<Arc<rockstream_types::tls::TlsCertificateReloader>>,
     protocol_range: SupportedVersionRange,
     insecure_internal_dev: bool,
 }
@@ -186,6 +187,7 @@ impl ExchangeService {
             cancel_token: CancellationToken::new(),
             exchange_config: ExchangeConfig::default(),
             internal_tls: None,
+            tls_reloader: None,
             protocol_range: SupportedVersionRange::v1_through_v2(),
             insecure_internal_dev: false,
         }
@@ -201,6 +203,14 @@ impl ExchangeService {
         config: rockstream_types::identity::InternalTlsConfig,
     ) -> Self {
         self.internal_tls = Some(config);
+        self
+    }
+
+    pub fn with_tls_reloader(
+        mut self,
+        reloader: Arc<rockstream_types::tls::TlsCertificateReloader>,
+    ) -> Self {
+        self.tls_reloader = Some(reloader);
         self
     }
 
@@ -236,7 +246,7 @@ impl ExchangeService {
         addr: std::net::SocketAddr,
     ) -> Result<tokio::task::JoinHandle<()>, String> {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let tls_config = if let Some(tls_cfg) = &self.internal_tls {
+        let tls_reloader = if let Some(tls_cfg) = &self.internal_tls {
             if !tls_cfg.is_enabled() {
                 return Err(format!(
                     "{RS_2410}: worker shuffle TLS certificate and private key are required"
@@ -246,32 +256,22 @@ impl ExchangeService {
                 return Err(format!("{RS_2410}: worker shuffle requires mutual TLS"));
             }
             tls_cfg.validate()?;
-            let cert_path = tls_cfg.cert_path.as_ref().unwrap();
-            let key_path = tls_cfg.key_path.as_ref().unwrap();
-            let cert_pem = std::fs::read_to_string(cert_path)
-                .map_err(|e| format!("failed to read TLS cert {}: {e}", cert_path.display()))?;
-            let key_pem = std::fs::read_to_string(key_path)
-                .map_err(|e| format!("failed to read TLS key {}: {e}", key_path.display()))?;
-            let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-            let mut server_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
-            if let Some(ca_path) = &tls_cfg.ca_cert_path {
-                let ca_pem = std::fs::read_to_string(ca_path).map_err(|e| {
-                    format!("failed to read TLS CA cert {}: {e}", ca_path.display())
-                })?;
-                let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
-                server_tls = server_tls.client_ca_root(ca_cert);
-            }
-            Some(server_tls)
+            Some(match &self.tls_reloader {
+                Some(reloader) => reloader.clone(),
+                None => Arc::new(rockstream_types::tls::TlsCertificateReloader::new(
+                    tls_cfg.clone(),
+                )?),
+            })
         } else {
             None
         };
 
-        if tls_config.is_none() && !addr.ip().is_loopback() {
+        if tls_reloader.is_none() && !addr.ip().is_loopback() {
             return Err(format!(
                 "{RS_2410}: plaintext worker shuffle is limited to loopback development"
             ));
         }
-        if tls_config.is_none() && !self.insecure_internal_dev {
+        if tls_reloader.is_none() && !self.insecure_internal_dev {
             return Err(format!(
                 "{RS_2410}: plaintext worker shuffle requires explicit loopback development opt-in"
             ));
@@ -286,31 +286,92 @@ impl ExchangeService {
         )
         .with_exchange_config(self.exchange_config.clone())
         .with_supported_protocol_range(self.protocol_range)
-        .with_required_worker_identity(tls_config.is_some());
+        .with_required_worker_identity(tls_reloader.is_some());
         let cancel_token = self.cancel_token.clone();
+        let task_tracker = self.task_tracker.clone();
 
-        let mut builder = tonic::transport::Server::builder();
-        if let Some(tls) = tls_config {
-            builder = builder
-                .tls_config(tls)
-                .map_err(|e| format!("{RS_2410}: failed to configure worker shuffle TLS: {e}"))?;
-        }
         let handle = self.task_tracker.spawn(async move {
-            let incoming = futures::stream::unfold(listener, |listener| async move {
-                let accepted = listener.accept().await.map(|(stream, _)| stream);
-                Some((accepted, listener))
-            });
-            if let Err(error) = builder
-                .add_service(
-                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
-                        server,
-                    ),
-                )
-                .serve_with_incoming_shutdown(incoming, async move {
-                    cancel_token.cancelled().await;
-                })
-                .await
-            {
+            let api = crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                server,
+            );
+            let result = if let Some(reloader) = tls_reloader {
+                let (incoming_tx, incoming_rx) = mpsc::channel::<
+                    Result<
+                        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                        std::io::Error,
+                    >,
+                >(crate::exchange::flow_control::DEFAULT_MAX_PENDING_REQUESTS);
+                let handshake_gate = Arc::new(Semaphore::new(
+                    crate::exchange::flow_control::DEFAULT_MAX_PENDING_REQUESTS,
+                ));
+                let accept_tracker = task_tracker.clone();
+                let handshake_tracker = task_tracker.clone();
+                let accept_cancel = cancel_token.clone();
+                accept_tracker.spawn(async move {
+                    loop {
+                        let accepted = tokio::select! {
+                            _ = accept_cancel.cancelled() => break,
+                            accepted = listener.accept() => accepted,
+                        };
+                        let (stream, peer_addr) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(error) => {
+                                tracing::warn!(%error, %addr, "worker shuffle listener accept failed");
+                                continue;
+                            }
+                        };
+                        let permit = tokio::select! {
+                            _ = accept_cancel.cancelled() => break,
+                            permit = handshake_gate.clone().acquire_owned() => match permit {
+                                Ok(permit) => permit,
+                                Err(_) => break,
+                            },
+                        };
+                        let reloader = reloader.clone();
+                        let incoming_tx = incoming_tx.clone();
+                        let handshake_cancel = accept_cancel.clone();
+                        handshake_tracker.clone().spawn(async move {
+                            let _permit = permit;
+                            let handshake = tokio::select! {
+                                _ = handshake_cancel.cancelled() => return,
+                                result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    reloader.current_acceptor().accept(stream),
+                                ) => result,
+                            };
+                            match handshake {
+                                Ok(Ok(stream)) => {
+                                    let _ = incoming_tx.send(Ok(stream)).await;
+                                }
+                                Ok(Err(_)) | Err(_) => {
+                                    tracing::warn!(%peer_addr, "worker shuffle mTLS handshake rejected");
+                                }
+                            }
+                        });
+                    }
+                });
+                let incoming = futures::stream::unfold(incoming_rx, |mut receiver| async move {
+                    receiver.recv().await.map(|stream| (stream, receiver))
+                });
+                tonic::transport::Server::builder()
+                    .add_service(api)
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        cancel_token.cancelled().await;
+                    })
+                    .await
+            } else {
+                let incoming = futures::stream::unfold(listener, |listener| async move {
+                    let accepted = listener.accept().await.map(|(stream, _)| stream);
+                    Some((accepted, listener))
+                });
+                tonic::transport::Server::builder()
+                    .add_service(api)
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        cancel_token.cancelled().await;
+                    })
+                    .await
+            };
+            if let Err(error) = result {
                 tracing::error!(code = %RS_0001, %error, %addr, "worker shuffle endpoint stopped");
             }
         });

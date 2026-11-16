@@ -438,6 +438,7 @@ pub async fn setup_test_deployment(
         storage_context: storage_context.clone(),
         compaction_config: comp_config_lock,
         deployments: deployments.clone(),
+        tls_reloader: None,
     };
 
     let store = rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
@@ -540,6 +541,27 @@ pub async fn setup_test_deployment(
 mod data_plane_tests {
     use super::*;
     use rockstream_types::ids::OperatorId;
+
+    #[tokio::test]
+    async fn worker_tls_reload_rejects_missing_credentials_and_disabled_mtls() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, ..) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        let pki = rockstream_test_support::pki::TestPki::generate();
+
+        assert_eq!(
+            client
+                .reload_tls(rockstream_types::identity::InternalTlsConfig::default())
+                .unwrap_err(),
+            "RS-2410: worker shuffle TLS certificate and private key are required"
+        );
+        let mut without_mtls = pki.worker_tls_config(1);
+        without_mtls.client_auth_required = false;
+        assert_eq!(
+            client.reload_tls(without_mtls).unwrap_err(),
+            "RS-2410: worker shuffle requires mutual TLS"
+        );
+    }
 
     #[test]
     fn linux_memory_headroom_uses_available_memory() {
@@ -840,9 +862,30 @@ pub struct WorkerClientHandle {
     storage_context: Arc<rockstream_storage::storage_context::WorkerStorageContext>,
     compaction_config: Arc<RwLock<EpochCompactionConfig>>,
     deployments: WorkerDeployments,
+    tls_reloader: Option<Arc<rockstream_types::tls::TlsCertificateReloader>>,
 }
 
 impl WorkerClientHandle {
+    /// Reload the worker shuffle listener's mTLS credentials without closing active streams.
+    pub fn reload_tls(
+        &self,
+        config: rockstream_types::identity::InternalTlsConfig,
+    ) -> Result<(), String> {
+        if !config.is_enabled() {
+            return Err(
+                "RS-2410: worker shuffle TLS certificate and private key are required".to_string(),
+            );
+        }
+        if !config.client_auth_required {
+            return Err("RS-2410: worker shuffle requires mutual TLS".to_string());
+        }
+        config.validate()?;
+        self.tls_reloader
+            .as_ref()
+            .ok_or_else(|| "RS-2410: worker shuffle TLS is not enabled".to_string())?
+            .reload(config)
+    }
+
     /// Returns the worker-wide epoch compaction config.
     pub fn compaction_config(&self) -> EpochCompactionConfig {
         self.compaction_config.read().clone()
@@ -1381,6 +1424,14 @@ where
         (WorkloadId, ShardId),
         Arc<WorkerDeployment>,
     >::new()));
+    let tls_reloader = if exchange_endpoint.is_some() && tls_config.is_enabled() {
+        Some(Arc::new(
+            rockstream_types::tls::TlsCertificateReloader::new(tls_config.clone())
+                .map_err(io::Error::other)?,
+        ))
+    } else {
+        None
+    };
 
     let handle = WorkerClientHandle {
         worker_id: worker_id.clone(),
@@ -1393,6 +1444,7 @@ where
         storage_context: storage_context.clone(),
         compaction_config: compaction_config.clone(),
         deployments: deployments.clone(),
+        tls_reloader: tls_reloader.clone(),
     };
 
     let exchange_shutdown = if let Some(endpoint) = exchange_endpoint {
@@ -1401,6 +1453,9 @@ where
                 .with_exchange_config(exchange_config);
         if tls_config.is_enabled() {
             service = service.with_internal_tls(tls_config);
+            if let Some(reloader) = tls_reloader {
+                service = service.with_tls_reloader(reloader);
+            }
         } else if allow_insecure_internal_dev {
             service = service.with_insecure_internal_dev();
         }

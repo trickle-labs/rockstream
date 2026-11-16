@@ -6,7 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::StreamExt;
+use parking_lot::RwLock;
 use rockstream_control::audit::FileAuditLog;
+use rockstream_runtime::exchange::pool::ShuffleClientPool;
+use rockstream_runtime::exchange::proto::ShuffleFrame;
 use rockstream_storage::catalog::{
     CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogSourceEntry, CatalogStore,
     CatalogTable, CatalogTxn, DurableCatalogStore,
@@ -2892,6 +2896,93 @@ async fn wait_for_release_worker_lease(
 }
 
 #[cfg(unix)]
+fn start_worker_shuffle_process(
+    working_dir: &Path,
+    storage: &Path,
+    control_addr: std::net::SocketAddr,
+    exchange_addr: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    worker_id: u64,
+) -> RunningGateway {
+    let mut config = rockstream_types::config::NodeConfig::default();
+    config.worker.exchange_bind_addr = Some(exchange_addr.to_string());
+    config.worker.exchange_advertise_addr = Some(exchange_addr.to_string());
+    std::fs::write(
+        working_dir.join("rockstream.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let tls = pki.worker_tls_config(worker_id);
+    let child = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .current_dir(working_dir)
+        .env("RUST_LOG", "off")
+        .env_remove("ROCKSTREAM_CONFIG")
+        .args([
+            "start",
+            "--role",
+            "worker",
+            "--daemon",
+            "--storage",
+            storage.to_str().unwrap(),
+            "--control",
+            &control_addr.to_string(),
+            "--worker-id",
+            &worker_id.to_string(),
+            "--internal-tls-cert-path",
+            tls.cert_path.as_ref().unwrap().to_str().unwrap(),
+            "--internal-tls-key-path",
+            tls.key_path.as_ref().unwrap().to_str().unwrap(),
+            "--internal-tls-ca-cert-path",
+            tls.ca_cert_path.as_ref().unwrap().to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    RunningGateway(child)
+}
+
+#[cfg(unix)]
+async fn wait_for_worker_shuffle_peer(
+    address: std::net::SocketAddr,
+    worker_id: WorkerId,
+    tls: rockstream_types::identity::InternalTlsConfig,
+) {
+    let mut last_error = String::from("no connection attempt completed");
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let peers = Arc::new(RwLock::new(std::collections::HashMap::from([(
+                worker_id,
+                address.to_string(),
+            )])));
+            let pool = ShuffleClientPool::new(peers).with_internal_tls(tls.clone());
+            match pool.get_client(worker_id).await {
+                Ok(mut client) => {
+                    let mut request =
+                        tonic::Request::new(futures::stream::iter(Vec::<ShuffleFrame>::new()));
+                    request.metadata_mut().insert(
+                        "protocol_version",
+                        tonic::metadata::MetadataValue::from_static("1"),
+                    );
+                    match client.shuffle_stream(request).await {
+                        Ok(_) => return,
+                        Err(error) => last_error = error.to_string(),
+                    }
+                }
+                Err(error) => last_error = error.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "worker shuffle listener did not accept the qualified peer certificate: {last_error}"
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn in_flight_internal_mtls_rotation_preserves_release_worker_stream() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
@@ -2998,6 +3089,83 @@ async fn in_flight_internal_mtls_rotation_preserves_release_worker_stream() {
         denials_before,
         "valid old and new workers must not be rejected during rollover"
     );
+
+    let worker_exchange_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let worker_dir = temp.path().join("worker-process");
+    std::fs::create_dir_all(&worker_dir).unwrap();
+    let worker_storage = temp.path().join("worker-process-storage");
+    let mut worker_process = start_worker_shuffle_process(
+        &worker_dir,
+        &worker_storage,
+        address,
+        worker_exchange_addr,
+        &pki,
+        3,
+    );
+    wait_for_gateway(&mut worker_process.0, worker_exchange_addr).await;
+    let gen1_client_tls = pki.worker_tls_config_with_ca(1, pki.ca_cert_path.clone());
+    wait_for_worker_shuffle_peer(worker_exchange_addr, WorkerId(3), gen1_client_tls.clone()).await;
+
+    let peers = Arc::new(RwLock::new(std::collections::HashMap::from([(
+        WorkerId(3),
+        worker_exchange_addr.to_string(),
+    )])));
+    let pool = ShuffleClientPool::new(peers.clone()).with_internal_tls(gen1_client_tls);
+    let mut client = pool.get_client(WorkerId(3)).await.unwrap();
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(1);
+    let stream = futures::stream::unfold(frame_rx, |mut receiver| async move {
+        receiver.recv().await.map(|frame| (frame, receiver))
+    });
+    let mut request = tonic::Request::new(stream);
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    let mut active_stream = client.shuffle_stream(request).await.unwrap().into_inner();
+
+    let gen2_worker_tls = pki.gen2_worker_tls_config(3);
+    let (worker_cert, worker_key) = pki.worker_certs.get(&3).unwrap();
+    std::fs::copy(gen2_worker_tls.cert_path.as_ref().unwrap(), worker_cert).unwrap();
+    std::fs::copy(gen2_worker_tls.key_path.as_ref().unwrap(), worker_key).unwrap();
+    let worker_process_id = worker_process.0.id();
+    assert_eq!(
+        unsafe { libc::kill(worker_process_id as i32, libc::SIGHUP) },
+        0
+    );
+
+    frame_tx
+        .send(ShuffleFrame {
+            exchange_id: 100,
+            src_shard: 0,
+            target_shard: u32::MAX,
+            epoch: 1,
+            seq: 1,
+            payload: Vec::new().into(),
+            row_count: 0,
+        })
+        .await
+        .unwrap();
+    let denial = active_stream.next().await.unwrap().unwrap_err();
+    assert_eq!(denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denial.message(),
+        "RS-2401: target shard is not assigned to this worker"
+    );
+
+    wait_for_worker_shuffle_peer(
+        worker_exchange_addr,
+        WorkerId(3),
+        pki.worker_tls_config_with_ca(1, pki.ca_cert_path.clone()),
+    )
+    .await;
+    wait_for_worker_shuffle_peer(
+        worker_exchange_addr,
+        WorkerId(3),
+        pki.gen2_worker_tls_config(1),
+    )
+    .await;
+    assert!(worker_process.0.try_wait().unwrap().is_none());
 
     old_worker_task.abort();
     new_worker_task.abort();

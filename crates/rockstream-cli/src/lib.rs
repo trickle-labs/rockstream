@@ -1252,24 +1252,39 @@ type InternalTlsReloadSignal = ();
 async fn wait_for_signal_or_tls_reload(
     coordinator: &ShutdownCoordinator,
     control: Option<&rockstream_control::ControlServiceHandle>,
+    worker: Option<&rockstream_runtime::WorkerClientHandle>,
     tls: &rockstream_types::identity::InternalTlsConfig,
     mut reload_signal: Option<&mut InternalTlsReloadSignal>,
 ) {
     #[cfg(unix)]
     if tls.reload_enabled {
-        if let (Some(signal), Some(control)) = (reload_signal.take(), control) {
+        if let Some(signal) = reload_signal.take() {
             let shutdown = coordinator.wait_for_signal_or_trigger();
             tokio::pin!(shutdown);
             loop {
                 tokio::select! {
                     _ = &mut shutdown => break,
-                    _ = signal.recv() => match control.reload_tls(tls.clone()) {
-                        Ok(()) => tracing::info!("internal TLS credentials reloaded after SIGHUP"),
-                        Err(error) => tracing::error!(
-                            code = %rockstream_types::error_code::RS_2413,
-                            %error,
-                            "internal TLS reload after SIGHUP failed"
-                        ),
+                    _ = signal.recv() => {
+                        if let Some(control) = control {
+                            match control.reload_tls(tls.clone()) {
+                                Ok(()) => tracing::info!("control internal TLS credentials reloaded after SIGHUP"),
+                                Err(error) => tracing::error!(
+                                    code = %rockstream_types::error_code::RS_2413,
+                                    %error,
+                                    "control internal TLS reload after SIGHUP failed"
+                                ),
+                            }
+                        }
+                        if let Some(worker) = worker {
+                            match worker.reload_tls(tls.clone()) {
+                                Ok(()) => tracing::info!("worker internal TLS credentials reloaded after SIGHUP"),
+                                Err(error) => tracing::error!(
+                                    code = %rockstream_types::error_code::RS_2413,
+                                    %error,
+                                    "worker internal TLS reload after SIGHUP failed"
+                                ),
+                            }
+                        }
                     }
                 }
             }
@@ -1278,7 +1293,7 @@ async fn wait_for_signal_or_tls_reload(
     }
 
     #[cfg(not(unix))]
-    let _ = (control, tls, reload_signal);
+    let _ = (control, worker, tls, reload_signal);
 
     coordinator.wait_for_signal_or_trigger().await;
 }
@@ -1442,7 +1457,8 @@ pub fn run_start_with_dev_transport(
         let coordinator = ShutdownCoordinator::new(tracker.clone(), Duration::from_secs(timeout_secs));
 
         #[cfg(unix)]
-        let mut tls_reload_signal = if matches!(opts.role.as_str(), "control" | "all")
+        let mut tls_reload_signal = if (matches!(opts.role.as_str(), "control" | "all")
+            || (opts.role == "worker" && worker_exchange_endpoint.is_some()))
             && opts.config.internal_tls.is_enabled()
             && opts.config.internal_tls.reload_enabled
         {
@@ -1481,6 +1497,7 @@ pub fn run_start_with_dev_transport(
 
         let mut control_handle = None;
         let mut worker_handle = None;
+        let mut worker_client = None;
         let mut control_url = opts.control.clone();
         let mut raft_node_guard: Option<rockstream_control::raft::RaftNodeHandleFull> = None;
         // `--role all` opens exactly one shared shard (id 0) via the
@@ -1858,6 +1875,9 @@ pub fn run_start_with_dev_transport(
                     shared_gateway_shard = Some((Arc::new(db), store));
                 }
             }
+            if worker_exchange_endpoint.is_some() && opts.config.internal_tls.is_enabled() {
+                worker_client = Some(client);
+            }
             worker_handle = Some(handle);
         }
 
@@ -1919,6 +1939,7 @@ pub fn run_start_with_dev_transport(
                         wait_for_signal_or_tls_reload(
                             &coordinator,
                             control_handle.as_ref(),
+                            worker_client.as_ref(),
                             &opts.config.internal_tls,
                             tls_reload_signal.as_mut(),
                         )
@@ -1970,6 +1991,7 @@ pub fn run_start_with_dev_transport(
                     wait_for_signal_or_tls_reload(
                         &coordinator,
                         control_handle.as_ref(),
+                        worker_client.as_ref(),
                         &opts.config.internal_tls,
                         tls_reload_signal.as_mut(),
                     )

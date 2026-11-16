@@ -1,11 +1,16 @@
 use std::sync::Arc;
 
+use futures::StreamExt;
 use parking_lot::RwLock;
+use rockstream_ops::zset::ArrowZSet;
+use rockstream_runtime::client::ShardState;
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
+use rockstream_runtime::exchange::proto::ShuffleFrame;
 use rockstream_runtime::exchange::service::{ExchangeRegistry, ExchangeService};
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::config::ExchangeConfig;
-use rockstream_types::ids::WorkerId;
+use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
+use rockstream_types::lease::ShardLease;
 use rockstream_types::topology::{
     CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
     WorkerLocation,
@@ -13,7 +18,14 @@ use rockstream_types::topology::{
 use std::collections::HashMap;
 
 fn registry_with_workers(worker_ids: &[u64]) -> ExchangeRegistry {
-    let workers = worker_ids
+    ExchangeRegistry::with_worker_state(
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(worker_infos(worker_ids))),
+    )
+}
+
+fn worker_infos(worker_ids: &[u64]) -> HashMap<WorkerId, WorkerInfo> {
+    worker_ids
         .iter()
         .map(|worker_id| {
             let worker_id = WorkerId(*worker_id);
@@ -34,11 +46,7 @@ fn registry_with_workers(worker_ids: &[u64]) -> ExchangeRegistry {
                 },
             )
         })
-        .collect();
-    ExchangeRegistry::with_worker_state(
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(workers)),
-    )
+        .collect()
 }
 
 #[tokio::test]
@@ -74,6 +82,111 @@ async fn test_worker_shuffle_grpc_mtls_valid_cert_admitted() {
         "mTLS RPC stream should succeed with valid certificates: {:?}",
         res.err()
     );
+
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn worker_shuffle_rotation_keeps_active_stream_and_accepts_both_generations() {
+    let pki = TestPki::generate();
+    let (_, _, gen2_server_tls) = pki.generate_gen2_pki();
+    let dual_ca = gen2_server_tls.ca_cert_path.clone().unwrap();
+    let gen1_client_tls = pki.worker_tls_config_with_ca(2, dual_ca);
+    let gen2_client_tls = pki.gen2_worker_tls_config(2);
+    let gen1_server_tls = pki.worker_tls_config(1);
+    let reloader = Arc::new(
+        rockstream_types::tls::TlsCertificateReloader::new(gen1_server_tls.clone()).unwrap(),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let db = rockstream_storage::ShardDb::builder("rotation-shard", store)
+        .build()
+        .await
+        .unwrap();
+    let active_shards = Arc::new(RwLock::new(HashMap::from([(
+        ShardId(1),
+        ShardState {
+            lease: ShardLease::new(ShardId(1), WorkerId(1), LeaseToken(1)),
+            db: Some(db),
+        },
+    )])));
+    let registry = ExchangeRegistry::with_worker_state(
+        active_shards,
+        Arc::new(RwLock::new(worker_infos(&[2]))),
+    );
+    let (inlet_tx, mut inlet_rx) = tokio::sync::mpsc::channel(1);
+    let schema = ArrowZSet::from_ab_rows(&[], 1).schema();
+    registry.register(100, 1, inlet_tx, schema);
+    let service = ExchangeService::new(registry)
+        .with_internal_tls(gen1_server_tls)
+        .with_tls_reloader(reloader.clone());
+    service.start(addr).await.unwrap();
+
+    let peers = Arc::new(RwLock::new(HashMap::from([(
+        WorkerId(1),
+        addr.to_string(),
+    )])));
+    let pool = ShuffleClientPool::new(peers.clone()).with_internal_tls(pki.worker_tls_config(2));
+    let mut client = pool.get_client(WorkerId(1)).await.unwrap();
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(1);
+    let stream = futures::stream::unfold(frame_rx, |mut receiver| async move {
+        receiver.recv().await.map(|frame| (frame, receiver))
+    });
+    let mut request = tonic::Request::new(stream);
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    let mut response = client.shuffle_stream(request).await.unwrap().into_inner();
+
+    reloader.reload(gen2_server_tls).unwrap();
+    let zset = ArrowZSet::from_ab_rows(&[(42, 7)], 1);
+    let payload = rockstream_runtime::exchange::serialization::serialize_zset(&zset).unwrap();
+    frame_tx
+        .send(ShuffleFrame {
+            exchange_id: 100,
+            src_shard: 0,
+            target_shard: 1,
+            epoch: 1,
+            seq: 1,
+            payload: payload.clone().into(),
+            row_count: zset.num_rows() as u32,
+        })
+        .await
+        .unwrap();
+    let ack = response.next().await.unwrap().unwrap();
+    assert_eq!(
+        (
+            ack.exchange_id,
+            ack.src_shard,
+            ack.target_shard,
+            ack.epoch,
+            ack.seq
+        ),
+        (100, 0, 1, 1, 1)
+    );
+    assert_eq!(
+        rockstream_runtime::exchange::serialization::serialize_zset(
+            &inlet_rx.recv().await.unwrap()
+        )
+        .unwrap(),
+        payload
+    );
+
+    for tls in [gen1_client_tls, gen2_client_tls] {
+        let pool = ShuffleClientPool::new(peers.clone()).with_internal_tls(tls);
+        let mut client = pool.get_client(WorkerId(1)).await.unwrap();
+        let mut request = tonic::Request::new(futures::stream::iter(Vec::<ShuffleFrame>::new()));
+        request.metadata_mut().insert(
+            "protocol_version",
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        assert!(client.shuffle_stream(request).await.is_ok());
+    }
 
     service.shutdown().await;
 }
