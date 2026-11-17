@@ -89,7 +89,14 @@ mod tests {
 
         let storage_dir = tempfile::tempdir().unwrap();
 
-        let (client, worker_handle) = start_worker_client(42, &control_url, storage_dir.path())
+        let (client, worker_handle) =
+            client::start_worker_client_with_insecure_internal_dev_and_metadata(
+                42,
+                &control_url,
+                storage_dir.path(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 

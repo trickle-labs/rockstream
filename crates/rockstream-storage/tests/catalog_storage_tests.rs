@@ -174,6 +174,10 @@ async fn test_catalog_log_append_and_replay() {
         expected_tables.push(tbl.clone());
         let txn = CatalogTxn::new(i, i * 10, vec![CatalogMutation::PutTable(tbl)]).unwrap();
         expected_objects.insert(
+            format!("test/catalog/log/{i:020}.log"),
+            txn.encode().unwrap(),
+        );
+        expected_objects.insert(
             format!("test/catalog/log/{i:020}_{:020}.log", i * 10),
             txn.encode().unwrap(),
         );
@@ -236,10 +240,16 @@ async fn test_catalog_snapshot_creation_and_recovery() {
             .into_iter()
             .filter(|(path, _)| path.ends_with(".log"))
             .collect::<Vec<_>>(),
-        vec![(
-            "test/catalog/log/00000000000000000004_00000000000000000040.log".into(),
-            expected_log
-        )]
+        vec![
+            (
+                "test/catalog/log/00000000000000000004.log".into(),
+                expected_log.clone()
+            ),
+            (
+                "test/catalog/log/00000000000000000004_00000000000000000040.log".into(),
+                expected_log
+            )
+        ]
     );
 
     // Recovery uses snapshot at revision 3 + log at revision 4
@@ -248,6 +258,47 @@ async fn test_catalog_snapshot_creation_and_recovery() {
     let mut tables = recovered.list_tables().await.unwrap();
     tables.sort_by_key(|table| table.id);
     assert_eq!(tables, expected_tables);
+}
+
+#[tokio::test]
+async fn test_revision_log_recovery_repairs_legacy_alias() {
+    let store = Arc::new(InMemory::new());
+    let table = CatalogTable {
+        id: TableId(1),
+        name: "recovered".into(),
+        namespace_id: NamespaceId(1),
+        columns: vec![],
+        pk_cols: vec![],
+    };
+    let txn = CatalogTxn::new(1, 10, vec![CatalogMutation::PutTable(table.clone())]).unwrap();
+    let bytes = txn.encode().unwrap();
+    store
+        .put(
+            &ObjectPath::from("recovery/catalog/log/00000000000000000001.log"),
+            bytes.clone().into(),
+        )
+        .await
+        .unwrap();
+
+    let recovered = DurableCatalogStore::recover(store.clone(), "recovery")
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.get_revision().await, 1);
+    assert_eq!(recovered.list_tables().await.unwrap(), vec![table]);
+    assert_eq!(
+        store
+            .get(&ObjectPath::from(
+                "recovery/catalog/log/00000000000000000001_00000000000000000010.log"
+            ))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        bytes
+    );
 }
 
 #[tokio::test]
@@ -277,7 +328,7 @@ async fn test_log_deletion_requires_durable_snapshot_confirmation() {
 
     // Now compaction succeeds and deletes covered logs
     let deleted = catalog.compact_logs(1).await.unwrap();
-    assert_eq!(deleted, 1);
+    assert_eq!(deleted, 2);
 }
 
 #[tokio::test]
@@ -386,6 +437,6 @@ async fn test_catalog_compaction_uses_no_range_delete() {
 
     catalog.create_snapshot().await.unwrap();
     let deleted = catalog.compact_logs(1).await.unwrap();
-    assert_eq!(deleted, 1);
+    assert_eq!(deleted, 2);
     // Verified: No SlateDB range deletion used, purely ObjectStore::delete calls on individual keys
 }

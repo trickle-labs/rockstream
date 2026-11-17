@@ -4,7 +4,7 @@ use std::time::Duration;
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
 use rockstream_ops::sink::{read_view_output, ColumnValue};
 use rockstream_plan::PlanNode;
-use rockstream_runtime::start_worker_client_with_metadata;
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata;
 use rockstream_types::config::JoinStrategy;
 use rockstream_types::data_plane::{
     DeploymentColumn, DeploymentRequest, DeploymentSchema, OwnedEpochIntent, RuntimeRow,
@@ -28,7 +28,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
     let control_handle = control_service.start("127.0.0.1:0").await.unwrap();
     let control_addr = control_handle.addr.to_string();
     let location = WorkerLocation::new("test-host", "test-zone");
-    let (worker1, task1) = start_worker_client_with_metadata(
+    let (worker1, task1) = start_worker_client_with_insecure_internal_dev_and_metadata(
         301,
         &control_addr,
         &dir.path().join("worker-301"),
@@ -37,7 +37,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
     )
     .await
     .unwrap();
-    let (worker2, task2) = start_worker_client_with_metadata(
+    let (worker2, task2) = start_worker_client_with_insecure_internal_dev_and_metadata(
         302,
         &control_addr,
         &dir.path().join("worker-302"),
@@ -67,6 +67,8 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
     let request = DeploymentRequest {
         version: DEPLOYMENT_DESCRIPTOR_VERSION,
         workload_id,
+        namespace: "public".to_owned(),
+        workload_name: "test_view".to_owned(),
         plan_json: serde_json::to_string(&plan).unwrap(),
         join_strategy: JoinStrategy::Auto,
         schemas: vec![DeploymentSchema {
@@ -274,7 +276,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
         other => panic!("unexpected read response after failure: {other:?}"),
     }
     assert_eq!(
-        rockstream_runtime::data_plane::DataPlaneClient::new(&control_addr)
+        rockstream_runtime::data_plane::DataPlaneClient::new(&control_addr).with_insecure_internal_dev()
             .read_workload(workload_id)
             .await
             .unwrap_err()
@@ -369,7 +371,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
     let control_handle = control_service.start("127.0.0.1:0").await.unwrap();
     let control_addr = control_handle.addr.to_string();
     let location = WorkerLocation::new("replacement-host", "test-zone");
-    let (worker1, task1) = start_worker_client_with_metadata(
+    let (worker1, task1) = start_worker_client_with_insecure_internal_dev_and_metadata(
         401,
         &control_addr,
         &dir.path().join("worker-401"),
@@ -378,7 +380,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
     )
     .await
     .unwrap();
-    let (worker2, task2) = start_worker_client_with_metadata(
+    let (worker2, task2) = start_worker_client_with_insecure_internal_dev_and_metadata(
         402,
         &control_addr,
         &dir.path().join("worker-402"),
@@ -425,7 +427,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
         other => panic!("unexpected deployment response after restart: {other:?}"),
     }
     assert_eq!(
-        rockstream_runtime::data_plane::DataPlaneClient::new(&control_addr)
+        rockstream_runtime::data_plane::DataPlaneClient::new(&control_addr).with_insecure_internal_dev()
             .read_workload(workload_id)
             .await
             .unwrap_err()

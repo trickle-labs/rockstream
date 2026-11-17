@@ -16,6 +16,13 @@ pub enum Role {
     Control,
 }
 
+/// Durable catalog layout used by offline security administration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SecurityCatalogLayout {
+    All,
+    Gateway,
+}
+
 impl std::fmt::Display for Role {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -184,6 +191,11 @@ pub enum Command {
     Admin {
         #[command(subcommand)]
         command: AdminCommand,
+    },
+    /// Offline security administration against the durable catalog.
+    Security {
+        #[command(subcommand)]
+        command: SecurityCommand,
     },
     /// Developer and offline development tooling.
     Dev {
@@ -937,6 +949,29 @@ pub enum AdminCommand {
         target: Option<String>,
         /// Force overwrite of existing non-empty destination.
         #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SecurityCommand {
+    /// Preprovision the first administrator before opening application listeners.
+    #[command(name = "preprovision-admin")]
+    PreprovisionAdministrator {
+        /// Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`.
+        #[arg(long, value_enum)]
+        layout: SecurityCatalogLayout,
+        /// Node storage directory used by `start --storage` for this deployment.
+        #[arg(long)]
+        storage: PathBuf,
+        /// JSON-serialized SecurityPrincipal containing an enabled interactive cluster administrator.
+        #[arg(long)]
+        principal_file: PathBuf,
+        /// Stable catalog operation ID to reuse if this command must be retried.
+        #[arg(long)]
+        operation_id: u64,
+        /// Confirm the deployment is stopped and the selected durable store is correct.
+        #[arg(long)]
         yes: bool,
     },
 }

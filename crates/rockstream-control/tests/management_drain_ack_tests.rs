@@ -15,6 +15,10 @@ use rockstream_types::topology::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+#[path = "common/management_auth.rs"]
+mod management_auth;
+use management_auth::ManagementAuth;
+
 async fn register_worker(addr: std::net::SocketAddr, worker_id: u64) -> TcpStream {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let registration = WorkerRegistration::new(
@@ -81,18 +85,21 @@ async fn operation(
 
 #[tokio::test]
 async fn management_drain_retries_after_mismatched_recipient_ack() {
+    let auth = ManagementAuth::new(&[]).await;
     let catalog = TopologyCatalog::new();
     let shard_manager = ShardManager::new();
     let management_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let management_addr = management_listener.local_addr().unwrap();
     drop(management_listener);
-    let service = ControlService::new(catalog.clone())
-        .with_shard_manager(shard_manager.clone())
-        .with_management(
-            management_addr.to_string(),
-            Arc::new(InMemory::new()),
-            NodeConfig::default(),
-        );
+    let service = auth.protect_control(
+        ControlService::new(catalog.clone())
+            .with_shard_manager(shard_manager.clone())
+            .with_management(
+                management_addr.to_string(),
+                Arc::new(InMemory::new()),
+                NodeConfig::default(),
+            ),
+    );
     let control = service
         .with_insecure_dev_mode()
         .start("127.0.0.1:0")
@@ -101,9 +108,7 @@ async fn management_drain_retries_after_mismatched_recipient_ack() {
     let mut donor = register_worker(control.addr, 31).await;
     let mut recipient = register_worker(control.addr, 32).await;
     shard_manager.acquire(ShardId(301), WorkerId(31)).unwrap();
-    let mut client = ManagementServiceClient::connect(format!("http://{management_addr}"))
-        .await
-        .unwrap();
+    let mut client = auth.client(management_addr).await;
     let accepted = client
         .drain_worker(DrainWorkerRequest {
             protocol_version: 1,

@@ -746,12 +746,20 @@ exact denial audit event. `identity.rs::tests::node_identity_worker_matching`
 checks worker-ID matching, and
 `cli/src/lib.rs::tests::default_start_requires_internal_mtls_before_storage_creation`
 checks that default startup rejects plaintext before creating storage. The
-control, runtime, and CLI lifecycle fixtures explicitly opt into loopback
-development transport and do not qualify production mTLS. This slice refines
-M4's registration boundary, but its abstract model contains no certificates,
-trust roots, or TLS-handshake state. Gateway authentication, worker-to-worker
-mTLS, management authentication, delegated actor assertions, and release-process
-qualification remain outside this PR and are not qualified by these tests.
+#359 integration also adds versioned RS256 gateway actor assertions bound to a
+60-second expiry, deployment and audience, action and scope, request digest,
+persisted principal revision, and scoped secret-use allowance. Control verifies
+the assertion and rereads the durable principal policy before applying the
+operation. `oidc_release_process_tests.rs` covers policy recheck, delegated SQL,
+and delegated secret use in release processes; `internal_mtls_tests.rs` covers
+current-policy intersection and scoped grants. These authorization transitions
+are not represented by M1–M7, so the concrete tests are not formal proof.
+
+`runtime/src/exchange` has worker mTLS service and client-pool code covered by
+`shuffle_mtls_tests.rs`, but no production worker startup caller wires those
+components. Worker-to-worker application wiring, release-process coverage, and
+in-flight certificate rollover/stream continuity therefore remain incomplete.
+Control-worker rotation tests do not establish worker-to-worker continuity.
 
 Issue #203 replaces the public `aws_kms` provider's ARN/region-derived local
 encryption with signed KMS `Encrypt` and `Decrypt` requests. Both operations

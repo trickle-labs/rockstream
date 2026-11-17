@@ -70,6 +70,8 @@ async fn owned_epoch_is_prepared_before_dispatch_and_finished_before_reply() {
         let request = DeploymentRequest {
             version: 1,
             workload_id,
+            namespace: "public".to_owned(),
+            workload_name: "test_view".to_owned(),
             plan_json: "{}".to_owned(),
             join_strategy: JoinStrategy::Auto,
             schemas: vec![],
