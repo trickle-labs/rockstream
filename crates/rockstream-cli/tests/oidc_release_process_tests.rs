@@ -6001,7 +6001,6 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
     let catalog = DurableCatalogStore::recover(security_store, "gateway")
         .await
         .unwrap();
-    let audit_before = catalog.list_security_audit_records().await.unwrap();
     let operations_before = client
         .list_operations(ListOperationsRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -6021,6 +6020,7 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
     );
     assert!(operations_before.operations.is_empty());
     assert!(operations_before.next_page_token.is_empty());
+    let audit_before = catalog.list_security_audit_records().await.unwrap();
 
     let mut streams = Vec::new();
     for _ in 0..8 {
