@@ -352,7 +352,7 @@ mod tests {
                 opaque_id: "artifact-uuid".to_string()
             }
         ));
-        assert!(allows(
+        assert!(!allows(
             &policy,
             SecurityAction::SupportDownload,
             &PolicyScope::Artifact {
