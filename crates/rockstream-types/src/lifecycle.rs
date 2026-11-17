@@ -2,6 +2,7 @@
 
 use crate::candidate_identity::CandidateIdentity;
 use crate::error_code::{ErrorCode, RS_0001};
+use crate::metrics;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -812,6 +813,16 @@ impl LifecycleTracker {
             dimensions.readiness.reason = None;
         }
 
+        let audit_degraded = metrics::is_security_audit_degraded();
+        if audit_degraded {
+            dimensions.degradation = HealthDimensionObservation::new(
+                HealthDimensionStatus::Warn,
+                format!("{}:security-audit", self.role),
+                now_secs,
+            )
+            .with_reason("security audit storage is degraded");
+        }
+
         // Apply stale observation policy (15s threshold)
         dimensions.apply_stale_policy(now_secs);
 
@@ -828,6 +839,8 @@ impl LifecycleTracker {
             || dimensions.availability.status == HealthDimensionStatus::Fail
         {
             "unhealthy".to_string()
+        } else if audit_degraded && state.is_ready() {
+            "degraded".to_string()
         } else {
             state.health_status_str().to_string()
         };
