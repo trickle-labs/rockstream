@@ -202,7 +202,7 @@ async fn fixture() -> (Arc<InMemory>, CatalogSnapshot) {
         .await
         .unwrap();
     let snapshot = catalog.create_snapshot().await.unwrap();
-    assert_eq!(catalog.compact_logs(1).await.unwrap(), 1);
+    assert_eq!(catalog.compact_logs(1).await.unwrap(), 2);
     (storage, snapshot)
 }
 

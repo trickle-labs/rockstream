@@ -524,6 +524,31 @@ fn apply_env_vars(
             ConfigOrigin::Environment("ROCKSTREAM_AUTH_OIDC_JWKS_URL".to_string()),
         );
     }
+    if let Ok(value) = std::env::var("ROCKSTREAM_NODE_DEPLOYMENT_ID") {
+        node_config.node.deployment_id = Some(value);
+        origins.insert(
+            "node.deployment_id".to_string(),
+            ConfigOrigin::Environment("ROCKSTREAM_NODE_DEPLOYMENT_ID".to_string()),
+        );
+    }
+    if let Ok(value) = std::env::var("ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH") {
+        node_config.auth.actor_assertion_signing_key_path = Some(value.into());
+        origins.insert(
+            "auth.actor_assertion_signing_key_path".to_string(),
+            ConfigOrigin::Environment(
+                "ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH".to_string(),
+            ),
+        );
+    }
+    if let Ok(value) = std::env::var("ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH") {
+        node_config.auth.actor_assertion_public_key_path = Some(value.into());
+        origins.insert(
+            "auth.actor_assertion_public_key_path".to_string(),
+            ConfigOrigin::Environment(
+                "ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH".to_string(),
+            ),
+        );
+    }
     if let Ok(value) = std::env::var("ROCKSTREAM_WORKER_EXECUTION_THREADS") {
         if let Ok(value) = value.parse::<usize>() {
             config.worker.execution_threads = value;
@@ -545,6 +570,13 @@ fn apply_env_vars(
             ["NODE", "ROLE"] => {
                 node_config.node.role = v.clone();
                 origins.insert("node.role".to_string(), ConfigOrigin::Environment(k));
+            }
+            ["NODE", "DEPLOYMENT_ID"] => {
+                node_config.node.deployment_id = Some(v.clone());
+                origins.insert(
+                    "node.deployment_id".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
             }
             ["NODE", "HOST_ID"] => {
                 node_config.node.host_id = Some(v.clone());
@@ -674,6 +706,20 @@ fn apply_env_vars(
                 node_config.auth.oidc_jwks_url = Some(v.clone());
                 origins.insert(
                     "auth.oidc_jwks_url".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
+            }
+            ["AUTH", "ACTOR_ASSERTION_SIGNING_KEY_PATH"] => {
+                node_config.auth.actor_assertion_signing_key_path = Some(v.clone().into());
+                origins.insert(
+                    "auth.actor_assertion_signing_key_path".to_string(),
+                    ConfigOrigin::Environment(k),
+                );
+            }
+            ["AUTH", "ACTOR_ASSERTION_PUBLIC_KEY_PATH"] => {
+                node_config.auth.actor_assertion_public_key_path = Some(v.clone().into());
+                origins.insert(
+                    "auth.actor_assertion_public_key_path".to_string(),
                     ConfigOrigin::Environment(k),
                 );
             }

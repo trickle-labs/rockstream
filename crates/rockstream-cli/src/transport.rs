@@ -199,19 +199,71 @@ pub struct ManagementCliClient {
 }
 
 impl ManagementCliClient {
-    pub fn connect(addr: &str) -> Result<Self, CliError> {
+    pub fn connect(
+        addr: &str,
+        tls: rockstream_types::identity::InternalTlsConfig,
+    ) -> Result<Self, CliError> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        tls.validate()
+            .map_err(|error| management_client_error("TLS configuration", error))?;
+        let cert_path = tls.cert_path.as_ref().ok_or_else(|| {
+            management_client_error(
+                "TLS configuration",
+                "client certificate is required".to_owned(),
+            )
+        })?;
+        let key_path = tls.key_path.as_ref().ok_or_else(|| {
+            management_client_error(
+                "TLS configuration",
+                "client private key is required".to_owned(),
+            )
+        })?;
+        let ca_path = tls.ca_cert_path.as_ref().ok_or_else(|| {
+            management_client_error(
+                "TLS configuration",
+                "trusted CA certificate is required".to_owned(),
+            )
+        })?;
+        let client_identity = tonic::transport::Identity::from_pem(
+            fs::read(cert_path).map_err(|error| {
+                management_client_error("read client certificate", error.to_string())
+            })?,
+            fs::read(key_path).map_err(|error| {
+                management_client_error("read client private key", error.to_string())
+            })?,
+        );
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(
+                fs::read(ca_path).map_err(|error| {
+                    management_client_error("read trusted CA certificate", error.to_string())
+                })?,
+            ))
+            .identity(client_identity);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| management_client_error("create runtime", error.to_string()))?;
-        let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
+        if addr.starts_with("http://") {
+            return Err(management_client_error(
+                "TLS configuration",
+                "management API refuses plaintext HTTP".to_owned(),
+            ));
+        }
+        let endpoint = if addr.starts_with("https://") {
             addr.to_owned()
         } else {
-            format!("http://{addr}")
+            format!("https://{addr}")
         };
-        let client = runtime
-            .block_on(ManagementGrpcClient::connect(endpoint))
-            .map_err(|error| management_client_error("connect", error.to_string()))?;
+        let channel = runtime.block_on(async {
+            tonic::transport::Endpoint::from_shared(endpoint)
+                .map_err(|error| management_client_error("parse endpoint", error.to_string()))?
+                .tls_config(tls)
+                .map_err(|error| management_client_error("configure TLS", error.to_string()))?
+                .connect()
+                .await
+                .map_err(|error| management_client_error("connect", error.to_string()))
+        })?;
+        let client = ManagementGrpcClient::new(channel);
         Ok(Self { runtime, client })
     }
 

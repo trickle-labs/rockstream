@@ -149,6 +149,7 @@ pub struct ExchangeService {
     exchange_config: ExchangeConfig,
     internal_tls: Option<rockstream_types::identity::InternalTlsConfig>,
     protocol_range: SupportedVersionRange,
+    insecure_internal_dev: bool,
 }
 
 impl ExchangeService {
@@ -160,6 +161,7 @@ impl ExchangeService {
             exchange_config: ExchangeConfig::default(),
             internal_tls: None,
             protocol_range: SupportedVersionRange::v1_through_v2(),
+            insecure_internal_dev: false,
         }
     }
 
@@ -173,6 +175,12 @@ impl ExchangeService {
         config: rockstream_types::identity::InternalTlsConfig,
     ) -> Self {
         self.internal_tls = Some(config);
+        self
+    }
+
+    /// Allow plaintext shuffle only for explicitly authorized loopback development.
+    pub fn with_insecure_internal_dev(mut self) -> Self {
+        self.insecure_internal_dev = true;
         self
     }
 
@@ -235,6 +243,11 @@ impl ExchangeService {
         if tls_config.is_none() && !addr.ip().is_loopback() {
             return Err(format!(
                 "{RS_2410}: plaintext worker shuffle is limited to loopback development"
+            ));
+        }
+        if tls_config.is_none() && !self.insecure_internal_dev {
+            return Err(format!(
+                "{RS_2410}: plaintext worker shuffle requires explicit loopback development opt-in"
             ));
         }
         let server = ShuffleServer::new_with_tracker(
