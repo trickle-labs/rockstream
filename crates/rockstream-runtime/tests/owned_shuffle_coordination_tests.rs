@@ -424,6 +424,14 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
         ),
         other => panic!("unexpected deployment response after restart: {other:?}"),
     }
+    assert_eq!(
+        rockstream_runtime::data_plane::DataPlaneClient::new(&control_addr)
+            .read_workload(workload_id)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "RS-0001: workload requires recovery after failed execution; Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying."
+    );
     let later = WorkerMessage::SubmitSourceDelta(SourceDeltaRequest {
         version: DEPLOYMENT_DESCRIPTOR_VERSION,
         request_id: "after-restart".to_owned(),
