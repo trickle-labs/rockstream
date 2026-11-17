@@ -63,7 +63,7 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
             name: "items".to_owned(),
         }),
     };
-    let workload_id = WorkloadId(91);
+    let workload_id = WorkloadId((1_u64 << 40) + 91);
     let request = DeploymentRequest {
         version: DEPLOYMENT_DESCRIPTOR_VERSION,
         workload_id,
@@ -250,6 +250,37 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
         }
         other => panic!("unexpected failed source response: {other:?}"),
     }
+    write
+        .write_all(
+            (serde_json::to_string(&WorkerMessage::ReadWorkload { workload_id }).unwrap() + "\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    line.clear();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    match serde_json::from_str::<ControlMessage>(&line).unwrap() {
+        ControlMessage::OperationFailed { code, message, next_steps } => assert_eq!(
+            (code, message, next_steps),
+            (
+                "RS-0001".to_owned(),
+                "workload requires recovery after failed execution".to_owned(),
+                "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
+            )
+        ),
+        other => panic!("unexpected read response after failure: {other:?}"),
+    }
+    assert_eq!(
+        rockstream_runtime::data_plane::DataPlaneClient::new(&control_addr)
+            .read_workload(workload_id)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "RS-0001: workload requires recovery after failed execution; Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying."
+    );
     target_db.set_fail_writes(false);
     assert_eq!(
         read_view_output(&target_db, OperatorId(10), 1)

@@ -142,6 +142,21 @@ async fn owned_epoch_is_prepared_before_dispatch_and_finished_before_reply() {
                 target_shards: vec![descriptor.shard.shard_id],
             }
         );
+        let observer = TcpStream::connect(control_handle.addr).await.unwrap();
+        let (read, mut observer_write) = observer.into_split();
+        let mut observer_read = BufReader::new(read);
+        send(&mut observer_write, &WorkerMessage::ReadWorkload { workload_id }).await;
+        match receive(&mut observer_read).await {
+            ControlMessage::OperationFailed { code, message, next_steps } => assert_eq!(
+                (code, message, next_steps),
+                (
+                    "RS-0001".to_owned(),
+                    "workload has an incomplete execution".to_owned(),
+                    "Retry after the workload and workers are ready.".to_owned(),
+                )
+            ),
+            other => panic!("unexpected in-flight read response: {other:?}"),
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(100), receive(&mut worker_read))
                 .await
@@ -221,6 +236,11 @@ async fn owned_epoch_is_prepared_before_dispatch_and_finished_before_reply() {
                 epoch,
             } => assert_eq!((actual, epoch), (request_id.clone(), 1)),
             other => panic!("unexpected completion: {other:?}"),
+        }
+        send(&mut observer_write, &WorkerMessage::ReadWorkload { workload_id }).await;
+        match receive(&mut observer_read).await {
+            ControlMessage::WorkloadSnapshot { snapshot } => assert_eq!(snapshot.deployment.workload_id, workload_id),
+            other => panic!("unexpected completed read response: {other:?}"),
         }
 
         let next_rows = vec![RuntimeRow {

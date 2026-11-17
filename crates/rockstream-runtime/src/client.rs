@@ -589,7 +589,7 @@ pub(crate) fn owned_shuffle_handler(
             let prepared = (|| -> Result<(), String> {
                 if !owner.rows.is_empty()
                     || frame.exchange_id != owner.workload_id.0
-                    || u64::from(frame.target_shard) != owner.shard_id.0
+                    || frame.target_shard != owned_shuffle_shard(owner.workload_id, owner.shard_id)?
                     || frame.epoch != owner.epoch
                     || frame.seq != 0
                 {
@@ -633,6 +633,12 @@ pub(crate) fn owned_shuffle_handler(
     })
 }
 
+fn owned_shuffle_shard(workload_id: WorkloadId, shard_id: ShardId) -> Result<u32, String> {
+    let index = shard_id.0.wrapping_sub(workload_id.0.wrapping_mul(16));
+    u32::try_from(index)
+        .map_err(|_| "owned shuffle shard index exceeds the supported range".to_owned())
+}
+
 async fn dispatch_owned_shuffle(
     mux: &crate::exchange::multiplexer::WorkerStreamMultiplexer,
     deployments: &WorkerDeployments,
@@ -652,10 +658,8 @@ async fn dispatch_owned_shuffle(
         })
         .min_by_key(|(shard, _)| *shard)
         .ok_or_else(|| "shuffle source is not deployed".to_owned())?;
-    let src_shard = u32::try_from(source_shard.0)
-        .map_err(|_| "source shard cannot be represented in shuffle".to_owned())?;
-    let target_shard = u32::try_from(frame.shard_id.0)
-        .map_err(|_| "target shard cannot be represented in shuffle".to_owned())?;
+    let src_shard = owned_shuffle_shard(frame.workload_id, source_shard)?;
+    let target_shard = owned_shuffle_shard(frame.workload_id, frame.shard_id)?;
     let input = rows_to_zset(&frame.rows, schema).map_err(|error| error.to_string())?;
     let row_count = u32::try_from(input.num_rows())
         .map_err(|_| "shuffle batch has too many rows".to_owned())?;
@@ -968,6 +972,20 @@ mod data_plane_tests {
         }
     }
 
+    #[test]
+    fn owned_shuffle_shard_uses_checked_workload_relative_index() {
+        let workload = WorkloadId((1_u64 << 60) + 91);
+        let base = workload.0.wrapping_mul(16);
+        assert_eq!(
+            owned_shuffle_shard(workload, ShardId(base.wrapping_add(42))),
+            Ok(42)
+        );
+        assert_eq!(
+            owned_shuffle_shard(workload, ShardId(base.wrapping_add(1_u64 << 32))),
+            Err("owned shuffle shard index exceeds the supported range".to_owned())
+        );
+    }
+
     #[tokio::test]
     async fn owned_shuffle_runs_the_worker_and_waits_for_commit() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1017,7 +1035,7 @@ mod data_plane_tests {
         let frame = crate::exchange::proto::ShuffleFrame {
             exchange_id: 1,
             src_shard: 0,
-            target_shard: 100,
+            target_shard: 84,
             epoch: 1,
             seq: 0,
             payload: crate::exchange::serialization::serialize_zset(&input)
@@ -1054,7 +1072,7 @@ mod data_plane_tests {
         let addr = listener.local_addr().unwrap();
         let registry = crate::exchange::service::ExchangeRegistry::new();
         let (inlet_tx, inlet_rx) = mpsc::channel(1);
-        registry.register(1, 100, inlet_tx, schema.clone());
+        registry.register(1, 84, inlet_tx, schema.clone());
         drop(inlet_rx);
         let service = crate::exchange::service::ExchangeService::new(registry.clone())
             .with_owned_handler(handle);
@@ -1118,7 +1136,7 @@ mod data_plane_tests {
             None
         );
         let (inlet_tx, mut reopened_inlet) = mpsc::channel(1);
-        registry.register(1, 100, inlet_tx, schema);
+        registry.register(1, 84, inlet_tx, schema);
         actors_for_test.register_owned(owner.shard_id, owner.lease_token, execute);
         let sending = {
             let mux = mux.clone();
@@ -1135,7 +1153,7 @@ mod data_plane_tests {
             .await
             .unwrap();
         assert!(!sending.is_finished());
-        assert_eq!(flow.rows_in_flight(1, 100, 100), 2);
+        assert_eq!(flow.rows_in_flight(1, 84, 84), 2);
         assert_eq!(
             db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
                 .await
@@ -1231,8 +1249,8 @@ mod data_plane_tests {
         );
         assert_eq!(
             (
-                flow.rows_in_flight(1, 100, 100),
-                flow.batches_in_flight(1, 100, 100)
+                flow.rows_in_flight(1, 84, 84),
+                flow.batches_in_flight(1, 84, 84)
             ),
             (0, 0)
         );

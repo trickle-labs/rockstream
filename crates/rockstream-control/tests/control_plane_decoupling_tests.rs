@@ -334,17 +334,14 @@ async fn source_delta_waits_for_each_routed_shard() {
         )
         .await;
         match read_control_message(&mut client_reader).await {
-            ControlMessage::WorkloadSnapshot { snapshot } => {
-                let mut frontiers: Vec<_> = snapshot
-                    .workers
-                    .into_iter()
-                    .map(|worker| (worker.worker_id, worker.frontier))
-                    .collect();
-                frontiers.sort_by_key(|(worker_id, _)| *worker_id);
-                let mut expected = vec![(workers[0].2, 2), (workers[1].2, 2)];
-                expected.sort_by_key(|(worker_id, _)| *worker_id);
-                assert_eq!(frontiers, expected);
-            }
+            ControlMessage::OperationFailed { code, message, next_steps } => assert_eq!(
+                (code, message, next_steps),
+                (
+                    "RS-0001".to_owned(),
+                    "workload requires recovery after failed execution".to_owned(),
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
+                )
+            ),
             other => panic!("unexpected workload response: {other:?}"),
         }
         for rows in [failed_frame.rows.clone(), Vec::new()] {

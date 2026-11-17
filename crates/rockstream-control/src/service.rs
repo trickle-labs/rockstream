@@ -4168,30 +4168,45 @@ async fn handle_connection_stream<R, W>(
                 send_message(&sender, &reply).await;
             }
             WorkerMessage::ReadWorkload { workload_id } => {
-                let snapshot = {
+                let reply = {
                     let state = data_plane.lock().await;
-                    state.deployments.get(&workload_id).map(|deployment| {
-                        let mut shards: Vec<_> = deployment
-                            .descriptors
-                            .keys()
-                            .map(|shard_id| ShardOutput {
-                                shard_id: *shard_id,
-                                deltas: Vec::new(),
-                            })
-                            .collect();
-                        shards.sort_by_key(|shard| shard.shard_id);
-                        let mut workers: Vec<_> = deployment.workers.values().cloned().collect();
-                        workers.sort_by_key(|status| status.worker_id);
-                        WorkloadSnapshot {
-                            deployment: deployment.request.clone(),
-                            shards,
-                            workers,
+                    match state.deployments.get(&workload_id) {
+                        Some(deployment) if deployment.recovery_required => {
+                            workload_recovery_failure()
                         }
-                    })
+                        Some(deployment)
+                            if deployment.ready_waiter.is_some()
+                                || state
+                                    .source_waiters
+                                    .values()
+                                    .any(|waiter| waiter.workload_id == workload_id) =>
+                        {
+                            data_plane_failure("workload has an incomplete execution")
+                        }
+                        Some(deployment) => {
+                            let mut shards: Vec<_> = deployment
+                                .descriptors
+                                .keys()
+                                .map(|shard_id| ShardOutput {
+                                    shard_id: *shard_id,
+                                    deltas: Vec::new(),
+                                })
+                                .collect();
+                            shards.sort_by_key(|shard| shard.shard_id);
+                            let mut workers: Vec<_> =
+                                deployment.workers.values().cloned().collect();
+                            workers.sort_by_key(|status| status.worker_id);
+                            ControlMessage::WorkloadSnapshot {
+                                snapshot: WorkloadSnapshot {
+                                    deployment: deployment.request.clone(),
+                                    shards,
+                                    workers,
+                                },
+                            }
+                        }
+                        None => data_plane_failure("workload is not deployed"),
+                    }
                 };
-                let reply = snapshot
-                    .map(|snapshot| ControlMessage::WorkloadSnapshot { snapshot })
-                    .unwrap_or_else(|| data_plane_failure("workload is not deployed"));
                 send_message(&sender, &reply).await;
             }
             WorkerMessage::Heartbeat {

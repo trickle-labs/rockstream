@@ -726,8 +726,9 @@ authentication. Those boundaries require separate qualification.
 The owned shuffle path records a source epoch on its anchor before dispatch and
 clears that record only after all target shards report committed execution.
 Worker execution records distinguish matching committed replays from conflicting
-input. The coordinator and runtime tests cover ordering, failure, restart,
-closed-inlet delivery, and exact replay. M1 does not model the journal or the
+input. Distributed view reads fail while execution is incomplete or requires
+recovery. The coordinator, gateway, and runtime tests cover ordering, failure,
+restart, closed-inlet delivery, and exact replay. M1 does not model the journal or the
 transport-to-worker handoff; the bare credit-only transport and independent-host
 recovery remain unqualified by these tests.
 
