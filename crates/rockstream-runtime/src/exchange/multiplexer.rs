@@ -566,7 +566,12 @@ impl WorkerStreamMultiplexer {
                             .to_owned(),
                     );
                 }
-                Err(error) => return Err(format!("Durable shuffle append claim failed: {error}")),
+                Err(error) => {
+                    return Err(format!(
+                        "{}: durable shuffle append claim failed: {error}",
+                        rockstream_types::error_code::RS_3012
+                    ))
+                }
             }
 
             let append_result: Result<(), String> = async {
@@ -627,7 +632,7 @@ impl WorkerStreamMultiplexer {
                     }
                 }
                 Err(object_store::Error::NotFound { .. }) => {}
-                Err(error) => return Err(format!("Durable shuffle object lookup failed: {error}")),
+                Err(error) => return Err(format!("{}: durable shuffle object lookup failed: {error}", rockstream_types::error_code::RS_3012)),
             }
 
             if already_present {
@@ -665,11 +670,15 @@ impl WorkerStreamMultiplexer {
                 (Err(error), Ok(())) => return Err(error),
                 (Ok(()), Err(error)) => {
                     return Err(format!(
-                        "Durable shuffle append claim release failed: {error}"
+                        "{}: durable shuffle append claim release failed: {error}",
+                        rockstream_types::error_code::RS_3012
                     ))
                 }
                 (Err(error), Err(release)) => {
-                    return Err(format!("{error}; append claim release failed: {release}"))
+                    return Err(format!(
+                        "{}: {error}; append claim release failed: {release}",
+                        rockstream_types::error_code::RS_3012
+                    ))
                 }
             }
 
@@ -733,7 +742,12 @@ impl WorkerStreamMultiplexer {
         match store.head(&path).await {
             Ok(_) => {}
             Err(object_store::Error::NotFound { .. }) => return Ok(()),
-            Err(error) => return Err(format!("Durable shuffle object lookup failed: {error}")),
+            Err(error) => {
+                return Err(format!(
+                    "{}: durable shuffle object lookup failed: {error}",
+                    rockstream_types::error_code::RS_3012
+                ))
+            }
         }
         let footer =
             crate::exchange::durable::DurableShuffleReader::read_footer(store, &path).await?;

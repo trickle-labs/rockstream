@@ -723,6 +723,14 @@ exercise the recovery gate. M1 abstracts the batch and does not model compiled
 operators, gateway cancellation, source shuffle ownership, or management
 authentication. Those boundaries require separate qualification.
 
+The owned shuffle path records a source epoch on its anchor before dispatch and
+clears that record only after all target shards report committed execution.
+Worker execution records distinguish matching committed replays from conflicting
+input. The coordinator and runtime tests cover ordering, failure, restart,
+closed-inlet delivery, and exact replay. M1 does not model the journal or the
+transport-to-worker handoff; the bare credit-only transport and independent-host
+recovery remain unqualified by these tests.
+
 Issue #303's #309 slice binds control-worker registration to the authenticated
 certificate identity. `control_worker_mtls_tests.rs` covers missing, expired,
 and untrusted certificates, identity mismatch, and role-only rejection; the

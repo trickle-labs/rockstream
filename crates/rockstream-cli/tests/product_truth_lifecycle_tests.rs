@@ -72,6 +72,15 @@ fn assert_json_status_transcript(
             .iter()
             .find(|actual| actual.node_id == node.node_id)
             .expect("expected node is present in status");
+        if node.address == "127.0.0.1:0" {
+            let address: std::net::SocketAddr = actual.address.parse().expect("worker address");
+            assert_eq!(
+                address.ip(),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            );
+            assert_ne!(address.port(), 0);
+            node.address = actual.address.clone();
+        }
         assert!((0.0..=1.0).contains(&actual.capacity_headroom));
         node.capacity_headroom = actual.capacity_headroom;
         node.registered_at_ms = 0;
@@ -372,6 +381,7 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
     }
     let pressure_status =
         assert_json_status_transcript(&pressure_output, "healthy", pressure_nodes);
+    assert_eq!(pressure_status.nodes[0].address, live.nodes[0].address);
     assert!(pressure_status.nodes[0].capacity_headroom < before_headroom);
     std::hint::black_box(&memory_pressure);
 
