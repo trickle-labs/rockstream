@@ -326,12 +326,13 @@ impl ExchangeRegistry {
         if !active {
             return Some(format!("authenticated worker {worker_id} is not active"));
         }
-        self
-            .shard_leases
+        self.shard_leases
             .read()
             .get(&rockstream_types::ids::ShardId(src_shard as u64))
             .is_none_or(|lease| lease.worker_id != worker_id)
-        .then(|| format!("authenticated worker {worker_id} does not own source shard {src_shard}"))
+            .then(|| {
+                format!("authenticated worker {worker_id} does not own source shard {src_shard}")
+            })
     }
 
     pub fn register(
