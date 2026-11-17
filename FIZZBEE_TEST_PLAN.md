@@ -723,7 +723,11 @@ exercise the recovery gate. M1 abstracts the batch and does not model compiled
 operators, gateway cancellation, source shuffle ownership, or management
 authentication. Those boundaries require separate qualification.
 
-The owned shuffle path records a source epoch on its anchor before dispatch and
+The gateway records pending source dispatch in the base-row batch and clears it
+after all source requests complete; reads and subsequent writes fail if a
+gateway restarts with that record. Distributed reads also fail when snapshots
+do not contain worker output, rather than report an empty result. The owned
+shuffle path records a source epoch on its anchor before dispatch and
 clears that record only after all target shards report committed execution.
 Worker execution records distinguish matching committed replays from conflicting
 input. Distributed view reads fail while execution is incomplete or requires

@@ -4036,11 +4036,41 @@ impl GatewayHandler {
     }
 
     async fn ensure_local_view_consistency(&self) -> PgWireResult<()> {
-        if !self.pending_view_recovery.lock().is_empty() {
+        let pending = if let Some(db) = &self.shard_db {
+            db.get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                b"distributed-source-pending",
+            ))
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?
+            .is_some()
+        } else {
+            false
+        };
+        if pending || !self.pending_view_recovery.lock().is_empty() {
             let _guard = self.shard_commit_lock.lock().await;
             self.recover_pending_views_locked()
                 .await
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_no_pending_distributed_locked(&self) -> Result<(), GatewayError> {
+        if let Some(db) = &self.shard_db {
+            if db
+                .get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                    b"distributed-source-pending",
+                ))
+                .await?
+                .is_some()
+            {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying".to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -9180,6 +9210,15 @@ impl GatewayHandler {
         order_by: Vec<(String, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        let _distributed_read_guard = if self.distributed_data_plane.is_some() {
+            let guard = self.shard_commit_lock.lock().await;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            Some(guard)
+        } else {
+            None
+        };
         if let Some(error_responses) = self
             .select_access_error_response(view_name, conn_id)
             .await?
@@ -9248,6 +9287,14 @@ impl GatewayHandler {
                         detail: format!("read distributed view {view_name}: {error}"),
                     }))
                 })?;
+            // shortcut: snapshots omit worker output, remove this gate when reads include it.
+            if snapshot.shards.iter().all(|shard| shard.deltas.is_empty()) {
+                return Err(PgWireError::ApiError(Box::new(
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("distributed view {view_name} output is unavailable; contact the operator before relying on this result"),
+                    },
+                )));
+            }
             let mut rows = merge_workload_snapshot(&snapshot)
                 .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
             if !order_by.is_empty() {
@@ -12095,7 +12142,10 @@ impl GatewayHandler {
         self.recover_pending_views_locked()
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-        let (epoch, ops, changes) = {
+        self.ensure_no_pending_distributed_locked()
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        let (epoch, ops, changes, requests) = {
             let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
@@ -12115,6 +12165,65 @@ impl GatewayHandler {
 
             let mut batch = rockstream_storage::WriteBatch::new();
             append_dml_ops(&mut batch, &ops);
+            let mut requests = Vec::new();
+            if self.distributed_data_plane.is_some() {
+                let changed_tables = ops
+                    .iter()
+                    .map(|op| match op {
+                        DmlOp::Insert { table, .. }
+                        | DmlOp::Update { table, .. }
+                        | DmlOp::Delete { table, .. } => table.clone(),
+                    })
+                    .collect();
+                for view_name in self.reachable_compiled_views(&changed_tables) {
+                    for source in self.catalog.get_view_deps(&view_name) {
+                        if !changed_tables
+                            .iter()
+                            .any(|table: &String| table.eq_ignore_ascii_case(&source))
+                        {
+                            continue;
+                        }
+                        let rows = runtime_rows_for_table(&source, &ops);
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        let request_id = format!(
+                            "{}-{epoch}-{}",
+                            std::process::id(),
+                            NEXT_DISTRIBUTED_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+                        );
+                        requests.push((
+                            view_name.clone(),
+                            SourceDeltaRequest {
+                                version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                                request_id,
+                                workload_id: WorkloadId(stable_name_id("workload", &view_name)),
+                                epoch,
+                                source,
+                                rows,
+                            },
+                        ));
+                    }
+                }
+                if !requests.is_empty() {
+                    let pending = requests
+                        .iter()
+                        .map(|(view, request)| {
+                            format!(
+                                "{} {} {} {}",
+                                view, request.epoch, request.source, request.request_id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    batch.put(
+                        &rockstream_storage::ShardKeyEncoder::meta_key(
+                            b"distributed-source-pending",
+                        ),
+                        pending.as_bytes(),
+                    );
+                }
+            }
             // Persist idempotency key so replays are no-ops
             if let Some(key_hash) = idempotency_key {
                 let now_ms = std::time::SystemTime::now()
@@ -12227,7 +12336,7 @@ impl GatewayHandler {
             }
             // Do not expose this epoch yet. The table write is staged, but
             // dependent materialized view writes and the durable flush follow.
-            (epoch, ops, changes)
+            (epoch, ops, changes, requests)
         };
         let affected = ops.len();
 
@@ -12236,52 +12345,20 @@ impl GatewayHandler {
         // every view that transitively depends on them.  This converts the
         // serving shard from a raw DML store into a live view serving layer.
         {
-            let changed_tables: std::collections::HashSet<String> = ops
-                .iter()
-                .map(|op| match op {
-                    DmlOp::Insert { table, .. } => table.clone(),
-                    DmlOp::Update { table, .. } => table.clone(),
-                    DmlOp::Delete { table, .. } => table.clone(),
-                })
-                .collect();
             if let Some(data_plane) = &self.distributed_data_plane {
-                for view_name in self.reachable_compiled_views(&changed_tables) {
-                    for source in self.catalog.get_view_deps(&view_name) {
-                        if !changed_tables
-                            .iter()
-                            .any(|table| table.eq_ignore_ascii_case(&source))
-                        {
-                            continue;
-                        }
-                        let rows = runtime_rows_for_table(&source, &ops);
-                        if rows.is_empty() {
-                            continue;
-                        }
-                        let request_id = format!(
-                            "{}-{epoch}-{}",
-                            std::process::id(),
-                            NEXT_DISTRIBUTED_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-                        );
-                        data_plane
-                            .submit_delta(SourceDeltaRequest {
-                                version: DEPLOYMENT_DESCRIPTOR_VERSION,
-                                request_id,
-                                workload_id: WorkloadId(stable_name_id("workload", &view_name)),
-                                epoch,
-                                source,
-                                rows,
-                            })
-                            .await
-                            .map_err(|error| {
-                                PgWireError::ApiError(Box::new(
-                                    GatewayError::QueryTimeExecutionFailed {
-                                        detail: format!(
-                                            "distributed view refresh {view_name}: {error}"
-                                        ),
-                                    },
-                                ))
-                            })?;
-                    }
+                for (view_name, request) in &requests {
+                    data_plane
+                        .submit_delta(request.clone())
+                        .await
+                        .map_err(|error| {
+                            PgWireError::ApiError(Box::new(
+                                GatewayError::QueryTimeExecutionFailed {
+                                    detail: format!(
+                                        "distributed view refresh {view_name}: {error}; preserve source input and shard storage and contact the operator before retrying"
+                                    ),
+                                },
+                            ))
+                        })?;
                 }
             }
             // Flush the WAL so that materialised view output is immediately
@@ -12292,6 +12369,14 @@ impl GatewayHandler {
             shard_db.flush().await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
+            if !requests.is_empty() {
+                shard_db
+                    .delete(&rockstream_storage::ShardKeyEncoder::meta_key(
+                        b"distributed-source-pending",
+                    ))
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?;
+            }
             self.frontier_published_at_ms
                 .store(current_time_ms(), Ordering::SeqCst);
             self.pending_view_recovery.lock().clear();
