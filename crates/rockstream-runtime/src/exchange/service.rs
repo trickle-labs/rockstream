@@ -313,15 +313,25 @@ impl ExchangeRegistry {
             .map(|worker| worker.worker_id)
     }
 
-    fn source_shard_owned_by(
+    fn frame_authorization_denial(
         &self,
-        src_shard: u32,
         worker_id: rockstream_types::ids::WorkerId,
-    ) -> bool {
-        self.shard_leases
+        src_shard: u32,
+    ) -> Option<String> {
+        let active = self
+            .topology_workers
+            .read()
+            .get(&worker_id)
+            .is_some_and(|worker| worker.healthy && worker.lifecycle.is_active());
+        if !active {
+            return Some(format!("authenticated worker {worker_id} is not active"));
+        }
+        (!self
+            .shard_leases
             .read()
             .get(&rockstream_types::ids::ShardId(src_shard as u64))
-            .is_some_and(|lease| lease.worker_id == worker_id)
+            .is_some_and(|lease| lease.worker_id == worker_id))
+        .then(|| format!("authenticated worker {worker_id} does not own source shard {src_shard}"))
     }
 
     pub fn register(
@@ -766,27 +776,28 @@ impl ShuffleService for ShuffleServer {
                 match result {
                     Ok(frame) => {
                         if let Some(worker_id) = authenticated_worker_id {
-                            if !registry.source_shard_owned_by(frame.src_shard, worker_id) {
+                            if let Some(reason) =
+                                registry.frame_authorization_denial(worker_id, frame.src_shard)
+                            {
                                 if let Err(audit_error) =
                                     registry.audit_authorization_denial(worker_id, &frame).await
                                 {
                                     let _ = tx.send(Err(audit_error)).await;
                                     break;
                                 }
-                                let status = Status::permission_denied(format!(
-                                "{RS_2401}: authenticated worker {worker_id} does not own source shard {}",
-                                frame.src_shard
-                            ));
+                                let status =
+                                    Status::permission_denied(format!("{RS_2401}: {reason}"));
                                 tracing::warn!(
                                     action = "security.authorization_denied",
                                     authenticated_worker = %worker_id,
+                                    reason = %reason,
                                     source_shard = frame.src_shard,
                                     exchange_id = frame.exchange_id,
                                     target_shard = frame.target_shard,
                                     epoch = frame.epoch,
                                     seq = frame.seq,
                                     error_code = %RS_2401,
-                                    "shuffle frame source shard is not owned by the authenticated worker"
+                                    "shuffle frame authorization denied"
                                 );
                                 let _ = tx.send(Err(status)).await;
                                 break;
@@ -1039,6 +1050,52 @@ mod tests {
             healthy: true,
             lifecycle: WorkerLifecycleState::Active,
         }
+    }
+
+    #[test]
+    fn shuffle_authorization_observes_revocation_with_live_lease() {
+        use rockstream_types::ids::{LeaseToken, ShardId};
+
+        let worker_id = WorkerId(42);
+        let shard_id = ShardId(10);
+        let topology_workers = Arc::new(RwLock::new(HashMap::from([(
+            worker_id,
+            worker_info(worker_id.0, "127.0.0.1:1".to_owned(), "host", "az"),
+        )])));
+        let shard_leases = Arc::new(RwLock::new(HashMap::from([(
+            shard_id,
+            ShardLease::new(shard_id, worker_id, LeaseToken(1)),
+        )])));
+        let registry = ExchangeRegistry::with_worker_state(
+            Arc::new(RwLock::new(HashMap::new())),
+            topology_workers.clone(),
+        )
+        .with_shard_leases(shard_leases.clone());
+
+        assert_eq!(registry.frame_authorization_denial(worker_id, 10), None);
+        topology_workers
+            .write()
+            .get_mut(&worker_id)
+            .unwrap()
+            .healthy = false;
+        assert_eq!(
+            registry.frame_authorization_denial(worker_id, 10),
+            Some(format!("authenticated worker {worker_id} is not active"))
+        );
+        assert_eq!(
+            shard_leases.read().get(&shard_id).unwrap().worker_id,
+            worker_id
+        );
+
+        let mut topology_worker = topology_workers.write();
+        let worker = topology_worker.get_mut(&worker_id).unwrap();
+        worker.healthy = true;
+        worker.lifecycle = WorkerLifecycleState::draining(1, 2);
+        drop(topology_worker);
+        assert_eq!(
+            registry.frame_authorization_denial(worker_id, 10),
+            Some(format!("authenticated worker {worker_id} is not active"))
+        );
     }
 
     async fn shard_db(name: &str) -> (Arc<object_store::memory::InMemory>, ShardDb) {
