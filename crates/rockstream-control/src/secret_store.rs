@@ -829,6 +829,7 @@ impl SecretStore {
     }
 
     /// Apply or reconcile a secret rotation under its client-generated operation UUID.
+    #[allow(clippy::too_many_arguments)]
     pub async fn alter_secret_with_operation(
         &self,
         namespace_id: u128,

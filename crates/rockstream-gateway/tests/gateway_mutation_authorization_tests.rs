@@ -645,6 +645,9 @@ async fn administrator_can_manage_secret_and_read_only_its_metadata() {
         .unwrap();
     catalog.set_durable_store(durable.clone());
 
+    let operations = rockstream_control::ManagementOperationStore::new(Arc::new(
+        object_store::memory::InMemory::new(),
+    ));
     let secret_store = Arc::new(
         SecretStore::open_durable(
             "secret-administration-policy-test-secrets",
@@ -655,7 +658,8 @@ async fn administrator_can_manage_secret_and_read_only_its_metadata() {
         )
         .await
         .unwrap()
-        .with_security_audit_catalog(durable),
+        .with_security_audit_catalog(durable)
+        .with_management_operation_store(operations, "secret-administration-policy-test".into()),
     );
     let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader))
         .with_secret_store(secret_store.clone());
@@ -757,6 +761,13 @@ async fn administrator_can_manage_secret_and_read_only_its_metadata() {
     assert!(sales_rows.next().await.is_none());
     assert!(!format!("{sales_row:?}").contains("sales-secret"));
 
+    handler
+        .dispatch_async_with_conn(
+            "SET rockstream.idempotency_key = '00000000-0000-4000-8000-000000000002'",
+            Some("secret-admin-connection"),
+        )
+        .await
+        .unwrap();
     let altered_sales = handler
         .dispatch_async_with_conn(
             "ALTER SECRET kafka_auth SET (password = 'replacement')",
