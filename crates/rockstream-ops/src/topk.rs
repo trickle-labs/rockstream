@@ -915,6 +915,8 @@ mod tests {
     }
 
     fn accumulate_vals(state: &mut HashMap<i64, i64>, zset: &ArrowZSet) {
+        zset.validate()
+            .expect("top-k output must have aligned row weights");
         if zset.is_empty() {
             return;
         }
@@ -924,8 +926,8 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
-            *state.entry(col.value(i)).or_insert(0) += zset.weights[i];
+        for (i, &weight) in zset.weights.iter().enumerate() {
+            *state.entry(col.value(i)).or_insert(0) += weight;
         }
     }
 

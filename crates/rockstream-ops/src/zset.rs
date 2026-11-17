@@ -230,10 +230,10 @@ impl ArrowZSet {
         let a_col = self.data.column(0).as_any().downcast_ref::<Int64Array>();
         let b_col = self.data.column(1).as_any().downcast_ref::<Int64Array>();
         if let (Some(a), Some(b)) = (a_col, b_col) {
-            for i in 0..self.num_rows() {
+            for (i, &weight) in self.weights.iter().enumerate() {
                 let key = (a.value(i), b.value(i));
                 let current = acc.get(&key).copied().unwrap_or(0);
-                let next = rockstream_verified::zset::consolidate_weight(current, self.weights[i])
+                let next = rockstream_verified::zset::consolidate_weight(current, weight)
                     .ok_or_else(|| OpError::numeric_overflow("Z-set weight consolidation"))?;
                 if rockstream_verified::zset::weight_cancels(next) {
                     acc.remove(&key);

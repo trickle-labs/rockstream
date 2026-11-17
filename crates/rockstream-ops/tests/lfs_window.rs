@@ -68,6 +68,8 @@ fn make_input(rows: &[(i64, i64, i64)]) -> ArrowZSet {
 
 /// Accumulate a ZSet delta into a state map: (v, rn) → weight.
 fn accumulate_v_rn(state: &mut std::collections::HashMap<(i64, i64), i64>, zset: &ArrowZSet) {
+    zset.validate()
+        .expect("window output must have aligned row weights");
     if zset.is_empty() {
         return;
     }
@@ -83,9 +85,9 @@ fn accumulate_v_rn(state: &mut std::collections::HashMap<(i64, i64), i64>, zset:
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..zset.num_rows() {
+    for (i, &weight) in zset.weights.iter().enumerate() {
         let key = (v_col.value(i), rn_col.value(i));
-        *state.entry(key).or_insert(0) += zset.weights[i];
+        *state.entry(key).or_insert(0) += weight;
     }
 }
 
