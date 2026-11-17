@@ -68,6 +68,12 @@ SlateDB `WriteBatch`) and the CALM invariant
 contributing shard's persisted frontier satisfies `frontier ≥ N`, verifiable by
 any reader of the object store with no coordinator).
 
+The durable shuffle catch-up helper currently persists its inbox marker before
+the inlet handoff, outside the operator's epoch commit. The closed-inlet retry
+test covers explicit rejection and retry; it does not establish atomicity with
+operator state or recovery of a marker left before delivery. Concurrent
+catch-up and owning-epoch recovery remain unqualified (issue #321).
+
 Verification targets:
 - `WriteBatch` is **all-or-nothing**: a crash mid-commit leaves the shard at
   epoch `N-1`, never a torn state where the frontier advanced but state did not
@@ -783,14 +789,34 @@ These tests do not claim live KMS or abrupt process-termination qualification.
 Issue #304 persists source/sink secret bindings in `SecretMetadata.source_refs`
 and retains sink bindings in `CatalogSinkEntry.secret_name`. Source/sink DDL
 adds and removes those references; `DROP SECRET` combines persisted and cached
-references and rejects deletion with `RS-2426` while a binding remains. This is
-catalog metadata lifecycle coverage, not a new M1–M7 coordination transition.
-The `test_secret_references_survive_store_reopen` regression in
+references and rejects deletion with `RS-2426` while a binding remains. The
+gateway pgoutput worker rechecks the durable secret version at transaction
+boundaries, resolves a changed value under the consumer's current grant, and
+reconnects only after the epoch result, source checkpoint, and slot ACK commit.
+The worker process and committed result state remain in place. A Docker-backed
+release-process regression rotates credentials with an upstream transaction
+pending, compares the complete result multiset after the transaction and a
+post-rotation write, then kills and restarts the gateway and compares the
+recovered result multiset. It does not yet verify the corresponding durable
+security-audit sequence or lost-response reconciliation. Kafka source/sink
+runtime rotation remains unqualified; SQL `CREATE SINK` does not configure the
+experimental runtime adapter. The `test_secret_references_survive_store_reopen` regression in
 `crates/rockstream-control/tests/secrets_lifecycle_tests.rs` verifies that a
 reopened store retains the reference and continues to reject secret deletion.
 The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
 `crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
 deletion until `DROP SINK` removes it.
+
+The v0.73 principal, grant, and audit changes persist reviewed policy revisions
+with their mutation audit records through the durable catalog. The
+`catalog_security_policy_tests.rs` suite checks exact principal and audit
+recovery through log replay, snapshot recovery, and reopen, along with one-time
+audited bootstrap, stale-revision rejection, last-administrator protection,
+and self-grant denial. `authorization.rs` tests the preset and scoped-grant
+boundaries. The M1–M7 models do not represent principal policy or audit-retention
+state; this change adds no worker, epoch, lease, or sink transition. Release
+endpoint, concurrency, and bounded-retention qualification remains separate
+evidence.
 
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
@@ -869,6 +895,39 @@ state remains an external source boundary outside M1–M7, so this adds real
 cluster evidence without a new abstract invariant or a general CDC guarantee
 (`docs/testing/postgres-cdc-kafka-minio-v1.md`). The adjacent spill-governor
 atomic compatibility annotation changes no coordination transition.
+
+Issue #338's partitioned `postgres_cdc` retention contract refines M3's
+external source admission and ACK boundary, not M3's abstract record-level
+transition. A partitioned source published without
+`publish_via_partition_root = true` is rejected with `RS-4013` before the
+gateway accepts child-relation changes as parent-table data. A `pgoutput`
+TRUNCATE frame lacks row images, so the legacy row-only decoder fails closed
+with `RS-4015` before acknowledging the containing transaction. The
+relation-aware gateway instead reconstructs bounded row retractions from local
+committed images, applying them atomically with the slot checkpoint (issue #339).
+Neither path may silently advance the slot LSN or leave stale aggregates
+presented as correct.
+The M3 abstraction still requires durable input/output/checkpoint coupling
+before source acknowledgement, but does not model PostgreSQL relation OIDs,
+publication modes, partition DDL, or historical window state. Source-side
+DETACH/DROP PARTITION emits no row-level retractions, and a fresh snapshot of
+retained partitions cannot reconstruct already-pruned historical aggregates.
+These limitations must remain explicit instead of asserting a new abstract
+exactly-once or historical-resnapshot property.
+
+Concrete evidence: `postgres_cdc::tests::pgoutput_truncate_row_only_paths_fail_closed_and_event_decodes`
+checks row-only rejection and relation-aware frame decoding;
+`postgres_cdc::tests::pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames`
+checks strict relation and flag validation;
+`postgres_cdc::tests::partitioned_sources_require_root_publication_identity`
+checks the admission guard; and the real PostgreSQL 16
+`postgres_cdc_partition_retention_tests::partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed`
+checks parent publication identity, exact initial and post-pruning snapshot
+transcripts, the child INSERT delta, unchanged slot acknowledgement on rejected
+TRUNCATE, and missing-slot recovery refusal. It does **not** test preserving
+closed TUMBLE aggregates through resnapshot, reconstructing missing WAL, or
+publication-level DDL replay. Those require a separate durable-state model
+and end-to-end recovery proof before being claimed.
 
 Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
 still abstracts epochs, not row contents. The adapter persists the full pending

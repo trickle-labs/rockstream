@@ -596,6 +596,17 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
         self.source.capture_source_snapshot(relations).await
     }
 
+    /// Reject unsafe publication identities for every imported table under
+    /// the active source lease, including attachments made after bootstrap.
+    pub async fn validate_pgoutput_table(
+        &self,
+        lease: &SourceOwnerLease,
+        table: &str,
+    ) -> Result<(), SourceError> {
+        self.require_active_lease(lease)?;
+        self.source.validate_pgoutput_table(table).await
+    }
+
     pub async fn pgoutput_relation_column_policies(
         &self,
         lease: &SourceOwnerLease,
@@ -603,6 +614,28 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
     ) -> Result<Vec<(bool, bool)>, SourceError> {
         self.require_active_lease(lease)?;
         self.source.relation_column_policies(relation_id).await
+    }
+
+    pub fn pgoutput_secret_binding(
+        &self,
+        lease: &SourceOwnerLease,
+    ) -> Result<(Option<&str>, u64), SourceError> {
+        self.require_active_lease(lease)?;
+        Ok(self.source.secret_binding())
+    }
+
+    pub async fn rotate_pgoutput_secret_at_epoch(
+        &mut self,
+        lease: &SourceOwnerLease,
+        secret_name: &str,
+        version: u64,
+        password: String,
+    ) -> Result<bool, SourceError> {
+        self.require_active_lease(lease)?;
+        let has_checkpoint = self.committed_epoch() != 0;
+        self.source
+            .rotate_pgoutput_secret_at_epoch(secret_name, version, password, has_checkpoint)
+            .await
     }
 
     pub fn close_pgoutput(&mut self, lease: &SourceOwnerLease) -> bool {

@@ -9,7 +9,6 @@ use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use tokio_postgres::NoTls;
 
 fn normalize_correlation_id(stderr: Vec<u8>) -> String {
     let stderr = String::from_utf8(stderr).unwrap();
@@ -55,25 +54,18 @@ fn test_cli_invalid_auth_fails_startup() {
     let err = res.unwrap_err();
     assert_eq!(
         err.to_string(),
-        "RS-0002 unknown auth mode `invalid_super_auth`\n  next steps: Pass a supported authentication mode: off, oidc, or mtls."
+        "RS-0002 unknown auth mode `invalid_super_auth`\n  next steps: Pass a supported authentication mode: off, scram, oidc, or mtls."
     );
 }
 
 #[tokio::test]
-async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_start() {
+async fn test_cli_md5_mode_fails_closed_before_storage_or_listener_start() {
     let tmp = tempfile::tempdir().unwrap();
-    for (mode, detail, next_steps) in [
-        (
-            "scram",
-            "durable principal integration is incomplete",
-            "SCRAM remains blocked until durable principal grants are enforced on the public gateway path.",
-        ),
-        (
-            "md5",
-            "MD5 is not a release authentication mode",
-            "Use a release-supported authentication mode.",
-        ),
-    ] {
+    for (mode, detail, next_steps) in [(
+        "md5",
+        "MD5 is not a release authentication mode",
+        "Use a release-supported authentication mode.",
+    )] {
         let storage = tmp.path().join(mode);
         let opts = test_options(storage.clone(), mode, Some("127.0.0.1:0".to_string()));
         let err = start_gateway(&opts).await.unwrap_err();
@@ -88,7 +80,22 @@ async fn test_cli_unavailable_auth_modes_fail_closed_before_storage_or_listener_
 }
 
 #[tokio::test]
-async fn explicit_off_auth_mode_overrides_configured_oidc_mode() {
+async fn scram_mode_fails_closed_without_enabled_login() {
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = test_options(
+        tmp.path().join("scram"),
+        "scram",
+        Some("127.0.0.1:0".to_string()),
+    );
+    let error = start_gateway(&opts).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "RS-0002 gateway startup rejected: SCRAM requires an available durable catalog with an enabled SCRAM login\n  next steps: Provision an enabled SCRAM login in the recovered durable catalog before starting the gateway."
+    );
+}
+
+#[tokio::test]
+async fn configured_oidc_auth_mode_cannot_be_disabled_by_start_options() {
     let tmp = tempfile::tempdir().unwrap();
     let mut node_config = NodeConfig::default();
     node_config.auth.mode = "oidc".to_string();
@@ -99,23 +106,14 @@ async fn explicit_off_auth_mode_overrides_configured_oidc_mode() {
     );
     opts.node_config = Some(node_config);
 
-    let (address, handle) = start_gateway(&opts).await.unwrap();
-    let (client, connection) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=alice password=unused dbname=test sslmode=disable",
-            address.port()
-        ),
-        NoTls,
-    )
-    .await
-    .expect("explicit auth mode should control the listener");
-    let connection_handle = tokio::spawn(connection);
-    let rows = client.query("SELECT 1 AS value", &[]).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get::<_, i64>(0), 1);
-    drop(client);
-    connection_handle.abort();
-    handle.abort();
+    let error = start_gateway(&opts)
+        .await
+        .expect_err("off must not mask configured OIDC");
+    assert_eq!(
+        error.to_string(),
+        "RS-0002 OIDC requires auth.oidc_issuer, auth.oidc_audience, and auth.oidc_jwks_url\n  next steps: Configure the issuer, audience, and JWKS endpoint before starting the gateway."
+    );
+    assert!(!opts.storage.exists(), "failed startup created storage");
 }
 
 #[tokio::test]
@@ -156,7 +154,7 @@ async fn gateway_start_fails_closed_when_durable_catalog_recovery_fails() {
     assert_eq!(
         error.to_string(),
         format!(
-            "RS-0003 gateway catalog recovery failed: {catalog_error}\n  next steps: Restore or repair durable catalog storage before starting the gateway."
+            "RS-0003 gateway durable catalog recovery failed: {catalog_error}\n  next steps: Check that the durable catalog is intact and storage is accessible."
         )
     );
 }

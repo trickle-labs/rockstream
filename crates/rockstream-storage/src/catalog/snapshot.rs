@@ -7,13 +7,16 @@
 //! `latest valid snapshot + subsequent valid log entries = current catalog state`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use super::envelope::compute_checksum;
 use super::{
     CatalogDatabase, CatalogError, CatalogIndexEntry, CatalogInlineView, CatalogNamespace,
     CatalogRoleEntry, CatalogSinkEntry, CatalogSourceEntry, CatalogTable, CatalogView,
     CatalogWorkloadEntry, CompiledPlanRecord, ViewDependency,
+};
+use rockstream_types::authorization::{
+    PermissionPreset, PolicyScope, SecurityAuditRecord, SecurityPrincipal,
 };
 use rockstream_types::workload::WorkloadDef;
 
@@ -41,6 +44,10 @@ pub struct CatalogSnapshot {
     /// Successful operation identities must survive log compaction.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub committed_operations: BTreeSet<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_principals: Vec<SecurityPrincipal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_audit_records: Vec<SecurityAuditRecord>,
     pub checksum: u32,
 }
 
@@ -81,6 +88,8 @@ impl CatalogSnapshot {
             roles,
             compiled_plans,
             committed_operations,
+            security_principals: Vec::new(),
+            security_audit_records: Vec::new(),
             checksum: 0,
         };
 
@@ -90,6 +99,56 @@ impl CatalogSnapshot {
         snap.checksum = compute_checksum(&serialized);
 
         Ok(snap)
+    }
+
+    /// Add security records while preserving the legacy snapshot constructor.
+    pub fn with_security_records(
+        mut self,
+        principals: Vec<SecurityPrincipal>,
+        audit_records: Vec<SecurityAuditRecord>,
+    ) -> Result<Self, CatalogError> {
+        let mut principal_ids = HashSet::new();
+        for principal in &principals {
+            principal.validate().map_err(|error| {
+                CatalogError::DecodeError(format!(
+                    "[RS-1003] invalid security principal in snapshot: {error}"
+                ))
+            })?;
+            if !principal_ids.insert(principal.id) {
+                return Err(CatalogError::DecodeError(
+                    "[RS-1003] duplicate security principal ID in snapshot".into(),
+                ));
+            }
+        }
+        SecurityPrincipal::validate_unique_login_identities(principals.iter()).map_err(
+            |error| {
+                CatalogError::DecodeError(format!(
+                    "[RS-1003] invalid security login mapping in snapshot: {error}"
+                ))
+            },
+        )?;
+        let mut audit_ids = HashSet::new();
+        for event in &audit_records {
+            event.validate().map_err(|error| {
+                CatalogError::DecodeError(format!(
+                    "[RS-1003] invalid security audit record in snapshot: {error}"
+                ))
+            })?;
+            if !audit_ids.insert(event.event_id.as_str()) {
+                return Err(CatalogError::DecodeError(
+                    "[RS-1003] duplicate security audit event ID in snapshot".into(),
+                ));
+            }
+        }
+        validate_last_administrator(&principals)?;
+        self.security_principals = principals;
+        self.security_audit_records = audit_records;
+        self.checksum = 0;
+        let serialized = serde_json::to_vec(&self).map_err(|e| {
+            CatalogError::Internal(format!("[RS-0001] failed to serialize snapshot: {e}"))
+        })?;
+        self.checksum = compute_checksum(&serialized);
+        Ok(self)
     }
 
     /// Serialize snapshot to bytes.
@@ -123,8 +182,123 @@ impl CatalogSnapshot {
                 stored_checksum, expected
             )));
         }
+        let mut principal_ids = HashSet::new();
+        for principal in &snap.security_principals {
+            principal.validate().map_err(|error| {
+                CatalogError::DecodeError(format!(
+                    "[RS-1003] invalid security principal in snapshot: {error}"
+                ))
+            })?;
+            if !principal_ids.insert(principal.id) {
+                return Err(CatalogError::DecodeError(
+                    "[RS-1003] duplicate security principal ID in snapshot".into(),
+                ));
+            }
+        }
+        SecurityPrincipal::validate_unique_login_identities(snap.security_principals.iter())
+            .map_err(|error| {
+                CatalogError::DecodeError(format!(
+                    "[RS-1003] invalid security login mapping in snapshot: {error}"
+                ))
+            })?;
+        let mut audit_ids = HashSet::new();
+        for event in &snap.security_audit_records {
+            event.validate().map_err(|error| {
+                CatalogError::DecodeError(format!(
+                    "[RS-1003] invalid security audit record in snapshot: {error}"
+                ))
+            })?;
+            if !audit_ids.insert(event.event_id.as_str()) {
+                return Err(CatalogError::DecodeError(
+                    "[RS-1003] duplicate security audit event ID in snapshot".into(),
+                ));
+            }
+        }
+        validate_last_administrator(&snap.security_principals)?;
         snap.checksum = stored_checksum;
 
         Ok(snap)
+    }
+}
+
+fn validate_last_administrator(principals: &[SecurityPrincipal]) -> Result<(), CatalogError> {
+    if !principals.is_empty()
+        && !principals.iter().any(|principal| {
+            principal.enabled
+                && principal.has_interactive_login()
+                && principal.preset_grants.iter().any(|grant| {
+                    grant.preset == PermissionPreset::Administrator
+                        && grant.scope == PolicyScope::Cluster
+                })
+        })
+    {
+        return Err(CatalogError::DecodeError(
+            "[RS-1003] security snapshot has no enabled interactive administrator".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rockstream_types::{
+        authorization::{LoginMethod, ScopedPresetGrant, SECURITY_PRINCIPAL_FORMAT_VERSION},
+        ids::PrincipalId,
+    };
+
+    fn administrator(id: u64) -> SecurityPrincipal {
+        SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(id),
+            display_name: format!("administrator-{id}"),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::ScramSha256 {
+                username: "shared-login".to_string(),
+                salt: vec![1; 16],
+                iterations: 4096,
+                stored_key: vec![2; 32],
+                server_key: vec![3; 32],
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![],
+        }
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_login_identities_across_principals() {
+        let mut snapshot = CatalogSnapshot::new(
+            1,
+            2,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            BTreeSet::new(),
+        )
+        .unwrap();
+        snapshot.security_principals = vec![administrator(1), administrator(2)];
+        snapshot.checksum = 0;
+        let checksum_input = serde_json::to_vec(&snapshot).unwrap();
+        snapshot.checksum = compute_checksum(&checksum_input);
+
+        let error = CatalogSnapshot::decode(&snapshot.encode().unwrap()).unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogError::DecodeError(message)
+                if message == "[RS-1003] invalid security login mapping in snapshot: login identity is mapped more than once in the security catalog"
+        ));
     }
 }

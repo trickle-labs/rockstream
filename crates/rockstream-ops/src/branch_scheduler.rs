@@ -118,6 +118,7 @@ impl ViewDependencyGraph {
 
 /// Trait implemented by view delta executors.
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ViewBranchExecutor: Send + Sync {
     /// Execute maintenance on a view given the deltas of its dependencies.
     async fn execute(

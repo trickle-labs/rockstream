@@ -11,7 +11,7 @@ pub mod service;
 pub mod shared_memory;
 
 /// Re-export generated proto definitions
-#[allow(clippy::result_large_err)]
+#[allow(clippy::double_must_use, clippy::result_large_err)]
 pub mod proto {
     tonic::include_proto!("rockstream.shuffle");
 }

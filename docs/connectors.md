@@ -3,8 +3,22 @@
 ## Secret rotation
 
 Kafka sources/sinks and PostgreSQL CDC sources can bind to `secret = '<name>'`.
-An altered secret queues one encrypted replacement token and applies it at the
-next epoch boundary, preserving the connector process and committed batches.
+New source and sink catalog entries store the binding as `secret://<name>`;
+resolved credential values are not copied into connector metadata. Attaching a
+secret requires an explicit `SecretUse` grant scoped to the secret and consumer
+principal; missing identity or durable policy fails closed. Source and sink
+metadata is committed before CREATE or DROP is acknowledged. The gateway
+rechecks a source consumer's current grant before resolving its credential.
+Older entries without persisted consumer scope fail closed; an authorized
+migration route remains to be qualified.
+
+The gateway pgoutput source checks the durable secret version before a source
+transaction and after its committed epoch. If it changes during the transaction,
+the worker commits the complete result and slot checkpoint, then opens a new
+upstream connection with the authorized replacement while keeping the source
+worker alive. Kafka source/sink rotation remains unqualified; the experimental
+sink is not configured by SQL `CREATE SINK` and has no supported full-Core
+qualification route.
 
 RockStream supports exactly three external connector boundaries: PostgreSQL
 CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,
@@ -103,11 +117,30 @@ the source with `RS-4014` (or `RS-4013` for a protocol error) **without advancin
 the slot**. Operators must resolve the bound or resnapshot; the source cannot
 silently ignore or partially apply TRUNCATE. The legacy row-only
 `PostgresCdcSource::poll_delta` path does not have local imported-row state and
-therefore rejects TRUNCATE with `RS-4013`; it does not claim support for it.
+therefore rejects TRUNCATE with `RS-4015`; it does not claim support for it.
 
 ### Recovery and Resnapshot
 
-When PostgreSQL invalidates a replication slot (e.g. WAL retention exhaustion, errors `55000` / `58P01`), the connector transitions to `BLOCKED` with error code `RS-4011` / `RS-4016` and requires an operator-initiated resnapshot.
+When PostgreSQL invalidates a replication slot (e.g. WAL retention exhaustion, errors `55000` / `58P01`), the connector transitions to `BLOCKED` with error code `RS-4011` / `RS-4016`. A source with a durable checkpoint **does not silently create a replacement slot**. If the original slot cannot be recovered, a new snapshot alone is not sufficient to reconstruct already-pruned events.
+
+### Partitioned sources, retention, and historical view correctness
+
+For a PostgreSQL partitioned **root** used as an imported source table, its publication **must** set `publish_via_partition_root = true`; RockStream rejects a root published under child partition relation IDs with `RS-4013`, rather than silently missing their changes. For example:
+
+```sql
+CREATE PUBLICATION events_pub FOR TABLE public.events
+    WITH (publish_via_partition_root = true);
+```
+
+PostgreSQL defaults this flag to false. Changes are otherwise published using individual child relation identities, not the parent identity imported by RockStream. Configure the publication before initial capture and keep its identity mode stable.
+
+**Important retention boundary:** `ALTER TABLE ... DETACH PARTITION` and `DROP TABLE` on a partition do not produce row-level DELETE events over `pgoutput`. A maintained view may therefore still contain the historical rows or aggregates from that partition. This is a consequence of retaining local materialization, **not** a source-retention or rebuild guarantee. A fresh initial snapshot/backfill sees only the rows still present in PostgreSQL and **cannot** reconstruct omitted historical aggregates. This includes rebuilding a view, discarding a checkpoint, and recovery after replication-slot loss. A normal process restart that restores an intact RockStream checkpoint is different from rebuilding from the upstream snapshot.
+
+`TRUNCATE` is different from row-by-row DELETE: `pgoutput` carries a TRUNCATE message without old row images. The legacy row-only decoder fails closed with `RS-4015` before acknowledging its LSN; the relation-aware gateway expands it atomically into row retractions and blocks with `RS-4014` if the local preimages cannot be reconstructed within bounds. PostgreSQL **does not publish** direct child-partition TRUNCATE when `publish_via_partition_root = true`, so even this guard cannot detect those operations. Do not perform direct partition TRUNCATE against a source whose view must stay exact.
+
+**Operational contract until historical resnapshot retention is implemented:** Do not treat source-side partition pruning as safe, reconstructable materialized-view retention. Keep a complete replayable source/archive and validated checkpoints, or accept that rebuilding pruned historical groups is impossible. After slot loss, preserve the current RockStream checkpoint and investigate upstream history availability; never replace it with a newly truncated snapshot and describe the result as complete. A finalized TUMBLE window surviving a checkpoint restart is **not** evidence that it can be re-derived after the input partitions have been dropped.
+
+See [PostgreSQL's publication settings](https://www.postgresql.org/docs/current/sql-createpublication.html) for partition identity, DDL, and TRUNCATE limitations.
 
 ## Kafka source
 
@@ -259,7 +292,7 @@ sink cells below exercise legacy marker transport and recovery only.
 | Cell | Test |
 | --- | --- |
 | Snapshot → stream handoff over the v0.52.1 fence | `postgres_cdc_snapshot_stream_fence_has_exact_transcript` |
-| INSERT, UPDATE including key change, DELETE | `postgres_cdc_insert_update_delete_have_exact_transcript` |
+| INSERT, UPDATE including key change, and DELETE | `postgres_cdc_insert_update_delete_have_exact_transcript` |
 | TRUNCATE (nonempty tables, multi-relation, same-transaction row changes, dependent views, gateway restart) | `pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart` (gateway TestContainers) |
 | Restart at every commit boundary | `postgres_cdc_each_commit_boundary_recovers_exactly_once` |
 | WAL lag | `postgres_cdc_wal_lag_pauses_at_bound_and_recovers_within_slo` |
