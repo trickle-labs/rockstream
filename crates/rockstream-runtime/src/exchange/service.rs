@@ -1317,7 +1317,7 @@ mod tests {
             target_shard: 2,
             epoch: 1,
             seq: 1,
-            payload: Vec::new().into(),
+            payload: Vec::new(),
             row_count: 1,
         };
         let request = Request::new(futures::stream::iter(vec![frame]));

@@ -36,7 +36,7 @@ async fn test_exchange_service_reports_listener_bind_failure() {
     let addr = listener.local_addr().unwrap();
     let service = ExchangeService::new(ExchangeRegistry::new()).with_insecure_internal_dev();
 
-    let error = service.start(addr).await.err().expect("bind must fail");
+    let error = service.start(addr).await.expect_err("bind must fail");
     assert!(error.starts_with(&format!(
         "RS-0001: failed to bind worker shuffle listener {addr}:"
     )));

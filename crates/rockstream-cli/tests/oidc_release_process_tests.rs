@@ -2949,8 +2949,10 @@ async fn worker_peer_certificate_rejections_are_audited_by_release_process() {
         pki.expired_worker_tls_config(),
         pki.untrusted_worker_tls_config(),
     ] {
-        let mut config = rockstream_types::config::ExchangeConfig::default();
-        config.max_retries = 1;
+        let config = rockstream_types::config::ExchangeConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
         let pool = ShuffleClientPool::new(peers.clone())
             .with_config(config)
             .with_internal_tls(tls);
@@ -3374,7 +3376,7 @@ async fn in_flight_internal_mtls_rotation_preserves_release_worker_stream() {
             target_shard: u32::MAX,
             epoch: 1,
             seq: 1,
-            payload: Vec::new().into(),
+            payload: Vec::new(),
             row_count: 0,
         })
         .await

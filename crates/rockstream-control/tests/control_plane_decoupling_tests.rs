@@ -27,6 +27,15 @@ async fn read_control_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Contro
     serde_json::from_str(&line).unwrap()
 }
 
+async fn read_worker_command<R: AsyncBufRead + Unpin>(reader: &mut R) -> ControlMessage {
+    loop {
+        let message = read_control_message(reader).await;
+        if !matches!(&message, ControlMessage::TopologyChanged { .. }) {
+            return message;
+        }
+    }
+}
+
 async fn write_worker_message<W: AsyncWrite + Unpin>(writer: &mut W, message: &WorkerMessage) {
     let mut line = serde_json::to_string(message).unwrap();
     line.push('\n');
@@ -111,13 +120,11 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
 
     // Worker receives ShardAssigned then Deploy
     line.clear();
-    worker_reader.read_line(&mut line).await.unwrap();
-    let shard_resp: ControlMessage = serde_json::from_str(&line).unwrap();
+    let shard_resp = read_worker_command(&mut worker_reader).await;
     assert!(matches!(shard_resp, ControlMessage::ShardAssigned { .. }));
 
     line.clear();
-    worker_reader.read_line(&mut line).await.unwrap();
-    let deploy_msg: ControlMessage = serde_json::from_str(&line).unwrap();
+    let deploy_msg = read_worker_command(&mut worker_reader).await;
     let descriptor = match deploy_msg {
         ControlMessage::Deploy { descriptor } => descriptor,
         other => panic!("Expected Deploy, got {other:?}"),
@@ -357,7 +364,7 @@ async fn operator_stats_round_trip_is_scoped_to_workload_and_operator_ids() {
             }
         });
         let descriptor = loop {
-            match read_control_message(&mut worker_reader).await {
+            match read_worker_command(&mut worker_reader).await {
                 ControlMessage::Deploy { descriptor } => break descriptor,
                 ControlMessage::ShardAssigned { .. } => {}
                 other => panic!("unexpected worker command during deployment: {other:?}"),
@@ -402,7 +409,7 @@ async fn operator_stats_round_trip_is_scoped_to_workload_and_operator_ids() {
                     .await
             }
         });
-        let (request_id, requested) = match read_control_message(&mut worker_reader).await {
+        let (request_id, requested) = match read_worker_command(&mut worker_reader).await {
             ControlMessage::ReadOperatorStats {
                 request_id,
                 workload_id: actual_workload_id,
