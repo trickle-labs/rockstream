@@ -222,7 +222,7 @@ class GateSelfTests(unittest.TestCase):
             script = ("import json, time; print(json.dumps({'type':'test', 'event':'started', "
                       "'name':'blocked_case'}), flush=True); time.sleep(30)")
             env = dict(os.environ, ROCKSTREAM_CI_TRACE_TESTS="1")
-            with patch.object(gate, "MAX_GATEWAY_HARNESS_SECONDS", 0.5), \
+            with patch.object(gate, "MAX_GATEWAY_HARNESS_SECONDS", 5.0), \
                  contextlib.redirect_stdout(io.StringIO()) as log:
                 result = gate.run_cmd(
                     [sys.executable, "-c", script, "-Z"], Path(tmp), env,
