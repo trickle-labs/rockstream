@@ -243,9 +243,85 @@ def libtest_flags(key: str, spec: dict) -> list[str]:
 # cancellation limit. A timeout is a failed gate, never a passing/ignored case.
 # Keep this per-harness rather than per-test so no case silently goes unrun.
 MAX_GATEWAY_HARNESS_SECONDS = 25 * 60
+# The gateway-components shard previously spent six hours inside Cargo's
+# --no-run compile, before the first libtest harness could start. Preserve
+# machine-readable Cargo JSON and fail closed on a bounded compiler stall.
+MAX_GATEWAY_BUILD_SECONDS = 90 * 60
+
+
+def run_cargo_build_traced(argv: list[str], cwd: Path, env: dict) -> subprocess.CompletedProcess:
+    # Temp files prevent a stalled child from blocking on a full stdout pipe.
+    # Cargo's stdout is JSON evidence for build_artifacts; only its human
+    # diagnostics on stderr are echoed live to the Actions log.
+    with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
+        process = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdout=stdout_file, stderr=stderr_file,
+            start_new_session=True,
+        )
+        started_at = time.monotonic()
+        last_heartbeat = started_at
+        stderr_offset = 0
+        pending = b""
+        timed_out = False
+
+        while True:
+            elapsed = time.monotonic() - started_at
+            try:
+                process.wait(timeout=min(10, max(0.1, MAX_GATEWAY_BUILD_SECONDS - elapsed)))
+            except subprocess.TimeoutExpired:
+                pass
+
+            while True:
+                chunk = os.pread(stderr_file.fileno(), 64 * 1024, stderr_offset)
+                if not chunk:
+                    break
+                stderr_offset += len(chunk)
+                pending += chunk
+                lines = pending.split(b"\n")
+                pending = lines.pop()
+                for line in lines:
+                    if line:
+                        print(f"CI cargo: {line.decode('utf-8', errors='replace')}", flush=True)
+
+            if process.poll() is not None:
+                break
+
+            elapsed = time.monotonic() - started_at
+            if elapsed >= MAX_GATEWAY_BUILD_SECONDS:
+                timed_out = True
+                print(f"CI cargo build timeout after {MAX_GATEWAY_BUILD_SECONDS}s", flush=True)
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                break
+            if elapsed - (last_heartbeat - started_at) >= 60:
+                last_heartbeat = time.monotonic()
+                print(f"CI cargo compile still running after {int(elapsed)}s", flush=True)
+
+        stdout_file.seek(0)
+        stdout = stdout_file.read().decode("utf-8", errors="replace")
+        stderr_file.seek(0)
+        stderr = stderr_file.read().decode("utf-8", errors="replace")
+        if timed_out:
+            stderr += f"\nCI cargo build exceeded {MAX_GATEWAY_BUILD_SECONDS}s\n"
+        return subprocess.CompletedProcess(
+            argv, 124 if timed_out else process.returncode, stdout, stderr,
+        )
 
 
 def run_cmd(argv: list[str], cwd: Path, env: dict) -> subprocess.CompletedProcess:
+    if (env.get("ROCKSTREAM_CI_TRACE_TESTS") == "1"
+            and Path(argv[0]).name == "cargo" and "--no-run" in argv):
+        return run_cargo_build_traced(argv, cwd, env)
     if env.get("ROCKSTREAM_CI_TRACE_TESTS") != "1" or "-Z" not in argv:
         return subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, errors="replace")
 
@@ -409,6 +485,8 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
         env["ROCKSTREAM_REQUIRE_DOCKER"] = "1"
     if job == "pr-gateway-components":
         env["ROCKSTREAM_CI_TRACE_TESTS"] = "1"
+        # Prevent simultaneous linking of the gateway lib and many large test bins.
+        env["CARGO_BUILD_JOBS"] = "2"
     result["features_and_services"] = {
         "services": spec.get("services", []),
         "package_features": spec.get("package_features", {}),

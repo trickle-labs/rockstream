@@ -237,6 +237,42 @@ class GateSelfTests(unittest.TestCase):
             self.assertTrue(any("missing terminal execution event" in error for error in errors))
             self.assertEqual(results[0]["outcome"], "not_run")
 
+    def test_traced_gateway_cargo_build_keeps_cargo_json_and_reports_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_cargo = Path(tmp) / "cargo"
+            fake_cargo.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "print(json.dumps({'reason':'compiler-artifact', 'executable':'test-binary'}), flush=True)\n"
+                "print('Compiling gateway test bins', file=sys.stderr, flush=True)\n"
+            )
+            fake_cargo.chmod(0o755)
+            env = dict(os.environ, ROCKSTREAM_CI_TRACE_TESTS="1")
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                result = gate.run_cmd([str(fake_cargo), "test", "--no-run"], Path(tmp), env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["reason"], "compiler-artifact")
+            self.assertIn("Compiling gateway test bins", log.getvalue())
+
+    def test_traced_gateway_cargo_build_timeout_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_cargo = Path(tmp) / "cargo"
+            fake_cargo.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "print('Compiling stuck gateway test', file=sys.stderr, flush=True)\n"
+                "time.sleep(60)\n"
+            )
+            fake_cargo.chmod(0o755)
+            env = dict(os.environ, ROCKSTREAM_CI_TRACE_TESTS="1")
+            with patch.object(gate, "MAX_GATEWAY_BUILD_SECONDS", 5.0), \
+                 contextlib.redirect_stdout(io.StringIO()) as log:
+                result = gate.run_cmd([str(fake_cargo), "test", "--no-run"], Path(tmp), env)
+            self.assertEqual(result.returncode, 124)
+            self.assertIn("CI cargo build exceeded", result.stderr)
+            self.assertIn("Compiling stuck gateway test", log.getvalue())
+            self.assertIn("CI cargo build timeout", log.getvalue())
+
     def test_results_parser(self):
         raw = '{"type":"test","event":"ok","name":"a"}\nnot json\n{"type":"suite","event":"ok"}\n'
         self.assertEqual(len(gate.parse_events(raw)), 2)
