@@ -575,7 +575,6 @@ impl SourceRuntimeCoordinator<KafkaSource> {
         self.require_active_lease(lease)?;
         self.source
             .rotate_sasl_plain_credentials(secret_name, version, username, password)
-            .map_err(SourceError::Io)
     }
 }
 

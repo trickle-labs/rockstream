@@ -1052,6 +1052,7 @@ impl ManagementService {
         };
         let Some(request) = current.request() else {
             tracing::error!(
+                code = %rockstream_types::error_code::RS_0001,
                 operation_id = current.operation_id(),
                 "support artifact recovery request is missing"
             );
@@ -1063,6 +1064,7 @@ impl ManagementService {
             .map(PrincipalId)
         else {
             tracing::error!(
+                code = %rockstream_types::error_code::RS_0001,
                 operation_id = current.operation_id(),
                 "support artifact recovery actor is missing"
             );
@@ -1076,6 +1078,7 @@ impl ManagementService {
         };
         let Some(catalog) = self.security_catalog.as_ref() else {
             tracing::error!(
+                code = %rockstream_types::error_code::RS_0003,
                 operation_id = current.operation_id(),
                 "support artifact recovery audit catalog is unavailable"
             );
@@ -3036,7 +3039,12 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .await
         {
             if let Err(error) = self.support_artifacts.remove(&key, principal_id).await {
-                tracing::error!(?error, artifact_id = %key, "failed to remove unaudited support artifact");
+                tracing::error!(
+                    code = %rockstream_types::error_code::RS_0003,
+                    ?error,
+                    artifact_id = %key,
+                    "failed to remove unaudited support artifact"
+                );
                 return Err(Status::unavailable(
                     "support artifact cleanup is unavailable",
                 ));

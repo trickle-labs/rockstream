@@ -493,23 +493,31 @@ impl KafkaSource {
         version: u64,
         username: &str,
         password: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, SourceError> {
         if self.secret_name.as_deref() != Some(secret_name) {
-            return Err("rotated secret does not match the Kafka source binding".to_string());
+            return Err(SourceError::Io(
+                "rotated secret does not match the Kafka source binding".to_string(),
+            ));
         }
         if version < self.secret_version {
-            return Err("Kafka source secret version moved backwards".to_string());
+            return Err(SourceError::Io(
+                "Kafka source secret version moved backwards".to_string(),
+            ));
         }
         if version == self.secret_version {
             return Ok(false);
         }
         if username.is_empty() || password.is_empty() {
-            return Err("Kafka SASL secret requires a username and password".to_string());
+            return Err(SourceError::Io(
+                "Kafka SASL secret requires a username and password".to_string(),
+            ));
         }
-        CString::new(username)
-            .map_err(|_| "Kafka SASL username contains an invalid NUL byte".to_string())?;
-        CString::new(password)
-            .map_err(|_| "Kafka SASL password contains an invalid NUL byte".to_string())?;
+        CString::new(username).map_err(|_| {
+            SourceError::Io("Kafka SASL username contains an invalid NUL byte".to_string())
+        })?;
+        CString::new(password).map_err(|_| {
+            SourceError::Io("Kafka SASL password contains an invalid NUL byte".to_string())
+        })?;
         let mut consumer_config = self.consumer_config.clone();
         consumer_config
             .set("sasl.username", username)
@@ -520,14 +528,14 @@ impl KafkaSource {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
-                .map_err(|_| "Kafka runtime creation failed".to_string())?;
+                .map_err(|_| SourceError::Io("Kafka runtime creation failed".to_string()))?;
             let _guard = runtime.enter();
             consumer_config.create::<StreamConsumer>()
         }
-        .map_err(|_| "Kafka SASL consumer recreation failed".to_string())?;
+        .map_err(|_| SourceError::Io("Kafka SASL consumer recreation failed".to_string()))?;
         replacement
             .subscribe(&[&self.topic])
-            .map_err(|_| "Kafka SASL consumer subscription failed".to_string())?;
+            .map_err(|_| SourceError::Io("Kafka SASL consumer subscription failed".to_string()))?;
         drop(std::mem::replace(&mut self.consumer, replacement));
         self.consumer_config = consumer_config;
         self.assigned_partitions.clear();
