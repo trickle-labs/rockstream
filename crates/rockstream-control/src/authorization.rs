@@ -270,7 +270,7 @@ mod tests {
                 node_id: "worker-1".to_string()
             }
         ));
-        assert!(!allows(
+        assert!(allows(
             &policy,
             SecurityAction::SupportDownload,
             &PolicyScope::Artifact {

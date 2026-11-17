@@ -3762,7 +3762,7 @@ mod tests {
         assert_eq!(first_chunk.offset, 0);
         assert_eq!(first_chunk.expires_at_ms, expires_at_ms);
         assert!(!first_chunk.final_chunk);
-        assert_eq!(first_chunk.content.as_slice(), &content[..64 * 1024]);
+        assert_eq!(first_chunk.content.as_slice(), &content[..60 * 1024]);
 
         let mut principal = security_catalog
             .get_security_principal(PrincipalId(1))

@@ -1,7 +1,7 @@
 use rockstream_management_proto::{ensure_protocol_version, v1, PROTOCOL_VERSION};
 
 #[test]
-fn management_v1_contract_has_all_sixteen_methods() {
+fn management_v1_contract_has_all_eighteen_methods() {
     let proto = include_str!("../proto/management/v1/management.proto");
     let service = proto
         .split("service ManagementService {")
@@ -35,6 +35,8 @@ fn management_v1_contract_has_all_sixteen_methods() {
             "rpc MigrateShard(MigrateShardRequest) returns (MigrateShardResponse);",
             "rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse);",
             "rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);",
+            "rpc GenerateSupportArtifact(GenerateSupportArtifactRequest) returns (GenerateSupportArtifactResponse);",
+            "rpc DownloadSupportArtifact(DownloadSupportArtifactRequest) returns (stream DownloadSupportArtifactChunk);",
         ]
     );
 
@@ -118,6 +120,10 @@ struct TestService;
 
 #[tonic::async_trait]
 impl v1::management_service_server::ManagementService for TestService {
+    type DownloadSupportArtifactStream = tonic::codegen::tokio_stream::wrappers::ReceiverStream<
+        Result<v1::DownloadSupportArtifactChunk, tonic::Status>,
+    >;
+
     async fn get_cluster_status(
         &self,
         _: tonic::Request<v1::GetClusterStatusRequest>,
@@ -212,6 +218,18 @@ impl v1::management_service_server::ManagementService for TestService {
         &self,
         _: tonic::Request<v1::CancelOperationRequest>,
     ) -> Result<tonic::Response<v1::CancelOperationResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn generate_support_artifact(
+        &self,
+        _: tonic::Request<v1::GenerateSupportArtifactRequest>,
+    ) -> Result<tonic::Response<v1::GenerateSupportArtifactResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn download_support_artifact(
+        &self,
+        _: tonic::Request<v1::DownloadSupportArtifactRequest>,
+    ) -> Result<tonic::Response<Self::DownloadSupportArtifactStream>, tonic::Status> {
         Err(rockstream_management_proto::unavailable_status())
     }
 }

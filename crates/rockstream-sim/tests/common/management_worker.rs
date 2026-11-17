@@ -4,9 +4,7 @@ use std::time::Duration;
 use rockstream_cli::transport::ManagementCliClient;
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::authorization::{
-    AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
-    ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
-    SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
+    LoginMethod, PermissionPreset, SecurityAuditClass, SecurityAuditOutcome,
 };
 use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::{ShardId, WorkerId};
@@ -17,6 +15,10 @@ use rockstream_types::topology::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+#[path = "management_security.rs"]
+mod management_security;
+pub use management_security::preprovision_management_catalog;
 
 pub fn run_drain_cli(
     management_addr: SocketAddr,
@@ -82,84 +84,6 @@ pub async fn wait_for_operation_state(
     })
     .await
     .unwrap_or_else(|_| panic!("operation {operation_id} did not reach {expected_state}"))
-}
-
-pub async fn preprovision_management_catalog(storage_dir: &std::path::Path, pki: &TestPki) {
-    use rockstream_storage::catalog::{
-        CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
-    };
-    use rockstream_types::ids::PrincipalId;
-    use sha2::{Digest, Sha256};
-    use std::io::BufReader;
-
-    let catalog_dir = storage_dir.join("gateway-shard");
-    std::fs::create_dir_all(&catalog_dir).unwrap();
-    let store = std::sync::Arc::new(
-        object_store::local::LocalFileSystem::new_with_prefix(catalog_dir).unwrap(),
-    );
-    let catalog = DurableCatalogStore::recover(store, "gateway")
-        .await
-        .unwrap();
-    let certs = rustls_pemfile::certs(&mut BufReader::new(
-        std::fs::File::open(&pki.cli_cert_path).unwrap(),
-    ))
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap();
-    let certificate_sha256 = Sha256::digest(certs[0].as_ref()).into();
-    let principal = SecurityPrincipal {
-        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
-        id: PrincipalId(1),
-        display_name: "management test administrator".to_owned(),
-        enabled: true,
-        revision: 1,
-        login_methods: vec![LoginMethod::Mtls { certificate_sha256 }],
-        preset_grants: [PermissionPreset::Administrator, PermissionPreset::Operator]
-            .into_iter()
-            .map(|preset| ScopedPresetGrant {
-                preset,
-                scope: PolicyScope::Cluster,
-            })
-            .collect(),
-        scoped_grants: Vec::new(),
-    };
-    let audit = SecurityAuditRecord {
-        format_version: SECURITY_AUDIT_FORMAT_VERSION,
-        event_id: "management-test-bootstrap".to_owned(),
-        timestamp_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
-        actor: AuditIdentity::Unknown,
-        target: AuditField::Known("principal:1".to_owned()),
-        scope: AuditField::Known("cluster".to_owned()),
-        action: SecurityAuditClass::GrantChange,
-        outcome: SecurityAuditOutcome::Success,
-        correlation: AuditCorrelation::NotApplicable,
-        operation_id: AuditField::Known("1".to_owned()),
-        policy_revision: AuditField::Known(1),
-        before_state: AuditField::NotApplicable,
-        after_state: AuditField::Known(format!(
-            "revision=1;policy={}",
-            serde_json::to_string(&(true, &principal.preset_grants, &principal.scoped_grants))
-                .unwrap()
-        )),
-    };
-    catalog
-        .commit_txn(
-            CatalogTxn::new(
-                1,
-                1,
-                vec![CatalogMutation::PutSecurityPrincipal {
-                    principal,
-                    expected_revision: None,
-                    grantor_revision: None,
-                    audit,
-                }],
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
