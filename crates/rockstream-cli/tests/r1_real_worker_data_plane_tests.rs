@@ -17,7 +17,7 @@ use rockstream_storage::ShardDb;
 use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS, MINIO_USER};
 use rockstream_types::data_plane::WorkerExecutionStatus;
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_postgres::{Client, NoTls};
 
 static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -651,6 +651,100 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
             join_rows(&values)
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
+    use rockstream_types::topology::{ControlMessage, WorkerMessage};
+
+    let _test_guard = PROCESS_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = listener.local_addr().unwrap().to_string();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let control = tokio::spawn(async move {
+        let mut request_tx = Some(request_tx);
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            match serde_json::from_str::<WorkerMessage>(&line).unwrap() {
+                WorkerMessage::DeployWorkload(request) => {
+                    let response = ControlMessage::DeploymentReady {
+                        workload_id: request.workload_id,
+                        workers: Vec::new(),
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
+                WorkerMessage::SubmitSourceDelta(request) => {
+                    request_tx.take().unwrap().send(request).unwrap();
+                    std::future::pending::<()>().await;
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+    });
+    let gateway_addr = free_addr();
+    let gateway_storage = root.path().join("gateway");
+    let start_gateway = || {
+        TestChild(spawn(&[
+            "start",
+            "--storage",
+            gateway_storage.to_str().unwrap(),
+            "--role",
+            "gateway",
+            "--control",
+            &control_addr,
+            "--listen",
+            &gateway_addr,
+        ]))
+    };
+    let mut gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    execute(
+        &client,
+        "CREATE TABLE pending_items (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)",
+    )
+    .await;
+    execute(&client, "CREATE MATERIALIZED VIEW pending_view AS SELECT id, SUM(value) AS total FROM pending_items GROUP BY id").await;
+    let insert = tokio::spawn(async move {
+        client
+            .simple_query("INSERT INTO pending_items VALUES (1, 10), (2, 20)")
+            .await
+    });
+    let request = tokio::time::timeout(Duration::from_secs(10), request_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.source, "pending_items");
+    assert_eq!(
+        request.rows,
+        vec![
+            rockstream_types::data_plane::RuntimeRow {
+                values_tsv: "1\t10".to_string(),
+                weight: 1
+            },
+            rockstream_types::data_plane::RuntimeRow {
+                values_tsv: "2\t20".to_string(),
+                weight: 1
+            },
+        ]
+    );
+    gateway.0.kill().unwrap();
+    gateway.0.wait().unwrap();
+    assert!(insert.await.unwrap().is_err());
+    let _gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    let error = client
+        .simple_query("SELECT * FROM pending_view")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    control.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

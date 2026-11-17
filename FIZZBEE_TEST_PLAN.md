@@ -729,6 +729,8 @@ gateway restarts with that record. Distributed reads also fail when snapshots
 do not contain worker output, rather than report an empty result. The owned
 shuffle path records a source epoch on its anchor before dispatch and
 clears that record only after all target shards report committed execution.
+The process regression stops the gateway with a source request outstanding and
+checks the exact input and post-restart failure.
 Worker execution records distinguish matching committed replays from conflicting
 input. Distributed view reads fail while execution is incomplete or requires
 recovery. The coordinator, gateway, and runtime tests cover ordering, failure,
