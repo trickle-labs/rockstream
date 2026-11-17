@@ -4757,16 +4757,33 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             .unwrap(),
     )
     .unwrap();
-    management_store
-        .put(&expired_blob_path, expired_content.to_vec().into())
-        .await
-        .unwrap();
-    ledger["artifacts"][&expired_id] = serde_json::json!({
-        "owner": PrincipalId(1),
-        "scope": PolicyScope::Cluster,
-        "size": expired_content.len(),
-        "expires_at_ms": expired_at_ms,
-    });
+    let retained_before_cleanup = ledger["artifacts"].as_object().unwrap().len();
+    assert_eq!(retained_before_cleanup, 2);
+    let expired_ids = std::iter::once(expired_id.clone())
+        .chain((0..(2_048 - retained_before_cleanup - 1)).map(|_| uuid::Uuid::new_v4().to_string()))
+        .collect::<Vec<_>>();
+    for id in &expired_ids {
+        ledger["artifacts"][id] = serde_json::json!({
+            "owner": PrincipalId(1),
+            "scope": PolicyScope::Cluster,
+            "size": expired_content.len(),
+            "expires_at_ms": expired_at_ms,
+        });
+    }
+    assert_eq!(ledger["artifacts"].as_object().unwrap().len(), 2_048);
+    let mut uploads = tokio::task::JoinSet::new();
+    for id in &expired_ids {
+        let store = management_store.clone();
+        let path = support_artifact_object_path(id);
+        let content = expired_content.to_vec();
+        uploads.spawn(async move { store.put(&path, content.into()).await });
+        if uploads.len() == 64 {
+            uploads.join_next().await.unwrap().unwrap().unwrap();
+        }
+    }
+    while let Some(result) = uploads.join_next().await {
+        result.unwrap().unwrap();
+    }
     management_store
         .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
         .await
@@ -4782,6 +4799,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             .as_ref(),
         expired_content
     );
+    let cleanup_started = Instant::now();
     let mut restarted = start_control_process(
         temp.path(),
         &storage,
@@ -4792,8 +4810,15 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         true,
     )
     .await;
-    wait_for_gateway(&mut restarted.0, control_address).await;
-    let mut client = wait_for_management_client(management_address, &pki).await;
+    let mut client = tokio::time::timeout(Duration::from_secs(60), async {
+        wait_for_gateway(&mut restarted.0, control_address).await;
+        wait_for_management_client(management_address, &pki).await
+    })
+    .await
+    .expect(
+        "startup cleanup of 2,048 retained artifacts must finish before management accepts clients",
+    );
+    assert!(cleanup_started.elapsed() < Duration::from_secs(60));
     let retry = client
         .generate_support_artifact(GenerateSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -4818,16 +4843,32 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         .bytes()
         .await
         .unwrap();
-    let recovered_ids = serde_json::from_slice::<serde_json::Value>(&recovered_ledger).unwrap()
-        ["artifacts"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut expected_recovered_ids = vec![idempotency_key.clone(), foreign_id.clone()];
-    expected_recovered_ids.sort();
-    assert_eq!(recovered_ids, expected_recovered_ids);
+    let mut expected_artifacts = serde_json::Map::new();
+    expected_artifacts.insert(
+        idempotency_key.clone(),
+        serde_json::json!({
+            "owner": PrincipalId(1),
+            "scope": PolicyScope::Cluster,
+            "size": expected_content.len(),
+            "expires_at_ms": first.expires_at_ms,
+        }),
+    );
+    expected_artifacts.insert(
+        foreign_id.clone(),
+        serde_json::json!({
+            "owner": PrincipalId(2),
+            "scope": PolicyScope::Cluster,
+            "size": foreign_content.len(),
+            "expires_at_ms": first.expires_at_ms,
+        }),
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&recovered_ledger).unwrap(),
+        serde_json::json!({
+            "format_version": 1,
+            "artifacts": expected_artifacts,
+        })
+    );
     assert_eq!(
         management_store
             .get(&foreign_blob_path)
@@ -4839,10 +4880,15 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             .as_ref(),
         foreign_content
     );
-    match management_store.get(&expired_blob_path).await {
-        Err(object_store::Error::NotFound { .. }) => {}
-        Err(error) => panic!("expired artifact lookup failed unexpectedly: {error:?}"),
-        Ok(_) => panic!("expired artifact bytes remained after startup cleanup"),
+    for id in &expired_ids {
+        match management_store
+            .get(&support_artifact_object_path(id))
+            .await
+        {
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => panic!("expired artifact {id} lookup failed: {error:?}"),
+            Ok(_) => panic!("expired artifact {id} remained after startup cleanup"),
+        }
     }
     assert_eq!(
         client
