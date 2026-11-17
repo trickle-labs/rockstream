@@ -878,6 +878,21 @@ pub async fn setup_test_deployment(
 
 #[cfg(test)]
 mod data_plane_tests {
+    #[test]
+    fn local_mode_checks_control_peer() {
+        let local = std::net::IpAddr::from([127, 0, 0, 1]);
+        let remote = std::net::IpAddr::from([192, 0, 2, 1]);
+        let error = super::validate_local_control_peer(true, false, remote).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "explicit local mode requires a loopback control address"
+        );
+        assert!(super::validate_local_control_peer(true, false, local).is_ok());
+        assert!(super::validate_local_control_peer(true, true, remote).is_ok());
+        assert!(super::validate_local_control_peer(false, false, remote).is_ok());
+    }
+
     use super::*;
     use rockstream_types::ids::OperatorId;
 
@@ -2035,6 +2050,20 @@ impl WorkerClientHandle {
     }
 }
 
+fn validate_local_control_peer(
+    local_mode: bool,
+    protected: bool,
+    peer: std::net::IpAddr,
+) -> io::Result<()> {
+    if local_mode && !protected && !peer.is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "explicit local mode requires a loopback control address",
+        ));
+    }
+    Ok(())
+}
+
 /// Connect to the control plane and start the worker client daemon loop.
 pub async fn start_worker_client(
     proposed_worker_id: u64,
@@ -2191,6 +2220,11 @@ async fn start_worker_client_with_transport_options(
         .trim_start_matches("https://")
         .trim_start_matches("http://");
     let stream = TcpStream::connect(clean_url).await?;
+    validate_local_control_peer(
+        allow_insecure_internal_dev,
+        tls_config.is_enabled(),
+        stream.peer_addr()?.ip(),
+    )?;
     let local_ip = stream.local_addr()?.ip();
     let exchange_ip = if !tls_config.is_enabled() && !local_ip.is_loopback() {
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
