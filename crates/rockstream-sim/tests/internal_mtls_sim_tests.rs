@@ -11,8 +11,16 @@ use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
 use rockstream_runtime::client::start_worker_client_with_tls;
 use rockstream_sim::buggify;
 use rockstream_sim::buggify::buggify_init;
+use rockstream_storage::catalog::DurableCatalogStore;
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::ids::ShardId;
+
+fn security_audit_catalog() -> Arc<DurableCatalogStore> {
+    Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "mtls-sim-test",
+    ))
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_mtls_rotation_simruntime_faults() {
@@ -27,6 +35,7 @@ async fn test_mtls_rotation_simruntime_faults() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -100,6 +109,7 @@ async fn test_mtls_concurrent_worker_joins_under_rotation() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();

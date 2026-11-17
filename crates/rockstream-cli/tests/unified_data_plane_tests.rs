@@ -5,18 +5,79 @@
 //! this test launches the CLI as a child and sends it a real SIGTERM once the
 //! shard layout has settled.
 
+use sha2::Digest;
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
 use std::time::Duration;
+use std::{
+    io::Read,
+    process::{Command, Stdio},
+};
 
 #[test]
 fn role_all_creates_exactly_one_shard_directory() {
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().to_path_buf();
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let mut config = rockstream_types::config::NodeConfig::default();
+    config.control.management_addr = Some("127.0.0.1:0".to_owned());
+    let internal_tls = pki.worker_tls_config(1);
+    let cert_path = internal_tls.cert_path.unwrap();
+    let key_path = internal_tls.key_path.unwrap();
+    let ca_cert_path = internal_tls.ca_cert_path.unwrap();
+    std::fs::write(
+        dir.path().join("rockstream.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+        std::fs::File::open(&pki.cli_cert_path).unwrap(),
+    ))
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    let administrator = rockstream_types::authorization::SecurityPrincipal {
+        format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: rockstream_types::ids::PrincipalId(1),
+        display_name: "role all test administrator".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![rockstream_types::authorization::LoginMethod::Mtls {
+            certificate_sha256: sha2::Sha256::digest(certs[0].as_ref()).into(),
+        }],
+        preset_grants: vec![rockstream_types::authorization::ScopedPresetGrant {
+            preset: rockstream_types::authorization::PermissionPreset::Administrator,
+            scope: rockstream_types::authorization::PolicyScope::Cluster,
+        }],
+        scoped_grants: Vec::new(),
+    };
+    let principal_file = dir.path().join("administrator.json");
+    std::fs::write(&principal_file, serde_json::to_vec(&administrator).unwrap()).unwrap();
+    let bootstrap = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .current_dir(dir.path())
+        .arg("--json")
+        .arg("security")
+        .arg("preprovision-admin")
+        .arg("--storage")
+        .arg(&storage)
+        .arg("--layout")
+        .arg("all")
+        .arg("--principal-file")
+        .arg(&principal_file)
+        .arg("--operation-id")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .unwrap();
+    assert!(
+        bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let listen_addr = listener.local_addr().unwrap();
     drop(listener);
     let mut child = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .current_dir(dir.path())
+        .env_remove("ROCKSTREAM_CONFIG")
         .args([
             "start",
             "--storage",
@@ -26,11 +87,17 @@ fn role_all_creates_exactly_one_shard_directory() {
             "--auth",
             "off",
             "--allow-insecure-internal-dev",
+            "--internal-tls-cert-path",
+            cert_path.to_str().unwrap(),
+            "--internal-tls-key-path",
+            key_path.to_str().unwrap(),
+            "--internal-tls-ca-cert-path",
+            ca_cert_path.to_str().unwrap(),
             "--listen",
             &listen_addr.to_string(),
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("failed to start rockstream child");
 
@@ -47,9 +114,17 @@ fn role_all_creates_exactly_one_shard_directory() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    let mut stderr = String::new();
+    if !audit.contains("\"action\":\"gateway.started\"") {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(mut output) = child.stderr.take() {
+            output.read_to_string(&mut stderr).unwrap();
+        }
+    }
     assert!(
         audit.contains("\"action\":\"gateway.started\""),
-        "expected gateway.started in {}, found {audit:?}",
+        "expected gateway.started in {}, found {audit:?}; child stderr: {stderr}",
         audit_path.display()
     );
     assert!(

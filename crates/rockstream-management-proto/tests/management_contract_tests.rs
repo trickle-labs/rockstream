@@ -1,7 +1,7 @@
 use rockstream_management_proto::{ensure_protocol_version, v1, PROTOCOL_VERSION};
 
 #[test]
-fn management_v1_contract_has_all_fourteen_methods() {
+fn management_v1_contract_has_all_sixteen_methods() {
     let proto = include_str!("../proto/management/v1/management.proto");
     let service = proto
         .split("service ManagementService {")
@@ -25,6 +25,8 @@ fn management_v1_contract_has_all_fourteen_methods() {
             "rpc ListShards(ListShardsRequest) returns (ListShardsResponse);",
             "rpc GetShard(GetShardRequest) returns (GetShardResponse);",
             "rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);",
+            "rpc ListSecurityPrincipals(ListSecurityPrincipalsRequest) returns (ListSecurityPrincipalsResponse);",
+            "rpc SetSecurityPrincipalGrants(SetSecurityPrincipalGrantsRequest) returns (SetSecurityPrincipalGrantsResponse);",
             "rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);",
             "rpc GetConfigSummary(GetConfigSummaryRequest) returns (GetConfigSummaryResponse);",
             "rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);",
@@ -71,6 +73,10 @@ fn every_request_and_response_carries_protocol_version() {
         v1::GetShardResponse,
         v1::ListOperationsRequest,
         v1::ListOperationsResponse,
+        v1::ListSecurityPrincipalsRequest,
+        v1::ListSecurityPrincipalsResponse,
+        v1::SetSecurityPrincipalGrantsRequest,
+        v1::SetSecurityPrincipalGrantsResponse,
         v1::GetOperationRequest,
         v1::GetOperationResponse,
         v1::GetConfigSummaryRequest,
@@ -146,6 +152,18 @@ impl v1::management_service_server::ManagementService for TestService {
         &self,
         _: tonic::Request<v1::ListOperationsRequest>,
     ) -> Result<tonic::Response<v1::ListOperationsResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn list_security_principals(
+        &self,
+        _: tonic::Request<v1::ListSecurityPrincipalsRequest>,
+    ) -> Result<tonic::Response<v1::ListSecurityPrincipalsResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn set_security_principal_grants(
+        &self,
+        _: tonic::Request<v1::SetSecurityPrincipalGrantsRequest>,
+    ) -> Result<tonic::Response<v1::SetSecurityPrincipalGrantsResponse>, tonic::Status> {
         Err(rockstream_management_proto::unavailable_status())
     }
     async fn get_operation(

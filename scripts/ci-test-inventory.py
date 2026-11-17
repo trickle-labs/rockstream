@@ -10,8 +10,10 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -237,8 +239,95 @@ def libtest_flags(key: str, spec: dict) -> list[str]:
     return ["--include-ignored"] if key in spec.get("include_ignored_targets", []) else []
 
 
+# An executing libtest harness must finish well before GitHub's six-hour
+# cancellation limit. A timeout is a failed gate, never a passing/ignored case.
+# Keep this per-harness rather than per-test so no case silently goes unrun.
+MAX_GATEWAY_HARNESS_SECONDS = 25 * 60
+
+
 def run_cmd(argv: list[str], cwd: Path, env: dict) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, errors="replace")
+    if env.get("ROCKSTREAM_CI_TRACE_TESTS") != "1" or "-Z" not in argv:
+        return subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, errors="replace")
+
+    # libtest JSON is normally buffered until process exit; if one test hangs,
+    # the entire six-hour CI job otherwise reports no case name or artifact.
+    # Separate files avoid PIPE deadlock, and pread never changes the child's
+    # shared append offset while reading incremental test events.
+    with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
+        process = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdout=stdout_file, stderr=stderr_file,
+            start_new_session=True,
+        )
+        started_at = time.monotonic()
+        offset = 0
+        pending = b""
+        running = set()
+        timed_out = False
+
+        while True:
+            try:
+                process.wait(timeout=min(10, max(0.1, MAX_GATEWAY_HARNESS_SECONDS - (time.monotonic() - started_at))))
+            except subprocess.TimeoutExpired:
+                pass
+            while True:
+                chunk = os.pread(stdout_file.fileno(), 64 * 1024, offset)
+                if not chunk:
+                    break
+                offset += len(chunk)
+                pending += chunk
+                lines = pending.split(b"\n")
+                pending = lines.pop()
+                for raw in lines:
+                    try:
+                        event = json.loads(raw)
+                    except (ValueError, UnicodeError):
+                        continue
+                    if not isinstance(event, dict) or event.get("type") != "test":
+                        continue
+                    name = event.get("name")
+                    if not isinstance(name, str):
+                        continue
+                    if event.get("event") == "started":
+                        running.add(name)
+                        print(f"CI libtest started: {name}", flush=True)
+                    elif event.get("event") in ("ok", "failed", "ignored"):
+                        running.discard(name)
+                        if event["event"] == "failed":
+                            print(f"CI libtest failed: {name}", flush=True)
+
+            if process.poll() is not None:
+                break
+            if time.monotonic() - started_at >= MAX_GATEWAY_HARNESS_SECONDS:
+                timed_out = True
+                print(
+                    f"CI libtest timeout after {MAX_GATEWAY_HARNESS_SECONDS}s; "
+                    f"unfinished cases: {sorted(running)}",
+                    flush=True,
+                )
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                break
+
+        stdout_file.seek(0)
+        stdout = stdout_file.read().decode("utf-8", errors="replace")
+        stderr_file.seek(0)
+        stderr = stderr_file.read().decode("utf-8", errors="replace")
+        if timed_out:
+            stderr += (
+                f"\nCI libtest harness exceeded {MAX_GATEWAY_HARNESS_SECONDS}s; "
+                f"unfinished cases: {sorted(running)}\n"
+            )
+        return subprocess.CompletedProcess(argv, 124 if timed_out else process.returncode, stdout, stderr)
 
 
 def service_problems(spec: dict, env: dict) -> list[str]:
@@ -318,6 +407,8 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
     env["RUSTC_BOOTSTRAP"] = "1"  # matches existing PGWire libtest JSON CI invocation
     if "docker" in spec.get("services", []):
         env["ROCKSTREAM_REQUIRE_DOCKER"] = "1"
+    if job == "pr-gateway-components":
+        env["ROCKSTREAM_CI_TRACE_TESTS"] = "1"
     result["features_and_services"] = {
         "services": spec.get("services", []),
         "package_features": spec.get("package_features", {}),

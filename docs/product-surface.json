@@ -3283,6 +3283,105 @@
         ]
       },
       {
+        "name": "security",
+        "about": "Offline security administration against the durable catalog",
+        "subcommands": [
+          {
+            "name": "preprovision-admin",
+            "about": "Preprovision the first administrator before opening application listeners",
+            "options": [
+              {
+                "name": "layout",
+                "long": "layout",
+                "help": "Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`",
+                "required": true,
+                "value_name": "LAYOUT",
+                "possible_values": [
+                  "all",
+                  "gateway"
+                ]
+              },
+              {
+                "name": "operation_id",
+                "long": "operation-id",
+                "help": "Stable catalog operation ID to reuse if this command must be retried",
+                "required": true,
+                "value_name": "OPERATION_ID"
+              },
+              {
+                "name": "principal_file",
+                "long": "principal-file",
+                "help": "JSON-serialized SecurityPrincipal containing an enabled interactive cluster administrator",
+                "required": true,
+                "value_name": "PRINCIPAL_FILE"
+              },
+              {
+                "name": "storage",
+                "long": "storage",
+                "help": "Node storage directory used by `start --storage` for this deployment",
+                "required": true,
+                "value_name": "STORAGE"
+              },
+              {
+                "name": "yes",
+                "long": "yes",
+                "help": "Confirm the deployment is stopped and the selected durable store is correct",
+                "required": false,
+                "value_name": "YES",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0002",
+              "RS-0003",
+              "RS-0005"
+            ]
+          }
+        ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0002",
+          "RS-0003",
+          "RS-0005"
+        ]
+      },
+      {
         "name": "shard",
         "about": "Shard inspection commands",
         "subcommands": [
@@ -4779,6 +4878,24 @@
   "config_surface": {
     "options": [
       {
+        "key": "auth.actor_assertion_public_key_path",
+        "data_type": "Option<PathBuf>",
+        "default_value": "None",
+        "description": "Matching single-key RSA RS256 public JWK used by control to verify gateway actor assertions",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.actor_assertion_signing_key_path",
+        "data_type": "Option<PathBuf>",
+        "default_value": "None",
+        "description": "Dedicated RSA private key used by an authenticated gateway connected to control; use a distinct key pair from gateway and internal TLS",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
         "key": "auth.mode",
         "data_type": "String",
         "default_value": "off",
@@ -4894,6 +5011,15 @@
         "deprecated": false,
         "env_var": "ROCKSTREAM_AUTOTUNER_MIN_PARALLELISM",
         "source_origin": "rockstream-types::config::AutotunerConfig"
+      },
+      {
+        "key": "node.deployment_id",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Shared deployment identifier required by gateway actor assertions; configure the same value on gateway and control",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_NODE_DEPLOYMENT_ID",
+        "source_origin": "rockstream-types::config::NodeSection"
       },
       {
         "key": "scatter_pruning.shard_bloom_budget_bytes",

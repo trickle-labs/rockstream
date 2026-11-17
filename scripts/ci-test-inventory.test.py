@@ -5,8 +5,10 @@ import copy
 import contextlib
 import importlib.util
 import io
+import os
 import json
 import re
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -196,6 +198,44 @@ class GateSelfTests(unittest.TestCase):
             self.assertEqual(len(target_list), len(set(target_list)))
         self.assertIn("dst_fuzz_harness", POLICY["sim_groups"]["nightly-seeds"])
         self.assertIn("rolling_upgrade_tests", POLICY["sim_groups"]["release-docker"])
+
+    def test_traced_gateway_runner_preserves_terminal_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = ("import json; print(json.dumps({'type':'test', 'event':'started', "
+                      "'name':'complete_case'}), flush=True); "
+                      "print(json.dumps({'type':'test', 'event':'ok', "
+                      "'name':'complete_case'}), flush=True)")
+            env = dict(os.environ, ROCKSTREAM_CI_TRACE_TESTS="1")
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                result = gate.run_cmd(
+                    [sys.executable, "-c", script, "-Z"], Path(tmp), env,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                [e["event"] for e in gate.parse_events(result.stdout)],
+                ["started", "ok"],
+            )
+            self.assertIn("CI libtest started: complete_case", log.getvalue())
+
+    def test_traced_gateway_runner_timeout_fails_closed_and_names_stuck_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = ("import json, time; print(json.dumps({'type':'test', 'event':'started', "
+                      "'name':'blocked_case'}), flush=True); time.sleep(30)")
+            env = dict(os.environ, ROCKSTREAM_CI_TRACE_TESTS="1")
+            with patch.object(gate, "MAX_GATEWAY_HARNESS_SECONDS", 0.5), \
+                 contextlib.redirect_stdout(io.StringIO()) as log:
+                result = gate.run_cmd(
+                    [sys.executable, "-c", script, "-Z"], Path(tmp), env,
+                )
+            self.assertEqual(result.returncode, 124)
+            self.assertIn("blocked_case", result.stderr)
+            self.assertIn("CI libtest timeout", log.getvalue())
+            results, errors, passed = gate.observed_results(
+                self.target, ["blocked_case"], gate.parse_events(result.stdout), {},
+            )
+            self.assertEqual(passed, 0)
+            self.assertTrue(any("missing terminal execution event" in error for error in errors))
+            self.assertEqual(results[0]["outcome"], "not_run")
 
     def test_results_parser(self):
         raw = '{"type":"test","event":"ok","name":"a"}\nnot json\n{"type":"suite","event":"ok"}\n'

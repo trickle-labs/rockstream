@@ -31,7 +31,7 @@ pub use envelope::{CatalogEnvelope, CURRENT_CATALOG_FORMAT_VERSION};
 pub use identity::{stable_name_id, IdAllocator};
 pub use log::{CatalogLogManager, CatalogScanPage, MAX_REPLAY_BUFFER_BYTES, MAX_SCAN_PAGE_SIZE};
 pub use snapshot::CatalogSnapshot;
-pub use store::{CatalogStore, DurableCatalogStore};
+pub use store::{CatalogStore, DurableCatalogStore, SECURITY_AUDIT_APPEND_ATTEMPTS};
 pub use txn::{CatalogMutation, CatalogTxn, MAX_MUTATIONS_PER_TRANSACTION};
 
 /// Catalog errors with standard RS-XXXX error codes.
