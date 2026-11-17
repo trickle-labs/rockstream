@@ -19550,12 +19550,19 @@ mod pgoutput_truncate_unit_tests {
         .build()
         .await
         .unwrap();
-        db.put(
-            b"view_output/a/id=1",
-            &vec![b'9'; rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES + 1],
-        )
-        .await
-        .unwrap();
+        // Exceed the aggregate scan budget with bounded individual writes.
+        // A single oversized WAL entry can stall before the scan is exercised.
+        let row_image = vec![b'9'; 512 * 1024];
+        for id in 0..17 {
+            let key = format!("view_output/a/id={id}");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                db.put(key.as_bytes(), &row_image),
+            )
+            .await
+            .expect("bounded fixture write timed out")
+            .unwrap();
+        }
         let a = route(7, "a");
         let routes = HashMap::from([(7, &a)]);
         let changes = [EncodedChange::Truncate {
@@ -19563,12 +19570,16 @@ mod pgoutput_truncate_unit_tests {
             schema_version: 1,
             tag: PgOutputTruncateTag::Truncate,
         }];
-        let error = load_pgoutput_truncate_images(&db, &changes, &routes)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            load_pgoutput_truncate_images(&db, &changes, &routes),
+        )
+        .await
+        .expect("bounded preimage scan timed out")
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("RS-4014"), "{error}");
-        assert!(db.get(b"view_output/a/id=1").await.unwrap().is_some());
+        assert!(db.get(b"view_output/a/id=0").await.unwrap().is_some());
     }
 }
 
