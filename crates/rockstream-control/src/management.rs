@@ -3201,7 +3201,8 @@ impl v1::management_service_server::ManagementService for ManagementService {
                     if offset >= content.len() {
                         return None;
                     }
-                    let end = offset.saturating_add(64 * 1024).min(content.len());
+                    // Keep each gRPC message below HTTP/2's initial stream window.
+                    let end = offset.saturating_add(60 * 1024).min(content.len());
                     let chunk = v1::DownloadSupportArtifactChunk {
                         content: content[offset..end].to_vec(),
                         offset: offset as u64,

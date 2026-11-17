@@ -14,9 +14,9 @@ use rockstream_control::management_store::{
 };
 use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CancelOperationRequest,
-    CreateBackupRequest, DownloadSupportArtifactRequest, GenerateSupportArtifactRequest,
-    GenerateSupportArtifactResponse, GetClusterStatusRequest, GetOperationRequest,
-    ListOperationsRequest,
+    CreateBackupRequest, DownloadSupportArtifactChunk, DownloadSupportArtifactRequest,
+    GenerateSupportArtifactRequest, GenerateSupportArtifactResponse, GetClusterStatusRequest,
+    GetOperationRequest, ListOperationsRequest,
 };
 use rockstream_storage::catalog::{
     CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogSourceEntry, CatalogStore,
@@ -967,7 +967,7 @@ async fn download_support_artifact(
     client: &mut ManagementServiceClient<tonic::transport::Channel>,
     opaque_id: &str,
 ) -> (Vec<u8>, u64) {
-    let mut stream = client
+    let stream = client
         .download_support_artifact(DownloadSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             opaque_id: opaque_id.to_owned(),
@@ -975,9 +975,15 @@ async fn download_support_artifact(
         .await
         .unwrap()
         .into_inner();
-    let mut content = Vec::new();
+    read_support_artifact_stream(stream, Vec::new()).await
+}
+
+async fn read_support_artifact_stream(
+    mut stream: tonic::Streaming<DownloadSupportArtifactChunk>,
+    mut content: Vec<u8>,
+) -> (Vec<u8>, u64) {
     let mut expires_at_ms = None;
-    let mut expected_offset = 0;
+    let mut expected_offset = content.len() as u64;
     let mut final_chunk = false;
     while let Some(chunk) = stream.message().await.unwrap() {
         assert_eq!(chunk.offset, expected_offset);
@@ -5913,6 +5919,269 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected_audit);
     }
+}
+
+#[tokio::test]
+async fn support_artifact_download_limit_holds_under_release_process_pressure() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-support-download-pressure";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for support-artifact download pressure qualification");
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_control_process(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+    let mut client = wait_for_management_client(management_address, &pki).await;
+
+    let artifact_id = uuid::Uuid::new_v4().to_string();
+    let expires_at_ms = chrono::Utc::now().timestamp_millis().max(1) as u64 + 600_000;
+    let mut content = serde_json::to_vec(&serde_json::json!({
+        "format_version": 1,
+        "generated_at_ms": 1,
+        "scope": "cluster",
+        "source_version": "test",
+        "topology_revision": 1,
+        "active_operations": 0,
+        "retained_operations": 0,
+        "node": null,
+    }))
+    .unwrap();
+    content.resize(10 * 1024 * 1024, b' ');
+    let management_store = object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "management",
+    );
+    let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
+    let mut artifacts = serde_json::Map::new();
+    artifacts.insert(
+        artifact_id.clone(),
+        serde_json::json!({
+            "owner": PrincipalId(1),
+            "scope": PolicyScope::Cluster,
+            "size": content.len(),
+            "expires_at_ms": expires_at_ms,
+        }),
+    );
+    let ledger_bytes = serde_json::to_vec(&serde_json::json!({
+        "format_version": 1,
+        "artifacts": artifacts,
+    }))
+    .unwrap();
+    management_store
+        .put(
+            &support_artifact_object_path(&artifact_id),
+            content.clone().into(),
+        )
+        .await
+        .unwrap();
+    management_store
+        .put(&ledger_path, ledger_bytes.clone().into())
+        .await
+        .unwrap();
+
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "gateway-shard",
+    ));
+    let catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let audit_before = catalog.list_security_audit_records().await.unwrap();
+    let operations_before = client
+        .list_operations(ListOperationsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        operations_before.protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+    assert_eq!(
+        operations_before.source_version,
+        "management-operation-records:v1"
+    );
+    assert!(operations_before.operations.is_empty());
+    assert!(operations_before.next_page_token.is_empty());
+
+    let mut streams = Vec::new();
+    for _ in 0..8 {
+        let stream = client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: artifact_id.clone(),
+            })
+            .await
+            .expect("the first eight concurrent release downloads should be admitted")
+            .into_inner();
+        streams.push(stream);
+    }
+
+    let rejected = match client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: artifact_id.clone(),
+        })
+        .await
+    {
+        Ok(_) => panic!("the ninth concurrent release download was admitted"),
+        Err(error) => error,
+    };
+    assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        rejected.message(),
+        "support artifact download limit reached"
+    );
+
+    let full_stream = streams.pop().expect("one admitted stream remains open");
+    drop(streams);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let recovered_stream = loop {
+        match client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: artifact_id.clone(),
+            })
+            .await
+        {
+            Ok(response) => break response.into_inner(),
+            Err(error)
+                if error.code() == tonic::Code::ResourceExhausted && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("download capacity did not recover after stream close: {error}"),
+        }
+    };
+    drop(recovered_stream);
+    let (full_bytes, full_expiry) = tokio::time::timeout(
+        Duration::from_secs(120),
+        read_support_artifact_stream(full_stream, Vec::new()),
+    )
+    .await
+    .expect("one admitted download did not drain");
+    assert_eq!(full_bytes, content);
+    assert_eq!(full_expiry, expires_at_ms);
+    let completed_stream = client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: artifact_id.clone(),
+        })
+        .await
+        .expect("a completed download should release its permit")
+        .into_inner();
+    drop(completed_stream);
+
+    let operations_after = client
+        .list_operations(ListOperationsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(operations_after.operations, operations_before.operations);
+    assert_eq!(
+        operations_after.source_version,
+        operations_before.source_version
+    );
+    assert_eq!(
+        operations_after.next_page_token,
+        operations_before.next_page_token
+    );
+    assert_eq!(
+        management_store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        ledger_bytes.as_slice()
+    );
+    assert_eq!(
+        management_store
+            .get(&support_artifact_object_path(&artifact_id))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        content.as_slice()
+    );
+
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "gateway-shard",
+    ));
+    let recovered_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let records = recovered_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), audit_before.len() + 10);
+    assert_eq!(&records[..audit_before.len()], audit_before.as_slice());
+    let expected_scope = serde_json::to_string(&PolicyScope::Artifact {
+        opaque_id: artifact_id.clone(),
+    })
+    .unwrap();
+    let mut downloads = records[audit_before.len()..].to_vec();
+    let mut event_ids = Vec::new();
+    for record in &mut downloads {
+        assert!(record.timestamp_ms > 0);
+        assert!(record.event_id.starts_with("support-artifact-"));
+        event_ids.push(record.event_id.clone());
+        record.timestamp_ms = 0;
+        record.event_id = "support-artifact".to_owned();
+    }
+    event_ids.sort();
+    assert!(event_ids.windows(2).all(|pair| pair[0] != pair[1]));
+    assert_eq!(
+        downloads,
+        vec![
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: "support-artifact".to_owned(),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known(format!("support-artifact:{artifact_id}")),
+                scope: AuditField::Known(expected_scope),
+                action: SecurityAuditClass::AdminOperationStart,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            };
+            10
+        ]
+    );
 }
 
 #[cfg(unix)]
