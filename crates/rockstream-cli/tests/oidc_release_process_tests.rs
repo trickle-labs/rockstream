@@ -25,7 +25,7 @@ use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CancelOperationRequest,
     CreateBackupRequest, DownloadSupportArtifactRequest, GenerateSupportArtifactRequest,
     GenerateSupportArtifactResponse, GetClusterStatusRequest, GetOperationRequest,
-    ListOperationsRequest,
+    ListOperationsRequest, Operation as ManagementWireOperation, SetSecurityPrincipalGrantsRequest,
 };
 use rockstream_storage::catalog::{
     CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogSourceEntry, CatalogStore,
@@ -54,6 +54,11 @@ use tokio::{
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 static RELEASE_PROCESS_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[path = "common/management_auth.rs"]
+mod management_auth;
+
+use management_auth::try_management_client;
 
 const TEST_JWKS: &str = r#"{"keys":[{"kty":"RSA","use":"sig","kid":"test-rsa","alg":"RS256","n":"uC5TZBsRzpdMEuqLcWOwt2Lpxpgm9ndeGckqfIDXk91vhkJkwZmnI6flKMl7Q76xTKPmElATzyjc0SCthFS9Y2LFuunjfWdz1mBqrldJy90LZ3Jc65o3ZHxq4XPZCcSF7ysbFhBYC85LApxCOwn2ibtmOAA2K_5G4ZuXZkavlqXfHE8ETbWBghh7pUlOqAfx915ge_2vTs0Z1CeBShizn4ZRvPnlSCzoVt4fOHIpE_mESnJ1hYtS3zz9b_8fILwIzo2vxJAn3FMxvzb5UJIUJGfaqQVcvjXEHYwjiLncIeMSYEWgCFYdBuQTjI1YqFmNMFZSFJqZNoeOgTvrZmKx8w","e":"AQAB"}]}"#;
 const EXPIRED_JWK: &str = r#"{"kty":"RSA","use":"sig","kid":"expired-rsa","alg":"RS256","n":"1EAvcvNNqEitQgm7G-0cS1NV6X0JM4UBR1CRc7Ye3thwDkiOp-OCm_K0eooIytTX8v6LBaphymD9rUBVWEpH23XZESlf2El9nXaa7wTYmBkISXSTky90WHGB91MPVk-OY3abfGnX1hIaW-gFawjaprCCbt3pwxKkQMDgC42Qu1WvUUAHlCtgbJp_j-zflKaZDS-HXDT5kfYLptmhoEN1p6EkQxgF6BARB00SokWf-XE8cJ6OOUDMPgrFe6I6zJjtl2ndGtvNEI-EmZKaq59sRAJ45C9nBz8MdQtkOGs5Bp_QF2KIddGmQ3HvykYZiuDvy94yqAAREpfaxQiZJai27w","e":"AQAB"}"#;
@@ -1373,67 +1378,12 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     let control_catalog = DurableCatalogStore::recover(control_store, "gateway")
         .await
         .unwrap();
-    let mut updated_control_actor = control_catalog
-        .get_security_principal(PrincipalId(2))
-        .await
-        .unwrap()
-        .unwrap();
-    let before_policy = serde_json::to_string(&(
-        updated_control_actor.enabled,
-        &updated_control_actor.preset_grants,
-        &updated_control_actor.scoped_grants,
-    ))
-    .unwrap();
-    updated_control_actor.revision = 2;
-    updated_control_actor.preset_grants.clear();
-    let after_policy = serde_json::to_string(&(
-        updated_control_actor.enabled,
-        &updated_control_actor.preset_grants,
-        &updated_control_actor.scoped_grants,
-    ))
-    .unwrap();
-    let catalog_revision = control_catalog.get_revision().await + 1;
-    let policy_operation_id = catalog_revision.to_string();
-    let policy_audit = SecurityAuditRecord {
-        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
-        event_id: "release-test-policy-revision-2".to_owned(),
-        timestamp_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
-        actor: AuditIdentity::Verified("principal:1".to_owned()),
-        target: AuditField::Known("principal:2".to_owned()),
-        scope: AuditField::Known("cluster".to_owned()),
-        action: SecurityAuditClass::GrantChange,
-        outcome: SecurityAuditOutcome::Success,
-        correlation: AuditCorrelation::Observed(policy_operation_id.to_owned()),
-        operation_id: AuditField::Known(policy_operation_id.to_owned()),
-        policy_revision: AuditField::Known(2),
-        before_state: AuditField::Known(format!("revision=1;policy={before_policy}")),
-        after_state: AuditField::Known(format!("revision=2;policy={after_policy}")),
-    };
-    control_catalog
-        .commit_txn(
-            CatalogTxn::new(
-                catalog_revision,
-                catalog_revision,
-                vec![CatalogMutation::PutSecurityPrincipal {
-                    principal: updated_control_actor,
-                    expected_revision: Some(1),
-                    grantor_revision: Some((PrincipalId(1), 1)),
-                    audit: policy_audit,
-                }],
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let control_management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut control_process = start_control_process_with_operator(
         &control_working_dir,
         &control_storage,
         control_address,
-        control_management_address,
+        management_address,
         &pki,
         None,
         false,
@@ -1499,6 +1449,158 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         .execute("CREATE TABLE orders (id BIGINT, amount BIGINT)", &[])
         .await
         .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut management = loop {
+        match try_management_client(management_address, &pki).await {
+            Ok(client) => break client,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("management endpoint did not start: {error}"),
+        }
+    };
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let response = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: operation_id.clone(),
+            preset_grants: Vec::new(),
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .expect("authenticated management request should revoke the actor grants")
+        .into_inner();
+    assert_eq!(
+        response.protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+    let mut operation = response.operation.expect("grant mutation operation");
+    assert_eq!(operation.operation_id, operation_id);
+    assert!(chrono::DateTime::parse_from_rfc3339(&operation.started_at).is_ok());
+    assert!(chrono::DateTime::parse_from_rfc3339(&operation.updated_at).is_ok());
+    operation.started_at = "<timestamp>".to_owned();
+    operation.updated_at = "<timestamp>".to_owned();
+    assert_eq!(
+        operation,
+        ManagementWireOperation {
+            operation_id: operation_id.clone(),
+            kind: "security_principal_grants".to_owned(),
+            state: "succeeded".to_owned(),
+            started_at: "<timestamp>".to_owned(),
+            updated_at: "<timestamp>".to_owned(),
+            progress: "100%".to_owned(),
+            phase: "security_policy_committed".to_owned(),
+            error_code: String::new(),
+            next_steps: Vec::new(),
+            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
+            result_json: r#"{"effective_permissions":[],"preset_grants":[],"principal_id":2,"revision":2,"scoped_grants":[]}"#.to_owned(),
+        }
+    );
+
+    let mut revoked_actor = control_actor.clone();
+    revoked_actor.revision = 2;
+    revoked_actor.preset_grants.clear();
+    let mut principals_after_grant = principals_before.clone();
+    *principals_after_grant
+        .iter_mut()
+        .find(|principal| principal.id == PrincipalId(2))
+        .expect("delegated actor is provisioned") = revoked_actor.clone();
+    control_catalog.refresh().await.unwrap();
+    let mut current_principals = control_catalog.list_security_principals().await.unwrap();
+    current_principals.sort_by_key(|principal| principal.id);
+    assert_eq!(current_principals, principals_after_grant);
+
+    let audit_after_grant = control_catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(audit_after_grant.len(), audit_before.len() + 4);
+    assert_eq!(
+        &audit_after_grant[..audit_before.len()],
+        audit_before.as_slice()
+    );
+    let authentication = &audit_after_grant[audit_before.len()];
+    let authentication_id = authentication
+        .event_id
+        .strip_prefix("management-authn-")
+        .expect("management authentication audit event");
+    assert!(uuid::Uuid::parse_str(authentication_id).is_ok());
+    assert!(authentication.timestamp_ms > 0);
+    assert_eq!(
+        authentication,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: authentication.event_id.clone(),
+            timestamp_ms: authentication.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let start = &audit_after_grant[audit_before.len() + 1];
+    assert!(start.timestamp_ms > 0);
+    assert_eq!(
+        start,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-security-grants-start:{operation_id}"),
+            timestamp_ms: start.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:2".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::AdminOperationStart,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(operation_id.clone()),
+            operation_id: AuditField::Known(operation_id.clone()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let before_policy = serde_json::to_string(&(
+        control_actor.enabled,
+        &control_actor.preset_grants,
+        &control_actor.scoped_grants,
+    ))
+    .unwrap();
+    let after_policy = serde_json::to_string(&(
+        revoked_actor.enabled,
+        &revoked_actor.preset_grants,
+        &revoked_actor.scoped_grants,
+    ))
+    .unwrap();
+    let grant = &audit_after_grant[audit_before.len() + 2];
+    assert!(grant.timestamp_ms > 0);
+    let expected_grant = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("management-security-grants:{operation_id}"),
+        timestamp_ms: grant.timestamp_ms,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Observed(operation_id.clone()),
+        operation_id: AuditField::Known(operation_id.clone()),
+        policy_revision: AuditField::Known(2),
+        before_state: AuditField::Known(format!("revision=1;policy={before_policy}")),
+        after_state: AuditField::Known(format!("revision=2;policy={after_policy}")),
+    };
+    assert_eq!(grant, &expected_grant);
+    let completion = &audit_after_grant[audit_before.len() + 3];
+    assert_eq!(completion.timestamp_ms, grant.timestamp_ms);
+    let mut expected_completion = expected_grant;
+    expected_completion.event_id = format!("management-security-grants-completion:{operation_id}");
+    expected_completion.action = SecurityAuditClass::AdminOperationCompletion;
+    assert_eq!(completion, &expected_completion);
 
     let error = client
         .execute(
@@ -1574,11 +1676,14 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         .unwrap();
     let mut principals_after = recovered.list_security_principals().await.unwrap();
     principals_after.sort_by_key(|principal| principal.id);
-    assert_eq!(principals_after, principals_before);
+    assert_eq!(principals_after, principals_after_grant);
     let records = recovered.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), audit_before.len() + 1);
-    assert_eq!(&records[..audit_before.len()], audit_before.as_slice());
-    let denial = &records[audit_before.len()];
+    assert_eq!(records.len(), audit_after_grant.len() + 1);
+    assert_eq!(
+        &records[..audit_after_grant.len()],
+        audit_after_grant.as_slice()
+    );
+    let denial = &records[audit_after_grant.len()];
     assert!(denial.event_id.starts_with("gateway-delegation:"));
     assert!(denial.timestamp_ms > 0);
     assert_eq!(
