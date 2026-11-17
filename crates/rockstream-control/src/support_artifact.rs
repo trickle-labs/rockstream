@@ -16,6 +16,8 @@ pub(crate) const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_ARTIFACT_STORAGE_BYTES: usize = 100 * 1024 * 1024;
 pub(crate) const MAX_ARTIFACTS_PER_DEPLOYMENT: usize = 2_048;
 pub(crate) const ARTIFACT_TTL: Duration = Duration::from_secs(10 * 60);
+// Reserve one second for the background cleanup tick to observe expiry.
+const ARTIFACT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(59);
 const LEDGER_CAS_RETRIES: usize = 32;
 const LEDGER_FORMAT_VERSION: u16 = 1;
 
@@ -292,6 +294,21 @@ impl SupportArtifactStore {
     }
 
     pub async fn cleanup_expired(&self, now_ms: u64) -> Result<(), ArtifactStoreError> {
+        self.cleanup_expired_with_timeout(now_ms, ARTIFACT_CLEANUP_TIMEOUT)
+            .await
+    }
+
+    async fn cleanup_expired_with_timeout(
+        &self,
+        now_ms: u64,
+        timeout: Duration,
+    ) -> Result<(), ArtifactStoreError> {
+        tokio::time::timeout(timeout, self.cleanup_expired_inner(now_ms))
+            .await
+            .map_err(|_| ArtifactStoreError::StorageUnavailable)?
+    }
+
+    async fn cleanup_expired_inner(&self, now_ms: u64) -> Result<(), ArtifactStoreError> {
         self.ensure_available()?;
         let (ledger, _) = self.read_ledger().await?;
         let expired: Vec<_> = ledger
@@ -303,13 +320,17 @@ impl SupportArtifactStore {
         if expired.is_empty() {
             return Ok(());
         }
-        let store = self.clone();
-        let _: Vec<()> = futures::stream::iter(expired)
-            .map(move |id| {
-                let store = store.clone();
-                async move { store.delete_artifact(&id).await }
+        let paths = expired
+            .iter()
+            .map(|id| Ok::<_, ObjectStoreError>(self.artifact_path(id)))
+            .collect::<Vec<_>>();
+        let _: Vec<()> = self
+            .store
+            .delete_stream(futures::stream::iter(paths).boxed())
+            .map(|result| match result {
+                Ok(_) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
+                Err(_) => Err(ArtifactStoreError::StorageUnavailable),
             })
-            .buffer_unordered(64)
             .try_collect()
             .await?;
         maybe_crash_after_debug_test_boundary("cleanup-after-delete");
@@ -863,6 +884,66 @@ mod tests {
                 Err(ObjectStoreError::NotFound { .. })
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_timeout_keeps_the_ledger_entry_for_retry() {
+        let object_store = Arc::new(InMemory::new());
+        let throttled_store = Arc::new(object_store::throttle::ThrottledStore::new(
+            object_store.clone(),
+            object_store::throttle::ThrottleConfig {
+                wait_delete_per_call: Duration::from_secs(1),
+                ..Default::default()
+            },
+        ));
+        let store = SupportArtifactStore::new(throttled_store.clone());
+        store.initialize().await.unwrap();
+        let entry = LedgerArtifact {
+            owner: PrincipalId(1),
+            scope: PolicyScope::Cluster,
+            size: 7,
+            expires_at_ms: 2_000,
+        };
+        store
+            .mutate_ledger(|ledger| {
+                ledger.artifacts.insert("expired".to_owned(), entry.clone());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        object_store
+            .put(&store.artifact_path("expired"), b"expired".to_vec().into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .cleanup_expired_with_timeout(2_000, Duration::from_millis(1))
+                .await,
+            Err(ArtifactStoreError::StorageUnavailable)
+        );
+        assert_eq!(
+            store.read_ledger().await.unwrap().0.artifacts,
+            BTreeMap::from([("expired".to_owned(), entry)])
+        );
+        assert_eq!(
+            object_store
+                .get(&store.artifact_path("expired"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            b"expired"[..]
+        );
+
+        throttled_store.config_mut(|config| config.wait_delete_per_call = Duration::ZERO);
+        store.cleanup_expired(2_000).await.unwrap();
+        assert!(store.read_ledger().await.unwrap().0.artifacts.is_empty());
+        assert!(matches!(
+            object_store.get(&store.artifact_path("expired")).await,
+            Err(ObjectStoreError::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
