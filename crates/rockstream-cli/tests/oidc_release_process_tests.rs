@@ -3110,6 +3110,185 @@ async fn worker_peer_certificate_rejections_are_audited_by_release_process() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn worker_shuffle_mtls_rollover_preserves_release_process_stream() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let (gen2_ca_path, _, _) = pki.generate_gen2_pki();
+    let gen1_server_tls = pki.worker_tls_config(3);
+    let gen2_server_tls = pki.gen2_worker_tls_config(3);
+    let gen1_client_tls =
+        pki.worker_tls_config_with_ca(4, gen2_server_tls.ca_cert_path.clone().unwrap());
+    let mut gen2_client_tls = pki.gen2_worker_tls_config(4);
+    gen2_client_tls.ca_cert_path = Some(gen2_ca_path);
+    let control_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut control =
+        start_control_process(temp.path(), &storage, control_addr, &pki, None, false).await;
+    wait_for_gateway(&mut control.0, control_addr).await;
+
+    let server_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let client_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let server_dir = temp.path().join("worker-3");
+    let client_dir = temp.path().join("worker-4");
+    std::fs::create_dir_all(&server_dir).unwrap();
+    std::fs::create_dir_all(&client_dir).unwrap();
+    let mut server = start_worker_shuffle_process(
+        &server_dir,
+        &temp.path().join("worker-3-storage"),
+        control_addr,
+        server_addr,
+        &pki,
+        3,
+    );
+    let mut client_worker = start_worker_shuffle_process(
+        &client_dir,
+        &temp.path().join("worker-4-storage"),
+        control_addr,
+        client_addr,
+        &pki,
+        4,
+    );
+    wait_for_gateway(&mut server.0, server_addr).await;
+    wait_for_gateway(&mut client_worker.0, client_addr).await;
+    wait_for_worker_shuffle_peer(server_addr, WorkerId(3), gen1_client_tls.clone()).await;
+    wait_for_worker_shuffle_peer(client_addr, WorkerId(4), pki.worker_tls_config(3)).await;
+
+    let peers = Arc::new(RwLock::new(std::collections::HashMap::from([(
+        WorkerId(3),
+        server_addr.to_string(),
+    )])));
+    let pool = ShuffleClientPool::new(peers).with_internal_tls(gen1_client_tls.clone());
+    let mut client = pool.get_client(WorkerId(3)).await.unwrap();
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(1);
+    let stream = futures::stream::unfold(frame_rx, |mut receiver| async move {
+        receiver.recv().await.map(|frame| (frame, receiver))
+    });
+    let mut request = tonic::Request::new(stream);
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    let mut response = client.shuffle_stream(request).await.unwrap().into_inner();
+
+    for (source, target) in [
+        (
+            gen2_server_tls.cert_path.as_ref().unwrap(),
+            gen1_server_tls.cert_path.as_ref().unwrap(),
+        ),
+        (
+            gen2_server_tls.key_path.as_ref().unwrap(),
+            gen1_server_tls.key_path.as_ref().unwrap(),
+        ),
+        (
+            gen2_server_tls.ca_cert_path.as_ref().unwrap(),
+            gen1_server_tls.ca_cert_path.as_ref().unwrap(),
+        ),
+    ] {
+        std::fs::copy(source, target).unwrap();
+    }
+    assert_eq!(
+        unsafe { libc::kill(server.0.id() as libc::pid_t, libc::SIGHUP) },
+        0,
+        "worker listener must accept the certificate reload signal"
+    );
+    wait_for_worker_shuffle_peer(server_addr, WorkerId(3), gen1_client_tls).await;
+    wait_for_worker_shuffle_peer(server_addr, WorkerId(3), gen2_client_tls).await;
+
+    let security_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    security_catalog.refresh().await.unwrap();
+    let audit_before = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+
+    frame_tx
+        .send(ShuffleFrame {
+            exchange_id: 100,
+            src_shard: 10,
+            target_shard: 20,
+            epoch: 1,
+            seq: 1,
+            payload: Vec::new(),
+            row_count: 0,
+        })
+        .await
+        .unwrap();
+    let denial = response.message().await.unwrap_err();
+    assert_eq!(denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denial.message(),
+        "RS-2401: authenticated worker worker-4 does not own source shard 10"
+    );
+    assert!(server.0.try_wait().unwrap().is_none());
+    assert!(client_worker.0.try_wait().unwrap().is_none());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let audit_after = loop {
+        security_catalog.refresh().await.unwrap();
+        let records = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        if records.len() == audit_before.len() + 1 {
+            break records;
+        }
+        assert!(Instant::now() < deadline, "shuffle denial was not audited");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let rejection = audit_after.last().unwrap();
+    assert!(rejection.event_id.starts_with("shuffle-authorization:"));
+    assert_eq!(
+        rejection,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: rejection.event_id.clone(),
+            timestamp_ms: rejection.timestamp_ms,
+            actor: AuditIdentity::Verified("worker-4".to_owned()),
+            target: AuditField::Known("source_shard:10".to_owned()),
+            scope: AuditField::Known("worker_shuffle".to_owned()),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Observed(
+                "exchange:100:source:10:target:20:epoch:1:sequence:1".to_owned(),
+            ),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+
+    server.0.kill().unwrap();
+    server.0.wait().unwrap();
+    client_worker.0.kill().unwrap();
+    client_worker.0.wait().unwrap();
+    control.0.kill().unwrap();
+    control.0.wait().unwrap();
+    let recovered_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let recovered = DurableCatalogStore::recover(recovered_store, "gateway")
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.list_security_audit_records().await.unwrap(),
+        audit_after
+    );
+}
+
+#[cfg(unix)]
 async fn wait_for_release_worker_lease(
     client: &rockstream_runtime::WorkerClientHandle,
     shard_id: ShardId,
