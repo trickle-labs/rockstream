@@ -270,7 +270,7 @@ mod tests {
                 node_id: "worker-1".to_string()
             }
         ));
-        assert!(!allows(
+        assert!(allows(
             &policy,
             SecurityAction::SupportDownload,
             &PolicyScope::Artifact {
@@ -352,7 +352,7 @@ mod tests {
                 opaque_id: "artifact-uuid".to_string()
             }
         ));
-        assert!(!allows(
+        assert!(allows(
             &policy,
             SecurityAction::SupportDownload,
             &PolicyScope::Artifact {

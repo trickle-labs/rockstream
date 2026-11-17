@@ -54,13 +54,20 @@ rockstream --output json --management 127.0.0.1:9201 shard show 0
 rockstream --output json --management 127.0.0.1:9201 config summary
 rockstream --output json --management 127.0.0.1:9201 admin operation list
 rockstream --output json --management 127.0.0.1:9201 admin operation show <operation-id>
-rockstream --management 127.0.0.1:9201 support artifact create --idempotency-key <client-generated-uuid>
-rockstream --management 127.0.0.1:9201 support artifact download <opaque-id> --out support.json
 ```
 
 Keep the client-generated UUID before sending the create request and reuse it for retries. If it is omitted, the CLI prints a generated UUID to stderr before the request. The response returns the same opaque ID. Artifacts contain only sanitized operational metadata: no business rows, SQL literals, connector payloads, secret values, keys, or tokens. Each artifact is at most 10 MiB, remains downloadable for at most 10 minutes, and is bound to its creator and source scope. A durable conditional-write ledger limits payload storage to 100 MiB and retained artifacts to 2,048 per deployment. Each management-service instance admits one artifact generation at a time. A concurrent request rejected by that gate returns gRPC `ResourceExhausted` with `support artifact generation is busy` before accepting an operation; retry it with the same UUID. An admitted request rejected by either storage limit returns the same code with `support artifact storage budget is full`, records a failed operation, and does not evict unexpired artifacts. Artifacts survive service restart; startup removes expired data before listeners open, and background cleanup removes newly expired data within 60 seconds. A backend without atomic conditional writes disables support-artifact generation and download while leaving other management operations available. After expiry or deletion, replaying the same key reports that the artifact is unavailable; use a new key to request a new artifact.
 
 If the create response is lost, retry `support artifact create` with the same UUID or use the authorized `admin operation show <uuid>` lookup. The operation UUID is known before the mutation starts, and an unavailable or expired artifact is never silently regenerated under the old key.
+
+### Support artifact commands
+
+Use a client-generated UUID for `--idempotency-key` and the opaque ID returned by `create` for `download`:
+
+```sh
+rockstream --management 127.0.0.1:9201 support artifact create --idempotency-key <client-generated-uuid>
+rockstream --management 127.0.0.1:9201 support artifact download <opaque-id> --out support.json
+```
 
 `CreateBackup` accepts a local path, a `file://` path, or an `s3://bucket/prefix` destination. It requires an idle cluster with no active workload deployments or source writes. The operation record stores the destination and checkpoint phase. The server stores its checkpoint manifest in the source store and writes the export under `checkpoint-exports/management-<operation_id>`. A missing worker or temporary storage error leaves the operation waiting. An invalid destination or checkpoint integrity error leaves it failed.
 

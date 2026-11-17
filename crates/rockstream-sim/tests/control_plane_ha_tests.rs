@@ -617,14 +617,15 @@ mod tc {
             }
         }
 
-        /// Poll every node (skipping unreachable ones) until exactly one
-        /// reachable node reports itself as `Leader`, or `timeout` elapses.
-        /// Panics if at any observed instant *more than one* node reports
-        /// `Leader` (split-brain — must never happen, checked on every
-        /// poll, not just the final one).
+        /// Poll every node (skipping unreachable ones) until the same node
+        /// and term remain the sole reported leader for three election windows,
+        /// or `timeout` elapses. Panics if at any observed instant *more than
+        /// one* node reports `Leader` (split-brain — checked on every poll).
         pub async fn wait_for_single_leader(&self, timeout: Duration) -> (usize, u64) {
             let deadline = Instant::now() + timeout;
             let mut stable_leader = None;
+            let mut stable_since = None;
+            let stability_window = rockstream_control::raft::DEFAULT_ELECTION_TIMEOUT_MAX * 3;
             loop {
                 let mut statuses = Vec::new();
                 for node in &self.nodes {
@@ -647,11 +648,18 @@ mod tc {
                         None => unreachable!(),
                     };
                     if stable_leader == Some((idx, term)) {
-                        return (idx, term);
+                        if stable_since
+                            .is_some_and(|since: Instant| since.elapsed() >= stability_window)
+                        {
+                            return (idx, term);
+                        }
+                    } else {
+                        stable_leader = Some((idx, term));
+                        stable_since = Some(Instant::now());
                     }
-                    stable_leader = Some((idx, term));
                 } else {
                     stable_leader = None;
+                    stable_since = None;
                 }
                 if Instant::now() > deadline {
                     if std::env::var("RS_TC_DEBUG").is_ok() {
