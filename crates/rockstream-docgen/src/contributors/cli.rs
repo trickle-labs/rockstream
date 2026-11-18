@@ -93,7 +93,10 @@ impl CliContributor {
             },
         ];
 
-        let mut error_codes = if matches!(name.as_str(), "security" | "preprovision-admin") {
+        let mut error_codes = if matches!(
+            name.as_str(),
+            "security" | "preprovision-admin" | "recover-admin"
+        ) {
             vec![
                 "RS-0002".to_string(),
                 "RS-0003".to_string(),
@@ -138,6 +141,11 @@ mod tests {
             .iter()
             .find(|command| command.name == "preprovision-admin")
             .unwrap();
+        let recovery = security
+            .subcommands
+            .iter()
+            .find(|command| command.name == "recover-admin")
+            .unwrap();
         let expected = vec![
             "RS-0002".to_string(),
             "RS-0003".to_string(),
@@ -146,5 +154,6 @@ mod tests {
 
         assert_eq!(security.error_codes, expected);
         assert_eq!(preprovision.error_codes, expected);
+        assert_eq!(recovery.error_codes, expected);
     }
 }
