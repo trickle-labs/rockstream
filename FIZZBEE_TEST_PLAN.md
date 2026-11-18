@@ -747,11 +747,15 @@ authorization rule. `security_audit_metrics_tests.rs::durable_audit_metrics_foll
 and `security_audit_health_tests.rs::audit_storage_degradation_is_visible_without_failing_ready_health`
 check the metric and health surfaces.
 
-`runtime/src/exchange` has worker mTLS service and client-pool code covered by
-`shuffle_mtls_tests.rs`, but no production worker startup caller wires those
-components. Worker-to-worker application wiring, release-process coverage, and
-in-flight certificate rollover/stream continuity therefore remain incomplete.
-Control-worker rotation tests do not establish worker-to-worker continuity.
+`runtime/src/exchange` now provides a worker mTLS listener and client pool.
+`shuffle_mtls_tests.rs` covers invalid peer credentials, worker identity and
+source-shard authorization, audited denial without inlet delivery, and active
+stream continuity while both certificate generations are trusted. Worker
+startup starts the listener, but production does not register `ExchangeInlet`s
+or connect them to compiled pipelines; application result delivery remains
+incomplete. The release-process test covers worker-stream continuity for this
+path. M1–M7 do not model this protocol, so these tests are implementation
+evidence, not formal proof.
 
 Issue #203 replaces the public `aws_kms` provider's ARN/region-derived local
 encryption with signed KMS `Encrypt` and `Decrypt` requests. Both operations

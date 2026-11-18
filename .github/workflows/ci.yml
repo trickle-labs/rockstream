@@ -9,7 +9,7 @@ on:
       - "**/openwiki/**"
       - "**/.openwikiignore"
   pull_request:
-    branches: [main]
+    branches: [main, codex/pr303-management-auth-mainline]
     paths-ignore:
       - "**/AGENTS.md"
       - "**/openwiki/**"

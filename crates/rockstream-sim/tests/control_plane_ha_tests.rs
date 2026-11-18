@@ -813,7 +813,7 @@ mod tc {
         assert!(
             matches!(
                 serde_json::from_str::<ControlMessage>(response.trim()),
-                Ok(ControlMessage::Registered { worker_id: registered })
+                Ok(ControlMessage::Registered { worker_id: registered, .. })
                     if registered == WorkerId(worker_id)
             ),
             "worker registration was rejected; response: {response:?}"
