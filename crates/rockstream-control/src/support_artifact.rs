@@ -888,6 +888,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn minio_cleanup_at_the_artifact_count_limit_finishes_within_the_bound() {
+        assert!(rockstream_test_support::docker_available());
+        let bucket = "rockstream-support-artifact-cleanup-pressure";
+        let (_minio, port) = rockstream_test_support::minio::start_minio(bucket)
+            .await
+            .expect("MinIO is required for maximum-count cleanup coverage");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+            rockstream_test_support::minio::minio_object_store(port, bucket),
+            "management",
+        ));
+        let store = SupportArtifactStore::new(Arc::clone(&object_store));
+        store.initialize().await.unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
+        let artifacts = (0..MAX_ARTIFACTS_PER_DEPLOYMENT)
+            .map(|index| {
+                (
+                    format!("expired-{index:04}"),
+                    LedgerArtifact {
+                        owner: PrincipalId(1),
+                        scope: PolicyScope::Cluster,
+                        size: 0,
+                        expires_at_ms: now_ms,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        store
+            .mutate_ledger(|ledger| {
+                ledger.artifacts = artifacts.clone();
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        let paths = artifacts
+            .keys()
+            .map(|id| store.artifact_path(id))
+            .collect::<Vec<_>>();
+        futures::stream::iter(paths)
+            .map(|path| {
+                let object_store = Arc::clone(&object_store);
+                async move { object_store.put(&path, Vec::new().into()).await }
+            })
+            .buffer_unordered(32)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        store.cleanup_expired(now_ms).await.unwrap();
+        assert!(started.elapsed() <= ARTIFACT_CLEANUP_TIMEOUT);
+        assert!(store.read_ledger().await.unwrap().0.artifacts.is_empty());
+        for id in artifacts.keys() {
+            assert!(matches!(
+                object_store.get(&store.artifact_path(id)).await,
+                Err(ObjectStoreError::NotFound { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn cleanup_rescans_artifacts_that_expire_during_a_sweep() {
         let object_store = Arc::new(InMemory::new());
         let delete_delay = Duration::from_millis(15);
