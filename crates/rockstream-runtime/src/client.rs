@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +20,10 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+use rockstream_types::config::ExchangeConfig;
 use rockstream_types::data_plane::{
     DEPLOYMENT_DESCRIPTOR_VERSION, DeploymentDescriptor, RuntimeExchangeMessage,
     RuntimeOutputDelta, RuntimeRow,
@@ -750,6 +753,8 @@ pub async fn setup_test_deployment(
     let worker_id = Arc::new(RwLock::new(Some(WorkerId(42))));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
+    let shard_leases = Arc::new(RwLock::new(HashMap::new()));
+    let security_audit_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let frontier_report_waiter = Arc::new(parking_lot::Mutex::new(None));
     let secret_manager = Arc::new(WorkerSecretManager::new("worker-42".to_string()));
@@ -766,13 +771,16 @@ pub async fn setup_test_deployment(
         worker_id,
         active_shards,
         topology_workers,
+        shard_leases,
         msg_tx,
+        security_audit_waiters,
         fence_waiters: fence_waiters.clone(),
         frontier_report_waiter: frontier_report_waiter.clone(),
         secret_manager,
         storage_context: storage_context.clone(),
         compaction_config: comp_config_lock,
         deployments: deployments.clone(),
+        tls_reloader: None,
     };
 
     let store = rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
@@ -895,6 +903,27 @@ mod data_plane_tests {
 
     use super::*;
     use rockstream_types::ids::OperatorId;
+
+    #[tokio::test]
+    async fn worker_tls_reload_rejects_missing_credentials_and_disabled_mtls() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, ..) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        let pki = rockstream_test_support::pki::TestPki::generate();
+
+        assert_eq!(
+            client
+                .reload_tls(rockstream_types::identity::InternalTlsConfig::default())
+                .unwrap_err(),
+            "RS-2410: worker shuffle TLS certificate and private key are required"
+        );
+        let mut without_mtls = pki.worker_tls_config(1);
+        without_mtls.client_auth_required = false;
+        assert_eq!(
+            client.reload_tls(without_mtls).unwrap_err(),
+            "RS-2410: worker shuffle requires mutual TLS"
+        );
+    }
 
     #[test]
     fn linux_memory_headroom_uses_available_memory() {
@@ -1857,7 +1886,9 @@ pub struct WorkerClientHandle {
     worker_id: Arc<RwLock<Option<WorkerId>>>,
     active_shards: Arc<RwLock<HashMap<ShardId, ShardState>>>,
     topology_workers: Arc<RwLock<HashMap<WorkerId, WorkerInfo>>>,
+    shard_leases: Arc<RwLock<HashMap<ShardId, ShardLease>>>,
     msg_tx: mpsc::Sender<WorkerMessage>,
+    security_audit_waiters: crate::exchange::service::SecurityAuditWaiters,
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
     frontier_report_waiter: FrontierReportWaiter,
@@ -1865,9 +1896,30 @@ pub struct WorkerClientHandle {
     storage_context: Arc<rockstream_storage::storage_context::WorkerStorageContext>,
     compaction_config: Arc<RwLock<EpochCompactionConfig>>,
     deployments: WorkerDeployments,
+    tls_reloader: Option<Arc<rockstream_types::tls::TlsCertificateReloader>>,
 }
 
 impl WorkerClientHandle {
+    /// Reload the worker shuffle listener's mTLS credentials without closing active streams.
+    pub fn reload_tls(
+        &self,
+        config: rockstream_types::identity::InternalTlsConfig,
+    ) -> Result<(), String> {
+        if !config.is_enabled() {
+            return Err(
+                "RS-2410: worker shuffle TLS certificate and private key are required".to_string(),
+            );
+        }
+        if !config.client_auth_required {
+            return Err("RS-2410: worker shuffle requires mutual TLS".to_string());
+        }
+        config.validate()?;
+        self.tls_reloader
+            .as_ref()
+            .ok_or_else(|| "RS-2410: worker shuffle TLS is not enabled".to_string())?
+            .reload(config)
+    }
+
     /// Returns the worker-wide epoch compaction config.
     pub fn compaction_config(&self) -> EpochCompactionConfig {
         self.compaction_config.read().clone()
@@ -1942,6 +1994,15 @@ impl WorkerClientHandle {
     /// Latest topology snapshot advertised by the control plane.
     pub fn topology_snapshot(&self) -> Vec<WorkerInfo> {
         self.topology_workers.read().values().cloned().collect()
+    }
+
+    pub(crate) fn exchange_registry(&self) -> crate::exchange::service::ExchangeRegistry {
+        crate::exchange::service::ExchangeRegistry::with_worker_state(
+            self.active_shards.clone(),
+            self.topology_workers.clone(),
+        )
+        .with_shard_leases(self.shard_leases.clone())
+        .with_security_audit(self.msg_tx.clone(), self.security_audit_waiters.clone())
     }
 
     /// Request a fresh short-lived token over the authenticated control channel.
@@ -2067,6 +2128,20 @@ fn validate_local_control_peer(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkerExchangeEndpoint {
+    pub bind_addr: SocketAddr,
+    pub advertise_addr: String,
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Connect to the control plane and start the worker client daemon loop.
 pub async fn start_worker_client(
     proposed_worker_id: u64,
@@ -2171,7 +2246,7 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
     tls_config: InternalTlsConfig,
     compaction_config: EpochCompactionConfig,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
-    start_worker_client_with_transport_options(
+    start_worker_client_with_runtime(
         proposed_worker_id,
         control_url,
         storage_dir,
@@ -2179,6 +2254,8 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
         capabilities,
         tls_config,
         compaction_config,
+        None,
+        ExchangeConfig::default(),
         false,
     )
     .await
@@ -2191,7 +2268,7 @@ pub async fn start_worker_client_with_insecure_internal_dev_and_metadata(
     location: WorkerLocation,
     capabilities: WorkerCapabilities,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
-    start_worker_client_with_transport_options(
+    start_worker_client_with_runtime(
         proposed_worker_id,
         control_url,
         storage_dir,
@@ -2199,6 +2276,8 @@ pub async fn start_worker_client_with_insecure_internal_dev_and_metadata(
         capabilities,
         InternalTlsConfig::default(),
         EpochCompactionConfig::default(),
+        None,
+        ExchangeConfig::default(),
         true,
     )
     .await
@@ -2212,7 +2291,7 @@ pub async fn start_worker_client_with_insecure_internal_dev_and_metadata_and_tls
     capabilities: WorkerCapabilities,
     tls_config: InternalTlsConfig,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
-    start_worker_client_with_transport_options(
+    start_worker_client_with_runtime(
         proposed_worker_id,
         control_url,
         storage_dir,
@@ -2220,13 +2299,43 @@ pub async fn start_worker_client_with_insecure_internal_dev_and_metadata_and_tls
         capabilities,
         tls_config,
         EpochCompactionConfig::default(),
+        None,
+        ExchangeConfig::default(),
         true,
     )
     .await
 }
 
+/// Start a worker with its peer shuffle listener available before registration.
 #[allow(clippy::too_many_arguments)]
-async fn start_worker_client_with_transport_options(
+pub async fn start_worker_client_with_exchange_endpoint(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+    exchange_config: ExchangeConfig,
+    endpoint: WorkerExchangeEndpoint,
+    allow_insecure_internal_dev: bool,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_runtime(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        tls_config,
+        EpochCompactionConfig::default(),
+        Some(endpoint),
+        exchange_config,
+        allow_insecure_internal_dev,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_worker_client_with_runtime(
     proposed_worker_id: u64,
     control_url: &str,
     storage_dir: &Path,
@@ -2234,11 +2343,17 @@ async fn start_worker_client_with_transport_options(
     capabilities: WorkerCapabilities,
     tls_config: InternalTlsConfig,
     compaction_config: EpochCompactionConfig,
+    exchange_endpoint: Option<WorkerExchangeEndpoint>,
+    exchange_config: ExchangeConfig,
     allow_insecure_internal_dev: bool,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
     compaction_config
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let registration_address = exchange_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.advertise_addr.clone())
+        .unwrap_or_else(|| "127.0.0.1:0".to_owned());
     let initial_headroom = system_memory_headroom()?;
     let clean_url = control_url
         .trim_start_matches("https://")
@@ -2283,8 +2398,11 @@ async fn start_worker_client_with_transport_options(
             capabilities,
             initial_headroom,
             compaction_config,
+            registration_address,
             exchange_addr,
+            exchange_endpoint.clone(),
             tls_config.clone(),
+            exchange_config.clone(),
             allow_insecure_internal_dev,
             reader,
             writer,
@@ -2299,8 +2417,11 @@ async fn start_worker_client_with_transport_options(
             capabilities,
             initial_headroom,
             compaction_config,
+            registration_address,
             exchange_addr,
-            tls_config.clone(),
+            exchange_endpoint,
+            tls_config,
+            exchange_config,
             allow_insecure_internal_dev,
             reader,
             writer,
@@ -2379,8 +2500,11 @@ async fn run_worker_client<R, W>(
     capabilities: WorkerCapabilities,
     initial_headroom: CapacityHeadroom,
     compaction_config: EpochCompactionConfig,
+    mut registration_address: String,
     exchange_addr: std::net::SocketAddr,
+    exchange_endpoint: Option<WorkerExchangeEndpoint>,
     tls_config: InternalTlsConfig,
+    exchange_config: ExchangeConfig,
     allow_insecure_internal_dev: bool,
     reader: R,
     mut writer: W,
@@ -2394,7 +2518,9 @@ where
     let worker_id = Arc::new(RwLock::new(None));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
+    let shard_leases = Arc::new(RwLock::new(HashMap::new()));
     let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMessage>(32);
+    let security_audit_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let frontier_report_waiter = Arc::new(parking_lot::Mutex::new(None));
     let secret_manager = Arc::new(WorkerSecretManager::new(format!(
@@ -2412,18 +2538,29 @@ where
         (WorkloadId, ShardId),
         Arc<WorkerDeployment>,
     >::new()));
+    let tls_reloader = if tls_config.is_enabled() {
+        Some(Arc::new(
+            rockstream_types::tls::TlsCertificateReloader::new(tls_config.clone())
+                .map_err(io::Error::other)?,
+        ))
+    } else {
+        None
+    };
 
     let handle = WorkerClientHandle {
         worker_id: worker_id.clone(),
         active_shards: active_shards.clone(),
         topology_workers: topology_workers.clone(),
+        shard_leases: shard_leases.clone(),
         msg_tx: msg_tx.clone(),
+        security_audit_waiters: security_audit_waiters.clone(),
         fence_waiters: fence_waiters.clone(),
         frontier_report_waiter: frontier_report_waiter.clone(),
         secret_manager: secret_manager.clone(),
         storage_context: storage_context.clone(),
         compaction_config: compaction_config.clone(),
         deployments: deployments.clone(),
+        tls_reloader: tls_reloader.clone(),
     };
 
     let actor_registry =
@@ -2438,29 +2575,58 @@ where
 
     let mut shuffle_pool =
         crate::exchange::pool::ShuffleClientPool::new(Arc::new(RwLock::new(HashMap::new())));
-    let registry = crate::exchange::service::ExchangeRegistry::with_shards(active_shards.clone());
+    let exchange_bind_addr = exchange_endpoint
+        .as_ref()
+        .map_or(exchange_addr, |endpoint| endpoint.bind_addr);
+    let should_start_exchange =
+        exchange_endpoint.is_some() || allow_insecure_internal_dev || tls_config.is_enabled();
     let mut exchange_service =
-        crate::exchange::service::ExchangeService::new(registry).with_owned_handler(
-            owned_shuffle_handler(actor_registry.clone(), deployments.clone(), handle.clone()),
-        );
+        crate::exchange::service::ExchangeService::new(handle.exchange_registry())
+            .with_exchange_config(exchange_config)
+            .with_owned_handler(owned_shuffle_handler(
+                actor_registry.clone(),
+                deployments.clone(),
+                handle.clone(),
+            ));
     if tls_config.is_enabled() {
+        exchange_service = exchange_service.with_internal_tls(tls_config.clone());
+        if let Some(reloader) = tls_reloader.clone() {
+            exchange_service = exchange_service.with_tls_reloader(reloader);
+        }
         shuffle_pool = shuffle_pool.with_internal_tls(tls_config.clone());
-        exchange_service = exchange_service.with_internal_tls(tls_config);
     } else if allow_insecure_internal_dev {
         exchange_service = exchange_service.with_insecure_internal_dev();
     }
+    let exchange_shutdown = if should_start_exchange {
+        let listener = tokio::net::TcpListener::bind(exchange_bind_addr).await?;
+        let local_addr = listener.local_addr()?;
+        registration_address = match exchange_endpoint.as_ref() {
+            Some(endpoint) if endpoint.bind_addr.port() == 0 => endpoint
+                .advertise_addr
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .filter(|addr| addr.port() == 0)
+                .map(|addr| {
+                    std::net::SocketAddr::new(addr.ip(), local_addr.port()).to_string()
+                })
+                .unwrap_or(registration_address),
+            Some(_) => registration_address,
+            None => local_addr.to_string(),
+        };
+        let shutdown = exchange_service.cancel_token().clone();
+        let _exchange_task = exchange_service
+            .start_listener(listener)
+            .await
+            .map_err(io::Error::other)?;
+        Some(shutdown)
+    } else {
+        None
+    };
     let shuffle_mux = crate::exchange::multiplexer::WorkerStreamMultiplexer::new(
         shuffle_pool.clone(),
         crate::exchange::flow_control::FlowController::new(),
     )
     .with_src_worker(WorkerId(proposed_worker_id));
-    let listener = tokio::net::TcpListener::bind(exchange_addr).await?;
-    let exchange_address = listener.local_addr()?.to_string();
-    let exchange_task = exchange_service
-        .start_listener(listener)
-        .await
-        .map_err(io::Error::other)?;
-
     let worker_id_clone = worker_id.clone();
     let epoch_client = handle.clone();
     let active_shards_clone = active_shards.clone();
@@ -2475,18 +2641,18 @@ where
     let compaction_config_clone = compaction_config.clone();
 
     let join_handle = tokio::spawn(async move {
-        let _exchange_task = AbortOnDropHandle::new(exchange_task);
+        let _exchange_shutdown = exchange_shutdown.map(CancelOnDrop);
         // 1. Send Registration message.
         let reg = WorkerRegistration::new(
             WorkerId(proposed_worker_id),
             NodeRole::Worker,
-            exchange_address,
+            registration_address,
             initial_headroom,
         )
         .with_location(location.clone())
         .with_capabilities(capabilities)
         .with_compatibility(
-            rockstream_types::compatibility::SupportedVersionRange::v1_through_v2(),
+            rockstream_types::compatibility::SupportedVersionRange::v3_only(),
             rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(),
         );
         let mut local_info = rockstream_types::topology::WorkerInfo::from_registration(&reg);
@@ -2605,6 +2771,14 @@ where
             };
 
             match msg {
+                ControlMessage::SecurityAuditRecorded {
+                    request_id,
+                    persisted,
+                } => {
+                    if let Some(waiter) = security_audit_waiters.lock().remove(&request_id) {
+                        let _ = waiter.send(persisted);
+                    }
+                }
                 ControlMessage::BeginDrain(request) => {
                     let Some(id) = *worker_id_clone.read() else {
                         continue;
@@ -2662,7 +2836,20 @@ where
                         }
                     }
                 }
-                ControlMessage::Registered { worker_id: wid } => {
+                ControlMessage::Registered {
+                    worker_id: wid,
+                    protocol_version,
+                } => {
+                    if !rockstream_types::compatibility::SupportedVersionRange::v3_only()
+                        .contains(protocol_version)
+                    {
+                        tracing::error!(
+                            code = %rockstream_types::error_code::RS_5021,
+                            %protocol_version,
+                            "control plane does not support the worker protocol required for audited shard ownership"
+                        );
+                        break;
+                    }
                     tracing::info!("Worker client registered successfully as {:?}", wid);
                     *worker_id_clone.write() = Some(wid);
                     local_info.worker_id = wid;
@@ -2672,7 +2859,10 @@ where
                         .send(WorkerMessage::OwnedShuffleReady { worker_id: wid })
                         .await;
                 }
-                ControlMessage::TopologyChanged { workers } => {
+                ControlMessage::TopologyChanged {
+                    workers,
+                    shard_leases: leases,
+                } => {
                     shuffle_pool.replace_peer_infos(workers.clone());
                     if let Some(worker) = workers
                         .iter()
@@ -2685,6 +2875,9 @@ where
                     let mut topology = topology_workers.write();
                     topology.clear();
                     topology.extend(workers.into_iter().map(|worker| (worker.worker_id, worker)));
+                    let mut current_leases = shard_leases.write();
+                    current_leases.clear();
+                    current_leases.extend(leases.into_iter().map(|lease| (lease.shard_id, lease)));
                 }
                 ControlMessage::Deploy { descriptor } => {
                     let result: io::Result<Arc<WorkerDeployment>> = async {
@@ -3350,6 +3543,14 @@ where
             }
         }
 
+        if let Some(shutdown) = &_exchange_shutdown {
+            shutdown.0.cancel();
+        }
+        topology_workers.write().clear();
+        shard_leases.write().clear();
+        for (_, waiter) in std::mem::take(&mut *security_audit_waiters.lock()) {
+            let _ = waiter.send(false);
+        }
         if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
             let _ = waiter.send(Err("Control channel closed".to_owned()));
         }

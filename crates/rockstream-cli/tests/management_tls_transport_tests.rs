@@ -123,12 +123,14 @@ fn spawn_worker_process(
     storage: &Path,
     control_addr: SocketAddr,
     pki: &TestPki,
+    config: &Path,
 ) -> RunningProcess {
     let (certificate, key) = pki.worker_certs.get(&1).unwrap();
     RunningProcess(
         Command::new(binary)
             .env("RUST_LOG", "off")
             .env_remove("ROCKSTREAM_CONFIG")
+            .env("ROCKSTREAM_CONFIG", config)
             .args(["start", "--role", "worker", "--storage"])
             .arg(storage)
             .args(["--control"])
@@ -509,6 +511,15 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         management_addr = free_addr();
     }
     let worker_storage = temp.path().join("worker-storage");
+    let exchange_addr = free_addr();
+    let worker_config = temp.path().join("worker.toml");
+    std::fs::write(
+        &worker_config,
+        format!(
+            "[worker]\nexchange_bind_addr = '{exchange_addr}'\nexchange_advertise_addr = '{exchange_addr}'\n"
+        ),
+    )
+    .unwrap();
     let mut control = spawn_control_process(binary, &storage, control_addr, management_addr, &pki);
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -536,7 +547,8 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let mut worker = spawn_worker_process(binary, &worker_storage, control_addr, &pki);
+    let mut worker =
+        spawn_worker_process(binary, &worker_storage, control_addr, &pki, &worker_config);
     let deadline = Instant::now() + Duration::from_secs(20);
     let before_workers = loop {
         let output = run_management_cli(
@@ -571,12 +583,7 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
     );
     assert_eq!(node.node_id, 1);
     assert_eq!(node.role, "worker");
-    let (host, port) = node
-        .address
-        .rsplit_once(":")
-        .expect("worker address includes port");
-    assert_eq!(host, "127.0.0.1");
-    assert_ne!(port.parse::<u16>().expect("worker port is valid"), 0);
+    assert_eq!(node.address, exchange_addr.to_string());
     assert_eq!(node.state, "active");
     assert!((0.0..=1.0).contains(&node.capacity_headroom));
     assert_eq!(node.host_id, "management-test-worker");
@@ -698,7 +705,7 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
             nodes: vec![ManagementNodeInfo {
                 node_id: 1,
                 role: "worker".to_owned(),
-                address: actual_status.nodes[0].address.clone(),
+                address: exchange_addr.to_string(),
                 state: "active".to_owned(),
                 capacity_headroom: actual_capacity_headroom,
                 host_id: "management-test-worker".to_owned(),

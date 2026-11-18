@@ -19,7 +19,6 @@ use rockstream_control::delegation::{
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::{ControlService, SecretStore, ShardManager, TopologyCatalog};
 use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata_and_tls as start_worker_client_for_local_test;
-use rockstream_runtime::client::start_worker_client_with_tls;
 use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_storage::catalog::{
     CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogSourceEntry, CatalogStore,
@@ -32,7 +31,7 @@ use rockstream_types::authorization::{
     ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
     SecurityAuditRecord, SecurityPrincipal,
 };
-use rockstream_types::error_code::{RS_2400, RS_2410, RS_2411, RS_2412};
+use rockstream_types::error_code::{RS_2400, RS_2410, RS_2411};
 use rockstream_types::ids::{
     DatabaseId, NamespaceId, OperatorId, PrincipalId, ShardId, SourceId, TableId, WorkerId,
     WorkloadId,

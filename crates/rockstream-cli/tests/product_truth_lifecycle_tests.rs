@@ -294,9 +294,12 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
     let pki = TestPki::generate_with_worker_ids([77]);
     preprovision_administrator(binary, &control_storage, &pki, "gateway");
     let canary = "v066-management-config-canary-93e1";
+    let exchange_addr = format!("127.0.0.1:{}", free_port());
     std::fs::write(
         root.path().join("rockstream.toml"),
-        format!("version = 1\n[auth]\nsecret_path = \"{canary}\"\n"),
+        format!(
+            "version = 1\n[auth]\nsecret_path = \"{canary}\"\n[worker]\nexchange_bind_addr = \"{exchange_addr}\"\nexchange_advertise_addr = \"{exchange_addr}\"\n"
+        ),
     )
     .expect("write canary config");
 
@@ -331,21 +334,25 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
 
     let (worker_cert, worker_key) = pki.worker_certs.get(&77).unwrap();
     let mut worker_command = Command::new(binary);
-    worker_command.env("RUST_LOG", "off").args([
-        "start",
-        "--role",
-        "worker",
-        "--storage",
-        worker_storage.to_str().unwrap(),
-        "--control",
-        &control_addr,
-        "--worker-id",
-        "77",
-        "--host-id",
-        "standalone-host",
-        "--availability-zone",
-        "standalone-zone",
-    ]);
+    worker_command
+        .env("RUST_LOG", "off")
+        .env_remove("ROCKSTREAM_CONFIG")
+        .current_dir(root.path())
+        .args([
+            "start",
+            "--role",
+            "worker",
+            "--storage",
+            worker_storage.to_str().unwrap(),
+            "--control",
+            &control_addr,
+            "--worker-id",
+            "77",
+            "--host-id",
+            "standalone-host",
+            "--availability-zone",
+            "standalone-zone",
+        ]);
     worker_command
         .args(["--internal-tls-cert-path"])
         .arg(worker_cert)
@@ -368,7 +375,7 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
         vec![ManagementNodeInfo {
             node_id: 77,
             role: "worker".to_owned(),
-            address: "127.0.0.1:0".to_owned(),
+            address: exchange_addr.clone(),
             state: "active".to_owned(),
             capacity_headroom: 1.0,
             host_id: "standalone-host".to_owned(),

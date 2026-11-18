@@ -28,6 +28,26 @@ fn security_audit_catalog() -> Arc<DurableCatalogStore> {
     ))
 }
 
+fn worker_shuffle_denial_record() -> SecurityAuditRecord {
+    SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "shuffle-authorization:test-1".to_owned(),
+        timestamp_ms: 1_800_000_000_000,
+        actor: AuditIdentity::Verified("worker-2".to_owned()),
+        target: AuditField::Known("source_shard:10".to_owned()),
+        scope: AuditField::Known("worker_shuffle".to_owned()),
+        action: SecurityAuditClass::AuthorizationDenial,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Observed(
+            "exchange:100:source:10:target:20:epoch:1:sequence:1".to_owned(),
+        ),
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    }
+}
+
 fn assert_control_message(actual: &str, expected: ControlMessage) {
     assert_eq!(actual, serde_json::to_string(&expected).unwrap());
 }
@@ -78,6 +98,7 @@ async fn connect_registered_worker(
         response.trim(),
         ControlMessage::Registered {
             worker_id: WorkerId(worker_id),
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
         },
     );
     reader
@@ -135,6 +156,187 @@ async fn test_control_worker_mtls_valid_cert_admitted() {
     );
 
     worker_handle.abort();
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn control_worker_mtls_rejects_protocol_without_audited_shuffle_support() {
+    let pki = TestPki::generate();
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
+    let catalog = TopologyCatalog::new();
+    let security_catalog = security_audit_catalog();
+    let svc = ControlService::new(catalog.clone())
+        .with_audit(audit.clone())
+        .with_security_catalog(security_catalog.clone())
+        .with_internal_tls(pki.control_tls_config());
+    let handle = svc.start("127.0.0.1:0").await.unwrap();
+    let connector =
+        rockstream_runtime::tls::build_client_tls_connector(&pki.worker_tls_config(1)).unwrap();
+    let stream = TcpStream::connect(handle.addr).await.unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap();
+    let mut reader = BufReader::new(connector.connect(server_name, stream).await.unwrap());
+    let registration = WorkerRegistration::new(
+        WorkerId(1),
+        NodeRole::Worker,
+        "127.0.0.1:7001",
+        CapacityHeadroom::FULL,
+    )
+    .with_compatibility(
+        rockstream_types::compatibility::SupportedVersionRange::v1_through_v2(),
+        rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(),
+    );
+    let request = WorkerMessage::Register(registration);
+    reader
+        .get_mut()
+        .write_all((serde_json::to_string(&request).unwrap() + "\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    assert_control_message(
+        response.trim(),
+        ControlMessage::OperationFailed {
+            code: "RS-5021".to_owned(),
+            message: "RS-5021: authenticated worker shuffle requires protocol v3".to_owned(),
+            next_steps: rockstream_types::error_code::next_steps(
+                rockstream_types::error_code::RS_5021,
+            )
+            .to_string(),
+        },
+    );
+    assert_eq!(catalog.len(), 0);
+    assert!(audit.read_all().unwrap().iter().any(|event| {
+        event.action == "security.internal_mtls_denied"
+            && event.error_code.as_deref() == Some("RS-5021")
+    }));
+    let records = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].actor,
+        AuditIdentity::Verified("worker:worker-1".to_owned())
+    );
+    assert_eq!(records[0].target, AuditField::Known("worker-1".to_owned()));
+    assert_eq!(
+        records[0].scope,
+        AuditField::Known("worker_control".to_owned())
+    );
+    assert_eq!(records[0].action, SecurityAuditClass::AuthorizationDenial);
+    assert_eq!(records[0].outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(records[0].correlation, AuditCorrelation::Unknown);
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn worker_security_audit_is_durable_before_acknowledgement() {
+    let pki = TestPki::generate();
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
+    let security_catalog = security_audit_catalog();
+    let svc = ControlService::new(TopologyCatalog::new())
+        .with_audit(audit)
+        .with_security_catalog(security_catalog.clone())
+        .with_internal_tls(pki.control_tls_config());
+    let handle = svc.start("127.0.0.1:0").await.unwrap();
+    let mut worker = connect_registered_worker(&pki, handle.addr, 1).await;
+    let record = worker_shuffle_denial_record();
+    let request_id = record.event_id.clone();
+    let response = send_and_read(
+        &mut worker,
+        &WorkerMessage::ReportSecurityAudit {
+            request_id,
+            record: record.clone(),
+        },
+    )
+    .await;
+    assert_control_message(
+        &response,
+        ControlMessage::SecurityAuditRecorded {
+            request_id: record.event_id.clone(),
+            persisted: true,
+        },
+    );
+    assert_eq!(
+        security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap(),
+        vec![record]
+    );
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn worker_security_audit_requires_an_authenticated_peer() {
+    let security_catalog = security_audit_catalog();
+    let svc = ControlService::new(TopologyCatalog::new())
+        .with_security_catalog(security_catalog.clone())
+        .with_insecure_dev_mode();
+    let handle = svc.start("127.0.0.1:0").await.unwrap();
+    let mut worker = BufReader::new(TcpStream::connect(handle.addr).await.unwrap());
+    let registration = WorkerRegistration::new(
+        WorkerId(2),
+        NodeRole::Worker,
+        "127.0.0.1:7002".to_owned(),
+        CapacityHeadroom::FULL,
+    );
+    worker
+        .get_mut()
+        .write_all(
+            (serde_json::to_string(&WorkerMessage::Register(registration)).unwrap() + "\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    worker.read_line(&mut response).await.unwrap();
+    assert_control_message(
+        response.trim(),
+        ControlMessage::Registered {
+            worker_id: WorkerId(2),
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
+        },
+    );
+
+    let record = worker_shuffle_denial_record();
+    worker
+        .get_mut()
+        .write_all(
+            (serde_json::to_string(&WorkerMessage::ReportSecurityAudit {
+                request_id: record.event_id.clone(),
+                record,
+            })
+            .unwrap()
+                + "\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    loop {
+        response.clear();
+        worker.read_line(&mut response).await.unwrap();
+        if matches!(
+            serde_json::from_str::<ControlMessage>(response.trim()).unwrap(),
+            ControlMessage::SecurityAuditRecorded { .. }
+        ) {
+            assert_control_message(
+                response.trim(),
+                ControlMessage::SecurityAuditRecorded {
+                    request_id: "shuffle-authorization:test-1".to_owned(),
+                    persisted: false,
+                },
+            );
+            break;
+        }
+    }
+    assert!(security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .is_empty());
     handle.shutdown();
 }
 

@@ -5,20 +5,29 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
 use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::exchange::proto::{shuffle_service_server::ShuffleService, ShuffleAck, ShuffleFrame};
 use crate::exchange::serialization::deserialize_zset;
 use rockstream_ops::zset::ArrowZSet;
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+};
 use rockstream_types::compatibility::{ProtocolVersion, SupportedVersionRange};
 use rockstream_types::config::ExchangeConfig;
-use rockstream_types::error_code::{RS_2401, RS_2410};
+use rockstream_types::error_code::{RS_0001, RS_0003, RS_2401, RS_2410};
 use rockstream_types::identity::{NodeIdentity, NodeRole};
+use rockstream_types::ids::WorkerId;
+use rockstream_types::topology::WorkerMessage;
+
+pub type SecurityAuditWaiters = Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
 pub(crate) type OwnedShuffleHandler = Arc<
     dyn Fn(ShuffleFrame, bytes::Bytes) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
@@ -38,6 +47,13 @@ pub struct ExchangeInlet {
 pub struct ExchangeRegistry {
     inlets: Arc<RwLock<HashMap<(u64, u32), ExchangeInlet>>>,
     active_shards: Arc<RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>>,
+    shard_leases:
+        Arc<RwLock<HashMap<rockstream_types::ids::ShardId, rockstream_types::lease::ShardLease>>>,
+    topology_workers: Arc<
+        RwLock<HashMap<rockstream_types::ids::WorkerId, rockstream_types::topology::WorkerInfo>>,
+    >,
+    worker_messages: Option<mpsc::Sender<WorkerMessage>>,
+    security_audit_waiters: Option<SecurityAuditWaiters>,
     cluster_frontier: Arc<std::sync::atomic::AtomicU64>,
     grpc_frames_received: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -47,6 +63,10 @@ impl Default for ExchangeRegistry {
         Self {
             inlets: Arc::new(RwLock::new(HashMap::new())),
             active_shards: Arc::new(RwLock::new(HashMap::new())),
+            shard_leases: Arc::new(RwLock::new(HashMap::new())),
+            topology_workers: Arc::new(RwLock::new(HashMap::new())),
+            worker_messages: None,
+            security_audit_waiters: None,
             cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -63,12 +83,175 @@ impl ExchangeRegistry {
             RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>,
         >,
     ) -> Self {
-        ExchangeRegistry {
+        Self::with_worker_state(active_shards, Arc::new(RwLock::new(HashMap::new())))
+    }
+
+    pub fn with_worker_state(
+        active_shards: Arc<
+            RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>,
+        >,
+        topology_workers: Arc<
+            RwLock<
+                HashMap<rockstream_types::ids::WorkerId, rockstream_types::topology::WorkerInfo>,
+            >,
+        >,
+    ) -> Self {
+        Self {
             inlets: Arc::new(RwLock::new(HashMap::new())),
             active_shards,
+            shard_leases: Arc::new(RwLock::new(HashMap::new())),
+            topology_workers,
+            worker_messages: None,
+            security_audit_waiters: None,
             cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    pub fn with_shard_leases(
+        mut self,
+        shard_leases: Arc<
+            RwLock<HashMap<rockstream_types::ids::ShardId, rockstream_types::lease::ShardLease>>,
+        >,
+    ) -> Self {
+        self.shard_leases = shard_leases;
+        self
+    }
+
+    pub fn with_security_audit(
+        mut self,
+        worker_messages: mpsc::Sender<WorkerMessage>,
+        waiters: SecurityAuditWaiters,
+    ) -> Self {
+        self.worker_messages = Some(worker_messages);
+        self.security_audit_waiters = Some(waiters);
+        self
+    }
+
+    async fn append_security_audit(&self, record: SecurityAuditRecord) -> Result<(), Status> {
+        let (Some(worker_messages), Some(waiters)) =
+            (&self.worker_messages, &self.security_audit_waiters)
+        else {
+            return Err(Status::unavailable(format!(
+                "{RS_0003}: required security audit transport is unavailable"
+            )));
+        };
+        record.validate().map_err(|_| {
+            Status::internal(format!("{RS_0003}: invalid required security audit record"))
+        })?;
+        let request_id = record.event_id.clone();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        {
+            let mut waiters = waiters.lock();
+            if waiters.len() >= worker_messages.max_capacity() || waiters.contains_key(&request_id)
+            {
+                return Err(Status::unavailable(format!(
+                    "{RS_0003}: required security audit capacity is unavailable"
+                )));
+            }
+            waiters.insert(request_id.clone(), ack_tx);
+        }
+        if worker_messages
+            .try_send(WorkerMessage::ReportSecurityAudit {
+                request_id: request_id.clone(),
+                record,
+            })
+            .is_err()
+        {
+            waiters.lock().remove(&request_id);
+            return Err(Status::unavailable(format!(
+                "{RS_0003}: required security audit transport is unavailable"
+            )));
+        }
+        match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
+            Ok(Ok(true)) => Ok(()),
+            _ => {
+                waiters.lock().remove(&request_id);
+                Err(Status::unavailable(format!(
+                    "{RS_0003}: required security audit append failed"
+                )))
+            }
+        }
+    }
+
+    fn node_identity_rejection(
+        identity: AuditIdentity,
+        target: AuditField<String>,
+    ) -> SecurityAuditRecord {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("shuffle-node-identity:{}", uuid::Uuid::new_v4()),
+            timestamp_ms: timestamp_ms.max(1),
+            actor: identity,
+            target,
+            scope: AuditField::Known("worker_shuffle".to_owned()),
+            action: SecurityAuditClass::NodeIdentityRejection,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    }
+
+    fn tls_handshake_rejection(peer_addr: std::net::SocketAddr) -> SecurityAuditRecord {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("shuffle-tls-handshake:{}", uuid::Uuid::new_v4()),
+            timestamp_ms: timestamp_ms.max(1),
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Unknown,
+            scope: AuditField::Known("worker_shuffle".to_owned()),
+            action: SecurityAuditClass::NodeIdentityRejection,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Observed(format!("peer={peer_addr}")),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    }
+
+    async fn audit_authorization_denial(
+        &self,
+        worker_id: WorkerId,
+        frame: &ShuffleFrame,
+    ) -> Result<(), Status> {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        self.append_security_audit(SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("shuffle-authorization:{}", uuid::Uuid::new_v4()),
+            timestamp_ms: timestamp_ms.max(1),
+            actor: AuditIdentity::Verified(worker_id.to_string()),
+            target: AuditField::Known(format!("source_shard:{}", frame.src_shard)),
+            scope: AuditField::Known("worker_shuffle".to_owned()),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Observed(format!(
+                "exchange:{}:source:{}:target:{}:epoch:{}:sequence:{}",
+                frame.exchange_id, frame.src_shard, frame.target_shard, frame.epoch, frame.seq
+            )),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        })
+        .await
     }
 
     /// Get total count of gRPC frames received.
@@ -122,6 +305,43 @@ impl ExchangeRegistry {
             .and_then(|state| state.db.clone())
     }
 
+    fn registered_worker_id(
+        &self,
+        identity: &NodeIdentity,
+    ) -> Option<rockstream_types::ids::WorkerId> {
+        self.topology_workers
+            .read()
+            .values()
+            .find(|worker| {
+                worker.healthy
+                    && worker.lifecycle == rockstream_types::topology::WorkerLifecycleState::Active
+                    && identity.matches_worker_id(worker.worker_id.0)
+            })
+            .map(|worker| worker.worker_id)
+    }
+
+    fn frame_authorization_denial(
+        &self,
+        worker_id: rockstream_types::ids::WorkerId,
+        src_shard: u32,
+    ) -> Option<String> {
+        let active = self
+            .topology_workers
+            .read()
+            .get(&worker_id)
+            .is_some_and(|worker| worker.healthy && worker.lifecycle.is_active());
+        if !active {
+            return Some(format!("authenticated worker {worker_id} is not active"));
+        }
+        self.shard_leases
+            .read()
+            .get(&rockstream_types::ids::ShardId(src_shard as u64))
+            .is_none_or(|lease| lease.worker_id != worker_id)
+            .then(|| {
+                format!("authenticated worker {worker_id} does not own source shard {src_shard}")
+            })
+    }
+
     pub fn register(
         &self,
         exchange_id: u64,
@@ -155,6 +375,7 @@ pub struct ExchangeService {
     cancel_token: CancellationToken,
     exchange_config: ExchangeConfig,
     internal_tls: Option<rockstream_types::identity::InternalTlsConfig>,
+    tls_reloader: Option<Arc<rockstream_types::tls::TlsCertificateReloader>>,
     protocol_range: SupportedVersionRange,
     owned_handler: Option<OwnedShuffleHandler>,
     insecure_internal_dev: bool,
@@ -173,7 +394,8 @@ impl ExchangeService {
             cancel_token: CancellationToken::new(),
             exchange_config: ExchangeConfig::default(),
             internal_tls: None,
-            protocol_range: SupportedVersionRange::v1_through_v2(),
+            tls_reloader: None,
+            protocol_range: SupportedVersionRange::v1_through_v3(),
             owned_handler: None,
             insecure_internal_dev: false,
         }
@@ -189,6 +411,14 @@ impl ExchangeService {
         config: rockstream_types::identity::InternalTlsConfig,
     ) -> Self {
         self.internal_tls = Some(config);
+        self
+    }
+
+    pub fn with_tls_reloader(
+        mut self,
+        reloader: Arc<rockstream_types::tls::TlsCertificateReloader>,
+    ) -> Self {
+        self.tls_reloader = Some(reloader);
         self
     }
 
@@ -225,7 +455,9 @@ impl ExchangeService {
     ) -> Result<tokio::task::JoinHandle<()>, String> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .map_err(|error| format!("failed to bind exchange listener: {error}"))?;
+            .map_err(|error| {
+                format!("{RS_0001}: failed to bind worker shuffle listener {addr}: {error}")
+            })?;
         self.start_listener(listener).await
     }
 
@@ -235,7 +467,7 @@ impl ExchangeService {
     ) -> Result<tokio::task::JoinHandle<()>, String> {
         let addr = listener.local_addr().map_err(|error| error.to_string())?;
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let tls_config = if let Some(tls_cfg) = &self.internal_tls {
+        let tls_reloader = if let Some(tls_cfg) = &self.internal_tls {
             if !tls_cfg.is_enabled() {
                 return Err(format!(
                     "{RS_2410}: worker shuffle TLS certificate and private key are required"
@@ -245,32 +477,22 @@ impl ExchangeService {
                 return Err(format!("{RS_2410}: worker shuffle requires mutual TLS"));
             }
             tls_cfg.validate()?;
-            let cert_path = tls_cfg.cert_path.as_ref().unwrap();
-            let key_path = tls_cfg.key_path.as_ref().unwrap();
-            let cert_pem = std::fs::read_to_string(cert_path)
-                .map_err(|e| format!("failed to read TLS cert {}: {e}", cert_path.display()))?;
-            let key_pem = std::fs::read_to_string(key_path)
-                .map_err(|e| format!("failed to read TLS key {}: {e}", key_path.display()))?;
-            let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-            let mut server_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
-            if let Some(ca_path) = &tls_cfg.ca_cert_path {
-                let ca_pem = std::fs::read_to_string(ca_path).map_err(|e| {
-                    format!("failed to read TLS CA cert {}: {e}", ca_path.display())
-                })?;
-                let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
-                server_tls = server_tls.client_ca_root(ca_cert);
-            }
-            Some(server_tls)
+            Some(match &self.tls_reloader {
+                Some(reloader) => reloader.clone(),
+                None => Arc::new(rockstream_types::tls::TlsCertificateReloader::new(
+                    tls_cfg.clone(),
+                )?),
+            })
         } else {
             None
         };
 
-        if tls_config.is_none() && !addr.ip().is_loopback() {
+        if tls_reloader.is_none() && !addr.ip().is_loopback() {
             return Err(format!(
                 "{RS_2410}: plaintext worker shuffle is limited to loopback development"
             ));
         }
-        if tls_config.is_none() && !self.insecure_internal_dev {
+        if tls_reloader.is_none() && !self.insecure_internal_dev {
             return Err(format!(
                 "{RS_2410}: plaintext worker shuffle requires explicit loopback development opt-in"
             ));
@@ -282,31 +504,105 @@ impl ExchangeService {
         )
         .with_exchange_config(self.exchange_config.clone())
         .with_supported_protocol_range(self.protocol_range)
-        .with_required_worker_identity(tls_config.is_some());
+        .with_required_worker_identity(tls_reloader.is_some());
         server.owned_handler = self.owned_handler.clone();
         let cancel_token = self.cancel_token.clone();
+        let task_tracker = self.task_tracker.clone();
 
-        let mut builder = tonic::transport::Server::builder();
-        if let Some(tls) = tls_config {
-            builder = builder
-                .tls_config(tls)
-                .map_err(|e| format!("{RS_2410}: failed to configure worker shuffle TLS: {e}"))?;
-        }
-        let incoming = futures::stream::unfold(listener, |listener| async move {
-            let connection = listener.accept().await.map(|(stream, _)| stream);
-            Some((connection, listener))
-        });
         let handle = self.task_tracker.spawn(async move {
-            let _ = builder
-                .add_service(
-                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
-                        server,
-                    ),
-                )
-                .serve_with_incoming_shutdown(Box::pin(incoming), async move {
-                    cancel_token.cancelled().await;
-                })
-                .await;
+            let audit_registry = server.registry.clone();
+            let api = crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                server,
+            );
+            let result = if let Some(reloader) = tls_reloader {
+                let (incoming_tx, incoming_rx) = mpsc::channel::<
+                    Result<
+                        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                        std::io::Error,
+                    >,
+                >(crate::exchange::flow_control::DEFAULT_MAX_PENDING_REQUESTS);
+                let handshake_gate = Arc::new(Semaphore::new(
+                    crate::exchange::flow_control::DEFAULT_MAX_PENDING_REQUESTS,
+                ));
+                let accept_tracker = task_tracker.clone();
+                let handshake_tracker = task_tracker.clone();
+                let accept_cancel = cancel_token.clone();
+                accept_tracker.spawn(async move {
+                    loop {
+                        let accepted = tokio::select! {
+                            _ = accept_cancel.cancelled() => break,
+                            accepted = listener.accept() => accepted,
+                        };
+                        let (stream, peer_addr) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(error) => {
+                                tracing::warn!(%error, %addr, "worker shuffle listener accept failed");
+                                continue;
+                            }
+                        };
+                        let permit = tokio::select! {
+                            _ = accept_cancel.cancelled() => break,
+                            permit = handshake_gate.clone().acquire_owned() => match permit {
+                                Ok(permit) => permit,
+                                Err(_) => break,
+                            },
+                        };
+                        let reloader = reloader.clone();
+                        let incoming_tx = incoming_tx.clone();
+                        let handshake_cancel = accept_cancel.clone();
+                        let audit_registry = audit_registry.clone();
+                        handshake_tracker.clone().spawn(async move {
+                            let _permit = permit;
+                            let handshake = tokio::select! {
+                                _ = handshake_cancel.cancelled() => return,
+                                result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    reloader.current_acceptor().accept(stream),
+                                ) => result,
+                            };
+                            match handshake {
+                                Ok(Ok(stream)) => {
+                                    let _ = incoming_tx.send(Ok(stream)).await;
+                                }
+                                Ok(Err(_)) | Err(_) => {
+                                    if let Err(error) = audit_registry
+                                        .append_security_audit(
+                                            ExchangeRegistry::tls_handshake_rejection(peer_addr),
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(%peer_addr, %error, code = %RS_0003, "failed to durably audit worker shuffle mTLS rejection");
+                                    }
+                                    tracing::warn!(%peer_addr, "worker shuffle mTLS handshake rejected");
+                                }
+                            }
+                        });
+                    }
+                });
+                let incoming = futures::stream::unfold(incoming_rx, |mut receiver| async move {
+                    receiver.recv().await.map(|stream| (stream, receiver))
+                });
+                tonic::transport::Server::builder()
+                    .add_service(api)
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        cancel_token.cancelled().await;
+                    })
+                    .await
+            } else {
+                let incoming = futures::stream::unfold(listener, |listener| async move {
+                    let accepted = listener.accept().await.map(|(stream, _)| stream);
+                    Some((accepted, listener))
+                });
+                tonic::transport::Server::builder()
+                    .add_service(api)
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        cancel_token.cancelled().await;
+                    })
+                    .await
+            };
+            if let Err(error) = result {
+                tracing::error!(code = %RS_0001, %error, %addr, "worker shuffle endpoint stopped");
+            }
         });
         Ok(handle)
     }
@@ -337,7 +633,7 @@ impl ShuffleServer {
             task_tracker: None,
             cancel_token: None,
             exchange_config: ExchangeConfig::default(),
-            protocol_range: SupportedVersionRange::v1_through_v2(),
+            protocol_range: SupportedVersionRange::v1_through_v3(),
             require_worker_identity: false,
             owned_handler: None,
         }
@@ -353,7 +649,7 @@ impl ShuffleServer {
             task_tracker,
             cancel_token,
             exchange_config: ExchangeConfig::default(),
-            protocol_range: SupportedVersionRange::v1_through_v2(),
+            protocol_range: SupportedVersionRange::v1_through_v3(),
             require_worker_identity: false,
             owned_handler: None,
         }
@@ -375,30 +671,66 @@ impl ShuffleServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn validate_worker_identity<T>(&self, request: &Request<T>) -> Result<(), Status> {
+    fn validate_worker_identity<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<WorkerId>, (Status, SecurityAuditRecord)> {
         if !self.require_worker_identity {
-            return Ok(());
+            return Ok(None);
         }
-        let certs = request.peer_certs().ok_or_else(|| {
-            Status::unauthenticated(format!("{RS_2410}: worker certificate required"))
-        })?;
-        let cert = certs.first().ok_or_else(|| {
-            Status::unauthenticated(format!("{RS_2410}: empty worker certificate chain"))
-        })?;
-        let identity =
-            NodeIdentity::from_certificate_der(cert.as_ref()).map_err(Status::unauthenticated)?;
+        let Some(certs) = request.peer_certs() else {
+            return Err((
+                Status::unauthenticated(format!("{RS_2410}: worker certificate required")),
+                ExchangeRegistry::node_identity_rejection(
+                    AuditIdentity::Unknown,
+                    AuditField::Unknown,
+                ),
+            ));
+        };
+        let Some(cert) = certs.first() else {
+            return Err((
+                Status::unauthenticated(format!("{RS_2410}: empty worker certificate chain")),
+                ExchangeRegistry::node_identity_rejection(
+                    AuditIdentity::Unknown,
+                    AuditField::Unknown,
+                ),
+            ));
+        };
+        let identity = match NodeIdentity::from_certificate_der(cert.as_ref()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err((
+                    Status::unauthenticated(error),
+                    ExchangeRegistry::node_identity_rejection(
+                        AuditIdentity::Unknown,
+                        AuditField::Unverified("invalid certificate identity".to_owned()),
+                    ),
+                ));
+            }
+        };
         if identity.role != NodeRole::Worker {
-            tracing::warn!(
-                action = "security.authorization_denied",
-                actor = %identity.to_cn(),
-                error_code = %RS_2401,
-                "non-worker identity denied on worker shuffle endpoint"
-            );
-            return Err(Status::permission_denied(format!(
-                "{RS_2401}: worker shuffle requires a worker node identity"
-            )));
+            return Err((
+                Status::permission_denied(format!(
+                    "{RS_2401}: worker shuffle requires a worker node identity"
+                )),
+                ExchangeRegistry::node_identity_rejection(
+                    AuditIdentity::Unverified(identity.to_cn()),
+                    AuditField::Unverified(identity.to_cn()),
+                ),
+            ));
         }
-        Ok(())
+        let Some(worker_id) = self.registry.registered_worker_id(&identity) else {
+            return Err((
+                Status::permission_denied(format!(
+                    "{RS_2401}: worker node identity is not currently registered"
+                )),
+                ExchangeRegistry::node_identity_rejection(
+                    AuditIdentity::Unverified(identity.to_cn()),
+                    AuditField::Unverified(identity.to_cn()),
+                ),
+            ));
+        };
+        Ok(Some(worker_id))
     }
 
     /// Validate a request's protocol metadata before its frame stream is read.
@@ -452,7 +784,13 @@ impl ShuffleService for ShuffleServer {
         &self,
         request: Request<Streaming<ShuffleFrame>>,
     ) -> Result<Response<Self::ShuffleStreamStream>, Status> {
-        self.validate_worker_identity(&request)?;
+        let authenticated_worker_id = match self.validate_worker_identity(&request) {
+            Ok(worker_id) => worker_id,
+            Err((status, record)) => {
+                self.registry.append_security_audit(record).await?;
+                return Err(status);
+            }
+        };
         self.validate_protocol_version(request.metadata())?;
         let owned_context = request
             .metadata()
@@ -529,6 +867,7 @@ impl ShuffleService for ShuffleServer {
         }
         let mut stream = request.into_inner();
         let registry = self.registry.clone();
+        let require_local_assignment = self.require_worker_identity;
 
         let cap = self.exchange_config.frame_channel_capacity.max(1);
         let (tx, rx) = mpsc::channel(cap);
@@ -538,49 +877,90 @@ impl ShuffleService for ShuffleServer {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(frame) => {
+                        if let Some(worker_id) = authenticated_worker_id {
+                            if let Some(reason) =
+                                registry.frame_authorization_denial(worker_id, frame.src_shard)
+                            {
+                                if let Err(audit_error) =
+                                    registry.audit_authorization_denial(worker_id, &frame).await
+                                {
+                                    let _ = tx.send(Err(audit_error)).await;
+                                    break;
+                                }
+                                let status =
+                                    Status::permission_denied(format!("{RS_2401}: {reason}"));
+                                tracing::warn!(
+                                    action = "security.authorization_denied",
+                                    authenticated_worker = %worker_id,
+                                    reason = %reason,
+                                    source_shard = frame.src_shard,
+                                    exchange_id = frame.exchange_id,
+                                    target_shard = frame.target_shard,
+                                    epoch = frame.epoch,
+                                    seq = frame.seq,
+                                    error_code = %RS_2401,
+                                    "shuffle frame authorization denied"
+                                );
+                                let _ = tx.send(Err(status)).await;
+                                break;
+                            }
+                        }
+                        if require_local_assignment
+                            && registry.get_shard_db(frame.target_shard).is_none()
+                        {
+                            let status = Status::permission_denied(format!(
+                                "{RS_2401}: target shard is not assigned to this worker"
+                            ));
+                            let _ = tx.send(Err(status)).await;
+                            break;
+                        }
                         registry
                             .grpc_frames_received
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let inlet_opt = registry.get(frame.exchange_id, frame.target_shard);
-                        if let Some(inlet) = inlet_opt {
-                            let mut already_reflected = false;
-                            if let Some(db) = registry.get_shard_db(frame.target_shard) {
-                                match crate::exchange::persistence::committed_frontier(&db).await {
-                                    Ok(frontier) => {
-                                        already_reflected = frame.epoch <= frontier;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            code = %rockstream_types::error_code::RS_3023,
-                                            exchange_id = frame.exchange_id,
-                                            target_shard = frame.target_shard,
-                                            epoch = frame.epoch,
-                                            "failed to read committed frontier for shuffle replay dedup; delivering conservatively: {:?}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-
-                            if !already_reflected {
-                                if let Ok(zset) =
-                                    deserialize_zset(&frame.payload, inlet.schema.clone())
-                                {
-                                    if inlet.sender.send(zset).await.is_err() {
-                                        tracing::warn!(
-                                            exchange_id = frame.exchange_id,
-                                            target_shard = frame.target_shard,
-                                            "Target inlet receiver dropped"
-                                        );
-                                    }
-                                }
-                            }
-                        } else {
+                        let Some(inlet) = registry.get(frame.exchange_id, frame.target_shard)
+                        else {
                             tracing::warn!(
                                 exchange_id = frame.exchange_id,
                                 target_shard = frame.target_shard,
                                 "Received shuffle frame for unregistered target"
                             );
+                            let _ = tx
+                                .send(Err(Status::permission_denied(format!(
+                                    "{RS_2401}: shuffle target is not registered"
+                                ))))
+                                .await;
+                            break;
+                        };
+                        let mut already_reflected = false;
+                        if let Some(db) = registry.get_shard_db(frame.target_shard) {
+                            match crate::exchange::persistence::committed_frontier(&db).await {
+                                Ok(frontier) => {
+                                    already_reflected = frame.epoch <= frontier;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        code = %rockstream_types::error_code::RS_3023,
+                                        exchange_id = frame.exchange_id,
+                                        target_shard = frame.target_shard,
+                                        epoch = frame.epoch,
+                                        "failed to read committed frontier for shuffle replay dedup; delivering conservatively: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+
+                        if !already_reflected {
+                            if let Ok(zset) = deserialize_zset(&frame.payload, inlet.schema.clone())
+                            {
+                                if inlet.sender.send(zset).await.is_err() {
+                                    tracing::warn!(
+                                        exchange_id = frame.exchange_id,
+                                        target_shard = frame.target_shard,
+                                        "Target inlet receiver dropped"
+                                    );
+                                }
+                            }
                         }
 
                         let ack = ShuffleAck {
@@ -633,14 +1013,32 @@ impl ShuffleService for ShuffleServer {
         &self,
         request: Request<Streaming<crate::exchange::proto::ExchangeFrame>>,
     ) -> Result<Response<Self::ExchangeStreamStream>, Status> {
-        self.validate_worker_identity(&request)?;
+        if let Err((status, record)) = self.validate_worker_identity(&request) {
+            self.registry.append_security_audit(record).await?;
+            return Err(status);
+        }
         self.validate_protocol_version(request.metadata())?;
         let mut stream = request.into_inner();
+        let registry = self.registry.clone();
+        let require_local_assignment = self.require_worker_identity;
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(frame) => {
+                        if require_local_assignment
+                            && u32::try_from(frame.shard_id)
+                                .ok()
+                                .and_then(|shard_id| registry.get_shard_db(shard_id))
+                                .is_none()
+                        {
+                            let _ = tx
+                                .send(Err(Status::permission_denied(format!(
+                                    "{RS_2401}: target shard is not assigned to this worker"
+                                ))))
+                                .await;
+                            break;
+                        }
                         let ack = crate::exchange::proto::ExchangeAck {
                             protocol_version: frame.protocol_version,
                             workload_id: frame.workload_id,
@@ -754,6 +1152,52 @@ mod tests {
             healthy: true,
             lifecycle: WorkerLifecycleState::Active,
         }
+    }
+
+    #[test]
+    fn shuffle_authorization_observes_revocation_with_live_lease() {
+        use rockstream_types::ids::{LeaseToken, ShardId};
+
+        let worker_id = WorkerId(42);
+        let shard_id = ShardId(10);
+        let topology_workers = Arc::new(RwLock::new(HashMap::from([(
+            worker_id,
+            worker_info(worker_id.0, "127.0.0.1:1".to_owned(), "host", "az"),
+        )])));
+        let shard_leases = Arc::new(RwLock::new(HashMap::from([(
+            shard_id,
+            ShardLease::new(shard_id, worker_id, LeaseToken(1)),
+        )])));
+        let registry = ExchangeRegistry::with_worker_state(
+            Arc::new(RwLock::new(HashMap::new())),
+            topology_workers.clone(),
+        )
+        .with_shard_leases(shard_leases.clone());
+
+        assert_eq!(registry.frame_authorization_denial(worker_id, 10), None);
+        topology_workers
+            .write()
+            .get_mut(&worker_id)
+            .unwrap()
+            .healthy = false;
+        assert_eq!(
+            registry.frame_authorization_denial(worker_id, 10),
+            Some(format!("authenticated worker {worker_id} is not active"))
+        );
+        assert_eq!(
+            shard_leases.read().get(&shard_id).unwrap().worker_id,
+            worker_id
+        );
+
+        let mut topology_worker = topology_workers.write();
+        let worker = topology_worker.get_mut(&worker_id).unwrap();
+        worker.healthy = true;
+        worker.lifecycle = WorkerLifecycleState::draining(1, 2);
+        drop(topology_worker);
+        assert_eq!(
+            registry.frame_authorization_denial(worker_id, 10),
+            Some(format!("authenticated worker {worker_id} is not active"))
+        );
     }
 
     async fn shard_db(name: &str) -> (Arc<object_store::memory::InMemory>, ShardDb) {
@@ -1077,6 +1521,46 @@ mod tests {
         let _ = tx_close.send(());
         server_handle.abort();
         eprintln!("TEST FINISHED");
+    }
+
+    #[tokio::test]
+    async fn grpc_shuffle_rejects_unregistered_target_instead_of_acknowledging_loss() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let service = ExchangeService::new(ExchangeRegistry::new()).with_insecure_internal_dev();
+        service.start(addr).await.unwrap();
+
+        let peers = Arc::new(RwLock::new(HashMap::from([(
+            WorkerId(1),
+            addr.to_string(),
+        )])));
+        let pool = ShuffleClientPool::new(peers);
+        let mut client = pool.get_client(WorkerId(1)).await.unwrap();
+        let frame = ShuffleFrame {
+            exchange_id: 10,
+            src_shard: 1,
+            target_shard: 2,
+            epoch: 1,
+            seq: 1,
+            payload: Vec::new(),
+            row_count: 1,
+        };
+        let request = Request::new(futures::stream::iter(vec![frame]));
+        let mut request = request;
+        request.metadata_mut().insert(
+            "protocol_version",
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        let mut response = client.shuffle_stream(request).await.unwrap().into_inner();
+        let status = response.next().await.unwrap().unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            status.message(),
+            "RS-2401: shuffle target is not registered"
+        );
+        service.shutdown().await;
     }
 
     #[tokio::test]

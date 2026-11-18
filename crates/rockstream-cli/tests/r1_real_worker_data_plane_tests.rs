@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -65,13 +65,36 @@ fn free_addr() -> String {
     listener.local_addr().unwrap().to_string()
 }
 
+fn worker_exchange_config(args: &[&str]) -> Option<PathBuf> {
+    if !args.windows(2).any(|pair| pair == ["--role", "worker"]) {
+        return None;
+    }
+    let storage = args
+        .windows(2)
+        .find(|pair| pair[0] == "--storage")
+        .map(|pair| Path::new(pair[1]))
+        .unwrap();
+    std::fs::create_dir_all(storage).unwrap();
+    let address = free_addr();
+    let mut config = rockstream_types::config::NodeConfig::default();
+    config.worker.exchange_bind_addr = Some(address.clone());
+    config.worker.exchange_advertise_addr = Some(address);
+    let path = storage.join("worker-shuffle.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    Some(path)
+}
+
 fn spawn(args: &[&str]) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_rockstream"))
+    let worker_config = worker_exchange_config(args);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    command
         .args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
+        .stderr(Stdio::null());
+    if let Some(path) = worker_config {
+        command.env("ROCKSTREAM_CONFIG", path);
+    }
+    command.spawn().unwrap()
 }
 
 fn spawn_with_tls(
@@ -80,11 +103,15 @@ fn spawn_with_tls(
     key: &std::path::Path,
     pki: &TestPki,
 ) -> Child {
+    let worker_config = worker_exchange_config(args);
     let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
     command
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(path) = worker_config {
+        command.env("ROCKSTREAM_CONFIG", path);
+    }
     add_identity_tls_args(&mut command, certificate, key, pki);
     command.spawn().unwrap()
 }
@@ -99,19 +126,22 @@ fn spawn_worker_with_tls(
 ) -> Child {
     let (certificate, key) = pki.worker_certs.get(&worker_id).unwrap();
     let worker_id = worker_id.to_string();
+    let args = [
+        "start",
+        "--storage",
+        storage.to_str().unwrap(),
+        "--role",
+        "worker",
+        "--control",
+        control_addr,
+        "--worker-id",
+        &worker_id,
+    ];
+    let worker_config = worker_exchange_config(&args).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
     command
-        .args([
-            "start",
-            "--storage",
-            storage.to_str().unwrap(),
-            "--role",
-            "worker",
-            "--control",
-            control_addr,
-            "--worker-id",
-            &worker_id,
-        ])
+        .args(args)
+        .env("ROCKSTREAM_CONFIG", worker_config)
         .env(
             "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
             format!("http://127.0.0.1:{minio_port}"),
@@ -946,6 +976,7 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
     let empty_output = wait_for_management_status_nodes(&management_addr, 0, &pki).await;
     let empty = assert_management_status_transcript(&empty_output, "unknown", vec![]);
     let empty_revision = topology_revision(&empty);
+    let mut worker_addresses = Vec::new();
 
     for (worker_id, host_id, zone) in [
         (501_u64, "multi-host-a", "multi-zone-a"),
@@ -974,6 +1005,10 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
             key,
             &pki,
         ));
+        let config: rockstream_types::config::NodeConfig =
+            toml::from_str(&std::fs::read_to_string(storage.join("worker-shuffle.toml")).unwrap())
+                .unwrap();
+        worker_addresses.push(config.worker.exchange_advertise_addr.unwrap());
     }
     wait_for_registered_workers(&control_storage.join("audit.jsonl"), 2).await;
 
@@ -985,7 +1020,7 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
             ManagementNodeInfo {
                 node_id: 501,
                 role: "worker".to_owned(),
-                address: "127.0.0.1:0".to_owned(),
+                address: worker_addresses[0].clone(),
                 state: "active".to_owned(),
                 capacity_headroom: 1.0,
                 host_id: "multi-host-a".to_owned(),
@@ -998,7 +1033,7 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
             ManagementNodeInfo {
                 node_id: 502,
                 role: "worker".to_owned(),
-                address: "127.0.0.1:0".to_owned(),
+                address: worker_addresses[1].clone(),
                 state: "active".to_owned(),
                 capacity_headroom: 1.0,
                 host_id: "multi-host-b".to_owned(),
@@ -1021,7 +1056,7 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
         vec![ManagementNodeInfo {
             node_id: 502,
             role: "worker".to_owned(),
-            address: "127.0.0.1:0".to_owned(),
+            address: worker_addresses[1].clone(),
             state: "active".to_owned(),
             capacity_headroom: 1.0,
             host_id: "multi-host-b".to_owned(),

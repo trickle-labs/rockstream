@@ -50,7 +50,9 @@ async fn owned_epoch_is_prepared_before_dispatch_and_finished_before_reply() {
         )
         .await;
         loop {
-            if let ControlMessage::Registered { worker_id: actual } =
+            if let ControlMessage::Registered {
+                worker_id: actual, ..
+            } =
                 receive(&mut worker_read).await
             {
                 assert_eq!(actual, worker_id);
