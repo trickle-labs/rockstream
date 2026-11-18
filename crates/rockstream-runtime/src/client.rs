@@ -22,8 +22,8 @@ use tokio::time::sleep;
 use tokio_util::task::AbortOnDropHandle;
 
 use rockstream_types::data_plane::{
-    DeploymentDescriptor, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow,
-    DEPLOYMENT_DESCRIPTOR_VERSION,
+    DEPLOYMENT_DESCRIPTOR_VERSION, DeploymentDescriptor, RuntimeExchangeMessage,
+    RuntimeOutputDelta, RuntimeRow,
 };
 use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::{LeaseToken, OperatorId, ShardId, WorkerId, WorkloadId};
@@ -79,7 +79,7 @@ fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<St
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("unsupported deployment type {other}"),
-                            ))
+                            ));
                         }
                     };
                     Ok(Field::new(&column.name, data_type, true))
@@ -196,7 +196,7 @@ fn zset_to_rows(zset: &rockstream_ops::zset::ArrowZSet) -> io::Result<Vec<Runtim
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("unsupported Arrow type {other}"),
-                            ))
+                            ));
                         }
                     }
                     .ok_or_else(|| {
@@ -370,13 +370,13 @@ pub async fn execute_frame(
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "committed execution does not match replay",
-                    ))
+                    ));
                 }
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "committed execution record is unavailable",
-                    ))
+                    ));
                 }
             }
         }
@@ -1203,7 +1203,7 @@ mod data_plane_tests {
                 .map(|value| value.to_vec()),
             Some(1_u64.to_be_bytes().to_vec())
         );
-        use rockstream_ops::sink::{read_view_output, ColumnValue};
+        use rockstream_ops::sink::{ColumnValue, read_view_output};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
         let expected = vec![
             (1, vec![ColumnValue::Int64(1), ColumnValue::Int64(10)], 1),
@@ -1357,7 +1357,7 @@ mod data_plane_tests {
         assert_eq!(metrics.emitted_updates, 2);
 
         // 3. Check storage: only key 20 was written, key 10 was omitted completely
-        use rockstream_ops::sink::{read_view_output, ColumnValue};
+        use rockstream_ops::sink::{ColumnValue, read_view_output};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].0, 1); // epoch 1
@@ -1679,7 +1679,10 @@ mod data_plane_tests {
         };
         db.set_fail_writes(true);
         assert_eq!(
-            execute_frame(&client, &deployments, frame.clone()).await.unwrap_err().to_string(),
+            execute_frame(&client, &deployments, frame.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
             "[RS-0001] Internal error: unsupported operation: injected storage write failure; next_steps: report this issue"
         );
         db.set_fail_writes(false);
@@ -1723,7 +1726,7 @@ mod data_plane_tests {
             }
             other => panic!("unexpected worker response: {other:?}"),
         }
-        use rockstream_ops::sink::{read_view_output, ColumnValue};
+        use rockstream_ops::sink::{ColumnValue, read_view_output};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
         assert_eq!(
             stored
@@ -1794,7 +1797,7 @@ mod data_plane_tests {
         assert_eq!(compactor.metrics().collapsed_updates(), 1);
         assert_eq!(compactor.metrics().cancelled_zero_weight_updates(), 0);
 
-        use rockstream_ops::sink::{read_view_output, ColumnValue};
+        use rockstream_ops::sink::{ColumnValue, read_view_output};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(
@@ -2195,6 +2198,27 @@ pub async fn start_worker_client_with_insecure_internal_dev_and_metadata(
         location,
         capabilities,
         InternalTlsConfig::default(),
+        EpochCompactionConfig::default(),
+        true,
+    )
+    .await
+}
+
+pub async fn start_worker_client_with_insecure_internal_dev_and_metadata_and_tls(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_transport_options(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        tls_config,
         EpochCompactionConfig::default(),
         true,
     )

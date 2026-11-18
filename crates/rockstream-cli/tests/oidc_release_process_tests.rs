@@ -6,8 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rockstream_control::audit::FileAuditLog;
 use rockstream_control::MANAGEMENT_OPERATION_RECORD_VERSION;
+use rockstream_control::audit::FileAuditLog;
 use rockstream_management_proto::v1::{
     Operation as ManagementWireOperation, SetSecurityPrincipalGrantsRequest,
 };
@@ -18,11 +18,11 @@ use rockstream_storage::catalog::{
 use rockstream_types::{
     authorization::{
         AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
-        ResourceKind, ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass,
-        SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
-        SECURITY_PRINCIPAL_FORMAT_VERSION,
+        ResourceKind, SECURITY_PRINCIPAL_FORMAT_VERSION, ScopedActionGrant, ScopedPresetGrant,
+        SecurityAction, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
+        SecurityPrincipal,
     },
-    data_plane::{DeploymentRequest, DEPLOYMENT_DESCRIPTOR_VERSION},
+    data_plane::{DEPLOYMENT_DESCRIPTOR_VERSION, DeploymentRequest},
     ids::{DatabaseId, NamespaceId, OperatorId, PrincipalId, ShardId, WorkerId, WorkloadId},
     topology::WorkerMessage,
 };
@@ -828,7 +828,7 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
         .unwrap_err();
     assert_eq!(
         policy_denial.to_string(),
-        "RS-2401: asserted user actor is no longer authorized for this operation and scope"
+        "RS-2401: asserted user actor is no longer authorized for this operation and scope; Request elevated RBAC role from an admin or contact the namespace owner"
     );
     let identity_denial = client
         .deploy_delegated(request, &wrong_deployment)
@@ -836,7 +836,7 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
         .unwrap_err();
     assert_eq!(
         identity_denial.to_string(),
-        "RS-2400: gateway actor assertion is invalid, expired, or bound to another deployment/request"
+        "RS-2400: gateway actor assertion is invalid, expired, or bound to another deployment/request; Provide valid credentials (Bearer token or mTLS certificate)"
     );
 
     process.0.kill().unwrap();
@@ -877,9 +877,11 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
         }
     );
     let rejected_identity = &records[audit_before.len() + 1];
-    assert!(rejected_identity
-        .event_id
-        .starts_with("gateway-delegation:"));
+    assert!(
+        rejected_identity
+            .event_id
+            .starts_with("gateway-delegation:")
+    );
     assert!(rejected_identity.timestamp_ms > 0);
     assert!(matches!(
         rejected_identity.actor,
@@ -1225,7 +1227,17 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         .expect("registered error includes diagnostic context");
     assert!(uuid::Uuid::parse_str(correlation_id).is_ok());
     let expected_message = format!(
-        "[RS-2026] query.query_time_execution_failed: Query-time DataFusion planning or execution failed for an ad hoc query (detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope) (correlation_id=<uuid> context=detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope) next_steps: {}",
+        "[RS-2026] query.query_time_execution_failed: Query-time DataFusion planning or execution failed for an ad hoc query (detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope; {}) (correlation_id=<uuid> context=detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope; {}) next_steps: {}",
+        rockstream_types::error_code::ErrorDescriptor::lookup(
+            rockstream_types::error_code::RS_2401
+        )
+        .unwrap()
+        .default_next_steps,
+        rockstream_types::error_code::ErrorDescriptor::lookup(
+            rockstream_types::error_code::RS_2401
+        )
+        .unwrap()
+        .default_next_steps,
         descriptor.default_next_steps
     );
     assert_eq!(
@@ -1470,9 +1482,11 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
         .deploy_delegated(request.clone(), &assertion)
         .await
         .unwrap();
-    assert!(worker
-        .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
-        .is_some());
+    assert!(
+        worker
+            .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
+            .is_some()
+    );
 
     let resolved = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -1946,9 +1960,11 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         assert_eq!(record.actor, AuditIdentity::Unknown);
         assert_eq!(record.target, AuditField::Unknown);
     }
-    assert!(!serde_json::to_string(&records)
-        .unwrap()
-        .contains("bad-token"));
+    assert!(
+        !serde_json::to_string(&records)
+            .unwrap()
+            .contains("bad-token")
+    );
 }
 
 #[tokio::test]
@@ -2144,7 +2160,9 @@ async fn scram_failures_run_in_release_process_and_audit_after_restart() {
     assert_eq!(fields.get(&b'C').map(String::as_str), Some("28P01"));
     assert_eq!(
         fields.get(&b'M').map(String::as_str),
-        Some("[RS-2401] auth.invalid_password: password authentication failed for user 'alice'. next_steps: Check password and retry")
+        Some(
+            "[RS-2401] auth.invalid_password: password authentication failed for user 'alice'. next_steps: Check password and retry"
+        )
     );
     let mut byte = [0];
     assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
@@ -2430,9 +2448,11 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
     assert_eq!(before_restart.len(), 1);
     assert_eq!(before_restart[0][0].as_deref(), Some("pg_auth"));
     assert_eq!(before_restart[0][1].as_deref(), Some("postgres_role"));
-    assert!(!serde_json::to_string(&before_restart)
-        .unwrap()
-        .contains("rotated-fixture-value"));
+    assert!(
+        !serde_json::to_string(&before_restart)
+            .unwrap()
+            .contains("rotated-fixture-value")
+    );
     drop(client);
     connection_task.abort();
     process.0.kill().unwrap();
@@ -2517,10 +2537,12 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .await
         .unwrap();
     assert_eq!(secret.metadata.version, 2);
-    assert!(secret
-        .payload
-        .get("password")
-        .is_some_and(|value| value == "rotated-fixture-value"));
+    assert!(
+        secret
+            .payload
+            .get("password")
+            .is_some_and(|value| value == "rotated-fixture-value")
+    );
     let rotation_audits = durable_catalog
         .list_security_audit_records()
         .await
@@ -2530,9 +2552,11 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .collect::<Vec<_>>();
     assert_eq!(rotation_audits.len(), 1);
     let rotation_audit = &rotation_audits[0];
-    assert!(rotation_audit
-        .event_id
-        .starts_with("gateway-secret-rotation-"));
+    assert!(
+        rotation_audit
+            .event_id
+            .starts_with("gateway-secret-rotation-")
+    );
     assert!(rotation_audit.timestamp_ms > 0);
     assert_eq!(
         rotation_audit.format_version,
@@ -2838,11 +2862,13 @@ async fn expired_and_wrong_ca_worker_certificates_are_rejected_by_release_contro
         assert_eq!(denial.actor, "unknown");
         assert!(denial.resource.starts_with("peer=127.0.0.1:"));
         assert_eq!(denial.error_code.as_deref(), Some("RS-2411"));
-        assert!(denial
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.starts_with("TLS handshake failed: ")
-                && detail.ends_with(", error_code=RS-2411")));
+        assert!(
+            denial
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("TLS handshake failed: ")
+                    && detail.ends_with(", error_code=RS-2411"))
+        );
     }
     assert_eq!(
         events
@@ -2906,8 +2932,7 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
     assert_eq!(client.worker_id(), None);
 
     let audit_path = storage.join("audit.jsonl");
-    let expected_detail =
-        "node identity mismatch: cert=worker:worker-999, requested_worker_id=worker-1, error_code=RS-2412";
+    let expected_detail = "node identity mismatch: cert=worker:worker-999, requested_worker_id=worker-1, error_code=RS-2412";
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let events = FileAuditLog::open(&audit_path).unwrap().read_all().unwrap();

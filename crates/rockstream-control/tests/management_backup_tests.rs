@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
-use object_store::{prefix::PrefixStore, ObjectStore};
+use object_store::{ObjectStore, prefix::PrefixStore};
 use rockstream_control::{
     CheckpointManifestStore, ControlService, ManagementOperationStore, ManagementService,
     OperationKind, OperationStatus, OperationUpdate, ShardManager, TopologyCatalog,
 };
 use rockstream_management_proto::v1::{
-    management_service_client::ManagementServiceClient, CreateBackupRequest, GetOperationRequest,
-    Operation,
+    CreateBackupRequest, GetOperationRequest, Operation,
+    management_service_client::ManagementServiceClient,
 };
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_test_worker_client;
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::config::NodeConfig;
 use rockstream_types::ids::{ShardId, WorkerId};
@@ -84,10 +85,15 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
         .await
         .unwrap();
     let control_url = control.addr.to_string();
-    let (worker, worker_task) =
-        rockstream_runtime::start_worker_client(17, &control_url, storage.path())
-            .await
-            .unwrap();
+    let (worker, worker_task) = start_test_worker_client(
+        17,
+        &control_url,
+        storage.path(),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while worker.worker_id().is_none() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -145,10 +151,12 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
     assert_eq!(completed.kind, "create_backup");
     assert_eq!(completed.state, "succeeded");
     assert_eq!(completed.started_at, accepted_operation.started_at);
-    assert!(completed
-        .updated_at
-        .parse::<chrono::DateTime<chrono::FixedOffset>>()
-        .is_ok());
+    assert!(
+        completed
+            .updated_at
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .is_ok()
+    );
     assert_eq!(completed.progress, "100%");
     assert_eq!(completed.phase, "completed");
     assert_eq!(completed.error_code, "");

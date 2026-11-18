@@ -126,7 +126,14 @@ impl DataPlaneClient {
                 code,
                 message,
                 next_steps,
-            } => io::Error::other(format!("{code}: {message}; {next_steps}")),
+            } => {
+                let message = if message.contains(&next_steps) {
+                    format!("{code}: {message}")
+                } else {
+                    format!("{code}: {message}; {next_steps}")
+                };
+                io::Error::other(message)
+            }
             other => io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected control response: {other:?}"),
