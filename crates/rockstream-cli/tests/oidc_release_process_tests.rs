@@ -2951,10 +2951,23 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .batch_execute("BEGIN; INSERT INTO public.orders VALUES (3, 30), (3, 30), (4, NULL);")
         .await
         .unwrap();
-    upstream
+    let (rotation_admin, rotation_admin_connection) = tokio_postgres::connect(
+        &format!(
+            "host={postgres_host} port={postgres_port} user=postgres password=rotation-fixture-value dbname=postgres"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let rotation_admin_task = tokio::spawn(async move {
+        let _ = rotation_admin_connection.await;
+    });
+    rotation_admin
         .simple_query("ALTER ROLE postgres PASSWORD 'rotated-fixture-value'")
         .await
         .unwrap();
+    drop(rotation_admin);
+    rotation_admin_task.await.unwrap();
     let old_credential_error = match tokio_postgres::connect(
         &format!(
             "host={postgres_host} port={postgres_port} user=postgres password=rotation-fixture-value dbname=postgres"
@@ -3219,7 +3232,27 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         }
         assert!(
             Instant::now() < deadline,
-            "release PostgreSQL source did not consume the post-restart row with the rotated credential; observed: {observed:?}, slot_checkpointed: {slot_checkpointed}"
+            "release PostgreSQL source did not consume the post-restart row with the rotated credential; observed: {observed:?}, slot_checkpointed: {slot_checkpointed}; backfill status: {:?}; source status: {:?}; pending slot messages: {}",
+            simple_query_rows(
+                &client
+                    .simple_query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW order_rows")
+                    .await
+                    .unwrap()
+            ),
+            simple_query_rows(
+                &client
+                    .simple_query("SHOW SOURCE STATUS FOR orders")
+                    .await
+                    .unwrap()
+            ),
+            upstream
+                .query_one(
+                    "SELECT count(*)::bigint FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, 'proto_version', '1', 'publication_names', 'orders_pub')",
+                    &[&slot_name],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

@@ -5689,7 +5689,7 @@ impl GatewayHandler {
     fn pgoutput_source_aliases(&self, connector_id: ConnectorId) -> Vec<CatalogSourceEntry> {
         self.pgoutput_registered_aliases(connector_id)
             .into_iter()
-            .filter(|source| source.status == "OK")
+            .filter(|source| matches!(source.status.as_str(), "OK" | "RUNNING"))
             .collect()
     }
 
