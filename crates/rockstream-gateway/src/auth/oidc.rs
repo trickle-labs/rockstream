@@ -628,6 +628,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jwks_metric_returns_to_zero_when_verifier_is_dropped() {
+        let metric_lines = || {
+            rockstream_types::metrics::generate_prometheus_metrics()
+                .lines()
+                .filter(|line| {
+                    line.starts_with("# HELP jwks_cache_size")
+                        || line.starts_with("# TYPE jwks_cache_size")
+                        || line.starts_with("jwks_cache_size ")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let verifier = verifier_with_local_jwks().await;
+        assert_eq!(
+            metric_lines(),
+            [
+                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
+                "# TYPE jwks_cache_size gauge",
+                "jwks_cache_size 1",
+            ]
+        );
+
+        drop(verifier);
+
+        assert_eq!(
+            metric_lines(),
+            [
+                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
+                "# TYPE jwks_cache_size gauge",
+                "jwks_cache_size 0",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn retries_one_transient_jwks_failure_before_startup() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
