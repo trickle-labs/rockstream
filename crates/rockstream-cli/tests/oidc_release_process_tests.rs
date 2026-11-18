@@ -3443,7 +3443,6 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         "",
         "",
     );
-    let process_id = process.0.id();
     wait_for_gateway(&mut process.0, address).await;
     let (client, connection) = tokio_postgres::connect(
         &format!(
@@ -3594,6 +3593,36 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     response_proxy.await.unwrap();
     drop(rotation_client);
     rotation_connection_task.abort();
+    connection_task.abort();
+    drop(client);
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    drop(process);
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut process.0, address).await;
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection_task = tokio::spawn(connection);
+    let reconciled_process_id = process.0.id();
+    assert!(process.0.try_wait().unwrap().is_none());
     client
         .simple_query(&format!(
             "SET rockstream.idempotency_key = '{rotation_operation_id}'"
@@ -3723,7 +3752,7 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     )
     .await;
     assert!(process.0.try_wait().unwrap().is_none());
-    assert_eq!(process.0.id(), process_id);
+    assert_eq!(process.0.id(), reconciled_process_id);
 
     connection_task.abort();
     drop(client);
