@@ -7644,19 +7644,90 @@ async fn worker_shuffle_mtls_rollover_preserves_release_process_stream() {
     assert!(client_worker.0.try_wait().unwrap().is_none());
 
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed_count = audit_before.len();
+    let mut stable_since = None;
     let audit_after = loop {
         security_catalog.refresh().await.unwrap();
         let records = security_catalog
             .list_security_audit_records()
             .await
             .unwrap();
-        if records.len() == audit_before.len() + 1 {
-            break records;
+        let has_denial = records
+            .iter()
+            .skip(audit_before.len())
+            .any(|record| record.event_id.starts_with("shuffle-authorization:"));
+        if has_denial {
+            if records.len() == observed_count {
+                if stable_since
+                    .is_some_and(|since: Instant| since.elapsed() >= Duration::from_millis(200))
+                {
+                    break records;
+                }
+            } else {
+                observed_count = records.len();
+                stable_since = Some(Instant::now());
+            }
+        } else {
+            observed_count = records.len();
+            stable_since = None;
         }
-        assert!(Instant::now() < deadline, "shuffle denial was not audited");
+        assert!(
+            Instant::now() < deadline,
+            "shuffle denial was not audited: records grew from {} to {} ({:?})",
+            audit_before.len(),
+            records.len(),
+            records
+                .iter()
+                .skip(audit_before.len())
+                .map(|record| &record.event_id)
+                .collect::<Vec<_>>()
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let rejection = audit_after.last().unwrap();
+    let new_records = &audit_after[audit_before.len()..];
+    let denials = new_records
+        .iter()
+        .filter(|record| record.event_id.starts_with("shuffle-authorization:"))
+        .collect::<Vec<_>>();
+    assert_eq!(denials.len(), 1, "expected one audited shuffle denial");
+    let handshake_rejections = new_records
+        .iter()
+        .filter(|record| record.event_id.starts_with("shuffle-tls-handshake:"))
+        .collect::<Vec<_>>();
+    for handshake in &handshake_rejections {
+        let AuditCorrelation::Observed(peer) = &handshake.correlation else {
+            panic!("handshake audit must use the listener-observed peer address");
+        };
+        assert!(peer
+            .strip_prefix("peer=")
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .is_ok());
+        assert_eq!(
+            *handshake,
+            &SecurityAuditRecord {
+                format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: handshake.event_id.clone(),
+                timestamp_ms: handshake.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unknown,
+                scope: AuditField::Known("worker_shuffle".to_owned()),
+                action: SecurityAuditClass::NodeIdentityRejection,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Observed(peer.clone()),
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::NotApplicable,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+    }
+    assert_eq!(
+        new_records.len(),
+        denials.len() + handshake_rejections.len(),
+        "unexpected security audit during worker certificate rollover: {new_records:?}"
+    );
+    let rejection = denials[0];
     assert!(rejection.event_id.starts_with("shuffle-authorization:"));
     assert_eq!(
         rejection,
